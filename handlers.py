@@ -33,7 +33,7 @@ from config import OWNER_IDS
 from database import (async_session_maker, User, Message as DBMessage, AIConfig, KnowledgeBase, Content, IndexingQueue,
                      ContentMedia, Topic, SubscriptionPlan, UserSubscription, PromoCode, SubscriptionConfig, Mailing,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
-                     ReferralPaymentLog)
+                     ReferralPaymentLog, MailingDeliveryLog)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_questions_file
@@ -7291,6 +7291,42 @@ async def admin_create_mailing_start(callback: CallbackQuery, state: FSMContext)
                                      reply_markup=kb.mailing_audience_keyboard())
 
 
+def _birthday_mailing_step_text() -> str:
+    return (
+        "Шаг 2: Отправьте текст, фото или видео для ДР-рассылки.\n\n"
+        "Если хотите сначала добавить только медиа, можно отправить фото/видео без подписи, "
+        "а потом подставить готовый шаблон ДР.\n\n"
+        f"Доступные подстановки: <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
+    )
+
+
+async def _get_latest_birthday_mailing(session):
+    return await session.scalar(
+        select(Mailing)
+        .where(Mailing.recurring_type == BIRTHDAY_MAILING_TYPE)
+        .order_by(Mailing.created_at.desc(), Mailing.id.desc())
+        .limit(1)
+    )
+
+
+async def _show_birthday_template_screen(message: Message, bot: Bot):
+    async with async_session_maker() as session:
+        mailing = await _get_latest_birthday_mailing(session)
+
+    if not mailing:
+        await message.edit_text(
+            "🎂 <b>Шаблон ДР-рассылки</b>\n\n"
+            "Сейчас шаблон не создан.\n\n"
+            "Создай один шаблон, и планировщик будет использовать его автоматически в день рождения пользователя.",
+            reply_markup=kb.birthday_template_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    callback_stub = SimpleNamespace(message=message, from_user=SimpleNamespace(id=message.chat.id), data=f"mailing_details_{mailing.id}")
+    await admin_mailing_details(callback_stub, bot)
+
+
 @router.callback_query(F.data.startswith("mailing_audience_"), AdminStates.mailing_audience)
 async def admin_select_mailing_audience(callback: CallbackQuery, state: FSMContext):
     audience = callback.data.replace("mailing_audience_", "")
@@ -7299,16 +7335,31 @@ async def admin_select_mailing_audience(callback: CallbackQuery, state: FSMConte
 
     step_text = "Шаг 2: Отправьте сообщение для рассылки (текст, фото с подписью или видео с подписью)."
     if audience == "birthday_today":
-        step_text = (
-            "Шаг 2: Отправьте сообщение для ДР-рассылки или нажмите кнопку готового шаблона.\n\n"
-            f"Доступные подстановки: <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
-        )
+        step_text = _birthday_mailing_step_text()
 
     await callback.message.edit_text(
         step_text,
         reply_markup=kb.mailing_content_keyboard(audience),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "mailing_create_birthday_template")
+async def admin_create_birthday_template(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.mailing_content)
+    await state.update_data(audience="birthday_today", message_id=callback.message.message_id)
+    await callback.message.edit_text(
+        _birthday_mailing_step_text(),
+        reply_markup=kb.mailing_content_keyboard("birthday_today"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "mailing_birthday_template")
+async def admin_birthday_template_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+    await _show_birthday_template_screen(callback.message, bot)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "mailing_use_birthday_template", AdminStates.mailing_content)
@@ -7468,10 +7519,7 @@ async def admin_edit_mailing_content(callback: CallbackQuery, state: FSMContext)
 
     text = "Шаг 2: Отправьте сообщение для рассылки (текст, фото с подписью или видео с подписью)."
     if audience == "birthday_today":
-        text = (
-            "Шаг 2: Отправьте сообщение для ДР-рассылки или нажмите кнопку готового шаблона.\n\n"
-            f"Доступные подстановки: <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
-        )
+        text = _birthday_mailing_step_text()
     sent_msg = await callback.message.answer(
         text,
         reply_markup=kb.mailing_content_keyboard(audience),
@@ -7486,25 +7534,47 @@ async def admin_confirm_mailing(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     audience = data.get('audience')
     async with async_session_maker() as session:
-        new_mailing = Mailing(
-            text=data.get('text'),
-            media_file_id=data.get('media_file_id'),
-            media_file_type=data.get('media_file_type'),
-            media_position=data.get('media_position', 'media_top'),
-            target_audience=audience,
-            creator_id=callback.from_user.id,
-            recurring_type=BIRTHDAY_MAILING_TYPE if audience == "birthday_today" else None,
-            is_enabled=True,
-            status='active' if audience == "birthday_today" else 'pending'
-        )
-        session.add(new_mailing)
+        if audience == "birthday_today":
+            new_mailing = await _get_latest_birthday_mailing(session)
+            if new_mailing is None:
+                new_mailing = Mailing(
+                    target_audience=audience,
+                    creator_id=callback.from_user.id,
+                    recurring_type=BIRTHDAY_MAILING_TYPE,
+                    is_enabled=True,
+                    status='active'
+                )
+                session.add(new_mailing)
+            new_mailing.text = data.get('text')
+            new_mailing.media_file_id = data.get('media_file_id')
+            new_mailing.media_file_type = data.get('media_file_type')
+            new_mailing.media_position = data.get('media_position', 'media_top')
+            new_mailing.target_audience = audience
+            new_mailing.creator_id = callback.from_user.id
+            new_mailing.recurring_type = BIRTHDAY_MAILING_TYPE
+            new_mailing.is_enabled = True
+            new_mailing.status = 'active'
+        else:
+            new_mailing = Mailing(
+                text=data.get('text'),
+                media_file_id=data.get('media_file_id'),
+                media_file_type=data.get('media_file_type'),
+                media_position=data.get('media_position', 'media_top'),
+                target_audience=audience,
+                creator_id=callback.from_user.id,
+                recurring_type=None,
+                is_enabled=True,
+                status='pending'
+            )
+            session.add(new_mailing)
         await session.commit()
 
     await state.clear()
     await callback.message.delete()
     if audience == "birthday_today":
         await callback.message.answer(
-            "✅ Шаблон ДР-рассылки сохранен. Планировщик будет отправлять его пользователям в день рождения."
+            "✅ Шаблон ДР-рассылки сохранен. Он обновляется в одном месте и будет отправляться пользователям в день рождения.",
+            reply_markup=kb.birthday_template_keyboard(new_mailing.id, new_mailing.is_enabled)
         )
     else:
         await callback.message.answer("✅ Рассылка добавлена в очередь на отправку! Вы получите отчет по завершении.")
@@ -8195,7 +8265,8 @@ async def admin_mailing_history(callback: CallbackQuery):
     page = int(callback.data.split("_")[-1])
 
     async with async_session_maker() as session:
-        total_mailings = await session.scalar(select(func.count(Mailing.id)))
+        history_filter = or_(Mailing.recurring_type.is_(None), Mailing.recurring_type != BIRTHDAY_MAILING_TYPE)
+        total_mailings = await session.scalar(select(func.count(Mailing.id)).where(history_filter))
 
         if total_mailings == 0:
             text_to_send = "📜 История рассылок пуста."
@@ -8206,6 +8277,7 @@ async def admin_mailing_history(callback: CallbackQuery):
 
             mailings_result = await session.execute(
                 select(Mailing)
+                .where(history_filter)
                 .order_by(Mailing.created_at.desc())
                 .offset(page * PAGE_SIZE)
                 .limit(PAGE_SIZE)
@@ -8250,17 +8322,27 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
     end_time_str = to_msk(mailing.end_time).strftime('%d.%m.%Y %H:%M') if mailing.end_time else "N/A"
     mailing_type = "Автоматическая ДР-рассылка" if is_birthday_mailing(mailing) else "Обычная рассылка"
 
-    text = (
-        f"<b>Детали рассылки #{mailing.id}</b>\n\n"
-        f"<b>Тип:</b> {mailing_type}\n"
-        f"<b>Аудитория:</b> {audience_name}\n"
-        f"<b>Статус:</b> {status}\n"
-        f"<b>Начало:</b> {start_time_str}\n"
-        f"<b>Конец:</b> {end_time_str}\n"
-        f"<b>Успешно:</b> {mailing.success_count}\n"
-        f"<b>Ошибки:</b> {mailing.failure_count}\n\n"
-        f"<b><u>Текст:</u></b>\n{mailing.text or 'Нет текста'}"
-    )
+    if is_birthday_mailing(mailing):
+        text = (
+            "<b>🎂 Шаблон ДР-рассылки</b>\n\n"
+            f"<b>Статус:</b> {status}\n"
+            f"<b>Создан:</b> {to_msk(mailing.created_at).strftime('%d.%m.%Y %H:%M')}\n"
+            f"<b>Отправлено успешно:</b> {mailing.success_count}\n"
+            f"<b>Ошибок:</b> {mailing.failure_count}\n\n"
+            f"<b><u>Текст:</u></b>\n{mailing.text or 'Нет текста'}"
+        )
+    else:
+        text = (
+            f"<b>Детали рассылки #{mailing.id}</b>\n\n"
+            f"<b>Тип:</b> {mailing_type}\n"
+            f"<b>Аудитория:</b> {audience_name}\n"
+            f"<b>Статус:</b> {status}\n"
+            f"<b>Начало:</b> {start_time_str}\n"
+            f"<b>Конец:</b> {end_time_str}\n"
+            f"<b>Успешно:</b> {mailing.success_count}\n"
+            f"<b>Ошибки:</b> {mailing.failure_count}\n\n"
+            f"<b><u>Текст:</u></b>\n{mailing.text or 'Нет текста'}"
+        )
     if is_birthday_mailing(mailing):
         text += f"\n\n<b>Переменные:</b> <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
 
@@ -8291,7 +8373,53 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
         logging.error(f"Error showing mailing details: {e}")
         await bot.send_message(callback.from_user.id, text, reply_markup=back_keyboard, parse_mode='HTML')
 
-    await callback.answer()
+    answer_method = getattr(callback, "answer", None)
+    if callable(answer_method):
+        await answer_method()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("mailing_delete_birthday_") and not c.data.startswith("mailing_delete_birthday_confirm_"))
+async def admin_delete_birthday_template_prompt(callback: CallbackQuery):
+    mailing_id = int(callback.data.split("_")[-1])
+
+    async with async_session_maker() as session:
+        mailing = await session.get(Mailing, mailing_id)
+        if not mailing or not is_birthday_mailing(mailing):
+            await callback.answer("Шаблон не найден.", show_alert=True)
+            return
+
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest:
+        pass
+
+    await callback.bot.send_message(
+        callback.from_user.id,
+        "🗑 Удалить шаблон ДР-рассылки?\n\nЭто удалит текущий шаблон и старые дубли ДР-шаблонов, если они есть.",
+        reply_markup=kb.birthday_template_delete_keyboard(mailing_id),
+    )
+    answer_method = getattr(callback, "answer", None)
+    if callable(answer_method):
+        await answer_method()
+
+
+@router.callback_query(F.data.startswith("mailing_delete_birthday_confirm_"))
+async def admin_delete_birthday_template_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    async with async_session_maker() as session:
+        birthday_ids = (
+            await session.execute(
+                select(Mailing.id).where(Mailing.recurring_type == BIRTHDAY_MAILING_TYPE)
+            )
+        ).scalars().all()
+
+        if birthday_ids:
+            await session.execute(delete(MailingDeliveryLog).where(MailingDeliveryLog.mailing_id.in_(birthday_ids)))
+            await session.execute(delete(Mailing).where(Mailing.id.in_(birthday_ids)))
+            await session.commit()
+
+    await state.clear()
+    await callback.answer("Шаблон ДР удален.", show_alert=True)
+    await _show_birthday_template_screen(callback.message, bot)
 
 
 @router.callback_query(F.data.startswith("mailing_toggle_enabled_"))

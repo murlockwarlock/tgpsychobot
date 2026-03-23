@@ -925,6 +925,7 @@ def admin_view_admin_profile_keyboard(admin_id: int, can_view_history: bool):
 def mailing_menu_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🚀 Создать рассылку", callback_data="mailing_create")
+    builder.button(text="🎂 Шаблон ДР", callback_data="mailing_birthday_template")
     builder.button(text="📜 История рассылок", callback_data="mailing_history_page_0")
     builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
     builder.adjust(1)
@@ -942,7 +943,9 @@ def mailing_content_keyboard(audience: str):
     builder = InlineKeyboardBuilder()
     if audience == "birthday_today":
         builder.button(text="✨ Подставить шаблон ДР", callback_data="mailing_use_birthday_template")
-    builder.button(text="⬅️ Назад к выбору аудитории", callback_data="mailing_create")
+    back_callback = "mailing_birthday_template" if audience == "birthday_today" else "mailing_create"
+    back_text = "⬅️ Назад к шаблону ДР" if audience == "birthday_today" else "⬅️ Назад к выбору аудитории"
+    builder.button(text=back_text, callback_data=back_callback)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1028,12 +1031,31 @@ def mailing_history_keyboard(mailings: list, page: int, total_pages: int):
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_mailing_menu"))
     return builder.as_markup()
 
+def birthday_template_keyboard(mailing_id: int | None = None, is_enabled: bool = True):
+    builder = InlineKeyboardBuilder()
+    if mailing_id is None:
+        builder.button(text="➕ Создать шаблон", callback_data="mailing_create_birthday_template")
+    else:
+        builder.button(text="✏️ Обновить шаблон", callback_data="mailing_create_birthday_template")
+        builder.button(text="🧪 Отправить себе сейчас", callback_data=f"mailing_send_test_{mailing_id}")
+        toggle_text = "⏸ Выключить шаблон" if is_enabled else "▶️ Включить шаблон"
+        builder.button(text=toggle_text, callback_data=f"mailing_toggle_enabled_{mailing_id}")
+        builder.button(text="🗑 Удалить шаблон", callback_data=f"mailing_delete_birthday_{mailing_id}")
+    builder.button(text="⬅️ В меню рассылок", callback_data="admin_mailing_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def birthday_template_delete_keyboard(mailing_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🗑 Да, удалить шаблон", callback_data=f"mailing_delete_birthday_confirm_{mailing_id}")
+    builder.button(text="⬅️ Назад к шаблону", callback_data="mailing_birthday_template")
+    builder.adjust(1)
+    return builder.as_markup()
+
 def mailing_details_keyboard(mailing):
     builder = InlineKeyboardBuilder()
     if is_birthday_mailing(mailing):
-        builder.button(text="🧪 Отправить себе сейчас", callback_data=f"mailing_send_test_{mailing.id}")
-        toggle_text = "⏸ Выключить шаблон" if mailing.is_enabled else "▶️ Включить шаблон"
-        builder.button(text=toggle_text, callback_data=f"mailing_toggle_enabled_{mailing.id}")
+        return birthday_template_keyboard(mailing.id, mailing.is_enabled)
     builder.button(text="⬅️ Назад к истории", callback_data="mailing_history_page_0")
     builder.adjust(1)
     return builder.as_markup()
