@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 
-from database import async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestSession, MediaLibrary
+from database import async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestSession, MediaLibrary, TopicMediaDeck
 from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
@@ -285,7 +285,24 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
 
         available_media_text = ""
         if user.current_topic_id:
-            media_stmt = select(MediaLibrary).where(MediaLibrary.topic_id == user.current_topic_id)
+            # Получаем колоды (категории), привязанные к этому топику
+            deck_stmt = select(TopicMediaDeck.deck_name).where(
+                TopicMediaDeck.topic_id == user.current_topic_id
+            )
+            deck_res = await session.execute(deck_stmt)
+            assigned_decks = [r[0] for r in deck_res.all()]
+
+            if assigned_decks:
+                # Загружаем медиа из всех привязанных колод
+                media_stmt = select(MediaLibrary).where(
+                    MediaLibrary.category.in_(assigned_decks)
+                )
+            else:
+                # Фоллбэк на старое поведение (topic_id) для обратной совместимости
+                media_stmt = select(MediaLibrary).where(
+                    MediaLibrary.topic_id == user.current_topic_id
+                )
+
             media_res = await session.execute(media_stmt)
             media_files = media_res.scalars().all()
             if media_files:
@@ -303,7 +320,11 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
                         desc_part = f" — {m.description}" if m.description else ""
                         available_media_text += f"  - [{m.media_type.upper()}] {m.file_name}{desc_part}\n"
             else:
-                available_media_text = "Доступные медиа-файлы: не загружены.\n"
+                available_media_text = (
+                    "Медиа-файлы (карты, аудио) в этой теме НЕ загружены.\n"
+                    "НЕ используй теги RANDOM_IMG, CHOICE_IMG, CHOICE_IMG_HIDDEN, SHOW_IMG, SEND_AUDIO.\n"
+                    "Для визуализации используй только GEN_IMG: [промпт на английском].\n"
+                )
 
         provider = ai_config.provider
         provider_key = provider.strip().lower() if provider else ""

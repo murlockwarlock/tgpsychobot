@@ -537,11 +537,12 @@ def edit_topic_keyboard(topic_id: int, is_active: bool, in_menu: bool = False, i
     builder.button(text="📎 Привязать файлы БЗ", callback_data=f"assign_kb_topic_{topic_id}_page_0")
 
     builder.button(text="📁 Медиа-файлы темы", callback_data=f"admin_topic_media_{topic_id}")
+    builder.button(text="🃏 Привязать колоды", callback_data=f"assign_deck_topic_{topic_id}_page_0")
 
     builder.button(text="🗑️ Удалить тему", callback_data=f"delete_topic_{topic_id}")
     builder.button(text="⬅️ К списку тем", callback_data="admin_topics_page_0")
 
-    builder.adjust(1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1)
     return builder.as_markup()
 
 
@@ -1264,6 +1265,30 @@ def media_edit_keyboard(media_id: int, topic_id: int):
     builder.button(text="🗑️ Удалить", callback_data=f"admin_media_delete_{media_id}_{topic_id}")
     builder.button(text="⬅️ Назад к списку", callback_data=f"admin_topic_media_{topic_id}")
     builder.adjust(2, 2, 1, 1)
+    return builder.as_markup()
+
+
+def assign_decks_to_topic_keyboard(topic_id: int, all_decks: list[str], assigned_decks: set[str], page: int, total_pages: int):
+    builder = InlineKeyboardBuilder()
+    for deck in all_decks:
+        is_assigned = deck in assigned_decks
+        text = f"✅ {deck}" if is_assigned else f"⭕️ {deck}"
+        action = "remove" if is_assigned else "add"
+        callback_data = f"deck_topic_{action}_{topic_id}_{deck}_{page}"
+        builder.button(text=text, callback_data=callback_data)
+    builder.adjust(1)
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"assign_deck_topic_{topic_id}_page_{page - 1}"))
+    nav_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"assign_deck_topic_{topic_id}_page_{page + 1}"))
+
+    if nav_buttons:
+        builder.row(*nav_buttons)
+
+    builder.row(InlineKeyboardButton(text="⬅️ Назад к теме", callback_data=f"edit_topic_{topic_id}"))
     return builder.as_markup()
 
 

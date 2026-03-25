@@ -21,6 +21,13 @@ topic_knowledgebase_association = Table(
     Column('knowledge_base_id', Integer, ForeignKey('knowledge_base.id'), primary_key=True)
 )
 
+topic_media_deck_association = Table(
+    'topic_media_deck',
+    Base.metadata,
+    Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE'), primary_key=True),
+    Column('deck_name', String, primary_key=True),
+)
+
 promocode_plan_association = Table(
     'promocode_plan_association',
     Base.metadata,
@@ -138,6 +145,7 @@ class Topic(Base):
 
     knowledge_base_files = relationship("KnowledgeBase", secondary=topic_knowledgebase_association,
                                         back_populates="topics")
+    media_decks = relationship("TopicMediaDeck", back_populates="topic", cascade="all, delete-orphan")
 
 
 class Content(Base):
@@ -509,6 +517,14 @@ class YookassaPayment(Base):
     is_recurring = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     processed_at = Column(DateTime, nullable=True)
+
+
+class TopicMediaDeck(Base):
+    __tablename__ = 'topic_media_deck'
+    __table_args__ = {'extend_existing': True}
+    topic_id = Column(Integer, ForeignKey('topics.id', ondelete='CASCADE'), primary_key=True)
+    deck_name = Column(String, primary_key=True)
+    topic = relationship("Topic", back_populates="media_decks")
 
 
 class MediaLibrary(Base):

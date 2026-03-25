@@ -20,7 +20,7 @@ from aiogram.types import (Message, CallbackQuery, FSInputFile, Document,
 from aiogram.filters import CommandStart, Command, StateFilter, Filter, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sqlalchemy import select, func, update, delete, or_, cast, String, desc
+from sqlalchemy import select, func, update, delete, or_, and_, cast, String, desc
 from sqlalchemy.orm import selectinload
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile
@@ -33,7 +33,7 @@ from config import OWNER_IDS
 from database import (async_session_maker, User, Message as DBMessage, AIConfig, KnowledgeBase, Content, IndexingQueue,
                      ContentMedia, Topic, SubscriptionPlan, UserSubscription, PromoCode, SubscriptionConfig, Mailing,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
-                     ReferralPaymentLog, MailingDeliveryLog)
+                     ReferralPaymentLog, MailingDeliveryLog, TopicMediaDeck)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_questions_file
@@ -468,6 +468,27 @@ async def send_card_album(
                 await send_photo_or_document(bot, chat_id, file_id)
 
 
+async def _get_assigned_decks(session, topic_id: int) -> list[str]:
+    """Возвращает список имён колод, привязанных к топику."""
+    if not topic_id:
+        return []
+    deck_stmt = select(TopicMediaDeck.deck_name).where(TopicMediaDeck.topic_id == topic_id)
+    deck_res = await session.execute(deck_stmt)
+    return [r[0] for r in deck_res.all()]
+
+
+def _media_filter_by_deck(assigned_decks: list[str], topic_id: int, category: str = None):
+    """Возвращает SQLAlchemy фильтр для поиска медиа: по колодам если привязаны, иначе фоллбэк на topic_id."""
+    if assigned_decks:
+        if category:
+            return MediaLibrary.category == category
+        return MediaLibrary.category.in_(assigned_decks)
+    else:
+        if category:
+            return and_(MediaLibrary.topic_id == topic_id, MediaLibrary.category == category)
+        return MediaLibrary.topic_id == topic_id
+
+
 async def execute_media_commands(message: Message, response_text: str, user_id: int, bot: Bot):
     async with async_session_maker() as session:
         user_stmt = select(User).where(User.id == user_id)
@@ -479,10 +500,12 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
 
         topic_id = user.current_topic_id
 
+        assigned_decks = await _get_assigned_decks(session, topic_id)
+
         audio_matches = re.findall(r"\[SEND_AUDIO:\s*(.+?)\]", response_text)
         for file_name in audio_matches:
             stmt = select(MediaLibrary).where(
-                MediaLibrary.topic_id == topic_id,
+                _media_filter_by_deck(assigned_decks, topic_id),
                 MediaLibrary.file_name == file_name.strip(),
                 MediaLibrary.media_type == 'audio'
             )
@@ -497,9 +520,8 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             category = match[0].strip() if isinstance(match, tuple) else match.strip()
             count = int(match[1]) if isinstance(match, tuple) and match[1] else 1
             stmt = select(MediaLibrary).where(
-                MediaLibrary.topic_id == topic_id,
+                _media_filter_by_deck(assigned_decks, topic_id, category),
                 MediaLibrary.media_type == 'photo',
-                MediaLibrary.category == category,
                 MediaLibrary.file_name != '_back',
             ).order_by(func.random()).limit(count)
             res = await session.execute(stmt)
@@ -528,9 +550,8 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             cards_per_round = int(match[1])
             rounds = int(match[2]) if match[2] else 1
             stmt = select(MediaLibrary).where(
-                MediaLibrary.topic_id == topic_id,
+                _media_filter_by_deck(assigned_decks, topic_id, category),
                 MediaLibrary.media_type == 'photo',
-                MediaLibrary.category == category,
                 MediaLibrary.file_name != '_back',
             ).order_by(func.random()).limit(cards_per_round)
             res = await session.execute(stmt)
@@ -558,9 +579,8 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             cards_per_round = int(match[1])
             rounds = int(match[2]) if match[2] else 1
             stmt = select(MediaLibrary).where(
-                MediaLibrary.topic_id == topic_id,
+                _media_filter_by_deck(assigned_decks, topic_id, cat_stripped),
                 MediaLibrary.media_type == 'photo',
-                MediaLibrary.category == cat_stripped,
                 MediaLibrary.file_name != '_back',
             ).order_by(func.random()).limit(cards_per_round)
             res = await session.execute(stmt)
@@ -575,8 +595,7 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                 back_stmt = select(MediaLibrary).where(
                     MediaLibrary.category == cat_stripped,
                     MediaLibrary.file_name == '_back',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
-                ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+                ).limit(1)
                 back_media = await session.scalar(back_stmt)
                 if back_media:
                     await send_card_album(
@@ -594,8 +613,7 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             stmt = select(MediaLibrary).where(
                 MediaLibrary.file_name == file_name.strip(),
                 MediaLibrary.media_type == 'photo',
-                or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
-            ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+            ).limit(1)
             res = await session.execute(stmt)
             media = res.scalar_one_or_none()
             if media:
@@ -635,6 +653,7 @@ async def process_buffered_messages(user_id: int, bot: Bot):
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             topic_id = user.current_topic_id if user else None
+            assigned_decks = await _get_assigned_decks(session, topic_id) if topic_id else []
 
             # --- 1. Текст AI (сначала предисловие) ---
 
@@ -666,10 +685,10 @@ async def process_buffered_messages(user_id: int, bot: Bot):
 
             for audio_name in audios:
                 stmt = select(MediaLibrary).where(
+                    _media_filter_by_deck(assigned_decks, topic_id),
                     MediaLibrary.file_name == audio_name.strip(),
                     MediaLibrary.media_type == 'audio',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
-                ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+                ).limit(1)
                 media = await session.scalar(stmt)
                 if media:
                     await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=media.description, parse_mode='HTML')
@@ -678,8 +697,7 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 stmt = select(MediaLibrary).where(
                     MediaLibrary.file_name == file_name.strip(),
                     MediaLibrary.media_type == 'photo',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
-                ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+                ).limit(1)
                 media = await session.scalar(stmt)
                 if media:
                     await send_photo_or_document(
@@ -696,10 +714,9 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 cat = match[0].strip() if isinstance(match, tuple) else match.strip()
                 r_count = int(match[1]) if isinstance(match, tuple) and match[1] else 1
                 stmt = select(MediaLibrary).where(
-                    MediaLibrary.category == cat,
+                    _media_filter_by_deck(assigned_decks, topic_id, cat),
                     MediaLibrary.media_type == 'photo',
                     MediaLibrary.file_name != '_back',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
                 ).order_by(func.random()).limit(r_count)
                 res = await session.execute(stmt)
                 r_cards = res.scalars().all()
@@ -728,10 +745,9 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 cards_per_round = int(match[1])
                 rounds = int(match[2]) if match[2] else 1
                 stmt = select(MediaLibrary).where(
-                    MediaLibrary.category == cat,
+                    _media_filter_by_deck(assigned_decks, topic_id, cat),
                     MediaLibrary.media_type == 'photo',
                     MediaLibrary.file_name != '_back',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
                 ).order_by(func.random()).limit(cards_per_round)
                 res = await session.execute(stmt)
                 cards = res.scalars().all()
@@ -755,10 +771,9 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 cards_per_round = int(match[1])
                 rounds = int(match[2]) if match[2] else 1
                 stmt = select(MediaLibrary).where(
-                    MediaLibrary.category == cat_stripped,
+                    _media_filter_by_deck(assigned_decks, topic_id, cat_stripped),
                     MediaLibrary.media_type == 'photo',
                     MediaLibrary.file_name != '_back',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
                 ).order_by(func.random()).limit(cards_per_round)
                 res = await session.execute(stmt)
                 cards = res.scalars().all()
@@ -772,8 +787,7 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                     back_stmt = select(MediaLibrary).where(
                         MediaLibrary.category == cat_stripped,
                         MediaLibrary.file_name == '_back',
-                        or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
-                    ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+                    ).limit(1)
                     back_media = await session.scalar(back_stmt)
                     if back_media:
                         await send_card_album(
@@ -912,13 +926,13 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 spread['chosen_card_ids'].append(card_id)
                 spread['rounds_left'] -= 1
                 async with async_session_maker() as s3:
+                    spread_decks = await _get_assigned_decks(s3, spread['topic_id'])
                     exclude_ids = spread['chosen_card_ids']
                     stmt = select(MediaLibrary).where(
-                        MediaLibrary.category == spread['category'],
+                        _media_filter_by_deck(spread_decks, spread['topic_id'], spread['category']),
                         MediaLibrary.media_type == 'photo',
                         MediaLibrary.file_name != '_back',
                         MediaLibrary.id.notin_(exclude_ids),
-                        or_(MediaLibrary.topic_id == spread['topic_id'], MediaLibrary.topic_id == None)
                     ).order_by(func.random()).limit(spread['cards_per_round'])
                     res = await s3.execute(stmt)
                     next_cards = res.scalars().all()
@@ -927,8 +941,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                             back_stmt = select(MediaLibrary).where(
                                 MediaLibrary.category == spread['category'],
                                 MediaLibrary.file_name == '_back',
-                                or_(MediaLibrary.topic_id == spread['topic_id'], MediaLibrary.topic_id == None)
-                            ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+                            ).limit(1)
                             back_media = await s3.scalar(back_stmt)
                             if back_media:
                                 await send_card_album(
@@ -3494,12 +3507,14 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         # --- 2. Медиа (карты, аудио) после текста ---
 
         async with async_session_maker() as session:
+            msg_assigned_decks = await _get_assigned_decks(session, topic_id) if topic_id else []
+
             for audio_name in audios:
                 stmt = select(MediaLibrary).where(
+                    _media_filter_by_deck(msg_assigned_decks, topic_id),
                     MediaLibrary.file_name == audio_name.strip(),
                     MediaLibrary.media_type == 'audio',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
-                ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+                ).limit(1)
                 media = await session.scalar(stmt)
                 if media:
                     await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=media.description, parse_mode='HTML')
@@ -3508,8 +3523,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 stmt = select(MediaLibrary).where(
                     MediaLibrary.file_name == file_name.strip(),
                     MediaLibrary.media_type == 'photo',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
-                ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+                ).limit(1)
                 media = await session.scalar(stmt)
                 if media:
                     await send_photo_or_document(
@@ -3526,10 +3540,9 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cat = match[0].strip() if isinstance(match, tuple) else match.strip()
                 r_count = int(match[1]) if isinstance(match, tuple) and match[1] else 1
                 stmt = select(MediaLibrary).where(
-                    MediaLibrary.category == cat,
+                    _media_filter_by_deck(msg_assigned_decks, topic_id, cat),
                     MediaLibrary.media_type == 'photo',
                     MediaLibrary.file_name != '_back',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
                 ).order_by(func.random()).limit(r_count)
                 res = await session.execute(stmt)
                 r_cards = res.scalars().all()
@@ -3558,10 +3571,9 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cards_per_round = int(match[1])
                 rounds = int(match[2]) if match[2] else 1
                 stmt = select(MediaLibrary).where(
-                    MediaLibrary.category == cat,
+                    _media_filter_by_deck(msg_assigned_decks, topic_id, cat),
                     MediaLibrary.media_type == 'photo',
                     MediaLibrary.file_name != '_back',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
                 ).order_by(func.random()).limit(cards_per_round)
                 res = await session.execute(stmt)
                 cards = res.scalars().all()
@@ -3585,10 +3597,9 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cards_per_round = int(match[1])
                 rounds = int(match[2]) if match[2] else 1
                 stmt = select(MediaLibrary).where(
-                    MediaLibrary.category == cat_stripped,
+                    _media_filter_by_deck(msg_assigned_decks, topic_id, cat_stripped),
                     MediaLibrary.media_type == 'photo',
                     MediaLibrary.file_name != '_back',
-                    or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
                 ).order_by(func.random()).limit(cards_per_round)
                 res = await session.execute(stmt)
                 cards = res.scalars().all()
@@ -3602,8 +3613,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                     back_stmt = select(MediaLibrary).where(
                         MediaLibrary.category == cat_stripped,
                         MediaLibrary.file_name == '_back',
-                        or_(MediaLibrary.topic_id == topic_id, MediaLibrary.topic_id == None)
-                    ).order_by(MediaLibrary.topic_id.desc()).limit(1)
+                    ).limit(1)
                     back_media = await session.scalar(back_stmt)
                     if back_media:
                         await send_card_album(
@@ -4583,6 +4593,113 @@ async def admin_toggle_kb_for_topic(callback: CallbackQuery):
     await callback.answer(f"Файл '{kb_file.filename}' {'добавлен' if action == 'add' else 'удален'}.")
 
     await _show_assign_kb_to_topic_menu(
+        bot=callback.bot,
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        topic_id=topic_id,
+        page=page
+    )
+
+
+# ────────── Привязка медиа-колод к топикам ──────────
+
+DECK_PAGE_SIZE = 20
+
+
+async def _show_assign_deck_to_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_id: int, page: int = 0):
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if not topic:
+            return
+
+        # Все уникальные категории (колоды) из media_library
+        all_decks_res = await session.execute(
+            select(MediaLibrary.category)
+            .where(MediaLibrary.category != None, MediaLibrary.category != '')
+            .group_by(MediaLibrary.category)
+            .order_by(MediaLibrary.category)
+        )
+        all_deck_names = [r[0] for r in all_decks_res.all()]
+        total_decks = len(all_deck_names)
+        total_pages = max(1, math.ceil(total_decks / DECK_PAGE_SIZE))
+        page_decks = all_deck_names[page * DECK_PAGE_SIZE: (page + 1) * DECK_PAGE_SIZE]
+
+        # Колоды, привязанные к этому топику
+        assigned_res = await session.execute(
+            select(TopicMediaDeck.deck_name).where(TopicMediaDeck.topic_id == topic_id)
+        )
+        assigned_decks = {r[0] for r in assigned_res.all()}
+
+        # Подсчёт файлов в каждой колоде
+        count_res = await session.execute(
+            select(MediaLibrary.category, func.count(MediaLibrary.id))
+            .where(MediaLibrary.category.in_(page_decks))
+            .group_by(MediaLibrary.category)
+        )
+        deck_counts = dict(count_res.all())
+
+    deck_info = ", ".join(f"{d} ({deck_counts.get(d, 0)})" for d in page_decks)
+    text = (
+        f"🃏 Привязка колод к теме: <b>{topic.name}</b>\n"
+        f"Нажми на колоду, чтобы добавить или убрать.\n\n"
+        f"Колоды: {deck_info}"
+    )
+
+    await bot.edit_message_text(
+        text=text,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=kb.assign_decks_to_topic_keyboard(topic_id, page_decks, assigned_decks, page, total_pages),
+        parse_mode='HTML'
+    )
+
+
+@router.callback_query(F.data.startswith("assign_deck_topic_"), StateFilter('*'))
+async def admin_assign_deck_to_topic(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    # assign_deck_topic_{topic_id}_page_{page}
+    topic_id = int(parts[3])
+    page = int(parts[5])
+    await _show_assign_deck_to_topic_menu(
+        bot=callback.bot,
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        topic_id=topic_id,
+        page=page
+    )
+
+
+@router.callback_query(F.data.startswith("deck_topic_"))
+async def admin_toggle_deck_for_topic(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    # deck_topic_{action}_{topic_id}_{deck_name}_{page}
+    action = parts[2]
+    topic_id = int(parts[3])
+    deck_name = parts[4]
+    page = int(parts[5])
+
+    async with async_session_maker() as session:
+        if action == "add":
+            existing = await session.execute(
+                select(TopicMediaDeck).where(
+                    TopicMediaDeck.topic_id == topic_id,
+                    TopicMediaDeck.deck_name == deck_name
+                )
+            )
+            if not existing.scalar_one_or_none():
+                session.add(TopicMediaDeck(topic_id=topic_id, deck_name=deck_name))
+        elif action == "remove":
+            await session.execute(
+                delete(TopicMediaDeck).where(
+                    TopicMediaDeck.topic_id == topic_id,
+                    TopicMediaDeck.deck_name == deck_name
+                )
+            )
+        await session.commit()
+
+    await callback.answer(f"Колода '{deck_name}' {'добавлена' if action == 'add' else 'убрана'}.")
+
+    await _show_assign_deck_to_topic_menu(
         bot=callback.bot,
         chat_id=callback.message.chat.id,
         message_id=callback.message.message_id,
@@ -8075,7 +8192,13 @@ async def _show_edit_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_i
             select(func.count(MediaLibrary.id)).where(MediaLibrary.topic_id == topic_id)
         )
 
+        deck_res = await session.execute(
+            select(TopicMediaDeck.deck_name).where(TopicMediaDeck.topic_id == topic_id)
+        )
+        assigned_deck_names = [r[0] for r in deck_res.all()]
+
     kb_files_count = len(topic.knowledge_base_files)
+    decks_info = ", ".join(assigned_deck_names) if assigned_deck_names else "не привязаны"
     prompt_status = "✅ Задан" if topic.system_prompt else "❌ Не задан (используется общий)"
     active_status = "🟢 Активна" if topic.is_active else "⚪️ Неактивна"
     admin_only = getattr(topic, 'admin_only', False)
@@ -8098,7 +8221,8 @@ async def _show_edit_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_i
         f"<b>Приветствие:</b> {intro_status}\n"
         f"<b>Кнопка действия:</b> {btn_status}\n"
         f"<b>Файлов БЗ (RAG):</b> {kb_files_count}\n"
-        f"<b>Медиа-файлов (аудио/фото):</b> {media_count}"
+        f"<b>Медиа-файлов (аудио/фото):</b> {media_count}\n"
+        f"<b>Колоды:</b> {decks_info}"
     )
 
     try:
@@ -11753,6 +11877,18 @@ async def admin_media_final(message: Message, state: FSMContext):
             description=message.text.strip()
         )
         session.add(new_media)
+
+        # Автопривязка колоды к текущему топику
+        if category and topic_id:
+            existing_deck = await session.execute(
+                select(TopicMediaDeck).where(
+                    TopicMediaDeck.topic_id == topic_id,
+                    TopicMediaDeck.deck_name == category
+                )
+            )
+            if not existing_deck.scalar_one_or_none():
+                session.add(TopicMediaDeck(topic_id=topic_id, deck_name=category))
+
         await session.commit()
 
         MEDIA_PAGE_SIZE = 10
