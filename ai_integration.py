@@ -990,18 +990,51 @@ async def edit_image_gemini_v3(api_key: str, model: str, prompt: str, image_byte
 
 
 def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
+    aspect_ratio, _ = _select_image_generation_shape(prompt)
     if model == "google/imagen4-fast":
         return {
             "prompt": prompt,
-            "aspect_ratio": "1:1",
+            "aspect_ratio": aspect_ratio,
             "num_images": "1",
         }
     if model in {"google/imagen4-ultra", "google/imagen4"}:
         return {
             "prompt": prompt,
-            "aspect_ratio": "1:1",
+            "aspect_ratio": aspect_ratio,
         }
     raise AIServiceError(f"Неподдерживаемая KIE image generation model: {model}")
+
+
+def _select_image_generation_shape(prompt: str) -> tuple[str, str]:
+    prompt_lc = (prompt or "").lower()
+
+    portrait_markers = (
+        "tarot",
+        "card",
+        "oracle",
+        "poster",
+        "cover",
+        "vertical",
+        "portrait orientation",
+        "full body",
+        "full-body",
+        "phone wallpaper",
+    )
+    landscape_markers = (
+        "landscape orientation",
+        "horizontal",
+        "wide shot",
+        "widescreen",
+        "panoramic",
+        "banner",
+        "cinematic wide",
+    )
+
+    if any(marker in prompt_lc for marker in portrait_markers):
+        return "3:4", "1024x1536"
+    if any(marker in prompt_lc for marker in landscape_markers):
+        return "4:3", "1536x1024"
+    return "1:1", "1024x1024"
 
 
 async def _call_kie_image_generation(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
@@ -1134,15 +1167,31 @@ async def generate_openai_image(prompt: str) -> str:
 
     try:
         model = "gpt-image-1.5"
+        _, preferred_size = _select_image_generation_shape(prompt)
 
         logging.info(f"Generating image via {model} with prompt: {prompt}")
+        requested_sizes = [preferred_size]
+        if preferred_size != "1024x1024":
+            requested_sizes.append("1024x1024")
 
-        response = await client.images.generate(
-            model=model,
-            prompt=prompt,
-            n=1,
-            size="1024x1024"
-        )
+        response = None
+        last_error = None
+        for size in requested_sizes:
+            try:
+                response = await client.images.generate(
+                    model=model,
+                    prompt=prompt,
+                    n=1,
+                    size=size
+                )
+                logging.info("OpenAI image generation completed with size=%s", size)
+                break
+            except Exception as exc:
+                last_error = exc
+                logging.warning("OpenAI image generation failed with size=%s: %s", size, exc)
+
+        if response is None:
+            raise last_error or Exception("OpenAI image generation failed without response")
 
         if not response.data:
             raise Exception("API не вернул данных (empty data).")
