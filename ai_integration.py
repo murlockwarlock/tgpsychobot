@@ -656,14 +656,26 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                 return f"❌ Ошибка: API ключ для {provider} (для транскрибации) не установлен администратором."
             if not model:
                 return f"❌ Ошибка: Модель для {provider} (для транскрибации) не выбрана администратором."
-            response_text = await _call_kie_transcribe(
-                api_key,
-                _get_kie_base_url(ai_config),
-                _get_kie_upload_base_url(ai_config),
-                model,
-                file_bytes,
-                filename,
-            )
+            try:
+                response_text = await _call_kie_transcribe(
+                    api_key,
+                    _get_kie_base_url(ai_config),
+                    _get_kie_upload_base_url(ai_config),
+                    model,
+                    file_bytes,
+                    filename,
+                )
+            except (InsufficientBalanceError, AIServiceError) as kie_exc:
+                openai_api_key = ai_config.openai_api_key
+                if not openai_api_key:
+                    raise
+
+                logging.warning(
+                    "KIE transcription failed, falling back to OpenAI Whisper: model=%s error=%s",
+                    model,
+                    kie_exc,
+                )
+                response_text = await _call_openai_transcribe(openai_api_key, file_bytes, filename)
 
         else:
             return f"❌ Ошибка: Неизвестный провайдер транскрибации: {provider}"
