@@ -1170,6 +1170,7 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
         provider = config.vision_provider
         v_model = config.vision_model
         temperature = getattr(config, 'temperature', 0.7) or 0.7
+        api_key = None
 
         if provider == "Gemini":
             api_key = config.gemini_api_key
@@ -1199,57 +1200,57 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
                 if not api_key:
                     raise
                 v_model = "gpt-4o"
-
         else:
             api_key = config.openai_api_key
-            if not api_key:
-                api_key = os.getenv('OPENAI_API_KEY')
-            if not api_key:
-                return "❌ Ошибка: API ключ для OpenAI (Vision) не установлен."
 
-            b64_img = base64.b64encode(image_bytes).decode('utf-8')
-            formatting_rules = (
-                "\n\nТЕХНИЧЕСКИЕ ПРАВИЛА ФОРМАТИРОВАНИЯ:\n"
-                "1. Markdown: Всегда используй стандартный Markdown. Никакого ручного HTML.\n"
-                "2. ПРАВИЛО ВЫДЕЛЕНИЯ ТЕКСТА: Используй жирный шрифт (**текст**) только для заголовков. "
-                "Никогда не выделяй жирным целые абзацы. Всегда закрывай теги **.\n"
-                "3. Списки: Для маркированных списков используй исключительно дефис '-'.\n"
+        if not api_key:
+            api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            return "❌ Ошибка: API ключ для OpenAI (Vision) не установлен."
+
+        b64_img = base64.b64encode(image_bytes).decode('utf-8')
+        formatting_rules = (
+            "\n\nТЕХНИЧЕСКИЕ ПРАВИЛА ФОРМАТИРОВАНИЯ:\n"
+            "1. Markdown: Всегда используй стандартный Markdown. Никакого ручного HTML.\n"
+            "2. ПРАВИЛО ВЫДЕЛЕНИЯ ТЕКСТА: Используй жирный шрифт (**текст**) только для заголовков. "
+            "Никогда не выделяй жирным целые абзацы. Всегда закрывай теги **.\n"
+            "3. Списки: Для маркированных списков используй исключительно дефис '-'.\n"
+        )
+
+        vision_instructions = (
+            "You are a professional expert analyst. Analyze the provided image thoroughly. "
+            "If visualization is needed, add at the very end: "
+            "GEN_IMG: [Detailed English prompt].\n\n"
+            f"Role and Context: {prompt}{formatting_rules}"
+        )
+
+        messages = []
+        if history:
+            for msg in history:
+                messages.append({"role": msg.role, "content": msg.content})
+
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": vision_instructions},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}", "detail": "high"}}
+            ]
+        })
+
+        base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+        try:
+            response = await client.chat.completions.create(
+                model=v_model,
+                messages=messages,
+                max_tokens=4096,
+                temperature=temperature
             )
-
-            vision_instructions = (
-                "You are a professional expert analyst. Analyze the provided image thoroughly. "
-                "If visualization is needed, add at the very end: "
-                "GEN_IMG: [Detailed English prompt].\n\n"
-                f"Role and Context: {prompt}{formatting_rules}"
-            )
-
-            messages = []
-            if history:
-                for msg in history:
-                    messages.append({"role": msg.role, "content": msg.content})
-
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": vision_instructions},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}", "detail": "high"}}
-                ]
-            })
-
-            base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
-            client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-
-            try:
-                response = await client.chat.completions.create(
-                    model=v_model,
-                    messages=messages,
-                    max_tokens=4096,
-                    temperature=temperature
-                )
-                return response.choices[0].message.content
-            except Exception as e:
-                logging.error(f"OpenAI Vision Error: {e}")
-                raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {e}")
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.error(f"OpenAI Vision Error: {e}")
+            raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {e}")
 
 
 async def _call_gemini_vision(api_key: str, model: str, image_bytes: bytes, prompt: str, history: list = None, temperature: float = 0.7) -> str:
