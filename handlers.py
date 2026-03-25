@@ -2320,7 +2320,12 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             return
 
         provider = config.provider
-        model_name = getattr(config, f"{provider.lower()}_model", "не выбрана")
+        if provider == "KIE":
+            model_name = getattr(config, "kie_model", "не выбрана")
+            model_label = "Активная модель KIE"
+        else:
+            model_name = getattr(config, f"{provider.lower()}_model", "не выбрана")
+            model_label = "Активная модель"
 
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
         vis_provider = config.vision_provider
@@ -2341,7 +2346,7 @@ async def admin_ai_settings(message: Message | CallbackQuery):
 
     text = (f"🤖 <b>Настройки ИИ</b>\n\n"
             f"▫️ Текущий провайдер: <b>{provider}</b>\n"
-            f"▫️ Активная модель: <code>{model_name}</code>\n\n"
+            f"▫️ {model_label}: <code>{model_name}</code>\n\n"
             f"📝 <b>Промпты:</b>\n"
             f"▫️ Основной промпт: <b>{prompt_source}</b>\n"
             f"▫️ Общий блок: <b>{shared_block_status}</b>\n"
