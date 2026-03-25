@@ -90,6 +90,19 @@ def _guess_filename(file_bytes: bytes, fallback_stem: str, fallback_ext: str) ->
     return f"{fallback_stem}.{ext}"
 
 
+def _guess_image_media_type(file_bytes: bytes) -> str:
+    header = file_bytes[:16]
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith(b"GIF8"):
+        return "image/gif"
+    if header.startswith(b"RIFF") and file_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 def _extract_kie_chat_text(payload: dict) -> str:
     choices = payload.get("choices")
     if isinstance(choices, list) and choices:
@@ -468,6 +481,65 @@ async def _call_claude_api(api_key: str, model: str, history: list, context: str
     except Exception as e:
         logging.error(f"Claude API error: {e}")
         raise AIServiceError(f"Ошибка при обращении к Claude API: {e}")
+
+
+async def _call_claude_vision(
+    api_key: str,
+    model: str,
+    image_bytes: bytes,
+    prompt: str,
+    history: list = None,
+    temperature: float = 0.7,
+) -> str:
+    try:
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        history_text = []
+        if history:
+            for msg in history:
+                if msg.content:
+                    prefix = "Пользователь" if msg.role == "user" else "Ассистент"
+                    history_text.append(f"{prefix}: {msg.content}")
+
+        full_prompt = prompt
+        if history_text:
+            full_prompt = f"{prompt}\n\nКонтекст диалога:\n" + "\n".join(history_text[-12:])
+
+        message = await client.messages.create(
+            model=model,
+            max_tokens=4096,
+            temperature=temperature,
+            system=full_prompt,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Проанализируй это изображение согласно системной инструкции."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": _guess_image_media_type(image_bytes),
+                                "data": base64.b64encode(image_bytes).decode("utf-8"),
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+
+        text_parts = []
+        for item in message.content:
+            if getattr(item, "type", None) == "text" and getattr(item, "text", None):
+                text_parts.append(item.text)
+        result = "\n".join(text_parts).strip()
+        if not result:
+            raise AIResponseError("Claude vision returned empty content")
+        return result
+    except anthropic.AuthenticationError as e:
+        raise InsufficientBalanceError(f"Claude Vision API Error: {e}")
+    except Exception as e:
+        logging.error("Claude vision error", exc_info=e)
+        raise AIServiceError(f"Ошибка анализа изображения (Claude): {e}")
 
 
 async def _call_deepseek_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7):
@@ -1270,6 +1342,18 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
             if not api_key:
                 return "❌ Ошибка: API ключ для Gemini (Vision) не установлен."
             return await _call_gemini_vision(api_key, v_model, image_bytes, prompt, history=history, temperature=temperature)
+        if provider == "Claude":
+            api_key = config.claude_api_key
+            if not api_key:
+                return "❌ Ошибка: API ключ для Claude (Vision) не установлен."
+            return await _call_claude_vision(
+                api_key,
+                v_model or getattr(config, "claude_model", "claude-sonnet-4-5-20250929"),
+                image_bytes,
+                prompt,
+                history=history,
+                temperature=temperature,
+            )
         if provider == "KIE":
             api_key = getattr(config, "kie_api_key", None)
             if not api_key:
