@@ -479,6 +479,9 @@ async def _call_claude_api(api_key: str, model: str, history: list, context: str
     except anthropic.AuthenticationError as e:
         raise InsufficientBalanceError(f"Claude API Error: {e}")
     except Exception as e:
+        error_text = str(e).lower()
+        if any(marker in error_text for marker in ["credit balance", "billing", "quota", "purchase credits", "insufficient"]):
+            raise InsufficientBalanceError(f"Claude API Error: {e}")
         logging.error(f"Claude API error: {e}")
         raise AIServiceError(f"Ошибка при обращении к Claude API: {e}")
 
@@ -538,6 +541,9 @@ async def _call_claude_vision(
     except anthropic.AuthenticationError as e:
         raise InsufficientBalanceError(f"Claude Vision API Error: {e}")
     except Exception as e:
+        error_text = str(e).lower()
+        if any(marker in error_text for marker in ["credit balance", "billing", "quota", "purchase credits", "insufficient"]):
+            raise InsufficientBalanceError(f"Claude Vision API Error: {e}")
         logging.error("Claude vision error", exc_info=e)
         raise AIServiceError(f"Ошибка анализа изображения (Claude): {e}")
 
