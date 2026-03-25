@@ -119,7 +119,7 @@ class AIConfig(Base):
     kie_model = Column(String, default='gemini-3-flash')
     kie_base_url = Column(String, default='https://api.kie.ai')
     kie_upload_base_url = Column(String, default='https://kieai.redpandaai.co')
-    kie_transcription_model = Column(String, default='gemini-3-flash')
+    kie_transcription_model = Column(String, default='elevenlabs/speech-to-text')
     kie_credit_alert_threshold = Column(Float, default=0, nullable=False)
     kie_credit_alert_sent = Column(Boolean, default=False, nullable=False)
     claude_model = Column(String, default='claude-sonnet-4-5-20250929')
@@ -480,7 +480,7 @@ async def init_db():
             if 'kie_upload_base_url' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_upload_base_url VARCHAR DEFAULT 'https://kieai.redpandaai.co'"))
             if 'kie_transcription_model' not in ai_columns:
-                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_transcription_model VARCHAR DEFAULT 'gemini-3-flash'"))
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_transcription_model VARCHAR DEFAULT 'elevenlabs/speech-to-text'"))
             if 'kie_credit_alert_threshold' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_credit_alert_threshold FLOAT DEFAULT 0 NOT NULL"))
             if 'kie_credit_alert_sent' not in ai_columns:
@@ -518,7 +518,7 @@ async def init_db():
             if getattr(ai_conf, 'kie_upload_base_url', None) is None:
                 ai_conf.kie_upload_base_url = 'https://kieai.redpandaai.co'
             if getattr(ai_conf, 'kie_transcription_model', None) is None:
-                ai_conf.kie_transcription_model = 'gemini-3-flash'
+                ai_conf.kie_transcription_model = 'elevenlabs/speech-to-text'
             if getattr(ai_conf, 'kie_credit_alert_threshold', None) is None:
                 ai_conf.kie_credit_alert_threshold = 0
             if getattr(ai_conf, 'kie_credit_alert_sent', None) is None:

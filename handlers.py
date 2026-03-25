@@ -2683,6 +2683,7 @@ async def admin_toggle_transcription(callback: CallbackQuery):
             config.transcription_provider = "Gemini"
         elif config.transcription_provider == "Gemini":
             config.transcription_provider = "KIE"
+            config.kie_transcription_model = "elevenlabs/speech-to-text"
         elif config.transcription_provider == "KIE":
             config.transcription_provider = "None"
         else:

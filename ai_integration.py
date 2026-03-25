@@ -160,6 +160,22 @@ def _extract_text_from_openai_message(message) -> str:
     return ""
 
 
+def _find_first_string_value(data, candidate_keys: tuple[str, ...]) -> str | None:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in candidate_keys and isinstance(value, str) and value.strip():
+                return value.strip()
+            found = _find_first_string_value(value, candidate_keys)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = _find_first_string_value(item, candidate_keys)
+            if found:
+                return found
+    return None
+
+
 def _load_configured_system_prompt(ai_config: AIConfig, topic_prompt_text: str | None) -> str:
     system_prompt_text = topic_prompt_text
 
@@ -973,6 +989,23 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
 async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str, model: str, file_bytes: bytes, filename: str) -> str:
     try:
         file_url = await _upload_file_to_kie(api_key, upload_base_url, file_bytes, filename, "audio")
+        if model == "elevenlabs/speech-to-text":
+            task_id = await _create_kie_task(
+                api_key,
+                base_url,
+                model,
+                {"audio_url": file_url},
+            )
+            task_payload = await _poll_kie_task(api_key, base_url, task_id)
+            result = _extract_kie_task_result(task_payload)
+            transcription = _find_first_string_value(
+                result,
+                ("text", "transcript", "transcription", "content", "result"),
+            )
+            if not transcription:
+                raise AIResponseError(f"KIE STT returned no transcription text: task_id={task_id} payload={task_payload}")
+            return transcription
+
         prompt = "Сделай точную транскрипцию аудио. Язык речи: русский. Верни только текст без пояснений."
         return await _call_kie_multimodal(
             api_key,
