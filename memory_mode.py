@@ -30,7 +30,7 @@ def memory_mode_label(mode: str) -> str:
     if mode == MEMORY_MODE_TOPIC:
         return "По темам"
     if mode == MEMORY_MODE_GLOBAL:
-        return "Общий контекст"
+        return "Глобальная"
     return "Сброс при смене"
 
 
