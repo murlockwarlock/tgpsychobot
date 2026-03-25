@@ -112,9 +112,16 @@ class AIConfig(Base):
     claude_api_key = Column(String, nullable=True)
     deepseek_api_key = Column(String, nullable=True)
     openai_api_key = Column(String, nullable=True)
+    kie_api_key = Column(String, nullable=True)
     yandex_api_key = Column(String, nullable=True)
     yandex_folder_id = Column(String, nullable=True)
     gemini_model = Column(String, default='gemini-2.0-flash')
+    kie_model = Column(String, default='gemini-3-flash')
+    kie_base_url = Column(String, default='https://api.kie.ai')
+    kie_upload_base_url = Column(String, default='https://kieai.redpandaai.co')
+    kie_transcription_model = Column(String, default='gemini-3-flash')
+    kie_credit_alert_threshold = Column(Float, default=0, nullable=False)
+    kie_credit_alert_sent = Column(Boolean, default=False, nullable=False)
     claude_model = Column(String, default='claude-sonnet-4-5-20250929')
     deepseek_model = Column(String, default='deepseek-chat')
     openai_model = Column(String, default='gpt-4o')
@@ -122,6 +129,10 @@ class AIConfig(Base):
     transcription_provider = Column(String, default='OpenAI', nullable=False)
     vision_provider = Column(String, default='Gemini', nullable=False)
     vision_model = Column(String, default='gemini-3-flash-preview', nullable=False)
+    image_generation_provider = Column(String, default='Gemini', nullable=False)
+    image_generation_model = Column(String, default='imagen-4.0-generate-001', nullable=False)
+    image_edit_provider = Column(String, default='Gemini', nullable=False)
+    image_edit_model = Column(String, default='gemini-3-pro-image-preview', nullable=False)
     context_limit_first = Column(Integer, default=2, nullable=False)
     context_limit_recent = Column(Integer, default=10, nullable=False)
     temperature = Column(Float, default=0.7, nullable=False)
@@ -460,6 +471,28 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN shared_prompt_block TEXT DEFAULT '' NOT NULL"))
             if 'service_prompt_block' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN service_prompt_block TEXT"))
+            if 'kie_api_key' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_api_key VARCHAR"))
+            if 'kie_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_model VARCHAR DEFAULT 'gemini-3-flash'"))
+            if 'kie_base_url' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_base_url VARCHAR DEFAULT 'https://api.kie.ai'"))
+            if 'kie_upload_base_url' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_upload_base_url VARCHAR DEFAULT 'https://kieai.redpandaai.co'"))
+            if 'kie_transcription_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_transcription_model VARCHAR DEFAULT 'gemini-3-flash'"))
+            if 'kie_credit_alert_threshold' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_credit_alert_threshold FLOAT DEFAULT 0 NOT NULL"))
+            if 'kie_credit_alert_sent' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_credit_alert_sent BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'image_generation_provider' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_generation_provider VARCHAR DEFAULT 'Gemini' NOT NULL"))
+            if 'image_generation_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_generation_model VARCHAR DEFAULT 'imagen-4.0-generate-001' NOT NULL"))
+            if 'image_edit_provider' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_provider VARCHAR DEFAULT 'Gemini' NOT NULL"))
+            if 'image_edit_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_model VARCHAR DEFAULT 'gemini-3-pro-image-preview' NOT NULL"))
 
             mailing_columns = [c['name'] for c in insp.get_columns('mailings')]
             if 'recurring_type' not in mailing_columns:
@@ -478,6 +511,26 @@ async def init_db():
                 ai_conf.vision_provider = 'Gemini'
             if not hasattr(ai_conf, 'vision_model') or ai_conf.vision_model is None:
                 ai_conf.vision_model = 'gemini-3-flash-preview'
+            if getattr(ai_conf, 'kie_model', None) is None:
+                ai_conf.kie_model = 'gemini-3-flash'
+            if getattr(ai_conf, 'kie_base_url', None) is None:
+                ai_conf.kie_base_url = 'https://api.kie.ai'
+            if getattr(ai_conf, 'kie_upload_base_url', None) is None:
+                ai_conf.kie_upload_base_url = 'https://kieai.redpandaai.co'
+            if getattr(ai_conf, 'kie_transcription_model', None) is None:
+                ai_conf.kie_transcription_model = 'gemini-3-flash'
+            if getattr(ai_conf, 'kie_credit_alert_threshold', None) is None:
+                ai_conf.kie_credit_alert_threshold = 0
+            if getattr(ai_conf, 'kie_credit_alert_sent', None) is None:
+                ai_conf.kie_credit_alert_sent = False
+            if getattr(ai_conf, 'image_generation_provider', None) is None:
+                ai_conf.image_generation_provider = 'Gemini'
+            if getattr(ai_conf, 'image_generation_model', None) is None:
+                ai_conf.image_generation_model = 'imagen-4.0-generate-001'
+            if getattr(ai_conf, 'image_edit_provider', None) is None:
+                ai_conf.image_edit_provider = 'Gemini'
+            if getattr(ai_conf, 'image_edit_model', None) is None:
+                ai_conf.image_edit_model = 'gemini-3-pro-image-preview'
             if getattr(ai_conf, 'memory_mode', None) is None:
                 ai_conf.memory_mode = get_memory_mode(ai_conf)
             ai_conf.preserve_topic_context = ai_conf.memory_mode == MEMORY_MODE_TOPIC

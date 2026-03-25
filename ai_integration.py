@@ -6,6 +6,7 @@ import io
 import mimetypes
 import base64
 import asyncio
+import json
 from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
@@ -29,6 +30,11 @@ class AIServiceError(Exception):
     pass
 
 
+class AIResponseError(AIServiceError):
+    """Provider returned an invalid or empty payload."""
+    pass
+
+
 def _build_async_transport_from_env(env_var_name: str):
     import httpx
 
@@ -41,6 +47,35 @@ def _build_async_transport_from_env(env_var_name: str):
         return None
 
     return httpx.AsyncHTTPTransport(proxy=proxy)
+
+
+def _normalize_provider_name(provider: str | None) -> str:
+    return provider.strip().lower() if provider else ""
+
+
+def _get_kie_base_url(ai_config: AIConfig) -> str:
+    return (getattr(ai_config, "kie_base_url", None) or "https://api.kie.ai").rstrip("/")
+
+
+def _get_kie_upload_base_url(ai_config: AIConfig) -> str:
+    return (getattr(ai_config, "kie_upload_base_url", None) or "https://kieai.redpandaai.co").rstrip("/")
+
+
+def _kie_model_base_url(base_url: str, model: str) -> str:
+    return f"{base_url.rstrip('/')}/{model}/v1"
+
+
+def _extract_text_from_openai_message(message) -> str:
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        return "\n".join(part for part in text_parts if part).strip()
+    return ""
 
 
 def _load_configured_system_prompt(ai_config: AIConfig, topic_prompt_text: str | None) -> str:
@@ -112,6 +147,240 @@ async def _call_gemini_api(api_key: str, model: str, history: list, context: str
         if any(word in str(e).lower() for word in ["billing", "quota", "location", "geo-block"]):
             raise InsufficientBalanceError(f"Gemini API Error: {e}")
         raise AIServiceError(f"Ошибка при обращении к Gemini: {e}")
+
+
+async def _call_kie_chat(api_key: str, base_url: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7) -> str:
+    client = None
+    try:
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=_kie_model_base_url(base_url, model),
+        )
+
+        kie_history = []
+        for msg in history:
+            if msg.content:
+                kie_history.append({"role": msg.role, "content": msg.content})
+
+        full_system_prompt = f"{system_prompt}\n\nИспользуй следующие данные из базы знаний для ответа:\n{context}"
+
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": full_system_prompt},
+                *kie_history,
+            ],
+            max_tokens=4096,
+            temperature=temperature,
+            stream=False,
+        )
+        text = _extract_text_from_openai_message(response.choices[0].message)
+        if not text:
+            raise AIResponseError("KIE chat returned empty content")
+        return text
+    except AuthenticationError as e:
+        raise InsufficientBalanceError(f"KIE API Error: Invalid API key. {e}")
+    except RateLimitError as e:
+        raise InsufficientBalanceError(f"KIE API Error: Rate limit or quota exceeded. {e}")
+    except BadRequestError as e:
+        error_text = str(e)
+        if any(word in error_text.lower() for word in ["billing", "quota", "balance"]):
+            raise InsufficientBalanceError(f"KIE API Error: {e}")
+        raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {e}")
+    except (InsufficientBalanceError, AIServiceError):
+        raise
+    except Exception as e:
+        logging.error("KIE chat error", exc_info=e)
+        raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {e}")
+    finally:
+        if client is not None:
+            await client.close()
+
+
+async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: bytes, filename: str, upload_path: str) -> str:
+    import httpx
+
+    url = f"{upload_base_url}/api/file-stream-upload"
+    files = {"file": (filename, file_bytes, mimetypes.guess_type(filename)[0] or "application/octet-stream")}
+    data = {"uploadPath": upload_path, "fileName": filename}
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+            response = await client.post(url, headers=headers, data=data, files=files)
+        if response.status_code != 200:
+            raise AIServiceError(f"KIE upload failed: status={response.status_code} body={response.text}")
+        payload = response.json()
+        file_url = payload.get("data", {}).get("downloadUrl") or payload.get("data", {}).get("fileUrl")
+        if not file_url:
+            raise AIResponseError(f"KIE upload returned no file URL: {payload}")
+        return file_url
+    except (AIServiceError, AIResponseError):
+        raise
+    except Exception as e:
+        logging.error("KIE upload error", exc_info=e)
+        raise AIServiceError(f"Ошибка загрузки файла в KIE: {e}")
+
+
+async def _call_kie_multimodal(api_key: str, base_url: str, model: str, system_prompt: str, user_content: list, temperature: float = 0.7) -> str:
+    client = None
+    try:
+        client = AsyncOpenAI(api_key=api_key, base_url=_kie_model_base_url(base_url, model))
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            max_tokens=4096,
+            temperature=temperature,
+            stream=False,
+        )
+        text = _extract_text_from_openai_message(response.choices[0].message)
+        if not text:
+            raise AIResponseError("KIE multimodal request returned empty content")
+        return text
+    except AuthenticationError as e:
+        raise InsufficientBalanceError(f"KIE API Error: Invalid API key. {e}")
+    except RateLimitError as e:
+        raise InsufficientBalanceError(f"KIE API Error: Rate limit or quota exceeded. {e}")
+    except BadRequestError as e:
+        error_text = str(e)
+        if any(word in error_text.lower() for word in ["billing", "quota", "balance"]):
+            raise InsufficientBalanceError(f"KIE API Error: {e}")
+        raise AIServiceError(f"Ошибка обращения к KIE multimodal API: {e}")
+    except (InsufficientBalanceError, AIServiceError):
+        raise
+    except Exception as e:
+        logging.error("KIE multimodal error", exc_info=e)
+        raise AIServiceError(f"Ошибка обращения к KIE multimodal API: {e}")
+    finally:
+        if client is not None:
+            await client.close()
+
+
+async def _create_kie_task(api_key: str, base_url: str, model: str, input_payload: dict) -> str:
+    import httpx
+
+    url = f"{base_url}/api/v1/jobs/createTask"
+    payload = {"model": model, "input": input_payload}
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            raise AIServiceError(f"KIE task creation failed: status={response.status_code} body={response.text}")
+        data = response.json()
+        task_id = data.get("data", {}).get("taskId")
+        if not task_id:
+            raise AIResponseError(f"KIE task creation returned no taskId: {data}")
+        return task_id
+    except (AIServiceError, AIResponseError):
+        raise
+    except Exception as e:
+        logging.error("KIE create task error", exc_info=e)
+        raise AIServiceError(f"Ошибка создания задачи KIE: {e}")
+
+
+def _extract_kie_task_result(task_payload: dict) -> dict:
+    response_payload = task_payload.get("response")
+    if isinstance(response_payload, dict) and response_payload:
+        return response_payload
+    result_json = task_payload.get("resultJson")
+    if isinstance(result_json, str) and result_json:
+        try:
+            return json.loads(result_json)
+        except json.JSONDecodeError as exc:
+            raise AIResponseError(f"Cannot decode KIE resultJson: {exc}: {result_json}") from exc
+    if isinstance(result_json, dict):
+        return result_json
+    return {}
+
+
+async def _poll_kie_task(api_key: str, base_url: str, task_id: str, *, timeout_sec: int = 180) -> dict:
+    import httpx
+
+    url = f"{base_url}/api/v1/jobs/recordInfo"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    delay = 2.0
+    deadline = asyncio.get_running_loop().time() + timeout_sec
+
+    async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+        while True:
+            response = await client.get(url, headers=headers, params={"taskId": task_id})
+            if response.status_code != 200:
+                raise AIServiceError(f"KIE task polling failed: task_id={task_id} status={response.status_code} body={response.text}")
+            payload = response.json().get("data", {})
+            state = (payload.get("state") or payload.get("status") or "").lower()
+            success_flag = payload.get("successFlag")
+            if state in {"success", "succeed", "succeeded"} or success_flag == 1:
+                return payload
+            if state in {"fail", "failed", "error"}:
+                fail_msg = payload.get("failMsg") or payload.get("errorMessage") or "unknown task failure"
+                raise AIServiceError(f"KIE task failed: task_id={task_id} message={fail_msg}")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AIServiceError(f"KIE task timed out: task_id={task_id} state={state}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, 8.0)
+
+
+async def _download_binary_file(url: str) -> bytes:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+        response = await client.get(url)
+    if response.status_code != 200:
+        raise AIServiceError(f"Result download failed: status={response.status_code} url={url}")
+    return response.content
+
+
+async def _get_kie_download_url(api_key: str, base_url: str, url: str) -> str:
+    import httpx
+
+    endpoint = f"{base_url}/api/v1/common/download-url"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"url": url}
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            response = await client.post(endpoint, headers=headers, json=payload)
+        if response.status_code != 200:
+            return url
+        data = response.json()
+        return data.get("data") or url
+    except Exception:
+        return url
+
+
+async def get_kie_remaining_credits(api_key: str, base_url: str) -> float:
+    import httpx
+
+    endpoint = f"{base_url}/api/v1/chat/credit"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+            response = await client.get(endpoint, headers=headers)
+        if response.status_code != 200:
+            raise AIServiceError(f"KIE credits check failed: status={response.status_code} body={response.text}")
+
+        payload = response.json()
+        data = payload.get("data")
+        if isinstance(data, (int, float, str)):
+            return float(data)
+        if data is None:
+            raise AIResponseError(f"KIE credits response has no data field: {payload}")
+        for key in ("remainingCredits", "remaining_credits", "credits", "balance", "creditBalance"):
+            value = data.get(key)
+            if value is not None:
+                return float(value)
+        raise AIResponseError(f"KIE credits response has no remaining credits field: {payload}")
+    except (AIServiceError, AIResponseError):
+        raise
+    except Exception as e:
+        logging.error("KIE credits check error", exc_info=e)
+        raise AIServiceError(f"Ошибка проверки остатка кредитов KIE: {e}")
 
 
 async def _call_claude_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7):
@@ -224,6 +493,21 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
             if not model:
                 return f"❌ Ошибка: Модель для {provider} (для транскрибации) не выбрана администратором."
             response_text = await _call_gemini_transcribe(api_key, model, file_bytes, filename)
+        elif provider == "KIE":
+            api_key = ai_config.kie_api_key
+            model = getattr(ai_config, "kie_transcription_model", None) or getattr(ai_config, "kie_model", None)
+            if not api_key:
+                return f"❌ Ошибка: API ключ для {provider} (для транскрибации) не установлен администратором."
+            if not model:
+                return f"❌ Ошибка: Модель для {provider} (для транскрибации) не выбрана администратором."
+            response_text = await _call_kie_transcribe(
+                api_key,
+                _get_kie_base_url(ai_config),
+                _get_kie_upload_base_url(ai_config),
+                model,
+                file_bytes,
+                filename,
+            )
 
         else:
             return f"❌ Ошибка: Неизвестный провайдер транскрибации: {provider}"
@@ -465,6 +749,8 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
             response_text = await _call_claude_api(api_key, model, final_history, context, system_prompt, temperature)
         elif provider_key == 'gemini':
             response_text = await _call_gemini_api(api_key, model, final_history, context, system_prompt, temperature)
+        elif provider_key == 'kie':
+            response_text = await _call_kie_chat(api_key, _get_kie_base_url(ai_config), model, final_history, context, system_prompt, temperature)
         elif provider_key == 'deepseek':
             response_text = await _call_deepseek_api(api_key, model, final_history, context, system_prompt, temperature)
         elif provider_key == 'xai':
@@ -544,6 +830,28 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
         raise AIServiceError(f"Ошибка при транскрибации (Gemini API): {e}")
 
 
+async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str, model: str, file_bytes: bytes, filename: str) -> str:
+    try:
+        file_url = await _upload_file_to_kie(api_key, upload_base_url, file_bytes, filename, "audio")
+        prompt = "Сделай точную транскрипцию аудио. Язык речи: русский. Верни только текст без пояснений."
+        return await _call_kie_multimodal(
+            api_key,
+            base_url,
+            model,
+            "Ты — сервис точной транскрибации речи.",
+            [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": file_url}},
+            ],
+            temperature=0.0,
+        )
+    except (InsufficientBalanceError, AIServiceError):
+        raise
+    except Exception as e:
+        logging.error("KIE transcription error", exc_info=e)
+        raise AIServiceError(f"Ошибка при транскрибации (KIE API): {e}")
+
+
 async def _call_gemini_image_generation(api_key: str, model: str, prompt: str) -> bytes:
     import httpx
     import base64
@@ -607,16 +915,69 @@ async def edit_image_gemini_v3(api_key: str, model: str, prompt: str, image_byte
             response = await client.post(url, json=payload, headers={'Content-Type': 'application/json'})
             if response.status_code != 200:
                 logging.error(f"Gemini Edit Image HTTP Error: {response.status_code} - {response.text}")
-                return None
+                raise AIServiceError(f"Ошибка редактирования изображения Gemini: {response.status_code} {response.text}")
             data = response.json()
             parts = data.get('candidates', [{}])[0].get('content', {}).get('parts', [])
             for part in parts:
                 if 'inline_data' in part:
                     return base64.b64decode(part['inline_data']['data'])
-            return None
+            raise AIResponseError("Gemini edit image returned no binary payload")
     except Exception as e:
-        logging.error(f"Gemini edit_image_gemini_v3 Exception: {e}")
-        return None
+        logging.error("Gemini edit_image_gemini_v3 Exception", exc_info=e)
+        raise AIServiceError(f"Ошибка редактирования изображения Gemini: {e}")
+
+
+def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
+    if model == "google/imagen4-fast":
+        return {
+            "prompt": prompt,
+            "aspect_ratio": "1:1",
+            "num_images": "1",
+        }
+    if model in {"google/imagen4-ultra", "google/imagen4"}:
+        return {
+            "prompt": prompt,
+            "aspect_ratio": "1:1",
+        }
+    raise AIServiceError(f"Неподдерживаемая KIE image generation model: {model}")
+
+
+async def _call_kie_image_generation(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
+    task_id = await _create_kie_task(
+        api_key,
+        base_url,
+        model,
+        _build_kie_image_generation_input(model, prompt),
+    )
+    task_payload = await _poll_kie_task(api_key, base_url, task_id)
+    result = _extract_kie_task_result(task_payload)
+    result_urls = result.get("resultUrls") or result.get("result_urls") or []
+    if not result_urls:
+        raise AIResponseError(f"KIE image generation returned no result URLs: task_id={task_id} payload={task_payload}")
+    download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
+    return await _download_binary_file(download_url)
+
+
+async def _call_kie_image_edit(api_key: str, base_url: str, upload_base_url: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
+    source_url = await _upload_file_to_kie(api_key, upload_base_url, image_bytes, "image_edit_source.jpg", "images")
+    task_id = await _create_kie_task(
+        api_key,
+        base_url,
+        model,
+        {
+            "prompt": prompt,
+            "image_urls": [source_url],
+            "output_format": "png",
+            "image_size": "1:1",
+        },
+    )
+    task_payload = await _poll_kie_task(api_key, base_url, task_id)
+    result = _extract_kie_task_result(task_payload)
+    result_urls = result.get("resultUrls") or result.get("result_urls") or []
+    if not result_urls:
+        raise AIResponseError(f"KIE image edit returned no result URLs: task_id={task_id} payload={task_payload}")
+    download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
+    return await _download_binary_file(download_url)
 
 
 async def generate_image(prompt: str) -> any:
@@ -625,17 +986,52 @@ async def generate_image(prompt: str) -> any:
         if not config:
             raise Exception("Конфигурация ИИ не найдена.")
 
-        provider = config.vision_provider
-        provider_key = provider.strip().lower() if provider else ""
+        provider = getattr(config, "image_generation_provider", None) or config.vision_provider
+        provider_key = _normalize_provider_name(provider)
+        model = getattr(config, "image_generation_model", None) or "imagen-4.0-generate-001"
 
     if provider_key == 'gemini':
         api_key = config.gemini_api_key
-        model = "imagen-4.0-generate-001"
         if not api_key:
             raise Exception("API ключ Gemini для генерации не установлен.")
         return await _call_gemini_image_generation(api_key, model, prompt)
+    if provider_key == 'kie':
+        api_key = getattr(config, "kie_api_key", None)
+        if not api_key:
+            raise Exception("API ключ KIE для генерации не установлен.")
+        return await _call_kie_image_generation(api_key, _get_kie_base_url(config), model or "google/imagen4-fast", prompt)
     else:
         return await generate_openai_image(prompt)
+
+
+async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            raise Exception("Конфигурация ИИ не найдена.")
+
+        provider = getattr(config, "image_edit_provider", None) or config.vision_provider
+        provider_key = _normalize_provider_name(provider)
+        model = getattr(config, "image_edit_model", None) or "gemini-3-pro-image-preview"
+
+    if provider_key == "gemini":
+        api_key = config.gemini_api_key
+        if not api_key:
+            raise Exception("API ключ Gemini для редактирования не установлен.")
+        return await edit_image_gemini_v3(api_key, model, prompt, image_bytes)
+    if provider_key == "kie":
+        api_key = getattr(config, "kie_api_key", None)
+        if not api_key:
+            raise Exception("API ключ KIE для редактирования не установлен.")
+        return await _call_kie_image_edit(
+            api_key,
+            _get_kie_base_url(config),
+            _get_kie_upload_base_url(config),
+            model or "google/nano-banana-edit",
+            prompt,
+            image_bytes,
+        )
+    raise AIServiceError(f"Редактирование изображений не поддерживается для провайдера: {provider}")
 
 
 async def generate_openai_image(prompt: str) -> str:
@@ -696,6 +1092,20 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
             if not api_key:
                 return "❌ Ошибка: API ключ для Gemini (Vision) не установлен."
             return await _call_gemini_vision(api_key, v_model, image_bytes, prompt, history=history, temperature=temperature)
+        if provider == "KIE":
+            api_key = getattr(config, "kie_api_key", None)
+            if not api_key:
+                return "❌ Ошибка: API ключ для KIE (Vision) не установлен."
+            return await _call_kie_vision(
+                api_key,
+                _get_kie_base_url(config),
+                _get_kie_upload_base_url(config),
+                v_model or "gemini-3-flash",
+                image_bytes,
+                prompt,
+                history=history,
+                temperature=temperature,
+            )
 
         else:
             api_key = config.openai_api_key
@@ -822,3 +1232,45 @@ async def _call_gemini_vision(api_key: str, model: str, image_bytes: bytes, prom
             raise AIServiceError(f"Ошибка анализа изображения (Gemini): {e}")
 
     raise AIServiceError("Сервис Gemini Vision временно перегружен.")
+
+
+async def _call_kie_vision(
+    api_key: str,
+    base_url: str,
+    upload_base_url: str,
+    model: str,
+    image_bytes: bytes,
+    prompt: str,
+    history: list = None,
+    temperature: float = 0.7,
+) -> str:
+    try:
+        file_url = await _upload_file_to_kie(api_key, upload_base_url, image_bytes, "vision_input.jpg", "images")
+
+        history_text = []
+        if history:
+            for msg in history:
+                if msg.content:
+                    prefix = "Пользователь" if msg.role == "user" else "Ассистент"
+                    history_text.append(f"{prefix}: {msg.content}")
+
+        system_prompt = prompt
+        if history_text:
+            system_prompt = f"{prompt}\n\nКонтекст диалога:\n" + "\n".join(history_text[-12:])
+
+        return await _call_kie_multimodal(
+            api_key,
+            base_url,
+            model,
+            system_prompt,
+            [
+                {"type": "text", "text": "Проанализируй это изображение согласно системной инструкции."},
+                {"type": "image_url", "image_url": {"url": file_url}},
+            ],
+            temperature=temperature,
+        )
+    except (InsufficientBalanceError, AIServiceError):
+        raise
+    except Exception as e:
+        logging.error("KIE vision error", exc_info=e)
+        raise AIServiceError(f"Ошибка анализа изображения (KIE): {e}")

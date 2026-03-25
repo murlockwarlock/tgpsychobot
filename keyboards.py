@@ -161,6 +161,7 @@ def ai_settings_keyboard(current_provider: str):
         "Deepseek": "ai_provider_Deepseek",
         "Claude": "ai_provider_Claude",
         "Gemini": "ai_provider_Gemini",
+        "KIE": "ai_provider_KIE",
         "OpenAI": "ai_provider_OpenAI"
     }
     builder = InlineKeyboardBuilder()
@@ -178,17 +179,22 @@ def ai_settings_keyboard(current_provider: str):
 
 def ai_keys_models_keyboard(current_transcription_provider: str, context_first: int, context_recent: int,
                             current_vision_provider: str, current_vision_model: str,
+                            image_generation_provider: str, image_generation_model: str,
+                            image_edit_provider: str, image_edit_model: str,
+                            kie_credit_alert_threshold: float,
                             temperature: float = 0.7, memory_mode: str = "reset"):
     builder = InlineKeyboardBuilder()
 
     builder.button(text="🔑 Deepseek", callback_data="set_key_Deepseek")
     builder.button(text="🔑 Claude", callback_data="set_key_Claude")
     builder.button(text="🔑 Gemini", callback_data="set_key_Gemini")
+    builder.button(text="🔑 KIE", callback_data="set_key_KIE")
     builder.button(text="🔑 OpenAI", callback_data="set_key_OpenAI")
 
     builder.button(text="🧠 Deepseek", callback_data="view_models_Deepseek")
     builder.button(text="🧠 Claude", callback_data="view_models_Claude")
     builder.button(text="🧠 Gemini", callback_data="view_models_Gemini")
+    builder.button(text="🧠 KIE", callback_data="view_models_KIE")
     builder.button(text="🧠 OpenAI", callback_data="view_models_OpenAI")
 
     builder.button(text=f"📌 Первые: {context_first}", callback_data="set_context_first")
@@ -201,6 +207,17 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                    callback_data="admin_toggle_vision")
     builder.button(text="🔧 Сменить модель фото", callback_data="admin_change_vision_model")
 
+    builder.button(text=f"🖼 Генерация: {image_generation_provider} ({image_generation_model})",
+                   callback_data="admin_toggle_image_generation")
+    builder.button(text="🔧 Модель генерации", callback_data="admin_change_image_generation_model")
+
+    builder.button(text=f"🎨 Редактирование: {image_edit_provider} ({image_edit_model})",
+                   callback_data="admin_toggle_image_edit")
+    builder.button(text="🔧 Модель редактирования", callback_data="admin_change_image_edit_model")
+
+    threshold_label = int(kie_credit_alert_threshold) if float(kie_credit_alert_threshold).is_integer() else round(kie_credit_alert_threshold, 2)
+    builder.button(text=f"💳 KIE порог: {threshold_label}", callback_data="set_kie_credit_threshold")
+
     builder.button(text=f"🌡️ Температура: {round(temperature, 2)}", callback_data="set_temperature")
     builder.button(
         text=f"🧠 Память: {memory_mode_label(memory_mode)}",
@@ -210,7 +227,7 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     builder.button(text="⏱️ Лимит аудио", callback_data="set_audio_limit")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
 
-    builder.adjust(2, 2, 2, 2, 1, 1, 2, 1, 2, 2)
+    builder.adjust(2, 2, 1, 2, 2, 2, 2, 1, 1, 2, 2)
     return builder.as_markup()
 
 

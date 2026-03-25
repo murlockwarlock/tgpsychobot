@@ -6,7 +6,8 @@ from sqlalchemy.orm import selectinload
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database import (async_session_maker, UserSubscription, SubscriptionPlan, SubscriptionConfig, User,
-                      RobokassaPayment, PromoCode, YookassaPayment)
+                      RobokassaPayment, PromoCode, YookassaPayment, AIConfig, get_all_admin_ids)
+from ai_integration import get_kie_remaining_credits, AIServiceError
 from dateutil.relativedelta import relativedelta
 from yookassa import Configuration, Payment
 from yookassa.domain.exceptions import (BadRequestError, ForbiddenError, InternalServerError,
@@ -174,6 +175,50 @@ async def _send_deduplicated_notification(
     await bot.send_message(recipient_id, text, reply_markup=reply_markup)
     plog.info(f"NOTIFY_SENT | recipient_id={recipient_id} | key={key}")
     return True
+
+
+async def check_kie_credit_balance(bot: Bot):
+    try:
+        async with async_session_maker() as session:
+            config = await session.get(AIConfig, 1)
+            if not config:
+                return
+
+            api_key = getattr(config, "kie_api_key", None)
+            threshold = float(getattr(config, "kie_credit_alert_threshold", 0) or 0)
+            base_url = (getattr(config, "kie_base_url", None) or "https://api.kie.ai").rstrip("/")
+
+            if not api_key or threshold <= 0:
+                if config.kie_credit_alert_sent:
+                    config.kie_credit_alert_sent = False
+                    await session.commit()
+                return
+
+            remaining_credits = await get_kie_remaining_credits(api_key, base_url)
+
+            if remaining_credits < threshold:
+                if not config.kie_credit_alert_sent:
+                    config.kie_credit_alert_sent = True
+                    await session.commit()
+                    text = (
+                        "⚠️ <b>Низкий баланс KIE</b>\n\n"
+                        f"Остаток кредитов: <b>{remaining_credits}</b>\n"
+                        f"Порог уведомления: <b>{threshold}</b>\n\n"
+                        "Пополните баланс KIE, чтобы генерации и мультимодальные запросы не остановились."
+                    )
+                    for admin_id in await get_all_admin_ids():
+                        try:
+                            await bot.send_message(admin_id, text, parse_mode="HTML")
+                        except Exception as exc:
+                            log.error("Failed to send KIE balance alert admin_id=%s error=%s", admin_id, exc)
+            else:
+                if config.kie_credit_alert_sent:
+                    config.kie_credit_alert_sent = False
+                    await session.commit()
+    except AIServiceError as exc:
+        log.error("KIE credit balance check failed: %s", exc, exc_info=exc)
+    except Exception as exc:
+        log.error("Unexpected KIE credit balance check error: %s", exc, exc_info=exc)
 
 
 async def disable_auto_renewal_after_failed_attempts(

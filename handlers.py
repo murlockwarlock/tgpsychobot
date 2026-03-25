@@ -45,11 +45,13 @@ from ai_integration import (
     InsufficientBalanceError,
     AIServiceError,
     transcribe_voice_message,
+    edit_image,
     _call_gemini_api,
     _call_openai_api,
     _call_deepseek_api,
     _call_claude_api
 )
+from error_reporting import notify_admins_about_error
 from memory_mode import (
     MEMORY_MODE_GLOBAL,
     MEMORY_MODE_RESET,
@@ -138,6 +140,17 @@ MODELS_INFO = {
             'desc': 'Оптимальная модель по соотношению цены и производительности для большинства повседневных задач.'
         },
         'pricing': '<b>Вход (Pro):</b> $1.25 / 1M токенов\n<b>Выход (Pro):</b> $10.00 / 1M токенов\n(Flash значительно дешевле)'
+    },
+    "KIE": {
+        'gemini-3-flash': {
+            'name': 'KIE Gemini 3 Flash',
+            'desc': 'Основная KIE-модель для чата, фото и транскрибации через мультимодальный chat API.'
+        },
+        'gemini-2.5-flash': {
+            'name': 'KIE Gemini 2.5 Flash',
+            'desc': 'Быстрая KIE-модель для более дешёвых сценариев и fallback.'
+        },
+        'pricing': '<b>Зависит от выбранной модели в KIE.</b>\nДля чата используйте Gemini 3 Flash.'
     },
     "Claude": {
         'claude-sonnet-4-5-20250929': {
@@ -272,6 +285,7 @@ class AdminStates(StatesGroup):
     set_context_first_limit = State()
     set_context_recent_limit = State()
     set_temperature = State()
+    set_kie_credit_threshold = State()
     upload_test_questions_file = State()
     set_test_system_prompt = State()
     set_welcome_bonus_days = State()
@@ -366,6 +380,59 @@ def _user_ref(user_id: int, username: str = None, full_name: str = None) -> str:
         return f"@{html.escape(username)} ({link})"
     name = html.escape(full_name) if full_name else str(user_id)
     return f"<a href='tg://user?id={user_id}'>{name}</a>"
+
+
+def _resolve_ai_provider_model(config: AIConfig | None, channel: str) -> tuple[str | None, str | None]:
+    if not config:
+        return None, None
+    if channel == "chat":
+        provider = config.provider
+        model = getattr(config, f"{provider.lower()}_model", None) if provider else None
+        return provider, model
+    if channel == "transcription":
+        provider = config.transcription_provider
+        if provider == "Gemini":
+            model = config.gemini_model
+        elif provider == "KIE":
+            model = getattr(config, "kie_transcription_model", None)
+        else:
+            model = "whisper-1" if provider == "OpenAI" else None
+        return provider, model
+    if channel == "vision":
+        return config.vision_provider, config.vision_model
+    if channel == "image_generation":
+        return getattr(config, "image_generation_provider", None), getattr(config, "image_generation_model", None)
+    if channel == "image_edit":
+        return getattr(config, "image_edit_provider", None), getattr(config, "image_edit_model", None)
+    return None, None
+
+
+async def _report_ai_failure(
+    bot: Bot,
+    *,
+    title: str,
+    user,
+    provider: str | None = None,
+    model: str | None = None,
+    stage: str | None = None,
+    details: str | None = None,
+    extra: dict | None = None,
+    exception: Exception | None = None,
+) -> None:
+    await notify_admins_about_error(
+        bot,
+        title=title,
+        user_id=getattr(user, "id", None),
+        username=getattr(user, "username", None),
+        full_name=getattr(user, "full_name", None),
+        provider=provider,
+        model=model,
+        stage=stage,
+        details=details or (str(exception) if exception else None),
+        extra=extra,
+        exception=exception,
+        logger=log,
+    )
 
 
 async def handle_ai_media_content(bot: Bot, user_id: int, response_text: str):
@@ -674,6 +741,8 @@ async def process_buffered_messages(user_id: int, bot: Bot):
             pass
 
     typing_task = asyncio.create_task(keep_typing_loop())
+    async with async_session_maker() as session:
+        ai_config = await session.get(AIConfig, 1)
     try:
         response_text = await ai_integration.generate_response(user_id, full_text)
         typing_task.cancel()
@@ -701,7 +770,19 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                     try:
                         image_data = await ai_integration.generate_image(image_prompt)
                         await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(image_data, filename="gen.png"), caption="✨ Готово!")
-                    except Exception:
+                    except Exception as e:
+                        gen_provider, gen_model = _resolve_ai_provider_model(ai_config, "image_generation")
+                        await _report_ai_failure(
+                            bot,
+                            title="Сбой генерации изображения",
+                            user=SimpleNamespace(id=user_id),
+                            provider=gen_provider,
+                            model=gen_model,
+                            stage="generate_image",
+                            details=str(e),
+                            extra={"prompt_len": len(image_prompt)},
+                            exception=e,
+                        )
                         await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
             else:
                 if clean_text:
@@ -859,29 +940,50 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation, dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
                         await s2.commit()
             except Exception as e:
-                logging.error(f"Error generating card interpretation for user {user_id}: {e}")
+                provider, model = _resolve_ai_provider_model(ai_config, "chat")
+                await _report_ai_failure(
+                    bot,
+                    title="Сбой интерпретации карт",
+                    user=SimpleNamespace(id=user_id),
+                    provider=provider,
+                    model=model,
+                    stage="buffered_card_interpretation",
+                    details=str(e),
+                    exception=e,
+                )
 
     except AIServiceError as e:
         if typing_task: typing_task.cancel()
-        logging.error(f"AIServiceError for user {user_id}: {e}")
+        provider, model = _resolve_ai_provider_model(ai_config, "chat")
+        await _report_ai_failure(
+            bot,
+            title="Сбой AI-сервиса",
+            user=SimpleNamespace(id=user_id),
+            provider=provider,
+            model=model,
+            stage="process_buffered_messages",
+            details=str(e),
+            extra={"prompt_len": len(full_text)},
+            exception=e,
+        )
         await bot.send_message(
             chat_id=user_id,
             text="Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
         )
-        for owner_id in OWNER_IDS:
-            try:
-                await bot.send_message(
-                    owner_id,
-                    f"⚠️ <b>Сбой AI-сервиса</b>\n\n"
-                    f"Пользователь: {_user_ref(user_id)}\n"
-                    f"<b>Ошибка:</b> <code>{html.escape(str(e))}</code>",
-                    parse_mode='HTML'
-                )
-            except Exception:
-                pass
     except Exception as e:
         if typing_task: typing_task.cancel()
-        logging.error(f"Error processing messages for user {user_id}: {e}\n{traceback.format_exc()}")
+        provider, model = _resolve_ai_provider_model(ai_config, "chat")
+        await _report_ai_failure(
+            bot,
+            title="Непредвиденная ошибка AI-потока",
+            user=SimpleNamespace(id=user_id),
+            provider=provider,
+            model=model,
+            stage="process_buffered_messages_unexpected",
+            details=str(e),
+            extra={"prompt_len": len(full_text)},
+            exception=e,
+        )
         await bot.send_message(chat_id=user_id, text="Произошла ошибка при обработке сообщения.")
 
 
@@ -890,6 +992,9 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
     card_id = int(callback.data.rsplit("_", 1)[-1])
     user_id = callback.from_user.id
     final_spread_file_ids = []
+
+    async with async_session_maker() as cfg_session:
+        ai_config = await cfg_session.get(AIConfig, 1)
 
     try:
         await callback.message.delete()
@@ -948,7 +1053,17 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
             except Exception as e:
                 if typing_task_interp:
                     typing_task_interp.cancel()
-                logging.error(f"Error generating card interpretation for user {user_id}: {e}")
+                provider, model = _resolve_ai_provider_model(ai_config, "chat")
+                await _report_ai_failure(
+                    bot,
+                    title="Сбой интерпретации карт",
+                    user=callback.from_user,
+                    provider=provider,
+                    model=model,
+                    stage="message_card_interpretation",
+                    details=str(e),
+                    exception=e,
+                )
 
             spread = user_spread_state.get(user_id)
             if spread:
@@ -2210,6 +2325,11 @@ async def admin_ai_settings(message: Message | CallbackQuery):
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
         vis_provider = config.vision_provider
         vis_model = config.vision_model
+        image_gen_provider = getattr(config, 'image_generation_provider', 'Gemini')
+        image_gen_model = getattr(config, 'image_generation_model', 'imagen-4.0-generate-001')
+        image_edit_provider = getattr(config, 'image_edit_provider', 'Gemini')
+        image_edit_model = getattr(config, 'image_edit_model', 'gemini-3-pro-image-preview')
+        kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0)
         voice_limit = config.max_voice_duration_sec
         prompt_source = (
             f"Файл: <code>{config.prompt_filename}</code>"
@@ -2231,7 +2351,15 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             f"▫️ Лимит: <b>{voice_limit} сек.</b>\n\n"
             f"🖼 <b>Фото (Vision):</b>\n"
             f"▫️ Провайдер: <b>{vis_provider}</b>\n"
-            f"▫️ Модель: <code>{vis_model}</code>")
+            f"▫️ Модель: <code>{vis_model}</code>\n\n"
+            f"🧪 <b>Генерация изображений:</b>\n"
+            f"▫️ Провайдер: <b>{image_gen_provider}</b>\n"
+            f"▫️ Модель: <code>{image_gen_model}</code>\n\n"
+            f"🎨 <b>Редактирование изображений:</b>\n"
+            f"▫️ Провайдер: <b>{image_edit_provider}</b>\n"
+            f"▫️ Модель: <code>{image_edit_model}</code>\n\n"
+            f"💳 <b>KIE кредиты:</b>\n"
+            f"▫️ Порог алерта: <b>{kie_credit_alert_threshold}</b>")
 
     if is_callback:
         try:
@@ -2262,6 +2390,11 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     trans_provider = config.transcription_provider if config else 'OpenAI'
     vis_provider = config.vision_provider if config else 'Gemini'
     vis_model = config.vision_model if config else 'gemini-3-flash-preview'
+    image_gen_provider = getattr(config, 'image_generation_provider', 'Gemini') if config else 'Gemini'
+    image_gen_model = getattr(config, 'image_generation_model', 'imagen-4.0-generate-001') if config else 'imagen-4.0-generate-001'
+    image_edit_provider = getattr(config, 'image_edit_provider', 'Gemini') if config else 'Gemini'
+    image_edit_model = getattr(config, 'image_edit_model', 'gemini-3-pro-image-preview') if config else 'gemini-3-pro-image-preview'
+    kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0) if config else 0
     c_first = config.context_limit_first if config else 2
     c_recent = config.context_limit_recent if config else 10
     temp = getattr(config, 'temperature', 0.7) if config else 0.7
@@ -2275,6 +2408,11 @@ async def admin_ai_keys_models(callback: CallbackQuery):
             c_recent,
             vis_provider,
             vis_model,
+            image_gen_provider,
+            image_gen_model,
+            image_edit_provider,
+            image_edit_model,
+            kie_credit_alert_threshold,
             temp,
             memory_mode
         )
@@ -2292,6 +2430,9 @@ async def admin_toggle_vision(callback: CallbackQuery):
         if config.vision_provider == "OpenAI":
             config.vision_provider = "Gemini"
             config.vision_model = "gemini-3-flash-preview"
+        elif config.vision_provider == "Gemini":
+            config.vision_provider = "KIE"
+            config.vision_model = "gemini-3-flash"
         else:
             config.vision_provider = "OpenAI"
             config.vision_model = "gpt-4o"
@@ -2390,6 +2531,22 @@ async def start_set_temperature(callback: CallbackQuery, state: FSMContext):
     )
 
 
+@router.callback_query(F.data == "set_kie_credit_threshold")
+async def start_set_kie_credit_threshold(callback: CallbackQuery, state: FSMContext):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        current_threshold = getattr(config, "kie_credit_alert_threshold", 0) if config else 0
+
+    await state.set_state(AdminStates.set_kie_credit_threshold)
+    await state.update_data(message_id_to_edit=callback.message.message_id)
+    await callback.message.edit_text(
+        "Введите порог KIE-кредитов, ниже которого всем админам придёт уведомление.\n\n"
+        f"Текущее значение: <b>{current_threshold}</b>\n\n"
+        "Введите `0`, чтобы отключить уведомления.",
+        reply_markup=kb.back_to_previous_menu("admin_ai_keys")
+    )
+
+
 @router.message(AdminStates.set_temperature, F.text)
 async def finish_set_temperature(message: Message, state: FSMContext, bot: Bot):
     try:
@@ -2402,6 +2559,40 @@ async def finish_set_temperature(message: Message, state: FSMContext, bot: Bot):
 
     async with async_session_maker() as session:
         await session.execute(update(AIConfig).where(AIConfig.id == 1).values(temperature=temp))
+        await session.commit()
+
+    data = await state.get_data()
+    msg_id = data.get('message_id_to_edit')
+    await state.clear()
+    await message.delete()
+
+    callback_mock = type('obj', (object,), {
+        'message': type('obj', (object,), {
+            'chat': message.chat,
+            'message_id': msg_id,
+            'edit_text': lambda *args, **kwargs: bot.edit_message_text(chat_id=message.chat.id, message_id=msg_id, *args, **kwargs)
+        })
+    })()
+    await admin_ai_keys_models(callback_mock)
+
+
+@router.message(AdminStates.set_kie_credit_threshold, F.text)
+async def finish_set_kie_credit_threshold(message: Message, state: FSMContext, bot: Bot):
+    try:
+        threshold = float(message.text.strip().replace(',', '.'))
+        if threshold < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число 0 или больше (например: 100)")
+        return
+
+    async with async_session_maker() as session:
+        await session.execute(
+            update(AIConfig).where(AIConfig.id == 1).values(
+                kie_credit_alert_threshold=threshold,
+                kie_credit_alert_sent=False,
+            )
+        )
         await session.commit()
 
     data = await state.get_data()
@@ -2460,6 +2651,8 @@ async def admin_toggle_transcription(callback: CallbackQuery):
         if config.transcription_provider == "OpenAI":
             config.transcription_provider = "Gemini"
         elif config.transcription_provider == "Gemini":
+            config.transcription_provider = "KIE"
+        elif config.transcription_provider == "KIE":
             config.transcription_provider = "None"
         else:
             config.transcription_provider = "OpenAI"
@@ -2470,6 +2663,49 @@ async def admin_toggle_transcription(callback: CallbackQuery):
     display_provider = "Выкл" if new_provider == "None" else new_provider
     await callback.answer(f"✅ Провайдер транскрибации изменен на {display_provider}")
 
+    await admin_ai_keys_models(callback)
+
+
+@router.callback_query(F.data == "admin_toggle_image_generation")
+async def admin_toggle_image_generation(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
+            return
+
+        if config.image_generation_provider == "OpenAI":
+            config.image_generation_provider = "Gemini"
+            config.image_generation_model = "imagen-4.0-generate-001"
+        elif config.image_generation_provider == "Gemini":
+            config.image_generation_provider = "KIE"
+            config.image_generation_model = "google/imagen4-fast"
+        else:
+            config.image_generation_provider = "OpenAI"
+            config.image_generation_model = "gpt-image-1.5"
+        await session.commit()
+
+    await callback.answer(f"✅ Генерация изображений: {config.image_generation_provider}")
+    await admin_ai_keys_models(callback)
+
+
+@router.callback_query(F.data == "admin_toggle_image_edit")
+async def admin_toggle_image_edit(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
+            return
+
+        if config.image_edit_provider == "Gemini":
+            config.image_edit_provider = "KIE"
+            config.image_edit_model = "google/nano-banana-edit"
+        else:
+            config.image_edit_provider = "Gemini"
+            config.image_edit_model = "gemini-3-pro-image-preview"
+        await session.commit()
+
+    await callback.answer(f"✅ Редактирование изображений: {config.image_edit_provider}")
     await admin_ai_keys_models(callback)
 
 
@@ -3475,6 +3711,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
 
     thinking_msg = await message.answer("🤖 Думаю...")
     ai_prompt_text = prompt_text
+    async with async_session_maker() as session:
+        ai_config = await session.get(AIConfig, 1)
     if topic_id:
         random_phrase = await get_random_message_by_topic(topic_id)
         if random_phrase:
@@ -3517,7 +3755,19 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 try:
                     image_data = await ai_integration.generate_image(image_prompt)
                     await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(image_data, filename="gen.png"), caption="✨ Готово!")
-                except Exception:
+                except Exception as e:
+                    gen_provider, gen_model = _resolve_ai_provider_model(ai_config, "image_generation")
+                    await _report_ai_failure(
+                        bot,
+                        title="Сбой генерации изображения",
+                        user=message.from_user,
+                        provider=gen_provider,
+                        model=gen_model,
+                        stage="generate_image",
+                        details=str(e),
+                        extra={"prompt_len": len(image_prompt)},
+                        exception=e,
+                    )
                     await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
         else:
             if clean_text:
@@ -3697,39 +3947,60 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             except Exception as e:
                 if typing_task_interp:
                     typing_task_interp.cancel()
-                logging.error(f"Error generating card interpretation for user {user_id}: {e}")
+                provider, model = _resolve_ai_provider_model(ai_config, "chat")
+                await _report_ai_failure(
+                    bot,
+                    title="Сбой интерпретации карт",
+                    user=message.from_user,
+                    provider=provider,
+                    model=model,
+                    stage="message_card_interpretation",
+                    details=str(e),
+                    exception=e,
+                )
 
     except InsufficientBalanceError as e:
-        error_message_for_admins = (
-            f"🚨 <b>КРИТИЧЕСКАЯ ОШИБКА API</b> 🚨\n\n"
-            f"Не удалось выполнить запрос к AI из-за проблемы с балансом или API-ключом.\n\n"
-            f"<b>Подробности:</b>\n<code>{html.escape(str(e))}</code>\n\n"
-            f"<b>Пожалуйста, срочно проверьте баланс и валидность ключей в админ-панели!</b>"
+        provider, model = _resolve_ai_provider_model(ai_config, "chat")
+        await _report_ai_failure(
+            bot,
+            title="Критическая ошибка AI API",
+            user=message.from_user,
+            provider=provider,
+            model=model,
+            stage="process_user_prompt_balance",
+            details=str(e),
+            exception=e,
         )
-        for owner_id in OWNER_IDS:
-            try:
-                await bot.send_message(owner_id, error_message_for_admins)
-            except Exception:
-                pass
         await thinking_msg.edit_text("К сожалению, сервис временно недоступен из-за технической проблемы.")
     except AIServiceError as e:
-        logging.error(f"AIServiceError in process_user_prompt: {e}")
+        provider, model = _resolve_ai_provider_model(ai_config, "chat")
+        await _report_ai_failure(
+            bot,
+            title="Сбой AI-сервиса",
+            user=message.from_user,
+            provider=provider,
+            model=model,
+            stage="process_user_prompt",
+            details=str(e),
+            extra={"prompt_len": len(ai_prompt_text)},
+            exception=e,
+        )
         await thinking_msg.edit_text(
             "Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
         )
-        for owner_id in OWNER_IDS:
-            try:
-                await bot.send_message(
-                    owner_id,
-                    f"⚠️ <b>Сбой AI-сервиса</b>\n\n"
-                    f"Пользователь: {_user_ref(message.from_user.id, message.from_user.username, message.from_user.full_name)}\n"
-                    f"<b>Ошибка:</b> <code>{html.escape(str(e))}</code>",
-                    parse_mode='HTML'
-                )
-            except Exception:
-                pass
     except Exception as e:
-        logging.error(f"Unexpected error in process_user_prompt: {e}")
+        provider, model = _resolve_ai_provider_model(ai_config, "chat")
+        await _report_ai_failure(
+            bot,
+            title="Непредвиденная ошибка AI-потока",
+            user=message.from_user,
+            provider=provider,
+            model=model,
+            stage="process_user_prompt_unexpected",
+            details=str(e),
+            extra={"prompt_len": len(ai_prompt_text)},
+            exception=e,
+        )
         await thinking_msg.edit_text("Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.")
 
 
@@ -9287,38 +9558,51 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 await asyncio.sleep(0.3)
 
     except InsufficientBalanceError as e:
-        error_message_for_admins = (
-            f"🚨 <b>КРИТИЧЕСКАЯ ОШИБКА API (Транскрибация)</b> 🚨\n\n"
-            f"Не удалось выполнить запрос к OpenAI Whisper из-за проблемы с балансом или API-ключом.\n\n"
-            f"<b>Подробности:</b>\n<code>{html.escape(str(e))}</code>\n\n"
-            f"<b>Пожалуйста, срочно проверьте баланс и валидность ключей OpenAI!</b>"
+        provider, model = _resolve_ai_provider_model(ai_config, "transcription")
+        await _report_ai_failure(
+            bot,
+            title="Критическая ошибка API транскрибации",
+            user=message.from_user,
+            provider=provider,
+            model=model,
+            stage="voice_transcription_balance",
+            details=str(e),
+            extra={"duration_sec": message.voice.duration},
+            exception=e,
         )
-        for owner_id in OWNER_IDS:
-            try:
-                await bot.send_message(owner_id, error_message_for_admins)
-            except Exception as notify_error:
-                logging.error(f"Failed to send critical error notification to owner {owner_id}: {notify_error}")
         await thinking_msg.edit_text(
             "К сожалению, сервис транскрибации временно недоступен из-за технической проблемы. Мы уже работаем над ее решением.")
         return
     except AIServiceError as e:
-        logging.error(f"AIServiceError in voice transcription: {e}")
+        provider, model = _resolve_ai_provider_model(ai_config, "transcription")
+        await _report_ai_failure(
+            bot,
+            title="Сбой транскрибации",
+            user=message.from_user,
+            provider=provider,
+            model=model,
+            stage="voice_transcription",
+            details=str(e),
+            extra={"duration_sec": message.voice.duration},
+            exception=e,
+        )
         await thinking_msg.edit_text(
             "Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
         )
-        for owner_id in OWNER_IDS:
-            try:
-                await bot.send_message(
-                    owner_id,
-                    f"⚠️ <b>Сбой транскрибации</b>\n\n"
-                    f"Пользователь: {_user_ref(message.from_user.id, message.from_user.username, message.from_user.full_name)}\n"
-                    f"<b>Ошибка:</b> <code>{html.escape(str(e))}</code>",
-                    parse_mode='HTML'
-                )
-            except Exception:
-                pass
         return
     except Exception as e:
+        provider, model = _resolve_ai_provider_model(ai_config, "transcription")
+        await _report_ai_failure(
+            bot,
+            title="Непредвиденная ошибка обработки голосового",
+            user=message.from_user,
+            provider=provider,
+            model=model,
+            stage="voice_handler_unexpected",
+            details=str(e),
+            extra={"duration_sec": message.voice.duration},
+            exception=e,
+        )
         await thinking_msg.edit_text(
             f"Произошла непредвиденная ошибка при обработке аудио.\n<code>{html.escape(str(e))}</code>")
         return
@@ -11867,7 +12151,6 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             processing_msg = await message.answer("👀 Тщательно изучаю изображение...")
 
             ai_config = await session.get(AIConfig, 1)
-            api_key = ai_config.gemini_api_key
 
             current_topic_id = user.current_topic_id
 
@@ -11939,7 +12222,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             if edit_match:
                 edit_prompt = edit_match.group(1).strip()
                 m_gen_status = await message.answer("🎨 Редактирую ваше фото...")
-                edited_data = await ai_integration.edit_image_gemini_v3(api_key, "gemini-3-pro-image-preview", edit_prompt, image_bytes)
+                edited_data = await ai_integration.edit_image(edit_prompt, image_bytes)
                 if edited_data:
                     await message.answer_photo(photo=BufferedInputFile(edited_data, filename="edited.png"), caption="✨ Результат редактирования:")
                 else:
@@ -11967,7 +12250,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
     except AIServiceError as e:
         if typing_task:
             typing_task.cancel()
-        logging.error(f"AIServiceError in photo handler: {e}")
+        vision_provider, vision_model = _resolve_ai_provider_model(ai_config if 'ai_config' in locals() else None, "vision")
         if processing_msg:
             try:
                 await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
@@ -11976,26 +12259,35 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         await message.answer(
             "Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
         )
-        for owner_id in OWNER_IDS:
-            try:
-                await bot.send_message(
-                    owner_id,
-                    f"⚠️ <b>Сбой анализа изображения</b>\n\n"
-                    f"Пользователь: {_user_ref(message.from_user.id, message.from_user.username, message.from_user.full_name)}\n"
-                    f"<b>Ошибка:</b> <code>{html.escape(str(e))}</code>",
-                    parse_mode='HTML'
-                )
-            except Exception:
-                pass
+        await _report_ai_failure(
+            bot,
+            title="Сбой анализа изображения",
+            user=message.from_user,
+            provider=vision_provider,
+            model=vision_model,
+            stage="photo_handler",
+            details=str(e),
+            exception=e,
+        )
     except Exception as e:
         if typing_task:
             typing_task.cancel()
-        logging.error(f"Global Photo Handler Error: {e}")
+        provider, model = _resolve_ai_provider_model(ai_config if 'ai_config' in locals() else None, "vision")
         if processing_msg:
             try:
                 await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
             except Exception:
                 pass
+        await _report_ai_failure(
+            bot,
+            title="Непредвиденная ошибка обработки фото",
+            user=message.from_user,
+            provider=provider,
+            model=model,
+            stage="photo_handler_unexpected",
+            details=str(e),
+            exception=e,
+        )
         await message.answer("Произошла ошибка при обработке фото.")
 
 
@@ -12839,6 +13131,8 @@ async def admin_change_vision_model_list(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     if provider == "Gemini":
         models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-3-flash-preview"]
+    elif provider == "KIE":
+        models = ["gemini-3-flash", "gemini-2.5-flash"]
     else:
         models = ["gpt-4o", "gpt-4o-mini"]
 
@@ -12860,6 +13154,68 @@ async def save_vision_model(callback: CallbackQuery):
         await session.commit()
 
     await callback.answer(f"✅ Модель для фото изменена на {model_name}")
+
+
+@router.callback_query(F.data == "admin_change_image_generation_model")
+async def admin_change_image_generation_model_list(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        provider = getattr(config, "image_generation_provider", "Gemini")
+
+    builder = InlineKeyboardBuilder()
+    if provider == "Gemini":
+        models = ["imagen-4.0-generate-001"]
+    elif provider == "KIE":
+        models = ["google/imagen4-fast", "google/imagen4-ultra"]
+    else:
+        models = ["gpt-image-1.5"]
+
+    for m in models:
+        builder.button(text=m, callback_data=f"save_image_generation_model_{m}")
+
+    builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
+    builder.adjust(1)
+    await callback.message.edit_text(f"Выберите модель генерации для {provider}:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("save_image_generation_model_"))
+async def save_image_generation_model(callback: CallbackQuery):
+    model_name = callback.data.replace("save_image_generation_model_", "")
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        config.image_generation_model = model_name
+        await session.commit()
+    await callback.answer(f"✅ Модель генерации изменена на {model_name}")
+
+
+@router.callback_query(F.data == "admin_change_image_edit_model")
+async def admin_change_image_edit_model_list(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        provider = getattr(config, "image_edit_provider", "Gemini")
+
+    builder = InlineKeyboardBuilder()
+    if provider == "Gemini":
+        models = ["gemini-3-pro-image-preview"]
+    else:
+        models = ["google/nano-banana-edit"]
+
+    for m in models:
+        builder.button(text=m, callback_data=f"save_image_edit_model_{m}")
+
+    builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
+    builder.adjust(1)
+    await callback.message.edit_text(f"Выберите модель редактирования для {provider}:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("save_image_edit_model_"))
+async def save_image_edit_model(callback: CallbackQuery):
+    model_name = callback.data.replace("save_image_edit_model_", "")
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        config.image_edit_model = model_name
+        await session.commit()
+    await callback.answer(f"✅ Модель редактирования изменена на {model_name}")
 
 
 # ══════════════════════════════════════════════════════════════

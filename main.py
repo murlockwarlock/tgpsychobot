@@ -15,7 +15,7 @@ from config import BOT_TOKEN, OWNER_IDS
 from handlers import router
 from database import init_db, async_session_maker, User
 from background_worker import process_queue, process_mailings
-from scheduler import check_subscriptions
+from scheduler import check_subscriptions, check_kie_credit_balance
 from webhooks import setup_webhooks
 
 WEB_SERVER_HOST = '0.0.0.0'
@@ -103,8 +103,14 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     except Exception as e:
         logging.error(f"Error during initial subscription check: {e}")
 
+    try:
+        await check_kie_credit_balance(bot)
+    except Exception as e:
+        logging.error(f"Error during initial KIE credit balance check: {e}")
+
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
+    scheduler.add_job(check_kie_credit_balance, 'interval', minutes=15, args=(bot,))
     scheduler.start()
 
     dispatcher.shutdown.register(scheduler.shutdown)
