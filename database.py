@@ -28,6 +28,20 @@ topic_media_deck_association = Table(
     Column('deck_name', String, primary_key=True),
 )
 
+media_collection_items = Table(
+    'media_collection_items',
+    Base.metadata,
+    Column('collection_id', Integer, ForeignKey('media_collections.id', ondelete='CASCADE'), primary_key=True),
+    Column('media_id', Integer, ForeignKey('media_library.id', ondelete='CASCADE'), primary_key=True),
+)
+
+topic_collection_association = Table(
+    'topic_media_collection',
+    Base.metadata,
+    Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE'), primary_key=True),
+    Column('collection_id', Integer, ForeignKey('media_collections.id', ondelete='CASCADE'), primary_key=True),
+)
+
 promocode_plan_association = Table(
     'promocode_plan_association',
     Base.metadata,
@@ -146,6 +160,8 @@ class Topic(Base):
     knowledge_base_files = relationship("KnowledgeBase", secondary=topic_knowledgebase_association,
                                         back_populates="topics")
     media_decks = relationship("TopicMediaDeck", back_populates="topic", cascade="all, delete-orphan")
+    media_collections = relationship("MediaCollection", secondary=topic_collection_association,
+                                     back_populates="topics")
 
 
 class Content(Base):
@@ -527,6 +543,14 @@ class TopicMediaDeck(Base):
     topic = relationship("Topic", back_populates="media_decks")
 
 
+class MediaCollection(Base):
+    __tablename__ = 'media_collections'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False, unique=True)
+    media_files = relationship("MediaLibrary", secondary=media_collection_items, back_populates="collections")
+    topics = relationship("Topic", secondary=topic_collection_association, back_populates="media_collections")
+
+
 class MediaLibrary(Base):
     __tablename__ = 'media_library'
     __table_args__ = (
@@ -539,3 +563,4 @@ class MediaLibrary(Base):
     category = Column(String, nullable=True)
     description = Column(Text, nullable=True)
     media_type = Column(String, nullable=False)
+    collections = relationship("MediaCollection", secondary=media_collection_items, back_populates="media_files")

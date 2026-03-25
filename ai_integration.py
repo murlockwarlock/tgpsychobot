@@ -10,7 +10,8 @@ from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 
-from database import async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestSession, MediaLibrary, TopicMediaDeck
+from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestSession,
+                     MediaLibrary, TopicMediaDeck, MediaCollection, media_collection_items, topic_collection_association)
 from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
@@ -285,26 +286,43 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
 
         available_media_text = ""
         if user.current_topic_id:
-            # Получаем колоды (категории), привязанные к этому топику
-            deck_stmt = select(TopicMediaDeck.deck_name).where(
-                TopicMediaDeck.topic_id == user.current_topic_id
+            # Получаем ID коллекций, привязанных к этому топику
+            coll_stmt = select(topic_collection_association.c.collection_id).where(
+                topic_collection_association.c.topic_id == user.current_topic_id
             )
-            deck_res = await session.execute(deck_stmt)
-            assigned_decks = [r[0] for r in deck_res.all()]
+            coll_res = await session.execute(coll_stmt)
+            assigned_coll_ids = [r[0] for r in coll_res.all()]
 
-            if assigned_decks:
-                # Медиа из привязанных колод + свои медиа по topic_id (для аудио и пр.)
+            if assigned_coll_ids:
+                # Медиа из привязанных коллекций + свои медиа по topic_id (для аудио и пр.)
                 media_stmt = select(MediaLibrary).where(
                     or_(
-                        MediaLibrary.category.in_(assigned_decks),
+                        MediaLibrary.id.in_(
+                            select(media_collection_items.c.media_id).where(
+                                media_collection_items.c.collection_id.in_(assigned_coll_ids)
+                            )
+                        ),
                         MediaLibrary.topic_id == user.current_topic_id
                     )
                 )
             else:
-                # Фоллбэк на старое поведение (topic_id) для обратной совместимости
-                media_stmt = select(MediaLibrary).where(
-                    MediaLibrary.topic_id == user.current_topic_id
+                # Фоллбэк: старые колоды (topic_media_deck) или прямой topic_id
+                deck_stmt = select(TopicMediaDeck.deck_name).where(
+                    TopicMediaDeck.topic_id == user.current_topic_id
                 )
+                deck_res = await session.execute(deck_stmt)
+                assigned_decks = [r[0] for r in deck_res.all()]
+                if assigned_decks:
+                    media_stmt = select(MediaLibrary).where(
+                        or_(
+                            MediaLibrary.category.in_(assigned_decks),
+                            MediaLibrary.topic_id == user.current_topic_id
+                        )
+                    )
+                else:
+                    media_stmt = select(MediaLibrary).where(
+                        MediaLibrary.topic_id == user.current_topic_id
+                    )
 
             media_res = await session.execute(media_stmt)
             media_files = media_res.scalars().all()
