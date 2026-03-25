@@ -478,11 +478,13 @@ async def _get_assigned_decks(session, topic_id: int) -> list[str]:
 
 
 def _media_filter_by_deck(assigned_decks: list[str], topic_id: int, category: str = None):
-    """Возвращает SQLAlchemy фильтр для поиска медиа: по колодам если привязаны, иначе фоллбэк на topic_id."""
+    """Возвращает SQLAlchemy фильтр для поиска медиа: по колодам + свой topic_id, иначе фоллбэк только на topic_id."""
     if assigned_decks:
         if category:
+            # Конкретная категория — ищем глобально по категории
             return MediaLibrary.category == category
-        return MediaLibrary.category.in_(assigned_decks)
+        # Без категории — медиа из привязанных колод ИЛИ из своего топика (для аудио и пр.)
+        return or_(MediaLibrary.category.in_(assigned_decks), MediaLibrary.topic_id == topic_id)
     else:
         if category:
             return and_(MediaLibrary.topic_id == topic_id, MediaLibrary.category == category)

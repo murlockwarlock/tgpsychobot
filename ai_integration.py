@@ -6,7 +6,7 @@ import io
 import mimetypes
 import base64
 import asyncio
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 
@@ -293,9 +293,12 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
             assigned_decks = [r[0] for r in deck_res.all()]
 
             if assigned_decks:
-                # Загружаем медиа из всех привязанных колод
+                # Медиа из привязанных колод + свои медиа по topic_id (для аудио и пр.)
                 media_stmt = select(MediaLibrary).where(
-                    MediaLibrary.category.in_(assigned_decks)
+                    or_(
+                        MediaLibrary.category.in_(assigned_decks),
+                        MediaLibrary.topic_id == user.current_topic_id
+                    )
                 )
             else:
                 # Фоллбэк на старое поведение (topic_id) для обратной совместимости
