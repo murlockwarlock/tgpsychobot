@@ -991,7 +991,6 @@ async def edit_image_gemini_v3(api_key: str, model: str, prompt: str, image_byte
 
 def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
     aspect_ratio, _ = _select_image_generation_shape(prompt)
-    seedream_image_size = _aspect_ratio_to_seedream_size(aspect_ratio)
     if model == "google/imagen4-fast":
         return {
             "prompt": prompt,
@@ -1006,7 +1005,7 @@ def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
     if model == "bytedance/seedream-v4-text-to-image":
         return {
             "prompt": prompt,
-            "image_size": seedream_image_size,
+            "image_size": "square_hd",
             "image_resolution": "1K",
             "max_images": 1,
         }
@@ -1061,7 +1060,6 @@ def _aspect_ratio_to_seedream_size(aspect_ratio: str) -> str:
 
 def _build_kie_image_edit_input(model: str, prompt: str, source_url: str) -> dict:
     aspect_ratio, _ = _select_image_generation_shape(prompt)
-    seedream_image_size = _aspect_ratio_to_seedream_size(aspect_ratio)
 
     if model == "google/nano-banana-edit":
         return {
@@ -1074,7 +1072,7 @@ def _build_kie_image_edit_input(model: str, prompt: str, source_url: str) -> dic
         return {
             "prompt": prompt,
             "image_urls": [source_url],
-            "image_size": seedream_image_size,
+            "image_size": "square_hd",
             "image_resolution": "1K",
             "max_images": 1,
         }
