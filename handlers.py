@@ -435,6 +435,18 @@ async def _report_ai_failure(
     )
 
 
+def _start_chat_action_loop(bot: Bot, chat_id: int, action: str, interval: float = 4.5) -> asyncio.Task:
+    async def _loop():
+        try:
+            while True:
+                await bot.send_chat_action(chat_id=chat_id, action=action)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+
+    return asyncio.create_task(_loop())
+
+
 async def handle_ai_media_content(bot: Bot, user_id: int, response_text: str):
     audio_pattern = r'\[SEND_AUDIO:\s*(.*?)\]'
     random_img_pattern = r'\[RANDOM_IMG:\s*(.+?)(?:\s*\|\s*(\d+))?\s*\]'
@@ -766,7 +778,7 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                     for chunk in split_html_text(html_text):
                         await bot.send_message(chat_id=user_id, text=chunk, parse_mode='HTML')
                 if image_prompt:
-                    await bot.send_chat_action(chat_id=user_id, action="upload_photo")
+                    upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
                     try:
                         image_data = await ai_integration.generate_image(image_prompt)
                         await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(image_data, filename="gen.png"), caption="✨ Готово!")
@@ -784,6 +796,8 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                             exception=e,
                         )
                         await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
+                    finally:
+                        upload_task.cancel()
             else:
                 if clean_text:
                     html_response = markdown_to_html(clean_text)
@@ -3756,7 +3770,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 await thinking_msg.delete()
 
             if image_prompt:
-                await bot.send_chat_action(chat_id=user_id, action="upload_photo")
+                upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
                 try:
                     image_data = await ai_integration.generate_image(image_prompt)
                     await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(image_data, filename="gen.png"), caption="✨ Готово!")
@@ -3774,6 +3788,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                         exception=e,
                     )
                     await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
+                finally:
+                    upload_task.cancel()
         else:
             if clean_text:
                 html_response = markdown_to_html(clean_text)
@@ -12242,7 +12258,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 m_gen_status = await message.answer("🎨 Редактирую ваше фото...")
                 edited_data = await ai_integration.edit_image(edit_prompt, image_bytes)
                 if edited_data:
-                    await message.answer_photo(photo=BufferedInputFile(edited_data, filename="edited.png"), caption="✨ Результат редактирования:")
+                    upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
+                    try:
+                        await message.answer_photo(photo=BufferedInputFile(edited_data, filename="edited.png"), caption="✨ Результат редактирования:")
+                    finally:
+                        upload_task.cancel()
                 else:
                     await message.answer("😔 К сожалению, не удалось отредактировать изображение. Возможно, сервис дал сбой или запрос был отклонен фильтрами безопасности.")
                 try:
@@ -12255,7 +12275,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 m_gen_status = await message.answer("🖼 Генерирую новое изображение...")
                 new_img = await ai_integration.generate_image(gen_prompt)
                 if new_img:
-                    await message.answer_photo(photo=BufferedInputFile(new_img, filename="generated.png"), caption="✨ Новая генерация:")
+                    upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
+                    try:
+                        await message.answer_photo(photo=BufferedInputFile(new_img, filename="generated.png"), caption="✨ Новая генерация:")
+                    finally:
+                        upload_task.cancel()
                 try:
                     await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
                 except Exception:
