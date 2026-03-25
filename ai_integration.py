@@ -7,6 +7,7 @@ import mimetypes
 import base64
 import asyncio
 import json
+import httpx
 from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
@@ -63,6 +64,62 @@ def _get_kie_upload_base_url(ai_config: AIConfig) -> str:
 
 def _kie_model_base_url(base_url: str, model: str) -> str:
     return f"{base_url.rstrip('/')}/{model}/v1"
+
+
+def _guess_filename(file_bytes: bytes, fallback_stem: str, fallback_ext: str) -> str:
+    header = file_bytes[:16]
+    ext = fallback_ext.lower().lstrip(".")
+
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        ext = "png"
+    elif header.startswith(b"\xff\xd8\xff"):
+        ext = "jpg"
+    elif header.startswith(b"GIF8"):
+        ext = "gif"
+    elif header.startswith(b"RIFF") and file_bytes[8:12] == b"WEBP":
+        ext = "webp"
+    elif header.startswith(b"RIFF") and file_bytes[8:12] == b"WAVE":
+        ext = "wav"
+    elif header.startswith(b"OggS"):
+        ext = "ogg"
+    elif header.startswith(b"ID3") or header[:2] == b"\xff\xfb":
+        ext = "mp3"
+    elif header.startswith(b"%PDF"):
+        ext = "pdf"
+
+    return f"{fallback_stem}.{ext}"
+
+
+def _extract_kie_chat_text(payload: dict) -> str:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+            return "\n".join(part for part in text_parts if part).strip()
+    return ""
+
+
+def _validate_kie_json_response(status_code: int, payload: dict, *, context: str) -> dict:
+    if status_code != 200:
+        detail = payload.get("msg") or payload.get("message") or str(payload)
+        raise AIServiceError(f"{context}: status={status_code} message={detail}")
+
+    code = payload.get("code")
+    if code not in (None, 200, "200"):
+        detail = payload.get("msg") or payload.get("message") or str(payload)
+        lowered = str(detail).lower()
+        if any(word in lowered for word in ["billing", "quota", "balance", "credit"]):
+            raise InsufficientBalanceError(f"KIE API Error: {detail}")
+        raise AIServiceError(f"{context}: {detail}")
+
+    return payload.get("data") if isinstance(payload.get("data"), dict) else payload
 
 
 def _extract_text_from_openai_message(message) -> str:
@@ -150,56 +207,47 @@ async def _call_gemini_api(api_key: str, model: str, history: list, context: str
 
 
 async def _call_kie_chat(api_key: str, base_url: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7) -> str:
-    client = None
     try:
-        client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=_kie_model_base_url(base_url, model),
-        )
-
         kie_history = []
         for msg in history:
             if msg.content:
                 kie_history.append({"role": msg.role, "content": msg.content})
 
         full_system_prompt = f"{system_prompt}\n\nИспользуй следующие данные из базы знаний для ответа:\n{context}"
-
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
+        payload = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": full_system_prompt},
                 *kie_history,
             ],
-            max_tokens=4096,
-            temperature=temperature,
-            stream=False,
+            "max_tokens": 4096,
+            "temperature": temperature,
+            "stream": False,
+        }
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+            response = await client.post(
+                f"{_kie_model_base_url(base_url, model)}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        response_payload = _validate_kie_json_response(
+            response.status_code,
+            response.json(),
+            context="Ошибка при обращении к KIE Chat API",
         )
-        text = _extract_text_from_openai_message(response.choices[0].message)
+        text = _extract_kie_chat_text(response_payload)
         if not text:
             raise AIResponseError("KIE chat returned empty content")
         return text
-    except AuthenticationError as e:
-        raise InsufficientBalanceError(f"KIE API Error: Invalid API key. {e}")
-    except RateLimitError as e:
-        raise InsufficientBalanceError(f"KIE API Error: Rate limit or quota exceeded. {e}")
-    except BadRequestError as e:
-        error_text = str(e)
-        if any(word in error_text.lower() for word in ["billing", "quota", "balance"]):
-            raise InsufficientBalanceError(f"KIE API Error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {e}")
     except (InsufficientBalanceError, AIServiceError):
         raise
     except Exception as e:
         logging.error("KIE chat error", exc_info=e)
         raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {e}")
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: bytes, filename: str, upload_path: str) -> str:
-    import httpx
-
     url = f"{upload_base_url}/api/file-stream-upload"
     files = {"file": (filename, file_bytes, mimetypes.guess_type(filename)[0] or "application/octet-stream")}
     data = {"uploadPath": upload_path, "fileName": filename}
@@ -208,10 +256,13 @@ async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: by
     try:
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(url, headers=headers, data=data, files=files)
-        if response.status_code != 200:
-            raise AIServiceError(f"KIE upload failed: status={response.status_code} body={response.text}")
         payload = response.json()
-        file_url = payload.get("data", {}).get("downloadUrl") or payload.get("data", {}).get("fileUrl")
+        data_payload = _validate_kie_json_response(
+            response.status_code,
+            payload,
+            context="KIE upload failed",
+        )
+        file_url = data_payload.get("downloadUrl") or data_payload.get("fileUrl")
         if not file_url:
             raise AIResponseError(f"KIE upload returned no file URL: {payload}")
         return file_url
@@ -223,45 +274,41 @@ async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: by
 
 
 async def _call_kie_multimodal(api_key: str, base_url: str, model: str, system_prompt: str, user_content: list, temperature: float = 0.7) -> str:
-    client = None
     try:
-        client = AsyncOpenAI(api_key=api_key, base_url=_kie_model_base_url(base_url, model))
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
+        payload = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            max_tokens=4096,
-            temperature=temperature,
-            stream=False,
+            "max_tokens": 4096,
+            "temperature": temperature,
+            "stream": False,
+        }
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+            response = await client.post(
+                f"{_kie_model_base_url(base_url, model)}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        response_payload = _validate_kie_json_response(
+            response.status_code,
+            response.json(),
+            context="Ошибка обращения к KIE multimodal API",
         )
-        text = _extract_text_from_openai_message(response.choices[0].message)
+        text = _extract_kie_chat_text(response_payload)
         if not text:
             raise AIResponseError("KIE multimodal request returned empty content")
         return text
-    except AuthenticationError as e:
-        raise InsufficientBalanceError(f"KIE API Error: Invalid API key. {e}")
-    except RateLimitError as e:
-        raise InsufficientBalanceError(f"KIE API Error: Rate limit or quota exceeded. {e}")
-    except BadRequestError as e:
-        error_text = str(e)
-        if any(word in error_text.lower() for word in ["billing", "quota", "balance"]):
-            raise InsufficientBalanceError(f"KIE API Error: {e}")
-        raise AIServiceError(f"Ошибка обращения к KIE multimodal API: {e}")
     except (InsufficientBalanceError, AIServiceError):
         raise
     except Exception as e:
         logging.error("KIE multimodal error", exc_info=e)
         raise AIServiceError(f"Ошибка обращения к KIE multimodal API: {e}")
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def _create_kie_task(api_key: str, base_url: str, model: str, input_payload: dict) -> str:
-    import httpx
-
     url = f"{base_url}/api/v1/jobs/createTask"
     payload = {"model": model, "input": input_payload}
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -269,10 +316,13 @@ async def _create_kie_task(api_key: str, base_url: str, model: str, input_payloa
     try:
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(url, headers=headers, json=payload)
-        if response.status_code != 200:
-            raise AIServiceError(f"KIE task creation failed: status={response.status_code} body={response.text}")
         data = response.json()
-        task_id = data.get("data", {}).get("taskId")
+        data_payload = _validate_kie_json_response(
+            response.status_code,
+            data,
+            context="KIE task creation failed",
+        )
+        task_id = data_payload.get("taskId")
         if not task_id:
             raise AIResponseError(f"KIE task creation returned no taskId: {data}")
         return task_id
@@ -299,8 +349,6 @@ def _extract_kie_task_result(task_payload: dict) -> dict:
 
 
 async def _poll_kie_task(api_key: str, base_url: str, task_id: str, *, timeout_sec: int = 180) -> dict:
-    import httpx
-
     url = f"{base_url}/api/v1/jobs/recordInfo"
     headers = {"Authorization": f"Bearer {api_key}"}
     delay = 2.0
@@ -309,9 +357,11 @@ async def _poll_kie_task(api_key: str, base_url: str, task_id: str, *, timeout_s
     async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
         while True:
             response = await client.get(url, headers=headers, params={"taskId": task_id})
-            if response.status_code != 200:
-                raise AIServiceError(f"KIE task polling failed: task_id={task_id} status={response.status_code} body={response.text}")
-            payload = response.json().get("data", {})
+            payload = _validate_kie_json_response(
+                response.status_code,
+                response.json(),
+                context=f"KIE task polling failed: task_id={task_id}",
+            )
             state = (payload.get("state") or payload.get("status") or "").lower()
             success_flag = payload.get("successFlag")
             if state in {"success", "succeed", "succeeded"} or success_flag == 1:
@@ -943,23 +993,39 @@ def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
 
 
 async def _call_kie_image_generation(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
-    task_id = await _create_kie_task(
-        api_key,
-        base_url,
-        model,
-        _build_kie_image_generation_input(model, prompt),
-    )
-    task_payload = await _poll_kie_task(api_key, base_url, task_id)
-    result = _extract_kie_task_result(task_payload)
-    result_urls = result.get("resultUrls") or result.get("result_urls") or []
-    if not result_urls:
-        raise AIResponseError(f"KIE image generation returned no result URLs: task_id={task_id} payload={task_payload}")
-    download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
-    return await _download_binary_file(download_url)
+    attempts = 2
+    last_exc = None
+    for _ in range(attempts):
+        try:
+            task_id = await _create_kie_task(
+                api_key,
+                base_url,
+                model,
+                _build_kie_image_generation_input(model, prompt),
+            )
+            task_payload = await _poll_kie_task(api_key, base_url, task_id)
+            result = _extract_kie_task_result(task_payload)
+            result_urls = result.get("resultUrls") or result.get("result_urls") or []
+            if not result_urls:
+                raise AIResponseError(f"KIE image generation returned no result URLs: task_id={task_id} payload={task_payload}")
+            download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
+            return await _download_binary_file(download_url)
+        except AIServiceError as exc:
+            last_exc = exc
+            if "internal error" not in str(exc).lower():
+                raise
+            await asyncio.sleep(2)
+    raise last_exc or AIServiceError("KIE image generation failed without detailed error")
 
 
 async def _call_kie_image_edit(api_key: str, base_url: str, upload_base_url: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
-    source_url = await _upload_file_to_kie(api_key, upload_base_url, image_bytes, "image_edit_source.jpg", "images")
+    source_url = await _upload_file_to_kie(
+        api_key,
+        upload_base_url,
+        image_bytes,
+        _guess_filename(image_bytes, "image_edit_source", "jpg"),
+        "images",
+    )
     task_id = await _create_kie_task(
         api_key,
         base_url,
@@ -1245,7 +1311,13 @@ async def _call_kie_vision(
     temperature: float = 0.7,
 ) -> str:
     try:
-        file_url = await _upload_file_to_kie(api_key, upload_base_url, image_bytes, "vision_input.jpg", "images")
+        file_url = await _upload_file_to_kie(
+            api_key,
+            upload_base_url,
+            image_bytes,
+            _guess_filename(image_bytes, "vision_input", "jpg"),
+            "images",
+        )
 
         history_text = []
         if history:
