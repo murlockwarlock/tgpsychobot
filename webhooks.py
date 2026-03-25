@@ -17,6 +17,7 @@ from database import (async_session_maker, UserSubscription, SubscriptionPlan, S
 from sqlalchemy import func
 from aiogram.fsm.context import FSMContext
 from subscription_retry_policy import get_next_retry_at
+from error_reporting import notify_admins_about_error
 
 log = logging.getLogger(__name__)
 plog = logging.getLogger("payment_events")
@@ -431,7 +432,16 @@ async def handle_yookassa_webhook(request: web.Request):
         return web.Response(status=200)
 
     except Exception as e:
-        print(f"Ошибка в обработке вебхука YooKassa: {e}")
+        log.error("Ошибка в обработке вебхука YooKassa: %s", e, exc_info=e)
+        await notify_admins_about_error(
+            bot,
+            title="Сбой webhook YooKassa",
+            provider="YooKassa",
+            stage="handle_yookassa_webhook",
+            details=str(e),
+            exception=e,
+            logger=log,
+        )
         return web.Response(status=500)
 
 
@@ -765,7 +775,16 @@ async def handle_robokassa_result(request: web.Request):
         return web.Response(text=f"OK{inv_id}")
 
     except Exception as e:
-        print(f"Ошибка в обработке вебхука Robokassa Result: {e}")
+        log.error("Ошибка в обработке вебхука Robokassa Result: %s", e, exc_info=e)
+        await notify_admins_about_error(
+            bot,
+            title="Сбой webhook Robokassa",
+            provider="Robokassa",
+            stage="handle_robokassa_result",
+            details=str(e),
+            exception=e,
+            logger=log,
+        )
         return web.Response(status=500)
 
 
@@ -792,10 +811,19 @@ async def handle_robokassa_success(request: web.Request):
         return web.HTTPFound(f"https://t.me/{bot_info.username}")
 
     except KeyError as e:
-        print(f"Robokassa SuccessURL Error: Missing parameter {e} in {data}")
+        log.error("Robokassa SuccessURL missing parameter %s in %s", e, data)
         return web.Response(text="bad sign", status=400)
     except Exception as e:
-        print(f"Ошибка в обработке вебхука Robokassa Success: {e}")
+        log.error("Ошибка в обработке вебхука Robokassa Success: %s", e, exc_info=e)
+        await notify_admins_about_error(
+            bot,
+            title="Сбой webhook Robokassa",
+            provider="Robokassa",
+            stage="handle_robokassa_success",
+            details=str(e),
+            exception=e,
+            logger=log,
+        )
         return web.Response(status=500)
 
 

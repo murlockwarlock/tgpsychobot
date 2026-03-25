@@ -14,6 +14,7 @@ from mailing_utils import get_mailing_audience_label, send_mailing_content
 from time_helpers import utc_now
 from vector_store import update_vector_index
 import keyboards as kb
+from error_reporting import notify_admins_about_error
 
 
 class DailyLimitError(Exception):
@@ -129,6 +130,15 @@ async def process_queue(bot: Bot):
                         update(IndexingQueue).where(IndexingQueue.id == job.id).values(status='failed'))
                     await session.commit()
                     logging.error(f"Job {job.id} failed: {e}")
+                    await notify_admins_about_error(
+                        bot,
+                        title="Сбой индексации файла",
+                        user_id=job.uploader_id,
+                        stage="process_queue",
+                        details=str(e),
+                        extra={"job_id": job.id, "filename": job.filename},
+                        exception=e,
+                    )
                     if progress_msg:
                         await bot.edit_message_text(
                             text=f"❌ Ошибка при обработке `{job.filename}`: {e}",
@@ -137,6 +147,13 @@ async def process_queue(bot: Bot):
                         )
         except Exception as e:
             logging.critical(f"Critical error in background worker: {e}. Restarting loop in 60s.")
+            await notify_admins_about_error(
+                bot,
+                title="Критический сбой очереди индексации",
+                stage="process_queue",
+                details=str(e),
+                exception=e,
+            )
             await asyncio.sleep(60)
 
 

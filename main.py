@@ -17,6 +17,7 @@ from database import init_db, async_session_maker, User
 from background_worker import process_queue, process_mailings
 from scheduler import check_subscriptions, check_kie_credit_balance
 from webhooks import setup_webhooks
+from error_reporting import notify_admins_about_error
 
 WEB_SERVER_HOST = '0.0.0.0'
 APP_PORT = int(os.environ.get('APP_PORT', 8080))
@@ -84,6 +85,13 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
             all_admin_ids.update(db_admin_ids)
     except Exception as e:
         logging.error(f"Failed to fetch admin IDs from DB for setting commands: {e}")
+        await notify_admins_about_error(
+            bot,
+            title="Сбой startup",
+            stage="load_admin_ids",
+            details=str(e),
+            exception=e,
+        )
 
     for admin_id in all_admin_ids:
         try:
@@ -94,7 +102,18 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     logging.info(f"Set default commands for users and special commands for {len(all_admin_ids)} admins.")
 
     webhook_url = f"{BASE_WEBHOOK_URL}{TELEGRAM_WEBHOOK_PATH}"
-    await configure_webhook(bot, webhook_url)
+    try:
+        await configure_webhook(bot, webhook_url)
+    except Exception as e:
+        await notify_admins_about_error(
+            bot,
+            title="Сбой startup",
+            stage="configure_webhook",
+            details=str(e),
+            extra={"webhook_url": webhook_url},
+            exception=e,
+        )
+        raise
 
     logging.info("Running initial subscription check on startup...")
     try:
@@ -102,11 +121,25 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
         logging.info("Initial subscription check complete.")
     except Exception as e:
         logging.error(f"Error during initial subscription check: {e}")
+        await notify_admins_about_error(
+            bot,
+            title="Сбой startup",
+            stage="initial_subscription_check",
+            details=str(e),
+            exception=e,
+        )
 
     try:
         await check_kie_credit_balance(bot)
     except Exception as e:
         logging.error(f"Error during initial KIE credit balance check: {e}")
+        await notify_admins_about_error(
+            bot,
+            title="Сбой startup",
+            stage="initial_kie_credit_check",
+            details=str(e),
+            exception=e,
+        )
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
@@ -140,8 +173,27 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
             count = bg_restart_counts.get(name, 0) + 1
             bg_restart_counts[name] = count
             logging.error(f"Background task {name} crashed ({count}/{MAX_BG_RESTARTS}): {exc}", exc_info=exc)
+            asyncio.create_task(
+                notify_admins_about_error(
+                    bot,
+                    title="Сбой фоновой задачи",
+                    stage=name,
+                    details=f"task crashed ({count}/{MAX_BG_RESTARTS})",
+                    extra={"restart_count": count, "max_restarts": MAX_BG_RESTARTS},
+                    exception=exc,
+                )
+            )
             if count >= MAX_BG_RESTARTS:
                 logging.error(f"Background task {name} exceeded max restarts ({MAX_BG_RESTARTS}). Giving up.")
+                asyncio.create_task(
+                    notify_admins_about_error(
+                        bot,
+                        title="Фоновая задача остановлена",
+                        stage=name,
+                        details=f"exceeded max restarts ({MAX_BG_RESTARTS})",
+                        extra={"restart_count": count, "max_restarts": MAX_BG_RESTARTS},
+                    )
+                )
                 return
             delay = min(5 * (2 ** (count - 1)), 300)
             logging.info(f"Restarting background task {name} in {delay}s...")

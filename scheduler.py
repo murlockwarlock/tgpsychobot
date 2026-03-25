@@ -27,6 +27,7 @@ from urllib.parse import urlencode
 from birthday_mailings import process_birthday_mailings
 from subscription_notifications import should_send_upcoming_charge_notification
 from subscription_retry_policy import can_retry_now, get_next_retry_at
+from error_reporting import notify_admins_about_error
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -217,8 +218,26 @@ async def check_kie_credit_balance(bot: Bot):
                     await session.commit()
     except AIServiceError as exc:
         log.error("KIE credit balance check failed: %s", exc, exc_info=exc)
+        await notify_admins_about_error(
+            bot,
+            title="Сбой проверки баланса KIE",
+            provider="KIE",
+            stage="check_credit_balance",
+            details=str(exc),
+            exception=exc,
+            logger=log,
+        )
     except Exception as exc:
         log.error("Unexpected KIE credit balance check error: %s", exc, exc_info=exc)
+        await notify_admins_about_error(
+            bot,
+            title="Сбой проверки баланса KIE",
+            provider="KIE",
+            stage="check_credit_balance",
+            details=str(exc),
+            exception=exc,
+            logger=log,
+        )
 
 
 async def disable_auto_renewal_after_failed_attempts(
@@ -356,6 +375,14 @@ async def check_subscriptions(bot: Bot):
         await process_birthday_mailings(bot, now=now)
     except Exception as exc:
         log.error("Birthday mailing processing failed: %s", exc)
+        await notify_admins_about_error(
+            bot,
+            title="Сбой обработки ДР-рассылок",
+            stage="process_birthday_mailings",
+            details=str(exc),
+            exception=exc,
+            logger=log,
+        )
 
     two_hours_later = now + timedelta(hours=2)
     lookback_cutoff = now - timedelta(days=30)
@@ -1071,7 +1098,16 @@ async def check_subscriptions(bot: Bot):
                                         pass
 
             except Exception as e:
-                log.error(f"Error checking sub {sub.id}: {e}")
+                log.error(f"Error checking sub {sub.id}: {e}", exc_info=e)
+                await notify_admins_about_error(
+                    bot,
+                    title="Сбой обработки подписки",
+                    stage="check_subscriptions",
+                    details=str(e),
+                    extra={"subscription_id": sub.id, "user_id": sub.user_id},
+                    exception=e,
+                    logger=log,
+                )
 
 
 def calculate_signature(*args) -> str:

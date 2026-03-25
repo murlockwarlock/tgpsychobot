@@ -6701,6 +6701,19 @@ async def create_yookassa_invoice(callback: CallbackQuery, state: FSMContext):
             ErrorClass=type(e).__name__,
             Body=_encode_log_json(error_content) if isinstance(error_content, dict) else str(e),
         )
+        await notify_admins_about_error(
+            callback.bot,
+            title="Сбой создания платежа YooKassa",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="YooKassa",
+            stage="create_payment",
+            details=str(e),
+            extra={"plan_id": plan_id, "price": f"{price:.2f}"},
+            exception=e,
+            logger=log,
+        )
         await callback.message.edit_text(
             "❌ Произошла непредвиденная ошибка при создании платежа. Пожалуйста, попробуйте позже.")
 
