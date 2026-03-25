@@ -106,6 +106,18 @@ def _extract_kie_chat_text(payload: dict) -> str:
     return ""
 
 
+def _is_kie_transient_failure(error: Exception | str) -> bool:
+    text = str(error).lower()
+    markers = [
+        "maintained",
+        "maintenance",
+        "internal error",
+        "try again later",
+        "server is currently being maintained",
+    ]
+    return any(marker in text for marker in markers)
+
+
 def _validate_kie_json_response(status_code: int, payload: dict, *, context: str) -> dict:
     if status_code != 200:
         detail = payload.get("msg") or payload.get("message") or str(payload)
@@ -1065,7 +1077,13 @@ async def generate_image(prompt: str) -> any:
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise Exception("API ключ KIE для генерации не установлен.")
-        return await _call_kie_image_generation(api_key, _get_kie_base_url(config), model or "google/imagen4-fast", prompt)
+        try:
+            return await _call_kie_image_generation(api_key, _get_kie_base_url(config), model or "google/imagen4-fast", prompt)
+        except AIServiceError as exc:
+            if _is_kie_transient_failure(exc):
+                logging.warning("KIE image generation transient failure, falling back to OpenAI: %s", exc)
+                return await generate_openai_image(prompt)
+            raise
     else:
         return await generate_openai_image(prompt)
 
@@ -1162,16 +1180,25 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
             api_key = getattr(config, "kie_api_key", None)
             if not api_key:
                 return "❌ Ошибка: API ключ для KIE (Vision) не установлен."
-            return await _call_kie_vision(
-                api_key,
-                _get_kie_base_url(config),
-                _get_kie_upload_base_url(config),
-                v_model or "gemini-3-flash",
-                image_bytes,
-                prompt,
-                history=history,
-                temperature=temperature,
-            )
+            try:
+                return await _call_kie_vision(
+                    api_key,
+                    _get_kie_base_url(config),
+                    _get_kie_upload_base_url(config),
+                    v_model or "gemini-3-flash",
+                    image_bytes,
+                    prompt,
+                    history=history,
+                    temperature=temperature,
+                )
+            except AIServiceError as exc:
+                if not _is_kie_transient_failure(exc):
+                    raise
+                logging.warning("KIE vision transient failure, falling back to OpenAI: %s", exc)
+                api_key = config.openai_api_key or os.getenv('OPENAI_API_KEY')
+                if not api_key:
+                    raise
+                v_model = "gpt-4o"
 
         else:
             api_key = config.openai_api_key
