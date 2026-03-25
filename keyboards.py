@@ -183,6 +183,11 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                             image_edit_provider: str, image_edit_model: str,
                             kie_credit_alert_threshold: float,
                             temperature: float = 0.7, memory_mode: str = "reset"):
+    def short_model(model: str, limit: int = 16) -> str:
+        if len(model) <= limit:
+            return model
+        return f"{model[:limit - 1]}…"
+
     builder = InlineKeyboardBuilder()
 
     builder.button(text="🔑 Deepseek", callback_data="set_key_Deepseek")
@@ -200,20 +205,20 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     builder.button(text=f"📌 Первые: {context_first}", callback_data="set_context_first")
     builder.button(text=f"🔄 Последние: {context_recent}", callback_data="set_context_recent")
 
-    trans_label = f"🗣️ Аудио: {current_transcription_provider}" if current_transcription_provider != 'None' else "🗣️ Аудио: ❌ Выкл"
+    trans_label = f"🗣️ Аудио: {current_transcription_provider}" if current_transcription_provider != 'None' else "🗣️ Аудио: выкл"
     builder.button(text=trans_label, callback_data="admin_toggle_transcription")
 
-    builder.button(text=f"👁️ Фото: {current_vision_provider} ({current_vision_model})",
+    builder.button(text=f"👁️ Фото: {current_vision_provider}",
                    callback_data="admin_toggle_vision")
-    builder.button(text="🔧 Сменить модель фото", callback_data="admin_change_vision_model")
+    builder.button(text=f"Модель: {short_model(current_vision_model)}", callback_data="admin_change_vision_model")
 
-    builder.button(text=f"🖼 Генерация: {image_generation_provider} ({image_generation_model})",
+    builder.button(text=f"🖼 Ген: {image_generation_provider}",
                    callback_data="admin_toggle_image_generation")
-    builder.button(text="🔧 Модель генерации", callback_data="admin_change_image_generation_model")
+    builder.button(text=f"Модель: {short_model(image_generation_model)}", callback_data="admin_change_image_generation_model")
 
-    builder.button(text=f"🎨 Редактирование: {image_edit_provider} ({image_edit_model})",
+    builder.button(text=f"🎨 Редакт: {image_edit_provider}",
                    callback_data="admin_toggle_image_edit")
-    builder.button(text="🔧 Модель редактирования", callback_data="admin_change_image_edit_model")
+    builder.button(text=f"Модель: {short_model(image_edit_model)}", callback_data="admin_change_image_edit_model")
 
     threshold_label = int(kie_credit_alert_threshold) if float(kie_credit_alert_threshold).is_integer() else round(kie_credit_alert_threshold, 2)
     builder.button(text=f"💳 KIE порог: {threshold_label}", callback_data="set_kie_credit_threshold")
