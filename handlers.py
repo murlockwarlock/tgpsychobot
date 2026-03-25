@@ -1638,10 +1638,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
 
                         if topic.start_message:
                             text_to_send = topic.start_message
-                        elif restored:
-                            text_to_send = f"✅ Продолжаем тему: **{topic.name}**."
                         else:
-                            text_to_send = f"✅ Отлично! Мы переключились на тему: **{topic.name}**.\n\nПамять диалога была очищена. Можете задавать свой вопрос."
+                            text_to_send = _topic_switch_message(topic.name, restored, memory_mode)
 
                         reply_markup = None
                         if topic.start_button_text and topic.start_button_payload:
@@ -4317,6 +4315,20 @@ async def _apply_topic_switch(session, user, topic_key: int, memory_mode: str) -
     return False
 
 
+def _topic_switch_message(topic_name: str, restored: bool, memory_mode: str) -> str:
+    if restored:
+        return f"✅ Продолжаем тему: **{topic_name}**."
+    if is_global_memory_mode(memory_mode):
+        return (
+            f"✅ Отлично! Мы переключились на тему: **{topic_name}**.\n\n"
+            f"Контекст диалога сохранен. Дальше бот будет использовать промпт текущей темы."
+        )
+    return (
+        f"✅ Отлично! Мы переключились на тему: **{topic_name}**.\n\n"
+        f"Память диалога была очищена. Можете задавать свой вопрос."
+    )
+
+
 async def _new_dialogue_update_state(session, user, topic_key: int, memory_mode: str):
     user.current_dialogue_id += 1
     if is_global_memory_mode(memory_mode):
@@ -4395,10 +4407,8 @@ async def process_topic_selection(callback: CallbackQuery, bot: Bot):
 
     if topic.start_message:
         text_to_send = topic.start_message
-    elif restored:
-        text_to_send = f"✅ Продолжаем тему: **{topic.name}**."
     else:
-        text_to_send = f"✅ Отлично! Мы переключились на тему: **{topic.name}**.\n\nПамять диалога была очищена. Можете задавать свой вопрос."
+        text_to_send = _topic_switch_message(topic.name, restored, memory_mode)
 
     reply_markup = None
     if topic.start_button_text and topic.start_button_payload:
@@ -11645,10 +11655,8 @@ async def handle_direct_topic_button(message: Message, topic_id: int, topic_name
 
     if topic and topic.start_message:
         text_to_send = topic.start_message
-    elif restored:
-        text_to_send = f"✅ Продолжаем тему: **{topic_name}**."
     else:
-        text_to_send = f"✅ Отлично! Мы переключились на тему: **{topic_name}**.\n\nПамять диалога была очищена. Можете задавать свой вопрос."
+        text_to_send = _topic_switch_message(topic_name, restored, memory_mode)
 
     reply_markup = None
     if topic and topic.start_button_text and topic.start_button_payload:
@@ -12028,7 +12036,10 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
     chat_id = callback.from_user.id
 
     if not content_obj:
-        await bot.send_message(chat_id, "✅ Вы вернулись в основной режим. Память очищена.", reply_markup=main_kb)
+        text = "✅ Вы вернулись в основной режим. Память очищена."
+        if is_global_memory_mode(memory_mode):
+            text = "✅ Вы вернулись в основной режим. Контекст диалога сохранен."
+        await bot.send_message(chat_id, text, reply_markup=main_kb)
         return
 
     text = content_obj.text_content
@@ -12097,7 +12108,10 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
     if inline_kb:
         await bot.send_message(chat_id, "Главное меню:", reply_markup=main_kb)
     elif not keyboard_was_sent and not inline_kb:
-        await bot.send_message(chat_id, "✅ Вы вернулись в основной режим. Память очищена.", reply_markup=main_kb)
+        text = "✅ Вы вернулись в основной режим. Память очищена."
+        if is_global_memory_mode(memory_mode):
+            text = "✅ Вы вернулись в основной режим. Контекст диалога сохранен."
+        await bot.send_message(chat_id, text, reply_markup=main_kb)
 
 
 @router.message(F.document, Command("upload_random"))

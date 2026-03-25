@@ -30,7 +30,7 @@ def memory_mode_label(mode: str) -> str:
     if mode == MEMORY_MODE_TOPIC:
         return "По темам"
     if mode == MEMORY_MODE_GLOBAL:
-        return "Глобальная"
+        return "Общий контекст"
     return "Сброс при смене"
 
 
@@ -38,7 +38,7 @@ def memory_mode_description(mode: str) -> str:
     if mode == MEMORY_MODE_TOPIC:
         return "Память сохраняется отдельно внутри каждой темы."
     if mode == MEMORY_MODE_GLOBAL:
-        return "Память не сбрасывается при переключении тем, пока пользователь сам не начнет новый диалог."
+        return "Контекст диалога сохраняется между темами, но используется промпт текущей темы."
     return "При переключении темы память сбрасывается."
 
 
