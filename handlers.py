@@ -2707,7 +2707,7 @@ async def admin_toggle_image_generation(callback: CallbackQuery):
             config.image_generation_model = "imagen-4.0-generate-001"
         elif config.image_generation_provider == "Gemini":
             config.image_generation_provider = "KIE"
-            config.image_generation_model = "google/imagen4-fast"
+            config.image_generation_model = "bytedance/seedream-v4-text-to-image"
         else:
             config.image_generation_provider = "OpenAI"
             config.image_generation_model = "gpt-image-1.5"
@@ -2727,7 +2727,7 @@ async def admin_toggle_image_edit(callback: CallbackQuery):
 
         if config.image_edit_provider == "Gemini":
             config.image_edit_provider = "KIE"
-            config.image_edit_model = "google/nano-banana-edit"
+            config.image_edit_model = "bytedance/seedream-v4-edit"
         else:
             config.image_edit_provider = "Gemini"
             config.image_edit_model = "gemini-3-pro-image-preview"
@@ -13207,7 +13207,12 @@ async def admin_change_image_generation_model_list(callback: CallbackQuery):
     if provider == "Gemini":
         models = ["imagen-4.0-generate-001"]
     elif provider == "KIE":
-        models = ["google/imagen4-fast", "google/imagen4-ultra"]
+        models = [
+            "bytedance/seedream-v4-text-to-image",
+            "seedream/4.5-text-to-image",
+            "google/imagen4-fast",
+            "google/imagen4-ultra",
+        ]
     else:
         models = ["gpt-image-1.5"]
 
@@ -13239,7 +13244,11 @@ async def admin_change_image_edit_model_list(callback: CallbackQuery):
     if provider == "Gemini":
         models = ["gemini-3-pro-image-preview"]
     else:
-        models = ["google/nano-banana-edit"]
+        models = [
+            "bytedance/seedream-v4-edit",
+            "seedream/4.5-edit",
+            "google/nano-banana-edit",
+        ]
 
     for m in models:
         builder.button(text=m, callback_data=f"save_image_edit_model_{m}")

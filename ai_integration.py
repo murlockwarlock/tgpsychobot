@@ -991,6 +991,7 @@ async def edit_image_gemini_v3(api_key: str, model: str, prompt: str, image_byte
 
 def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
     aspect_ratio, _ = _select_image_generation_shape(prompt)
+    seedream_image_size = _aspect_ratio_to_seedream_size(aspect_ratio)
     if model == "google/imagen4-fast":
         return {
             "prompt": prompt,
@@ -1001,6 +1002,19 @@ def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
         return {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
+        }
+    if model == "bytedance/seedream-v4-text-to-image":
+        return {
+            "prompt": prompt,
+            "image_size": seedream_image_size,
+            "image_resolution": "1K",
+            "max_images": 1,
+        }
+    if model == "seedream/4.5-text-to-image":
+        return {
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "quality": "basic",
         }
     raise AIServiceError(f"Неподдерживаемая KIE image generation model: {model}")
 
@@ -1035,6 +1049,43 @@ def _select_image_generation_shape(prompt: str) -> tuple[str, str]:
     if any(marker in prompt_lc for marker in landscape_markers):
         return "4:3", "1536x1024"
     return "1:1", "1024x1024"
+
+
+def _aspect_ratio_to_seedream_size(aspect_ratio: str) -> str:
+    if aspect_ratio == "3:4":
+        return "portrait_3_4"
+    if aspect_ratio == "4:3":
+        return "landscape_4_3"
+    return "square_hd"
+
+
+def _build_kie_image_edit_input(model: str, prompt: str, source_url: str) -> dict:
+    aspect_ratio, _ = _select_image_generation_shape(prompt)
+    seedream_image_size = _aspect_ratio_to_seedream_size(aspect_ratio)
+
+    if model == "google/nano-banana-edit":
+        return {
+            "prompt": prompt,
+            "image_urls": [source_url],
+            "output_format": "png",
+            "image_size": "1:1",
+        }
+    if model == "bytedance/seedream-v4-edit":
+        return {
+            "prompt": prompt,
+            "image_urls": [source_url],
+            "image_size": seedream_image_size,
+            "image_resolution": "1K",
+            "max_images": 1,
+        }
+    if model == "seedream/4.5-edit":
+        return {
+            "prompt": prompt,
+            "image_urls": [source_url],
+            "aspect_ratio": aspect_ratio,
+            "quality": "basic",
+        }
+    raise AIServiceError(f"Неподдерживаемая KIE image edit model: {model}")
 
 
 async def _call_kie_image_generation(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
@@ -1075,12 +1126,7 @@ async def _call_kie_image_edit(api_key: str, base_url: str, upload_base_url: str
         api_key,
         base_url,
         model,
-        {
-            "prompt": prompt,
-            "image_urls": [source_url],
-            "output_format": "png",
-            "image_size": "1:1",
-        },
+        _build_kie_image_edit_input(model, prompt, source_url),
     )
     task_payload = await _poll_kie_task(api_key, base_url, task_id)
     result = _extract_kie_task_result(task_payload)
