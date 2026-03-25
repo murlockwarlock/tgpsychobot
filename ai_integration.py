@@ -994,7 +994,12 @@ async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str
                 api_key,
                 base_url,
                 model,
-                {"audio_url": file_url},
+                {
+                    "audio_url": file_url,
+                    "language_code": "ru",
+                    "tag_audio_events": False,
+                    "diarize": False,
+                },
             )
             task_payload = await _poll_kie_task(api_key, base_url, task_id)
             result = _extract_kie_task_result(task_payload)
