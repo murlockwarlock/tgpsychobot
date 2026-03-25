@@ -2460,7 +2460,7 @@ async def admin_toggle_vision(callback: CallbackQuery):
             config.vision_model = "gemini-3-flash-preview"
         elif config.vision_provider == "Gemini":
             config.vision_provider = "KIE"
-            config.vision_model = "gemini-3-flash"
+            config.vision_model = "gemini-2.5-flash"
         else:
             config.vision_provider = "OpenAI"
             config.vision_model = "gpt-4o"
@@ -13173,7 +13173,7 @@ async def admin_change_vision_model_list(callback: CallbackQuery):
     if provider == "Gemini":
         models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-3-flash-preview"]
     elif provider == "KIE":
-        models = ["gemini-3-flash", "gemini-2.5-flash"]
+        models = ["gemini-2.5-flash", "gemini-3-flash"]
     else:
         models = ["gpt-4o", "gpt-4o-mini"]
 

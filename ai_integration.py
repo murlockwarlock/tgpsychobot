@@ -1274,25 +1274,35 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
             api_key = getattr(config, "kie_api_key", None)
             if not api_key:
                 return "❌ Ошибка: API ключ для KIE (Vision) не установлен."
-            try:
-                return await _call_kie_vision(
-                    api_key,
-                    _get_kie_base_url(config),
-                    _get_kie_upload_base_url(config),
-                    v_model or "gemini-3-flash",
-                    image_bytes,
-                    prompt,
-                    history=history,
-                    temperature=temperature,
-                )
-            except AIServiceError as exc:
-                if not _is_kie_transient_failure(exc):
-                    raise
-                logging.warning("KIE vision transient failure, falling back to OpenAI: %s", exc)
-                api_key = config.openai_api_key or os.getenv('OPENAI_API_KEY')
-                if not api_key:
-                    raise
-                v_model = "gpt-4o"
+            preferred_model = v_model or "gemini-3-flash"
+            fallback_models = [preferred_model]
+            if preferred_model != "gemini-2.5-flash":
+                fallback_models.append("gemini-2.5-flash")
+            if preferred_model != "gemini-3-flash":
+                fallback_models.append("gemini-3-flash")
+
+            last_exc = None
+            for model_name in fallback_models:
+                try:
+                    if model_name != preferred_model:
+                        logging.warning("Retrying KIE vision with alternate model=%s after failure: %s", model_name, last_exc)
+                    return await _call_kie_vision(
+                        api_key,
+                        _get_kie_base_url(config),
+                        _get_kie_upload_base_url(config),
+                        model_name,
+                        image_bytes,
+                        prompt,
+                        history=history,
+                        temperature=temperature,
+                    )
+                except AIServiceError as exc:
+                    last_exc = exc
+                    if not _is_kie_transient_failure(exc):
+                        raise
+                    continue
+
+            raise last_exc or AIServiceError("KIE vision failed without detailed error")
         else:
             api_key = config.openai_api_key
 
