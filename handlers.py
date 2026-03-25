@@ -738,6 +738,17 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
     return clean_text
 
 
+def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None, str]:
+    pattern = rf"{directive}:\s*(.+?)(?=\n\s*\n|\n(?:[#>*-]|\d+\.)\s|\Z)"
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return None, text.strip()
+
+    payload = match.group(1).strip()
+    clean_text = (text[:match.start()] + text[match.end():]).strip()
+    return payload, clean_text
+
+
 async def process_buffered_messages(user_id: int, bot: Bot):
     if user_id not in user_message_buffers:
         return
@@ -769,10 +780,8 @@ async def process_buffered_messages(user_id: int, bot: Bot):
 
             # --- 1. Текст AI (сначала предисловие) ---
 
-            if "GEN_IMG:" in clean_text:
-                parts = clean_text.split("GEN_IMG:", 1)
-                text_part = parts[0].strip()
-                image_prompt = parts[1].strip()
+            image_prompt, text_part = _extract_ai_directive_payload(clean_text, "GEN_IMG")
+            if image_prompt:
                 if text_part:
                     html_text = markdown_to_html(text_part)
                     for chunk in split_html_text(html_text):
@@ -3753,10 +3762,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
 
         # --- 1. Текст AI (сначала предисловие) ---
 
-        if "GEN_IMG:" in clean_text:
-            parts = clean_text.split("GEN_IMG:", 1)
-            text_part = parts[0].strip()
-            image_prompt = parts[1].strip()
+        image_prompt, text_part = _extract_ai_directive_payload(clean_text, "GEN_IMG")
+        if image_prompt:
             if text_part:
                 html_text = markdown_to_html(text_part)
                 try:
@@ -12227,14 +12234,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             if typing_task:
                 typing_task.cancel()
 
-            edit_match = re.search(r'EDIT_IMG:\s*(.+)', analysis_result, re.DOTALL | re.IGNORECASE)
-            gen_match = re.search(r'GEN_IMG:\s*(.+)', analysis_result, re.DOTALL | re.IGNORECASE)
-
-            clean_text = analysis_result
-            if edit_match:
-                clean_text = analysis_result.replace(edit_match.group(0), "").strip()
-            elif gen_match:
-                clean_text = analysis_result.replace(gen_match.group(0), "").strip()
+            edit_prompt, clean_text = _extract_ai_directive_payload(analysis_result, "EDIT_IMG")
+            gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
 
             formatted_html = markdown_to_html(clean_text)
 
@@ -12253,8 +12254,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                         logging.error(f"HTML send failed: {e}. Body: {part[:100]}")
                         await message.answer(part, parse_mode=None)
 
-            if edit_match:
-                edit_prompt = edit_match.group(1).strip()
+            if edit_prompt:
                 m_gen_status = await message.answer("🎨 Редактирую ваше фото...")
                 edited_data = await ai_integration.edit_image(edit_prompt, image_bytes)
                 if edited_data:
@@ -12270,8 +12270,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 except Exception:
                     pass
 
-            elif gen_match:
-                gen_prompt = gen_match.group(1).strip()
+            elif gen_prompt:
                 m_gen_status = await message.answer("🖼 Генерирую новое изображение...")
                 new_img = await ai_integration.generate_image(gen_prompt)
                 if new_img:
