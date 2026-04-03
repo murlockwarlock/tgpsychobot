@@ -10058,6 +10058,43 @@ async def reset_user_promos(callback: CallbackQuery, state: FSMContext):
     await view_client_profile(callback, state)
 
 
+@router.callback_query(
+    lambda c: c.data
+    and c.data.startswith("admin_reset_sub_")
+    and not c.data.startswith("admin_reset_sub_confirm_")
+)
+async def prompt_reset_client_subscription(callback: CallbackQuery):
+    user_id = int(callback.data.split("_")[-1])
+    await callback.message.edit_text(
+        f"Сбросить подписку клиента <code>{user_id}</code>?\n\n"
+        "Будет удалена запись подписки (тариф, автопродление, привязка к платежу).\n"
+        "Платёжные записи и остальные данные аккаунта сохранятся.",
+        reply_markup=kb.confirm_client_action_keyboard(
+            f"admin_reset_sub_confirm_{user_id}",
+            f"view_client_{user_id}"
+        ),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_reset_sub_confirm_"))
+async def reset_client_subscription_confirm(callback: CallbackQuery, state: FSMContext):
+    user_id = int(callback.data.split("_")[-1])
+
+    async with async_session_maker() as session:
+        result = await session.execute(
+            delete(UserSubscription).where(UserSubscription.user_id == user_id)
+        )
+        await session.commit()
+
+    if result.rowcount:
+        await callback.answer(f"✅ Подписка клиента {user_id} сброшена.", show_alert=True)
+    else:
+        await callback.answer(f"У клиента {user_id} не было подписки.", show_alert=True)
+    await view_client_profile(callback, state)
+
+
 @router.callback_query(F.data.startswith("client_payment_info_"))
 async def view_client_payment_info(callback: CallbackQuery):
     user_id = int(callback.data.split("_")[-1])

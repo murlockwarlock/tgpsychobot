@@ -295,6 +295,7 @@ def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view
     builder.button(text="📜 История диалога", callback_data=f"client_history_{user_id}")
     builder.button(text="📥 Скачать историю", callback_data=f"download_history_{user_id}")
     builder.button(text="🎁 Сбросить промокоды", callback_data=f"reset_user_promos_{user_id}")
+    builder.button(text="🔄 Сбросить подписку", callback_data=f"admin_reset_sub_{user_id}")
     builder.button(text="🗑️ Удалить историю", callback_data=f"admin_delete_client_history_{user_id}")
     builder.button(text="♻️ Сбросить аккаунт", callback_data=f"admin_reset_client_{user_id}")
 
