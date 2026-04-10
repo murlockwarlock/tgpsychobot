@@ -7,6 +7,7 @@ import mimetypes
 import base64
 import asyncio
 import json
+import uuid
 import httpx
 from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
@@ -87,7 +88,8 @@ def _guess_filename(file_bytes: bytes, fallback_stem: str, fallback_ext: str) ->
     elif header.startswith(b"%PDF"):
         ext = "pdf"
 
-    return f"{fallback_stem}.{ext}"
+    unique_id = uuid.uuid4().hex[:12]
+    return f"{fallback_stem}_{unique_id}.{ext}"
 
 
 def _guess_image_media_type(file_bytes: bytes) -> str:
