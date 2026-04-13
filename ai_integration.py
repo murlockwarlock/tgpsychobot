@@ -940,20 +940,52 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
 
         final_history.append(DBMessage(role='user', content=user_prompt))
 
-        if provider_key == 'openai':
-            response_text = await _call_openai_api(api_key, model, final_history, context, system_prompt, temperature)
-        elif provider_key in ['anthropic', 'claude']:
-            response_text = await _call_claude_api(api_key, model, final_history, context, system_prompt, temperature)
-        elif provider_key == 'gemini':
-            response_text = await _call_gemini_api(api_key, model, final_history, context, system_prompt, temperature)
-        elif provider_key == 'kie':
-            response_text = await _call_kie_chat(api_key, _get_kie_base_url(ai_config), model, final_history, context, system_prompt, temperature)
-        elif provider_key == 'deepseek':
-            response_text = await _call_deepseek_api(api_key, model, final_history, context, system_prompt, temperature)
-        elif provider_key == 'xai':
-            response_text = await _call_openai_api(api_key, model, final_history, context, system_prompt, temperature)
-        else:
-            response_text = f"❌ Ошибка: Неизвестный провайдер ИИ: '{provider}'"
+        async def _dispatch_call(p_key, p_api_key, p_model):
+            if p_key == 'openai':
+                return await _call_openai_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+            elif p_key in ['anthropic', 'claude']:
+                return await _call_claude_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+            elif p_key == 'gemini':
+                return await _call_gemini_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+            elif p_key == 'kie':
+                return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, context, system_prompt, temperature)
+            elif p_key == 'deepseek':
+                return await _call_deepseek_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+            elif p_key == 'xai':
+                return await _call_openai_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+            else:
+                raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
+
+        try:
+            response_text = await _dispatch_call(provider_key, api_key, model)
+        except (AIServiceError, Exception) as primary_err:
+            if isinstance(primary_err, InsufficientBalanceError):
+                raise
+
+            fb_provider = getattr(ai_config, 'fallback_provider', None)
+            fb_model = getattr(ai_config, 'fallback_model', None)
+            if not fb_provider or not fb_model:
+                raise
+
+            fb_key = fb_provider.strip().lower()
+            fb_api_key = getattr(ai_config, f"{fb_key}_api_key", None)
+            if fb_key in ['anthropic', 'claude'] and not fb_api_key:
+                fb_api_key = ai_config.claude_api_key
+            if not fb_api_key:
+                logging.error(f"Fallback provider '{fb_provider}' has no API key configured, re-raising original error")
+                raise
+
+            logging.warning(
+                f"Primary provider '{provider}' failed ({primary_err}), "
+                f"falling back to '{fb_provider}' / '{fb_model}'"
+            )
+            try:
+                response_text = await _dispatch_call(fb_key, fb_api_key, fb_model)
+            except Exception as fb_err:
+                logging.error(f"Fallback provider '{fb_provider}' also failed: {fb_err}")
+                raise AIServiceError(
+                    f"Основной провайдер ({provider}) и резервный ({fb_provider}) недоступны"
+                ) from fb_err
 
         return response_text
 

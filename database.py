@@ -140,6 +140,8 @@ class AIConfig(Base):
     memory_mode = Column(String, default=MEMORY_MODE_RESET, nullable=False)
     shared_prompt_block = Column(Text, default=DEFAULT_SHARED_PROMPT_BLOCK, nullable=False)
     service_prompt_block = Column(Text, default=DEFAULT_SERVICE_PROMPT_TEMPLATE, nullable=False)
+    fallback_provider = Column(String, nullable=True)
+    fallback_model = Column(String, nullable=True)
 
 
 class KnowledgeBase(Base):

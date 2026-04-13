@@ -182,7 +182,8 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                             image_generation_provider: str, image_generation_model: str,
                             image_edit_provider: str, image_edit_model: str,
                             kie_credit_alert_threshold: float,
-                            temperature: float = 0.7, memory_mode: str = "reset"):
+                            temperature: float = 0.7, memory_mode: str = "reset",
+                            fallback_provider: str | None = None, fallback_model: str | None = None):
     def short_model(model: str, limit: int = 16) -> str:
         if len(model) <= limit:
             return model
@@ -228,6 +229,12 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
         text=f"🧠 Память: {memory_mode_label(memory_mode)}",
         callback_data="toggle_preserve_topic_context"
     )
+
+    fb_label = f"🔄 Резерв: {fallback_provider}" if fallback_provider else "🔄 Резерв: выкл"
+    builder.button(text=fb_label, callback_data="admin_toggle_fallback")
+    if fallback_provider:
+        fb_model_short = short_model(fallback_model) if fallback_model else "не задана"
+        builder.button(text=f"Модель: {fb_model_short}", callback_data="admin_change_fallback_model")
 
     builder.button(text="⏱️ Лимит аудио", callback_data="set_audio_limit")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")

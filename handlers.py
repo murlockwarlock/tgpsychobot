@@ -2357,6 +2357,8 @@ async def admin_ai_settings(message: Message | CallbackQuery):
         image_edit_provider = getattr(config, 'image_edit_provider', 'Gemini')
         image_edit_model = getattr(config, 'image_edit_model', 'gemini-3-pro-image-preview')
         kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0)
+        fb_provider = getattr(config, 'fallback_provider', None)
+        fb_model = getattr(config, 'fallback_model', None)
         voice_limit = config.max_voice_duration_sec
         prompt_source = (
             f"Файл: <code>{config.prompt_filename}</code>"
@@ -2366,9 +2368,15 @@ async def admin_ai_settings(message: Message | CallbackQuery):
         shared_block_status = "✅ задан" if (getattr(config, 'shared_prompt_block', "") or "").strip() else "❌ пуст"
         service_block_status = "✅ задан" if (getattr(config, 'service_prompt_block', "") or "").strip() else "❌ пуст"
 
+    fb_text = ""
+    if fb_provider:
+        fb_text = (f"\n🔄 <b>Резервный провайдер (текст):</b>\n"
+                   f"▫️ Провайдер: <b>{fb_provider}</b>\n"
+                   f"▫️ Модель: <code>{fb_model or 'не задана'}</code>\n")
+
     text = (f"🤖 <b>Настройки ИИ</b>\n\n"
             f"▫️ Текущий провайдер: <b>{provider}</b>\n"
-            f"▫️ {model_label}: <code>{model_name}</code>\n\n"
+            f"▫️ {model_label}: <code>{model_name}</code>\n{fb_text}\n"
             f"📝 <b>Промпты:</b>\n"
             f"▫️ Основной промпт: <b>{prompt_source}</b>\n"
             f"▫️ Общий блок: <b>{shared_block_status}</b>\n"
@@ -2426,6 +2434,8 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     c_recent = config.context_limit_recent if config else 10
     temp = getattr(config, 'temperature', 0.7) if config else 0.7
     memory_mode = get_memory_mode(config) if config else MEMORY_MODE_RESET
+    fb_provider = getattr(config, 'fallback_provider', None) if config else None
+    fb_model = getattr(config, 'fallback_model', None) if config else None
 
     await callback.message.edit_text(
         "🔑 Настройка ключей, моделей и глубины контекста (памяти)",
@@ -2441,7 +2451,9 @@ async def admin_ai_keys_models(callback: CallbackQuery):
             image_edit_model,
             kie_credit_alert_threshold,
             temp,
-            memory_mode
+            memory_mode,
+            fb_provider,
+            fb_model,
         )
     )
 
@@ -2737,6 +2749,81 @@ async def admin_toggle_image_edit(callback: CallbackQuery):
         await session.commit()
 
     await callback.answer(f"✅ Редактирование изображений: {config.image_edit_provider}")
+    await admin_ai_keys_models(callback)
+
+
+_FALLBACK_CYCLE = [None, "Deepseek", "Claude", "Gemini", "KIE", "OpenAI"]
+_FALLBACK_DEFAULT_MODELS = {
+    "Deepseek": "deepseek-chat",
+    "Claude": "claude-sonnet-4-5-20250929",
+    "Gemini": "gemini-2.0-flash",
+    "KIE": "gemini-3-flash",
+    "OpenAI": "gpt-4o",
+}
+
+
+@router.callback_query(F.data == "admin_toggle_fallback")
+async def admin_toggle_fallback(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
+            return
+
+        current = getattr(config, 'fallback_provider', None)
+        try:
+            idx = _FALLBACK_CYCLE.index(current)
+        except ValueError:
+            idx = 0
+        next_val = _FALLBACK_CYCLE[(idx + 1) % len(_FALLBACK_CYCLE)]
+        config.fallback_provider = next_val
+        if next_val:
+            config.fallback_model = _FALLBACK_DEFAULT_MODELS.get(next_val, "")
+        else:
+            config.fallback_model = None
+        await session.commit()
+
+    label = next_val if next_val else "выкл"
+    await callback.answer(f"✅ Резервный провайдер: {label}")
+    await admin_ai_keys_models(callback)
+
+
+@router.callback_query(F.data == "admin_change_fallback_model")
+async def admin_change_fallback_model_list(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        provider = getattr(config, 'fallback_provider', None)
+
+    if not provider:
+        await callback.answer("Сначала выберите резервный провайдер.", show_alert=True)
+        return
+
+    builder = InlineKeyboardBuilder()
+    model_map = {
+        "Deepseek": ["deepseek-chat", "deepseek-reasoner"],
+        "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
+        "Gemini": ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-2.5-pro-preview-05-06"],
+        "KIE": ["gemini-3-flash", "gemini-2.5-flash"],
+        "OpenAI": ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
+    }
+    models = model_map.get(provider, [])
+    for m in models:
+        builder.button(text=m, callback_data=f"save_fallback_model_{m}")
+    builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
+    builder.adjust(1)
+
+    await callback.message.edit_text(f"Выберите резервную модель для {provider}:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("save_fallback_model_"))
+async def save_fallback_model(callback: CallbackQuery):
+    model_name = callback.data.replace("save_fallback_model_", "")
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        config.fallback_model = model_name
+        await session.commit()
+
+    await callback.answer(f"✅ Резервная модель: {model_name}")
     await admin_ai_keys_models(callback)
 
 
