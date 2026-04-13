@@ -49,7 +49,8 @@ from ai_integration import (
     _call_gemini_api,
     _call_openai_api,
     _call_deepseek_api,
-    _call_claude_api
+    _call_claude_api,
+    _describe_subscription_status,
 )
 from error_reporting import notify_admins_about_error
 from memory_mode import (
@@ -12262,6 +12263,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 base_prompt_text = "Ты — профессиональный эксперт. Проанализируй это изображение максимально подробно."
 
             system_prompt = (
+                f"ДАННЫЕ КЛИЕНТА:\n"
+                f"{_describe_subscription_status(user.subscription)}\n\n"
                 f"{base_prompt_text}\n\n"
                 "ИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"
                 "1. Если пользователь просит ИЗМЕНИТЬ это фото или 'сделать так же', добавь в конце: EDIT_IMG: <prompt on english>.\n"

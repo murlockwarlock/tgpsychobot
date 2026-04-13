@@ -14,7 +14,8 @@ from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 
 from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestSession,
-                     MediaLibrary, TopicMediaDeck, MediaCollection, media_collection_items, topic_collection_association)
+                     MediaLibrary, TopicMediaDeck, MediaCollection, media_collection_items, topic_collection_association,
+                     UserSubscription)
 from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
@@ -103,6 +104,28 @@ def _guess_image_media_type(file_bytes: bytes) -> str:
     if header.startswith(b"RIFF") and file_bytes[8:12] == b"WEBP":
         return "image/webp"
     return "image/jpeg"
+
+
+def _describe_subscription_status(user_sub) -> str:
+    from datetime import datetime
+    now = datetime.utcnow()
+    if not user_sub or not user_sub.end_date or user_sub.end_date <= now:
+        return "СТАТУС ПОДПИСКИ: неактивен"
+
+    if user_sub.plan_id is not None:
+        reason = "оплаченный тариф"
+    else:
+        provider = user_sub.payment_provider or ""
+        if provider in ("Trial Referral", "Trial Referral Bonus"):
+            reason = "реферальный бонус"
+        elif provider == "Trial Promo":
+            reason = "промокод"
+        elif provider == "Trial Welcome":
+            reason = "приветственный бонус"
+        else:
+            reason = "бонус"
+
+    return f"СТАТУС ПОДПИСКИ: активен (основание: {reason})"
 
 
 def _extract_kie_chat_text(payload: dict) -> str:
@@ -724,7 +747,10 @@ async def _call_openai_api(api_key: str, model: str, history: list, context: str
 async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_gender: str) -> str:
     async with async_session_maker() as session:
         user_result = await session.execute(
-            select(User).options(selectinload(User.current_topic).selectinload(Topic.knowledge_base_files)).where(
+            select(User).options(
+                selectinload(User.current_topic).selectinload(Topic.knowledge_base_files),
+                selectinload(User.subscription),
+            ).where(
                 User.id == user_id)
         )
         user = user_result.scalar_one_or_none()
@@ -854,6 +880,7 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         forced_user_header = f"ДАННЫЕ КЛИЕНТА:\nИМЯ: {safe_user_name}\nПОЛ: {safe_user_gender}\n"
         if user.age:
             forced_user_header += f"ВОЗРАСТ: {user.age}\n"
+        forced_user_header += f"{_describe_subscription_status(user.subscription)}\n"
         forced_user_header += "\n"
 
         try:
