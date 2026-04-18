@@ -786,10 +786,10 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 if text_part:
                     html_text = markdown_to_html(text_part)
                     for chunk in split_html_text(html_text):
-                        try:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode='HTML')
-                        except Exception:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode=None)
+                        await _safe_send_html(
+                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
+                            chunk,
+                        )
                 if image_prompt:
                     upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
                     try:
@@ -815,10 +815,10 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 if clean_text:
                     html_response = markdown_to_html(clean_text)
                     for chunk in split_html_text(html_response):
-                        try:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode='HTML')
-                        except Exception:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode=None)
+                        await _safe_send_html(
+                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
+                            chunk,
+                        )
 
             # --- 2. Медиа (карты, аудио) после текста ---
 
@@ -958,10 +958,10 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 if clean_interpretation:
                     html_interp = markdown_to_html(clean_interpretation)
                     for chunk in split_html_text(html_interp):
-                        try:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode='HTML')
-                        except Exception:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode=None)
+                        await _safe_send_html(
+                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
+                            chunk,
+                        )
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation, dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
@@ -1068,10 +1068,10 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 if clean_interpretation:
                     html_interp = markdown_to_html(clean_interpretation)
                     for chunk in split_html_text(html_interp):
-                        try:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode='HTML')
-                        except Exception:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode=None)
+                        await _safe_send_html(
+                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
+                            chunk,
+                        )
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation,
@@ -1484,7 +1484,31 @@ def split_html_text(text: str, max_length: int = 4090) -> list[str]:
             if re.sub(r'<[^>]+>', '', final_c).strip():
                 chunks.append(final_c)
 
-    return [c for c in chunks if re.sub(r'<[^>]+>', '', c).strip()]
+    return [_fix_unclosed_html_tags(c) for c in chunks if re.sub(r'<[^>]+>', '', c).strip()]
+
+
+def _strip_all_html_tags(text: str) -> str:
+    """Удаляет все HTML-теги, оставляя только текст."""
+    return re.sub(r'<[^>]+>', '', text)
+
+
+async def _safe_send_html(send_coro_factory, chunk: str):
+    """Отправляет chunk с parse_mode='HTML'.
+
+    При ошибке парсинга — прогоняет через _fix_unclosed_html_tags и пробует снова.
+    Если всё равно не получилось — полностью удаляет теги, html-escape-ит текст
+    и отправляет с parse_mode='HTML' (чистый текст, но символы безопасны).
+    """
+    try:
+        await send_coro_factory(chunk, 'HTML')
+    except Exception:
+        fixed = _fix_unclosed_html_tags(chunk)
+        try:
+            await send_coro_factory(fixed, 'HTML')
+        except Exception:
+            plain = html.escape(_strip_all_html_tags(chunk), quote=False)
+            if plain.strip():
+                await send_coro_factory(plain, 'HTML')
 
 
 def infer_gender(name: str) -> str:
@@ -1774,10 +1798,10 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                         if html_text:
                             text_chunks = split_html_text(html_text, 4000)
                             for chunk in text_chunks:
-                                try:
-                                    await message.answer(chunk, parse_mode="HTML")
-                                except TelegramBadRequest:
-                                    await message.answer(chunk, parse_mode=None)
+                                await _safe_send_html(
+                                    lambda text, pm: message.answer(text, parse_mode=pm),
+                                    chunk,
+                                )
                                 await asyncio.sleep(0.2)
 
                     async def send_media_part():
@@ -3172,11 +3196,10 @@ async def handle_info_buttons(message: Message):
         if html_text:
             text_chunks = split_html_text(html_text, 4000)
             for chunk in text_chunks:
-                try:
-                    await message.answer(chunk, parse_mode="HTML")
-                except TelegramBadRequest:
-                    logging.warning(f"Failed to send chunk with HTML, sending as text. Chunk: {chunk[:50]}...")
-                    await message.answer(chunk, parse_mode=None)
+                await _safe_send_html(
+                    lambda text, pm: message.answer(text, parse_mode=pm),
+                    chunk,
+                )
                 await asyncio.sleep(0.2)
     async def send_media_part():
         if media:
@@ -3862,13 +3885,17 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 try:
                     await thinking_msg.edit_text(html_text, parse_mode="HTML")
                 except Exception:
-                    await thinking_msg.delete()
-                    for chunk in split_html_text(html_text):
-                        try:
-                            await message.answer(chunk, parse_mode="HTML")
-                        except Exception:
-                            await message.answer(chunk, parse_mode=None)
-                        await asyncio.sleep(0.3)
+                    fixed_html = _fix_unclosed_html_tags(html_text)
+                    try:
+                        await thinking_msg.edit_text(fixed_html, parse_mode="HTML")
+                    except Exception:
+                        await thinking_msg.delete()
+                        for chunk in split_html_text(html_text):
+                            await _safe_send_html(
+                                lambda text, pm: message.answer(text, parse_mode=pm),
+                                chunk,
+                            )
+                            await asyncio.sleep(0.3)
             else:
                 await thinking_msg.delete()
 
@@ -3899,14 +3926,18 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 try:
                     await thinking_msg.edit_text(html_response, parse_mode="HTML")
                 except Exception:
-                    await thinking_msg.delete()
-                    chunks = split_html_text(html_response, 4000)
-                    for chunk in chunks:
-                        try:
-                            await message.answer(chunk, parse_mode="HTML")
-                        except Exception:
-                            await message.answer(chunk, parse_mode=None)
-                        await asyncio.sleep(0.3)
+                    fixed_html = _fix_unclosed_html_tags(html_response)
+                    try:
+                        await thinking_msg.edit_text(fixed_html, parse_mode="HTML")
+                    except Exception:
+                        await thinking_msg.delete()
+                        chunks = split_html_text(html_response, 4000)
+                        for chunk in chunks:
+                            await _safe_send_html(
+                                lambda text, pm: message.answer(text, parse_mode=pm),
+                                chunk,
+                            )
+                            await asyncio.sleep(0.3)
             else:
                 await thinking_msg.delete()
 
@@ -4060,10 +4091,10 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 if clean_interpretation:
                     html_interp = markdown_to_html(clean_interpretation)
                     for chunk in split_html_text(html_interp):
-                        try:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode='HTML')
-                        except Exception:
-                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode=None)
+                        await _safe_send_html(
+                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
+                            chunk,
+                        )
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation, dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
@@ -9684,11 +9715,10 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
 
             if len(italicized_chunks) > 1:
                 for chunk in italicized_chunks[1:]:
-                    try:
-                        await message.answer(chunk)
-                    except TelegramBadRequest:
-                        logging.warning(f"Failed to send chunk with HTML, sending as text. Chunk: {chunk[:50]}...")
-                        await message.answer(chunk, parse_mode=None)
+                    await _safe_send_html(
+                        lambda text, pm: message.answer(text, parse_mode=pm),
+                        chunk,
+                    )
                     await asyncio.sleep(0.3)
 
         except TelegramBadRequest as e:
@@ -9699,11 +9729,10 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
             italicized_chunks = [f"<i>{chunk}</i>" for chunk in chunks]
 
             for chunk in italicized_chunks:
-                try:
-                    await message.answer(chunk)
-                except TelegramBadRequest:
-                    logging.warning(f"Failed to send chunk with HTML, sending as text. Chunk: {chunk[:50]}...")
-                    await message.answer(chunk, parse_mode=None)
+                await _safe_send_html(
+                    lambda text, pm: message.answer(text, parse_mode=pm),
+                    chunk,
+                )
                 await asyncio.sleep(0.3)
 
     except InsufficientBalanceError as e:
@@ -10956,10 +10985,10 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
 
     chunks = split_message(html_response, 4000)
     for chunk in chunks:
-        try:
-            await callback.message.answer(chunk, parse_mode="HTML")
-        except TelegramBadRequest:
-            await callback.message.answer(chunk, parse_mode=None)
+        await _safe_send_html(
+            lambda text, pm: callback.message.answer(text, parse_mode=pm),
+            chunk,
+        )
         await asyncio.sleep(0.3)
 
     secret_test_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -12398,11 +12427,10 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             if formatted_html:
                 parts = split_html_text(formatted_html)
                 for part in parts:
-                    try:
-                        await message.answer(part, parse_mode="HTML")
-                    except Exception as e:
-                        logging.error(f"HTML send failed: {e}. Body: {part[:100]}")
-                        await message.answer(part, parse_mode=None)
+                    await _safe_send_html(
+                        lambda text, pm: message.answer(text, parse_mode=pm),
+                        part,
+                    )
 
             if edit_prompt:
                 m_gen_status = await message.answer("🎨 Редактирую ваше фото...")
