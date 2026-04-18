@@ -15,7 +15,7 @@ from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestE
 
 from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestSession,
                      MediaLibrary, TopicMediaDeck, MediaCollection, media_collection_items, topic_collection_association,
-                     UserSubscription)
+                     UserSubscription, KnowledgeBase)
 from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
@@ -54,6 +54,13 @@ def _build_async_transport_from_env(env_var_name: str):
 
 def _normalize_provider_name(provider: str | None) -> str:
     return provider.strip().lower() if provider else ""
+
+
+def _normalize_config_value(value: str | None) -> str | None:
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return value
 
 
 def _get_kie_base_url(ai_config: AIConfig) -> str:
@@ -217,6 +224,31 @@ def _load_configured_system_prompt(ai_config: AIConfig, topic_prompt_text: str |
             system_prompt_text = ai_config.system_prompt
 
     return system_prompt_text or ""
+
+
+def _looks_like_prompt_kb_entry(filename: str | None, indexed_content: str | None) -> bool:
+    normalized_name = (filename or "").strip().lower()
+    prompt_name_markers = (
+        "prompt",
+        "промпт",
+        "system_prompt",
+        "system-prompt",
+        "system prompt",
+    )
+    if any(marker in normalized_name for marker in prompt_name_markers):
+        return True
+
+    normalized_head = (indexed_content or "")[:2000].strip().lower()
+    if not normalized_head:
+        return False
+
+    if "system prompt" in normalized_head or "системный промпт" in normalized_head:
+        return True
+
+    return (
+        "{user_name}" in normalized_head
+        and ("роль" in normalized_head or "ты ведёшь диалог как" in normalized_head)
+    )
 
 
 async def generate_response(user_id: int, user_prompt: str) -> str:
@@ -830,16 +862,16 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         provider = ai_config.provider
         provider_key = provider.strip().lower() if provider else ""
 
-        api_key = getattr(ai_config, f"{provider_key}_api_key", None)
+        api_key = _normalize_config_value(getattr(ai_config, f"{provider_key}_api_key", None))
         if provider_key in ['anthropic', 'claude'] and not api_key:
-            api_key = ai_config.claude_api_key
+            api_key = _normalize_config_value(ai_config.claude_api_key)
 
         if not api_key:
             return f"⚠️ Ошибка настройки: Не указан API ключ для провайдера '{provider}'. Пожалуйста, сообщите администратору."
 
-        model = getattr(ai_config, f"{provider_key}_model", None)
+        model = _normalize_config_value(getattr(ai_config, f"{provider_key}_model", None))
         if provider_key in ['anthropic', 'claude'] and not model:
-            model = ai_config.claude_model
+            model = _normalize_config_value(ai_config.claude_model)
 
         limit_first = ai_config.context_limit_first
         limit_recent = ai_config.context_limit_recent
@@ -914,9 +946,17 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
             if doc_ids:
                 relevant_chunks = await search_relevant_chunks(user_prompt, n_results=3, document_ids=doc_ids)
         else:
-            from database import KnowledgeBase
-            gen_files_res = await session.execute(select(KnowledgeBase.id).where(KnowledgeBase.use_in_general_mode == True))
-            gen_doc_ids = gen_files_res.scalars().all()
+            # Exclude prompt templates from general KB so they do not override the active system prompt.
+            gen_files_res = await session.execute(
+                select(KnowledgeBase.id, KnowledgeBase.filename, KnowledgeBase.indexed_content).where(
+                    KnowledgeBase.use_in_general_mode == True
+                )
+            )
+            gen_doc_ids = [
+                doc_id
+                for doc_id, filename, indexed_content in gen_files_res.all()
+                if not _looks_like_prompt_kb_entry(filename, indexed_content)
+            ]
             if gen_doc_ids:
                 relevant_chunks = await search_relevant_chunks(user_prompt, n_results=3, document_ids=gen_doc_ids)
 
@@ -968,9 +1008,9 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
                 raise
 
             fb_key = fb_provider.strip().lower()
-            fb_api_key = getattr(ai_config, f"{fb_key}_api_key", None)
+            fb_api_key = _normalize_config_value(getattr(ai_config, f"{fb_key}_api_key", None))
             if fb_key in ['anthropic', 'claude'] and not fb_api_key:
-                fb_api_key = ai_config.claude_api_key
+                fb_api_key = _normalize_config_value(ai_config.claude_api_key)
             if not fb_api_key:
                 logging.error(f"Fallback provider '{fb_provider}' has no API key configured, re-raising original error")
                 raise

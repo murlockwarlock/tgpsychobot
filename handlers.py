@@ -786,7 +786,10 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 if text_part:
                     html_text = markdown_to_html(text_part)
                     for chunk in split_html_text(html_text):
-                        await bot.send_message(chat_id=user_id, text=chunk, parse_mode='HTML')
+                        try:
+                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode='HTML')
+                        except Exception:
+                            await bot.send_message(chat_id=user_id, text=chunk, parse_mode=None)
                 if image_prompt:
                     upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
                     try:
@@ -2835,9 +2838,10 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
     current_state = await state.get_state()
     is_key = current_state == AdminStates.set_api_key.state
     column_name = f"{provider.lower()}_api_key" if is_key else f"{provider.lower()}_model"
+    value = message.text.strip() if message.text else None
 
     async with async_session_maker() as session:
-        stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: message.text})
+        stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
         await session.execute(stmt)
         await session.commit()
 
@@ -3683,8 +3687,7 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
         if user:
             ai_config = await session.get(AIConfig, 1)
             memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
-            await _new_dialogue_update_state(session, user, 0, memory_mode)
-            user.current_topic_id = None
+            await _new_dialogue_update_state(session, user, user.current_topic_id or 0, memory_mode)
 
             await session.execute(delete(TestSession).where(TestSession.user_id == user.id))
             await session.commit()
@@ -3861,7 +3864,10 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 except Exception:
                     await thinking_msg.delete()
                     for chunk in split_html_text(html_text):
-                        await message.answer(chunk, parse_mode="HTML")
+                        try:
+                            await message.answer(chunk, parse_mode="HTML")
+                        except Exception:
+                            await message.answer(chunk, parse_mode=None)
                         await asyncio.sleep(0.3)
             else:
                 await thinking_msg.delete()
@@ -10233,7 +10239,6 @@ async def delete_client_history_confirm(callback: CallbackQuery, state: FSMConte
         await session.execute(delete(DBMessage).where(DBMessage.user_id == user_id))
         await session.execute(delete(UserTopicState).where(UserTopicState.user_id == user_id))
         user.current_dialogue_id += 1
-        user.current_topic_id = None
         await session.commit()
 
     await callback.answer("✅ История клиента удалена.", show_alert=True)
