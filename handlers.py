@@ -1235,7 +1235,7 @@ def _fix_unclosed_html_tags(text: str) -> str:
     - Перекрёстная вложенность (<b><i>...</b></i>) → исправляется порядок
     - Дублированные теги (<b><b>...</b></b>) → дубли пропускаются
     """
-    allowed_tags = {'b', 'i', 's', 'code', 'pre', 'a'}
+    allowed_tags = {'b', 'i', 's', 'code', 'pre', 'a', 'blockquote'}
     tag_pattern = re.compile(r'<(/?)([a-z1-6]+)([^>]*)>', re.IGNORECASE)
 
     segments = []
@@ -1295,6 +1295,7 @@ def markdown_to_html(text: str) -> str:
     if not text:
         return ""
 
+    # Конвертируем существующие HTML-теги в markdown-эквиваленты
     text = re.sub(r'<b>(.*?)</b>', r'**\1**', text, flags=re.DOTALL)
     text = re.sub(r'<strong>(.*?)</strong>', r'**\1**', text, flags=re.DOTALL)
     text = re.sub(r'<i>(.*?)</i>', r'*\1*', text, flags=re.DOTALL)
@@ -1303,51 +1304,112 @@ def markdown_to_html(text: str) -> str:
     text = re.sub(r'<code>(.*?)</code>', r'`\1`', text, flags=re.DOTALL)
 
     text = html.escape(text, quote=False)
-    code_blocks = {}
+    placeholders = {}
 
-    def save_code_block(match):
-        key = f"\x01CODEBLOCK{len(code_blocks)}\x01"
-        code_blocks[key] = match.group(1)
+    def _placeholder(prefix, value):
+        key = f"\x01{prefix}{len(placeholders)}\x01"
+        placeholders[key] = value
         return key
+
+    # Сохраняем escaped-символы как плейсхолдеры (до обработки markdown)
+    def save_escaped(match):
+        return _placeholder("ESC", match.group(1))
+
+    text = re.sub(r'\\([*_~`#\[\]()\\>!|-])', save_escaped, text)
+
+    # Сохраняем блоки кода
+    def save_code_block(match):
+        code = match.group(1)
+        # Убираем идентификатор языка из первой строки
+        code = re.sub(r'^[a-zA-Z0-9_+-]+\n', '', code)
+        return _placeholder("CODEBLOCK", code)
 
     def save_inline_code(match):
-        key = f"\x01INLINE{len(code_blocks)}\x01"
-        code_blocks[key] = match.group(1)
-        return key
+        return _placeholder("INLINE", match.group(1))
 
     text = re.sub(r'```(.*?)```', save_code_block, text, flags=re.DOTALL)
     text = re.sub(r'`(.*?)`', save_inline_code, text)
+
+    # Горизонтальные линии
     text = re.sub(r'^\s*[\*_-]{3,}\s*$', '———', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\*\s*$', '———', text, flags=re.MULTILINE)
+
+    # Blockquotes: собираем последовательные строки с > в <blockquote>
+    def _format_quote_content(content):
+        """Обрабатываем markdown внутри цитаты (заголовки, списки)."""
+        content = re.sub(r'^\s*#{1,6}\s+(.*)', lambda m: '<b>' + m.group(1).replace('***', '').replace('**', '').replace('*', '') + '</b>', content, flags=re.MULTILINE)
+        content = re.sub(r'^\s*[-*]\s+', '• ', content, flags=re.MULTILINE)
+        return content
+
+    def process_blockquotes(txt):
+        lines = txt.split('\n')
+        result = []
+        quote_lines = []
+
+        def flush_quote():
+            if not quote_lines:
+                return
+            content = '\n'.join(quote_lines).strip()
+            if content:
+                content = _format_quote_content(content)
+                result.append(f'<blockquote>{content}</blockquote>')
+            quote_lines.clear()
+
+        for line in lines:
+            m = re.match(r'^\s*&gt;\s?(.*)', line)
+            if m:
+                quote_lines.append(m.group(1))
+            else:
+                flush_quote()
+                result.append(line)
+        flush_quote()
+        return '\n'.join(result)
+
+    text = process_blockquotes(text)
+
+    # Маркированные списки
     text = re.sub(r'^\s*[-*]\s+', '• ', text, flags=re.MULTILINE)
+
+    # Заголовки → <b>
     text = re.sub(r'^\s*#{1,6}\s+(.*)', lambda m: '\n\n<b>' + m.group(1).replace('***', '').replace('**', '').replace('*', '') + '</b>\n', text, flags=re.MULTILINE)
+
+    # Жирный + курсив (***text*** / ___text___)
     text = re.sub(r'\*\*\*(?=[^<>]*\*\*\*)((?:(?!\n\n)[^<>])+?)\*\*\*', r'<b><i>\1</i></b>', text)
     text = re.sub(r'___((?:(?!\n\n)[^<>])+?)___', r'<b><i>\1</i></b>', text)
+    # Жирный (**text** / __text__)
     text = re.sub(r'\*\*(?=[^<>]*\*\*)((?:(?!\n\n)[^<>])+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__(?=[^<>]*__)((?:(?!\n\n)[^<>])+?)__', r'<b>\1</b>', text)
+    # Курсив (*text* / _text_)
     text = re.sub(r'(?<!\w)\*(?!\s)([^<>\n]+?)(?<!\s)\*(?!\w)', r'<i>\1</i>', text)
     text = re.sub(r'(?<!\w)_(?!\s)([^<>\n]+?)(?<!\s)_(?!\w)', r'<i>\1</i>', text)
+    # Зачёркнутый
     text = re.sub(r'~~(?=[^<>\n]+~~)([^<>\n]+?)~~', r'<s>\1</s>', text)
+    # Ссылки
     text = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', text)
+
+    # Отступы перед заголовками и списками
     text = re.sub(r'([^\n])\n(<b>)', r'\1\n\n\2', text)
     text = re.sub(r'([^\n])\n(•)', r'\1\n\n\2', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
 
+    # Чистим оставшийся markdown-мусор
     text = text.replace('**', '').replace('__', '').replace('~~', '')
     text = text.replace('<b></b>', '').replace('<i></i>', '')
     text = re.sub(r'(?<![\w*])\*(?![\w*])', '', text)
 
-    for key, value in code_blocks.items():
+    # Восстанавливаем плейсхолдеры
+    for key, value in placeholders.items():
         if "CODEBLOCK" in key:
             replacement = f'<pre><code>{value}</code></pre>'
-        else:
+        elif "INLINE" in key:
             replacement = f'<code>{value}</code>'
+        else:
+            # ESC — escaped-символы, показываем как есть
+            replacement = value
         text = text.replace(key, replacement)
 
     text = text.strip()
-
     text = _fix_unclosed_html_tags(text)
-
     return text
 
 
