@@ -421,6 +421,12 @@ def user_history_keyboard(page: int, total_pages: int, for_admin_user_id: int | 
 
     builder.row(*nav_buttons)
 
+    if total_pages > 1:
+        builder.row(
+            InlineKeyboardButton(text="⏮ В начало", callback_data=f"{base_callback}_0"),
+            InlineKeyboardButton(text="В конец ⏭", callback_data=f"{base_callback}_{total_pages - 1}"),
+        )
+
     if for_admin_user_id:
         builder.row(InlineKeyboardButton(text="⬅️ К профилю", callback_data=f"view_client_{for_admin_user_id}"))
 
