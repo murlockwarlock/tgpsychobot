@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import timedelta
 
 from sqlalchemy import select, update, func
@@ -12,7 +13,7 @@ from database import (async_session_maker, IndexingQueue, KnowledgeBase, Mailing
 from file_parser import parse_file
 from mailing_utils import get_mailing_audience_label, send_mailing_content
 from time_helpers import utc_now
-from vector_store import update_vector_index
+from vector_store import delete_document_vectors, update_vector_index
 import keyboards as kb
 from error_reporting import notify_admins_about_error
 
@@ -28,123 +29,171 @@ class InsufficientBalanceError(Exception):
 STALE_MAILING_TIMEOUT = timedelta(minutes=30)
 
 
+@dataclass(slots=True)
+class IndexingJobPayload:
+    id: int
+    file_id: str
+    filename: str
+    uploader_id: int
+
+
+async def _claim_next_indexing_job() -> IndexingJobPayload | None:
+    async with async_session_maker() as session:
+        stmt = (
+            select(IndexingQueue)
+            .where(IndexingQueue.status == 'pending')
+            .order_by(IndexingQueue.created_at)
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        job = result.scalar_one_or_none()
+        if not job:
+            return None
+
+        job.status = 'processing'
+        await session.commit()
+        return IndexingJobPayload(
+            id=job.id,
+            file_id=job.file_id,
+            filename=job.filename,
+            uploader_id=job.uploader_id,
+        )
+
+
+async def _set_indexing_job_status(job_id: int, status: str) -> None:
+    async with async_session_maker() as session:
+        await session.execute(
+            update(IndexingQueue).where(IndexingQueue.id == job_id).values(status=status)
+        )
+        await session.commit()
+
+
+async def _create_kb_entry(filename: str, indexed_content: str) -> int:
+    async with async_session_maker() as session:
+        new_kb_entry = KnowledgeBase(filename=filename, indexed_content=indexed_content)
+        session.add(new_kb_entry)
+        await session.flush()
+        kb_entry_id = new_kb_entry.id
+        await session.commit()
+        return kb_entry_id
+
+
+async def _delete_kb_entry(kb_entry_id: int) -> None:
+    async with async_session_maker() as session:
+        kb_entry = await session.get(KnowledgeBase, kb_entry_id)
+        if kb_entry is not None:
+            await session.delete(kb_entry)
+            await session.commit()
+
+
 async def process_queue(bot: Bot):
     logging.info("Background worker started.")
     while True:
         try:
-            async with async_session_maker() as session:
-                stmt = select(IndexingQueue).where(IndexingQueue.status == 'pending').order_by(
-                    IndexingQueue.created_at).limit(1)
-                result = await session.execute(stmt)
-                job = result.scalar_one_or_none()
+            job = await _claim_next_indexing_job()
+            if not job:
+                await asyncio.sleep(10)
+                continue
 
-                if not job:
-                    await asyncio.sleep(10)
-                    continue
+            logging.info(f"Processing job {job.id} for file {job.filename}")
+            progress_msg = None
+            kb_entry_id = None
+            try:
+                progress_msg = await bot.send_message(
+                    job.uploader_id,
+                    f"⏳ Начинаю обработку файла: `{job.filename}`...",
+                )
 
-                logging.info(f"Processing job {job.id} for file {job.filename}")
-                await session.execute(
-                    update(IndexingQueue).where(IndexingQueue.id == job.id).values(status='processing'))
-                await session.commit()
+                await asyncio.sleep(1)
+                await bot.edit_message_text(
+                    text=f"⏳ Загружаю файл: `{job.filename}`...",
+                    chat_id=job.uploader_id,
+                    message_id=progress_msg.message_id
+                )
+                file_info = await bot.get_file(job.file_id)
+                file_bytes = await bot.download_file(file_info.file_path)
 
-                progress_msg = None
-                try:
-                    progress_msg = await bot.send_message(job.uploader_id,
-                                                          f"⏳ Начинаю обработку файла: `{job.filename}`...")
+                await asyncio.sleep(1)
+                await bot.edit_message_text(
+                    text=f"⏳ Анализирую и извлекаю текст из `{job.filename}`...",
+                    chat_id=job.uploader_id,
+                    message_id=progress_msg.message_id
+                )
+                indexed_content = await parse_file(file_bytes, job.filename)
+                if not indexed_content:
+                    raise ValueError("Не удалось извлечь текст из файла.")
 
-                    await asyncio.sleep(1)
+                kb_entry_id = await _create_kb_entry(job.filename, indexed_content)
+
+                await bot.edit_message_text(
+                    text=f"⏳ Создаю векторы и индексирую `{job.filename}`...",
+                    chat_id=job.uploader_id,
+                    message_id=progress_msg.message_id
+                )
+                await update_vector_index(kb_entry_id, indexed_content)
+
+                await _set_indexing_job_status(job.id, 'completed')
+                logging.info(f"Job {job.id} completed successfully.")
+
+                await bot.delete_message(chat_id=job.uploader_id, message_id=progress_msg.message_id)
+                await bot.send_message(
+                    job.uploader_id,
+                    f"✅ Файл `{job.filename}` полностью обработан и добавлен в Базу Знаний.",
+                )
+
+            except (DailyLimitError, InsufficientBalanceError) as api_error:
+                error_type = 'paused_limit' if isinstance(api_error, DailyLimitError) else 'paused_balance'
+                await _set_indexing_job_status(job.id, error_type)
+
+                if isinstance(api_error, DailyLimitError):
+                    logging.warning(f"Job {job.id} paused due to daily limit. Worker is sleeping.")
+                    msg_text = f"⌛️ Достигнут дневной лимит. Обработка файла `{job.filename}` будет возобновлена позже. Очередь приостановлена."
                     await bot.edit_message_text(
-                        text=f"⏳ Загружаю файл: `{job.filename}`...",
+                        text=msg_text,
                         chat_id=job.uploader_id,
                         message_id=progress_msg.message_id
                     )
-                    file_info = await bot.get_file(job.file_id)
-                    file_bytes = await bot.download_file(file_info.file_path)
+                    await asyncio.sleep(24 * 60 * 60)
+                    async with async_session_maker() as resume_session:
+                        await resume_session.execute(
+                            update(IndexingQueue).where(IndexingQueue.status == 'paused_limit').values(
+                                status='pending'))
+                        await resume_session.commit()
+                    await bot.send_message(job.uploader_id, "🌞 Лимиты обновлены, возобновляю обработку файлов.")
 
-                    await asyncio.sleep(1)
+                elif isinstance(api_error, InsufficientBalanceError):
+                    logging.error(f"Job {job.id} paused due to zero balance.")
+                    msg_text = f"❗️ Закончился баланс API! Обработка файла `{job.filename}` и вся очередь остановлены."
                     await bot.edit_message_text(
-                        text=f"⏳ Анализирую и извлекаю текст из `{job.filename}`...",
+                        text=msg_text,
                         chat_id=job.uploader_id,
                         message_id=progress_msg.message_id
                     )
-                    indexed_content = await parse_file(file_bytes, job.filename)
-                    if not indexed_content:
-                        raise ValueError("Не удалось извлечь текст из файла.")
+                    await bot.send_message(job.uploader_id, "Пожалуйста, пополните баланс и нажмите кнопку ниже.",
+                                           reply_markup=kb.balance_refilled_keyboard())
 
-                    new_kb_entry = KnowledgeBase(filename=job.filename, indexed_content=indexed_content)
-                    session.add(new_kb_entry)
-                    await session.flush()
+            except (TelegramBadRequest, Exception) as e:
+                if kb_entry_id is not None:
+                    delete_document_vectors(kb_entry_id)
+                    await _delete_kb_entry(kb_entry_id)
 
+                await _set_indexing_job_status(job.id, 'failed')
+                logging.error(f"Job {job.id} failed: {e}")
+                await notify_admins_about_error(
+                    bot,
+                    title="Сбой индексации файла",
+                    user_id=job.uploader_id,
+                    stage="process_queue",
+                    details=str(e),
+                    extra={"job_id": job.id, "filename": job.filename},
+                    exception=e,
+                )
+                if progress_msg:
                     await bot.edit_message_text(
-                        text=f"⏳ Создаю векторы и индексирую `{job.filename}`...",
+                        text=f"❌ Ошибка при обработке `{job.filename}`: {e}",
                         chat_id=job.uploader_id,
                         message_id=progress_msg.message_id
                     )
-                    await update_vector_index(new_kb_entry.id, indexed_content)
-
-                    await session.execute(
-                        update(IndexingQueue).where(IndexingQueue.id == job.id).values(status='completed'))
-                    await session.commit()
-                    logging.info(f"Job {job.id} completed successfully.")
-
-                    await bot.delete_message(chat_id=job.uploader_id, message_id=progress_msg.message_id)
-                    await bot.send_message(job.uploader_id,
-                                           f"✅ Файл `{job.filename}` полностью обработан и добавлен в Базу Знаний.")
-
-                except (DailyLimitError, InsufficientBalanceError) as api_error:
-                    error_type = 'paused_limit' if isinstance(api_error, DailyLimitError) else 'paused_balance'
-                    await session.execute(
-                        update(IndexingQueue).where(IndexingQueue.id == job.id).values(status=error_type))
-                    await session.commit()
-
-                    if isinstance(api_error, DailyLimitError):
-                        logging.warning(f"Job {job.id} paused due to daily limit. Worker is sleeping.")
-                        msg_text = f"⌛️ Достигнут дневной лимит. Обработка файла `{job.filename}` будет возобновлена позже. Очередь приостановлена."
-                        await bot.edit_message_text(
-                            text=msg_text,
-                            chat_id=job.uploader_id,
-                            message_id=progress_msg.message_id
-                        )
-                        await asyncio.sleep(24 * 60 * 60)
-                        async with async_session_maker() as resume_session:
-                            await resume_session.execute(
-                                update(IndexingQueue).where(IndexingQueue.status == 'paused_limit').values(
-                                    status='pending'))
-                            await resume_session.commit()
-                        await bot.send_message(job.uploader_id, "🌞 Лимиты обновлены, возобновляю обработку файлов.")
-
-                    elif isinstance(api_error, InsufficientBalanceError):
-                        logging.error(f"Job {job.id} paused due to zero balance.")
-                        msg_text = f"❗️ Закончился баланс API! Обработка файла `{job.filename}` и вся очередь остановлены."
-                        await bot.edit_message_text(
-                            text=msg_text,
-                            chat_id=job.uploader_id,
-                            message_id=progress_msg.message_id
-                        )
-                        await bot.send_message(job.uploader_id, "Пожалуйста, пополните баланс и нажмите кнопку ниже.",
-                                               reply_markup=kb.balance_refilled_keyboard())
-
-                except (TelegramBadRequest, Exception) as e:
-                    await session.rollback()
-                    await session.execute(
-                        update(IndexingQueue).where(IndexingQueue.id == job.id).values(status='failed'))
-                    await session.commit()
-                    logging.error(f"Job {job.id} failed: {e}")
-                    await notify_admins_about_error(
-                        bot,
-                        title="Сбой индексации файла",
-                        user_id=job.uploader_id,
-                        stage="process_queue",
-                        details=str(e),
-                        extra={"job_id": job.id, "filename": job.filename},
-                        exception=e,
-                    )
-                    if progress_msg:
-                        await bot.edit_message_text(
-                            text=f"❌ Ошибка при обработке `{job.filename}`: {e}",
-                            chat_id=job.uploader_id,
-                            message_id=progress_msg.message_id
-                        )
         except Exception as e:
             logging.critical(f"Critical error in background worker: {e}. Restarting loop in 60s.")
             await notify_admins_about_error(

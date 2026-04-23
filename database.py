@@ -9,7 +9,13 @@ from config import DATABASE_URL
 from memory_mode import MEMORY_MODE_RESET, MEMORY_MODE_TOPIC, get_memory_mode
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE, DEFAULT_SHARED_PROMPT_BLOCK
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_use_lifo=True,
+)
 async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 Base = declarative_base()

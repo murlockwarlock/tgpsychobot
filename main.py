@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from contextlib import suppress
 from logging.handlers import RotatingFileHandler
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -30,6 +31,11 @@ if not BASE_WEBHOOK_URL:
 
 WEBHOOK_SETUP_RETRIES = int(os.environ.get("WEBHOOK_SETUP_RETRIES", 10))
 WEBHOOK_RETRY_DELAY_SEC = int(os.environ.get("WEBHOOK_RETRY_DELAY_SEC", 15))
+POLLING_TIMEOUT = int(os.environ.get("POLLING_TIMEOUT", 10))
+TELEGRAM_DELIVERY_MODE = os.environ.get("TELEGRAM_DELIVERY_MODE", "auto").strip().lower()
+
+if TELEGRAM_DELIVERY_MODE not in {"auto", "webhook", "polling"}:
+    raise ValueError("TELEGRAM_DELIVERY_MODE must be one of: auto, webhook, polling")
 
 
 async def configure_webhook(bot: Bot, webhook_url: str):
@@ -55,6 +61,52 @@ async def configure_webhook(bot: Bot, webhook_url: str):
                 await asyncio.sleep(WEBHOOK_RETRY_DELAY_SEC)
 
     raise last_error
+
+
+async def _start_polling_fallback(bot: Bot, dispatcher: Dispatcher):
+    logging.warning("Switching Telegram delivery to polling mode.")
+    with suppress(Exception):
+        await bot.delete_webhook(drop_pending_updates=True)
+
+    polling_task = asyncio.create_task(
+        dispatcher._polling(
+            bot=bot,
+            polling_timeout=POLLING_TIMEOUT,
+            allowed_updates=dispatcher.resolve_used_update_types(),
+            dispatcher=dispatcher,
+            bots=(bot,),
+        ),
+        name=f"telegram_polling_{APP_PORT}",
+    )
+    dispatcher["_polling_task"] = polling_task
+    return polling_task
+
+
+async def _configure_telegram_delivery(bot: Bot, dispatcher: Dispatcher) -> str:
+    webhook_url = f"{BASE_WEBHOOK_URL}{TELEGRAM_WEBHOOK_PATH}"
+
+    if TELEGRAM_DELIVERY_MODE == "polling":
+        await _start_polling_fallback(bot, dispatcher)
+        return "polling"
+
+    try:
+        await configure_webhook(bot, webhook_url)
+        return "webhook"
+    except Exception as e:
+        await notify_admins_about_error(
+            bot,
+            title="Сбой startup",
+            stage="configure_webhook",
+            details=str(e),
+            extra={"webhook_url": webhook_url, "delivery_mode": TELEGRAM_DELIVERY_MODE},
+            exception=e,
+        )
+        if TELEGRAM_DELIVERY_MODE == "webhook":
+            raise
+
+        logging.warning("Webhook setup failed, falling back to polling mode: %s", e)
+        await _start_polling_fallback(bot, dispatcher)
+        return "polling"
 
 
 async def on_startup(bot: Bot, dispatcher: Dispatcher):
@@ -101,20 +153,6 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
 
     logging.info(f"Set default commands for users and special commands for {len(all_admin_ids)} admins.")
 
-    webhook_url = f"{BASE_WEBHOOK_URL}{TELEGRAM_WEBHOOK_PATH}"
-    try:
-        await configure_webhook(bot, webhook_url)
-    except Exception as e:
-        await notify_admins_about_error(
-            bot,
-            title="Сбой startup",
-            stage="configure_webhook",
-            details=str(e),
-            extra={"webhook_url": webhook_url},
-            exception=e,
-        )
-        raise
-
     logging.info("Running initial subscription check on startup...")
     try:
         await check_subscriptions(bot)
@@ -145,8 +183,7 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
     scheduler.add_job(check_kie_credit_balance, 'interval', minutes=15, args=(bot,))
     scheduler.start()
-
-    dispatcher.shutdown.register(scheduler.shutdown)
+    dispatcher['_scheduler'] = scheduler
 
     bg_task_factories = {
         'process_queue': lambda: process_queue(bot),
@@ -201,11 +238,19 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
 
     _start_bg_task('process_queue')
     _start_bg_task('process_mailings')
-    logging.info("Startup complete.")
+    telegram_delivery_mode = await _configure_telegram_delivery(bot, dispatcher)
+    dispatcher['telegram_delivery_mode'] = telegram_delivery_mode
+    logging.info("Startup complete. Telegram delivery mode: %s", telegram_delivery_mode)
 
 
 async def on_shutdown(bot: Bot, dispatcher: Dispatcher):
     logging.info("Shutting down...")
+    polling_task = dispatcher.get('_polling_task')
+    if polling_task and not polling_task.done():
+        polling_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await polling_task
+
     bg_tasks = dispatcher.get('_bg_tasks', {})
     for task in bg_tasks.values():
         if not task.done():
@@ -217,7 +262,11 @@ async def on_shutdown(bot: Bot, dispatcher: Dispatcher):
             pass
         except Exception:
             pass
-    await bot.delete_webhook(drop_pending_updates=True)
+
+    scheduler = dispatcher.get('_scheduler')
+    if scheduler is not None and scheduler.running:
+        scheduler.shutdown(wait=False)
+
     await bot.session.close()
     logging.info("Shutdown complete.")
 
@@ -225,12 +274,12 @@ async def on_shutdown(bot: Bot, dispatcher: Dispatcher):
 async def aiogram_on_startup(app: web.Application):
     bot: Bot = app['bot']
     dp: Dispatcher = app['dp']
-    await dp.emit_startup(bot=bot, dispatcher=dp)
+    await on_startup(bot, dp)
 
 async def aiogram_on_shutdown(app: web.Application):
     bot: Bot = app['bot']
     dp: Dispatcher = app['dp']
-    await dp.emit_shutdown(bot=bot, dispatcher=dp)
+    await on_shutdown(bot, dp)
 
 
 class _MskFormatter(logging.Formatter):
@@ -268,9 +317,6 @@ def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
-
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
 
     dp.include_router(router)
 

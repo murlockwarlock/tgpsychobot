@@ -3711,7 +3711,7 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
         total_pages = len(pages)
         page = max(0, min(page, total_pages - 1))
 
-        header_main = f"📜 <b>История клиента:</b> {html.escape(target_user.first_name)} (<code>{target_user.id}</code>)\n" if for_admin_view else "📜 <b>Ваша история сообщений:</b>\n"
+        header_main = f"📜 <b>История клиента:</b> {html.escape(target_user.first_name)} (<a href='https://t.me/@id{target_user.id}'>{target_user.id}</a>)\n" if for_admin_view else "📜 <b>Ваша история сообщений:</b>\n"
         text_to_show = header_main + pages[page]
 
         reply_markup = kb.user_history_keyboard(
@@ -6660,7 +6660,7 @@ async def show_plans_for_subscription(message_or_callback, state: FSMContext):
     if user_sub:
         global_discount_percent = user_sub.discount_percent
 
-    text = "Выберите подходящий тарифный план:"
+    text = "Выберите подходящий тариф:"
 
     if user_sub and user_sub.end_date > now and user_sub.plan_id is not None:
         text += "\n\n<b>При смене тарифа срок оплаты нового тарифа добавится к текущему (прибавятся неиспользуемые дни).</b>"
@@ -6733,8 +6733,11 @@ async def choose_payment_provider(callback: CallbackQuery, state: FSMContext):
     duration_unit_text = "дн." if plan.duration_unit == 'days' else "мес."
     text = (
         f"<b>Тариф:</b> {plan.name} ({plan.duration_value} {duration_unit_text})\n"
-        f"<b>Стоимость:</b> {final_price:.2f} руб.\n\n"
+        f"<b>Стоимость:</b> {final_price:.2f} руб.\n"
     )
+    if plan.description:
+        text += f"{html.escape(plan.description)}\n"
+    text += "\n"
 
     if plan.is_trial and plan.upgrades_to_plan:
         upgrade_plan = plan.upgrades_to_plan
@@ -6891,10 +6894,18 @@ async def create_yookassa_invoice(callback: CallbackQuery, state: FSMContext):
         user_ref += f" [id=<code>{callback.from_user.id}</code>]"
         plog.info(f"СЧЕТ_СОЗДАН | Yookassa | {user_ref} | {plan.name} | {price:.2f} руб | PayId={payment.id}")
 
+        plan_allows_renewal = getattr(plan, 'allow_auto_renewal', True)
+        payment_type_line = (
+            "Регулярная оплата, можно отключить в любой момент"
+            if (plan_allows_renewal or plan.is_trial)
+            else "Разовая оплата"
+        )
+
         text = (
             "Ваша ссылка на оплату готова.\n\n"
-            f"Нажимая «Оплатить», я даю согласие на регулярные списания, на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>.\n\n"
-            f"<b>Сумма:</b> {price:.2f} руб."
+            f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>.\n\n"
+            f"<b>Сумма:</b> {price:.2f} руб.\n"
+            f"{payment_type_line}"
         )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -9696,14 +9707,21 @@ async def create_robokassa_invoice(callback: CallbackQuery, state: FSMContext):
     offer_url = config.offer_agreement_url or "#"
 
     if plan_allows_renewal:
-        consent_line = f"Нажимая «Оплатить», я даю согласие на регулярные списания, на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>."
+        consent_line = f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>."
     else:
         consent_line = f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>."
+
+    payment_type_line = (
+        "Регулярная оплата, можно отключить в любой момент"
+        if plan_allows_renewal
+        else "Разовая оплата"
+    )
 
     text = (
         "Ваша ссылка на оплату готова.\n\n"
         f"{consent_line}\n\n"
         f"<b>Сумма:</b> {price:.2f} руб.\n"
+        f"{payment_type_line}\n"
         f"<b>Счёт действует до:</b> {expires_at_msk}\n\n"
         "Если срок действия истечёт, по кнопке ниже автоматически откроется новый счёт."
     )

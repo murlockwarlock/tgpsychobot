@@ -208,6 +208,20 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
 
     trans_label = f"🗣️ Аудио: {current_transcription_provider}" if current_transcription_provider != 'None' else "🗣️ Аудио: выкл"
     builder.button(text=trans_label, callback_data="admin_toggle_transcription")
+    builder.button(text="⏱️ Лимит аудио", callback_data="set_audio_limit")
+
+    threshold_label = int(kie_credit_alert_threshold) if float(kie_credit_alert_threshold).is_integer() else round(kie_credit_alert_threshold, 2)
+    builder.button(text=f"💳 KIE порог: {threshold_label}", callback_data="set_kie_credit_threshold")
+    builder.button(text=f"🌡️ Температура: {round(temperature, 2)}", callback_data="set_temperature")
+    builder.button(
+        text=f"🧠 Память: {memory_mode_label(memory_mode)}",
+        callback_data="toggle_preserve_topic_context"
+    )
+    fb_label = f"🔄 Резерв: {fallback_provider}" if fallback_provider else "🔄 Резерв: выкл"
+    builder.button(text=fb_label, callback_data="admin_toggle_fallback")
+    if fallback_provider:
+        fb_model_short = short_model(fallback_model) if fallback_model else "не задана"
+        builder.button(text=f"Модель: {fb_model_short}", callback_data="admin_change_fallback_model")
 
     builder.button(text=f"👁️ Фото: {current_vision_provider}",
                    callback_data="admin_toggle_vision")
@@ -221,25 +235,14 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                    callback_data="admin_toggle_image_edit")
     builder.button(text=f"Модель: {short_model(image_edit_model)}", callback_data="admin_change_image_edit_model")
 
-    threshold_label = int(kie_credit_alert_threshold) if float(kie_credit_alert_threshold).is_integer() else round(kie_credit_alert_threshold, 2)
-    builder.button(text=f"💳 KIE порог: {threshold_label}", callback_data="set_kie_credit_threshold")
-
-    builder.button(text=f"🌡️ Температура: {round(temperature, 2)}", callback_data="set_temperature")
-    builder.button(
-        text=f"🧠 Память: {memory_mode_label(memory_mode)}",
-        callback_data="toggle_preserve_topic_context"
-    )
-
-    fb_label = f"🔄 Резерв: {fallback_provider}" if fallback_provider else "🔄 Резерв: выкл"
-    builder.button(text=fb_label, callback_data="admin_toggle_fallback")
-    if fallback_provider:
-        fb_model_short = short_model(fallback_model) if fallback_model else "не задана"
-        builder.button(text=f"Модель: {fb_model_short}", callback_data="admin_change_fallback_model")
-
-    builder.button(text="⏱️ Лимит аудио", callback_data="set_audio_limit")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
 
-    builder.adjust(2, 2, 1, 2, 2, 2, 2, 1, 1, 2, 2)
+    # Layout: keys 2+2+1, models 2+2+1, context 2, audio+limit 2,
+    # KIE+temp 2, mem+fallback 2, [fallback model 1], vision 2, gen 2, edit 2, back 1
+    if fallback_provider:
+        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 2, 1, 2, 2, 2, 1)
+    else:
+        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 1)
     return builder.as_markup()
 
 
