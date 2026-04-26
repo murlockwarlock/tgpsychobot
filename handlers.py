@@ -12473,15 +12473,24 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
             )
 
+            memory_mode = get_memory_mode(ai_config)
             stmt = select(DBMessage).where(
                 DBMessage.user_id == user.id,
                 DBMessage.dialogue_id == user.current_dialogue_id,
             )
-            if not is_global_memory_mode(get_memory_mode(ai_config)):
+            if not is_global_memory_mode(memory_mode):
                 stmt = stmt.where(DBMessage.topic_id == current_topic_id)
-            stmt = stmt.order_by(DBMessage.timestamp.asc())
+            stmt = stmt.options(selectinload(DBMessage.topic)).order_by(DBMessage.timestamp.asc())
             result = await session.execute(stmt)
             history = result.scalars().all()
+            history, global_memory_context = ai_integration._build_memory_aware_history(
+                history,
+                current_topic_id,
+                user.current_topic.name if user.current_topic else None,
+                memory_mode,
+            )
+            if global_memory_context:
+                system_prompt = f"{system_prompt}\n\n{global_memory_context}"
 
             photo = message.photo[-1]
             file_info = await bot.get_file(photo.file_id)
