@@ -1415,6 +1415,7 @@ def assign_collections_to_topic_keyboard(topic_id: int, all_colls: list, assigne
 def admin_referral_menu_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="⚙️ Настройки", callback_data="admin_referral_settings")
+    builder.button(text="📩 Шаблоны приглашений", callback_data="admin_referral_templates")
     builder.button(text="👥 Список рефереров", callback_data="admin_referral_referrers_0")
     builder.button(text="⬅️ Назад", callback_data="admin_subscriptions")
     builder.adjust(1)
@@ -1507,4 +1508,55 @@ def admin_referral_referrer_detail_keyboard(referrer_id: int, page: int, total_p
         builder.row(*nav)
 
     builder.row(InlineKeyboardButton(text="⬅️ К списку", callback_data="admin_referral_referrers_0"))
+    return builder.as_markup()
+
+
+def referral_template_share_keyboard(share_url: str):
+    """Кнопка «Поделиться» под каждым шаблоном приглашения (открывает диалог контактов)."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📤 Поделиться", url=share_url)
+    return builder.as_markup()
+
+
+def admin_referral_templates_keyboard(templates: list):
+    """Список шаблонов приглашений для администратора."""
+    builder = InlineKeyboardBuilder()
+    for tpl in templates:
+        short_text = tpl.text[:40].replace('\n', ' ')
+        status = "✅" if tpl.is_enabled else "❌"
+        builder.button(
+            text=f"{status} {tpl.order_num + 1}. {short_text}…",
+            callback_data=f"admin_ref_tpl_{tpl.id}"
+        )
+    builder.button(text="➕ Добавить шаблон", callback_data="admin_ref_tpl_add")
+    builder.button(text="⬅️ Назад", callback_data="admin_referral_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_referral_template_detail_keyboard(tpl_id: int, is_enabled: bool):
+    """Кнопки для управления конкретным шаблоном приглашения."""
+    builder = InlineKeyboardBuilder()
+    toggle_label = "❌ Отключить" if is_enabled else "✅ Включить"
+    builder.button(text="✏️ Редактировать", callback_data=f"admin_ref_tpl_edit_{tpl_id}")
+    builder.button(text=toggle_label, callback_data=f"admin_ref_tpl_toggle_{tpl_id}")
+    builder.button(text="⬆️ Выше", callback_data=f"admin_ref_tpl_up_{tpl_id}")
+    builder.button(text="⬇️ Ниже", callback_data=f"admin_ref_tpl_down_{tpl_id}")
+    builder.button(text="🗑 Удалить", callback_data=f"admin_ref_tpl_del_{tpl_id}")
+    builder.button(text="⬅️ К шаблонам", callback_data="admin_referral_templates")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_referral_template_confirm_delete_keyboard(tpl_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🗑 Да, удалить", callback_data=f"admin_ref_tpl_del_confirm_{tpl_id}")
+    builder.button(text="⬅️ Отмена", callback_data=f"admin_ref_tpl_{tpl_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_referral_template_input_cancel_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Отмена", callback_data="admin_referral_templates")
     return builder.as_markup()

@@ -34,7 +34,8 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      ContentMedia, Topic, SubscriptionPlan, UserSubscription, PromoCode, SubscriptionConfig, Mailing,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
                      ReferralPaymentLog, MailingDeliveryLog, TopicMediaDeck,
-                     MediaCollection, media_collection_items, topic_collection_association)
+                     MediaCollection, media_collection_items, topic_collection_association,
+                     ReferralTemplate)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_questions_file
@@ -299,6 +300,8 @@ class AdminStates(StatesGroup):
     set_referral_pay_days = State()
     set_referral_btn_name = State()
     set_referral_sub_btn_name = State()
+    add_referral_template = State()
+    edit_referral_template = State()
 
 
 class UserStates(StatesGroup):
@@ -13044,15 +13047,24 @@ async def admin_media_delete(callback: CallbackQuery):
 @router.message(ReferralButtonFilter())
 async def show_referral_info(message: Message, bot: Bot):
     """Показывает экран реферальной программы при нажатии кнопки в меню."""
-    text = await _get_referral_screen_text(message.from_user.id, bot)
+    text, ref_link = await _get_referral_screen_text(message.from_user.id, bot)
+    if not text:
+        await message.answer("Реферальная программа недоступна.")
+        return
     await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await _send_referral_templates(message.chat.id, ref_link, bot)
 
 
 @router.callback_query(F.data == "referral_sub_info")
 async def show_referral_from_sub(callback: CallbackQuery, bot: Bot):
     """Показывает экран реферальной программы из меню подписки."""
-    text = await _get_referral_screen_text(callback.from_user.id, bot)
+    text, ref_link = await _get_referral_screen_text(callback.from_user.id, bot)
+    if not text:
+        await callback.message.answer("Реферальная программа недоступна.")
+        await callback.answer()
+        return
     await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await _send_referral_templates(callback.message.chat.id, ref_link, bot)
     await callback.answer()
 
 
@@ -13545,12 +13557,12 @@ async def save_image_edit_model(callback: CallbackQuery):
 #  РЕФЕРАЛЬНАЯ ПРОГРАММА — пользовательские хэндлеры
 # ══════════════════════════════════════════════════════════════
 
-async def _get_referral_screen_text(user_id: int, bot: Bot) -> str:
-    """Формирует текст экрана реферальной программы для пользователя."""
+async def _get_referral_screen_text(user_id: int, bot: Bot) -> tuple[str | None, str | None]:
+    """Возвращает (intro_text, ref_link) или (None, None) если программа недоступна."""
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
         if not config or not config.referral_enabled:
-            return "Реферальная программа недоступна."
+            return None, None
 
         count_result = await session.execute(
             select(func.count()).select_from(User).where(User.referred_by == user_id)
@@ -13568,7 +13580,32 @@ async def _get_referral_screen_text(user_id: int, bot: Bot) -> str:
         f"За каждого зарегистрировавшегося по ссылке — "
         f"вы и ваш друг получаете по <b>{config.referral_bonus_days_referrer} дн.</b> бонуса."
     )
-    return text
+    return text, link
+
+
+async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
+    """Отправляет активные шаблоны приглашений отдельными сообщениями с кнопкой «Поделиться»."""
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(ReferralTemplate)
+            .where(ReferralTemplate.is_enabled == True)
+            .order_by(ReferralTemplate.order_num.asc(), ReferralTemplate.id.asc())
+        )
+        templates = result.scalars().all()
+
+    if not templates:
+        return
+
+    for tpl in templates:
+        tpl_text = tpl.text.replace("{ref_link}", ref_link)
+        share_url = f"https://t.me/share/url?url={parse.quote(ref_link)}&text={parse.quote(tpl_text)}"
+        await bot.send_message(
+            chat_id,
+            tpl_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb.referral_template_share_keyboard(share_url),
+        )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -13932,3 +13969,228 @@ async def admin_referral_referrer_detail(callback: CallbackQuery):
     except Exception:
         await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
+
+
+# ══════════════════════════════════════════════════════════════
+#  РЕФЕРАЛЬНАЯ ПРОГРАММА — управление шаблонами приглашений
+# ══════════════════════════════════════════════════════════════
+
+async def _show_referral_templates_admin(target, edit: bool = True):
+    """Показывает список шаблонов приглашений администратору."""
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(ReferralTemplate)
+            .order_by(ReferralTemplate.order_num.asc(), ReferralTemplate.id.asc())
+        )
+        templates = result.scalars().all()
+
+    count = len(templates)
+    text = f"📩 <b>Шаблоны приглашений</b>\n\nВсего шаблонов: {count}\n\nВыберите шаблон для редактирования или добавьте новый.\n\n<i>Используйте <code>{{ref_link}}</code> в тексте — будет заменено на персональную ссылку пользователя.</i>"
+    markup = kb.admin_referral_templates_keyboard(templates)
+    msg = target.message if isinstance(target, CallbackQuery) else target
+    try:
+        if edit:
+            await msg.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await msg.answer(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        await msg.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "admin_referral_templates")
+async def admin_referral_templates_list(callback: CallbackQuery):
+    await _show_referral_templates_admin(callback, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_ref_tpl_add")
+async def admin_ref_tpl_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.add_referral_template)
+    await callback.message.answer(
+        "Введите текст нового шаблона приглашения.\n\n"
+        "Используйте <code>{ref_link}</code> — будет заменено на персональную ссылку пользователя.",
+        parse_mode="HTML",
+        reply_markup=kb.admin_referral_template_input_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.add_referral_template)
+async def admin_ref_tpl_add_save(message: Message, state: FSMContext):
+    text = message.text.strip() if message.text else ""
+    if not text:
+        await message.answer("Текст не может быть пустым. Попробуйте ещё раз или отмените.",
+                             reply_markup=kb.admin_referral_template_input_cancel_keyboard())
+        return
+    await state.clear()
+    async with async_session_maker() as session:
+        max_order = await session.scalar(
+            select(func.coalesce(func.max(ReferralTemplate.order_num), -1))
+        )
+        tpl = ReferralTemplate(text=text, order_num=(max_order or 0) + 1, is_enabled=True)
+        session.add(tpl)
+        await session.commit()
+    await message.answer("✅ Шаблон добавлен!")
+    await _show_referral_templates_admin(message, edit=False)
+
+
+@router.callback_query(F.data.startswith("admin_ref_tpl_") & ~F.data.startswith("admin_ref_tpl_edit_")
+                       & ~F.data.startswith("admin_ref_tpl_toggle_") & ~F.data.startswith("admin_ref_tpl_up_")
+                       & ~F.data.startswith("admin_ref_tpl_down_") & ~F.data.startswith("admin_ref_tpl_del_")
+                       & (F.data != "admin_ref_tpl_add"))
+async def admin_ref_tpl_detail(callback: CallbackQuery):
+    tpl_id_str = callback.data.replace("admin_ref_tpl_", "")
+    try:
+        tpl_id = int(tpl_id_str)
+    except ValueError:
+        await callback.answer()
+        return
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+    if not tpl:
+        await callback.answer("Шаблон не найден.")
+        return
+    status = "✅ Включён" if tpl.is_enabled else "❌ Отключён"
+    preview = tpl.text[:300]
+    text = f"📩 <b>Шаблон #{tpl.order_num + 1}</b>\nСтатус: {status}\n\n{preview}"
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML",
+                                         reply_markup=kb.admin_referral_template_detail_keyboard(tpl.id, tpl.is_enabled))
+    except Exception:
+        await callback.message.answer(text, parse_mode="HTML",
+                                      reply_markup=kb.admin_referral_template_detail_keyboard(tpl.id, tpl.is_enabled))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_ref_tpl_edit_"))
+async def admin_ref_tpl_edit_start(callback: CallbackQuery, state: FSMContext):
+    tpl_id = int(callback.data.replace("admin_ref_tpl_edit_", ""))
+    await state.set_state(AdminStates.edit_referral_template)
+    await state.update_data(edit_tpl_id=tpl_id)
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+    current = tpl.text if tpl else ""
+    await callback.message.answer(
+        f"Введите новый текст шаблона (текущий отправлен ниже):\n\n"
+        f"Используйте <code>{{ref_link}}</code> — заменяется на ссылку пользователя.",
+        parse_mode="HTML",
+        reply_markup=kb.admin_referral_template_input_cancel_keyboard(),
+    )
+    await callback.message.answer(current)
+    await callback.answer()
+
+
+@router.message(AdminStates.edit_referral_template)
+async def admin_ref_tpl_edit_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    tpl_id = data.get("edit_tpl_id")
+    new_text = message.text.strip() if message.text else ""
+    if not new_text:
+        await message.answer("Текст не может быть пустым. Попробуйте ещё раз или отмените.",
+                             reply_markup=kb.admin_referral_template_input_cancel_keyboard())
+        return
+    await state.clear()
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if tpl:
+            tpl.text = new_text
+            await session.commit()
+    await message.answer("✅ Шаблон обновлён!")
+    await _show_referral_templates_admin(message, edit=False)
+
+
+@router.callback_query(F.data.startswith("admin_ref_tpl_toggle_"))
+async def admin_ref_tpl_toggle(callback: CallbackQuery):
+    tpl_id = int(callback.data.replace("admin_ref_tpl_toggle_", ""))
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if tpl:
+            tpl.is_enabled = not tpl.is_enabled
+            await session.commit()
+            is_enabled = tpl.is_enabled
+    status = "✅ Включён" if is_enabled else "❌ Отключён"
+    await callback.answer(f"Шаблон {status.lower()}")
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=kb.admin_referral_template_detail_keyboard(tpl_id, is_enabled)
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("admin_ref_tpl_up_"))
+async def admin_ref_tpl_move_up(callback: CallbackQuery):
+    tpl_id = int(callback.data.replace("admin_ref_tpl_up_", ""))
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if not tpl:
+            await callback.answer()
+            return
+        prev = await session.scalar(
+            select(ReferralTemplate)
+            .where(ReferralTemplate.order_num < tpl.order_num)
+            .order_by(ReferralTemplate.order_num.desc())
+            .limit(1)
+        )
+        if prev:
+            tpl.order_num, prev.order_num = prev.order_num, tpl.order_num
+            await session.commit()
+    await callback.answer("⬆️ Перемещён выше")
+    await _show_referral_templates_admin(callback, edit=True)
+
+
+@router.callback_query(F.data.startswith("admin_ref_tpl_down_"))
+async def admin_ref_tpl_move_down(callback: CallbackQuery):
+    tpl_id = int(callback.data.replace("admin_ref_tpl_down_", ""))
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if not tpl:
+            await callback.answer()
+            return
+        nxt = await session.scalar(
+            select(ReferralTemplate)
+            .where(ReferralTemplate.order_num > tpl.order_num)
+            .order_by(ReferralTemplate.order_num.asc())
+            .limit(1)
+        )
+        if nxt:
+            tpl.order_num, nxt.order_num = nxt.order_num, tpl.order_num
+            await session.commit()
+    await callback.answer("⬇️ Перемещён ниже")
+    await _show_referral_templates_admin(callback, edit=True)
+
+
+@router.callback_query(F.data.startswith("admin_ref_tpl_del_") & ~F.data.startswith("admin_ref_tpl_del_confirm_"))
+async def admin_ref_tpl_delete_prompt(callback: CallbackQuery):
+    tpl_id = int(callback.data.replace("admin_ref_tpl_del_", ""))
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+    if not tpl:
+        await callback.answer("Шаблон не найден.")
+        return
+    preview = tpl.text[:80].replace('\n', ' ')
+    try:
+        await callback.message.edit_text(
+            f"🗑 Удалить шаблон?\n\n<i>{preview}…</i>",
+            parse_mode="HTML",
+            reply_markup=kb.admin_referral_template_confirm_delete_keyboard(tpl_id),
+        )
+    except Exception:
+        await callback.message.answer(
+            f"🗑 Удалить шаблон?\n\n<i>{preview}…</i>",
+            parse_mode="HTML",
+            reply_markup=kb.admin_referral_template_confirm_delete_keyboard(tpl_id),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_ref_tpl_del_confirm_"))
+async def admin_ref_tpl_delete_confirm(callback: CallbackQuery):
+    tpl_id = int(callback.data.replace("admin_ref_tpl_del_confirm_", ""))
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if tpl:
+            await session.delete(tpl)
+            await session.commit()
+    await callback.answer("🗑 Шаблон удалён")
+    await _show_referral_templates_admin(callback, edit=True)

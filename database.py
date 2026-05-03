@@ -317,6 +317,14 @@ class SubscriptionConfig(Base):
     referral_pay_bonus_first_only = Column(Boolean, default=True, nullable=False)
 
 
+class ReferralTemplate(Base):
+    __tablename__ = 'referral_templates'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    text = Column(Text, nullable=False)
+    order_num = Column(Integer, default=0, nullable=False)
+    is_enabled = Column(Boolean, default=True, nullable=False)
+
+
 class ReferralPaymentLog(Base):
     __tablename__ = 'referral_payment_logs'
     id = Column(Integer, primary_key=True, autoincrement=True)
