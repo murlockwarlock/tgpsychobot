@@ -1,4 +1,4 @@
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, SwitchInlineQueryChosenChat
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from database import async_session_maker, Content, SubscriptionConfig, TestConfig, Topic
@@ -1511,10 +1511,19 @@ def admin_referral_referrer_detail_keyboard(referrer_id: int, page: int, total_p
     return builder.as_markup()
 
 
-def referral_template_share_keyboard(share_url: str):
-    """Кнопка «Поделиться» под каждым шаблоном приглашения (открывает диалог контактов)."""
+def referral_template_share_keyboard(tpl_id: int):
+    """Кнопка «Поделиться» под каждым шаблоном — открывает выбор контакта/чата внутри Telegram."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="📤 Поделиться", url=share_url)
+    builder.button(
+        text="📤 Поделиться",
+        switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
+            query=f"ref_tpl_{tpl_id}",
+            allow_user_chats=True,
+            allow_bot_chats=False,
+            allow_group_chats=True,
+            allow_channel_chats=False,
+        )
+    )
     return builder.as_markup()
 
 

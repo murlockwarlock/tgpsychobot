@@ -13622,8 +13622,7 @@ async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
 
     for tpl in templates:
         tpl_text = tpl.text.replace("{ref_link}", ref_link)
-        share_url = f"https://t.me/share/url?text={parse.quote(tpl_text)}"
-        markup = kb.referral_template_share_keyboard(share_url)
+        markup = kb.referral_template_share_keyboard(tpl.id)
         try:
             await bot.send_message(
                 chat_id, tpl_text,
@@ -13632,12 +13631,51 @@ async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
                 reply_markup=markup,
             )
         except TelegramBadRequest:
-            # Текст содержит невалидный HTML — отправляем как plain text
             await bot.send_message(
                 chat_id, tpl_text,
                 disable_web_page_preview=True,
                 reply_markup=markup,
             )
+
+
+# ── Inline handler для шаблонов приглашений ──
+@router.inline_query(F.query.regexp(r'^ref_tpl_\d+$'))
+async def inline_referral_template(inline_query):
+    from aiogram.types import InlineQueryResultArticle, InputTextMessageContent
+    user_id = inline_query.from_user.id
+    tpl_id_str = inline_query.query.replace("ref_tpl_", "")
+    try:
+        tpl_id = int(tpl_id_str)
+    except ValueError:
+        await inline_query.answer([], cache_time=1)
+        return
+
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+
+    if not tpl or not tpl.is_enabled:
+        await inline_query.answer([], cache_time=1)
+        return
+
+    bot_info = await inline_query.bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+    tpl_text = tpl.text.replace("{ref_link}", ref_link)
+
+    await inline_query.answer(
+        results=[
+            InlineQueryResultArticle(
+                id=str(tpl_id),
+                title="Отправить приглашение",
+                description=tpl_text[:100],
+                input_message_content=InputTextMessageContent(
+                    message_text=tpl_text,
+                    disable_web_page_preview=True,
+                ),
+            )
+        ],
+        cache_time=30,
+        is_personal=True,
+    )
 
 
 # ══════════════════════════════════════════════════════════════
