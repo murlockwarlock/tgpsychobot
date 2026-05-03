@@ -13572,13 +13572,29 @@ async def _get_referral_screen_text(user_id: int, bot: Bot) -> tuple[str | None,
     bot_info = await bot.get_me()
     link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
 
+    # Блок бонусов для пригласившего (вас)
+    your_bonuses = []
+    if config.referral_bonus_days_referrer > 0:
+        your_bonuses.append(f"• +{config.referral_bonus_days_referrer} дн. при регистрации приглашённого")
+    if config.referral_pay_bonus_enabled and config.referral_pay_bonus_days > 0:
+        pay_note = " (только за первую)" if config.referral_pay_bonus_first_only else " (за каждую оплату)"
+        your_bonuses.append(f"• +{config.referral_pay_bonus_days} дн. при оплате приглашённого{pay_note}")
+
+    # Блок бонусов для друга
+    friend_bonuses = []
+    if config.referral_bonus_days_referral > 0:
+        friend_bonuses.append(f"• +{config.referral_bonus_days_referral} дн. при регистрации по вашей ссылке")
+
+    your_block = "\n".join(your_bonuses) if your_bonuses else "• нет бонусов"
+    friend_block = "\n".join(friend_bonuses) if friend_bonuses else "• нет бонусов"
+
     text = (
         f"🔗 <b>Реферальная программа</b>\n\n"
-        f"Пригласите друга по ссылке и получите бонусные дни!\n\n"
-        f"<b>Ваша ссылка:</b>\n{link}\n\n"
+        f"Пригласите друга по ссылке и получайте бонусные дни!\n\n"
+        f"🎁 <b>Ваши бонусы:</b>\n{your_block}\n\n"
+        f"🎁 <b>Бонусы вашего друга:</b>\n{friend_block}\n\n"
         f"👥 <b>Приглашено:</b> {referral_count} чел.\n\n"
-        f"За каждого зарегистрировавшегося по ссылке — "
-        f"вы и ваш друг получаете по <b>{config.referral_bonus_days_referrer} дн.</b> бонуса."
+        f"<b>Ваша ссылка:</b>\n{link}"
     )
     return text, link
 
