@@ -13622,7 +13622,9 @@ async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
 
     for tpl in templates:
         tpl_text = tpl.text.replace("{ref_link}", ref_link)
-        share_url = f"https://t.me/share/url?text={parse.quote(tpl_text)}"
+        # url= нужен для десктопа; text= — шаблон без ссылки (чтобы не дублировалась)
+        share_text = tpl.text.replace("{ref_link}", "").strip()
+        share_url = f"https://t.me/share/url?url={parse.quote(ref_link)}&text={parse.quote(share_text)}"
         markup = kb.referral_template_share_keyboard(share_url)
         try:
             await bot.send_message(
