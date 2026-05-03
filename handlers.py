@@ -13572,29 +13572,13 @@ async def _get_referral_screen_text(user_id: int, bot: Bot) -> tuple[str | None,
     bot_info = await bot.get_me()
     link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
 
-    # Блок бонусов для пригласившего (вас)
-    your_bonuses = []
-    if config.referral_bonus_days_referrer > 0:
-        your_bonuses.append(f"• +{config.referral_bonus_days_referrer} дн. при регистрации приглашённого")
-    if config.referral_pay_bonus_enabled and config.referral_pay_bonus_days > 0:
-        pay_note = " (только за первую)" if config.referral_pay_bonus_first_only else " (за каждую оплату)"
-        your_bonuses.append(f"• +{config.referral_pay_bonus_days} дн. при оплате приглашённого{pay_note}")
-
-    # Блок бонусов для друга
-    friend_bonuses = []
-    if config.referral_bonus_days_referral > 0:
-        friend_bonuses.append(f"• +{config.referral_bonus_days_referral} дн. при регистрации по вашей ссылке")
-
-    your_block = "\n".join(your_bonuses) if your_bonuses else "• нет бонусов"
-    friend_block = "\n".join(friend_bonuses) if friend_bonuses else "• нет бонусов"
-
     text = (
         f"🔗 <b>Реферальная программа</b>\n\n"
-        f"Пригласите друга по ссылке и получайте бонусные дни!\n\n"
-        f"🎁 <b>Ваши бонусы:</b>\n{your_block}\n\n"
-        f"🎁 <b>Бонусы вашего друга:</b>\n{friend_block}\n\n"
+        f"Пригласите друга по ссылке и получите бонусные дни!\n\n"
+        f"<b>Ваша ссылка:</b>\n{link}\n\n"
         f"👥 <b>Приглашено:</b> {referral_count} чел.\n\n"
-        f"<b>Ваша ссылка:</b>\n{link}"
+        f"За каждого зарегистрировавшегося по ссылке — "
+        f"вы и ваш друг получаете по <b>{config.referral_bonus_days_referrer} дн.</b> бонуса."
     )
     return text, link
 
@@ -13612,66 +13596,16 @@ async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
     if not templates:
         return
 
-    await bot.send_message(
-        chat_id,
-        "📩 <b>Шаблоны приглашений</b>\n\n"
-        "Я отправлю несколько готовых сообщений ниже отдельными сообщениями. "
-        "Выбери любой и отправь своим друзьям.",
-        parse_mode="HTML",
-    )
-
     for tpl in templates:
         tpl_text = tpl.text.replace("{ref_link}", ref_link)
-        markup = kb.referral_template_share_keyboard(tpl.id)
-        try:
-            await bot.send_message(
-                chat_id, tpl_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=markup,
-            )
-        except TelegramBadRequest:
-            await bot.send_message(
-                chat_id, tpl_text,
-                disable_web_page_preview=True,
-                reply_markup=markup,
-            )
-
-
-# ── Inline handler для шаблонов приглашений ──
-@router.inline_query(F.query.regexp(r'^ref_tpl_\d+$'))
-async def inline_referral_template(inline_query):
-    from aiogram.types import InlineQueryResultArticle, InputTextMessageContent
-    user_id = inline_query.from_user.id
-    tpl_id = int(inline_query.query.replace("ref_tpl_", ""))
-
-    async with async_session_maker() as session:
-        tpl = await session.get(ReferralTemplate, tpl_id)
-
-    if not tpl or not tpl.is_enabled:
-        await inline_query.answer([], cache_time=1, is_personal=True)
-        return
-
-    bot_info = await inline_query.bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
-    tpl_text = tpl.text.replace("{ref_link}", ref_link)
-
-    await inline_query.answer(
-        results=[
-            InlineQueryResultArticle(
-                id=str(tpl_id),
-                title="📤 Отправить приглашение",
-                description=tpl_text[:120],
-                input_message_content=InputTextMessageContent(
-                    message_text=tpl_text,
-                    disable_web_page_preview=True,
-                ),
-            )
-        ],
-        cache_time=30,
-        is_personal=True,
-    )
-
+        share_url = f"https://t.me/share/url?url={parse.quote(ref_link)}&text={parse.quote(tpl_text)}"
+        await bot.send_message(
+            chat_id,
+            tpl_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb.referral_template_share_keyboard(share_url),
+        )
 
 
 # ══════════════════════════════════════════════════════════════
