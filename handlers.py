@@ -13615,13 +13615,21 @@ async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
     for tpl in templates:
         tpl_text = tpl.text.replace("{ref_link}", ref_link)
         share_url = f"https://t.me/share/url?url={parse.quote(ref_link)}&text={parse.quote(tpl_text)}"
-        await bot.send_message(
-            chat_id,
-            tpl_text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=kb.referral_template_share_keyboard(share_url),
-        )
+        markup = kb.referral_template_share_keyboard(share_url)
+        try:
+            await bot.send_message(
+                chat_id, tpl_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=markup,
+            )
+        except TelegramBadRequest:
+            # Текст содержит невалидный HTML — отправляем как plain text
+            await bot.send_message(
+                chat_id, tpl_text,
+                disable_web_page_preview=True,
+                reply_markup=markup,
+            )
 
 
 # ══════════════════════════════════════════════════════════════
