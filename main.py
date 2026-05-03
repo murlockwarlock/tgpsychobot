@@ -116,11 +116,13 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
 
     user_commands = [
         BotCommand(command="start", description="Запустить / Перезапустить бота"),
+        BotCommand(command="ref", description="🤝 Пригласить друзей"),
         BotCommand(command="help", description="Помощь")
     ]
 
     admin_commands = [
         BotCommand(command="start", description="Запустить / Перезапустить бота"),
+        BotCommand(command="ref", description="🤝 Пригласить друзей"),
         BotCommand(command="admin", description="Админ-панель"),
         BotCommand(command="help", description="Помощь (для админов)")
     ]

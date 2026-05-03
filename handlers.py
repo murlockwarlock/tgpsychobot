@@ -1615,6 +1615,16 @@ async def is_admin(user_id: int) -> bool:
         return user.is_admin if user else False
 
 
+@router.message(Command("ref"))
+async def cmd_ref(message: Message, bot: Bot):
+    text, ref_link = await _get_referral_screen_text(message.from_user.id, bot)
+    if text:
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+        await _send_referral_templates(message.chat.id, ref_link, bot)
+    else:
+        await message.answer("Реферальная программа недоступна.")
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     if not await is_admin(message.from_user.id):
