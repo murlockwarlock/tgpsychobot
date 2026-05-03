@@ -1755,6 +1755,17 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 await show_subscription_info(message, state, bot)
                 return
 
+            elif args == "ref":
+                if welcome_bonus_text:
+                    await message.answer(welcome_bonus_text, parse_mode="HTML")
+                text, ref_link = await _get_referral_screen_text(message.from_user.id, bot)
+                if text:
+                    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+                    await _send_referral_templates(message.chat.id, ref_link, bot)
+                else:
+                    await message.answer("Реферальная программа недоступна.")
+                return
+
             elif args == "test":
                 if welcome_bonus_text:
                     await message.answer(welcome_bonus_text, parse_mode="HTML")
