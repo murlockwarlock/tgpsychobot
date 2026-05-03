@@ -13596,6 +13596,14 @@ async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
     if not templates:
         return
 
+    await bot.send_message(
+        chat_id,
+        "📩 <b>Шаблоны приглашений</b>\n\n"
+        "Я отправлю несколько готовых сообщений ниже отдельными сообщениями. "
+        "Выбери любой и отправь своим друзьям.",
+        parse_mode="HTML",
+    )
+
     for tpl in templates:
         tpl_text = tpl.text.replace("{ref_link}", ref_link)
         share_url = f"https://t.me/share/url?url={parse.quote(ref_link)}&text={parse.quote(tpl_text)}"
