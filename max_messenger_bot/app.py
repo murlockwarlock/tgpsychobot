@@ -37,6 +37,20 @@ configure_logging()
 log = get_bot_logger("app")
 max_log = get_max_logger("transport")
 
+TEXT_FILE_INPUT_STATES = {
+    "admin_edit_content_text",
+    "admin_edit_topic_prompt",
+    "admin_edit_topic_intro",
+    "admin_test_set_prompt",
+    "admin_kb_create_content",
+    "admin_kb_edit_content",
+    "admin_ai_set_system_prompt",
+    "admin_ai_set_global_prompt_appendix",
+    "admin_mailing_text",
+    "admin_ref_tpl_add",
+    "admin_ref_tpl_edit",
+}
+
 
 def _log_background_task_result(task: asyncio.Task[None]) -> None:
     try:
@@ -118,6 +132,10 @@ class MaxBotApplication:
 
         text = (message.text or "").strip()
         state = await self.states.get(message.sender.user_id)
+        if state and not text and message.media_type == "file" and message.media_token and state.state in TEXT_FILE_INPUT_STATES:
+            text = await self._read_text_attachment(message)
+            if not text:
+                return
         # Commands always escape any pending input state so users can't get stuck
         if state and text.startswith("/"):
             await self.states.clear(message.sender.user_id)
@@ -323,6 +341,12 @@ class MaxBotApplication:
             if state.state == "admin_referral_set_sub_btn_name":
                 await admin_referral_service.save_sub_btn_name(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
+            if state.state == "admin_ref_tpl_add":
+                await admin_referral_service.save_new_template(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "admin_ref_tpl_edit":
+                await admin_referral_service.save_template_edit(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
             # ── Collections states ──────────────────────────────────────────
             if state.state == "admin_coll_creating":
                 await admin_collections_service.save_create(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -470,6 +494,27 @@ class MaxBotApplication:
             await self._handle_image(message, caption=text)
             return
         await common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text)
+
+    async def _read_text_attachment(self, message: IncomingMessage) -> str | None:
+        try:
+            payload = await self.client.download_attachment(message.media_token, message.media_url)
+        except Exception:
+            log.exception("Failed to download text attachment token=%s", message.media_token)
+            await self.client.send_message(chat_id=message.chat_id, text="Не удалось скачать файл. Отправьте текст сообщением или повторите файл.")
+            return None
+        if len(payload) > 512 * 1024:
+            await self.client.send_message(chat_id=message.chat_id, text="Файл слишком большой. Максимум для текстового поля — 512 КБ.")
+            return None
+        for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+            try:
+                text = payload.decode(encoding).strip()
+                break
+            except UnicodeDecodeError:
+                text = ""
+        if not text:
+            await self.client.send_message(chat_id=message.chat_id, text="Не удалось прочитать файл как текст. Поддерживаются обычные .txt/.md в UTF-8 или Windows-1251.")
+            return None
+        return text
 
     async def _handle_voice(self, message: IncomingMessage) -> None:
         """Download and transcribe a voice/audio message."""
@@ -1022,11 +1067,46 @@ class MaxBotApplication:
             if data == "admin_referral_cancel_input":
                 await admin_referral_service.cancel_input(self.client, self.states, chat_id, user_id)
                 return
+            if data == "admin_referral_templates":
+                await admin_referral_service.show_templates(self.client, chat_id)
+                return
+            if data == "admin_ref_tpl_add":
+                await admin_referral_service.start_add_template(self.client, self.states, chat_id, user_id)
+                return
+            if data.startswith("admin_ref_tpl_edit_"):
+                await admin_referral_service.start_edit_template(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_ref_tpl_toggle_"):
+                await admin_referral_service.toggle_template(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_ref_tpl_up_"):
+                await admin_referral_service.move_template(self.client, chat_id, int(data.rsplit("_", 1)[1]), "up")
+                return
+            if data.startswith("admin_ref_tpl_down_"):
+                await admin_referral_service.move_template(self.client, chat_id, int(data.rsplit("_", 1)[1]), "down")
+                return
+            if data.startswith("admin_ref_tpl_del_confirm_"):
+                await admin_referral_service.delete_template(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_ref_tpl_del_"):
+                await admin_referral_service.confirm_delete_template(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_ref_tpl_"):
+                await admin_referral_service.show_template_detail(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
             if data.startswith("admin_referral_referrers_page_"):
+                await admin_referral_service.show_referrers_page(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_referral_referrers_"):
                 await admin_referral_service.show_referrers_page(self.client, chat_id, int(data.rsplit("_", 1)[1]))
                 return
             if data.startswith("admin_referral_referrer_detail_"):
                 payload = data.replace("admin_referral_referrer_detail_", "", 1)
+                parts = payload.rsplit("_", 1)
+                await admin_referral_service.show_referrer_detail(self.client, chat_id, int(parts[0]), int(parts[1]))
+                return
+            if data.startswith("admin_referral_referrer_"):
+                payload = data.replace("admin_referral_referrer_", "", 1)
                 parts = payload.rsplit("_", 1)
                 await admin_referral_service.show_referrer_detail(self.client, chat_id, int(parts[0]), int(parts[1]))
                 return
@@ -1411,7 +1491,11 @@ async def create_web_app() -> web.Application:
     await client.__aenter__()
     await client.set_commands([
         {"name": "start", "description": "Запустить бота"},
+        {"name": "help", "description": "Помощь"},
+        {"name": "promo", "description": "Ввести промокод"},
         {"name": "ref", "description": "Реферальная программа"},
+        {"name": "test", "description": "Пройти тест"},
+        {"name": "admin", "description": "Админ-панель"},
     ])
     bot_app = MaxBotApplication(client)
 

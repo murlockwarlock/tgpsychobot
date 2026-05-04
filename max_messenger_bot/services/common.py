@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 from ..ai import AIServiceError, generate_image, get_ai_response
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
-from ..keyboards import build_main_menu, disclaimer_keyboard
+from ..keyboards import build_main_menu, disclaimer_keyboard, inline_keyboard, main_menu_row
 from ..logging_utils import get_bot_logger
 from ..legacy import (
     AIConfig,
@@ -255,7 +255,7 @@ async def reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> No
                 )
             )
             await session.commit()
-    await client.send_message(chat_id=chat_id, text="✅ Память очищена.")
+    await client.send_message(chat_id=chat_id, text="✅ Память очищена.", attachments=inline_keyboard([main_menu_row()]))
 
 
 async def ensure_access_before_chat(client: MaxApiClient, chat_id: int, user: User) -> bool:
@@ -270,7 +270,12 @@ async def ensure_access_before_chat(client: MaxApiClient, chat_id: int, user: Us
                 text="Чтобы продолжить диалог, активируйте подписку или бонусные дни.",
                 attachments=[{
                     "type": "inline_keyboard",
-                    "payload": {"buttons": [[{"type": "callback", "text": "Открыть подписки", "payload": "show_subscription_info_from_chat"}]]},
+                    "payload": {
+                        "buttons": [
+                            [{"type": "callback", "text": "Открыть подписки", "payload": "show_subscription_info_from_chat"}],
+                            main_menu_row(),
+                        ]
+                    },
                 }],
             )
             return False

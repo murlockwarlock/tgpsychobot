@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 from yookassa import Configuration, Payment
 
 from ..api import MaxApiClient
-from ..keyboards import callback_button, link_button, payment_providers_keyboard, plans_keyboard, retry_subscription_keyboard, subscription_keyboard
+from ..keyboards import callback_button, inline_keyboard, link_button, main_menu_row, payment_providers_keyboard, plans_keyboard, retry_subscription_keyboard, subscription_keyboard
 from ..logging_utils import get_payments_logger
 from ..legacy import (
     PromoCode,
@@ -240,7 +240,7 @@ async def create_yookassa_link(client: MaxApiClient, chat_id: int, user_id: int,
             await session.commit()
         log.info("Yookassa payment created user_id=%s plan_id=%s payment_id=%s amount=%.2f", user_id, plan_id, payment.id, price)
         text = f"Ссылка на оплату готова.\n\n<b>Сумма:</b> {price:.2f} руб."
-        await client.send_message(chat_id=chat_id, text=text, attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через ЮKassa", payment.confirmation.confirmation_url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")]]}}])
+        await client.send_message(chat_id=chat_id, text=text, attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через ЮKassa", payment.confirmation.confirmation_url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")], main_menu_row()]}}])
     except Exception:
         log.exception("Yookassa payment creation failed user_id=%s plan_id=%s amount=%.2f", user_id, plan_id, price)
         await client.send_message(chat_id=chat_id, text="Не удалось сформировать ссылку ЮKassa. Попробуйте позже.")
@@ -282,7 +282,7 @@ async def create_robokassa_link(client: MaxApiClient, chat_id: int, user_id: int
         await client.send_message(
             chat_id=chat_id,
             text=f"Ссылка на оплату готова.\n\n<b>Сумма:</b> {price:.2f} руб.",
-            attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через Robokassa", url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")]]}}],
+            attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через Robokassa", url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")], main_menu_row()]}}],
         )
     except Exception:
         log.exception("Robokassa payment link creation failed user_id=%s plan_id=%s amount=%.2f", user_id, plan_id, price)
@@ -291,7 +291,7 @@ async def create_robokassa_link(client: MaxApiClient, chat_id: int, user_id: int
 
 async def start_promo_entry(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
     await states.set(user_id, chat_id, "awaiting_promo_code", {})
-    await client.send_message(chat_id=chat_id, text="Введите промокод сообщением.")
+    await client.send_message(chat_id=chat_id, text="Введите промокод сообщением.", attachments=inline_keyboard([main_menu_row()]))
 
 
 async def apply_promo_code(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, code_text: str) -> None:
@@ -389,6 +389,7 @@ async def _send_referral_templates(client: MaxApiClient, chat_id: int, ref_link:
     await client.send_message(
         chat_id=chat_id,
         text="📩 <b>Шаблоны приглашений</b>\n\nНиже — готовые сообщения. Выберите любое и отправьте друзьям.",
+        attachments=inline_keyboard([main_menu_row()]),
     )
     for tpl in templates:
         tpl_text = tpl.text.replace("{ref_link}", ref_link)
@@ -413,5 +414,5 @@ async def show_referral_info(client: MaxApiClient, chat_id: int, user_id: int) -
         f"👥 <b>Приглашено:</b> {referral_count}\n\n"
         f"За каждого приглашённого вы и ваш друг получите по <b>{config.referral_bonus_days_referrer} дн.</b>"
     )
-    await client.send_message(chat_id=chat_id, text=text)
+    await client.send_message(chat_id=chat_id, text=text, attachments=inline_keyboard([main_menu_row()]))
     await _send_referral_templates(client, chat_id, link)

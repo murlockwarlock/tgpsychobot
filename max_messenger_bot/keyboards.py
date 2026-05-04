@@ -23,6 +23,10 @@ def inline_keyboard(rows: list[list[dict]]) -> list[dict]:
     return [{"type": "inline_keyboard", "payload": {"buttons": rows}}]
 
 
+def main_menu_row(text: str = "⬅️ В главное меню") -> list[dict]:
+    return [callback_button(text, "main_menu")]
+
+
 async def build_main_menu() -> list[dict]:
     async with async_session_maker() as session:
         content_items = (
@@ -98,7 +102,7 @@ def settings_keyboard(user) -> list[dict]:
     return inline_keyboard(
         [
             [callback_button("✏️ Имя", "settings_change_name"), callback_button("👤 Пол", "settings_change_gender")],
-            [callback_button("🔢 Возраст", "settings_change_age"), callback_button("📏 Длина", "settings_toggle_length")],
+            [callback_button("🔢 Возраст", "settings_change_age"), callback_button("📏 Длина ответов", "settings_toggle_length")],
             [callback_button("🏠 Главное меню", "main_menu")],
         ]
     )
@@ -142,7 +146,7 @@ def subscription_keyboard(
         rows.append([callback_button("🔗 Привязать TG аккаунт", "link_tg_start")])
     if referral_enabled:
         rows.append([callback_button(referral_btn_name, "referral_sub_info")])
-    rows.append([callback_button("⬅️ Главное меню", "main_menu")])
+    rows.append(main_menu_row())
     return inline_keyboard(rows)
 
 
@@ -153,6 +157,7 @@ def retry_subscription_keyboard() -> list[dict]:
             [callback_button("❌ Отменить автопродление", "sub_disable_renewal")],
             [callback_button("🔄 Оформить заново", "sub_cancel_retry")],
             [callback_button("🎁 Ввести промокод", "sub_enter_promo")],
+            main_menu_row(),
         ]
     )
 
@@ -182,12 +187,14 @@ def plans_keyboard(plans: Iterable[SubscriptionPlan], discount_percent: int, use
         label = f"{plan.name} ({plan.duration_value} {unit}) - {price:.2f} руб."
         rows.append([callback_button(label, f"sub_pay_{plan.id}")])
     rows.append([callback_button("⬅️ Назад", "back_to_sub_info")])
+    rows.append(main_menu_row())
     return inline_keyboard(rows)
 
 
 def payment_providers_keyboard(providers: list[dict]) -> list[dict]:
     rows = [[button] for button in providers]
     rows.append([callback_button("⬅️ К тарифам", "sub_select_plan")])
+    rows.append(main_menu_row())
     return inline_keyboard(rows)
 
 
@@ -362,6 +369,44 @@ def admin_profile_keyboard(admin_id: int, can_view_history: bool, can_revoke: bo
         rows.append([callback_button("➖ Разжаловать", f"admin_revoke_{admin_id}")])
     rows.append([callback_button("⬅️ К списку админов", "admin_manage_admins")])
     return inline_keyboard(rows)
+
+
+def admin_referral_templates_keyboard(templates: list) -> list[dict]:
+    rows: list[list[dict]] = []
+    for tpl in templates:
+        short_text = (tpl.text or "")[:40].replace("\n", " ")
+        suffix = "..." if len(tpl.text or "") > 40 else ""
+        status = "✅" if tpl.is_enabled else "❌"
+        rows.append([callback_button(f"{status} {tpl.order_num + 1}. {short_text}{suffix}", f"admin_ref_tpl_{tpl.id}")])
+    rows.append([callback_button("➕ Добавить шаблон", "admin_ref_tpl_add")])
+    rows.append([callback_button("⬅️ Назад", "admin_referral_menu")])
+    return inline_keyboard(rows)
+
+
+def admin_referral_template_detail_keyboard(tpl_id: int, is_enabled: bool) -> list[dict]:
+    toggle_label = "❌ Отключить" if is_enabled else "✅ Включить"
+    return inline_keyboard(
+        [
+            [callback_button("✏️ Редактировать", f"admin_ref_tpl_edit_{tpl_id}")],
+            [callback_button(toggle_label, f"admin_ref_tpl_toggle_{tpl_id}")],
+            [callback_button("⬆️ Выше", f"admin_ref_tpl_up_{tpl_id}"), callback_button("⬇️ Ниже", f"admin_ref_tpl_down_{tpl_id}")],
+            [callback_button("🗑 Удалить", f"admin_ref_tpl_del_{tpl_id}")],
+            [callback_button("⬅️ К шаблонам", "admin_referral_templates")],
+        ]
+    )
+
+
+def admin_referral_template_confirm_delete_keyboard(tpl_id: int) -> list[dict]:
+    return inline_keyboard(
+        [
+            [callback_button("🗑 Да, удалить", f"admin_ref_tpl_del_confirm_{tpl_id}")],
+            [callback_button("⬅️ Отмена", f"admin_ref_tpl_{tpl_id}")],
+        ]
+    )
+
+
+def admin_referral_template_input_cancel_keyboard() -> list[dict]:
+    return inline_keyboard([[callback_button("⬅️ Отмена", "admin_referral_templates")]])
 
 
 def admin_topics_list_keyboard(topics: list) -> list[dict]:

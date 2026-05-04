@@ -6,8 +6,15 @@ import math
 from sqlalchemy import desc, func, select
 
 from ..api import MaxApiClient
-from ..keyboards import callback_button, inline_keyboard
-from ..legacy import ReferralPaymentLog, SubscriptionConfig, User, async_session_maker
+from ..keyboards import (
+    admin_referral_template_confirm_delete_keyboard,
+    admin_referral_template_detail_keyboard,
+    admin_referral_template_input_cancel_keyboard,
+    admin_referral_templates_keyboard,
+    callback_button,
+    inline_keyboard,
+)
+from ..legacy import ReferralPaymentLog, ReferralTemplate, SubscriptionConfig, User, async_session_maker
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 
@@ -45,6 +52,7 @@ async def show_menu(client: MaxApiClient, chat_id: int) -> None:
     )
     rows = [
         [callback_button("⚙️ Настройки", "admin_referral_settings")],
+        [callback_button("📩 Шаблоны приглашений", "admin_referral_templates")],
         [callback_button("👥 Рефереры", "admin_referral_referrers_page_0")],
         [callback_button("◀️ Назад", "admin_panel")],
     ]
@@ -240,6 +248,138 @@ async def cancel_input(client: MaxApiClient, states: StateStore, chat_id: int, u
     await show_settings(client, chat_id)
 
 
+async def show_templates(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        templates = (
+            await session.execute(
+                select(ReferralTemplate).order_by(ReferralTemplate.order_num.asc(), ReferralTemplate.id.asc())
+            )
+        ).scalars().all()
+    text = (
+        f"📩 <b>Шаблоны приглашений</b>\n\n"
+        f"Всего шаблонов: {len(templates)}\n\n"
+        "Используйте <code>{ref_link}</code> в тексте — он будет заменён на персональную ссылку пользователя."
+    )
+    await client.send_message(chat_id=chat_id, text=text, attachments=admin_referral_templates_keyboard(templates))
+
+
+async def start_add_template(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+    await states.set(user_id, chat_id, "admin_ref_tpl_add", {})
+    await client.send_message(
+        chat_id=chat_id,
+        text="Введите текст нового шаблона приглашения.\n\nИспользуйте <code>{ref_link}</code> для персональной ссылки.",
+        attachments=admin_referral_template_input_cancel_keyboard(),
+    )
+
+
+async def save_new_template(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    value = text.strip()
+    if not value:
+        await client.send_message(chat_id=chat_id, text="Текст не может быть пустым.", attachments=admin_referral_template_input_cancel_keyboard())
+        return
+    async with async_session_maker() as session:
+        max_order = await session.scalar(select(func.coalesce(func.max(ReferralTemplate.order_num), -1)))
+        session.add(ReferralTemplate(text=value, order_num=(max_order or 0) + 1, is_enabled=True))
+        await session.commit()
+    await states.clear(user_id)
+    await client.send_message(chat_id=chat_id, text="✅ Шаблон добавлен.")
+    await show_templates(client, chat_id)
+
+
+async def show_template_detail(client: MaxApiClient, chat_id: int, tpl_id: int) -> None:
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+    if not tpl:
+        await client.send_message(chat_id=chat_id, text="Шаблон не найден.")
+        return
+    status = "✅ Включён" if tpl.is_enabled else "❌ Отключён"
+    preview = html.escape((tpl.text or "")[:1200])
+    text = f"📩 <b>Шаблон #{tpl.order_num + 1}</b>\nСтатус: {status}\n\n{preview}"
+    await client.send_message(chat_id=chat_id, text=text, attachments=admin_referral_template_detail_keyboard(tpl.id, tpl.is_enabled))
+
+
+async def start_edit_template(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, tpl_id: int) -> None:
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+    if not tpl:
+        await client.send_message(chat_id=chat_id, text="Шаблон не найден.")
+        return
+    await states.set(user_id, chat_id, "admin_ref_tpl_edit", {"tpl_id": tpl_id})
+    await client.send_message(
+        chat_id=chat_id,
+        text="Введите новый текст шаблона. Текущий текст отправлен ниже.",
+        attachments=admin_referral_template_input_cancel_keyboard(),
+    )
+    await client.send_message(chat_id=chat_id, text=tpl.text)
+
+
+async def save_template_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    value = text.strip()
+    if not value:
+        await client.send_message(chat_id=chat_id, text="Текст не может быть пустым.", attachments=admin_referral_template_input_cancel_keyboard())
+        return
+    snapshot = await states.get(user_id)
+    tpl_id = int((snapshot.data if snapshot else {}).get("tpl_id", 0))
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if tpl:
+            tpl.text = value
+            await session.commit()
+    await states.clear(user_id)
+    await client.send_message(chat_id=chat_id, text="✅ Шаблон обновлён.")
+    await show_templates(client, chat_id)
+
+
+async def toggle_template(client: MaxApiClient, chat_id: int, tpl_id: int) -> None:
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if not tpl:
+            await client.send_message(chat_id=chat_id, text="Шаблон не найден.")
+            return
+        tpl.is_enabled = not tpl.is_enabled
+        await session.commit()
+    await show_template_detail(client, chat_id, tpl_id)
+
+
+async def move_template(client: MaxApiClient, chat_id: int, tpl_id: int, direction: str) -> None:
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if not tpl:
+            await client.send_message(chat_id=chat_id, text="Шаблон не найден.")
+            return
+        comparator = ReferralTemplate.order_num < tpl.order_num if direction == "up" else ReferralTemplate.order_num > tpl.order_num
+        ordering = ReferralTemplate.order_num.desc() if direction == "up" else ReferralTemplate.order_num.asc()
+        neighbor = await session.scalar(select(ReferralTemplate).where(comparator).order_by(ordering).limit(1))
+        if neighbor:
+            tpl.order_num, neighbor.order_num = neighbor.order_num, tpl.order_num
+            await session.commit()
+    await show_templates(client, chat_id)
+
+
+async def confirm_delete_template(client: MaxApiClient, chat_id: int, tpl_id: int) -> None:
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+    if not tpl:
+        await client.send_message(chat_id=chat_id, text="Шаблон не найден.")
+        return
+    preview = html.escape((tpl.text or "")[:120].replace("\n", " "))
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"🗑 Удалить шаблон?\n\n<i>{preview}...</i>",
+        attachments=admin_referral_template_confirm_delete_keyboard(tpl_id),
+    )
+
+
+async def delete_template(client: MaxApiClient, chat_id: int, tpl_id: int) -> None:
+    async with async_session_maker() as session:
+        tpl = await session.get(ReferralTemplate, tpl_id)
+        if tpl:
+            await session.delete(tpl)
+            await session.commit()
+    await client.send_message(chat_id=chat_id, text="🗑 Шаблон удалён.")
+    await show_templates(client, chat_id)
+
+
 async def show_referrers_page(client: MaxApiClient, chat_id: int, page: int) -> None:
     async with async_session_maker() as session:
         # Count per referrer (referrer_id = referred_by value)
@@ -319,7 +459,7 @@ async def show_referrer_detail(client: MaxApiClient, chat_id: int, referrer_id: 
         r_name = html.escape(r.first_name or "")
         if r.username:
             r_name += f" @{html.escape(r.username)}"
-        referral_lines.append(r_name or str(r.user_id))
+        referral_lines.append(r_name or str(r.id))
 
     referrals_text = "\n".join(referral_lines) if referral_lines else "—"
     text = (
