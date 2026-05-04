@@ -132,13 +132,20 @@ PAGE_LOG_SIZE = 15
 
 
 async def show_payment_stats(client: MaxApiClient, chat_id: int) -> None:
+    from ..models import MAX_ID_OFFSET
     async with async_session_maker() as session:
         now = datetime.utcnow()
-        total_users = (await session.execute(select(func.count(User.id)))).scalar() or 0
+        total_users = (await session.execute(
+            select(func.count(User.id)).where(User.id >= MAX_ID_OFFSET)
+        )).scalar() or 0
 
         active_paid_subs = (await session.execute(
             select(UserSubscription)
-            .where(UserSubscription.plan_id.is_not(None), UserSubscription.end_date > now)
+            .where(
+                UserSubscription.plan_id.is_not(None),
+                UserSubscription.end_date > now,
+                UserSubscription.user_id >= MAX_ID_OFFSET,
+            )
             .options(selectinload(UserSubscription.plan))
         )).scalars().all()
         active_paid_count = len(active_paid_subs)
@@ -146,21 +153,30 @@ async def show_payment_stats(client: MaxApiClient, chat_id: int) -> None:
 
         active_trials_count = (await session.execute(
             select(func.count(UserSubscription.id)).where(
-                UserSubscription.plan_id.is_(None), UserSubscription.end_date > now
+                UserSubscription.plan_id.is_(None),
+                UserSubscription.end_date > now,
+                UserSubscription.user_id >= MAX_ID_OFFSET,
             )
         )).scalar() or 0
 
         expired_count = (await session.execute(
-            select(func.count(UserSubscription.id)).where(UserSubscription.end_date <= now)
+            select(func.count(UserSubscription.id)).where(
+                UserSubscription.end_date <= now,
+                UserSubscription.user_id >= MAX_ID_OFFSET,
+            )
         )).scalar() or 0
 
-        total_robo_revenue = (await session.execute(select(func.sum(RobokassaPayment.amount)))).scalar() or 0.0
-        total_yoo_revenue = (await session.execute(select(func.sum(YookassaPayment.amount)))).scalar() or 0.0
+        total_robo_revenue = (await session.execute(
+            select(func.sum(RobokassaPayment.amount)).where(RobokassaPayment.user_id >= MAX_ID_OFFSET)
+        )).scalar() or 0.0
+        total_yoo_revenue = (await session.execute(
+            select(func.sum(YookassaPayment.amount)).where(YookassaPayment.user_id >= MAX_ID_OFFSET)
+        )).scalar() or 0.0
 
         plan_breakdown = (await session.execute(
             select(SubscriptionPlan.name, func.count(UserSubscription.id))
             .join(UserSubscription)
-            .where(UserSubscription.end_date > now)
+            .where(UserSubscription.end_date > now, UserSubscription.user_id >= MAX_ID_OFFSET)
             .group_by(SubscriptionPlan.name)
         )).all()
 

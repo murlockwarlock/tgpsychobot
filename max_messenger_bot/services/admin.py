@@ -63,8 +63,14 @@ async def show_stats(client: MaxApiClient, chat_id: int) -> None:
 async def show_subscriptions_summary(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
-        active_subs = await session.scalar(select(func.count()).select_from(UserSubscription).where(UserSubscription.end_date > func.now())) or 0
-        total_subs = await session.scalar(select(func.count()).select_from(UserSubscription)) or 0
+        active_subs = await session.scalar(
+            select(func.count()).select_from(UserSubscription).where(
+                UserSubscription.end_date > func.now(), UserSubscription.user_id >= MAX_ID_OFFSET
+            )
+        ) or 0
+        total_subs = await session.scalar(
+            select(func.count()).select_from(UserSubscription).where(UserSubscription.user_id >= MAX_ID_OFFSET)
+        ) or 0
         plans_count = await session.scalar(select(func.count()).select_from(SubscriptionPlan)) or 0
         promo_count = await session.scalar(select(func.count()).select_from(PromoCode)) or 0
     status = "✅ Включены" if (config and config.subscriptions_enabled) else "❌ Выключены"

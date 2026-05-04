@@ -16,14 +16,19 @@ REFERRAL_REFERRERS_PAGE_SIZE = 10
 async def show_menu(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
+        from ..models import MAX_ID_OFFSET
         referrers_count = (
             await session.execute(
-                select(func.count(func.distinct(User.referred_by))).where(User.referred_by.isnot(None))
+                select(func.count(func.distinct(User.referred_by))).where(
+                    User.referred_by.isnot(None), User.id >= MAX_ID_OFFSET
+                )
             )
         ).scalar() or 0
         referrals_count = (
             await session.execute(
-                select(func.count()).where(User.referred_by.isnot(None))
+                select(func.count()).select_from(User).where(
+                    User.referred_by.isnot(None), User.id >= MAX_ID_OFFSET
+                )
             )
         ).scalar() or 0
         total_turnover = (
@@ -40,7 +45,7 @@ async def show_menu(client: MaxApiClient, chat_id: int) -> None:
     )
     rows = [
         [callback_button("⚙️ Настройки", "admin_referral_settings")],
-        [callback_button("👥 Рефереры", "admin_referral_referrers_0")],
+        [callback_button("👥 Рефереры", "admin_referral_referrers_page_0")],
         [callback_button("◀️ Назад", "admin_panel")],
     ]
     await client.send_message(chat_id=chat_id, text=text, attachments=inline_keyboard(rows))

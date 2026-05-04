@@ -127,10 +127,11 @@ async def restart_text_edit(client: MaxApiClient, states: StateStore, chat_id: i
 
 
 async def _get_recipient_ids(session, audience: str, user_id: int) -> list[int]:
+    from ..models import MAX_ID_OFFSET
     if audience == "self":
         return [user_id]
 
-    stmt = select(User.id)
+    stmt = select(User.id).where(User.id >= MAX_ID_OFFSET)
 
     if audience == "all":
         return list((await session.execute(stmt)).scalars().all())
@@ -202,7 +203,9 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
     for recipient_id in recipient_ids:
         try:
             attachments = _preview_attachments(media_type, media_token, include_keyboard=False)
-            await client.send_message(user_id=recipient_id, text=mailing_text, attachments=attachments)
+            from ..models import MAX_ID_OFFSET
+            max_api_user_id = recipient_id - MAX_ID_OFFSET if recipient_id >= MAX_ID_OFFSET else recipient_id
+            await client.send_message(user_id=max_api_user_id, text=mailing_text, attachments=attachments)
             success_count += 1
             log.info("Mailing delivered mailing_id=%s target_id=%s", mailing_id, recipient_id)
         except Exception:
@@ -240,13 +243,17 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
 
 
 async def show_history(client: MaxApiClient, chat_id: int, page: int) -> None:
+    from ..models import MAX_ID_OFFSET
     async with async_session_maker() as session:
-        total_mailings = await session.scalar(select(func.count()).select_from(Mailing)) or 0
+        total_mailings = await session.scalar(
+            select(func.count()).select_from(Mailing).where(Mailing.creator_id >= MAX_ID_OFFSET)
+        ) or 0
         total_pages = max(1, math.ceil(total_mailings / PAGE_SIZE))
         page = max(0, min(page, total_pages - 1))
         mailings = (
             await session.execute(
                 select(Mailing)
+                .where(Mailing.creator_id >= MAX_ID_OFFSET)
                 .order_by(Mailing.created_at.desc(), Mailing.id.desc())
                 .offset(page * PAGE_SIZE)
                 .limit(PAGE_SIZE)

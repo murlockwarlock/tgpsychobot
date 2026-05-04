@@ -118,6 +118,10 @@ class MaxBotApplication:
 
         text = (message.text or "").strip()
         state = await self.states.get(message.sender.user_id)
+        # Commands always escape any pending input state so users can't get stuck
+        if state and text.startswith("/"):
+            await self.states.clear(message.sender.user_id)
+            state = None
         if state:
             if state.state == "awaiting_tg_id":
                 from .services.link_tg import process_tg_link
@@ -439,11 +443,13 @@ class MaxBotApplication:
             content = await session.scalar(select(Content).where(Content.button_title == text, Content.is_visible == True).limit(1))
             user = await session.get(User, message.sender.user_id, options=[selectinload(User.subscription)])
         if content:
+            from .keyboards import callback_button, inline_keyboard
             content_attachments = await common.get_content_attachments(content.key)
+            nav = inline_keyboard([[callback_button("◀️ Главное меню", "main_menu")]])
             await self.client.send_message(
                 chat_id=message.chat_id,
                 text=content.text_content or "Раздел пока пуст.",
-                attachments=content_attachments or None,
+                attachments=(content_attachments or []) + nav,
             )
             return
 
@@ -510,6 +516,9 @@ class MaxBotApplication:
 
         if data == "main_menu":
             await common.send_main_menu(self.client, chat_id)
+            return
+        if data == "topic_start_dialogue":
+            await self.client.send_message(chat_id=chat_id, text="✍️ Напишите ваш первый вопрос, и я отвечу.")
             return
         if data == "noop":
             await self.client.answer_callback(callback.callback_id)

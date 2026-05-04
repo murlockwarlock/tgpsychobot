@@ -63,11 +63,13 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         text = f"✅ Продолжаем тему: <b>{topic.name}</b>."
     else:
         text = f"✅ Переключились на тему: <b>{topic.name}</b>.\n\nПамять диалога очищена."
-    await client.send_message(chat_id=chat_id, text=text)
     await client.send_message(
         chat_id=chat_id,
-        text="Просто напишите своё первое сообщение, чтобы начать диалог ✍️",
-        attachments=inline_keyboard([[callback_button("◀️ Главное меню", "main_menu")]]),
+        text=text,
+        attachments=inline_keyboard([[
+            callback_button("💬 Начать диалог", "topic_start_dialogue"),
+            callback_button("◀️ Главное меню", "main_menu"),
+        ]]),
     )
 
 
