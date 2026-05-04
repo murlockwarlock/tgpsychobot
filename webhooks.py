@@ -198,12 +198,13 @@ async def handle_yookassa_webhook(request: web.Request):
                 user_part = user_ref_log or f"[id={user_id_str}]"
                 plan_part = plan_name_log or f"plan_id={plan_id_raw}"
                 plog.info(f"ОПЛАТА_ПРЕРВАНА | Yookassa | {user_part} | {plan_part} | PayId={payment_id}")
-                if is_recurring_payment and attempt_num:
+                uid_int = int(user_id_str)
+                if is_recurring_payment and attempt_num and uid_int < 100_000_000_000:
                     try:
                         if auto_renewal_disabled:
                             end_date_text = user_end_date.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M МСК') if user_end_date else "неизвестной даты"
                             await bot.send_message(
-                                int(user_id_str),
+                                uid_int,
                                 f"Не удалось списать средства (ЮKassa) после 3 попыток. Автопродление отключено.\n\n"
                                 f"Текущая подписка активна до {end_date_text}."
                             )
@@ -214,9 +215,9 @@ async def handle_yookassa_webhook(request: web.Request):
                                 if attempt_num == 1
                                 else f"Не удалось списать средства (ЮKassa). Последняя попытка — {next_retry_text}."
                             )
-                            await bot.send_message(int(user_id_str), retry_text)
+                            await bot.send_message(uid_int, retry_text)
                         else:
-                            await bot.send_message(int(user_id_str), "Не удалось списать средства (ЮKassa).")
+                            await bot.send_message(uid_int, "Не удалось списать средства (ЮKassa).")
                     except Exception:
                         pass
                 if config and config.notifications_enabled:
@@ -409,14 +410,17 @@ async def handle_yookassa_webhook(request: web.Request):
                 user_ref_log = f"[id={user_id}]"
 
             plog.info(f"ОПЛАТА | Yookassa | {user_ref_log} | {plan_name_for_notif} | {plan_price_for_notif:.2f} руб | PayId={payment_id}")
-            await bot.send_message(user_id, f"✅ Ваша подписка на тариф «{plan_name_for_notif}» успешно оформлена!")
+            # Skip TG notifications for MAX users (user_id >= MAX_ID_OFFSET = 100_000_000_000)
+            if user_id < 100_000_000_000:
+                await bot.send_message(user_id, f"✅ Ваша подписка на тариф «{plan_name_for_notif}» успешно оформлена!")
             if referrer_bonus_user_id and referrer_bonus_days > 0:
                 try:
-                    await bot.send_message(
-                        referrer_bonus_user_id,
-                        f"💰 Ваш реферал оформил подписку! Вам начислено <b>{referrer_bonus_days} бонусных дн.</b>",
-                        parse_mode="HTML"
-                    )
+                    if referrer_bonus_user_id < 100_000_000_000:
+                        await bot.send_message(
+                            referrer_bonus_user_id,
+                            f"💰 Ваш реферал оформил подписку! Вам начислено <b>{referrer_bonus_days} бонусных дн.</b>",
+                            parse_mode="HTML"
+                        )
                 except Exception:
                     pass
 
@@ -740,7 +744,7 @@ async def handle_robokassa_result(request: web.Request):
                     ))
                     await session.commit()
                     if ref_config_rk.referral_pay_bonus_enabled and ref_config_rk.referral_pay_bonus_days > 0:
-                        if not already_paid_rk:
+                        if not already_paid_rk and referrer_bonus_user_id_rk < 100_000_000_000:
                             try:
                                 await bot.send_message(
                                     referrer_bonus_user_id_rk,
@@ -753,11 +757,13 @@ async def handle_robokassa_result(request: web.Request):
 
         end_date_msk = end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M')
 
-        await bot.send_message(payment_user_id,
-                               f"Мы получили оплату {payment_amount_for_notif:.2f} руб по вашему тарифу «{plan_name_for_notif}».\n"
-                               f"Действие тарифа продлено до {end_date_msk} МСК.\n\n"
-                               f"Благодарим, что продолжаете пользоваться ботом!\n"
-                               f"Вы всегда можете направить нам свои пожелания, предложения по его работе.")
+        # Skip TG notification for MAX users (user_id >= MAX_ID_OFFSET = 100_000_000_000)
+        if payment_user_id < 100_000_000_000:
+            await bot.send_message(payment_user_id,
+                                   f"Мы получили оплату {payment_amount_for_notif:.2f} руб по вашему тарифу «{plan_name_for_notif}».\n"
+                                   f"Действие тарифа продлено до {end_date_msk} МСК.\n\n"
+                                   f"Благодарим, что продолжаете пользоваться ботом!\n"
+                                   f"Вы всегда можете направить нам свои пожелания, предложения по его работе.")
 
         if is_renewal:
             plog.info(f"ПРОДЛЕНИЕ | Robokassa | {user_display} | {plan_name_for_notif} | {payment_amount_for_notif:.2f} руб | InvId={inv_id}")

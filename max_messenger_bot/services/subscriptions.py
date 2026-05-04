@@ -15,6 +15,7 @@ from ..logging_utils import get_payments_logger
 from ..legacy import (
     PromoCode,
     ReferralTemplate,
+    RobokassaPayment,
     SubscriptionConfig,
     SubscriptionPlan,
     TrialUsageHistory,
@@ -257,7 +258,19 @@ async def create_robokassa_link(client: MaxApiClient, chat_id: int, user_id: int
     discount_percent = user.subscription.discount_percent if user.subscription else 0
     price = plan.price * (1 - discount_percent / 100) if discount_percent and not plan.is_trial else plan.price
     try:
-        invoice_id = int(utc_now().timestamp())
+        # Create DB record first so webhook can look it up by auto-increment id
+        async with async_session_maker() as session:
+            new_payment = RobokassaPayment(
+                user_id=user_id,
+                plan_id=plan_id,
+                amount=price,
+                expires_at=utc_now() + timedelta(hours=24),
+            )
+            session.add(new_payment)
+            await session.commit()
+            await session.refresh(new_payment)
+            invoice_id = new_payment.id
+
         url = _generate_robokassa_payment_url(
             config.robokassa_merchant_login,
             config.robokassa_password_1,
