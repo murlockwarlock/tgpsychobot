@@ -28,7 +28,7 @@ def _format_duration(plan: SubscriptionPlan) -> str:
 async def list_plans(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         plans = (await session.execute(select(SubscriptionPlan).order_by(SubscriptionPlan.price.asc(), SubscriptionPlan.id.asc()))).scalars().all()
-    text = "📦 <b>Тарифы</b><br><br>Выберите тариф для редактирования." if plans else "📦 <b>Тарифы</b><br><br>Тарифов пока нет."
+    text = "📦 <b>Тарифы</b><br/><br/>Выберите тариф для редактирования." if plans else "📦 <b>Тарифы</b><br/><br/>Тарифов пока нет."
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_plans_list_keyboard(plans))
 
 
@@ -40,17 +40,17 @@ async def show_plan_editor(client: MaxApiClient, chat_id: int, plan_id: int) -> 
         return
     upgrade_name = plan.upgrades_to_plan.name if plan.upgrades_to_plan else "не задан"
     text = (
-        f"<b>{html.escape(plan.name)}</b><br><br>"
-        f"<b>ID:</b> {plan.id}<br>"
-        f"<b>Цена:</b> {plan.price:.2f} руб.<br>"
-        f"<b>Длительность:</b> {_format_duration(plan)}<br>"
-        f"<b>Активен:</b> {'да' if plan.is_active else 'нет'}<br>"
-        f"<b>Только для админов:</b> {'да' if getattr(plan, 'admin_only', False) else 'нет'}<br>"
-        f"<b>Пробный тариф:</b> {'да' if plan.is_trial else 'нет'}<br>"
-        f"<b>Автопродление:</b> {'да' if getattr(plan, 'allow_auto_renewal', True) else 'нет'}<br>"
-        f"<b>Апгрейд после триала:</b> {html.escape(upgrade_name)}<br>"
-        f"<b>Кулдаун триала:</b> {plan.trial_cooldown_days} дн.<br><br>"
-        f"<b>Описание:</b><br><pre><code>{html.escape(plan.description or 'Не задано')}</code></pre>"
+        f"<b>{html.escape(plan.name)}</b><br/><br/>"
+        f"<b>ID:</b> {plan.id}<br/>"
+        f"<b>Цена:</b> {plan.price:.2f} руб.<br/>"
+        f"<b>Длительность:</b> {_format_duration(plan)}<br/>"
+        f"<b>Активен:</b> {'да' if plan.is_active else 'нет'}<br/>"
+        f"<b>Только для админов:</b> {'да' if getattr(plan, 'admin_only', False) else 'нет'}<br/>"
+        f"<b>Пробный тариф:</b> {'да' if plan.is_trial else 'нет'}<br/>"
+        f"<b>Автопродление:</b> {'да' if getattr(plan, 'allow_auto_renewal', True) else 'нет'}<br/>"
+        f"<b>Апгрейд после триала:</b> {html.escape(upgrade_name)}<br/>"
+        f"<b>Кулдаун триала:</b> {plan.trial_cooldown_days} дн.<br/><br/>"
+        f"<b>Описание:</b><br/><pre><code>{html.escape(plan.description or 'Не задано')}</code></pre>"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_plan_editor_keyboard(plan))
 
@@ -336,7 +336,7 @@ async def show_plan_upgrade_menu(client: MaxApiClient, chat_id: int, plan_id: in
             )
         ).scalars().all()
     text = (
-        f"Выберите целевой тариф для «{html.escape(plan.name)}».<br><br>"
+        f"Выберите целевой тариф для «{html.escape(plan.name)}».<br/><br/>"
         "Если апгрейд не нужен, оставьте вариант «Без апгрейда»."
     )
     await client.send_message(
@@ -387,7 +387,7 @@ async def delete_plan(client: MaxApiClient, chat_id: int, plan_id: int) -> None:
 async def list_promocodes(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         promos = (await session.execute(select(PromoCode).order_by(PromoCode.id.desc()))).scalars().all()
-    text = "🎁 <b>Промокоды</b><br><br>Выберите промокод для редактирования." if promos else "🎁 <b>Промокоды</b><br><br>Промокодов пока нет."
+    text = "🎁 <b>Промокоды</b><br/><br/>Выберите промокод для редактирования." if promos else "🎁 <b>Промокоды</b><br/><br/>Промокодов пока нет."
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_promocodes_list_keyboard(promos))
 
 
@@ -399,12 +399,12 @@ async def show_promo_editor(client: MaxApiClient, chat_id: int, promo_id: int) -
         return
     scope = "все тарифы" if promo.applies_to_all_plans else f"{len(promo.applicable_plans)} тариф(ов)"
     text = (
-        f"<b>{html.escape(promo.code)}</b><br><br>"
-        f"<b>ID:</b> {promo.id}<br>"
-        f"<b>Скидка:</b> {promo.discount_percent}%<br>"
-        f"<b>Бесплатные дни:</b> {promo.free_days}<br>"
-        f"<b>Использовано:</b> {promo.times_used} / {promo.max_uses}<br>"
-        f"<b>Активен:</b> {'да' if promo.is_active else 'нет'}<br>"
+        f"<b>{html.escape(promo.code)}</b><br/><br/>"
+        f"<b>ID:</b> {promo.id}<br/>"
+        f"<b>Скидка:</b> {promo.discount_percent}%<br/>"
+        f"<b>Бесплатные дни:</b> {promo.free_days}<br/>"
+        f"<b>Использовано:</b> {promo.times_used} / {promo.max_uses}<br/>"
+        f"<b>Активен:</b> {'да' if promo.is_active else 'нет'}<br/>"
         f"<b>Применяется к:</b> {scope}"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_promo_editor_keyboard(promo))
@@ -633,7 +633,7 @@ async def show_promo_assign_menu(client: MaxApiClient, chat_id: int, promo_id: i
         plans = (await session.execute(select(SubscriptionPlan).order_by(SubscriptionPlan.price.asc(), SubscriptionPlan.id.asc()))).scalars().all()
         assigned_plan_ids = {plan.id for plan in promo.applicable_plans}
     text = (
-        f"Привязка тарифов к промокоду «{html.escape(promo.code)}».<br><br>"
+        f"Привязка тарифов к промокоду «{html.escape(promo.code)}».<br/><br/>"
         "Если включён режим для всех тарифов, список ниже не ограничивает применение."
     )
     await client.send_message(

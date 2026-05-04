@@ -17,7 +17,7 @@ from ..storage import StateStore
 async def show_export_menu(client: MaxApiClient, chat_id: int) -> None:
     await client.send_message(
         chat_id=chat_id,
-        text="📤 <b>Экспорт данных</b><br><br>Выберите, что экспортировать:",
+        text="📤 <b>Экспорт данных</b><br/><br/>Выберите, что экспортировать:",
         attachments=admin_export_keyboard(),
     )
 
@@ -31,7 +31,7 @@ async def show_date_filter_menu(
     await states.set(user_id, chat_id, "admin_export_date_filter", {})
     await client.send_message(
         chat_id=chat_id,
-        text="🗓 <b>Фильтр по датам</b><br><br>Выберите диапазон для экспорта сообщений:",
+        text="🗓 <b>Фильтр по датам</b><br/><br/>Выберите диапазон для экспорта сообщений:",
         attachments=admin_date_filter_keyboard(),
     )
 
@@ -66,8 +66,8 @@ async def start_date_manual_from(
     await client.send_message(
         chat_id=chat_id,
         text=(
-            "✏️ Введите дату начала в формате <b>ДД-ММ-ГГГГ</b><br>"
-            "Пример: <b>01-09-2025</b><br><br>"
+            "✏️ Введите дату начала в формате <b>ДД-ММ-ГГГГ</b><br/>"
+            "Пример: <b>01-09-2025</b><br/><br/>"
             "Или отправьте <b>0</b>, чтобы не ограничивать начало."
         ),
     )
@@ -97,8 +97,8 @@ async def save_date_from(
     await client.send_message(
         chat_id=chat_id,
         text=(
-            "✏️ Теперь введите дату окончания в формате <b>ДД-ММ-ГГГГ</b><br>"
-            "Пример: <b>31-12-2025</b><br><br>"
+            "✏️ Теперь введите дату окончания в формате <b>ДД-ММ-ГГГГ</b><br/>"
+            "Пример: <b>31-12-2025</b><br/><br/>"
             "Или отправьте <b>0</b>, чтобы не ограничивать конец (до сегодня)."
         ),
     )
@@ -202,7 +202,7 @@ async def run_export(
     except Exception as exc:
         await client.send_message(
             chat_id=chat_id,
-            text=f"Ошибка при отправке файла: {exc}<br><br>Записей: {len(rows)}",
+            text=f"Ошибка при отправке файла: {exc}<br/><br/>Записей: {len(rows)}",
         )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -248,7 +248,7 @@ async def export_users_csv(client: MaxApiClient, chat_id: int) -> None:
     except Exception as exc:
         await client.send_message(
             chat_id=chat_id,
-            text=f"Ошибка при отправке файла: {exc}<br><br>Записей в файле: {len(users)}",
+            text=f"Ошибка при отправке файла: {exc}<br/><br/>Записей в файле: {len(users)}",
         )
     finally:
         Path(tmp_path).unlink(missing_ok=True)

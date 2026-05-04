@@ -101,7 +101,7 @@ async def show_list(client: MaxApiClient, chat_id: int, page: int = 0) -> None:
     page = max(0, min(page, total_pages - 1))
     page_colls = all_colls[page * COLL_PAGE_SIZE: (page + 1) * COLL_PAGE_SIZE]
 
-    text = f"🎨 <b>Медиа-коллекции</b> ({total})<br>Нажмите на коллекцию для управления."
+    text = f"🎨 <b>Медиа-коллекции</b> ({total})<br/>Нажмите на коллекцию для управления."
     await client.send_message(
         chat_id=chat_id,
         text=text,
@@ -130,8 +130,8 @@ async def show_detail(client: MaxApiClient, chat_id: int, coll_id: int) -> None:
 
     topics_text = ", ".join(html.escape(n) for n in topic_names) if topic_names else "нет"
     text = (
-        f"📂 <b>{html.escape(coll.name)}</b><br><br>"
-        f"Файлов: {file_count}<br>"
+        f"📂 <b>{html.escape(coll.name)}</b><br/><br/>"
+        f"Файлов: {file_count}<br/>"
         f"Привязана к темам: {topics_text}"
     )
     await client.send_message(
@@ -291,7 +291,7 @@ async def show_files(
 
     text = (
         f"📎 Файлы коллекции «{html.escape(coll.name)}» "
-        f"(отмечено {len(assigned_ids)} из {total})<br>"
+        f"(отмечено {len(assigned_ids)} из {total})<br/>"
         f"Нажмите, чтобы добавить/убрать файл."
     )
     await client.send_message(

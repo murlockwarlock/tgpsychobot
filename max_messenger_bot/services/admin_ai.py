@@ -87,11 +87,11 @@ async def show_settings(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
     model_name = getattr(config, MODEL_FIELDS.get(config.provider or "", ""), None) or "не выбрана"
     text = (
-        "🤖 <b>Настройки ИИ</b><br><br>"
-        f"▫️ Текущий провайдер: <b>{html.escape(config.provider or 'Не задан')}</b><br>"
-        f"▫️ Активная модель: <code>{html.escape(model_name)}</code><br><br>"
-        f"🎙 <b>Аудио:</b> {html.escape(config.transcription_provider or 'OpenAI')}<br>"
-        f"🖼 <b>Vision:</b> {html.escape(config.vision_provider)} / <code>{html.escape(config.vision_model)}</code><br>"
+        "🤖 <b>Настройки ИИ</b><br/><br/>"
+        f"▫️ Текущий провайдер: <b>{html.escape(config.provider or 'Не задан')}</b><br/>"
+        f"▫️ Активная модель: <code>{html.escape(model_name)}</code><br/><br/>"
+        f"🎙 <b>Аудио:</b> {html.escape(config.transcription_provider or 'OpenAI')}<br/>"
+        f"🖼 <b>Vision:</b> {html.escape(config.vision_provider)} / <code>{html.escape(config.vision_model)}</code><br/>"
         f"⏱️ <b>Лимит аудио:</b> {config.max_voice_duration_sec} сек."
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_ai_settings_keyboard(config.provider or "Gemini"))
@@ -153,16 +153,16 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
     kie_key = config.kie_api_key
     kie_threshold = config.kie_credit_alert_threshold
     text = (
-        "<b>Ключи и модели ИИ</b><br><br>"
-        f"<b>Deepseek:</b> <code>{_mask(config.deepseek_api_key)}</code><br>"
-        f"<b>Claude:</b> <code>{_mask(config.claude_api_key)}</code><br>"
-        f"<b>Gemini:</b> <code>{_mask(config.gemini_api_key)}</code><br>"
-        f"<b>OpenAI:</b> <code>{_mask(config.openai_api_key)}</code><br>"
-        f"<b>Режим памяти:</b> {html.escape(memory_mode_label(current_memory_mode))}<br><br>"
-        f"🎨 <b>Генерация изображений:</b> {'✅' if img_gen_enabled else '❌'} / {html.escape(img_gen)}<br>"
-        f"✏️ <b>Редактирование изображений:</b> {'✅' if img_edit_enabled else '❌'} / {html.escape(img_edit)}<br>"
-        f"🔄 <b>Фолбэк:</b> {'✅' if fallback_enabled else '❌'} / {html.escape(fallback_info)}<br>"
-        f"🤖 <b>KIE:</b> <code>{_mask(kie_key)}</code> / порог: {kie_threshold}<br><br>"
+        "<b>Ключи и модели ИИ</b><br/><br/>"
+        f"<b>Deepseek:</b> <code>{_mask(config.deepseek_api_key)}</code><br/>"
+        f"<b>Claude:</b> <code>{_mask(config.claude_api_key)}</code><br/>"
+        f"<b>Gemini:</b> <code>{_mask(config.gemini_api_key)}</code><br/>"
+        f"<b>OpenAI:</b> <code>{_mask(config.openai_api_key)}</code><br/>"
+        f"<b>Режим памяти:</b> {html.escape(memory_mode_label(current_memory_mode))}<br/><br/>"
+        f"🎨 <b>Генерация изображений:</b> {'✅' if img_gen_enabled else '❌'} / {html.escape(img_gen)}<br/>"
+        f"✏️ <b>Редактирование изображений:</b> {'✅' if img_edit_enabled else '❌'} / {html.escape(img_edit)}<br/>"
+        f"🔄 <b>Фолбэк:</b> {'✅' if fallback_enabled else '❌'} / {html.escape(fallback_info)}<br/>"
+        f"🤖 <b>KIE:</b> <code>{_mask(kie_key)}</code> / порог: {kie_threshold}<br/><br/>"
         "Ниже доступны смена моделей, лимитов контекста и vision/audio-параметров."
     )
     await client.send_message(
@@ -327,7 +327,7 @@ async def start_edit_system_prompt(client: MaxApiClient, states: StateStore, cha
     await states.set(user_id, chat_id, "admin_ai_set_system_prompt", {})
     await client.send_message(
         chat_id=chat_id,
-        text=f"<b>Текущий системный промпт</b><br><pre><code>{html.escape(preview)}</code></pre><br>Отправьте новый текст промпта.",
+        text=f"<b>Текущий системный промпт</b><br/><pre><code>{html.escape(preview)}</code></pre><br/>Отправьте новый текст промпта.",
     )
 
 
@@ -337,7 +337,7 @@ async def start_edit_global_prompt_appendix(client: MaxApiClient, states: StateS
     await states.set(user_id, chat_id, "admin_ai_set_global_prompt_appendix", {})
     await client.send_message(
         chat_id=chat_id,
-        text=f"<b>Общий блок для всех промптов</b><br><pre><code>{html.escape(preview)}</code></pre><br>Отправьте новый текст. Для очистки отправьте <code>-</code>.",
+        text=f"<b>Общий блок для всех промптов</b><br/><pre><code>{html.escape(preview)}</code></pre><br/>Отправьте новый текст. Для очистки отправьте <code>-</code>.",
     )
 
 

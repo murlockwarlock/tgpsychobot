@@ -28,13 +28,13 @@ async def show_stats(client: MaxApiClient, chat_id: int) -> None:
         active_subs = await session.scalar(select(func.count()).select_from(UserSubscription).where(UserSubscription.end_date > now)) or 0
 
     text = (
-        "📊 <b>Статистика</b><br><br>"
-        f"👥 <b>Пользователи:</b><br>"
-        f"• Всего: <b>{total_users}</b><br>"
-        f"• Сегодня: {users_today}<br>"
-        f"• Эта неделя: {users_week}<br>"
-        f"• Этот месяц: {users_month}<br><br>"
-        f"💬 <b>Сообщений всего:</b> {total_messages}<br>"
+        "📊 <b>Статистика</b><br/><br/>"
+        f"👥 <b>Пользователи:</b><br/>"
+        f"• Всего: <b>{total_users}</b><br/>"
+        f"• Сегодня: {users_today}<br/>"
+        f"• Эта неделя: {users_week}<br/>"
+        f"• Этот месяц: {users_month}<br/><br/>"
+        f"💬 <b>Сообщений всего:</b> {total_messages}<br/>"
         f"⭐️ <b>Активных подписок:</b> {active_subs}"
     )
     await client.send_message(
@@ -53,12 +53,12 @@ async def show_subscriptions_summary(client: MaxApiClient, chat_id: int) -> None
         promo_count = await session.scalar(select(func.count()).select_from(PromoCode)) or 0
     status = "✅ Включены" if (config and config.subscriptions_enabled) else "❌ Выключены"
     text = (
-        "<b>⭐️ Подписки</b><br><br>"
-        f"Статус системы: {status}<br>"
-        f"Активных подписок: {active_subs}<br>"
-        f"Всего записей подписок: {total_subs}<br>"
-        f"Тарифов в базе: {plans_count}<br>"
-        f"Промокодов в базе: {promo_count}<br><br>"
+        "<b>⭐️ Подписки</b><br/><br/>"
+        f"Статус системы: {status}<br/>"
+        f"Активных подписок: {active_subs}<br/>"
+        f"Всего записей подписок: {total_subs}<br/>"
+        f"Тарифов в базе: {plans_count}<br/>"
+        f"Промокодов в базе: {promo_count}<br/><br/>"
         "Управляйте тарифами, промокодами и платёжными настройками из этого раздела."
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_subscriptions_keyboard())
@@ -70,11 +70,11 @@ async def show_topics_summary(client: MaxApiClient, chat_id: int) -> None:
     if not topics:
         await client.send_message(chat_id=chat_id, text="Темы пока не созданы.", attachments=admin_panel_keyboard())
         return
-    lines = ["<b>💬 Темы диалогов</b><br><br>"]
+    lines = ["<b>💬 Темы диалогов</b><br/><br/>"]
     for topic in topics[:25]:
         status = "🟢" if topic.is_active else "⚪️"
         admin_only = " 🔒" if topic.admin_only else ""
-        lines.append(f"{status} {topic.name}{admin_only}<br>")
+        lines.append(f"{status} {topic.name}{admin_only}<br/>")
     await client.send_message(chat_id=chat_id, text="".join(lines), attachments=admin_panel_keyboard())
 
 
@@ -86,10 +86,10 @@ async def show_referral_summary(client: MaxApiClient, chat_id: int) -> None:
         turnover = await session.scalar(select(func.coalesce(func.sum(ReferralPaymentLog.amount), 0.0))) or 0.0
     status = "✅ Включена" if (config and config.referral_enabled) else "❌ Выключена"
     text = (
-        "<b>👫 Реферальная программа</b><br><br>"
-        f"Статус: {status}<br>"
-        f"Рефереров: {referrers}<br>"
-        f"Рефералов: {referrals}<br>"
+        "<b>👫 Реферальная программа</b><br/><br/>"
+        f"Статус: {status}<br/>"
+        f"Рефереров: {referrers}<br/>"
+        f"Рефералов: {referrals}<br/>"
         f"Оборот: {turnover:.2f} руб."
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_panel_keyboard())
@@ -99,8 +99,8 @@ async def show_test_summary(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
     text = (
-        "<b>🧩 Тест</b><br><br>"
-        "Пользовательский сценарий теста уже вынесен в отдельный модуль MAX.<br>"
+        "<b>🧩 Тест</b><br/><br/>"
+        "Пользовательский сценарий теста уже вынесен в отдельный модуль MAX.<br/>"
         "Админское редактирование вопросов и кейсов в этом переносе будет следующим блоком."
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_panel_keyboard())

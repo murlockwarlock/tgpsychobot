@@ -19,7 +19,7 @@ async def show_menu(client: MaxApiClient, chat_id: int) -> None:
             await session.commit()
     await client.send_message(
         chat_id=chat_id,
-        text="🧩 <b>Управление разделом теста</b><br><br>Здесь настраивается пользовательский сценарий теста.",
+        text="🧩 <b>Управление разделом теста</b><br/><br/>Здесь настраивается пользовательский сценарий теста.",
         attachments=admin_test_menu_keyboard(config),
     )
 
@@ -39,8 +39,8 @@ async def show_links(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
     text = (
-        "🔗 <b>Настройка ссылок</b><br><br>"
-        f"👤 <b>Admin Username:</b> @{html.escape(config.admin_username or '')}<br>"
+        "🔗 <b>Настройка ссылок</b><br/><br/>"
+        f"👤 <b>Admin Username:</b> @{html.escape(config.admin_username or '')}<br/>"
         f"🚀 <b>Марафон URL:</b> {html.escape(config.marathon_url or '')}"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_test_links_keyboard())
@@ -79,7 +79,7 @@ async def show_secret_questions(client: MaxApiClient, chat_id: int) -> None:
         items = (await session.execute(select(SecretTestQuestion).order_by(SecretTestQuestion.sort_order.asc()))).scalars().all()
     await client.send_message(
         chat_id=chat_id,
-        text="🔐 <b>Секретные вопросы</b><br><br>Добавляйте вопросы для второго блока теста.",
+        text="🔐 <b>Секретные вопросы</b><br/><br/>Добавляйте вопросы для второго блока теста.",
         attachments=admin_secret_questions_keyboard(items),
     )
 
@@ -117,7 +117,7 @@ async def start_edit_prompt(client: MaxApiClient, states: StateStore, chat_id: i
     preview = current[:3000] + ("\n\n[...]" if len(current) > 3000 else "")
     await client.send_message(
         chat_id=chat_id,
-        text=f"<b>Текущий промпт теста:</b><br><pre><code>{html.escape(preview)}</code></pre><br>Отправьте новый текст промпта.",
+        text=f"<b>Текущий промпт теста:</b><br/><pre><code>{html.escape(preview)}</code></pre><br/>Отправьте новый текст промпта.",
     )
 
 

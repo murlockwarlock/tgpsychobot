@@ -475,7 +475,7 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
         system_prompt = user.current_topic.system_prompt if user.current_topic and user.current_topic.system_prompt else ai_config.system_prompt
         if not system_prompt:
             system_prompt = "Ты полезный ИИ-помощник."
-        system_prompt = apply_global_prompt_appendix(system_prompt, ai_config.global_prompt_appendix)
+        system_prompt = apply_global_prompt_appendix(system_prompt, getattr(ai_config, 'global_prompt_appendix', None))
 
         if getattr(user, "response_length", "normal") == "short":
             system_prompt += "\n\nОтвечай кратко, по делу, без длинных вступлений."
@@ -520,7 +520,7 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         if not ai_config:
             raise AIServiceError("AIConfig не найден")
 
-    prompt = apply_global_prompt_appendix(system_prompt or ai_config.system_prompt or "Ты полезный ИИ-помощник.", ai_config.global_prompt_appendix)
+    prompt = apply_global_prompt_appendix(system_prompt or ai_config.system_prompt or "Ты полезный ИИ-помощник.", getattr(ai_config, 'global_prompt_appendix', None))
     if getattr(user, "response_length", "normal") == "short":
         prompt += "\n\nОтвечай кратко, по делу, без длинных вступлений."
     messages = [{"role": "user", "content": user_prompt}]

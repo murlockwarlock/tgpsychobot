@@ -74,6 +74,8 @@ class MaxBotApplication:
                 callback = parse_callback(update)
                 if callback:
                     await self.handle_callback(callback)
+                else:
+                    log.warning("Received message_callback but parse_callback returned None update=%s", update)
                 return
             max_log.info("Skipping unsupported MAX update type=%s update_id=%s", update_type, update_id)
         except Exception:
@@ -432,7 +434,12 @@ class MaxBotApplication:
             content = await session.scalar(select(Content).where(Content.button_title == text, Content.is_visible == True).limit(1))
             user = await session.get(User, message.sender.user_id, options=[selectinload(User.subscription)])
         if content:
-            await self.client.send_message(chat_id=message.chat_id, text=content.text_content or "Раздел пока пуст.")
+            content_attachments = await common.get_content_attachments(content.key)
+            await self.client.send_message(
+                chat_id=message.chat_id,
+                text=content.text_content or "Раздел пока пуст.",
+                attachments=content_attachments or None,
+            )
             await common.send_main_menu(self.client, message.chat_id)
             return
 

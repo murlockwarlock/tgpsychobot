@@ -57,16 +57,16 @@ def _build_test_diagram(questions: list[TestQuestion], answers: list[int]) -> tu
         total_max += 5
 
     ranking: list[tuple[str, float]] = []
-    lines = ["📊 <b>ТВОЯ КАРТА САМООЦЕНКИ</b><br>"]
+    lines = ["📊 <b>ТВОЯ КАРТА САМООЦЕНКИ</b><br/>"]
     for category, values in categories.items():
         percent = values["score"] / values["max"] if values["max"] else 0
         ranking.append((category, percent))
         filled = int(percent * 10)
         status = " ✅ Сильная сторона" if percent >= 0.75 else (" ⚠️ Зона внимания" if percent <= 0.45 else "")
-        lines.append(f"<br><b>{CATEGORY_NAMES.get(category, category)}</b><br>{'█' * filled}{'░' * (10 - filled)} {values['score']}/{values['max']}{status}")
+        lines.append(f"<br/><b>{CATEGORY_NAMES.get(category, category)}</b><br/>{'█' * filled}{'░' * (10 - filled)} {values['score']}/{values['max']}{status}")
 
     total_percent = int((total_score / total_max) * 100) if total_max else 0
-    lines.append(f"<br><br><b>ОБЩИЙ ИТОГ:</b> {total_score}/{total_max} ({total_percent}%)")
+    lines.append(f"<br/><br/><b>ОБЩИЙ ИТОГ:</b> {total_score}/{total_max} ({total_percent}%)")
     ranking.sort(key=lambda item: item[1])
     return "".join(lines), ranking
 
@@ -93,8 +93,8 @@ def _render_case_block(case_study: CaseStudy | None, ranking: list[tuple[str, fl
         excerpt = excerpt[:1800].rstrip() + "..."
     safe_excerpt = excerpt.replace("<", "&lt;").replace(">", "&gt;")
     return (
-        f"<b>История-зеркало</b><br><br>"
-        f"Ниже кейс, который ближе всего к вашим текущим зонам внимания: {weakest}.<br><br>"
+        f"<b>История-зеркало</b><br/><br/>"
+        f"Ниже кейс, который ближе всего к вашим текущим зонам внимания: {weakest}.<br/><br/>"
         f"<pre><code>{safe_excerpt}</code></pre>"
     )
 
@@ -102,15 +102,15 @@ def _render_case_block(case_study: CaseStudy | None, ranking: list[tuple[str, fl
 def _fallback_ai_summary(ranking: list[tuple[str, float]]) -> str:
     if not ranking:
         return (
-            "<b>Разбор результата</b><br><br>"
+            "<b>Разбор результата</b><br/><br/>"
             "Результаты уже сохранены. Продолжайте к секретному блоку вопросов, чтобы получить более точную картину."
         )
     weakest = ", ".join(CATEGORY_NAMES.get(category, category) for category, _ in ranking[:2])
     strongest = ", ".join(CATEGORY_NAMES.get(category, category) for category, _ in ranking[-2:])
     return (
-        "<b>Разбор результата</b><br><br>"
-        f"Сейчас стоит уделить больше внимания зонам: {weakest}.<br>"
-        f"При этом у вас есть ресурс в сферах: {strongest}.<br><br>"
+        "<b>Разбор результата</b><br/><br/>"
+        f"Сейчас стоит уделить больше внимания зонам: {weakest}.<br/>"
+        f"При этом у вас есть ресурс в сферах: {strongest}.<br/><br/>"
         "Секретный блок поможет точнее понять внутренние причины и перейти от общей картины к конкретным шагам."
     )
 
@@ -170,16 +170,16 @@ async def _send_question(client: MaxApiClient, chat_id: int, user_id: int, index
     suffix = "ен" if user and user.gender == "male" else "на"
     neutral = "Нейтрален" if user and user.gender == "male" else "Нейтральна"
     legend = (
-        f"1 — Совершенно не соглас{suffix}<br>"
-        f"2 — Скорее не соглас{suffix}<br>"
-        f"3 — {neutral}<br>"
-        f"4 — Скорее соглас{suffix}<br>"
+        f"1 — Совершенно не соглас{suffix}<br/>"
+        f"2 — Скорее не соглас{suffix}<br/>"
+        f"3 — {neutral}<br/>"
+        f"4 — Скорее соглас{suffix}<br/>"
         f"5 — Полностью соглас{suffix}"
     )
     text = (
-        f"<b>Вопрос {index + 1}/{len(questions)}</b><br>"
-        f"{_progress_bar(index, len(questions))}<br><br>"
-        f"<b>{question.text}</b><br><br>{legend}"
+        f"<b>Вопрос {index + 1}/{len(questions)}</b><br/>"
+        f"{_progress_bar(index, len(questions))}<br/><br/>"
+        f"<b>{question.text}</b><br/><br/>{legend}"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=test_answers_keyboard())
 
@@ -253,9 +253,9 @@ async def start_secret_test(client: MaxApiClient, states: StateStore, chat_id: i
     if not questions:
         await client.send_message(chat_id=chat_id, text="Вопросы секретного теста ещё не добавлены.")
         return
-    text = "<b>🔐 Секретный блок вопросов</b><br><br>Ответьте одним сообщением:<br><br>"
+    text = "<b>🔐 Секретный блок вопросов</b><br/><br/>Ответьте одним сообщением:<br/><br/>"
     for index, question in enumerate(questions, start=1):
-        text += f"{index}. {question.text}<br><br>"
+        text += f"{index}. {question.text}<br/><br/>"
     await states.set(user_id, chat_id, "secret_test_answering", {})
     await client.send_message(chat_id=chat_id, text=text)
 

@@ -19,13 +19,13 @@ async def list_topics(client: MaxApiClient, chat_id: int) -> None:
     if not topics:
         await client.send_message(
             chat_id=chat_id,
-            text="💬 <b>Темы диалогов</b><br><br>Тем пока нет.",
+            text="💬 <b>Темы диалогов</b><br/><br/>Тем пока нет.",
             attachments=admin_topics_list_keyboard([]),
         )
         return
     await client.send_message(
         chat_id=chat_id,
-        text="💬 <b>Темы диалогов</b><br><br>Выберите тему для редактирования.",
+        text="💬 <b>Темы диалогов</b><br/><br/>Выберите тему для редактирования.",
         attachments=admin_topics_list_keyboard(topics),
     )
 
@@ -37,15 +37,15 @@ async def show_topic_editor(client: MaxApiClient, chat_id: int, topic_id: int) -
         await client.send_message(chat_id=chat_id, text="Тема не найдена.")
         return
     text = (
-        f"<b>{html.escape(topic.name)}</b><br><br>"
-        f"<b>ID:</b> {topic.id}<br>"
-        f"<b>Активна:</b> {'да' if topic.is_active else 'нет'}<br>"
-        f"<b>Только для админов:</b> {'да' if topic.admin_only else 'нет'}<br>"
-        f"<b>В главном меню:</b> {'да' if topic.show_in_main_menu else 'нет'}<br>"
-        f"<b>В списке тем:</b> {'да' if topic.show_in_list else 'нет'}<br>"
-        f"<b>Записей KB:</b> {len(topic.knowledge_base_files)}<br><br>"
-        f"<b>Промпт:</b><br><pre><code>{html.escape(topic.system_prompt or 'Не задан')}</code></pre><br>"
-        f"<b>Приветствие:</b><br><pre><code>{html.escape(topic.start_message or 'Не задано')}</code></pre>"
+        f"<b>{html.escape(topic.name)}</b><br/><br/>"
+        f"<b>ID:</b> {topic.id}<br/>"
+        f"<b>Активна:</b> {'да' if topic.is_active else 'нет'}<br/>"
+        f"<b>Только для админов:</b> {'да' if topic.admin_only else 'нет'}<br/>"
+        f"<b>В главном меню:</b> {'да' if topic.show_in_main_menu else 'нет'}<br/>"
+        f"<b>В списке тем:</b> {'да' if topic.show_in_list else 'нет'}<br/>"
+        f"<b>Записей KB:</b> {len(topic.knowledge_base_files)}<br/><br/>"
+        f"<b>Промпт:</b><br/><pre><code>{html.escape(topic.system_prompt or 'Не задан')}</code></pre><br/>"
+        f"<b>Приветствие:</b><br/><pre><code>{html.escape(topic.start_message or 'Не задано')}</code></pre>"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_topic_editor_keyboard(topic))
 

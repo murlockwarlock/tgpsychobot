@@ -32,10 +32,10 @@ async def show_menu(client: MaxApiClient, chat_id: int) -> None:
 
     status = "✅ Включена" if (config and config.referral_enabled) else "❌ Выключена"
     text = (
-        f"👫 <b>Реферальная программа</b><br><br>"
-        f"Статус: {status}<br>"
-        f"Рефереров: {referrers_count}<br>"
-        f"Рефералов: {referrals_count}<br>"
+        f"👫 <b>Реферальная программа</b><br/><br/>"
+        f"Статус: {status}<br/>"
+        f"Рефереров: {referrers_count}<br/>"
+        f"Рефералов: {referrals_count}<br/>"
         f"Общий оборот: {total_turnover:.2f} руб."
     )
     rows = [
@@ -285,7 +285,7 @@ async def show_referrers_page(client: MaxApiClient, chat_id: int, page: int) -> 
         keyboard_rows.append(nav)
     keyboard_rows.append([callback_button("◀️ Назад", "admin_referral_menu")])
 
-    text = f"<b>👫 Рефереры · стр. {page + 1}/{total_pages}</b><br><br>Всего: {total}"
+    text = f"<b>👫 Рефереры · стр. {page + 1}/{total_pages}</b><br/><br/>Всего: {total}"
     await client.send_message(chat_id=chat_id, text=text, attachments=inline_keyboard(keyboard_rows))
 
 
@@ -316,13 +316,13 @@ async def show_referrer_detail(client: MaxApiClient, chat_id: int, referrer_id: 
             r_name += f" @{html.escape(r.username)}"
         referral_lines.append(r_name or str(r.user_id))
 
-    referrals_text = "<br>".join(referral_lines) if referral_lines else "—"
+    referrals_text = "<br/>".join(referral_lines) if referral_lines else "—"
     text = (
-        f"<b>👤 Реферер: {name}</b><br><br>"
-        f"ID: <code>{referrer_id}</code><br>"
-        f"Привлечённых: {len(referrals)}<br>"
-        f"Оборот: {total_turnover:.2f} руб.<br><br>"
-        f"<b>Рефералы:</b><br>"
+        f"<b>👤 Реферер: {name}</b><br/><br/>"
+        f"ID: <code>{referrer_id}</code><br/>"
+        f"Привлечённых: {len(referrals)}<br/>"
+        f"Оборот: {total_turnover:.2f} руб.<br/><br/>"
+        f"<b>Рефералы:</b><br/>"
         f"{referrals_text}"
     )
     rows = [[callback_button("◀️ Назад к реферерам", f"admin_referral_referrers_{page}")]]

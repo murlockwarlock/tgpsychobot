@@ -129,7 +129,7 @@ class MaxApiClient:
         if marker is not None:
             params["marker"] = marker
         if update_types:
-            params["types"] = list(update_types)
+            params["types"] = ",".join(update_types)
         result = await self._request("GET", "/updates", params=params)
         updates = result.get("updates", []) if isinstance(result, dict) else []
         log.info("MAX updates fetched marker=%s count=%s", marker, len(updates))
@@ -150,7 +150,9 @@ class MaxApiClient:
             params["user_id"] = user_id
         if chat_id is not None:
             params["chat_id"] = chat_id
-        body: dict[str, Any] = {"text": text or ""}
+        # In MAX HTML mode, \n is ignored — normalize to <br/> for consistent rendering
+        normalized_text = (text or "").replace("\n", "<br/>") if format_ == "html" else (text or "")
+        body: dict[str, Any] = {"text": normalized_text}
         if attachments is not None:
             body["attachments"] = attachments
         if format_:
@@ -160,7 +162,7 @@ class MaxApiClient:
             "MAX message sent user_id=%s chat_id=%s text_len=%s attachments=%s",
             user_id,
             chat_id,
-            len(text or ""),
+            len(normalized_text),
             len(attachments or []),
         )
         return result

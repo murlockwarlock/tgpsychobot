@@ -12,7 +12,7 @@ def markdown_to_html(text: str | None) -> str:
     escaped = re.sub(r"__(.+?)__", r"<b>\1</b>", escaped)
     escaped = re.sub(r"\*(.+?)\*", r"<i>\1</i>", escaped)
     escaped = re.sub(r"_(.+?)_", r"<i>\1</i>", escaped)
-    escaped = escaped.replace("\n", "<br>")
+    escaped = escaped.replace("\n", "<br/>")
     return escaped
 
 

@@ -34,13 +34,13 @@ async def show_admins(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         admins = (await session.execute(select(User).where(User.is_admin == True).order_by(User.first_name.asc(), User.id.asc()))).scalars().all()
     db_admins = [admin for admin in admins if admin.id not in owners]
-    lines = ["👮 <b>Управление администраторами</b><br><br>", "<b>Владельцы:</b><br>"]
+    lines = ["👮 <b>Управление администраторами</b><br/><br/>", "<b>Владельцы:</b><br/>"]
     if owners:
         for owner_id in owners:
-            lines.append(f"• <code>{owner_id}</code><br>")
+            lines.append(f"• <code>{owner_id}</code><br/>")
     else:
-        lines.append("не заданы<br>")
-    lines.append("<br><b>Администраторы из БД:</b><br>")
+        lines.append("не заданы<br/>")
+    lines.append("<br/><b>Администраторы из БД:</b><br/>")
     if not db_admins:
         lines.append("список пуст")
     text = "".join(lines)
@@ -84,11 +84,11 @@ async def show_admin_profile(client: MaxApiClient, chat_id: int, viewer_id: int,
         return
     owner = is_owner(viewer_id)
     text = (
-        "<b>Профиль администратора</b><br><br>"
-        f"<b>ID:</b> <code>{admin.id}</code><br>"
-        f"<b>Имя:</b> {html.escape(admin.first_name or admin.name or 'Не указано')}<br>"
-        f"<b>Username:</b> {html.escape(admin.username or 'Не указан')}<br>"
-        f"<b>Доступ к истории:</b> {'да' if admin.can_view_history else 'нет'}<br>"
+        "<b>Профиль администратора</b><br/><br/>"
+        f"<b>ID:</b> <code>{admin.id}</code><br/>"
+        f"<b>Имя:</b> {html.escape(admin.first_name or admin.name or 'Не указано')}<br/>"
+        f"<b>Username:</b> {html.escape(admin.username or 'Не указан')}<br/>"
+        f"<b>Доступ к истории:</b> {'да' if admin.can_view_history else 'нет'}<br/>"
         f"<b>Владелец:</b> {'да' if admin.id in _owner_ids() else 'нет'}"
     )
     await client.send_message(

@@ -46,7 +46,7 @@ async def show_settings(client: MaxApiClient, chat_id: int) -> None:
             await session.commit()
     await client.send_message(
         chat_id=chat_id,
-        text="⚙️ <b>Настройки платежей</b><br><br>Управление уведомлениями, подписками и ключами.",
+        text="⚙️ <b>Настройки платежей</b><br/><br/>Управление уведомлениями, подписками и ключами.",
         attachments=admin_payment_settings_keyboard(config),
     )
 
@@ -95,14 +95,14 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
     text = (
-        "<b>Текущие платёжные ключи и ссылки</b><br><br>"
-        f"<b>ЮKassa Shop ID:</b> <code>{config.yookassa_shop_id or 'Не задан'}</code><br>"
-        f"<b>ЮKassa Secret Key:</b> <code>{_mask(config.yookassa_secret_key)}</code><br>"
-        f"<b>Robokassa Merchant:</b> <code>{config.robokassa_merchant_login or 'Не задан'}</code><br>"
-        f"<b>Robokassa Pass 1:</b> <code>{_mask(config.robokassa_password_1)}</code><br>"
-        f"<b>Robokassa Pass 2:</b> <code>{_mask(config.robokassa_password_2)}</code><br>"
-        f"<b>Telegram Pay Token:</b> <code>{_mask(config.telegram_pay_token)}</code><br>"
-        f"<b>Оферта:</b> <code>{config.offer_agreement_url or 'Не задан'}</code><br>"
+        "<b>Текущие платёжные ключи и ссылки</b><br/><br/>"
+        f"<b>ЮKassa Shop ID:</b> <code>{config.yookassa_shop_id or 'Не задан'}</code><br/>"
+        f"<b>ЮKassa Secret Key:</b> <code>{_mask(config.yookassa_secret_key)}</code><br/>"
+        f"<b>Robokassa Merchant:</b> <code>{config.robokassa_merchant_login or 'Не задан'}</code><br/>"
+        f"<b>Robokassa Pass 1:</b> <code>{_mask(config.robokassa_password_1)}</code><br/>"
+        f"<b>Robokassa Pass 2:</b> <code>{_mask(config.robokassa_password_2)}</code><br/>"
+        f"<b>Telegram Pay Token:</b> <code>{_mask(config.telegram_pay_token)}</code><br/>"
+        f"<b>Оферта:</b> <code>{config.offer_agreement_url or 'Не задан'}</code><br/>"
         f"<b>Политика:</b> <code>{config.privacy_policy_url or 'Не задан'}</code>"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_payment_keys_keyboard())
@@ -165,23 +165,23 @@ async def show_payment_stats(client: MaxApiClient, chat_id: int) -> None:
         )).all()
 
     text = (
-        "<b>📊 Расширенная статистика</b><br><br>"
-        "👥 <b>Пользователи:</b><br>"
-        f"• Всего в базе: {total_users}<br>"
-        f"• Активные платные: {active_paid_count}<br>"
-        f"• На пробном периоде: {active_trials_count}<br>"
-        f"• Истекшие подписки: {expired_count}<br><br>"
-        "💰 <b>Финансы:</b><br>"
-        f"• Текущий MRR (активные): {current_mrr:,.2f} руб.<br>"
-        f"• Доход Robokassa: {total_robo_revenue:,.2f} руб.<br>"
-        f"• Доход YooKassa: {total_yoo_revenue:,.2f} руб.<br><br>"
-        "📉 <b>Популярность тарифов (Активные):</b><br>"
+        "<b>📊 Расширенная статистика</b><br/><br/>"
+        "👥 <b>Пользователи:</b><br/>"
+        f"• Всего в базе: {total_users}<br/>"
+        f"• Активные платные: {active_paid_count}<br/>"
+        f"• На пробном периоде: {active_trials_count}<br/>"
+        f"• Истекшие подписки: {expired_count}<br/><br/>"
+        "💰 <b>Финансы:</b><br/>"
+        f"• Текущий MRR (активные): {current_mrr:,.2f} руб.<br/>"
+        f"• Доход Robokassa: {total_robo_revenue:,.2f} руб.<br/>"
+        f"• Доход YooKassa: {total_yoo_revenue:,.2f} руб.<br/><br/>"
+        "📉 <b>Популярность тарифов (Активные):</b><br/>"
     )
     if plan_breakdown:
         for name, count in plan_breakdown:
-            text += f"• {html.escape(name)}: {count} шт.<br>"
+            text += f"• {html.escape(name)}: {count} шт.<br/>"
     else:
-        text += "• Нет активных тарифов<br>"
+        text += "• Нет активных тарифов<br/>"
 
     await client.send_message(
         chat_id=chat_id,
@@ -224,12 +224,12 @@ async def show_payment_log(client: MaxApiClient, chat_id: int, page: int = 0, fi
     page = max(0, min(page, total_pages - 1))
     page_entries = entries[page * PAGE_LOG_SIZE:(page + 1) * PAGE_LOG_SIZE]
 
-    lines = [f"<b>💳 Журнал платежей · стр. {page + 1}/{total_pages}</b> ({total} записей)<br>"]
+    lines = [f"<b>💳 Журнал платежей · стр. {page + 1}/{total_pages}</b> ({total} записей)<br/>"]
     for e in page_entries:
         dt = e["created_at"].strftime('%d.%m %H:%M') if e["created_at"] else "?"
         lines.append(f"<code>{dt}</code> {html.escape(e['source'])} user:{e['user_id']} {e['amount']:.2f}₽ {html.escape(e['status'] or '?')}")
 
-    text = "<br>".join(lines)
+    text = "<br/>".join(lines)
 
     nav_row = []
     if page > 0:

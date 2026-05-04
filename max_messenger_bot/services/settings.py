@@ -11,13 +11,13 @@ from ..storage import StateStore
 
 
 def _settings_text(user: User, prefix: str | None = None) -> str:
-    header = f"{prefix}<br><br>" if prefix else ""
+    header = f"{prefix}<br/><br/>" if prefix else ""
     length_text = "📏 Короткий" if getattr(user, "response_length", "normal") == "short" else "📏 Обычный"
     return (
-        f"{header}<b>⚙️ Настройки</b><br><br>"
-        f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}<br>"
-        f"<b>Пол:</b> {'👨 Мужской' if user.gender == 'male' else ('👩 Женский' if user.gender == 'female' else '❓ Не указан')}<br>"
-        f"<b>Возраст:</b> {user.age or 'Не указан'}<br>"
+        f"{header}<b>⚙️ Настройки</b><br/><br/>"
+        f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}<br/>"
+        f"<b>Пол:</b> {'👨 Мужской' if user.gender == 'male' else ('👩 Женский' if user.gender == 'female' else '❓ Не указан')}<br/>"
+        f"<b>Возраст:</b> {user.age or 'Не указан'}<br/>"
         f"<b>Длина ответов:</b> {length_text}"
     )
 

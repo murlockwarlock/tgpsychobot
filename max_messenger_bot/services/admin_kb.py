@@ -40,8 +40,8 @@ async def list_entries(client: MaxApiClient, chat_id: int, page: int = 0) -> Non
         ).scalars().all()
 
     text = (
-        "📚 <b>База знаний</b><br><br>"
-        "Здесь управляются записи `knowledge_base` для общего режима и для тем.<br>"
+        "📚 <b>База знаний</b><br/><br/>"
+        "Здесь управляются записи `knowledge_base` для общего режима и для тем.<br/>"
         "✅ = участвует в общем диалоге без темы. 🎯 = привязана хотя бы к одной теме."
     )
     await client.send_message(
@@ -62,12 +62,12 @@ async def show_entry_editor(client: MaxApiClient, chat_id: int, kb_id: int) -> N
     if not topics:
         topics = "Не привязана ни к одной теме"
     text = (
-        f"📚 <b>{html.escape(entry.filename or f'KB #{entry.id}')}</b><br><br>"
-        f"<b>ID:</b> {entry.id}<br>"
-        f"<b>Общий режим:</b> {'да' if entry.use_in_general_mode else 'нет'}<br>"
-        f"<b>Тем:</b> {len(entry.topics)}<br>"
-        f"<b>Привязки:</b> {topics}<br><br>"
-        f"<b>Содержимое:</b><br><pre><code>{html.escape(_content_preview(entry.indexed_content))}</code></pre>"
+        f"📚 <b>{html.escape(entry.filename or f'KB #{entry.id}')}</b><br/><br/>"
+        f"<b>ID:</b> {entry.id}<br/>"
+        f"<b>Общий режим:</b> {'да' if entry.use_in_general_mode else 'нет'}<br/>"
+        f"<b>Тем:</b> {len(entry.topics)}<br/>"
+        f"<b>Привязки:</b> {topics}<br/><br/>"
+        f"<b>Содержимое:</b><br/><pre><code>{html.escape(_content_preview(entry.indexed_content))}</code></pre>"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_kb_editor_keyboard(kb_id, bool(entry.use_in_general_mode)))
 
@@ -201,8 +201,8 @@ async def show_topic_assignments(client: MaxApiClient, chat_id: int, topic_id: i
         assigned_ids = {item.id for item in topic.knowledge_base_files}
 
     text = (
-        f"📚 <b>База знаний темы</b><br><br>"
-        f"Тема: <b>{html.escape(topic.name)}</b><br>"
+        f"📚 <b>База знаний темы</b><br/><br/>"
+        f"Тема: <b>{html.escape(topic.name)}</b><br/>"
         "Нажмите на запись, чтобы добавить или убрать её из темы."
     )
     await client.send_message(

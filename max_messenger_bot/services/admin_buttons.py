@@ -33,7 +33,7 @@ async def show_buttons(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         buttons = await _load_buttons(session)
     text = (
-        "🎛️ <b>Кнопки главного меню</b><br><br>"
+        "🎛️ <b>Кнопки главного меню</b><br/><br/>"
         "Здесь можно менять видимость, названия и порядок пользовательских кнопок."
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_buttons_keyboard(buttons))
@@ -46,11 +46,11 @@ async def show_button_editor(client: MaxApiClient, chat_id: int, button_key: str
         await client.send_message(chat_id=chat_id, text="Кнопка не найдена.")
         return
     text = (
-        f"<b>{button.button_title or button.key}</b><br><br>"
-        f"<b>ID:</b> <code>{button.key}</code><br>"
-        f"<b>Видимость:</b> {'да' if button.is_visible else 'нет'}<br>"
-        f"<b>Порядок:</b> {button.sort_order or 0}<br><br>"
-        f"<b>Текст контента:</b><br><pre><code>{(button.text_content or 'Не задан').replace('<', '&lt;').replace('>', '&gt;')[:2500]}</code></pre>"
+        f"<b>{button.button_title or button.key}</b><br/><br/>"
+        f"<b>ID:</b> <code>{button.key}</code><br/>"
+        f"<b>Видимость:</b> {'да' if button.is_visible else 'нет'}<br/>"
+        f"<b>Порядок:</b> {button.sort_order or 0}<br/><br/>"
+        f"<b>Текст контента:</b><br/><pre><code>{(button.text_content or 'Не задан').replace('<', '&lt;').replace('>', '&gt;')[:2500]}</code></pre>"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_button_editor_keyboard(button.key, bool(button.is_visible)))
 
