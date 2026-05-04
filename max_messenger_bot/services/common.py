@@ -156,7 +156,7 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                             )
                         )
                         welcome_bonus_text = (
-                            f"🎁 <b>Вам начислено {sub_config.referral_bonus_days_referral} бонусных дн.</b><br/>"
+                            f"🎁 <b>Вам начислено {sub_config.referral_bonus_days_referral} бонусных дн.</b>\n"
                             "Регистрация выполнена по пригласительной ссылке."
                         )
                         is_new_trial_needed = False
@@ -193,7 +193,7 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                 )
             )
             welcome_bonus_text = (
-                f"🎁 <b>Вам начислен приветственный бонус!</b><br/>"
+                f"🎁 <b>Вам начислен приветственный бонус!</b>\n"
                 f"Бесплатный доступ на {sub_config.welcome_bonus_days} дн."
             )
             await session.commit()

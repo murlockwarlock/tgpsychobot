@@ -150,8 +150,8 @@ class MaxApiClient:
             params["user_id"] = user_id
         if chat_id is not None:
             params["chat_id"] = chat_id
-        # In MAX HTML mode, \n is ignored — normalize to <br/> for consistent rendering
-        normalized_text = (text or "").replace("\n", "<br/>") if format_ == "html" else (text or "")
+        # MAX uses \n for line breaks (not <br/>); HTML format is only for bold/italic tags
+        normalized_text = (text or "")
         body: dict[str, Any] = {"text": normalized_text}
         if attachments is not None:
             body["attachments"] = attachments

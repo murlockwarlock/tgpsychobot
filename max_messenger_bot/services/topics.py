@@ -28,7 +28,7 @@ async def show_topics(client: MaxApiClient, chat_id: int, user_id: int) -> None:
         return
 
     text = (
-        f"Вы находитесь {current_status}.<br/>"
+        f"Вы находитесь {current_status}.\n"
         "Выберите тему для диалога. Для MAX список вынесен в inline-кнопки."
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=topics_keyboard(topics, current_topic_id))
@@ -58,11 +58,11 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
     if topic.start_message:
         text = topic.start_message
     elif current_memory_mode == "global":
-        text = f"✅ Переключились на тему: <b>{topic.name}</b>.<br/><br/>Текущий диалог продолжается. Память сохранена."
+        text = f"✅ Переключились на тему: <b>{topic.name}</b>.\n\nТекущий диалог продолжается. Память сохранена."
     elif restored:
         text = f"✅ Продолжаем тему: <b>{topic.name}</b>."
     else:
-        text = f"✅ Переключились на тему: <b>{topic.name}</b>.<br/><br/>Память диалога очищена."
+        text = f"✅ Переключились на тему: <b>{topic.name}</b>.\n\nПамять диалога очищена."
     await client.send_message(chat_id=chat_id, text=text)
     await client.send_message(chat_id=chat_id, text="Главное меню:", attachments=await build_main_menu())
 

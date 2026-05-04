@@ -54,7 +54,7 @@ async def list_questions(client: MaxApiClient, chat_id: int) -> None:
         questions = (
             await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc(), TestQuestion.id.asc()))
         ).scalars().all()
-    text = "❓ <b>Вопросы теста</b><br/><br/>Выберите вопрос для редактирования." if questions else "❓ <b>Вопросы теста</b><br/><br/>Вопросов пока нет."
+    text = "❓ <b>Вопросы теста</b>\n\nВыберите вопрос для редактирования." if questions else "❓ <b>Вопросы теста</b>\n\nВопросов пока нет."
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_test_questions_keyboard(questions))
 
 
@@ -65,10 +65,10 @@ async def show_question_editor(client: MaxApiClient, chat_id: int, question_id: 
         await client.send_message(chat_id=chat_id, text="Вопрос не найден.")
         return
     text = (
-        f"<b>Вопрос #{question.id}</b><br/><br/>"
-        f"<b>Порядок:</b> {question.sort_order}<br/>"
-        f"<b>Категория:</b> {html.escape(CATEGORY_NAMES.get(question.category, question.category))}<br/>"
-        f"<b>Тип:</b> {'обратный' if question.is_reverse else 'прямой'}<br/><br/>"
+        f"<b>Вопрос #{question.id}</b>\n\n"
+        f"<b>Порядок:</b> {question.sort_order}\n"
+        f"<b>Категория:</b> {html.escape(CATEGORY_NAMES.get(question.category, question.category))}\n"
+        f"<b>Тип:</b> {'обратный' if question.is_reverse else 'прямой'}\n\n"
         f"<pre><code>{html.escape(question.text)}</code></pre>"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_test_question_editor_keyboard(question.id, bool(question.is_reverse)))
@@ -256,7 +256,7 @@ async def list_case_studies(client: MaxApiClient, chat_id: int, page: int) -> No
             )
         ).scalars().all()
     text = (
-        f"📖 <b>Кейсы и истории</b><br/><br/>Страница {page + 1}/{total_pages}.<br/>"
+        f"📖 <b>Кейсы и истории</b>\n\nСтраница {page + 1}/{total_pages}.\n"
         "Эта база используется для подбора релевантной истории по результатам теста."
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_case_studies_keyboard(cases, page, total_pages))
@@ -269,7 +269,7 @@ async def show_case_study_editor(client: MaxApiClient, chat_id: int, case_id: in
         await client.send_message(chat_id=chat_id, text="Кейс не найден.")
         return
     preview = case_study.text[:3000] + ("..." if len(case_study.text) > 3000 else "")
-    text = f"<b>Кейс #{case_study.id}</b><br/><br/><pre><code>{html.escape(preview)}</code></pre>"
+    text = f"<b>Кейс #{case_study.id}</b>\n\n<pre><code>{html.escape(preview)}</code></pre>"
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_case_study_editor_keyboard(case_study.id, page))
 
 

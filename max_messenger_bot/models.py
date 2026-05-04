@@ -140,7 +140,8 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
 def parse_callback(update: dict[str, Any]) -> IncomingCallback | None:
     callback = update.get("callback") or update.get("message_callback") or update
     sender = parse_sender(callback)
-    message = callback.get("message") or {}
+    # MAX puts "message" at the top level of the update, not inside "callback"
+    message = update.get("message") or callback.get("message") or {}
     recipient = message.get("recipient") or callback.get("recipient") or {}
     chat_id = (
         recipient.get("chat_id")

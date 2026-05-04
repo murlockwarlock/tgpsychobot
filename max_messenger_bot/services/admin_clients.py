@@ -34,7 +34,7 @@ async def list_clients(client: MaxApiClient, chat_id: int, page: int = 0) -> Non
             )
         ).scalars().all()
 
-    text = f"<b>👥 Список клиентов</b><br/><br/>Страница {page + 1}/{total_pages}"
+    text = f"<b>👥 Список клиентов</b>\n\nСтраница {page + 1}/{total_pages}"
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_clients_keyboard(page, total_pages, clients))
 
 
@@ -53,14 +53,14 @@ async def show_client_profile(client: MaxApiClient, chat_id: int, target_user_id
             subscription_line = f"бонус до {user.subscription.end_date.strftime('%d.%m.%Y %H:%M')}"
 
     text = (
-        "<b>Профиль клиента</b><br/><br/>"
-        f"<b>ID:</b> <code>{user.id}</code><br/>"
-        f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}<br/>"
-        f"<b>Username:</b> {html.escape(user.username or 'Не указан')}<br/>"
-        f"<b>Пол:</b> {html.escape(user.gender or 'Не указан')}<br/>"
-        f"<b>Возраст:</b> {html.escape(user.age or 'Не указан')}<br/>"
-        f"<b>Подписка:</b> {html.escape(subscription_line)}<br/>"
-        f"<b>Админ:</b> {'да' if user.is_admin else 'нет'}<br/>"
+        "<b>Профиль клиента</b>\n\n"
+        f"<b>ID:</b> <code>{user.id}</code>\n"
+        f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}\n"
+        f"<b>Username:</b> {html.escape(user.username or 'Не указан')}\n"
+        f"<b>Пол:</b> {html.escape(user.gender or 'Не указан')}\n"
+        f"<b>Возраст:</b> {html.escape(user.age or 'Не указан')}\n"
+        f"<b>Подписка:</b> {html.escape(subscription_line)}\n"
+        f"<b>Админ:</b> {'да' if user.is_admin else 'нет'}\n"
         f"<b>Дата регистрации:</b> {user.created_at.strftime('%d.%m.%Y %H:%M')}"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_client_profile_keyboard(target_user_id))
@@ -90,7 +90,7 @@ async def show_client_history(client: MaxApiClient, chat_id: int, target_user_id
     last_dialogue_id = None
     for msg in messages:
         if msg.dialogue_id != last_dialogue_id:
-            rendered_parts.append(f"<br/>--- <b>Диалог №{msg.dialogue_id}</b> ---<br/>")
+            rendered_parts.append(f"\n--- <b>Диалог №{msg.dialogue_id}</b> ---\n")
             last_dialogue_id = msg.dialogue_id
         role = "👤 Клиент" if msg.role == "user" else "🤖 Бот"
         topic_name = topic_map.get(msg.topic_id, "Общий")
@@ -98,10 +98,10 @@ async def show_client_history(client: MaxApiClient, chat_id: int, target_user_id
         if msg.role == "assistant":
             content = markdown_to_html(msg.content or "")
         rendered_parts.append(
-            f"<b>{role}</b> [<i>{msg.timestamp.strftime('%d.%m.%Y %H:%M')}</i>] [<i>{html.escape(topic_name)}</i>]:<br/>{content}<br/>"
+            f"<b>{role}</b> [<i>{msg.timestamp.strftime('%d.%m.%Y %H:%M')}</i>] [<i>{html.escape(topic_name)}</i>]:\n{content}\n"
         )
 
-    full_text = f"📜 <b>История клиента:</b> {html.escape(target_user.first_name or str(target_user.id))} (<a href='https://t.me/@id{target_user.id}'><code>{target_user.id}</code></a>)<br/><br/>{''.join(rendered_parts)}"
+    full_text = f"📜 <b>История клиента:</b> {html.escape(target_user.first_name or str(target_user.id))} (<a href='https://t.me/@id{target_user.id}'><code>{target_user.id}</code></a>)\n\n{''.join(rendered_parts)}"
     pages = split_text(full_text, HISTORY_SAFE_LIMIT)
     total_pages = max(1, len(pages))
     page = max(0, min(page, total_pages - 1))
@@ -231,12 +231,12 @@ async def show_client_payment_info(client: MaxApiClient, chat_id: int, target_us
 
     name = user.name or user.first_name or str(target_user_id) if user else str(target_user_id)
     text = (
-        f"<b>💳 Платежи клиента {html.escape(name)}</b><br/><br/>"
-        f"Итого Robokassa: {total_robo:.2f} руб.<br/>"
-        f"Итого YooKassa: {total_yoo:.2f} руб.<br/><br/>"
+        f"<b>💳 Платежи клиента {html.escape(name)}</b>\n\n"
+        f"Итого Robokassa: {total_robo:.2f} руб.\n"
+        f"Итого YooKassa: {total_yoo:.2f} руб.\n\n"
     )
     if robo_payments or yoo_payments:
-        text += "<b>Последние платежи:</b><br/>"
+        text += "<b>Последние платежи:</b>\n"
         all_payments = []
         for r in robo_payments:
             all_payments.append((r.created_at, "Robo", r.amount, r.status))
@@ -245,9 +245,9 @@ async def show_client_payment_info(client: MaxApiClient, chat_id: int, target_us
         all_payments.sort(key=lambda x: x[0] or datetime.min, reverse=True)
         for dt, src, amount, status in all_payments[:10]:
             dt_str = dt.strftime('%d.%m.%Y %H:%M') if dt else "?"
-            text += f"<code>{dt_str}</code> {src}: {amount:.2f}₽ ({html.escape(status or '?')})<br/>"
+            text += f"<code>{dt_str}</code> {src}: {amount:.2f}₽ ({html.escape(status or '?')})\n"
     else:
-        text += "Платежи не найдены.<br/>"
+        text += "Платежи не найдены.\n"
 
     await client.send_message(
         chat_id=chat_id,

@@ -86,21 +86,21 @@ async def _build_list_text(topic: Topic, total_count: int, topic_id: int) -> str
         for cat in sorted(categories):
             marker = "🃏" if cat in back_categories else "⚠️ нет рубашки"
             lines.append(f"  <code>{cat}</code> — {marker}")
-        cats_info = "<br/><b>Категории:</b><br/>" + "<br/>".join(lines) + "<br/>"
+        cats_info = "\n<b>Категории:</b>\n" + "\n".join(lines) + "\n"
 
     return (
-        f"📁 Медиа-библиотека темы: <b>{topic.name}</b><br/>"
+        f"📁 Медиа-библиотека темы: <b>{topic.name}</b>\n"
         f"Файлов: {total_count}"
-        f"{cats_info}<br/>"
-        f"<b>Теги для AI:</b><br/>"
-        f"<code>[RANDOM_IMG: категория]</code> — случайная карта<br/>"
-        f"<code>[RANDOM_IMG: категория | N]</code> — N случайных карт сразу<br/>"
-        f"<code>[CHOICE_IMG: категория | N]</code> — выбор из N (лицом)<br/>"
-        f"<code>[CHOICE_IMG: категория | N | R]</code> — расклад из R карт, выбор из N<br/>"
-        f"<code>[CHOICE_IMG_HIDDEN: категория | N]</code> — выбор из N (рубашкой)<br/>"
-        f"<code>[CHOICE_IMG_HIDDEN: категория | N | R]</code> — расклад из R карт вслепую<br/>"
-        f"<code>[SHOW_IMG: имя_файла]</code> — конкретная карта<br/>"
-        f"<code>[SEND_AUDIO: имя]</code> — аудиофайл<br/><br/>"
+        f"{cats_info}\n"
+        f"<b>Теги для AI:</b>\n"
+        f"<code>[RANDOM_IMG: категория]</code> — случайная карта\n"
+        f"<code>[RANDOM_IMG: категория | N]</code> — N случайных карт сразу\n"
+        f"<code>[CHOICE_IMG: категория | N]</code> — выбор из N (лицом)\n"
+        f"<code>[CHOICE_IMG: категория | N | R]</code> — расклад из R карт, выбор из N\n"
+        f"<code>[CHOICE_IMG_HIDDEN: категория | N]</code> — выбор из N (рубашкой)\n"
+        f"<code>[CHOICE_IMG_HIDDEN: категория | N | R]</code> — расклад из R карт вслепую\n"
+        f"<code>[SHOW_IMG: имя_файла]</code> — конкретная карта\n"
+        f"<code>[SEND_AUDIO: имя]</code> — аудиофайл\n\n"
         f"🃏 Для скрытого выбора добавьте файл с именем <code>_back</code> в нужную категорию."
     )
 
@@ -156,16 +156,16 @@ async def show_media_detail(
 
     role_hint = ""
     if media.file_name == "_back":
-        role_hint = f"<br/>🃏 <b>Рубашка</b> для категории <code>{media.category}</code>"
+        role_hint = f"\n🃏 <b>Рубашка</b> для категории <code>{media.category}</code>"
 
     colls_text = ", ".join(coll_names) if coll_names else "нет"
     text = (
-        f"<b>📄 Данные файла:</b><br/>"
-        f"ID: <code>{media.id}</code><br/>"
-        f"Имя для AI: <code>{media.file_name}</code><br/>"
-        f"Тип: {media.media_type}<br/>"
-        f"Категория: {media.category or 'Не задана'}<br/>"
-        f"Коллекции: {colls_text}<br/>"
+        f"<b>📄 Данные файла:</b>\n"
+        f"ID: <code>{media.id}</code>\n"
+        f"Имя для AI: <code>{media.file_name}</code>\n"
+        f"Тип: {media.media_type}\n"
+        f"Категория: {media.category or 'Не задана'}\n"
+        f"Коллекции: {colls_text}\n"
         f"Описание: {media.description or 'Нет'}"
         f"{role_hint}"
     )
@@ -342,7 +342,7 @@ async def start_add_media(
     await client.send_message(
         chat_id=chat_id,
         text=(
-            "Отправьте файл (фото, аудио) или вставьте токен файла для добавления в медиатеку.<br/>"
+            "Отправьте файл (фото, аудио) или вставьте токен файла для добавления в медиатеку.\n"
             "Если вставляете токен текстом — просто отправьте его следующим сообщением."
         ),
     )
@@ -385,7 +385,7 @@ async def receive_add_file(
         await client.send_message(
             chat_id=chat_id,
             text=(
-                "Токен принят.<br/>"
+                "Токен принят.\n"
                 "Укажи тип файла: <b>photo</b> (фото/изображение) или <b>audio</b> (аудио)."
             ),
         )
@@ -402,9 +402,9 @@ async def receive_add_file(
     await client.send_message(
         chat_id=chat_id,
         text=(
-            f"✅ <b>Файл получен как {m_type}!</b><br/><br/>"
+            f"✅ <b>Файл получен как {m_type}!</b>\n\n"
             "Придумай короткое <b>техническое имя</b> на английском "
-            "(например: <code>morning_meditation</code>, <code>card_death</code>).<br/><br/>"
+            "(например: <code>morning_meditation</code>, <code>card_death</code>).\n\n"
             "⚠️ <b>ВАЖНО:</b> Это имя используется в системном промпте, "
             "например <code>[SEND_AUDIO: имя]</code>."
         ),
@@ -438,9 +438,9 @@ async def resolve_add_type(
     await client.send_message(
         chat_id=chat_id,
         text=(
-            f"✅ Тип <b>{m_type}</b> принят.<br/><br/>"
+            f"✅ Тип <b>{m_type}</b> принят.\n\n"
             "Придумай короткое <b>техническое имя</b> на английском "
-            "(например: <code>morning_meditation</code>, <code>card_death</code>).<br/><br/>"
+            "(например: <code>morning_meditation</code>, <code>card_death</code>).\n\n"
             "⚠️ <b>ВАЖНО:</b> Это имя используется в системном промпте."
         ),
     )
@@ -472,9 +472,9 @@ async def save_add_name(
         await client.send_message(
             chat_id=chat_id,
             text=(
-                f"👌 Имя <code>{tech_name}</code> принято.<br/><br/>"
+                f"👌 Имя <code>{tech_name}</code> принято.\n\n"
                 "Введи <b>категорию</b> для изображения "
-                "(например: <code>tarot</code>, <code>mak</code>, <code>oracle</code>).<br/>"
+                "(например: <code>tarot</code>, <code>mak</code>, <code>oracle</code>).\n"
                 "Категория используется для группировки карт одной колоды."
             ),
         )
@@ -487,8 +487,8 @@ async def save_add_name(
         await client.send_message(
             chat_id=chat_id,
             text=(
-                f"👌 Имя <code>{tech_name}</code> принято.<br/><br/>"
-                "Введи описание файла.<br/>"
+                f"👌 Имя <code>{tech_name}</code> принято.\n\n"
+                "Введи описание файла.\n"
                 "Для аудио — опиши, в какой момент AI должен предложить эту практику."
             ),
         )
@@ -513,7 +513,7 @@ async def save_add_category(
     await client.send_message(
         chat_id=chat_id,
         text=(
-            f"👌 Категория <code>{category}</code> принята.<br/><br/>"
+            f"👌 Категория <code>{category}</code> принята.\n\n"
             "Введи описание карты — трактовку, которую AI учтёт при интерпретации."
         ),
     )
@@ -582,20 +582,20 @@ async def save_add_description(
 
     if m_name == "_back":
         usage_hint = (
-            f"🃏 Это рубашка для категории <code>{category}</code>.<br/>"
-            f"Теперь AI может использовать скрытый выбор:<br/>"
+            f"🃏 Это рубашка для категории <code>{category}</code>.\n"
+            f"Теперь AI может использовать скрытый выбор:\n"
             f"<code>[CHOICE_IMG_HIDDEN: {category} | 3]</code>"
         )
     elif m_type == "audio":
         usage_hint = f"<code>[SEND_AUDIO: {m_name}]</code>"
     else:
         usage_hint = (
-            f"<code>[RANDOM_IMG: {category}]</code> — одна случайная карта<br/>"
-            f"<code>[RANDOM_IMG: {category} | 5]</code> — 5 случайных карт сразу<br/>"
-            f"<code>[CHOICE_IMG: {category} | 3]</code> — выбор из 3 карт (лицом)<br/>"
-            f"<code>[CHOICE_IMG: {category} | 3 | 5]</code> — расклад из 5 карт, выбор из 3<br/>"
-            f"<code>[CHOICE_IMG_HIDDEN: {category} | 3]</code> — выбор вслепую (рубашкой)<br/>"
-            f"<code>[CHOICE_IMG_HIDDEN: {category} | 3 | 5]</code> — расклад из 5 вслепую<br/>"
+            f"<code>[RANDOM_IMG: {category}]</code> — одна случайная карта\n"
+            f"<code>[RANDOM_IMG: {category} | 5]</code> — 5 случайных карт сразу\n"
+            f"<code>[CHOICE_IMG: {category} | 3]</code> — выбор из 3 карт (лицом)\n"
+            f"<code>[CHOICE_IMG: {category} | 3 | 5]</code> — расклад из 5 карт, выбор из 3\n"
+            f"<code>[CHOICE_IMG_HIDDEN: {category} | 3]</code> — выбор вслепую (рубашкой)\n"
+            f"<code>[CHOICE_IMG_HIDDEN: {category} | 3 | 5]</code> — расклад из 5 вслепую\n"
             f"<code>[SHOW_IMG: {m_name}]</code> — показать именно эту карту"
         )
 
@@ -603,9 +603,9 @@ async def save_add_description(
     await client.send_message(
         chat_id=chat_id,
         text=(
-            f"✅ <b>Файл успешно добавлен!</b><br/><br/>"
-            f"AI может использовать его через теги:<br/>"
-            f"{usage_hint}<br/><br/>"
+            f"✅ <b>Файл успешно добавлен!</b>\n\n"
+            f"AI может использовать его через теги:\n"
+            f"{usage_hint}\n\n"
             f"Файл привязан к теме: <b>{topic_name}</b>"
         ),
     )

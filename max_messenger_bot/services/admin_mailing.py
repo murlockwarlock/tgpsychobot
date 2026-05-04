@@ -43,7 +43,7 @@ STATUS_NAMES = {
 async def show_menu(client: MaxApiClient, chat_id: int) -> None:
     await client.send_message(
         chat_id=chat_id,
-        text="✉️ <b>Рассылки</b><br/><br/>Создание, запуск и история рассылок в MAX.",
+        text="✉️ <b>Рассылки</b>\n\nСоздание, запуск и история рассылок в MAX.",
         attachments=admin_mailing_menu_keyboard(),
     )
 
@@ -65,7 +65,7 @@ async def choose_audience(client: MaxApiClient, states: StateStore, chat_id: int
     await client.send_message(
         chat_id=chat_id,
         text=(
-            f"Выбрана аудитория: <b>{html.escape(AUDIENCE_NAMES[audience])}</b><br/><br/>"
+            f"Выбрана аудитория: <b>{html.escape(AUDIENCE_NAMES[audience])}</b>\n\n"
             "Отправьте текст рассылки или медиа с подписью одним сообщением."
         ),
     )
@@ -107,9 +107,9 @@ async def save_input(client: MaxApiClient, states: StateStore, chat_id: int, use
     await client.send_message(
         chat_id=chat_id,
         text=(
-            "<b>Предпросмотр рассылки</b><br/><br/>"
-            f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES[audience])}<br/><br/>"
-            f"<b>Медиа:</b> {html.escape(media_type or 'нет')}<br/><br/>"
+            "<b>Предпросмотр рассылки</b>\n\n"
+            f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES[audience])}\n\n"
+            f"<b>Медиа:</b> {html.escape(media_type or 'нет')}\n\n"
             f"<pre><code>{html.escape(preview or 'Без текста')}</code></pre>"
         ),
         attachments=_preview_attachments(media_type, media_token, include_keyboard=True),
@@ -229,10 +229,10 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
     await client.send_message(
         chat_id=chat_id,
         text=(
-            "✅ Рассылка завершена.<br/><br/>"
-            f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES[audience])}<br/>"
-            f"<b>Получателей:</b> {len(recipient_ids)}<br/>"
-            f"<b>Успешно:</b> {success_count}<br/>"
+            "✅ Рассылка завершена.\n\n"
+            f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES[audience])}\n"
+            f"<b>Получателей:</b> {len(recipient_ids)}\n"
+            f"<b>Успешно:</b> {success_count}\n"
             f"<b>Ошибки:</b> {failure_count}"
         ),
         attachments=admin_mailing_menu_keyboard(),
@@ -252,7 +252,7 @@ async def show_history(client: MaxApiClient, chat_id: int, page: int) -> None:
                 .limit(PAGE_SIZE)
             )
         ).scalars().all()
-    text = "📜 История рассылок пуста." if not mailings and total_mailings == 0 else f"📜 <b>История рассылок</b><br/><br/>Страница {page + 1}/{total_pages}"
+    text = "📜 История рассылок пуста." if not mailings and total_mailings == 0 else f"📜 <b>История рассылок</b>\n\nСтраница {page + 1}/{total_pages}"
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_mailing_history_keyboard(mailings, page, total_pages))
 
 
@@ -270,16 +270,16 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
     is_enabled = getattr(mailing, 'is_enabled', True)
     preview = mailing.text[:3000] + ("..." if mailing.text and len(mailing.text) > 3000 else "")
     text = (
-        f"<b>Рассылка #{mailing.id}</b><br/><br/>"
-        f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES.get(mailing.target_audience or '', mailing.target_audience or ''))}<br/>"
-        f"<b>Статус:</b> {STATUS_NAMES.get(mailing.status, mailing.status)}<br/>"
-        f"<b>Активна:</b> {'✅' if is_enabled else '❌'}<br/>"
-        f"<b>Создана:</b> {created}<br/>"
-        f"<b>Старт:</b> {started}<br/>"
-        f"<b>Завершение:</b> {ended}<br/>"
-        f"<b>Успешно:</b> {mailing.success_count}<br/>"
-        f"<b>Ошибки:</b> {mailing.failure_count}<br/>"
-        f"<b>Медиа:</b> {html.escape(mailing.media_file_type or 'нет')}<br/><br/>"
+        f"<b>Рассылка #{mailing.id}</b>\n\n"
+        f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES.get(mailing.target_audience or '', mailing.target_audience or ''))}\n"
+        f"<b>Статус:</b> {STATUS_NAMES.get(mailing.status, mailing.status)}\n"
+        f"<b>Активна:</b> {'✅' if is_enabled else '❌'}\n"
+        f"<b>Создана:</b> {created}\n"
+        f"<b>Старт:</b> {started}\n"
+        f"<b>Завершение:</b> {ended}\n"
+        f"<b>Успешно:</b> {mailing.success_count}\n"
+        f"<b>Ошибки:</b> {mailing.failure_count}\n"
+        f"<b>Медиа:</b> {html.escape(mailing.media_file_type or 'нет')}\n\n"
         f"<pre><code>{html.escape(preview or 'Нет текста')}</code></pre>"
     )
     toggle_label = "❌ Выключить" if is_enabled else "✅ Включить"
@@ -311,7 +311,7 @@ async def send_test(client: MaxApiClient, chat_id: int, user_id: int, mailing_id
         attachments.append({"type": mailing.media_file_type, "payload": {"token": mailing.media_file_id}})
 
     try:
-        await client.send_message(user_id=user_id, text=f"🧪 <b>Тест рассылки:</b><br/><br/>{formatted}", attachments=attachments or None)
+        await client.send_message(user_id=user_id, text=f"🧪 <b>Тест рассылки:</b>\n\n{formatted}", attachments=attachments or None)
         await client.send_message(chat_id=chat_id, text=f"✅ Тест рассылки #{mailing_id} отправлен вам.")
     except Exception:
         log.exception("Failed to send test mailing mailing_id=%s user_id=%s", mailing_id, user_id)

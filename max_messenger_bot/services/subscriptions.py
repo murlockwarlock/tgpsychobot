@@ -85,22 +85,22 @@ async def show_subscription_info(client: MaxApiClient, chat_id: int, user_id: in
             unit = "дн." if plan.duration_unit == "days" else "мес."
             renewal_line = ""
             if getattr(plan, "allow_auto_renewal", True):
-                renewal_line = f"<br/><b>Автопродление:</b> {'✅ Включено' if sub.auto_renewal else '❌ Выключено'}"
+                renewal_line = f"\n<b>Автопродление:</b> {'✅ Включено' if sub.auto_renewal else '❌ Выключено'}"
             text = (
-                "<b>⭐️ Ваша подписка активна</b><br/><br/>"
-                f"<b>Тариф:</b> {plan.name} ({plan.duration_value} {unit})<br/>"
+                "<b>⭐️ Ваша подписка активна</b>\n\n"
+                f"<b>Тариф:</b> {plan.name} ({plan.duration_value} {unit})\n"
                 f"<b>Действует до:</b> {format_msk(sub.end_date)} МСК"
                 f"{renewal_line}"
             )
             sub_info = {"auto_renewal": sub.auto_renewal, "allow_auto_renewal": getattr(plan, "allow_auto_renewal", True)}
         else:
             text = (
-                "<b>🎁 У вас активен бонусный доступ</b><br/><br/>"
+                "<b>🎁 У вас активен бонусный доступ</b>\n\n"
                 f"Действует до: {format_msk(sub.end_date)} МСК"
             )
     elif user.subscription and user.subscription.end_date <= now and user.subscription.auto_renewal and user.subscription.payment_method_id:
         text = (
-            "<b>⚠️ Подписка истекла, ожидается оплата по автопродлению</b><br/><br/>"
+            "<b>⚠️ Подписка истекла, ожидается оплата по автопродлению</b>\n\n"
             "Вы можете повторить списание вручную или оформить подписку заново."
         )
         await client.send_message(chat_id=chat_id, text=text, attachments=retry_subscription_keyboard())
@@ -172,8 +172,8 @@ async def choose_payment_provider(client: MaxApiClient, chat_id: int, user_id: i
         final_price = plan.price * (1 - discount_percent / 100)
 
     text = (
-        f"<b>Тариф:</b> {plan.name}<br/>"
-        f"<b>Стоимость:</b> {final_price:.2f} руб.<br/><br/>"
+        f"<b>Тариф:</b> {plan.name}\n"
+        f"<b>Стоимость:</b> {final_price:.2f} руб.\n\n"
         "Выберите способ оплаты:"
     )
     providers = []
@@ -231,7 +231,7 @@ async def create_yookassa_link(client: MaxApiClient, chat_id: int, user_id: int,
             )
             await session.commit()
         log.info("Yookassa payment created user_id=%s plan_id=%s payment_id=%s amount=%.2f", user_id, plan_id, payment.id, price)
-        text = f"Ссылка на оплату готова.<br/><br/><b>Сумма:</b> {price:.2f} руб."
+        text = f"Ссылка на оплату готова.\n\n<b>Сумма:</b> {price:.2f} руб."
         await client.send_message(chat_id=chat_id, text=text, attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через ЮKassa", payment.confirmation.confirmation_url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")]]}}])
     except Exception:
         log.exception("Yookassa payment creation failed user_id=%s plan_id=%s amount=%.2f", user_id, plan_id, price)
@@ -261,7 +261,7 @@ async def create_robokassa_link(client: MaxApiClient, chat_id: int, user_id: int
         log.info("Robokassa payment link created user_id=%s plan_id=%s invoice_id=%s amount=%.2f", user_id, plan_id, invoice_id, price)
         await client.send_message(
             chat_id=chat_id,
-            text=f"Ссылка на оплату готова.<br/><br/><b>Сумма:</b> {price:.2f} руб.",
+            text=f"Ссылка на оплату готова.\n\n<b>Сумма:</b> {price:.2f} руб.",
             attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через Robokassa", url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")]]}}],
         )
     except Exception:
@@ -366,9 +366,9 @@ async def show_referral_info(client: MaxApiClient, chat_id: int, user_id: int) -
     username = me.get("username") or me.get("name") or ""
     link = f"https://max.ru/{username}?start=ref_{user_id}" if username else f"ref_{user_id}"
     text = (
-        "<b>🔗 Реферальная программа</b><br/><br/>"
-        f"<b>Ваша ссылка:</b><br/>{link}<br/><br/>"
-        f"👥 <b>Приглашено:</b> {referral_count}<br/><br/>"
+        "<b>🔗 Реферальная программа</b>\n\n"
+        f"<b>Ваша ссылка:</b>\n{link}\n\n"
+        f"👥 <b>Приглашено:</b> {referral_count}\n\n"
         f"За каждого приглашённого вы и ваш друг получите по <b>{config.referral_bonus_days_referrer} дн.</b>"
     )
     await client.send_message(chat_id=chat_id, text=text)

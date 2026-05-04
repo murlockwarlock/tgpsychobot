@@ -31,7 +31,7 @@ async def show_content_list(client: MaxApiClient, chat_id: int) -> None:
     rows = [(item.key, _display_title(item), bool(item.is_visible)) for item in items]
     await client.send_message(
         chat_id=chat_id,
-        text="✏️ <b>Управление контентом</b><br/><br/>Выберите раздел для редактирования.",
+        text="✏️ <b>Управление контентом</b>\n\nВыберите раздел для редактирования.",
         attachments=admin_content_list_keyboard(rows),
     )
 
@@ -46,12 +46,12 @@ async def show_content_editor(client: MaxApiClient, chat_id: int, content_key: s
     text_display = html.escape(item.text_content or "Текст не задан.")
     visible = "✅ Виден пользователям" if item.is_visible else "❌ Скрыт от пользователей"
     message = (
-        f"📝 <b>{html.escape(_display_title(item))}</b><br/><br/>"
-        f"<b>Ключ:</b> <code>{item.key}</code><br/>"
-        f"<b>Статус:</b> {visible}<br/>"
-        f"<b>Порядок:</b> {html.escape(item.content_order or 'media_top')}<br/><br/>"
-        f"<b>MAX-медиа:</b> {media_count or 0}<br/><br/>"
-        f"<b>Текст:</b><br/><pre><code>{text_display}</code></pre><br/>"
+        f"📝 <b>{html.escape(_display_title(item))}</b>\n\n"
+        f"<b>Ключ:</b> <code>{item.key}</code>\n"
+        f"<b>Статус:</b> {visible}\n"
+        f"<b>Порядок:</b> {html.escape(item.content_order or 'media_top')}\n\n"
+        f"<b>MAX-медиа:</b> {media_count or 0}\n\n"
+        f"<b>Текст:</b>\n<pre><code>{text_display}</code></pre>\n"
         "Медиа для MAX хранятся отдельно; текст уже можно редактировать отсюда."
     )
     await client.send_message(chat_id=chat_id, text=message, attachments=admin_content_editor_keyboard(content_key, bool(item.is_visible)))
