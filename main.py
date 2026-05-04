@@ -129,11 +129,12 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
 
     await bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
 
-    all_admin_ids = set(OWNER_IDS)
+    MAX_ID_OFFSET = 100_000_000_000
+    all_admin_ids = {aid for aid in OWNER_IDS if aid < MAX_ID_OFFSET}
     try:
         async with async_session_maker() as session:
             admin_result = await session.execute(
-                select(User.id).where(User.is_admin == True)
+                select(User.id).where(User.is_admin == True, User.id < MAX_ID_OFFSET)
             )
             db_admin_ids = {row[0] for row in admin_result}
             all_admin_ids.update(db_admin_ids)

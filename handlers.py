@@ -1941,6 +1941,19 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
         stmt = select(Content).where(Content.key == "start_message").options(selectinload(Content.media))
         content_obj = await session.scalar(stmt)
 
+    # Ensure admin command menu is set for admins (in case bot was restarted before user /start)
+    if await is_admin(message.from_user.id):
+        from aiogram.types import BotCommand, BotCommandScopeChat
+        try:
+            await bot.set_my_commands([
+                BotCommand(command="start", description="Запустить / Перезапустить бота"),
+                BotCommand(command="ref", description="🤝 Пригласить друзей"),
+                BotCommand(command="admin", description="Админ-панель"),
+                BotCommand(command="help", description="Помощь (для админов)"),
+            ], scope=BotCommandScopeChat(chat_id=message.from_user.id))
+        except Exception:
+            pass
+
     main_kb = await kb.main_client_keyboard()
     if not content_obj:
         text = "Приветствие не задано."
