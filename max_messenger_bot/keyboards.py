@@ -103,7 +103,7 @@ def settings_keyboard(user) -> list[dict]:
         [
             [callback_button("✏️ Имя", "settings_change_name"), callback_button("👤 Пол", "settings_change_gender")],
             [callback_button("🔢 Возраст", "settings_change_age"), callback_button("📏 Длина ответов", "settings_toggle_length")],
-            [callback_button("🏠 Главное меню", "main_menu")],
+            main_menu_row(),
         ]
     )
 
@@ -126,7 +126,7 @@ def topics_keyboard(topics: Iterable, current_topic_id: int | None) -> list[dict
         text = f"✅ {topic.name}" if topic.id == current_topic_id else topic.name
         rows.append([callback_button(text, f"select_topic_{topic.id}")])
     rows.append([callback_button("🏠 Перейти в основной диалог", "reset_topic")])
-    rows.append([callback_button("⬅️ В главное меню", "main_menu")])
+    rows.append(main_menu_row())
     return inline_keyboard(rows)
 
 

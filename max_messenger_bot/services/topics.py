@@ -4,7 +4,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
-from ..keyboards import build_main_menu, callback_button, inline_keyboard, topics_keyboard
+from ..keyboards import build_main_menu, callback_button, inline_keyboard, main_menu_row, topics_keyboard
 from ..legacy import AIConfig, Content, Topic, User, UserTopicState, async_session_maker
 from memory_mode import apply_memory_mode_topic_switch, normalize_memory_mode
 
@@ -68,8 +68,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         text=text,
         attachments=inline_keyboard([[
             callback_button("💬 Начать диалог", "topic_start_dialogue"),
-            callback_button("◀️ Главное меню", "main_menu"),
-        ]]),
+        ], main_menu_row()]),
     )
 
 

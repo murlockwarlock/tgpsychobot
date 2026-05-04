@@ -470,9 +470,9 @@ class MaxBotApplication:
             content = await session.scalar(select(Content).where(Content.button_title == text, Content.is_visible == True).limit(1))
             user = await session.get(User, message.sender.user_id, options=[selectinload(User.subscription)])
         if content:
-            from .keyboards import callback_button, inline_keyboard
+            from .keyboards import inline_keyboard, main_menu_row
             content_attachments = await common.get_content_attachments(content.key)
-            nav = inline_keyboard([[callback_button("◀️ Главное меню", "main_menu")]])
+            nav = inline_keyboard([main_menu_row()])
             await self.client.send_message(
                 chat_id=message.chat_id,
                 text=content.text_content or "Раздел пока пуст.",
