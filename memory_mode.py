@@ -13,6 +13,19 @@ def normalize_memory_mode(ai_config) -> str:
     return get_memory_mode(ai_config)
 
 
+def build_history_scope(message_cls, user_id: int, dialogue_id, topic_id, memory_mode: str):
+    """Return a SQLAlchemy WHERE condition for history queries based on memory mode."""
+    from sqlalchemy import and_
+    if memory_mode == MEMORY_MODE_GLOBAL:
+        return message_cls.user_id == user_id
+    if memory_mode == MEMORY_MODE_TOPIC:
+        if topic_id is not None:
+            return and_(message_cls.user_id == user_id, message_cls.topic_id == topic_id)
+        return message_cls.user_id == user_id
+    # MEMORY_MODE_RESET: scope by dialogue
+    return and_(message_cls.user_id == user_id, message_cls.dialogue_id == (dialogue_id or 1))
+
+
 def get_memory_mode(ai_config) -> str:
     mode = getattr(ai_config, "memory_mode", None)
     if mode in MEMORY_MODE_VALUES:
