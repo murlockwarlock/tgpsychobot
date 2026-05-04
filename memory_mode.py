@@ -65,3 +65,46 @@ def is_topic_memory_mode(mode: str) -> bool:
 
 def is_global_memory_mode(mode: str) -> bool:
     return mode == MEMORY_MODE_GLOBAL
+
+
+async def start_new_dialogue(session, user, topic_id: int, memory_mode: str) -> None:
+    """Increment the user's dialogue_id to start a fresh context window."""
+    user.current_dialogue_id = (user.current_dialogue_id or 1) + 1
+
+
+async def apply_memory_mode_topic_switch(session, user, topic_id: int, memory_mode: str) -> bool:
+    """Handle memory context when the user switches topics.
+
+    Returns True if a previously saved context for the new topic was restored.
+    """
+    from database import UserTopicState  # local import to avoid circular dependency
+
+    if memory_mode == MEMORY_MODE_GLOBAL:
+        return False
+
+    # Save current topic's dialogue state before switching.
+    current_topic_id = getattr(user, "current_topic_id", None)
+    if current_topic_id is not None:
+        saved = await session.get(UserTopicState, (user.id, current_topic_id))
+        if saved:
+            saved.dialogue_id = user.current_dialogue_id
+        else:
+            session.add(UserTopicState(
+                user_id=user.id,
+                topic_id=current_topic_id,
+                dialogue_id=user.current_dialogue_id,
+            ))
+
+    if memory_mode == MEMORY_MODE_RESET:
+        user.current_dialogue_id = (user.current_dialogue_id or 1) + 1
+        return False
+
+    # MEMORY_MODE_TOPIC: restore previous dialogue state for this topic if available.
+    if topic_id:
+        saved = await session.get(UserTopicState, (user.id, topic_id))
+        if saved:
+            user.current_dialogue_id = saved.dialogue_id
+            return True
+
+    user.current_dialogue_id = (user.current_dialogue_id or 1) + 1
+    return False
