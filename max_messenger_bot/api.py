@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -270,6 +271,29 @@ class MaxApiClient:
                 )
                 await asyncio.sleep(delay)
         raise MaxApiError("MAX media send failed after retries")
+
+    async def send_text_file(
+        self,
+        *,
+        chat_id: int,
+        filename: str,
+        content: str,
+        caption: str | None = None,
+    ) -> dict[str, Any]:
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            result = await self.upload_file("file", tmp_path)
+            token = result.get("token") or result.get("fileId") or result.get("id")
+            if not token:
+                raise MaxApiError(f"MAX upload did not return file token: {result}")
+            attachment = {"type": "file", "payload": {"token": token, "filename": filename}}
+            return await self.send_message(chat_id=chat_id, text=caption or filename, attachments=[attachment])
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
     async def download_attachment(self, token: str, url: str | None = None) -> bytes:
         """Download a user-sent attachment by URL (preferred) or via API token."""

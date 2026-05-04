@@ -709,7 +709,9 @@ def admin_ai_settings_keyboard(current_provider: str) -> list[dict]:
         rows.append(chunk)
     rows.append([callback_button("🔑 Ключи и модели", "admin_ai_keys")])
     rows.append([callback_button("📝 Системный промпт", "admin_ai_system_prompt")])
+    rows.append([callback_button("📥 Скачать системный промпт", "admin_ai_download_system_prompt")])
     rows.append([callback_button("📎 Общий блок для всех промптов", "admin_ai_global_prompt_appendix")])
+    rows.append([callback_button("📥 Скачать общий блок", "admin_ai_download_global_prompt_appendix")])
     rows.append([callback_button("⬅️ В админ-панель", "admin_panel")])
     return inline_keyboard(rows)
 

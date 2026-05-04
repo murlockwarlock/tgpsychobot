@@ -713,8 +713,14 @@ class MaxBotApplication:
             if data == "admin_ai_system_prompt":
                 await admin_ai_service.start_edit_system_prompt(self.client, self.states, chat_id, user_id)
                 return
+            if data == "admin_ai_download_system_prompt":
+                await admin_ai_service.download_system_prompt(self.client, chat_id)
+                return
             if data == "admin_ai_global_prompt_appendix":
                 await admin_ai_service.start_edit_global_prompt_appendix(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_ai_download_global_prompt_appendix":
+                await admin_ai_service.download_global_prompt_appendix(self.client, chat_id)
                 return
             if data == "admin_clients":
                 await admin_clients_service.list_clients(self.client, chat_id, 0)

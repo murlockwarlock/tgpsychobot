@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 
 from ..api import MaxApiClient
+from ..formatting import split_text
 from ..keyboards import admin_ai_model_selection_keyboard, admin_ai_settings_keyboard, admin_ai_vision_models_keyboard, callback_button, inline_keyboard
 from ..legacy import AIConfig, async_session_maker
 from ..storage import StateStore
@@ -339,6 +340,29 @@ async def start_edit_global_prompt_appendix(client: MaxApiClient, states: StateS
         chat_id=chat_id,
         text=f"<b>Общий блок для всех промптов</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст. Для очистки отправьте <code>-</code>.",
     )
+
+
+async def _send_prompt_text_file(client: MaxApiClient, chat_id: int, filename: str, content: str) -> None:
+    try:
+        await client.send_text_file(chat_id=chat_id, filename=filename, content=content, caption=f"📥 {filename}")
+    except Exception:
+        escaped = html.escape(content or "Промпт пуст.")
+        for chunk in split_text(f"<pre><code>{escaped}</code></pre>", 3900)[:10]:
+            await client.send_message(chat_id=chat_id, text=chunk)
+
+
+async def download_system_prompt(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    content = config.system_prompt or ""
+    filename = config.prompt_filename or "system_prompt.txt"
+    if not filename.endswith(".txt"):
+        filename = f"{filename}.txt"
+    await _send_prompt_text_file(client, chat_id, filename, content)
+
+
+async def download_global_prompt_appendix(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    await _send_prompt_text_file(client, chat_id, "global_prompt_appendix.txt", config.global_prompt_appendix or "")
 
 
 async def save_system_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
