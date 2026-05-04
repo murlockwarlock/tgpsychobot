@@ -117,7 +117,7 @@ async def start_edit_prompt(client: MaxApiClient, states: StateStore, chat_id: i
     preview = current[:3000] + ("\n\n[...]" if len(current) > 3000 else "")
     await client.send_message(
         chat_id=chat_id,
-        text=f"<b>Текущий промпт теста:</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст промпта.",
+        text=f"<b>Текущий промпт теста:</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст промпта сообщением или загрузите <b>.txt/.md</b> файл.",
     )
 
 
@@ -128,4 +128,3 @@ async def save_prompt(client: MaxApiClient, states: StateStore, chat_id: int, us
         await session.commit()
     await states.clear(user_id)
     await show_menu(client, chat_id)
-

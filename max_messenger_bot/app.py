@@ -1497,11 +1497,7 @@ async def create_web_app() -> web.Application:
     await client.__aenter__()
     await client.set_commands([
         {"name": "start", "description": "Запустить бота"},
-        {"name": "help", "description": "Помощь"},
-        {"name": "promo", "description": "Ввести промокод"},
         {"name": "ref", "description": "Реферальная программа"},
-        {"name": "test", "description": "Пройти тест"},
-        {"name": "admin", "description": "Админ-панель"},
     ])
     bot_app = MaxBotApplication(client)
 

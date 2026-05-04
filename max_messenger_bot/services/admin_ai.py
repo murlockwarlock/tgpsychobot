@@ -328,7 +328,7 @@ async def start_edit_system_prompt(client: MaxApiClient, states: StateStore, cha
     await states.set(user_id, chat_id, "admin_ai_set_system_prompt", {})
     await client.send_message(
         chat_id=chat_id,
-        text=f"<b>Текущий системный промпт</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст промпта.",
+        text=f"<b>Текущий системный промпт</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст промпта сообщением или загрузите <b>.txt/.md</b> файл.",
     )
 
 
@@ -338,7 +338,7 @@ async def start_edit_global_prompt_appendix(client: MaxApiClient, states: StateS
     await states.set(user_id, chat_id, "admin_ai_set_global_prompt_appendix", {})
     await client.send_message(
         chat_id=chat_id,
-        text=f"<b>Общий блок для всех промптов</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст. Для очистки отправьте <code>-</code>.",
+        text=f"<b>Общий блок для всех промптов</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст сообщением или загрузите <b>.txt/.md</b> файл. Для очистки отправьте <code>-</code>.",
     )
 
 

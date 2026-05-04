@@ -106,7 +106,7 @@ async def save_name(client: MaxApiClient, states: StateStore, chat_id: int, user
 
 async def start_edit_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, topic_id: int) -> None:
     await states.set(user_id, chat_id, "admin_edit_topic_prompt", {"topic_id": topic_id})
-    await client.send_message(chat_id=chat_id, text="Отправьте новый системный промпт темы.")
+    await client.send_message(chat_id=chat_id, text="Отправьте новый системный промпт темы сообщением или загрузите .txt/.md файл.")
 
 
 async def save_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
