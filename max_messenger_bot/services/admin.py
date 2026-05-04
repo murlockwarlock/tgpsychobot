@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from ..api import MaxApiClient
 from ..keyboards import admin_panel_keyboard, admin_subscriptions_keyboard, callback_button, inline_keyboard
 from ..legacy import Message as DBMessage, PromoCode, ReferralPaymentLog, SubscriptionConfig, SubscriptionPlan, Topic, User, UserSubscription, async_session_maker
+from ..models import MAX_ID_OFFSET
 
 
 async def show_admin_panel(client: MaxApiClient, chat_id: int) -> None:
@@ -20,12 +21,27 @@ async def show_stats(client: MaxApiClient, chat_id: int) -> None:
         week_start = today_start - timedelta(days=today_start.weekday())
         month_start = today_start.replace(day=1)
 
-        total_users = await session.scalar(select(func.count()).select_from(User)) or 0
-        users_today = await session.scalar(select(func.count()).select_from(User).where(User.created_at >= today_start)) or 0
-        users_week = await session.scalar(select(func.count()).select_from(User).where(User.created_at >= week_start)) or 0
-        users_month = await session.scalar(select(func.count()).select_from(User).where(User.created_at >= month_start)) or 0
-        total_messages = await session.scalar(select(func.count()).select_from(DBMessage)) or 0
-        active_subs = await session.scalar(select(func.count()).select_from(UserSubscription).where(UserSubscription.end_date > now)) or 0
+        total_users = await session.scalar(
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET)
+        ) or 0
+        users_today = await session.scalar(
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET, User.created_at >= today_start)
+        ) or 0
+        users_week = await session.scalar(
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET, User.created_at >= week_start)
+        ) or 0
+        users_month = await session.scalar(
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET, User.created_at >= month_start)
+        ) or 0
+        total_messages = await session.scalar(
+            select(func.count()).select_from(DBMessage).where(DBMessage.user_id >= MAX_ID_OFFSET)
+        ) or 0
+        active_subs = await session.scalar(
+            select(func.count()).select_from(UserSubscription).where(
+                UserSubscription.user_id >= MAX_ID_OFFSET,
+                UserSubscription.end_date > now,
+            )
+        ) or 0
 
     text = (
         "📊 <b>Статистика</b>\n\n"

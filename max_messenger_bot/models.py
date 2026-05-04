@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Any
 
 
+MAX_ID_OFFSET = 100_000_000_000
+
+
 def _nested_get(data: dict[str, Any] | None, *path: str) -> Any:
     current: Any = data or {}
     for part in path:
@@ -76,6 +79,12 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
     body = raw.get("body") or raw
     recipient = raw.get("recipient") or raw.get("chat") or {}
     sender = parse_sender(raw)
+    sender = Sender(
+        user_id=sender.user_id + MAX_ID_OFFSET,
+        username=sender.username,
+        first_name=sender.first_name,
+        last_name=sender.last_name,
+    )
     attachments = None
     media_type = None
     media_token = None
@@ -140,6 +149,12 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
 def parse_callback(update: dict[str, Any]) -> IncomingCallback | None:
     callback = update.get("callback") or update.get("message_callback") or update
     sender = parse_sender(callback)
+    sender = Sender(
+        user_id=sender.user_id + MAX_ID_OFFSET,
+        username=sender.username,
+        first_name=sender.first_name,
+        last_name=sender.last_name,
+    )
     # MAX puts "message" at the top level of the update, not inside "callback"
     message = update.get("message") or callback.get("message") or {}
     recipient = message.get("recipient") or callback.get("recipient") or {}

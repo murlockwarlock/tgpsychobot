@@ -113,6 +113,10 @@ class MaxApiClient:
     async def get_me(self) -> dict[str, Any]:
         return await self._request("GET", "/me")
 
+    async def set_commands(self, commands: list[dict[str, str]]) -> dict[str, Any]:
+        """Set bot commands. commands = [{"name": "start", "description": "..."}]"""
+        return await self._request("PATCH", "/me", json_data={"commands": commands})
+
     async def set_webhook(self, url: str, secret: str | None, update_types: tuple[str, ...]) -> dict[str, Any]:
         payload: dict[str, Any] = {"url": url, "update_types": list(update_types)}
         if secret:

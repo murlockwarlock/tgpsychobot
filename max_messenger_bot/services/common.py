@@ -252,7 +252,6 @@ async def reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> No
             )
             await session.commit()
     await client.send_message(chat_id=chat_id, text="✅ Память очищена.")
-    await send_main_menu(client, chat_id)
 
 
 async def ensure_access_before_chat(client: MaxApiClient, chat_id: int, user: User) -> bool:

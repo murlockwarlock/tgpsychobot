@@ -75,6 +75,11 @@ async def show_subscription_info(client: MaxApiClient, chat_id: int, user_id: in
     now = utc_now()
     referral_enabled = bool(config and config.referral_enabled)
     referral_btn_name = config.referral_sub_btn_name if config else "🤝 Реферальная программа"
+    tg_link_line = (
+        f"\n\n<b>Привязанный TG ID:</b> <code>{user.tg_user_id}</code>"
+        if user.tg_user_id is not None
+        else ""
+    )
 
     text = "У вас нет активной подписки.\n\nОформите её, чтобы получить доступ ко всем возможностям бота."
     sub_info = None
@@ -103,13 +108,14 @@ async def show_subscription_info(client: MaxApiClient, chat_id: int, user_id: in
             "<b>⚠️ Подписка истекла, ожидается оплата по автопродлению</b>\n\n"
             "Вы можете повторить списание вручную или оформить подписку заново."
         )
-        await client.send_message(chat_id=chat_id, text=text, attachments=retry_subscription_keyboard())
+        await client.send_message(chat_id=chat_id, text=f"{text}{tg_link_line}", attachments=retry_subscription_keyboard())
         return
 
+    text = f"{text}{tg_link_line}"
     await client.send_message(
         chat_id=chat_id,
         text=text,
-        attachments=subscription_keyboard(sub_info, referral_enabled, referral_btn_name),
+        attachments=subscription_keyboard(sub_info, referral_enabled, referral_btn_name, user.tg_user_id),
     )
 
 

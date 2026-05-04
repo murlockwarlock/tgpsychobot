@@ -85,6 +85,7 @@ class User(Base):
     subscription = relationship("UserSubscription", back_populates="user", uselist=False, cascade="all, delete-orphan")
     promo_codes = relationship("PromoCode", secondary=user_promo_association, back_populates="users")
     referred_by = Column(BigInteger, nullable=True)
+    tg_user_id = Column(BigInteger, nullable=True)
 
 
 class Message(Base):

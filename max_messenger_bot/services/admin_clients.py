@@ -11,6 +11,7 @@ from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
 from ..keyboards import admin_client_profile_keyboard, admin_client_search_keyboard, admin_clients_keyboard, admin_history_keyboard, callback_button, inline_keyboard
 from ..legacy import Message as DBMessage, RobokassaPayment, Topic, User, UserSubscription, YookassaPayment, async_session_maker
+from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 
 
@@ -20,12 +21,15 @@ HISTORY_SAFE_LIMIT = 3500
 
 async def list_clients(client: MaxApiClient, chat_id: int, page: int = 0) -> None:
     async with async_session_maker() as session:
-        total_users = await session.scalar(select(func.count()).select_from(User)) or 0
+        total_users = await session.scalar(
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET)
+        ) or 0
         total_pages = max(1, math.ceil(total_users / PAGE_SIZE))
         page = max(0, min(page, total_pages - 1))
         clients = (
             await session.execute(
                 select(User)
+                .where(User.id >= MAX_ID_OFFSET)
                 .outerjoin(DBMessage, User.id == DBMessage.user_id)
                 .group_by(User.id)
                 .order_by(func.max(DBMessage.timestamp).desc().nulls_last(), User.created_at.desc())
@@ -41,6 +45,8 @@ async def list_clients(client: MaxApiClient, chat_id: int, page: int = 0) -> Non
 async def show_client_profile(client: MaxApiClient, chat_id: int, target_user_id: int) -> None:
     async with async_session_maker() as session:
         user = await session.get(User, target_user_id, options=[selectinload(User.subscription).selectinload(UserSubscription.plan)])
+    if user and user.id < MAX_ID_OFFSET:
+        user = None
     if not user:
         await client.send_message(chat_id=chat_id, text="Клиент не найден.")
         return
@@ -60,8 +66,9 @@ async def show_client_profile(client: MaxApiClient, chat_id: int, target_user_id
         f"<b>Пол:</b> {html.escape(user.gender or 'Не указан')}\n"
         f"<b>Возраст:</b> {html.escape(user.age or 'Не указан')}\n"
         f"<b>Подписка:</b> {html.escape(subscription_line)}\n"
-        f"<b>Админ:</b> {'да' if user.is_admin else 'нет'}\n"
-        f"<b>Дата регистрации:</b> {user.created_at.strftime('%d.%m.%Y %H:%M')}"
+        + (f"TG ID: <code>{user.tg_user_id}</code>\n" if user.tg_user_id else "TG аккаунт: не привязан\n")
+        + f"<b>Админ:</b> {'да' if user.is_admin else 'нет'}\n"
+        + f"<b>Дата регистрации:</b> {user.created_at.strftime('%d.%m.%Y %H:%M')}"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_client_profile_keyboard(target_user_id))
 
@@ -129,12 +136,13 @@ async def search_clients(client: MaxApiClient, states: StateStore, chat_id: int,
     async with async_session_maker() as session:
         is_id_query = query.lstrip("-").isdigit()
         if is_id_query:
-            stmt = select(User).where(User.id == int(query)).limit(20)
+            stmt = select(User).where(User.id >= MAX_ID_OFFSET, User.id == int(query)).limit(20)
         else:
             pattern = f"%{query_lower}%"
             stmt = (
                 select(User)
                 .where(
+                    User.id >= MAX_ID_OFFSET,
                     or_(
                         func.lower(User.first_name).like(pattern),
                         func.lower(User.name).like(pattern),

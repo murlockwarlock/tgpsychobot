@@ -126,13 +126,20 @@ def topics_keyboard(topics: Iterable, current_topic_id: int | None) -> list[dict
     return inline_keyboard(rows)
 
 
-def subscription_keyboard(sub_info: dict | None, referral_enabled: bool, referral_btn_name: str) -> list[dict]:
+def subscription_keyboard(
+    sub_info: dict | None,
+    referral_enabled: bool,
+    referral_btn_name: str,
+    tg_user_id: int | None = None,
+) -> list[dict]:
     rows = [[callback_button("💳 Оформить/Сменить тариф", "sub_select_plan")]]
     if sub_info and sub_info.get("allow_auto_renewal", True):
         callback_data = "sub_disable_renewal" if sub_info.get("auto_renewal") else "sub_enable_renewal"
         text = "❌ Отменить автопродление" if sub_info.get("auto_renewal") else "✅ Включить автопродление"
         rows.append([callback_button(text, callback_data)])
     rows.append([callback_button("🎁 Ввести промокод", "sub_enter_promo")])
+    if tg_user_id is None:
+        rows.append([callback_button("🔗 Привязать TG аккаунт", "link_tg_start")])
     if referral_enabled:
         rows.append([callback_button(referral_btn_name, "referral_sub_info")])
     rows.append([callback_button("⬅️ Главное меню", "main_menu")])

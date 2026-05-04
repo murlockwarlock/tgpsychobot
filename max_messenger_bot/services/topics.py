@@ -4,7 +4,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
-from ..keyboards import build_main_menu, topics_keyboard
+from ..keyboards import build_main_menu, callback_button, inline_keyboard, topics_keyboard
 from ..legacy import AIConfig, Content, Topic, User, UserTopicState, async_session_maker
 from memory_mode import apply_memory_mode_topic_switch, normalize_memory_mode
 
@@ -64,7 +64,11 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
     else:
         text = f"✅ Переключились на тему: <b>{topic.name}</b>.\n\nПамять диалога очищена."
     await client.send_message(chat_id=chat_id, text=text)
-    await client.send_message(chat_id=chat_id, text="Главное меню:", attachments=await build_main_menu())
+    await client.send_message(
+        chat_id=chat_id,
+        text="Просто напишите своё первое сообщение, чтобы начать диалог ✍️",
+        attachments=inline_keyboard([[callback_button("◀️ Главное меню", "main_menu")]]),
+    )
 
 
 async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int) -> None:

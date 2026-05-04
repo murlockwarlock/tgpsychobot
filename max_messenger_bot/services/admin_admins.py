@@ -8,6 +8,7 @@ from sqlalchemy import select
 from ..api import MaxApiClient
 from ..keyboards import admin_admins_keyboard, admin_profile_keyboard
 from ..legacy import User, async_session_maker
+from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 
 
@@ -32,7 +33,13 @@ def is_owner(user_id: int) -> bool:
 async def show_admins(client: MaxApiClient, chat_id: int) -> None:
     owners = sorted(_owner_ids())
     async with async_session_maker() as session:
-        admins = (await session.execute(select(User).where(User.is_admin == True).order_by(User.first_name.asc(), User.id.asc()))).scalars().all()
+        admins = (
+            await session.execute(
+                select(User)
+                .where(User.is_admin == True, User.id >= MAX_ID_OFFSET)
+                .order_by(User.first_name.asc(), User.id.asc())
+            )
+        ).scalars().all()
     db_admins = [admin for admin in admins if admin.id not in owners]
     lines = ["👮 <b>Управление администраторами</b>\n\n", "<b>Владельцы:</b>\n"]
     if owners:

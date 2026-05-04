@@ -119,6 +119,11 @@ class MaxBotApplication:
         text = (message.text or "").strip()
         state = await self.states.get(message.sender.user_id)
         if state:
+            if state.state == "awaiting_tg_id":
+                from .services.link_tg import process_tg_link
+
+                await process_tg_link(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
             if state.state == "awaiting_name":
                 await settings_service.process_new_name(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 state_data = state.data
@@ -440,7 +445,6 @@ class MaxBotApplication:
                 text=content.text_content or "Раздел пока пуст.",
                 attachments=content_attachments or None,
             )
-            await common.send_main_menu(self.client, message.chat_id)
             return
 
         if not user:
@@ -549,7 +553,7 @@ class MaxBotApplication:
         if data == "reset_topic":
             await topics_service.reset_topic(self.client, chat_id, user_id)
             return
-        if data == "show_subscription_info_from_chat" or data == "back_to_sub_info":
+        if data in {"show_subscription_info_from_chat", "back_to_sub_info", "sub_info"}:
             await subscriptions_service.show_subscription_info(self.client, chat_id, user_id)
             return
         if data == "sub_select_plan":
@@ -566,6 +570,12 @@ class MaxBotApplication:
             return
         if data == "sub_enter_promo":
             await subscriptions_service.start_promo_entry(self.client, self.states, chat_id, user_id)
+            return
+        if data == "link_tg_start":
+            from .services.link_tg import show_link_tg_prompt
+
+            await self.states.set(user_id, chat_id, "awaiting_tg_id", {})
+            await show_link_tg_prompt(self.client, chat_id, user_id)
             return
         if data == "sub_enable_renewal":
             await subscriptions_service.set_renewal(self.client, chat_id, user_id, True)
@@ -1387,6 +1397,10 @@ async def create_web_app() -> web.Application:
 
     client = MaxApiClient(settings.max_token, settings.max_api_base)
     await client.__aenter__()
+    await client.set_commands([
+        {"name": "start", "description": "Запустить бота"},
+        {"name": "admin", "description": "Панель управления"},
+    ])
     bot_app = MaxBotApplication(client)
 
     if settings.webhook_base_url and not settings.use_polling:
