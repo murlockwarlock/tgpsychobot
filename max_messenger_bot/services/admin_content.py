@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import html
+
+from sqlalchemy import func, select, update
+
+from ..api import MaxApiClient
+from ..keyboards import admin_content_editor_keyboard, admin_content_list_keyboard
+from ..legacy import Content, async_session_maker
+from ..storage import MaxContentMedia, StateStore
+
+
+SYSTEM_TITLES = {
+    "start_message": "Приветствие (/start)",
+    "disclaimer": "Дисклеймер",
+    "test_intro": "Вступление теста",
+    "test_results": "Результаты теста",
+    "secret_test_outro": "Финал секретного теста",
+}
+
+
+def _display_title(item: Content) -> str:
+    return SYSTEM_TITLES.get(item.key, item.button_title or item.key)
+
+
+async def show_content_list(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        items = (
+            await session.execute(select(Content).order_by(Content.sort_order.asc(), Content.key.asc()))
+        ).scalars().all()
+    rows = [(item.key, _display_title(item), bool(item.is_visible)) for item in items]
+    await client.send_message(
+        chat_id=chat_id,
+        text="✏️ <b>Управление контентом</b><br><br>Выберите раздел для редактирования.",
+        attachments=admin_content_list_keyboard(rows),
+    )
+
+
+async def show_content_editor(client: MaxApiClient, chat_id: int, content_key: str) -> None:
+    async with async_session_maker() as session:
+        item = await session.get(Content, content_key)
+        media_count = await session.scalar(select(func.count()).select_from(MaxContentMedia).where(MaxContentMedia.content_key == content_key))
+    if not item:
+        await client.send_message(chat_id=chat_id, text="Раздел контента не найден.")
+        return
+    text_display = html.escape(item.text_content or "Текст не задан.")
+    visible = "✅ Виден пользователям" if item.is_visible else "❌ Скрыт от пользователей"
+    message = (
+        f"📝 <b>{html.escape(_display_title(item))}</b><br><br>"
+        f"<b>Ключ:</b> <code>{item.key}</code><br>"
+        f"<b>Статус:</b> {visible}<br>"
+        f"<b>Порядок:</b> {html.escape(item.content_order or 'media_top')}<br><br>"
+        f"<b>MAX-медиа:</b> {media_count or 0}<br><br>"
+        f"<b>Текст:</b><br><pre><code>{text_display}</code></pre><br>"
+        "Медиа для MAX хранятся отдельно; текст уже можно редактировать отсюда."
+    )
+    await client.send_message(chat_id=chat_id, text=message, attachments=admin_content_editor_keyboard(content_key, bool(item.is_visible)))
+
+
+async def start_text_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, content_key: str) -> None:
+    await states.set(user_id, chat_id, "admin_edit_content_text", {"content_key": content_key})
+    await client.send_message(chat_id=chat_id, text=f"Отправьте новый текст для <code>{content_key}</code> одним сообщением.")
+
+
+async def save_text_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    snapshot = await states.get(user_id)
+    if not snapshot:
+        await client.send_message(chat_id=chat_id, text="Состояние редактирования потеряно.")
+        return
+    content_key = snapshot.data.get("content_key")
+    if not content_key:
+        await client.send_message(chat_id=chat_id, text="Не найден ключ контента.")
+        return
+    async with async_session_maker() as session:
+        item = await session.get(Content, content_key)
+        if not item:
+            item = Content(key=content_key)
+            session.add(item)
+        item.text_content = text
+        await session.commit()
+    await states.clear(user_id)
+    await client.send_message(chat_id=chat_id, text="✅ Текст обновлён.")
+    await show_content_editor(client, chat_id, content_key)
+
+
+async def toggle_visibility(client: MaxApiClient, chat_id: int, content_key: str) -> None:
+    async with async_session_maker() as session:
+        item = await session.get(Content, content_key)
+        if not item:
+            await client.send_message(chat_id=chat_id, text="Раздел не найден.")
+            return
+        item.is_visible = not item.is_visible
+        await session.commit()
+    await show_content_editor(client, chat_id, content_key)

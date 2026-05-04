@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import html
+
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+from ..api import MaxApiClient
+from ..keyboards import admin_topic_editor_keyboard, admin_topics_list_keyboard
+from ..legacy import Topic, async_session_maker
+from ..storage import StateStore
+
+
+async def list_topics(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        topics = (
+            await session.execute(select(Topic).order_by(Topic.sort_order.asc(), Topic.id.asc()))
+        ).scalars().all()
+    if not topics:
+        await client.send_message(
+            chat_id=chat_id,
+            text="💬 <b>Темы диалогов</b><br><br>Тем пока нет.",
+            attachments=admin_topics_list_keyboard([]),
+        )
+        return
+    await client.send_message(
+        chat_id=chat_id,
+        text="💬 <b>Темы диалогов</b><br><br>Выберите тему для редактирования.",
+        attachments=admin_topics_list_keyboard(topics),
+    )
+
+
+async def show_topic_editor(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id, options=[selectinload(Topic.knowledge_base_files)])
+    if not topic:
+        await client.send_message(chat_id=chat_id, text="Тема не найдена.")
+        return
+    text = (
+        f"<b>{html.escape(topic.name)}</b><br><br>"
+        f"<b>ID:</b> {topic.id}<br>"
+        f"<b>Активна:</b> {'да' if topic.is_active else 'нет'}<br>"
+        f"<b>Только для админов:</b> {'да' if topic.admin_only else 'нет'}<br>"
+        f"<b>В главном меню:</b> {'да' if topic.show_in_main_menu else 'нет'}<br>"
+        f"<b>В списке тем:</b> {'да' if topic.show_in_list else 'нет'}<br>"
+        f"<b>Записей KB:</b> {len(topic.knowledge_base_files)}<br><br>"
+        f"<b>Промпт:</b><br><pre><code>{html.escape(topic.system_prompt or 'Не задан')}</code></pre><br>"
+        f"<b>Приветствие:</b><br><pre><code>{html.escape(topic.start_message or 'Не задано')}</code></pre>"
+    )
+    await client.send_message(chat_id=chat_id, text=text, attachments=admin_topic_editor_keyboard(topic))
+
+
+async def start_create_topic(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+    await states.set(user_id, chat_id, "admin_create_topic_name", {})
+    await client.send_message(chat_id=chat_id, text="Введите название новой темы.")
+
+
+async def create_topic(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    name = text.strip()
+    if not name:
+        await client.send_message(chat_id=chat_id, text="Название не может быть пустым.")
+        return
+    async with async_session_maker() as session:
+        topic = Topic(name=name, is_active=True, show_in_list=True, show_in_main_menu=False)
+        session.add(topic)
+        await session.commit()
+        topic_id = topic.id
+    await states.clear(user_id)
+    await client.send_message(chat_id=chat_id, text=f"✅ Тема «{html.escape(name)}» создана.")
+    await show_topic_editor(client, chat_id, topic_id)
+
+
+async def start_edit_name(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, topic_id: int) -> None:
+    await states.set(user_id, chat_id, "admin_edit_topic_name", {"topic_id": topic_id})
+    await client.send_message(chat_id=chat_id, text="Введите новое название темы.")
+
+
+async def save_name(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    snapshot = await states.get(user_id)
+    topic_id = snapshot.data.get("topic_id") if snapshot else None
+    if not topic_id:
+        await client.send_message(chat_id=chat_id, text="Состояние темы потеряно.")
+        return
+    name = text.strip()
+    if not name:
+        await client.send_message(chat_id=chat_id, text="Название не может быть пустым.")
+        return
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if not topic:
+            await client.send_message(chat_id=chat_id, text="Тема не найдена.")
+            return
+        topic.name = name
+        await session.commit()
+    await states.clear(user_id)
+    await show_topic_editor(client, chat_id, topic_id)
+
+
+async def start_edit_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, topic_id: int) -> None:
+    await states.set(user_id, chat_id, "admin_edit_topic_prompt", {"topic_id": topic_id})
+    await client.send_message(chat_id=chat_id, text="Отправьте новый системный промпт темы.")
+
+
+async def save_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    snapshot = await states.get(user_id)
+    topic_id = snapshot.data.get("topic_id") if snapshot else None
+    if not topic_id:
+        await client.send_message(chat_id=chat_id, text="Состояние темы потеряно.")
+        return
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if not topic:
+            await client.send_message(chat_id=chat_id, text="Тема не найдена.")
+            return
+        topic.system_prompt = text
+        await session.commit()
+    await states.clear(user_id)
+    await show_topic_editor(client, chat_id, topic_id)
+
+
+async def start_edit_intro(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, topic_id: int) -> None:
+    await states.set(user_id, chat_id, "admin_edit_topic_intro", {"topic_id": topic_id})
+    await client.send_message(chat_id=chat_id, text="Отправьте новое приветственное сообщение темы.")
+
+
+async def save_intro(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    snapshot = await states.get(user_id)
+    topic_id = snapshot.data.get("topic_id") if snapshot else None
+    if not topic_id:
+        await client.send_message(chat_id=chat_id, text="Состояние темы потеряно.")
+        return
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if not topic:
+            await client.send_message(chat_id=chat_id, text="Тема не найдена.")
+            return
+        topic.start_message = text
+        await session.commit()
+    await states.clear(user_id)
+    await show_topic_editor(client, chat_id, topic_id)
+
+
+async def toggle_active(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if topic:
+            topic.is_active = not topic.is_active
+            await session.commit()
+    await show_topic_editor(client, chat_id, topic_id)
+
+
+async def toggle_admin_only(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if topic:
+            topic.admin_only = not topic.admin_only
+            await session.commit()
+    await show_topic_editor(client, chat_id, topic_id)
+
+
+async def toggle_menu(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if topic:
+            topic.show_in_main_menu = not topic.show_in_main_menu
+            await session.commit()
+    await show_topic_editor(client, chat_id, topic_id)
+
+
+async def toggle_list(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if topic:
+            topic.show_in_list = not topic.show_in_list
+            await session.commit()
+    await show_topic_editor(client, chat_id, topic_id)
+
+
+async def delete_topic(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if topic:
+            await session.delete(topic)
+            await session.commit()
+    await client.send_message(chat_id=chat_id, text="✅ Тема удалена.")
+    await list_topics(client, chat_id)
