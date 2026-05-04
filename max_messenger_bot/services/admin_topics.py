@@ -36,6 +36,14 @@ async def show_topic_editor(client: MaxApiClient, chat_id: int, topic_id: int) -
     if not topic:
         await client.send_message(chat_id=chat_id, text="Тема не найдена.")
         return
+    _PROMPT_LIMIT = 1200
+    _INTRO_LIMIT = 500
+
+    def _preview(s: str, limit: int) -> str:
+        return s[:limit] + "…" if len(s) > limit else s
+
+    prompt_raw = topic.system_prompt or ""
+    intro_raw = topic.start_message or ""
     text = (
         f"<b>{html.escape(topic.name)}</b>\n\n"
         f"<b>ID:</b> {topic.id}\n"
@@ -44,8 +52,8 @@ async def show_topic_editor(client: MaxApiClient, chat_id: int, topic_id: int) -
         f"<b>В главном меню:</b> {'да' if topic.show_in_main_menu else 'нет'}\n"
         f"<b>В списке тем:</b> {'да' if topic.show_in_list else 'нет'}\n"
         f"<b>Записей KB:</b> {len(topic.knowledge_base_files)}\n\n"
-        f"<b>Промпт:</b>\n<pre><code>{html.escape(topic.system_prompt or 'Не задан')}</code></pre>\n"
-        f"<b>Приветствие:</b>\n<pre><code>{html.escape(topic.start_message or 'Не задано')}</code></pre>"
+        f"<b>Промпт ({len(prompt_raw)} симв.):</b>\n<pre><code>{html.escape(_preview(prompt_raw or 'Не задан', _PROMPT_LIMIT))}</code></pre>\n"
+        f"<b>Приветствие ({len(intro_raw)} симв.):</b>\n<pre><code>{html.escape(_preview(intro_raw or 'Не задано', _INTRO_LIMIT))}</code></pre>"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_topic_editor_keyboard(topic))
 

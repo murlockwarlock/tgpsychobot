@@ -1479,6 +1479,7 @@ def admin_referral_referrers_keyboard(referrers: list, page: int, total_pages: i
             text=f"👤 {name} — {count} реф. | {total_amt:.0f} руб.",
             callback_data=f"admin_referral_referrer_{uid}_0"
         )
+    builder.adjust(1)  # one referrer per row
 
     nav = []
     if page > 0:

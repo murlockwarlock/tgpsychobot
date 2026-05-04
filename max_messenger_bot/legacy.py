@@ -18,6 +18,7 @@ from database import (  # noqa: E402
     PromoCode,
     RandomMessage,
     ReferralPaymentLog,
+    ReferralTemplate,
     RobokassaPayment,
     SecretTestQuestion,
     SubscriptionConfig,

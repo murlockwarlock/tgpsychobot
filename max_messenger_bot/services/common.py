@@ -137,6 +137,10 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                 referrer_id = int(start_payload.split("_", 1)[1])
             except ValueError:
                 referrer_id = 0
+            # If the referral link used the original MAX ID (without offset), add offset for DB lookup
+            from ..models import MAX_ID_OFFSET
+            if 0 < referrer_id < MAX_ID_OFFSET:
+                referrer_id += MAX_ID_OFFSET
             if referrer_id and referrer_id != user_id:
                 referrer = await session.get(User, referrer_id, options=[selectinload(User.subscription)])
                 if referrer:

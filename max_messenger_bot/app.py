@@ -408,6 +408,9 @@ class MaxBotApplication:
         if text == "/promo":
             await subscriptions_service.start_promo_entry(self.client, self.states, message.chat_id, message.sender.user_id)
             return
+        if text == "/ref":
+            await subscriptions_service.show_referral_info(self.client, message.chat_id, message.sender.user_id)
+            return
         if text == "/test" or text == "📝 Пройти тест":
             await tests_service.start_test(self.client, message.chat_id, message.sender.user_id)
             return
@@ -1409,6 +1412,7 @@ async def create_web_app() -> web.Application:
     await client.set_commands([
         {"name": "start", "description": "Запустить бота"},
         {"name": "admin", "description": "Панель управления"},
+        {"name": "ref", "description": "Реферальная программа"},
     ])
     bot_app = MaxBotApplication(client)
 

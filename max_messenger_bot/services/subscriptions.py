@@ -14,6 +14,7 @@ from ..keyboards import callback_button, link_button, payment_providers_keyboard
 from ..logging_utils import get_payments_logger
 from ..legacy import (
     PromoCode,
+    ReferralTemplate,
     SubscriptionConfig,
     SubscriptionPlan,
     TrialUsageHistory,
@@ -361,7 +362,28 @@ async def set_renewal(client: MaxApiClient, chat_id: int, user_id: int, enabled:
     await show_subscription_info(client, chat_id, user_id)
 
 
+async def _send_referral_templates(client: MaxApiClient, chat_id: int, ref_link: str) -> None:
+    """Sends enabled referral invite templates as individual messages."""
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(ReferralTemplate)
+            .where(ReferralTemplate.is_enabled == True)
+            .order_by(ReferralTemplate.order_num.asc(), ReferralTemplate.id.asc())
+        )
+        templates = result.scalars().all()
+    if not templates:
+        return
+    await client.send_message(
+        chat_id=chat_id,
+        text="📩 <b>Шаблоны приглашений</b>\n\nНиже — готовые сообщения. Выберите любое и отправьте друзьям.",
+    )
+    for tpl in templates:
+        tpl_text = tpl.text.replace("{ref_link}", ref_link)
+        await client.send_message(chat_id=chat_id, text=tpl_text)
+
+
 async def show_referral_info(client: MaxApiClient, chat_id: int, user_id: int) -> None:
+    from ..models import MAX_ID_OFFSET
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
         if not config or not config.referral_enabled:
@@ -370,7 +392,8 @@ async def show_referral_info(client: MaxApiClient, chat_id: int, user_id: int) -
         referral_count = await session.scalar(select(func.count()).select_from(User).where(User.referred_by == user_id)) or 0
     me = await client.get_me()
     username = me.get("username") or me.get("name") or ""
-    link = f"https://max.ru/{username}?start=ref_{user_id}" if username else f"ref_{user_id}"
+    original_id = user_id - MAX_ID_OFFSET
+    link = f"https://max.ru/{username}?start=ref_{original_id}" if username else f"ref_{original_id}"
     text = (
         "<b>🔗 Реферальная программа</b>\n\n"
         f"<b>Ваша ссылка:</b>\n{link}\n\n"
@@ -378,3 +401,4 @@ async def show_referral_info(client: MaxApiClient, chat_id: int, user_id: int) -
         f"За каждого приглашённого вы и ваш друг получите по <b>{config.referral_bonus_days_referrer} дн.</b>"
     )
     await client.send_message(chat_id=chat_id, text=text)
+    await _send_referral_templates(client, chat_id, link)

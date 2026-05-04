@@ -8,6 +8,7 @@ from sqlalchemy import desc, func, select
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard
 from ..legacy import ReferralPaymentLog, SubscriptionConfig, User, async_session_maker
+from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 
 REFERRAL_REFERRERS_PAGE_SIZE = 10
@@ -16,7 +17,6 @@ REFERRAL_REFERRERS_PAGE_SIZE = 10
 async def show_menu(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
-        from ..models import MAX_ID_OFFSET
         referrers_count = (
             await session.execute(
                 select(func.count(func.distinct(User.referred_by))).where(
@@ -245,7 +245,7 @@ async def show_referrers_page(client: MaxApiClient, chat_id: int, page: int) -> 
         # Count per referrer (referrer_id = referred_by value)
         subq = (
             select(User.referred_by.label("ref_id"), func.count().label("cnt"))
-            .where(User.referred_by.isnot(None))
+            .where(User.referred_by.isnot(None), User.id >= MAX_ID_OFFSET)
             .group_by(User.referred_by)
             .subquery()
         )
@@ -305,7 +305,7 @@ async def show_referrer_detail(client: MaxApiClient, chat_id: int, referrer_id: 
             name = str(referrer_id)
 
         referrals_result = await session.execute(
-            select(User).where(User.referred_by == referrer_id)
+            select(User).where(User.referred_by == referrer_id, User.id >= MAX_ID_OFFSET)
         )
         referrals = referrals_result.scalars().all()
 
