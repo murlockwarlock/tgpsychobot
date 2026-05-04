@@ -682,16 +682,19 @@ def admin_ai_keys_keyboard(
     trans_label = f"🗣️ Аудио: {transcription_provider}" if transcription_provider != "None" else "🗣️ Аудио: ❌ Выкл"
     return inline_keyboard(
         [
+            # Keys column | Models column — grouped same as TG bot
             [callback_button("🔑 Deepseek", "admin_ai_key_Deepseek"), callback_button("🧠 Deepseek", "admin_ai_models_Deepseek")],
-            [callback_button("🔑 Claude", "admin_ai_key_Claude"), callback_button("🧠 Claude", "admin_ai_models_Claude")],
-            [callback_button("🔑 Gemini", "admin_ai_key_Gemini"), callback_button("🧠 Gemini", "admin_ai_models_Gemini")],
-            [callback_button("🔑 OpenAI", "admin_ai_key_OpenAI"), callback_button("🧠 OpenAI", "admin_ai_models_OpenAI")],
+            [callback_button("🔑 Claude",   "admin_ai_key_Claude"),   callback_button("🧠 Claude",   "admin_ai_models_Claude")],
+            [callback_button("🔑 Gemini",   "admin_ai_key_Gemini"),   callback_button("🧠 Gemini",   "admin_ai_models_Gemini")],
+            [callback_button("🔑 OpenAI",   "admin_ai_key_OpenAI"),   callback_button("🧠 OpenAI",   "admin_ai_models_OpenAI")],
+            # Context
             [callback_button(f"📌 Первые: {context_first}", "admin_ai_set_context_first"), callback_button(f"🔄 Последние: {context_recent}", "admin_ai_set_context_recent")],
-            [callback_button(trans_label, "admin_ai_toggle_transcription")],
-            [callback_button(f"👁️ Фото: {vision_provider} ({vision_model})", "admin_ai_toggle_vision")],
-            [callback_button("🔧 Сменить модель фото", "admin_ai_vision_models")],
-            [callback_button(f"🌡️ Температура: {round(temperature, 2)}", "admin_ai_set_temperature"), callback_button(f"⏱️ Лимит аудио: {audio_limit}", "admin_ai_set_audio_limit")],
-            [callback_button(f"🧠 Память: {memory_mode_label}", "admin_ai_cycle_memory_scope")],
+            # Audio
+            [callback_button(trans_label, "admin_ai_toggle_transcription"), callback_button(f"⏱️ Лимит аудио: {audio_limit}", "admin_ai_set_audio_limit")],
+            # Temp + Memory
+            [callback_button(f"🌡️ Температура: {round(temperature, 2)}", "admin_ai_set_temperature"), callback_button(f"🧠 Память: {memory_mode_label}", "admin_ai_cycle_memory_scope")],
+            # Vision
+            [callback_button(f"👁️ Фото: {vision_provider}", "admin_ai_toggle_vision"), callback_button(f"Модель: {vision_model[:16]}", "admin_ai_vision_models")],
             [callback_button("⬅️ Назад", "admin_ai_settings")],
         ]
     )

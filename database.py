@@ -566,6 +566,18 @@ async def init_db():
         elif test_conf.test_system_prompt is None:
             test_conf.test_system_prompt = "Ты — психолог Алёны Верловицкой. Действуй строго по разделу 'ЗАДАЧА 1: СЦЕНАРИСТ'. Твоя цель: написать историю персонажа-двойника. Не показывай цифры. Только история."
 
+        # Seed default content sections for new bots (won't overwrite existing)
+        default_content = [
+            Content(key="start_message", button_title=None, is_visible=True, text_content="Приветствие не настроено.", content_order="text_top", sort_order=0),
+            Content(key="about_me",      button_title="Об авторе",   is_visible=True,  text_content="", content_order="media_top", sort_order=1),
+            Content(key="about",         button_title="О методе",    is_visible=True,  text_content="", content_order="media_top", sort_order=2),
+            Content(key="disclaimer",    button_title="Дисклеймер",  is_visible=False, text_content="", content_order="text_top",  sort_order=3),
+        ]
+        for item in default_content:
+            existing = await session.get(Content, item.key)
+            if not existing:
+                session.add(item)
+
         await session.commit()
 
 
