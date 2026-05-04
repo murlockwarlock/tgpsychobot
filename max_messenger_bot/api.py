@@ -68,6 +68,9 @@ class MaxApiClient:
         expected_status: int = 200,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
+        # yarl rejects bool query param values — convert them to lowercase strings
+        if params:
+            params = {k: str(v).lower() if isinstance(v, bool) else v for k, v in params.items()}
         try:
             async with self.session.request(method, url, params=params, json=json_data) as response:
                 text = await response.text()
