@@ -9,6 +9,10 @@ MEMORY_MODE_VALUES = {
 }
 
 
+def normalize_memory_mode(ai_config) -> str:
+    return get_memory_mode(ai_config)
+
+
 def get_memory_mode(ai_config) -> str:
     mode = getattr(ai_config, "memory_mode", None)
     if mode in MEMORY_MODE_VALUES:
