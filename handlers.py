@@ -1739,22 +1739,20 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                         restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
                         await session.commit()
 
-                        if topic.start_message:
-                            text_to_send = topic.start_message
-                        else:
-                            text_to_send = _topic_switch_message(topic.name, restored, memory_mode)
-
-                        reply_markup = None
-                        if topic.start_button_text and topic.start_button_payload:
-                            reply_markup = kb.action_button_keyboard(topic.start_button_text, "topic_action")
-
-                        if not reply_markup:
-                            reply_markup = await kb.main_client_keyboard()
-
-                        await message.answer(text_to_send, parse_mode="HTML" if topic.start_message else "Markdown",
-                                             reply_markup=reply_markup)
                         if welcome_bonus_text:
                             await message.answer(welcome_bonus_text, parse_mode="HTML")
+
+                        if await _request_profile_onboarding_if_needed(
+                            message,
+                            state,
+                            user,
+                            topic_intro_after=topic_id,
+                            topic_intro_restored=restored,
+                            topic_intro_memory_mode=memory_mode,
+                        ):
+                            return
+
+                        await _send_topic_intro(bot, message.chat.id, topic, restored, memory_mode)
                         return
                 except Exception as e:
                     logging.error(f"Error parsing topic deep link: {e}")
@@ -4274,6 +4272,9 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
 
     await callback.message.delete()
 
+    if await _send_pending_topic_intro(data, bot, callback.from_user.id):
+        return
+
     if prompt_text:
         await process_user_prompt(callback.message, user_id, prompt_text, bot)
     else:
@@ -4553,6 +4554,78 @@ def _topic_switch_message(topic_name: str, restored: bool, memory_mode: str) -> 
     )
 
 
+async def _send_topic_intro(bot: Bot, chat_id: int, topic: Topic, restored: bool, memory_mode: str) -> None:
+    if topic.start_message:
+        text_to_send = topic.start_message
+        parse_mode = "HTML"
+    else:
+        text_to_send = _topic_switch_message(topic.name, restored, memory_mode)
+        parse_mode = "Markdown"
+
+    reply_markup = None
+    if topic.start_button_text and topic.start_button_payload:
+        reply_markup = kb.action_button_keyboard(topic.start_button_text, "topic_action")
+
+    await bot.send_message(
+        chat_id,
+        text_to_send,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+
+
+async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int) -> bool:
+    topic_id = data.get("topic_intro_after_onboarding")
+    if not topic_id:
+        return False
+
+    restored = bool(data.get("topic_intro_restored", False))
+    memory_mode = data.get("topic_intro_memory_mode") or MEMORY_MODE_RESET
+
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, int(topic_id))
+
+    if not topic:
+        await bot.send_message(chat_id, "Тема больше недоступна. Выберите другую тему в меню.")
+        return True
+
+    await _send_topic_intro(bot, chat_id, topic, restored, memory_mode)
+    return True
+
+
+async def _request_profile_onboarding_if_needed(
+    message: Message,
+    state: FSMContext,
+    user: User,
+    *,
+    initial_prompt: str | None = None,
+    topic_intro_after: int | None = None,
+    topic_intro_restored: bool = False,
+    topic_intro_memory_mode: str = MEMORY_MODE_RESET,
+) -> bool:
+    state_data = {"initial_prompt": initial_prompt}
+    if topic_intro_after is not None:
+        state_data.update({
+            "topic_intro_after_onboarding": topic_intro_after,
+            "topic_intro_restored": topic_intro_restored,
+            "topic_intro_memory_mode": topic_intro_memory_mode,
+        })
+
+    if not user.name:
+        await state.set_state(UserStates.awaiting_name)
+        await state.update_data(**state_data)
+        await message.answer("Прежде чем мы начнем, подскажите, как я могу к вам обращаться?")
+        return True
+
+    if not user.gender:
+        await state.set_state(UserStates.awaiting_gender)
+        await state.update_data(is_onboarding=True, **state_data)
+        await message.answer("Укажите ваш пол:", reply_markup=kb.gender_selection_keyboard())
+        return True
+
+    return False
+
+
 async def _new_dialogue_update_state(session, user, topic_key: int, memory_mode: str):
     user.current_dialogue_id += 1
     if is_global_memory_mode(memory_mode):
@@ -4604,8 +4677,9 @@ async def select_topic_menu(message: Message):
 
 
 @router.callback_query(F.data.startswith("select_topic_"))
-async def process_topic_selection(callback: CallbackQuery, bot: Bot):
+async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bot: Bot):
     topic_id = int(callback.data.split("_")[-1])
+    memory_mode = MEMORY_MODE_RESET
     async with async_session_maker() as session:
         user = await session.get(User, callback.from_user.id)
         restored = False
@@ -4619,6 +4693,10 @@ async def process_topic_selection(callback: CallbackQuery, bot: Bot):
 
         topic = await session.get(Topic, topic_id)
 
+    if not topic:
+        await callback.answer("Тема больше недоступна.", show_alert=True)
+        return
+
     if already_in_topic:
         try:
             await callback.message.delete()
@@ -4629,21 +4707,19 @@ async def process_topic_selection(callback: CallbackQuery, bot: Bot):
 
     await callback.message.delete()
 
-    if topic.start_message:
-        text_to_send = topic.start_message
-    else:
-        text_to_send = _topic_switch_message(topic.name, restored, memory_mode)
+    if user and await _request_profile_onboarding_if_needed(
+        callback.message,
+        state,
+        user,
+        topic_intro_after=topic_id,
+        topic_intro_restored=restored,
+        topic_intro_memory_mode=memory_mode,
+    ):
+        await callback.answer()
+        return
 
-    reply_markup = None
-    if topic.start_button_text and topic.start_button_payload:
-        reply_markup = kb.action_button_keyboard(topic.start_button_text, "topic_action")
-
-    await bot.send_message(
-        callback.from_user.id,
-        text_to_send,
-        parse_mode="HTML" if topic.start_message else "Markdown",
-        reply_markup=reply_markup
-    )
+    await _send_topic_intro(bot, callback.from_user.id, topic, restored, memory_mode)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "reset_topic")
@@ -9934,10 +10010,7 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 )
                 return
 
-        if not user.name:
-            await state.set_state(UserStates.awaiting_name)
-            await state.update_data(initial_prompt=prompt_text)
-            await message.answer("Прежде чем мы начнем, подскажите, как я могу к вам обращаться?")
+        if await _request_profile_onboarding_if_needed(message, state, user, initial_prompt=prompt_text):
             return
 
         if not user.accepted_disclaimer:
@@ -10691,7 +10764,6 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
 
     if data.get('is_onboarding'):
         prompt_text = data.get('initial_prompt')
-        await state.clear()
         try:
             await callback.message.edit_text(f"Пол: {gender_label} ✅")
         except Exception:
@@ -10701,7 +10773,7 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
             disclaimer_content = await get_content_from_db("disclaimer")
             if disclaimer_content.get('is_visible', True):
                 await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                await state.update_data(initial_prompt=prompt_text)
+                await state.update_data(**data)
                 text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await callback.message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
                 return
@@ -10710,6 +10782,11 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
                     stmt = update(User).where(User.id == user_id).values(accepted_disclaimer=True)
                     await session.execute(stmt)
                     await session.commit()
+
+        await state.clear()
+
+        if await _send_pending_topic_intro(data, bot, callback.from_user.id):
+            return
 
         if prompt_text:
             await process_user_prompt(callback.message, user_id, prompt_text, bot)
@@ -11916,7 +11993,8 @@ class TopicDirectButtonFilter(Filter):
 
 
 @router.message(TopicDirectButtonFilter())
-async def handle_direct_topic_button(message: Message, topic_id: int, topic_name: str, bot: Bot):
+async def handle_direct_topic_button(message: Message, topic_id: int, topic_name: str, state: FSMContext, bot: Bot):
+    memory_mode = MEMORY_MODE_RESET
     async with async_session_maker() as session:
         restored = False
         user = await session.get(User, message.from_user.id)
@@ -11929,24 +12007,24 @@ async def handle_direct_topic_button(message: Message, topic_id: int, topic_name
 
         topic = await session.get(Topic, topic_id)
 
-    if topic and topic.start_message:
-        text_to_send = topic.start_message
+    if user and await _request_profile_onboarding_if_needed(
+        message,
+        state,
+        user,
+        topic_intro_after=topic_id,
+        topic_intro_restored=restored,
+        topic_intro_memory_mode=memory_mode,
+    ):
+        return
+
+    if topic:
+        await _send_topic_intro(bot, message.chat.id, topic, restored, memory_mode)
     else:
-        text_to_send = _topic_switch_message(topic_name, restored, memory_mode)
-
-    reply_markup = None
-    if topic and topic.start_button_text and topic.start_button_payload:
-        reply_markup = kb.action_button_keyboard(topic.start_button_text, "topic_action")
-
-    await message.answer(
-        text_to_send,
-        parse_mode="HTML" if topic and topic.start_message else "Markdown",
-        reply_markup=reply_markup
-    )
+        await message.answer(_topic_switch_message(topic_name, restored, memory_mode), parse_mode="Markdown")
 
 
 @router.callback_query(F.data == "action_btn_click")
-async def handle_action_button_click(callback: CallbackQuery, bot: Bot):
+async def handle_action_button_click(callback: CallbackQuery, state: FSMContext, bot: Bot):
     user_id = callback.from_user.id
     payload_text = None
 
@@ -11968,6 +12046,15 @@ async def handle_action_button_click(callback: CallbackQuery, bot: Bot):
 
     if payload_text:
         await callback.message.edit_reply_markup(reply_markup=None)
+
+        if await _request_profile_onboarding_if_needed(
+            callback.message,
+            state,
+            user,
+            initial_prompt=payload_text,
+        ):
+            await callback.answer()
+            return
 
         mock_message = type('obj', (object,), {
             'from_user': callback.from_user,
@@ -13137,10 +13224,7 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
                 )
                 return
 
-        if not user.name:
-            await state.set_state(UserStates.awaiting_name)
-            await state.update_data(initial_prompt=message.text)
-            await message.answer("Прежде чем мы начнем, подскажите, как я могу к вам обращаться?")
+        if await _request_profile_onboarding_if_needed(message, state, user, initial_prompt=message.text):
             return
 
         if not user.accepted_disclaimer:
@@ -13606,13 +13690,39 @@ async def _get_referral_screen_text(user_id: int, bot: Bot) -> tuple[str | None,
     bot_info = await bot.get_me()
     link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
 
+    referrer_bonus_lines = []
+    if config.referral_bonus_days_referrer > 0:
+        referrer_bonus_lines.append(
+            f"• +{config.referral_bonus_days_referrer} дн. при регистрации приглашённого"
+        )
+    if config.referral_pay_bonus_enabled and config.referral_pay_bonus_days > 0:
+        pay_period = (
+            "при первой оплате приглашённого"
+            if config.referral_pay_bonus_first_only
+            else "при оплате приглашённого (за каждую оплату)"
+        )
+        referrer_bonus_lines.append(f"• +{config.referral_pay_bonus_days} дн. {pay_period}")
+    if not referrer_bonus_lines:
+        referrer_bonus_lines.append("• Сейчас бонусы для приглашающего не начисляются")
+
+    friend_bonus_lines = []
+    if config.referral_bonus_days_referral > 0:
+        friend_bonus_lines.append(f"• +{config.referral_bonus_days_referral} дн. при регистрации по вашей ссылке")
+    if not friend_bonus_lines:
+        friend_bonus_lines.append("• Сейчас бонусы для друга не начисляются")
+
+    referrer_bonus_text = "\n".join(referrer_bonus_lines)
+    friend_bonus_text = "\n".join(friend_bonus_lines)
+
     text = (
         f"🔗 <b>Реферальная программа</b>\n\n"
-        f"Пригласите друга по ссылке и получите бонусные дни!\n\n"
-        f"<b>Ваша ссылка:</b>\n{link}\n\n"
+        f"Пригласите друга по ссылке и получайте бонусные дни!\n\n"
+        f"🎁 <b>Ваши бонусы:</b>\n"
+        f"{referrer_bonus_text}\n\n"
+        f"🎁 <b>Бонусы вашего друга:</b>\n"
+        f"{friend_bonus_text}\n\n"
         f"👥 <b>Приглашено:</b> {referral_count} чел.\n\n"
-        f"За каждого зарегистрировавшегося по ссылке — "
-        f"вы и ваш друг получаете по <b>{config.referral_bonus_days_referrer} дн.</b> бонуса."
+        f"<b>Ваша ссылка:</b>\n{link}"
     )
     return text, link
 
