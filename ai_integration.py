@@ -152,6 +152,22 @@ def _extract_kie_chat_text(payload: dict) -> str:
     return ""
 
 
+def _extract_openai_chat_text(response, *, provider: str) -> str:
+    if response is None:
+        raise AIResponseError(f"{provider} вернул пустой ответ")
+
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise AIResponseError(f"{provider} вернул ответ без choices")
+
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
+    if not isinstance(content, str) or not content.strip():
+        raise AIResponseError(f"{provider} вернул пустой content")
+
+    return content
+
+
 def _is_kie_transient_failure(error: Exception | str) -> bool:
     text = str(error).lower()
     markers = [
@@ -720,7 +736,7 @@ async def _call_deepseek_api(api_key: str, model: str, history: list, context: s
             max_tokens=4096,
             temperature=temperature
         )
-        return chat_completion.choices[0].message.content
+        return _extract_openai_chat_text(chat_completion, provider="Deepseek")
     except Exception as e:
         if hasattr(e, 'code') and e.code == 'insufficient_quota':
             raise InsufficientBalanceError(f"Deepseek API Error: {e}")
@@ -833,7 +849,7 @@ async def _call_openai_api(api_key: str, model: str, history: list, context: str
             max_tokens=4096,
             temperature=temperature
         )
-        return chat_completion.choices[0].message.content
+        return _extract_openai_chat_text(chat_completion, provider="OpenAI")
     except AuthenticationError as e:
         raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {e}")
     except RateLimitError as e:
@@ -1673,7 +1689,7 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
                 max_tokens=4096,
                 temperature=temperature
             )
-            return response.choices[0].message.content
+            return _extract_openai_chat_text(response, provider="OpenAI Vision")
         except Exception as e:
             logging.error(f"OpenAI Vision Error: {e}")
             raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {e}")

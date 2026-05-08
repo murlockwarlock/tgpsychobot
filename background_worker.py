@@ -276,10 +276,10 @@ async def process_mailings(bot: Bot):
                     target_users_stmt = select(User.id).outerjoin(UserSubscription).where(UserSubscription.id == None)
                 elif audience == "active_subscription":
                     target_users_stmt = select(User.id).join(UserSubscription).where(
-                        UserSubscription.end_date > datetime.utcnow())
+                        UserSubscription.end_date > now)
                 elif audience == "inactive_subscription":
                     target_users_stmt = select(User.id).join(UserSubscription).where(
-                        UserSubscription.end_date <= datetime.utcnow())
+                        UserSubscription.end_date <= now)
 
                 if target_users_stmt is None:
                     mailing.status = 'failed'
