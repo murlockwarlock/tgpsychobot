@@ -114,10 +114,15 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     await init_db()
 
     referral_enabled = False
+    topics_enabled = True
+    subscriptions_enabled = True
     try:
         async with async_session_maker() as session:
             sub_config = await session.get(SubscriptionConfig, 1)
-            referral_enabled = bool(sub_config and sub_config.referral_enabled)
+            if sub_config:
+                referral_enabled = bool(sub_config.referral_enabled)
+                topics_enabled = bool(sub_config.topics_enabled)
+                subscriptions_enabled = bool(sub_config.subscriptions_enabled)
     except Exception as e:
         logging.error("Failed to load referral config for bot commands: %s", e)
         await notify_admins_about_error(
@@ -132,6 +137,12 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
         BotCommand(command="start", description="Запустить / Перезапустить бота"),
         BotCommand(command="help", description="Помощь")
     ]
+    if topics_enabled:
+        user_commands.append(BotCommand(command="topics", description="Выбрать тему"))
+    user_commands.append(BotCommand(command="new_dialogue", description="Новый диалог"))
+    user_commands.append(BotCommand(command="settings", description="Настройки"))
+    if subscriptions_enabled:
+        user_commands.append(BotCommand(command="subscription", description="Подписка"))
     if referral_enabled:
         user_commands.insert(1, BotCommand(command="ref", description="🤝 Пригласить друзей"))
 
@@ -140,6 +151,12 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
         BotCommand(command="admin", description="Админ-панель"),
         BotCommand(command="help", description="Помощь (для админов)")
     ]
+    if topics_enabled:
+        admin_commands.insert(-1, BotCommand(command="topics", description="Выбрать тему"))
+    admin_commands.insert(-1, BotCommand(command="new_dialogue", description="Новый диалог"))
+    admin_commands.insert(-1, BotCommand(command="settings", description="Настройки"))
+    if subscriptions_enabled:
+        admin_commands.insert(-1, BotCommand(command="subscription", description="Подписка"))
     if referral_enabled:
         admin_commands.insert(1, BotCommand(command="ref", description="🤝 Пригласить друзей"))
 

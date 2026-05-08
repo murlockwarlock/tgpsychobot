@@ -3774,6 +3774,7 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
                     pass
 
 
+@router.message(Command("new_dialogue"))
 @router.message(F.text == "🗑️ Новый диалог")
 async def ask_delete_history(message: Message, state: FSMContext):
     await state.clear()
@@ -4638,6 +4639,7 @@ async def _new_dialogue_update_state(session, user, topic_key: int, memory_mode:
             session.add(UserTopicState(user_id=user.id, topic_id=topic_key, dialogue_id=user.current_dialogue_id))
 
 
+@router.message(Command("topics"))
 @router.message(F.text == "📚 Темы диалога")
 @router.message(TopicsButtonFilter())
 async def select_topic_menu(message: Message):
@@ -5992,6 +5994,7 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
     await bot.send_message(chat_id, text, reply_markup=kb.subscription_info_keyboard(sub_info, referral_info=referral_info))
 
 
+@router.message(Command("subscription"))
 @router.message(F.text == "⭐️ Подписка")
 async def show_subscription_info(message: Message, state: FSMContext, bot: Bot):
     await _send_subscription_info(message.from_user.id, message.chat.id, bot, state)
@@ -8190,6 +8193,7 @@ async def process_promo_field_edit(message: Message, state: FSMContext, bot: Bot
     await temp_msg.delete()
 
 
+@router.message(Command("settings"))
 @router.message(F.text == "⚙️ Настройки")
 async def user_settings_menu(message: Message, state: FSMContext):
     user_id = message.from_user.id
