@@ -480,6 +480,16 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN birth_month INTEGER"))
             if 'birth_year' not in user_columns:
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN birth_year INTEGER"))
+            if 'can_view_history' not in user_columns:
+                sync_conn.execute(text("ALTER TABLE users ADD COLUMN can_view_history BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'accepted_disclaimer' not in user_columns:
+                sync_conn.execute(text("ALTER TABLE users ADD COLUMN accepted_disclaimer BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'current_topic_id' not in user_columns:
+                sync_conn.execute(text("ALTER TABLE users ADD COLUMN current_topic_id INTEGER REFERENCES topics(id)"))
+            if 'referred_by' not in user_columns:
+                sync_conn.execute(text("ALTER TABLE users ADD COLUMN referred_by BIGINT"))
+            if 'tg_user_id' not in user_columns:
+                sync_conn.execute(text("ALTER TABLE users ADD COLUMN tg_user_id BIGINT"))
 
             ai_columns = [c['name'] for c in insp.get_columns('ai_config')]
             if 'memory_mode' not in ai_columns:

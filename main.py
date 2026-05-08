@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from config import BOT_TOKEN, OWNER_IDS
 from handlers import router
-from database import init_db, async_session_maker, User
+from database import init_db, async_session_maker, User, SubscriptionConfig
 from background_worker import process_queue, process_mailings
 from scheduler import check_subscriptions, check_kie_credit_balance
 from webhooks import setup_webhooks
@@ -113,20 +113,39 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     logging.info("Configuring startup...")
     await init_db()
 
+    referral_enabled = False
+    try:
+        async with async_session_maker() as session:
+            sub_config = await session.get(SubscriptionConfig, 1)
+            referral_enabled = bool(sub_config and sub_config.referral_enabled)
+    except Exception as e:
+        logging.error("Failed to load referral config for bot commands: %s", e)
+        await notify_admins_about_error(
+            bot,
+            title="Сбой startup",
+            stage="load_referral_config",
+            details=str(e),
+            exception=e,
+        )
 
     user_commands = [
         BotCommand(command="start", description="Запустить / Перезапустить бота"),
-        BotCommand(command="ref", description="🤝 Пригласить друзей"),
         BotCommand(command="help", description="Помощь")
     ]
+    if referral_enabled:
+        user_commands.insert(1, BotCommand(command="ref", description="🤝 Пригласить друзей"))
 
     admin_commands = [
         BotCommand(command="start", description="Запустить / Перезапустить бота"),
-        BotCommand(command="ref", description="🤝 Пригласить друзей"),
         BotCommand(command="admin", description="Админ-панель"),
         BotCommand(command="help", description="Помощь (для админов)")
     ]
+    if referral_enabled:
+        admin_commands.insert(1, BotCommand(command="ref", description="🤝 Пригласить друзей"))
 
+    await bot.delete_my_commands()
+    await bot.set_my_commands(user_commands)
+    await bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
     await bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
 
     MAX_ID_OFFSET = 100_000_000_000
@@ -150,11 +169,18 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
 
     for admin_id in all_admin_ids:
         try:
+            await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=admin_id))
             await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception as e:
             logging.warning(f"Could not set admin commands for {admin_id}: {e}")
 
-    logging.info(f"Set default commands for users and special commands for {len(all_admin_ids)} admins.")
+    logging.info(
+        "Set bot commands referral_enabled=%s user_commands=%s admin_commands=%s admins=%s.",
+        referral_enabled,
+        [command.command for command in user_commands],
+        [command.command for command in admin_commands],
+        len(all_admin_ids),
+    )
 
     logging.info("Running initial subscription check on startup...")
     try:
