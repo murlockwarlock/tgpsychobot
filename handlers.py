@@ -356,6 +356,43 @@ class DynamicButtonFilter(Filter):
             return result is not None
 
 
+async def _is_reserved_user_menu_text(text: str) -> bool:
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return False
+    if clean_text.startswith("/"):
+        return True
+
+    reserved_texts = {
+        "⚙️ Настройки",
+        "🗑️ Новый диалог",
+        "⭐️ Подписка",
+        "📝 Пройти тест",
+    }
+
+    async with async_session_maker() as session:
+        config = await session.get(SubscriptionConfig, 1)
+        if config:
+            reserved_texts.add(config.topics_btn_name or "📚 Темы диалога")
+            if config.referral_enabled:
+                reserved_texts.add(config.referral_btn_name or "👥 Пригласить друзей")
+
+        content_titles = await session.execute(
+            select(Content.button_title).where(
+                Content.button_title.isnot(None),
+                Content.is_visible == True,
+            )
+        )
+        reserved_texts.update(title for title in content_titles.scalars().all() if title)
+
+        topic_names = await session.execute(
+            select(Topic.name).where(Topic.is_active == True, Topic.show_in_list == True)
+        )
+        reserved_texts.update(name for name in topic_names.scalars().all() if name)
+
+    return clean_text in reserved_texts
+
+
 class TopicPhrasesState(StatesGroup):
     waiting_for_file = State()
 
@@ -1679,7 +1716,16 @@ async def cmd_help(message: Message):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: CommandObject = None):
-    welcome_bonus_text = ""
+    bonus_messages = []
+
+    async def send_bonus_messages(reply_markup=None):
+        for index, bonus_text in enumerate(bonus_messages):
+            await message.answer(
+                bonus_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup if index == len(bonus_messages) - 1 else None,
+            )
+
     async with async_session_maker() as session:
         user = await session.get(User, message.from_user.id)
         is_new_user = False
@@ -1719,7 +1765,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                     plan_id=None,
                     used_at=now
                 ))
-                welcome_bonus_text = (
+                bonus_messages.append(
                     f"🎁 <b>Вам начислен приветственный бонус!</b>\n"
                     f"Бесплатный доступ ко всем функциям на {sub_config.welcome_bonus_days} дн."
                 )
@@ -1739,8 +1785,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                         restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
                         await session.commit()
 
-                        if welcome_bonus_text:
-                            await message.answer(welcome_bonus_text, parse_mode="HTML")
+                        if bonus_messages:
+                            await send_bonus_messages()
 
                         if await _request_profile_onboarding_if_needed(
                             message,
@@ -1758,14 +1804,14 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                     logging.error(f"Error parsing topic deep link: {e}")
 
             elif args == "sub":
-                if welcome_bonus_text:
-                    await message.answer(welcome_bonus_text, parse_mode="HTML")
+                if bonus_messages:
+                    await send_bonus_messages()
                 await show_subscription_info(message, state, bot)
                 return
 
             elif args == "ref":
-                if welcome_bonus_text:
-                    await message.answer(welcome_bonus_text, parse_mode="HTML")
+                if bonus_messages:
+                    await send_bonus_messages()
                 text, ref_link = await _get_referral_screen_text(message.from_user.id, bot)
                 if text:
                     await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
@@ -1775,8 +1821,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 return
 
             elif args == "test":
-                if welcome_bonus_text:
-                    await message.answer(welcome_bonus_text, parse_mode="HTML")
+                if bonus_messages:
+                    await send_bonus_messages()
                 await cmd_start_test(message, state)
                 return
 
@@ -1816,7 +1862,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                                         payment_attempt_count=0,
                                         discount_percent=0
                                     ))
-                                welcome_bonus_text = (
+                                bonus_messages.append(
                                     f"🎁 <b>Вам начислено {ref_bonus_days} бонусных дн.</b> "
                                     f"за регистрацию по пригласительной ссылке!"
                                 )
@@ -1869,8 +1915,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 content_obj_dyn = await session.scalar(stmt_dyn)
 
                 if content_obj_dyn:
-                    if welcome_bonus_text:
-                        await message.answer(welcome_bonus_text, parse_mode="HTML")
+                    if bonus_messages:
+                        await send_bonus_messages()
 
                     content = await get_content_from_db(content_key)
                     text_dyn = content.get('text')
@@ -1956,8 +2002,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
     if not content_obj:
         text = "Приветствие не задано."
         await message.answer(text, reply_markup=main_kb, parse_mode="HTML")
-        if welcome_bonus_text:
-            await message.answer(welcome_bonus_text, parse_mode="HTML")
+        if bonus_messages:
+            await send_bonus_messages()
         return
 
     text = content_obj.text_content
@@ -2016,13 +2062,13 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
 
     if inline_kb:
         await asyncio.sleep(0.3)
-        if welcome_bonus_text:
-            await message.answer(welcome_bonus_text, parse_mode="HTML", reply_markup=main_kb)
+        if bonus_messages:
+            await send_bonus_messages(reply_markup=main_kb)
         else:
             await message.answer("🔽 Воспользуйтесь меню ниже для навигации:", reply_markup=main_kb)
-    elif welcome_bonus_text:
+    elif bonus_messages:
         await asyncio.sleep(0.3)
-        await message.answer(welcome_bonus_text, parse_mode="HTML")
+        await send_bonus_messages()
 
 
 @router.message(Command("admin"))
@@ -3703,7 +3749,7 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
                 last_dialogue_id = msg.dialogue_id
 
             t_name = topic_map.get(msg.topic_id, "Общий")
-            header = f"<b>{'👤 (Клиент)' if msg.role == 'user' else '🤖 (Бот)'}</b> [<i>{msg.timestamp.strftime('%d-%m-%Y %H:%M')}</i>] [<i>{t_name}</i>]:\n"
+            header = f"<b>{'👤 (Клиент)' if msg.role == 'user' else '🤖 (Бот)'}</b> [<i>{format_msk(msg.timestamp, '%d-%m-%Y %H:%M МСК')}</i>] [<i>{t_name}</i>]:\n"
 
             content = msg.content or ""
             if msg.role == 'assistant':
@@ -3909,10 +3955,12 @@ async def cancel_delete_history(callback: CallbackQuery, state: FSMContext):
 @router.message(UserStates.awaiting_name)
 async def process_user_name(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    user_name = message.text.strip()
+    user_name = (message.text or "").strip()
 
-    if len(user_name) > 50 or not user_name:
-        await message.answer("Пожалуйста, введите корректное имя.")
+    if len(user_name) > 50 or not user_name or await _is_reserved_user_menu_text(user_name):
+        await message.answer(
+            "Пожалуйста, напишите имя обычным текстом, без команд и кнопок меню."
+        )
         return
 
     async with async_session_maker() as session:
@@ -4337,12 +4385,12 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
                 t_name = topic_map.get(m.topic_id, "General")
                 role = "Client" if m.role == "user" else "Bot"
                 text = remove_markdown(m.content) if m.role == 'assistant' else m.content
-                content_str += f"[{m.timestamp.strftime('%Y-%m-%d %H:%M')}] [{t_name}] {role}: {text}\n\n"
+                content_str += f"[{format_msk(m.timestamp, '%Y-%m-%d %H:%M МСК')}] [{t_name}] {role}: {text}\n\n"
         else:
             history_data = []
             for m in messages:
                 history_data.append({
-                    "timestamp": m.timestamp.isoformat(),
+                    "timestamp": format_msk(m.timestamp, "%Y-%m-%dT%H:%M:%S+03:00"),
                     "topic": topic_map.get(m.topic_id, "General"),
                     "role": m.role,
                     "content": m.content
@@ -8225,8 +8273,10 @@ async def process_new_name(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     user_name = message.text.strip()
 
-    if len(user_name) > 50 or not user_name:
-        await message.answer("Пожалуйста, введите корректное имя.")
+    if len(user_name) > 50 or not user_name or await _is_reserved_user_menu_text(user_name):
+        await message.answer(
+            "Пожалуйста, напишите имя обычным текстом, без команд и кнопок меню."
+        )
         return
 
     async with async_session_maker() as session:
@@ -13501,7 +13551,7 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
                 for m in messages:
                     t_name = topic_map.get(m.topic_id, "General")
                     role = "Client" if m.role == "user" else "Bot"
-                    full_content += f"[{m.timestamp.strftime('%Y-%m-%d %H:%M')}] [{t_name}] {role}: {m.content}\n"
+                    full_content += f"[{format_msk(m.timestamp, '%Y-%m-%d %H:%M МСК')}] [{t_name}] {role}: {m.content}\n"
 
                 full_content += "\n" + "=" * 60 + "\n\n"
 
@@ -13530,7 +13580,7 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
 
                 for m in messages:
                     user_history["history"].append({
-                        "timestamp": m.timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                        "timestamp": format_msk(m.timestamp, "%Y-%m-%dT%H:%M:%S+03:00"),
                         "topic": topic_map.get(m.topic_id, "General"),
                         "role": m.role,
                         "content": m.content
