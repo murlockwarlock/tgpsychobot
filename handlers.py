@@ -99,6 +99,7 @@ from scheduler import (
 )
 from subscription_dates import extend_subscription_end_date
 from subscription_retry_policy import can_retry_manually
+from bot_commands import refresh_commands_for_user
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -1744,6 +1745,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
             user.username = message.from_user.username
             user.first_name = message.from_user.full_name
         await _sync_user_birthdate_from_telegram(bot, user)
+        is_admin_user_for_commands = bool(user.is_admin or message.from_user.id in OWNER_IDS)
         if is_new_user:
             sub_config = await session.get(SubscriptionConfig, 1)
             if sub_config and sub_config.welcome_bonus_days > 0 and sub_config.subscriptions_enabled:
@@ -1770,6 +1772,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                     f"Бесплатный доступ ко всем функциям на {sub_config.welcome_bonus_days} дн."
                 )
         await session.commit()
+        await refresh_commands_for_user(bot, message.from_user.id, is_admin_user_for_commands)
 
         if command and command.args:
             args = command.args
@@ -1984,19 +1987,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
 
         stmt = select(Content).where(Content.key == "start_message").options(selectinload(Content.media))
         content_obj = await session.scalar(stmt)
-
-    # Ensure admin command menu is set for admins (in case bot was restarted before user /start)
-    if await is_admin(message.from_user.id):
-        from aiogram.types import BotCommand, BotCommandScopeChat
-        try:
-            await bot.set_my_commands([
-                BotCommand(command="start", description="Запустить / Перезапустить бота"),
-                BotCommand(command="ref", description="🤝 Пригласить друзей"),
-                BotCommand(command="admin", description="Админ-панель"),
-                BotCommand(command="help", description="Помощь (для админов)"),
-            ], scope=BotCommandScopeChat(chat_id=message.from_user.id))
-        except Exception:
-            pass
 
     main_kb = await kb.main_client_keyboard()
     if not content_obj:

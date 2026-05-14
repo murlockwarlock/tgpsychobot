@@ -9,16 +9,22 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
-from sqlalchemy import select
 
 from config import BOT_TOKEN, OWNER_IDS
 from handlers import router
-from database import init_db, async_session_maker, User, SubscriptionConfig
+from database import init_db
 from background_worker import process_queue, process_mailings
 from scheduler import check_subscriptions, check_kie_credit_balance
 from webhooks import setup_webhooks
 from error_reporting import notify_admins_about_error
+from bot_commands import (
+    build_admin_commands,
+    build_command_sets,
+    build_user_commands,
+    get_admin_ids_for_command_scope,
+    refresh_chat_commands,
+    refresh_default_commands,
+)
 
 WEB_SERVER_HOST = '0.0.0.0'
 APP_PORT = int(os.environ.get('APP_PORT', 8080))
@@ -113,67 +119,28 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     logging.info("Configuring startup...")
     await init_db()
 
-    referral_enabled = False
-    topics_enabled = True
-    subscriptions_enabled = True
     try:
-        async with async_session_maker() as session:
-            sub_config = await session.get(SubscriptionConfig, 1)
-            if sub_config:
-                referral_enabled = bool(sub_config.referral_enabled)
-                topics_enabled = bool(sub_config.topics_enabled)
-                subscriptions_enabled = bool(sub_config.subscriptions_enabled)
+        user_commands, admin_commands, command_flags = await build_command_sets()
+        referral_enabled, topics_enabled, subscriptions_enabled = command_flags
     except Exception as e:
-        logging.error("Failed to load referral config for bot commands: %s", e)
+        logging.error("Failed to build bot commands: %s", e)
         await notify_admins_about_error(
             bot,
             title="Сбой startup",
-            stage="load_referral_config",
+            stage="build_bot_commands",
             details=str(e),
             exception=e,
         )
+        referral_enabled = False
+        topics_enabled = True
+        subscriptions_enabled = True
+        user_commands = build_user_commands(referral_enabled, topics_enabled, subscriptions_enabled)
+        admin_commands = build_admin_commands(referral_enabled, topics_enabled, subscriptions_enabled)
 
-    user_commands = [
-        BotCommand(command="start", description="Запустить / Перезапустить бота"),
-        BotCommand(command="help", description="Помощь")
-    ]
-    if topics_enabled:
-        user_commands.append(BotCommand(command="topics", description="Выбрать тему"))
-    user_commands.append(BotCommand(command="new_dialogue", description="Новый диалог"))
-    user_commands.append(BotCommand(command="settings", description="Настройки"))
-    if subscriptions_enabled:
-        user_commands.append(BotCommand(command="subscription", description="Подписка"))
-    if referral_enabled:
-        user_commands.insert(1, BotCommand(command="ref", description="🤝 Пригласить друзей"))
+    await refresh_default_commands(bot, user_commands)
 
-    admin_commands = [
-        BotCommand(command="start", description="Запустить / Перезапустить бота"),
-        BotCommand(command="admin", description="Админ-панель"),
-        BotCommand(command="help", description="Помощь (для админов)")
-    ]
-    if topics_enabled:
-        admin_commands.insert(-1, BotCommand(command="topics", description="Выбрать тему"))
-    admin_commands.insert(-1, BotCommand(command="new_dialogue", description="Новый диалог"))
-    admin_commands.insert(-1, BotCommand(command="settings", description="Настройки"))
-    if subscriptions_enabled:
-        admin_commands.insert(-1, BotCommand(command="subscription", description="Подписка"))
-    if referral_enabled:
-        admin_commands.insert(1, BotCommand(command="ref", description="🤝 Пригласить друзей"))
-
-    await bot.delete_my_commands()
-    await bot.set_my_commands(user_commands)
-    await bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
-    await bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
-
-    MAX_ID_OFFSET = 100_000_000_000
-    all_admin_ids = {aid for aid in OWNER_IDS if aid < MAX_ID_OFFSET}
     try:
-        async with async_session_maker() as session:
-            admin_result = await session.execute(
-                select(User.id).where(User.is_admin == True, User.id < MAX_ID_OFFSET)
-            )
-            db_admin_ids = {row[0] for row in admin_result}
-            all_admin_ids.update(db_admin_ids)
+        all_admin_ids = await get_admin_ids_for_command_scope()
     except Exception as e:
         logging.error(f"Failed to fetch admin IDs from DB for setting commands: {e}")
         await notify_admins_about_error(
@@ -183,11 +150,11 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
             details=str(e),
             exception=e,
         )
+        all_admin_ids = {aid for aid in OWNER_IDS if aid < 100_000_000_000}
 
     for admin_id in all_admin_ids:
         try:
-            await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=admin_id))
-            await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+            await refresh_chat_commands(bot, admin_id, admin_commands)
         except Exception as e:
             logging.warning(f"Could not set admin commands for {admin_id}: {e}")
 
