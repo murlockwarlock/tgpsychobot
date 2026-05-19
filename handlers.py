@@ -54,6 +54,7 @@ from ai_integration import (
     _describe_subscription_status,
 )
 from error_reporting import notify_admins_about_error
+from bot_restart import get_current_pm2_identity, schedule_pm2_restart, write_restart_marker
 from memory_mode import (
     MEMORY_MODE_GLOBAL,
     MEMORY_MODE_RESET,
@@ -2147,6 +2148,57 @@ async def cmd_promo(message: Message, state: FSMContext):
 @router.callback_query(F.data == "admin_panel")
 async def back_to_admin_panel(callback: CallbackQuery):
     await callback.message.edit_text("Добро пожаловать в админ-панель!", reply_markup=kb.admin_panel_keyboard())
+
+
+@router.callback_query(F.data == "admin_restart_bot")
+async def admin_restart_bot_confirm(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    identity = await get_current_pm2_identity()
+    pm2_id = identity.get("pm2_id")
+    process_name = identity.get("name") or "неизвестно"
+    if pm2_id is None:
+        await callback.answer("Не удалось определить PM2 id текущего процесса.", show_alert=True)
+        return
+
+    text = (
+        "Перезагрузить текущего бота?\n\n"
+        f"<b>PM2 id:</b> <code>{pm2_id}</code>\n"
+        f"<b>Процесс:</b> <code>{html.escape(str(process_name))}</code>\n"
+        f"<b>Порт:</b> <code>{html.escape(str(identity.get('app_port')))}</code>\n\n"
+        "После полного запуска бот отправит уведомление всем админам."
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Да, перезагрузить", callback_data="admin_restart_bot_confirmed")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_panel")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_restart_bot_confirmed")
+async def admin_restart_bot_process(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    identity = await get_current_pm2_identity()
+    pm2_id = identity.get("pm2_id")
+    if pm2_id is None:
+        await callback.answer("Не удалось определить PM2 id текущего процесса.", show_alert=True)
+        return
+
+    write_restart_marker(identity, callback.from_user)
+    await callback.message.edit_text(
+        "🔁 Перезагружаю бота.\n\n"
+        "Когда процесс полностью поднимется, всем админам придёт уведомление.",
+    )
+    await callback.answer("Рестарт запущен.")
+    await schedule_pm2_restart(int(pm2_id))
 
 
 @router.callback_query(F.data == "admin_stats")

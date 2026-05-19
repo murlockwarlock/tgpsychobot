@@ -17,6 +17,7 @@ from background_worker import process_queue, process_mailings
 from scheduler import check_subscriptions, check_kie_credit_balance
 from webhooks import setup_webhooks
 from error_reporting import notify_admins_about_error
+from bot_restart import notify_admins_after_requested_restart
 from bot_commands import (
     build_admin_commands,
     build_command_sets,
@@ -254,6 +255,7 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     telegram_delivery_mode = await _configure_telegram_delivery(bot, dispatcher)
     dispatcher['telegram_delivery_mode'] = telegram_delivery_mode
     logging.info("Startup complete. Telegram delivery mode: %s", telegram_delivery_mode)
+    await notify_admins_after_requested_restart(bot, telegram_delivery_mode)
 
 
 async def on_shutdown(bot: Bot, dispatcher: Dispatcher):

@@ -96,6 +96,7 @@ def admin_panel_keyboard():
     builder.button(text="🎛️ Кнопки меню", callback_data="admin_manage_buttons")
     builder.button(text="👮‍♂️ Администраторы", callback_data="admin_manage_admins")
     builder.button(text="✉️ Рассылка", callback_data="admin_mailing_menu")
+    builder.button(text="🔁 Перезагрузить бота", callback_data="admin_restart_bot")
     builder.adjust(2)
     return builder.as_markup()
 
