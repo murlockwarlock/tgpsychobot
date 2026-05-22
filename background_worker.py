@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from sqlalchemy import select, update, func
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.orm import selectinload
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -27,6 +28,64 @@ class InsufficientBalanceError(Exception):
 
 
 STALE_MAILING_TIMEOUT = timedelta(minutes=30)
+TRANSIENT_DB_RETRY_DELAY = 60
+TRANSIENT_DB_ALERT_THRESHOLD = 5
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, (ConnectionRefusedError, InterfaceError, OperationalError)):
+            return True
+        if isinstance(current, DBAPIError) and getattr(current, "connection_invalidated", False):
+            return True
+        current = current.__cause__ or current.__context__
+
+    message = str(exc).lower()
+    transient_markers = (
+        "connection refused",
+        "connection is closed",
+        "underlying connection is closed",
+        "server closed the connection",
+        "connection was closed",
+        "connection reset by peer",
+        "terminating connection",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+async def _handle_transient_db_failure(
+    bot: Bot,
+    *,
+    stage: str,
+    exc: BaseException,
+    failure_count: int,
+) -> None:
+    logging.warning(
+        "Transient DB failure in %s (%s/%s): %s. Retrying in %ss.",
+        stage,
+        failure_count,
+        TRANSIENT_DB_ALERT_THRESHOLD,
+        exc,
+        TRANSIENT_DB_RETRY_DELAY,
+    )
+    should_alert = (
+        failure_count >= TRANSIENT_DB_ALERT_THRESHOLD
+        and failure_count % TRANSIENT_DB_ALERT_THRESHOLD == 0
+    )
+    if should_alert:
+        await notify_admins_about_error(
+            bot,
+            title="Повторный сбой подключения к БД",
+            stage=stage,
+            details=str(exc),
+            extra={
+                "failure_count": failure_count,
+                "retry_delay_sec": TRANSIENT_DB_RETRY_DELAY,
+            },
+            exception=exc,
+        )
+    await asyncio.sleep(TRANSIENT_DB_RETRY_DELAY)
 
 
 @dataclass(slots=True)
@@ -88,9 +147,11 @@ async def _delete_kb_entry(kb_entry_id: int) -> None:
 
 async def process_queue(bot: Bot):
     logging.info("Background worker started.")
+    transient_db_failures = 0
     while True:
         try:
             job = await _claim_next_indexing_job()
+            transient_db_failures = 0
             if not job:
                 await asyncio.sleep(10)
                 continue
@@ -173,6 +234,9 @@ async def process_queue(bot: Bot):
                                            reply_markup=kb.balance_refilled_keyboard())
 
             except (TelegramBadRequest, Exception) as e:
+                if _is_transient_db_error(e):
+                    raise
+
                 if kb_entry_id is not None:
                     delete_document_vectors(kb_entry_id)
                     await _delete_kb_entry(kb_entry_id)
@@ -195,6 +259,17 @@ async def process_queue(bot: Bot):
                         message_id=progress_msg.message_id
                     )
         except Exception as e:
+            if _is_transient_db_error(e):
+                transient_db_failures += 1
+                await _handle_transient_db_failure(
+                    bot,
+                    stage="process_queue",
+                    exc=e,
+                    failure_count=transient_db_failures,
+                )
+                continue
+
+            transient_db_failures = 0
             logging.critical(f"Critical error in background worker: {e}. Restarting loop in 60s.")
             await notify_admins_about_error(
                 bot,
@@ -208,145 +283,162 @@ async def process_queue(bot: Bot):
 
 async def process_mailings(bot: Bot):
     logging.info("Mailing worker started.")
+    transient_db_failures = 0
     while True:
         await asyncio.sleep(15)
-        async with async_session_maker() as session:
-            now = utc_now()
-            stale_stmt = select(Mailing).where(
-                Mailing.status == 'sending',
-                Mailing.recurring_type.is_(None),
-                Mailing.start_time.is_not(None),
-                Mailing.start_time < (now - STALE_MAILING_TIMEOUT),
-            )
-            stale_mailings = (await session.execute(stale_stmt)).scalars().all()
-            if stale_mailings:
-                from database import get_all_admin_ids
-                admin_ids = await get_all_admin_ids()
-                for stale in stale_mailings:
-                    stale.status = 'failed'
-                    stale.end_time = now
-                    stale.failure_count = stale.failure_count or 0
-                    logging.error(
-                        "Mailing %s marked failed after stale sending timeout audience=%s start_time=%s",
-                        stale.id,
-                        stale.target_audience,
-                        stale.start_time,
-                    )
-                    for admin_id in admin_ids:
-                        try:
-                            await bot.send_message(
-                                admin_id,
-                                f"⚠️ Рассылка #{stale.id} помечена как failed\n"
-                                f"Аудитория: {get_mailing_audience_label(stale.target_audience)}\n"
-                                f"Причина: зависла в статусе sending более {int(STALE_MAILING_TIMEOUT.total_seconds() // 60)} минут"
-                            )
-                        except Exception:
-                            pass
-                await session.commit()
-
-            stmt = (
-                select(Mailing)
-                .where(Mailing.status == 'pending', Mailing.recurring_type.is_(None))
-                .order_by(Mailing.created_at)
-                .limit(1)
-            )
-            result = await session.execute(stmt)
-            mailing = result.scalar_one_or_none()
-            if not mailing:
-                continue
-
-            mailing.status = 'sending'
-            mailing.start_time = now
-            await session.commit()
-
-            audience = mailing.target_audience
-            success_count, failure_count = 0, 0
-            try:
-                target_users_stmt = None
-                if audience == "all":
-                    target_users_stmt = select(User.id)
-                elif audience == "self":
-                    target_users_stmt = select(User.id).where(User.id == mailing.creator_id)
-                elif audience == "no_dialogue":
-                    subquery = select(DBMessage.user_id, func.count(DBMessage.id).label("msg_count")).group_by(
-                        DBMessage.user_id).subquery()
-                    target_users_stmt = select(User.id).outerjoin(subquery, User.id == subquery.c.user_id).where(
-                        (subquery.c.msg_count == None) | (subquery.c.msg_count <= 1))
-                elif audience == "no_subscription":
-                    target_users_stmt = select(User.id).outerjoin(UserSubscription).where(UserSubscription.id == None)
-                elif audience == "active_subscription":
-                    target_users_stmt = select(User.id).join(UserSubscription).where(
-                        UserSubscription.end_date > now)
-                elif audience == "inactive_subscription":
-                    target_users_stmt = select(User.id).join(UserSubscription).where(
-                        UserSubscription.end_date <= now)
-
-                if target_users_stmt is None:
-                    mailing.status = 'failed'
-                    mailing.end_time = utc_now()
+        try:
+            async with async_session_maker() as session:
+                now = utc_now()
+                stale_stmt = select(Mailing).where(
+                    Mailing.status == 'sending',
+                    Mailing.recurring_type.is_(None),
+                    Mailing.start_time.is_not(None),
+                    Mailing.start_time < (now - STALE_MAILING_TIMEOUT),
+                )
+                stale_mailings = (await session.execute(stale_stmt)).scalars().all()
+                if stale_mailings:
+                    from database import get_all_admin_ids
+                    admin_ids = await get_all_admin_ids()
+                    for stale in stale_mailings:
+                        stale.status = 'failed'
+                        stale.end_time = now
+                        stale.failure_count = stale.failure_count or 0
+                        logging.error(
+                            "Mailing %s marked failed after stale sending timeout audience=%s start_time=%s",
+                            stale.id,
+                            stale.target_audience,
+                            stale.start_time,
+                        )
+                        for admin_id in admin_ids:
+                            try:
+                                await bot.send_message(
+                                    admin_id,
+                                    f"⚠️ Рассылка #{stale.id} помечена как failed\n"
+                                    f"Аудитория: {get_mailing_audience_label(stale.target_audience)}\n"
+                                    f"Причина: зависла в статусе sending более {int(STALE_MAILING_TIMEOUT.total_seconds() // 60)} минут"
+                                )
+                            except Exception:
+                                pass
                     await session.commit()
+
+                stmt = (
+                    select(Mailing)
+                    .where(Mailing.status == 'pending', Mailing.recurring_type.is_(None))
+                    .order_by(Mailing.created_at)
+                    .limit(1)
+                )
+                result = await session.execute(stmt)
+                mailing = result.scalar_one_or_none()
+                transient_db_failures = 0
+                if not mailing:
                     continue
 
-                user_ids = (await session.execute(target_users_stmt)).scalars().all()
-                logging.info(
-                    "Processing mailing id=%s audience=%s recipients=%s",
-                    mailing.id,
-                    audience,
-                    len(user_ids),
-                )
+                mailing.status = 'sending'
+                mailing.start_time = now
+                await session.commit()
 
-                for user_id in user_ids:
-                    try:
-                        await send_mailing_content(bot, user_id, mailing)
-                        success_count += 1
-                    except TelegramRetryAfter as e:
-                        await asyncio.sleep(e.retry_after)
+                audience = mailing.target_audience
+                success_count, failure_count = 0, 0
+                try:
+                    target_users_stmt = None
+                    if audience == "all":
+                        target_users_stmt = select(User.id)
+                    elif audience == "self":
+                        target_users_stmt = select(User.id).where(User.id == mailing.creator_id)
+                    elif audience == "no_dialogue":
+                        subquery = select(DBMessage.user_id, func.count(DBMessage.id).label("msg_count")).group_by(
+                            DBMessage.user_id).subquery()
+                        target_users_stmt = select(User.id).outerjoin(subquery, User.id == subquery.c.user_id).where(
+                            (subquery.c.msg_count == None) | (subquery.c.msg_count <= 1))
+                    elif audience == "no_subscription":
+                        target_users_stmt = select(User.id).outerjoin(UserSubscription).where(UserSubscription.id == None)
+                    elif audience == "active_subscription":
+                        target_users_stmt = select(User.id).join(UserSubscription).where(
+                            UserSubscription.end_date > now)
+                    elif audience == "inactive_subscription":
+                        target_users_stmt = select(User.id).join(UserSubscription).where(
+                            UserSubscription.end_date <= now)
+
+                    if target_users_stmt is None:
+                        mailing.status = 'failed'
+                        mailing.end_time = utc_now()
+                        await session.commit()
+                        continue
+
+                    user_ids = (await session.execute(target_users_stmt)).scalars().all()
+                    logging.info(
+                        "Processing mailing id=%s audience=%s recipients=%s",
+                        mailing.id,
+                        audience,
+                        len(user_ids),
+                    )
+
+                    for user_id in user_ids:
                         try:
                             await send_mailing_content(bot, user_id, mailing)
                             success_count += 1
+                        except TelegramRetryAfter as e:
+                            await asyncio.sleep(e.retry_after)
+                            try:
+                                await send_mailing_content(bot, user_id, mailing)
+                                success_count += 1
+                            except Exception:
+                                failure_count += 1
+                        except (TelegramForbiddenError, TelegramBadRequest):
+                            failure_count += 1
                         except Exception:
                             failure_count += 1
-                    except (TelegramForbiddenError, TelegramBadRequest):
-                        failure_count += 1
-                    except Exception:
-                        failure_count += 1
 
-                    await asyncio.sleep(0.05)
+                        await asyncio.sleep(0.05)
 
-                mailing.status = 'completed'
-                mailing.end_time = utc_now()
-                mailing.success_count = success_count
-                mailing.failure_count = failure_count
-                await session.commit()
+                    mailing.status = 'completed'
+                    mailing.end_time = utc_now()
+                    mailing.success_count = success_count
+                    mailing.failure_count = failure_count
+                    await session.commit()
 
-                from database import get_all_admin_ids
-                report = (
-                    f"✅ Рассылка #{mailing.id} завершена!\n"
-                    f"Аудитория: {get_mailing_audience_label(audience)}\n"
-                    f"Успешно: {success_count}\nОшибки: {failure_count}"
+                    from database import get_all_admin_ids
+                    report = (
+                        f"✅ Рассылка #{mailing.id} завершена!\n"
+                        f"Аудитория: {get_mailing_audience_label(audience)}\n"
+                        f"Успешно: {success_count}\nОшибки: {failure_count}"
+                    )
+                    for admin_id in await get_all_admin_ids():
+                        try:
+                            await bot.send_message(admin_id, report)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    if _is_transient_db_error(e):
+                        raise
+
+                    logging.exception("Mailing worker failed for mailing id=%s", mailing.id)
+                    mailing.status = 'failed'
+                    mailing.end_time = utc_now()
+                    mailing.success_count = success_count
+                    mailing.failure_count = failure_count
+                    await session.commit()
+
+                    from database import get_all_admin_ids
+                    for admin_id in await get_all_admin_ids():
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                f"⚠️ Рассылка #{mailing.id} завершилась с ошибкой\n"
+                                f"Аудитория: {get_mailing_audience_label(audience)}\n"
+                                f"Успешно: {success_count}\nОшибки: {failure_count}\n"
+                                f"Причина: {e}"
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            if _is_transient_db_error(e):
+                transient_db_failures += 1
+                await _handle_transient_db_failure(
+                    bot,
+                    stage="process_mailings",
+                    exc=e,
+                    failure_count=transient_db_failures,
                 )
-                for admin_id in await get_all_admin_ids():
-                    try:
-                        await bot.send_message(admin_id, report)
-                    except Exception:
-                        pass
-            except Exception as e:
-                logging.exception("Mailing worker failed for mailing id=%s", mailing.id)
-                mailing.status = 'failed'
-                mailing.end_time = utc_now()
-                mailing.success_count = success_count
-                mailing.failure_count = failure_count
-                await session.commit()
-
-                from database import get_all_admin_ids
-                for admin_id in await get_all_admin_ids():
-                    try:
-                        await bot.send_message(
-                            admin_id,
-                            f"⚠️ Рассылка #{mailing.id} завершилась с ошибкой\n"
-                            f"Аудитория: {get_mailing_audience_label(audience)}\n"
-                            f"Успешно: {success_count}\nОшибки: {failure_count}\n"
-                            f"Причина: {e}"
-                        )
-                    except Exception:
-                        pass
+                continue
+            raise
