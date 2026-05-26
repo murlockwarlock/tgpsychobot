@@ -23,6 +23,7 @@ from prompt_blocks import (
     DEFAULT_SHORT_RESPONSE_INSTRUCTION,
     render_prompt_block,
 )
+from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
 
 class InsufficientBalanceError(Exception):
@@ -62,6 +63,41 @@ def _normalize_config_value(value: str | None) -> str | None:
         value = value.strip()
         return value or None
     return value
+
+
+async def _notify_ai_fallback_used(
+    bot,
+    *,
+    user: User | None,
+    primary_provider: str,
+    primary_model: str | None,
+    fallback_provider: str,
+    fallback_model: str | None,
+    error: Exception,
+) -> None:
+    if bot is None:
+        return
+
+    try:
+        await notify_admins_about_error(
+            bot,
+            title="Основной AI-провайдер недоступен, включен резервный",
+            user_id=getattr(user, "id", None),
+            username=getattr(user, "username", None),
+            full_name=getattr(user, "full_name", None),
+            provider=primary_provider,
+            model=primary_model,
+            stage="ai_provider_fallback",
+            details=str(error),
+            extra={
+                "fallback_provider": fallback_provider,
+                "fallback_model": fallback_model,
+            },
+            exception=error,
+            level=logging.WARNING,
+        )
+    except Exception as notify_error:
+        logging.error("Failed to send AI fallback admin notification: %s", notify_error)
 
 
 def _get_kie_base_url(ai_config: AIConfig) -> str:
@@ -339,7 +375,7 @@ def _build_memory_aware_history(
     return current_topic_history, global_memory_context
 
 
-async def generate_response(user_id: int, user_prompt: str) -> str:
+async def generate_response(user_id: int, user_prompt: str, bot=None) -> str:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
@@ -348,7 +384,7 @@ async def generate_response(user_id: int, user_prompt: str) -> str:
         user_name = user.name if user.name else "Незнакомец"
         user_gender = user.gender if user.gender else "unknown"
 
-    return await get_ai_response(user_id, user_prompt, user_name, user_gender)
+    return await get_ai_response(user_id, user_prompt, user_name, user_gender, bot=bot)
 
 
 async def _call_gemini_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7) -> str:
@@ -864,7 +900,7 @@ async def _call_openai_api(api_key: str, model: str, history: list, context: str
         raise AIServiceError(f"Ошибка при обращении к OpenAI API: {e}")
 
 
-async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_gender: str) -> str:
+async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_gender: str, bot=None) -> str:
     async with async_session_maker() as session:
         user_result = await session.execute(
             select(User).options(
@@ -1119,6 +1155,15 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
             )
             try:
                 response_text = await _dispatch_call(fb_key, fb_api_key, fb_model)
+                await _notify_ai_fallback_used(
+                    bot,
+                    user=user,
+                    primary_provider=provider,
+                    primary_model=model,
+                    fallback_provider=fb_provider,
+                    fallback_model=fb_model,
+                    error=primary_err,
+                )
             except Exception as fb_err:
                 logging.error(f"Fallback provider '{fb_provider}' also failed: {fb_err}")
                 raise AIServiceError(

@@ -810,7 +810,7 @@ async def process_buffered_messages(user_id: int, bot: Bot):
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
     try:
-        response_text = await ai_integration.generate_response(user_id, full_text)
+        response_text = await ai_integration.generate_response(user_id, full_text, bot=bot)
         typing_task.cancel()
 
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_text)
@@ -993,7 +993,9 @@ async def process_buffered_messages(user_id: int, bot: Bot):
                 cards_text = "; ".join(drawn_cards_info)
                 typing_task_interp = asyncio.create_task(keep_typing_loop())
                 interpretation = await ai_integration.generate_response(
-                    user_id, f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]"
+                    user_id,
+                    f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]",
+                    bot=bot,
                 )
                 typing_task_interp.cancel()
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
@@ -1104,7 +1106,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                         pass
 
                 typing_task_interp = asyncio.create_task(_typing_loop_card())
-                interpretation = await ai_integration.generate_response(user_id, card_system_msg)
+                interpretation = await ai_integration.generate_response(user_id, card_system_msg, bot=bot)
                 typing_task_interp.cancel()
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
                 if clean_interpretation:
@@ -4272,7 +4274,9 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 typing_task_interp = asyncio.create_task(_typing_loop())
                 cards_text = "; ".join(drawn_cards_info)
                 interpretation = await ai_integration.generate_response(
-                    user_id, f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]"
+                    user_id,
+                    f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]",
+                    bot=bot,
                 )
                 typing_task_interp.cancel()
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
