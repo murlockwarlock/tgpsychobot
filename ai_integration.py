@@ -751,7 +751,7 @@ async def _call_deepseek_api(api_key: str, model: str, history: list, context: s
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
         transport = _build_async_transport_from_env("DEEPSEEK_PROXY")
         import httpx
-        timeout_sec = float(os.getenv("DEEPSEEK_TIMEOUT_SEC", "300"))
+        timeout_sec = float(os.getenv("DEEPSEEK_TIMEOUT_SEC", "60"))
         http_client = httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout_sec)
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
