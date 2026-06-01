@@ -247,11 +247,11 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
 
     # Layout: keys 2+2+1, models 2+2+1, context 2, audio+limit 2,
-    # KIE+temp 2, mem+proxy 2, fallback 1 (or 2), vision 2, gen 2, edit 2, timeout 1, back 1
+    # KIE+temp 2, mem 1, proxy 1, fallback 1 (or 1+1), vision 2, gen 2, edit 2, timeout 1, back 1
     if fallback_provider:
-        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 1, 1)
+        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 1, 1)
     else:
-        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 1, 2, 2, 2, 1, 1)
+        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 1, 1, 1, 2, 2, 2, 1, 1)
     return builder.as_markup()
 
 
