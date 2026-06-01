@@ -756,8 +756,12 @@ async def _call_claude_vision(
 async def _call_deepseek_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, use_proxy: bool = True, timeout: float = 60.0):
     client = None
     try:
-        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
-        transport = _build_async_transport_from_env("DEEPSEEK_PROXY", use_proxy)
+        if use_proxy:
+            base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
+            transport = _build_async_transport_from_env("DEEPSEEK_PROXY", use_proxy=True)
+        else:
+            base_url = "https://api.deepseek.com"
+            transport = None
         import httpx
         timeout_sec = timeout
         http_client = httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout_sec)
