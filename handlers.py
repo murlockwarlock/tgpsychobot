@@ -2650,6 +2650,7 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     memory_mode = get_memory_mode(config) if config else MEMORY_MODE_RESET
     fb_provider = getattr(config, 'fallback_provider', None) if config else None
     fb_model = getattr(config, 'fallback_model', None) if config else None
+    use_proxy = getattr(config, 'use_proxy', True) if config else True
 
     await callback.message.edit_text(
         "🔑 Настройка ключей, моделей и глубины контекста (памяти)",
@@ -2668,6 +2669,7 @@ async def admin_ai_keys_models(callback: CallbackQuery):
             memory_mode,
             fb_provider,
             fb_model,
+            use_proxy=use_proxy
         )
     )
 
@@ -2975,6 +2977,22 @@ _FALLBACK_DEFAULT_MODELS = {
     "OpenAI": "gpt-4o",
 }
 
+
+@router.callback_query(F.data == "admin_toggle_proxy")
+async def admin_toggle_proxy(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
+            return
+
+        current = getattr(config, 'use_proxy', True)
+        config.use_proxy = not current
+        await session.commit()
+
+    status = "ВКЛ" if not current else "ВЫКЛ"
+    await callback.answer(f"✅ Прокси: {status}")
+    await admin_ai_keys_models(callback)
 
 @router.callback_query(F.data == "admin_toggle_fallback")
 async def admin_toggle_fallback(callback: CallbackQuery):

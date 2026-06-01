@@ -184,7 +184,8 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                             image_edit_provider: str, image_edit_model: str,
                             kie_credit_alert_threshold: float,
                             temperature: float = 0.7, memory_mode: str = "reset",
-                            fallback_provider: str | None = None, fallback_model: str | None = None):
+                            fallback_provider: str | None = None, fallback_model: str | None = None,
+                            use_proxy: bool = True):
     def short_model(model: str, limit: int = 16) -> str:
         if len(model) <= limit:
             return model
@@ -218,6 +219,8 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
         text=f"🧠 Память: {memory_mode_label(memory_mode)}",
         callback_data="toggle_preserve_topic_context"
     )
+    proxy_status = "✅ ВКЛ" if use_proxy else "❌ ВЫКЛ"
+    builder.button(text=f"🌍 Прокси: {proxy_status}", callback_data="admin_toggle_proxy")
     fb_label = f"🔄 Резерв: {fallback_provider}" if fallback_provider else "🔄 Резерв: выкл"
     builder.button(text=fb_label, callback_data="admin_toggle_fallback")
     if fallback_provider:
@@ -239,11 +242,11 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
 
     # Layout: keys 2+2+1, models 2+2+1, context 2, audio+limit 2,
-    # KIE+temp 2, mem+fallback 2, [fallback model 1], vision 2, gen 2, edit 2, back 1
+    # KIE+temp 2, mem+proxy 2, fallback 1 (or 2), vision 2, gen 2, edit 2, back 1
     if fallback_provider:
-        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 2, 1, 2, 2, 2, 1)
+        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 1)
     else:
-        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 1)
+        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 1, 2, 2, 2, 1)
     return builder.as_markup()
 
 

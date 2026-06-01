@@ -149,6 +149,7 @@ class AIConfig(Base):
     service_prompt_block = Column(Text, default=DEFAULT_SERVICE_PROMPT_TEMPLATE, nullable=False)
     fallback_provider = Column(String, nullable=True)
     fallback_model = Column(String, nullable=True)
+    use_proxy = Column(Boolean, default=True, nullable=False)
 
 
 class KnowledgeBase(Base):
@@ -520,6 +521,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_provider VARCHAR DEFAULT 'Gemini' NOT NULL"))
             if 'image_edit_model' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_model VARCHAR DEFAULT 'gemini-3-pro-image-preview' NOT NULL"))
+            if 'use_proxy' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN use_proxy BOOLEAN DEFAULT TRUE NOT NULL"))
 
             mailing_columns = [c['name'] for c in insp.get_columns('mailings')]
             if 'recurring_type' not in mailing_columns:
@@ -565,6 +568,8 @@ async def init_db():
                 ai_conf.shared_prompt_block = DEFAULT_SHARED_PROMPT_BLOCK
             if getattr(ai_conf, 'service_prompt_block', None) is None:
                 ai_conf.service_prompt_block = DEFAULT_SERVICE_PROMPT_TEMPLATE
+            if getattr(ai_conf, 'use_proxy', None) is None:
+                ai_conf.use_proxy = True
 
         sub_conf = await session.get(SubscriptionConfig, 1)
         if not sub_conf:
