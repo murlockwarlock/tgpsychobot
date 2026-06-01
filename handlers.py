@@ -249,6 +249,7 @@ PROMPT_BLOCKS = {
 
 
 class AdminStates(StatesGroup):
+    set_ai_timeout = State()
     set_api_key = State()
     set_model = State()
     set_system_prompt = State()
