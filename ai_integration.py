@@ -753,11 +753,11 @@ async def _call_claude_vision(
         raise AIServiceError(f"Ошибка анализа изображения (Claude): {e}")
 
 
-async def _call_deepseek_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7):
+async def _call_deepseek_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, use_proxy: bool = True):
     client = None
     try:
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
-        transport = _build_async_transport_from_env("DEEPSEEK_PROXY")
+        transport = _build_async_transport_from_env("DEEPSEEK_PROXY", use_proxy)
         import httpx
         timeout_sec = float(os.getenv("DEEPSEEK_TIMEOUT_SEC", "60"))
         http_client = httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout_sec)
