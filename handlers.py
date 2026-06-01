@@ -14491,7 +14491,26 @@ async def save_ai_timeout(message: Message, state: FSMContext):
             text = "Настройки ключей и моделей:\n\n"
             text += f"Текущий таймаут: {conf2.fallback_timeout}с"
             from keyboards import ai_keys_models_keyboard
-            await message.answer(text, reply_markup=ai_keys_models_keyboard(conf2))
+            
+            from database import get_memory_mode
+            kb = ai_keys_models_keyboard(
+                current_transcription_provider=conf2.transcription_provider if conf2 else 'OpenAI',
+                context_first=conf2.context_limit_first if conf2 else 2,
+                context_recent=conf2.context_limit_recent if conf2 else 10,
+                current_vision_provider=conf2.vision_provider if conf2 else 'Gemini',
+                current_vision_model=conf2.vision_model if conf2 else 'gemini-3-flash-preview',
+                image_generation_provider=getattr(conf2, 'image_generation_provider', 'Gemini') if conf2 else 'Gemini',
+                image_generation_model=getattr(conf2, 'image_generation_model', 'imagen-4.0-generate-001') if conf2 else 'imagen-4.0-generate-001',
+                image_edit_provider=getattr(conf2, 'image_edit_provider', 'Gemini') if conf2 else 'Gemini',
+                image_edit_model=getattr(conf2, 'image_edit_model', 'gemini-3-pro-image-preview') if conf2 else 'gemini-3-pro-image-preview',
+                kie_credit_alert_threshold=getattr(conf2, 'kie_credit_alert_threshold', 0) if conf2 else 0,
+                temperature=getattr(conf2, 'temperature', 0.7) if conf2 else 0.7,
+                memory_mode=get_memory_mode(conf2) if conf2 else "reset",
+                fallback_provider=getattr(conf2, 'fallback_provider', None) if conf2 else None,
+                fallback_model=getattr(conf2, 'fallback_model', None) if conf2 else None,
+                use_proxy=getattr(conf2, 'use_proxy', True) if conf2 else True
+            )
+            await message.answer(text, reply_markup=kb)
             
     except ValueError:
         await message.answer("Пожалуйста, введите целое число.")
