@@ -19,3 +19,5 @@ prod_snapshots/
 
 .env
 .env.*
+
+html_utils.py
