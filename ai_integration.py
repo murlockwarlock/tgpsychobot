@@ -1125,12 +1125,12 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
 
         async def _dispatch_call(p_key, p_api_key, p_model):
             use_proxy = getattr(ai_config, 'use_proxy', True)
+            timeout = float(getattr(ai_config, "fallback_timeout", 60))
             if p_key == 'openai':
                 return await _call_openai_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             elif p_key in ['anthropic', 'claude']:
                 return await _call_claude_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             elif p_key == 'gemini':
-                timeout = float(getattr(ai_config, "fallback_timeout", 60))
                 return await _call_gemini_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             elif p_key == 'kie':
                 return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, context, system_prompt, temperature)
