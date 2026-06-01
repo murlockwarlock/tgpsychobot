@@ -14464,3 +14464,33 @@ async def admin_ref_tpl_delete_confirm(callback: CallbackQuery):
             await session.commit()
     await callback.answer("🗑 Шаблон удалён")
     await _show_referral_templates_admin(callback, edit=True)
+
+@router.callback_query(lambda c: c.data == "set_ai_timeout")
+async def process_set_ai_timeout(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите новый таймаут ИИ в секундах (например, 60):")
+    await state.set_state(AdminStates.set_ai_timeout)
+
+@router.message(AdminStates.set_ai_timeout)
+async def save_ai_timeout(message: Message, state: FSMContext):
+    try:
+        timeout_val = int(message.text.strip())
+        if timeout_val < 5:
+            await message.answer("Слишком маленький таймаут. Введите больше 5 секунд.")
+            return
+        async with async_session_maker() as session:
+            ai_conf = await session.get(AIConfig, 1)
+            ai_conf.fallback_timeout = timeout_val
+            await session.commit()
+        await message.answer(f"✅ Таймаут ИИ успешно установлен на {timeout_val} секунд.")
+        await state.clear()
+        
+        # Показываем админку снова
+        async with async_session_maker() as sess2:
+            conf2 = await sess2.get(AIConfig, 1)
+            text = "Настройки ключей и моделей:\n\n"
+            text += f"Текущий таймаут: {conf2.fallback_timeout}с"
+            from keyboards import ai_keys_models_keyboard
+            await message.answer(text, reply_markup=ai_keys_models_keyboard(conf2))
+            
+    except ValueError:
+        await message.answer("Пожалуйста, введите целое число.")

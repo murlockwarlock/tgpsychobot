@@ -150,6 +150,7 @@ class AIConfig(Base):
     fallback_provider = Column(String, nullable=True)
     fallback_model = Column(String, nullable=True)
     use_proxy = Column(Boolean, default=True, nullable=False)
+    fallback_timeout = Column(Integer, default=60, nullable=False)
 
 
 class KnowledgeBase(Base):
@@ -523,6 +524,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_model VARCHAR DEFAULT 'gemini-3-pro-image-preview' NOT NULL"))
             if 'use_proxy' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN use_proxy BOOLEAN DEFAULT TRUE NOT NULL"))
+            if 'fallback_timeout' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN fallback_timeout INTEGER DEFAULT 60 NOT NULL"))
 
             mailing_columns = [c['name'] for c in insp.get_columns('mailings')]
             if 'recurring_type' not in mailing_columns:
@@ -570,6 +573,8 @@ async def init_db():
                 ai_conf.service_prompt_block = DEFAULT_SERVICE_PROMPT_TEMPLATE
             if getattr(ai_conf, 'use_proxy', None) is None:
                 ai_conf.use_proxy = True
+            if getattr(ai_conf, 'fallback_timeout', None) is None:
+                ai_conf.fallback_timeout = 60
 
         sub_conf = await session.get(SubscriptionConfig, 1)
         if not sub_conf:

@@ -395,7 +395,7 @@ async def generate_response(user_id: int, user_prompt: str, bot=None) -> str:
     return await get_ai_response(user_id, user_prompt, user_name, user_gender, bot=bot)
 
 
-async def _call_gemini_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7) -> str:
+async def _call_gemini_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, timeout: float = 60.0) -> str:
     import httpx
     try:
         transport = _build_async_transport_from_env("GEMINI_PROXY")
@@ -417,7 +417,7 @@ async def _call_gemini_api(api_key: str, model: str, history: list, context: str
         }
         target_model = model if model else "gemini-2.5-flash"
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
-        async with httpx.AsyncClient(transport=transport, trust_env=False, timeout=60.0) as client:
+        async with httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout) as client:
             response = await client.post(url, json=payload, headers={'Content-Type': 'application/json'})
             if response.status_code != 200:
                 error_data = response.json()
@@ -663,7 +663,7 @@ async def get_kie_remaining_credits(api_key: str, base_url: str) -> float:
         raise AIServiceError(f"Ошибка проверки остатка кредитов KIE: {e}")
 
 
-async def _call_claude_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7):
+async def _call_claude_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, timeout: float = 60.0):
     try:
         client = anthropic.AsyncAnthropic(api_key=api_key)
 
@@ -753,13 +753,13 @@ async def _call_claude_vision(
         raise AIServiceError(f"Ошибка анализа изображения (Claude): {e}")
 
 
-async def _call_deepseek_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, use_proxy: bool = True):
+async def _call_deepseek_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, use_proxy: bool = True, timeout: float = 60.0):
     client = None
     try:
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
         transport = _build_async_transport_from_env("DEEPSEEK_PROXY", use_proxy)
         import httpx
-        timeout_sec = float(os.getenv("DEEPSEEK_TIMEOUT_SEC", "60"))
+        timeout_sec = timeout
         http_client = httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout_sec)
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
@@ -1126,17 +1126,18 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         async def _dispatch_call(p_key, p_api_key, p_model):
             use_proxy = getattr(ai_config, 'use_proxy', True)
             if p_key == 'openai':
-                return await _call_openai_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+                return await _call_openai_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             elif p_key in ['anthropic', 'claude']:
-                return await _call_claude_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+                return await _call_claude_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             elif p_key == 'gemini':
-                return await _call_gemini_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+                timeout = float(getattr(ai_config, "fallback_timeout", 60))
+        return await _call_gemini_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             elif p_key == 'kie':
                 return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, context, system_prompt, temperature)
             elif p_key == 'deepseek':
-                return await _call_deepseek_api(p_api_key, p_model, final_history, context, system_prompt, temperature, use_proxy=use_proxy)
+                return await _call_deepseek_api(p_api_key, p_model, final_history, context, system_prompt, temperature, use_proxy=use_proxy, timeout=timeout)
             elif p_key == 'xai':
-                return await _call_openai_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
+                return await _call_openai_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             else:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
 
@@ -1583,7 +1584,7 @@ async def generate_openai_image(prompt: str) -> str:
         raise Exception("API ключ OpenAI не установлен.")
 
     base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
     try:
         model = "gpt-image-1.5"
@@ -1729,7 +1730,7 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
         })
 
         base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
         try:
             response = await client.chat.completions.create(
