@@ -1721,6 +1721,7 @@ async def cmd_help(message: Message):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: CommandObject = None):
+    await state.clear()
     bonus_messages = []
 
     async def send_bonus_messages(reply_markup=None):
