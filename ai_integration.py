@@ -1131,7 +1131,7 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
                 return await _call_claude_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             elif p_key == 'gemini':
                 timeout = float(getattr(ai_config, "fallback_timeout", 60))
-        return await _call_gemini_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
+                return await _call_gemini_api(p_api_key, p_model, final_history, context, system_prompt, temperature, timeout=timeout)
             elif p_key == 'kie':
                 return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, context, system_prompt, temperature)
             elif p_key == 'deepseek':
