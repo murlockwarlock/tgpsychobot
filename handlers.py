@@ -14468,7 +14468,10 @@ async def admin_ref_tpl_delete_confirm(callback: CallbackQuery):
 
 @router.callback_query(lambda c: c.data == "set_ai_timeout")
 async def process_set_ai_timeout(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите новый таймаут ИИ в секундах (например, 60):")
+    async with async_session_maker() as session:
+        ai_conf = await session.get(AIConfig, 1)
+        current_val = getattr(ai_conf, "fallback_timeout", 60) if ai_conf else 60
+    await callback.message.edit_text(f"Текущий таймаут: {current_val}с\n\nВведите новый таймаут ИИ в секундах:")
     await state.set_state(AdminStates.set_ai_timeout)
 
 @router.message(AdminStates.set_ai_timeout)
