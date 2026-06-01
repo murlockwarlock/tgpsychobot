@@ -395,10 +395,10 @@ async def generate_response(user_id: int, user_prompt: str, bot=None) -> str:
     return await get_ai_response(user_id, user_prompt, user_name, user_gender, bot=bot)
 
 
-async def _call_gemini_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, use_proxy: bool = True) -> str:
+async def _call_gemini_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7) -> str:
     import httpx
     try:
-        transport = _build_async_transport_from_env("GEMINI_PROXY", use_proxy)
+        transport = _build_async_transport_from_env("GEMINI_PROXY")
         contents = []
         for msg in history:
             if not msg.content: continue
@@ -838,8 +838,7 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                 return f"❌ Ошибка: API ключ для {provider} (для транскрибации) не установлен администратором."
             if not model:
                 return f"❌ Ошибка: Модель для {provider} (для транскрибации) не выбрана администратором."
-            use_proxy = getattr(ai_config, "use_proxy", True)
-            response_text = await _call_gemini_transcribe(api_key, model, file_bytes, filename, use_proxy=use_proxy)
+            response_text = await _call_gemini_transcribe(api_key, model, file_bytes, filename)
         elif provider == "KIE":
             api_key = ai_config.kie_api_key
             model = getattr(ai_config, "kie_transcription_model", None) or getattr(ai_config, "kie_model", None)
@@ -1131,7 +1130,7 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
             elif p_key in ['anthropic', 'claude']:
                 return await _call_claude_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
             elif p_key == 'gemini':
-                return await _call_gemini_api(p_api_key, p_model, final_history, context, system_prompt, temperature, use_proxy=use_proxy)
+                return await _call_gemini_api(p_api_key, p_model, final_history, context, system_prompt, temperature)
             elif p_key == 'kie':
                 return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, context, system_prompt, temperature)
             elif p_key == 'deepseek':
@@ -1184,12 +1183,12 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         return response_text
 
 
-async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, filename: str, use_proxy: bool = True) -> str:
+async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, filename: str) -> str:
     import httpx
     import base64
 
     try:
-        transport = _build_async_transport_from_env("GEMINI_PROXY", use_proxy)
+        transport = _build_async_transport_from_env("GEMINI_PROXY")
 
         mime_type, _ = mimetypes.guess_type(filename)
         if not mime_type or not mime_type.startswith('audio/'):
@@ -1526,8 +1525,7 @@ async def generate_image(prompt: str) -> any:
         api_key = config.gemini_api_key
         if not api_key:
             raise Exception("API ключ Gemini для генерации не установлен.")
-        use_proxy = getattr(config, "use_proxy", True)
-        return await _call_gemini_image_generation(api_key, model, prompt, use_proxy=use_proxy)
+        return await _call_gemini_image_generation(api_key, model, prompt)
     if provider_key == 'kie':
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
@@ -1557,8 +1555,7 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
         api_key = config.gemini_api_key
         if not api_key:
             raise Exception("API ключ Gemini для редактирования не установлен.")
-        use_proxy = getattr(config, "use_proxy", True)
-        return await edit_image_gemini_v3(api_key, model, prompt, image_bytes, use_proxy=use_proxy)
+        return await edit_image_gemini_v3(api_key, model, prompt, image_bytes)
     if provider_key == "kie":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
@@ -1648,8 +1645,7 @@ async def analyze_image_content(image_bytes: bytes, prompt: str, history: list =
             api_key = config.gemini_api_key
             if not api_key:
                 return "❌ Ошибка: API ключ для Gemini (Vision) не установлен."
-            use_proxy = getattr(config, "use_proxy", True)
-            return await _call_gemini_vision(api_key, v_model, image_bytes, prompt, history=history, temperature=temperature, use_proxy=use_proxy)
+            return await _call_gemini_vision(api_key, v_model, image_bytes, prompt, history=history, temperature=temperature)
         if provider == "Claude":
             api_key = config.claude_api_key
             if not api_key:

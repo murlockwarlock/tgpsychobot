@@ -220,7 +220,7 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
         callback_data="toggle_preserve_topic_context"
     )
     proxy_status = "✅ ВКЛ" if use_proxy else "❌ ВЫКЛ"
-    builder.button(text=f"🌍 Прокси: {proxy_status}", callback_data="admin_toggle_proxy")
+    builder.button(text=f"🌍 Прокси Deepseek: {proxy_status}", callback_data="admin_toggle_proxy")
     fb_label = f"🔄 Резерв: {fallback_provider}" if fallback_provider else "🔄 Резерв: выкл"
     builder.button(text=fb_label, callback_data="admin_toggle_fallback")
     if fallback_provider:
