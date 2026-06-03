@@ -623,8 +623,14 @@ class MaxBotApplication:
         if data == "settings_change_age":
             await settings_service.start_change_age(self.client, self.states, chat_id, user_id)
             return
-        if data == "settings_toggle_length":
-            await settings_service.toggle_response_length(self.client, chat_id, user_id)
+        if data == "settings_change_length":
+            await settings_service.show_response_length(self.client, chat_id, user_id)
+            return
+        if data == "response_length_short":
+            await settings_service.set_response_length(self.client, chat_id, user_id, "short")
+            return
+        if data == "response_length_normal":
+            await settings_service.set_response_length(self.client, chat_id, user_id, "normal")
             return
         if data.startswith("select_topic_"):
             await topics_service.select_topic(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]))

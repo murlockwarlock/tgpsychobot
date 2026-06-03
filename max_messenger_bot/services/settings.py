@@ -5,7 +5,7 @@ import html
 from sqlalchemy import update
 
 from ..api import MaxApiClient
-from ..keyboards import gender_keyboard, settings_keyboard
+from ..keyboards import gender_keyboard, response_length_keyboard, settings_keyboard
 from ..legacy import User, async_session_maker
 from ..storage import StateStore
 
@@ -115,4 +115,26 @@ async def toggle_response_length(client: MaxApiClient, chat_id: int, user_id: in
         await session.commit()
         user = await session.get(User, user_id)
     await client.send_message(chat_id=chat_id, text=_settings_text(user, "✅ Длина ответов изменена"), attachments=settings_keyboard(user))
+
+
+async def show_response_length(client: MaxApiClient, chat_id: int, user_id: int) -> None:
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+    if not user:
+        return
+    current = getattr(user, "response_length", "normal") or "normal"
+    await client.send_message(
+        chat_id=chat_id,
+        text="<b>📏 Длина ответов</b>\n\nВыберите предпочтительную длину ответов:",
+        attachments=response_length_keyboard(current),
+    )
+
+
+async def set_response_length(client: MaxApiClient, chat_id: int, user_id: int, length: str) -> None:
+    async with async_session_maker() as session:
+        await session.execute(update(User).where(User.id == user_id).values(response_length=length))
+        await session.commit()
+        user = await session.get(User, user_id)
+    label = "Краткий" if length == "short" else "Обычный"
+    await client.send_message(chat_id=chat_id, text=_settings_text(user, f"✅ Длина ответов: {label}"), attachments=settings_keyboard(user))
 

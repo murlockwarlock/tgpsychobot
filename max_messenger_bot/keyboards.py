@@ -101,13 +101,13 @@ def admin_panel_keyboard() -> list[dict]:
 
 def settings_keyboard(user) -> list[dict]:
     response_length = getattr(user, "response_length", "normal") or "normal"
-    length_label = "📏 Длина: Краткий" if response_length == "short" else "📏 Длина: Обычный"
+    length_label = "📏 Длина: Краткий ✅" if response_length == "short" else "📏 Длина: Обычный ✅"
     return inline_keyboard(
         [
             [callback_button("✏️ Имя", "settings_change_name")],
             [callback_button("👤 Пол", "settings_change_gender")],
             [callback_button("🔢 Возраст", "settings_change_age")],
-            [callback_button(length_label, "settings_toggle_length")],
+            [callback_button(length_label, "settings_change_length")],
             main_menu_row(),
         ]
     )
@@ -117,6 +117,17 @@ def gender_keyboard() -> list[dict]:
     return inline_keyboard(
         [
             [callback_button("👨 Мужской", "gender_male"), callback_button("👩 Женский", "gender_female")],
+        ]
+    )
+
+
+def response_length_keyboard(current_length: str) -> list[dict]:
+    short_label = "📝 Краткий ✅" if current_length == "short" else "📝 Краткий"
+    normal_label = "📄 Обычный ✅" if current_length == "normal" else "📄 Обычный"
+    return inline_keyboard(
+        [
+            [callback_button(short_label, "response_length_short"), callback_button(normal_label, "response_length_normal")],
+            [callback_button("⬅️ Назад", "settings_back")],
         ]
     )
 
