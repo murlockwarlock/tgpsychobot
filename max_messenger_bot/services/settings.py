@@ -35,6 +35,18 @@ async def start_change_name(client: MaxApiClient, states: StateStore, chat_id: i
     await client.send_message(chat_id=chat_id, text="Введите новое имя.")
 
 
+async def save_name_only(states: StateStore, user_id: int, text: str) -> str | None:
+    """Save the user's name during onboarding without showing a settings block. Returns name or None if invalid."""
+    user_name = text.strip()
+    if not user_name or len(user_name) > 50:
+        return None
+    async with async_session_maker() as session:
+        await session.execute(update(User).where(User.id == user_id).values(name=user_name))
+        await session.commit()
+    await states.clear(user_id)
+    return user_name
+
+
 async def process_new_name(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
     user_name = text.strip()
     if not user_name or len(user_name) > 50:

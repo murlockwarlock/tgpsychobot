@@ -67,6 +67,17 @@ async def _call_claude(api_key: str, model: str, messages: list[dict], system_pr
     return response.content[0].text
 
 
+def _build_gemini_proxy_transport():
+    """Build an httpx AsyncHTTPTransport using the GEMINI_PROXY env variable, if set."""
+    raw_proxy = os.getenv("GEMINI_PROXY")
+    if not raw_proxy:
+        return None
+    proxy = raw_proxy.strip().strip('"').strip("'")
+    if not proxy:
+        return None
+    return httpx.AsyncHTTPTransport(proxy=proxy)
+
+
 async def _call_gemini(api_key: str, model: str, messages: list[dict], system_prompt: str, temperature: float) -> str:
     import httpx
 
@@ -81,7 +92,8 @@ async def _call_gemini(api_key: str, model: str, messages: list[dict], system_pr
     }
     target_model = model or "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    transport = _build_gemini_proxy_transport()
+    async with httpx.AsyncClient(timeout=60.0, transport=transport) as client:
         response = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
         response.raise_for_status()
         data = response.json()
@@ -430,6 +442,39 @@ async def _edit_kie(api_key: str, base_url: str, upload_base_url: str, model: st
     return await _download_binary_file(download_url)
 
 
+async def _call_kie_text_chat(api_key: str, base_url: str, model: str, messages: list[dict], system_prompt: str, temperature: float) -> str:
+    """Call KIE API for text chat (OpenAI-compatible endpoint)."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": system_prompt}, *messages],
+        "max_tokens": 4096,
+        "temperature": temperature,
+        "stream": False,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+            response = await client.post(
+                f"{_kie_model_base_url(base_url, model)}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        response_payload = _validate_kie_json_response(
+            response.status_code,
+            response.json(),
+            context="Ошибка при обращении к KIE Chat API",
+        )
+        text = _extract_kie_chat_text(response_payload)
+        if not text:
+            raise AIServiceError("KIE chat returned empty content")
+        return text
+    except (AIServiceError, InsufficientBalanceError):
+        raise
+    except Exception as e:
+        log.error("KIE chat error: %s", e, exc_info=True)
+        raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {e}") from e
+
+
 def _resolve_provider(ai_config: AIConfig) -> tuple[str, float]:
     provider = (ai_config.provider or "").strip().lower()
     temperature = getattr(ai_config, "temperature", 0.7) or 0.7
@@ -455,6 +500,11 @@ async def _dispatch_provider(ai_config: AIConfig, system_prompt: str, messages: 
         if not ai_config.deepseek_api_key:
             raise AIServiceError("DeepSeek API key не задан")
         return await _call_deepseek(ai_config.deepseek_api_key, ai_config.deepseek_model, [{"role": "system", "content": system_prompt}, *messages], temperature)
+    if provider == "kie":
+        if not ai_config.kie_api_key:
+            raise AIServiceError("KIE API key не задан")
+        base_url = _get_kie_base_url(ai_config)
+        return await _call_kie_text_chat(ai_config.kie_api_key, base_url, ai_config.kie_model or "gemini-3-flash", messages, system_prompt, temperature)
     raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
 
 
@@ -476,6 +526,19 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
         if not system_prompt:
             system_prompt = "Ты полезный ИИ-помощник."
         system_prompt = apply_global_prompt_appendix(system_prompt, getattr(ai_config, 'global_prompt_appendix', None))
+
+        # Inject user variables into system prompt template
+        safe_user_name = (getattr(user, "name", None) or getattr(user, "first_name", None) or "Не указано")
+        safe_user_gender = getattr(user, "gender", None) or "Не указан"
+        forced_user_header = f"ДАННЫЕ КЛИЕНТА:\nИМЯ: {safe_user_name}\nПОЛ: {safe_user_gender}\n"
+        if getattr(user, "age", None):
+            forced_user_header += f"ВОЗРАСТ: {user.age}\n"
+        forced_user_header += "\n"
+        try:
+            formatted_body = system_prompt.format(user_name=safe_user_name, user_gender=safe_user_gender)
+        except Exception:
+            formatted_body = system_prompt
+        system_prompt = forced_user_header.strip() + "\n\n" + formatted_body.strip()
 
         if getattr(user, "response_length", "normal") == "short":
             system_prompt += "\n\nОтвечай кратко, по делу, без длинных вступлений."
@@ -503,12 +566,40 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
             result = await _dispatch_provider(ai_config, system_prompt, stripped)
             log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
             return result
-        except AIServiceError:
-            log.exception("AI request failed user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
+        except InsufficientBalanceError:
             raise
-        except Exception as exc:
+        except (AIServiceError, Exception) as primary_err:
+            # Try fallback provider if configured
+            fb_provider = getattr(ai_config, "fallback_provider", None)
+            fb_model = getattr(ai_config, "fallback_model", None)
+            allow_fallback = getattr(ai_config, "allow_fallback", False)
+            if allow_fallback and fb_provider and fb_model:
+                fb_key = fb_provider.strip().lower()
+                if fb_key in {"claude", "anthropic"}:
+                    fb_api_key = ai_config.claude_api_key
+                else:
+                    fb_api_key = getattr(ai_config, f"{fb_key}_api_key", None)
+                if fb_api_key:
+                    log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
+                    # Build a temporary config-like object for dispatch
+                    import copy
+                    fb_config = copy.copy(ai_config)
+                    fb_config.provider = fb_provider
+                    setattr(fb_config, f"{fb_key}_model", fb_model)
+                    try:
+                        result = await _dispatch_provider(fb_config, system_prompt, stripped)
+                        log.info("Fallback response generated user_id=%s provider=%s", user_id, fb_provider)
+                        return result
+                    except Exception as fb_err:
+                        log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
+                        raise AIServiceError(
+                            f"Основной провайдер ({ai_config.provider}) и резервный ({fb_provider}) недоступны"
+                        ) from fb_err
+            if isinstance(primary_err, AIServiceError):
+                log.exception("AI request failed user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
+                raise
             log.exception("Unexpected AI request failure user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
-            raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {exc}") from exc
+            raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}") from primary_err
 
 
 async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: str) -> str:
@@ -563,7 +654,7 @@ async def _transcribe_gemini(api_key: str, model: str, file_bytes: bytes, filena
             ]
         }]
     }
-    async with httpx.AsyncClient(timeout=60.0) as http:
+    async with httpx.AsyncClient(timeout=60.0, transport=_build_gemini_proxy_transport()) as http:
         resp = await http.post(url, json=payload, headers={"Content-Type": "application/json"})
         resp.raise_for_status()
         data = resp.json()
@@ -618,7 +709,7 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, prompt: 
         }],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096},
     }
-    async with httpx.AsyncClient(timeout=60.0) as http:
+    async with httpx.AsyncClient(timeout=60.0, transport=_build_gemini_proxy_transport()) as http:
         resp = await http.post(url, json=payload, headers={"Content-Type": "application/json"})
         resp.raise_for_status()
         data = resp.json()
@@ -713,7 +804,7 @@ async def _generate_gemini(api_key: str, model: str, prompt: str) -> bytes:
         "instances": [{"prompt": prompt}],
         "parameters": {"sampleCount": 1, "aspectRatio": "1:1"},
     }
-    async with httpx.AsyncClient(timeout=90.0) as http:
+    async with httpx.AsyncClient(timeout=90.0, transport=_build_gemini_proxy_transport()) as http:
         resp = await http.post(url, json=payload)
         resp.raise_for_status()
         data = resp.json()

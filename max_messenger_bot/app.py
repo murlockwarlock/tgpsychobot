@@ -30,6 +30,7 @@ from .services import admin_collections as admin_collections_service
 from .services import admin_topic_media as admin_topic_media_service
 from .services import common, settings as settings_service, subscriptions as subscriptions_service, tests as tests_service, topics as topics_service
 from .settings import get_settings, validate_webhook_runtime_settings
+from .keyboards import build_main_menu
 from .storage import StateStore, init_storage
 
 
@@ -147,8 +148,11 @@ class MaxBotApplication:
                 await process_tg_link(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
             if state.state == "awaiting_name":
-                await settings_service.process_new_name(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 state_data = state.data
+                saved_name = await settings_service.save_name_only(self.states, message.sender.user_id, text)
+                if saved_name is None:
+                    await self.client.send_message(chat_id=message.chat_id, text="Введите корректное имя (не более 50 символов).")
+                    return
                 await settings_service.start_change_gender(
                     self.client,
                     self.states,
@@ -444,8 +448,14 @@ class MaxBotApplication:
         if text == "⚙️ Настройки":
             await settings_service.show_settings(self.client, message.chat_id, message.sender.user_id)
             return
-        if text == "🗑️ Новый диалог":
+        if text == "🗑️ Сбросить диалог":
             await common.reset_dialogue(self.client, message.chat_id, message.sender.user_id)
+            return
+        if text == "💬 Начать/продолжить диалог":
+            await self.client.send_message(
+                chat_id=message.chat_id,
+                text="Введите ваше сообщение для начала/продолжения диалога:",
+            )
             return
 
         async with async_session_maker() as session:
@@ -590,7 +600,19 @@ class MaxBotApplication:
             state_data = await settings_service.save_gender(self.client, self.states, chat_id, user_id, data.split("_", 1)[1])
             await self.client.answer_callback(callback.callback_id, notification="Пол сохранён")
             if state_data.get("is_onboarding"):
-                await settings_service.start_change_age(self.client, self.states, chat_id, user_id, is_settings=False)
+                # Onboarding complete — show main menu and continue with initial prompt
+                main_menu_kb = await build_main_menu()
+                await self.client.send_message(
+                    chat_id=chat_id,
+                    text="✅ Отлично! Теперь можете начать диалог. Используйте меню ниже или просто напишите сообщение.",
+                    attachments=main_menu_kb,
+                )
+                initial_prompt = state_data.get("initial_prompt")
+                if initial_prompt:
+                    async with async_session_maker() as session:
+                        user = await session.get(User, user_id, options=[selectinload(User.subscription)])
+                    if user and await common.ensure_access_before_chat(self.client, chat_id, user):
+                        await common.run_ai_dialogue(self.client, chat_id, user_id, initial_prompt)
             return
         if data == "settings_change_name":
             await settings_service.start_change_name(self.client, self.states, chat_id, user_id)
@@ -1310,6 +1332,12 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_reset_sub_"):
                 await admin_clients_service.reset_subscription(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_reset_account_confirmed_"):
+                await admin_clients_service.reset_account_confirmed(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_reset_account_"):
+                await admin_clients_service.reset_account(self.client, chat_id, int(data.rsplit("_", 1)[1]))
                 return
             if data.startswith("reset_user_promos_"):
                 await admin_billing_service.reset_user_promos(self.client, chat_id, int(data.rsplit("_", 1)[1]))

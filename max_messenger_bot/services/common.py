@@ -371,13 +371,20 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
 
         html_text = markdown_to_html(response_text)
         chunks = split_text(html_text)
+        main_menu_kb = inline_keyboard([main_menu_row()])
         if thinking_message_id and chunks:
-            await client.edit_message(thinking_message_id, text=chunks[0])
-            for chunk in chunks[1:]:
-                await client.send_message(chat_id=chat_id, text=chunk)
+            if len(chunks) == 1:
+                await client.edit_message(thinking_message_id, text=chunks[0], attachments=main_menu_kb)
+            else:
+                await client.edit_message(thinking_message_id, text=chunks[0])
+                for chunk in chunks[1:-1]:
+                    await client.send_message(chat_id=chat_id, text=chunk)
+                await client.send_message(chat_id=chat_id, text=chunks[-1], attachments=main_menu_kb)
         else:
-            for chunk in chunks:
+            for chunk in chunks[:-1]:
                 await client.send_message(chat_id=chat_id, text=chunk)
+            if chunks:
+                await client.send_message(chat_id=chat_id, text=chunks[-1], attachments=main_menu_kb)
         log.info("AI dialogue completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)

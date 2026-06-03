@@ -78,8 +78,9 @@ async def build_main_menu() -> list[dict]:
         if not sub_config or not sub_config.topics_btn_on_top:
             rows.append([message_button(topics_btn_name)])
 
-    bottom_row = [message_button("⚙️ Настройки"), message_button("🗑️ Новый диалог")]
+    bottom_row = [message_button("⚙️ Настройки"), message_button("🗑️ Сбросить диалог")]
     rows.append(bottom_row)
+    rows.append([message_button("💬 Начать/продолжить диалог")])
     return inline_keyboard(rows)
 
 
@@ -99,10 +100,14 @@ def admin_panel_keyboard() -> list[dict]:
 
 
 def settings_keyboard(user) -> list[dict]:
+    response_length = getattr(user, "response_length", "normal") or "normal"
+    length_label = "📏 Длина: Краткий" if response_length == "short" else "📏 Длина: Обычный"
     return inline_keyboard(
         [
-            [callback_button("✏️ Имя", "settings_change_name"), callback_button("👤 Пол", "settings_change_gender")],
-            [callback_button("🔢 Возраст", "settings_change_age"), callback_button("📏 Длина ответов", "settings_toggle_length")],
+            [callback_button("✏️ Имя", "settings_change_name")],
+            [callback_button("👤 Пол", "settings_change_gender")],
+            [callback_button("🔢 Возраст", "settings_change_age")],
+            [callback_button(length_label, "settings_toggle_length")],
             main_menu_row(),
         ]
     )
@@ -286,6 +291,7 @@ def admin_client_profile_keyboard(user_id: int) -> list[dict]:
             [callback_button("📥 Скачать историю", f"download_history_{user_id}"), callback_button("🗑️ Удалить историю", f"admin_delete_history_{user_id}")],
             [callback_button("💳 Платежи", f"client_payment_info_{user_id}"), callback_button("🔄 Сбросить подписку", f"admin_reset_sub_{user_id}")],
             [callback_button("🔄 Сбросить промокоды", f"reset_user_promos_{user_id}")],
+            [callback_button("🗑️ Сбросить аккаунт", f"admin_reset_account_{user_id}")],
             [callback_button("⬅️ К клиентам", "admin_clients")],
         ]
     )

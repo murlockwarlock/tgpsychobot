@@ -7,7 +7,7 @@ from ..formatting import split_text
 from ..keyboards import admin_ai_model_selection_keyboard, admin_ai_settings_keyboard, admin_ai_vision_models_keyboard, callback_button, inline_keyboard
 from ..legacy import AIConfig, async_session_maker
 from ..storage import StateStore
-from memory_mode import memory_mode_label, next_memory_mode, normalize_memory_mode
+from memory_mode import MEMORY_MODE_RESET, memory_mode_label, next_memory_mode, normalize_memory_mode
 
 
 PROVIDER_MODELS = {
@@ -15,7 +15,7 @@ PROVIDER_MODELS = {
     "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001", "claude-3-haiku-20240307"],
     "Gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
     "OpenAI": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-    "KIE": ["gemini-3-flash", "flux-dev", "flux-schnell"],
+    "KIE": ["gemini-3-flash", "gemini-2.5-flash", "gemini-3-pro", "gpt-4o"],
 }
 
 VISION_MODELS = {
@@ -34,7 +34,7 @@ IMAGE_EDIT_MODELS = {
     "KIE": ["gemini-3-flash", "flux-dev"],
 }
 
-FALLBACK_PROVIDERS = ["OpenAI", "Gemini", "Claude", "Deepseek"]
+FALLBACK_PROVIDERS = ["OpenAI", "Gemini", "Claude", "Deepseek", "KIE"]
 
 KEY_FIELDS = {
     "Deepseek": "deepseek_api_key",
@@ -316,8 +316,8 @@ async def cycle_memory_scope(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
         new_mode = next_memory_mode(normalize_memory_mode(config))
-        config.memory_scope = new_mode
-        config.preserve_topic_context = new_mode != "reset_on_switch"
+        config.memory_mode = new_mode
+        config.preserve_topic_context = new_mode != MEMORY_MODE_RESET
         await session.commit()
     await show_keys(client, chat_id)
 
