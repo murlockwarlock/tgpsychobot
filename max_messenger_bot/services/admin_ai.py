@@ -13,25 +13,35 @@ from memory_mode import MEMORY_MODE_RESET, memory_mode_label, next_memory_mode, 
 PROVIDER_MODELS = {
     "Deepseek": ["deepseek-chat", "deepseek-coder"],
     "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001", "claude-3-haiku-20240307"],
-    "Gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+    "Gemini": ["gemini-2.5-pro", "gemini-2.5-flash"],
     "OpenAI": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-    "KIE": ["gemini-3-flash", "gemini-2.5-flash", "gemini-3-pro", "gpt-4o"],
+    "KIE": ["gemini-3-flash", "gemini-2.5-flash"],
+}
+
+FALLBACK_MODELS = {
+    "Deepseek": ["deepseek-chat", "deepseek-reasoner"],
+    "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
+    "Gemini": ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-2.5-pro-preview-05-06"],
+    "KIE": ["gemini-3-flash", "gemini-2.5-flash"],
+    "OpenAI": ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
 }
 
 VISION_MODELS = {
     "Gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-3-flash-preview"],
+    "KIE": ["gemini-2.5-flash", "gemini-3-flash"],
+    "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
     "OpenAI": ["gpt-4o", "gpt-4o-mini"],
 }
 
 IMAGE_GEN_MODELS = {
-    "Gemini": ["imagen-4.0-generate-001", "gemini-2.0-flash-preview-image-generation"],
-    "OpenAI": ["dall-e-3", "dall-e-2"],
-    "KIE": ["gemini-3-flash", "flux-dev", "flux-schnell"],
+    "Gemini": ["imagen-4.0-generate-001"],
+    "KIE": ["seedream/4.5-text-to-image", "bytedance/seedream-v4-text-to-image", "google/imagen4-fast", "google/imagen4-ultra"],
+    "OpenAI": ["gpt-image-1.5"],
 }
 
 IMAGE_EDIT_MODELS = {
-    "Gemini": ["gemini-3-pro-image-preview", "gemini-2.0-flash"],
-    "KIE": ["gemini-3-flash", "flux-dev"],
+    "Gemini": ["gemini-3-pro-image-preview"],
+    "KIE": ["seedream/4.5-edit", "bytedance/seedream-v4-edit", "google/nano-banana-edit"],
 }
 
 FALLBACK_PROVIDERS = ["OpenAI", "Gemini", "Claude", "Deepseek", "KIE"]
@@ -472,7 +482,7 @@ async def set_fallback_provider(client: MaxApiClient, chat_id: int, provider: st
         config = await _ensure_session_config(session)
         config.fallback_provider = provider
         await session.commit()
-    models = PROVIDER_MODELS.get(provider, [])
+    models = FALLBACK_MODELS.get(provider, [])
     rows = [[callback_button(m, f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_fallback_models")])
     await client.send_message(
