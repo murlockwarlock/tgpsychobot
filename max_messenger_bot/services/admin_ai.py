@@ -389,8 +389,7 @@ async def save_global_prompt_appendix(client: MaxApiClient, states: StateStore, 
 async def toggle_image_generation(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        current = getattr(config, 'allow_image_generation', False)
-        setattr(config, 'allow_image_generation', not current)
+        config.allow_image_generation = not bool(config.allow_image_generation)
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -398,8 +397,7 @@ async def toggle_image_generation(client: MaxApiClient, chat_id: int) -> None:
 async def toggle_image_edit(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        current = getattr(config, 'allow_image_edit', False)
-        setattr(config, 'allow_image_edit', not current)
+        config.allow_image_edit = not bool(config.allow_image_edit)
         await session.commit()
     await show_keys(client, chat_id)
 
