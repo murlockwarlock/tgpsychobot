@@ -525,7 +525,7 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
         system_prompt = user.current_topic.system_prompt if user.current_topic and user.current_topic.system_prompt else ai_config.system_prompt
         if not system_prompt:
             system_prompt = "Ты полезный ИИ-помощник."
-        system_prompt = apply_global_prompt_appendix(system_prompt, getattr(ai_config, 'global_prompt_appendix', None))
+        system_prompt = apply_global_prompt_appendix(system_prompt, getattr(ai_config, 'shared_prompt_block', None))
 
         # Inject user variables into system prompt template
         safe_user_name = (getattr(user, "name", None) or getattr(user, "first_name", None) or "Не указано")
@@ -618,7 +618,7 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         if not ai_config:
             raise AIServiceError("AIConfig не найден")
 
-    prompt = apply_global_prompt_appendix(system_prompt or ai_config.system_prompt or "Ты полезный ИИ-помощник.", getattr(ai_config, 'global_prompt_appendix', None))
+    prompt = apply_global_prompt_appendix(system_prompt or ai_config.system_prompt or "Ты полезный ИИ-помощник.", getattr(ai_config, 'shared_prompt_block', None))
     if getattr(user, "response_length", "normal") == "short":
         prompt += "\n\nОтвечай кратко, по делу, без длинных вступлений."
     messages = [{"role": "user", "content": user_prompt}]
@@ -769,7 +769,7 @@ async def analyze_image(image_bytes: bytes, prompt: str) -> str:
     if not config:
         raise AIServiceError("AIConfig не найден")
 
-    if not getattr(config, "vision_enabled", True):
+    if not getattr(config, "vision_provider", None) or config.vision_provider == "None":
         raise AIServiceError("Обработка изображений отключена администратором")
 
     provider = (config.vision_provider or "Gemini").strip()
@@ -789,7 +789,7 @@ async def analyze_image(image_bytes: bytes, prompt: str) -> str:
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
-        model = getattr(config, "kie_model", None) or "google/gemini-2.5-pro"
+        model = config.vision_model or "google/gemini-2.5-pro"
         return await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, prompt, temperature)
     # Default: OpenAI
     api_key = config.openai_api_key

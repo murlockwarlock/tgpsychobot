@@ -39,7 +39,7 @@ def _topic_media_list_keyboard(
     if nav_row:
         rows.append(nav_row)
     rows.append([callback_button("➕ Добавить файл", f"admin_media_add_{topic_id}")])
-    rows.append([callback_button("⬅️ К теме", f"admin_topic_editor_{topic_id}")])
+    rows.append([callback_button("⬅️ К теме", f"admin_edit_topic_{topic_id}")])
     return inline_keyboard(rows)
 
 

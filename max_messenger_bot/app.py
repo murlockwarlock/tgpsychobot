@@ -371,7 +371,7 @@ class MaxBotApplication:
             if state.state == "admin_media_edit_file":
                 token = message.media_token if not text else None
                 mtype = message.media_type if not text else None
-                await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype, text=text)
+                await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype)
                 return
             if state.state == "admin_media_add_file":
                 token = message.media_token if not text else None
@@ -613,6 +613,9 @@ class MaxBotApplication:
                         user = await session.get(User, user_id, options=[selectinload(User.subscription)])
                     if user and await common.ensure_access_before_chat(self.client, chat_id, user):
                         await common.run_ai_dialogue(self.client, chat_id, user_id, initial_prompt)
+            return
+        if data == "settings_back":
+            await settings_service.show_settings(self.client, chat_id, user_id)
             return
         if data == "settings_change_name":
             await settings_service.start_change_name(self.client, self.states, chat_id, user_id)

@@ -285,13 +285,16 @@ async def reset_account_confirmed(client: MaxApiClient, chat_id: int, target_use
             sql_update(User).where(User.id == target_user_id).values(
                 name=None, gender=None, age=None,
                 accepted_disclaimer=False,
-                current_dialogue_id=None, current_topic_id=None,
+                current_dialogue_id=1, current_topic_id=None,
                 response_length="normal",
             )
         )
         await session.commit()
     await client.send_message(chat_id=chat_id, text=f"✅ Аккаунт пользователя <code>{target_user_id}</code> сброшен.")
     await show_client_profile(client, chat_id, target_user_id)
+
+
+async def reset_subscription(client: MaxApiClient, chat_id: int, target_user_id: int) -> None:
     await client.send_message(
         chat_id=chat_id,
         text=f"⚠️ Сбросить подписку пользователя <code>{target_user_id}</code>?",

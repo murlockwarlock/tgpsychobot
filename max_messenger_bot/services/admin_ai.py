@@ -237,6 +237,8 @@ async def toggle_transcription(client: MaxApiClient, chat_id: int) -> None:
         if current == "OpenAI":
             config.transcription_provider = "Gemini"
         elif current == "Gemini":
+            config.transcription_provider = "KIE"
+        elif current == "KIE":
             config.transcription_provider = "None"
         else:
             config.transcription_provider = "OpenAI"
@@ -250,6 +252,12 @@ async def toggle_vision(client: MaxApiClient, chat_id: int) -> None:
         if config.vision_provider == "OpenAI":
             config.vision_provider = "Gemini"
             config.vision_model = "gemini-3-flash-preview"
+        elif config.vision_provider == "Gemini":
+            config.vision_provider = "KIE"
+            config.vision_model = "gemini-2.5-flash"
+        elif config.vision_provider == "KIE":
+            config.vision_provider = "Claude"
+            config.vision_model = config.claude_model or "claude-sonnet-4-5-20250929"
         else:
             config.vision_provider = "OpenAI"
             config.vision_model = "gpt-4o"
@@ -344,7 +352,7 @@ async def start_edit_system_prompt(client: MaxApiClient, states: StateStore, cha
 
 async def start_edit_global_prompt_appendix(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
     config = await _get_config()
-    preview = (config.global_prompt_appendix or "Не задан.")[:3000]
+    preview = (config.shared_prompt_block or "Не задан.")[:3000]
     await states.set(user_id, chat_id, "admin_ai_set_global_prompt_appendix", {})
     await client.send_message(
         chat_id=chat_id,
@@ -372,7 +380,7 @@ async def download_system_prompt(client: MaxApiClient, chat_id: int) -> None:
 
 async def download_global_prompt_appendix(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
-    await _send_prompt_text_file(client, chat_id, "global_prompt_appendix.txt", config.global_prompt_appendix or "")
+    await _send_prompt_text_file(client, chat_id, "shared_prompt_block.txt", config.shared_prompt_block or "")
 
 
 async def save_system_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
@@ -390,7 +398,7 @@ async def save_global_prompt_appendix(client: MaxApiClient, states: StateStore, 
     value = None if text.strip() == "-" else text
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        config.global_prompt_appendix = value
+        config.shared_prompt_block = value
         await session.commit()
     await states.clear(user_id)
     await show_settings(client, chat_id)
@@ -399,7 +407,15 @@ async def save_global_prompt_appendix(client: MaxApiClient, states: StateStore, 
 async def toggle_image_generation(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        config.allow_image_generation = not bool(config.allow_image_generation)
+        if config.image_generation_provider == "OpenAI":
+            config.image_generation_provider = "Gemini"
+            config.image_generation_model = "imagen-4.0-generate-001"
+        elif config.image_generation_provider == "Gemini":
+            config.image_generation_provider = "KIE"
+            config.image_generation_model = "seedream/4.5-text-to-image"
+        else:
+            config.image_generation_provider = "OpenAI"
+            config.image_generation_model = "gpt-image-1.5"
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -407,7 +423,12 @@ async def toggle_image_generation(client: MaxApiClient, chat_id: int) -> None:
 async def toggle_image_edit(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        config.allow_image_edit = not bool(config.allow_image_edit)
+        if config.image_edit_provider == "Gemini":
+            config.image_edit_provider = "KIE"
+            config.image_edit_model = "seedream/4.5-edit"
+        else:
+            config.image_edit_provider = "Gemini"
+            config.image_edit_model = "gemini-3-pro-image-preview"
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -415,12 +436,13 @@ async def toggle_image_edit(client: MaxApiClient, chat_id: int) -> None:
 async def show_image_generation_models(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
     current_model = config.image_generation_model or ""
-    all_models = [m for models in IMAGE_GEN_MODELS.values() for m in models]
-    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_gen_model_{m}")] for m in all_models]
+    provider = config.image_generation_provider or "Gemini"
+    models = IMAGE_GEN_MODELS.get(provider, [])
+    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_gen_model_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
     await client.send_message(
         chat_id=chat_id,
-        text="Выберите модель генерации изображений.",
+        text=f"Выберите модель генерации изображений для {provider}.",
         attachments=inline_keyboard(rows),
     )
 
@@ -436,12 +458,13 @@ async def set_image_generation_model(client: MaxApiClient, chat_id: int, model_n
 async def show_image_edit_models(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
     current_model = config.image_edit_model or ""
-    all_models = [m for models in IMAGE_EDIT_MODELS.values() for m in models]
-    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_edit_model_{m}")] for m in all_models]
+    provider = config.image_edit_provider or "Gemini"
+    models = IMAGE_EDIT_MODELS.get(provider, [])
+    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_edit_model_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
     await client.send_message(
         chat_id=chat_id,
-        text="Выберите модель редактирования изображений.",
+        text=f"Выберите модель редактирования изображений для {provider}.",
         attachments=inline_keyboard(rows),
     )
 

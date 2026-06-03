@@ -342,11 +342,11 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             raise AIServiceError("ИИ вернул пустой ответ")
         await save_ai_message(user_id, response_text)
 
-        # Check for image generation directive [IMG: prompt]
-        img_match = re.search(r"\[IMG:\s*(.*?)\]", response_text, re.DOTALL)
+        # Check for image generation directive GEN_IMG: [...] or [IMG: ...]
+        img_match = re.search(r"GEN_IMG:\s*\[(.*?)\]|\[IMG:\s*(.*?)\]", response_text, re.DOTALL)
         if img_match:
-            img_prompt = img_match.group(1).strip()
-            clean_text = re.sub(r"\[IMG:\s*.*?\]", "", response_text, flags=re.DOTALL).strip()
+            img_prompt = (img_match.group(1) or img_match.group(2) or "").strip()
+            clean_text = re.sub(r"GEN_IMG:\s*\[.*?\]|\[IMG:\s*.*?\]", "", response_text, flags=re.DOTALL).strip()
             if thinking_message_id and clean_text:
                 await client.edit_message(thinking_message_id, text=markdown_to_html(clean_text))
                 thinking_message_id = None
