@@ -562,6 +562,7 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
         messages.append({"role": "user", "content": user_prompt})
 
         stripped = [item for item in messages if item["role"] != "system"]
+        temperature = getattr(ai_config, "temperature", 0.7) or 0.7
         try:
             result = await _dispatch_provider(ai_config, system_prompt, stripped)
             log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
@@ -581,13 +582,19 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
                     fb_api_key = getattr(ai_config, f"{fb_key}_api_key", None)
                 if fb_api_key:
                     log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
-                    # Build a temporary config-like object for dispatch
-                    import copy
-                    fb_config = copy.copy(ai_config)
-                    fb_config.provider = fb_provider
-                    setattr(fb_config, f"{fb_key}_model", fb_model)
                     try:
-                        result = await _dispatch_provider(fb_config, system_prompt, stripped)
+                        if fb_key == "openai":
+                            result = await _call_openai(fb_api_key, fb_model, [{"role": "system", "content": system_prompt}, *stripped], temperature)
+                        elif fb_key in {"claude", "anthropic"}:
+                            result = await _call_claude(fb_api_key, fb_model, stripped, system_prompt, temperature)
+                        elif fb_key == "gemini":
+                            result = await _call_gemini(fb_api_key, fb_model, stripped, system_prompt, temperature)
+                        elif fb_key == "deepseek":
+                            result = await _call_deepseek(fb_api_key, fb_model, [{"role": "system", "content": system_prompt}, *stripped], temperature)
+                        elif fb_key == "kie":
+                            result = await _call_kie_text_chat(fb_api_key, _get_kie_base_url(ai_config), fb_model, stripped, system_prompt, temperature)
+                        else:
+                            raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
                         log.info("Fallback response generated user_id=%s provider=%s", user_id, fb_provider)
                         return result
                     except Exception as fb_err:

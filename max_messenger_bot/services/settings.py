@@ -43,7 +43,7 @@ async def save_name_only(states: StateStore, user_id: int, text: str) -> str | N
     async with async_session_maker() as session:
         await session.execute(update(User).where(User.id == user_id).values(name=user_name))
         await session.commit()
-    await states.clear(user_id)
+    # State is NOT cleared here — caller (start_change_gender) will overwrite it
     return user_name
 
 

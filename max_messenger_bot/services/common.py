@@ -338,6 +338,8 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
 
     try:
         response_text = await get_ai_response(user_id, final_prompt)
+        if not response_text or not response_text.strip():
+            raise AIServiceError("ИИ вернул пустой ответ")
         await save_ai_message(user_id, response_text)
 
         # Check for image generation directive [IMG: prompt]

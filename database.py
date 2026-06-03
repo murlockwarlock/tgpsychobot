@@ -149,6 +149,7 @@ class AIConfig(Base):
     service_prompt_block = Column(Text, default=DEFAULT_SERVICE_PROMPT_TEMPLATE, nullable=False)
     fallback_provider = Column(String, nullable=True)
     fallback_model = Column(String, nullable=True)
+    allow_fallback = Column(Boolean, default=False, nullable=False)
     use_proxy = Column(Boolean, default=True, nullable=False)
     fallback_timeout = Column(Integer, default=60, nullable=False)
 
@@ -526,6 +527,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN use_proxy BOOLEAN DEFAULT TRUE NOT NULL"))
             if 'fallback_timeout' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN fallback_timeout INTEGER DEFAULT 60 NOT NULL"))
+            if 'allow_fallback' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_fallback BOOLEAN DEFAULT FALSE NOT NULL"))
 
             mailing_columns = [c['name'] for c in insp.get_columns('mailings')]
             if 'recurring_type' not in mailing_columns:

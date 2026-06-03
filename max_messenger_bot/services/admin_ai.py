@@ -449,8 +449,7 @@ async def set_image_edit_model(client: MaxApiClient, chat_id: int, model_name: s
 async def toggle_fallback(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        current = getattr(config, 'allow_fallback', False)
-        setattr(config, 'allow_fallback', not current)
+        config.allow_fallback = not bool(config.allow_fallback)
         await session.commit()
     await show_keys(client, chat_id)
 
