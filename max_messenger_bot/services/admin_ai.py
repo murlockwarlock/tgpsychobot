@@ -93,6 +93,11 @@ def _prompt_input_keyboard(cancel_payload: str) -> list[dict]:
     return inline_keyboard([[callback_button("⬅️ Отмена", cancel_payload)]])
 
 
+def _status_model_button(prefix: str, enabled: bool, provider: str | None, model: str | None) -> str:
+    status = "✅" if enabled else "❌"
+    return f"{prefix} {status} {_provider_model(provider, model)}"
+
+
 async def _get_config() -> AIConfig:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
@@ -153,12 +158,12 @@ def _build_keys_keyboard(config) -> list:
          callback_button(f"⏱ Лимит аудио: {config.max_voice_duration_sec}с", "admin_ai_set_audio_limit")],
         [callback_button(f"👁 Vision: {config.vision_provider}/{config.vision_model}", "admin_ai_toggle_vision"),
          callback_button("🔤 Vision модель", "admin_ai_vision_models")],
-        [callback_button(f"🎨 {'✅' if img_gen_enabled else '❌'} {config.image_generation_provider}/{config.image_generation_model}", "admin_ai_toggle_image_generation"),
-         callback_button("🔤 Ген.", "admin_ai_image_generation_models")],
-        [callback_button(f"✏️ {'✅' if img_edit_enabled else '❌'} {config.image_edit_provider}/{config.image_edit_model}", "admin_ai_toggle_image_edit"),
-         callback_button("🔤 Ред.", "admin_ai_image_edit_models")],
-        [callback_button(f"🔄 Фолбэк: {'✅' if fallback_enabled else '❌'}", "admin_ai_toggle_fallback"),
-         callback_button(f"🔤 {config.fallback_provider or 'нет'}/{config.fallback_model or _fallback_model_for_provider(config, config.fallback_provider)}", "admin_ai_fallback_models")],
+        [callback_button(_status_model_button("🎨", img_gen_enabled, config.image_generation_provider, config.image_generation_model), "admin_ai_toggle_image_generation"),
+         callback_button(_status_model_button("✏️", img_edit_enabled, config.image_edit_provider, config.image_edit_model), "admin_ai_toggle_image_edit")],
+        [callback_button("🔤 Модель ген.", "admin_ai_image_generation_models"),
+         callback_button("🔤 Модель ред.", "admin_ai_image_edit_models")],
+        [callback_button(f"🔄 {'✅' if fallback_enabled else '❌'}", "admin_ai_toggle_fallback"),
+         callback_button(f"🔤 {_provider_model(config.fallback_provider, config.fallback_model or _fallback_model_for_provider(config, config.fallback_provider))}", "admin_ai_fallback_models")],
         [callback_button(f"📐 Контекст: первые {config.context_limit_first}", "admin_ai_set_context_first"),
          callback_button(f"📐 Последние {config.context_limit_recent}", "admin_ai_set_context_recent")],
         [callback_button(f"🌡 Температура: {config.temperature}", "admin_ai_set_temperature")],
