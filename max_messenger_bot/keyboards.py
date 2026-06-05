@@ -437,26 +437,43 @@ def admin_topics_list_keyboard(topics: list) -> list[dict]:
     return inline_keyboard(rows)
 
 
-def admin_topic_editor_keyboard(topic) -> list[dict]:
+def admin_topic_editor_keyboard(topic, topic_url: str | None = None) -> list[dict]:
     active_text = "⚪️ Сделать неактивной" if topic.is_active else "🟢 Сделать активной"
     admin_only_text = "🔒 Только для админов: ВКЛ" if topic.admin_only else "🔓 Только для админов: ВЫКЛ"
     menu_text = "❌ Убрать из меню" if topic.show_in_main_menu else "✅ Показать в меню"
     list_text = "❌ Убрать из списка" if topic.show_in_list else "✅ Показать в списке"
+    rows = [
+        [callback_button("✏️ Название", f"admin_topic_edit_name_{topic.id}")],
+        [callback_button("📝 Системный промпт", f"admin_topic_prompt_{topic.id}")],
+        [callback_button("✏️ Изменить системный промпт", f"admin_topic_edit_prompt_{topic.id}")],
+        [callback_button("💬 Приветственное сообщение", f"admin_topic_edit_intro_{topic.id}")],
+        [callback_button(active_text, f"admin_topic_toggle_active_{topic.id}")],
+        [callback_button(admin_only_text, f"admin_topic_toggle_admin_{topic.id}")],
+        [callback_button(menu_text, f"admin_topic_toggle_menu_{topic.id}")],
+        [callback_button(list_text, f"admin_topic_toggle_list_{topic.id}")],
+        [callback_button("📚 База знаний темы", f"admin_topic_kb_{topic.id}_page_0")],
+        [callback_button("🖼️ Медиатека", f"admin_topic_media_{topic.id}_0")],
+        [callback_button("🗑️ Удалить тему", f"admin_topic_delete_{topic.id}")],
+        [callback_button("⬅️ К темам", "admin_topics")],
+    ]
+    if topic_url:
+        rows.insert(1, [link_button("🔗 Открыть тему", topic_url)])
+    return inline_keyboard(rows)
+
+
+def admin_topic_prompt_keyboard(topic_id: int) -> list[dict]:
     return inline_keyboard(
         [
-            [callback_button("✏️ Название", f"admin_topic_edit_name_{topic.id}")],
-            [callback_button("📝 Системный промпт", f"admin_topic_edit_prompt_{topic.id}")],
-            [callback_button("💬 Приветственное сообщение", f"admin_topic_edit_intro_{topic.id}")],
-            [callback_button(active_text, f"admin_topic_toggle_active_{topic.id}")],
-            [callback_button(admin_only_text, f"admin_topic_toggle_admin_{topic.id}")],
-            [callback_button(menu_text, f"admin_topic_toggle_menu_{topic.id}")],
-            [callback_button(list_text, f"admin_topic_toggle_list_{topic.id}")],
-            [callback_button("📚 База знаний темы", f"admin_topic_kb_{topic.id}_page_0")],
-            [callback_button("🖼️ Медиатека", f"admin_topic_media_{topic.id}_0")],
-            [callback_button("🗑️ Удалить тему", f"admin_topic_delete_{topic.id}")],
-            [callback_button("⬅️ К темам", "admin_topics")],
+            [
+                callback_button("📥 Скачать", f"admin_topic_prompt_download_{topic_id}"),
+                callback_button("⬅️ Назад", f"admin_edit_topic_{topic_id}"),
+            ],
         ]
     )
+
+
+def admin_topic_prompt_input_keyboard(topic_id: int) -> list[dict]:
+    return inline_keyboard([[callback_button("⬅️ Отмена", f"admin_topic_prompt_{topic_id}")]])
 
 
 def admin_kb_list_keyboard(entries: list, page: int, total_pages: int) -> list[dict]:

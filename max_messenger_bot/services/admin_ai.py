@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import html
+from pathlib import Path
 
 from ..api import MaxApiClient
-from ..formatting import split_text
 from ..keyboards import admin_ai_model_selection_keyboard, admin_ai_settings_keyboard, admin_ai_vision_models_keyboard, callback_button, inline_keyboard
 from ..legacy import AIConfig, async_session_maker
 from ..storage import StateStore
@@ -77,6 +77,22 @@ def _mask(value: str | None) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
+def _provider_model(provider: str | None, model: str | None) -> str:
+    provider_label = provider or "нет"
+    model_label = model or "нет"
+    return f"{provider_label}/{model_label}"
+
+
+def _fallback_model_for_provider(config: AIConfig, provider: str | None) -> str:
+    field = MODEL_FIELDS.get(provider or "")
+    configured = getattr(config, field, None) if field else None
+    return configured or (FALLBACK_MODELS.get(provider or "", ["нет"])[0] if provider else "нет")
+
+
+def _prompt_input_keyboard(cancel_payload: str) -> list[dict]:
+    return inline_keyboard([[callback_button("⬅️ Отмена", cancel_payload)]])
+
+
 async def _get_config() -> AIConfig:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
@@ -126,7 +142,8 @@ def _build_keys_keyboard(config) -> list:
          callback_button(f"Claude: {_mask(config.claude_api_key)}", "admin_ai_key_Claude")],
         [callback_button(f"Gemini: {_mask(config.gemini_api_key)}", "admin_ai_key_Gemini"),
          callback_button(f"OpenAI: {_mask(config.openai_api_key)}", "admin_ai_key_OpenAI")],
-        [callback_button(f"KIE: {_mask(config.kie_api_key)}", "admin_ai_key_KIE")],
+        [callback_button(f"KIE: {_mask(config.kie_api_key)}", "admin_ai_key_KIE"),
+         callback_button(f"📊 Порог KIE: {config.kie_credit_alert_threshold}", "admin_ai_set_kie_threshold")],
         [callback_button("🔤 Deepseek модель", "admin_ai_models_Deepseek"),
          callback_button("🔤 Claude модель", "admin_ai_models_Claude")],
         [callback_button("🔤 Gemini модель", "admin_ai_models_Gemini"),
@@ -136,13 +153,12 @@ def _build_keys_keyboard(config) -> list:
          callback_button(f"⏱ Лимит аудио: {config.max_voice_duration_sec}с", "admin_ai_set_audio_limit")],
         [callback_button(f"👁 Vision: {config.vision_provider}/{config.vision_model}", "admin_ai_toggle_vision"),
          callback_button("🔤 Vision модель", "admin_ai_vision_models")],
-        [callback_button(f"🎨 Ген. изображений: {'✅' if img_gen_enabled else '❌'}", "admin_ai_toggle_image_generation"),
-         callback_button("🔤 Модель ген.", "admin_ai_image_generation_models")],
-        [callback_button(f"✏️ Ред. изображений: {'✅' if img_edit_enabled else '❌'}", "admin_ai_toggle_image_edit"),
-         callback_button("🔤 Модель ред.", "admin_ai_image_edit_models")],
+        [callback_button(f"🎨 {'✅' if img_gen_enabled else '❌'} {config.image_generation_provider}/{config.image_generation_model}", "admin_ai_toggle_image_generation"),
+         callback_button("🔤 Ген.", "admin_ai_image_generation_models")],
+        [callback_button(f"✏️ {'✅' if img_edit_enabled else '❌'} {config.image_edit_provider}/{config.image_edit_model}", "admin_ai_toggle_image_edit"),
+         callback_button("🔤 Ред.", "admin_ai_image_edit_models")],
         [callback_button(f"🔄 Фолбэк: {'✅' if fallback_enabled else '❌'}", "admin_ai_toggle_fallback"),
-         callback_button("🔤 Фолбэк провайдер/модель", "admin_ai_fallback_models")],
-        [callback_button(f"📊 Порог KIE: {config.kie_credit_alert_threshold}", "admin_ai_set_kie_threshold")],
+         callback_button(f"🔤 {config.fallback_provider or 'нет'}/{config.fallback_model or _fallback_model_for_provider(config, config.fallback_provider)}", "admin_ai_fallback_models")],
         [callback_button(f"📐 Контекст: первые {config.context_limit_first}", "admin_ai_set_context_first"),
          callback_button(f"📐 Последние {config.context_limit_recent}", "admin_ai_set_context_recent")],
         [callback_button(f"🌡 Температура: {config.temperature}", "admin_ai_set_temperature")],
@@ -158,9 +174,9 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
     img_gen_enabled = getattr(config, 'allow_image_generation', False)
     img_edit_enabled = getattr(config, 'allow_image_edit', False)
     fallback_enabled = getattr(config, 'allow_fallback', False)
-    img_gen = config.image_generation_model or "не выбрана"
-    img_edit = f"{config.image_edit_provider}/{config.image_edit_model}"
-    fallback_info = f"{config.fallback_provider or 'нет'}/{config.fallback_model or 'нет'}"
+    img_gen = _provider_model(config.image_generation_provider, config.image_generation_model)
+    img_edit = _provider_model(config.image_edit_provider, config.image_edit_model)
+    fallback_info = _provider_model(config.fallback_provider, config.fallback_model or _fallback_model_for_provider(config, config.fallback_provider))
     kie_key = config.kie_api_key
     kie_threshold = config.kie_credit_alert_threshold
     text = (
@@ -169,11 +185,11 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
         f"<b>Claude:</b> <code>{_mask(config.claude_api_key)}</code>\n"
         f"<b>Gemini:</b> <code>{_mask(config.gemini_api_key)}</code>\n"
         f"<b>OpenAI:</b> <code>{_mask(config.openai_api_key)}</code>\n"
+        f"🤖 <b>KIE:</b> <code>{_mask(kie_key)}</code> / порог: {kie_threshold}\n"
         f"<b>Режим памяти:</b> {html.escape(memory_mode_label(current_memory_mode))}\n\n"
         f"🎨 <b>Генерация изображений:</b> {'✅' if img_gen_enabled else '❌'} / {html.escape(img_gen)}\n"
         f"✏️ <b>Редактирование изображений:</b> {'✅' if img_edit_enabled else '❌'} / {html.escape(img_edit)}\n"
-        f"🔄 <b>Фолбэк:</b> {'✅' if fallback_enabled else '❌'} / {html.escape(fallback_info)}\n"
-        f"🤖 <b>KIE:</b> <code>{_mask(kie_key)}</code> / порог: {kie_threshold}\n\n"
+        f"🔄 <b>Фолбэк:</b> {'✅' if fallback_enabled else '❌'} / {html.escape(fallback_info)}\n\n"
         "Ниже доступны смена моделей, лимитов контекста и vision/audio-параметров."
     )
     await client.send_message(
@@ -347,6 +363,7 @@ async def start_edit_system_prompt(client: MaxApiClient, states: StateStore, cha
     await client.send_message(
         chat_id=chat_id,
         text=f"<b>Текущий системный промпт</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст промпта сообщением или загрузите <b>.txt/.md</b> файл.",
+        attachments=_prompt_input_keyboard("admin_ai_cancel_system_prompt"),
     )
 
 
@@ -357,16 +374,16 @@ async def start_edit_global_prompt_appendix(client: MaxApiClient, states: StateS
     await client.send_message(
         chat_id=chat_id,
         text=f"<b>Общий блок для всех промптов</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст сообщением или загрузите <b>.txt/.md</b> файл. Для очистки отправьте <code>-</code>.",
+        attachments=_prompt_input_keyboard("admin_ai_cancel_global_prompt_appendix"),
     )
 
 
 async def _send_prompt_text_file(client: MaxApiClient, chat_id: int, filename: str, content: str) -> None:
+    safe_name = Path(filename).name or "system_prompt.txt"
     try:
-        await client.send_text_file(chat_id=chat_id, filename=filename, content=content, caption=f"📥 {filename}")
-    except Exception:
-        escaped = html.escape(content or "Промпт пуст.")
-        for chunk in split_text(f"<pre><code>{escaped}</code></pre>", 3900)[:10]:
-            await client.send_message(chat_id=chat_id, text=chunk)
+        await client.send_text_file(chat_id=chat_id, filename=safe_name, content=content, caption=f"📥 {safe_name}")
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"Не удалось отправить файл: {html.escape(str(exc))}")
 
 
 async def download_system_prompt(client: MaxApiClient, chat_id: int) -> None:
@@ -504,9 +521,13 @@ async def set_fallback_provider(client: MaxApiClient, chat_id: int, provider: st
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
         config.fallback_provider = provider
+        config.fallback_model = _fallback_model_for_provider(config, provider)
         await session.commit()
+        current_model = config.fallback_model
     models = FALLBACK_MODELS.get(provider, [])
-    rows = [[callback_button(m, f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
+    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
+    if current_model and current_model not in models:
+        rows.insert(0, [callback_button(f"✅ {current_model}", f"admin_ai_save_fallback_{provider}_{current_model}")])
     rows.append([callback_button("◀️ Назад", "admin_ai_fallback_models")])
     await client.send_message(
         chat_id=chat_id,
@@ -522,6 +543,11 @@ async def save_fallback_model(client: MaxApiClient, chat_id: int, provider: str,
         config.fallback_model = model_name
         await session.commit()
     await show_keys(client, chat_id)
+
+
+async def cancel_prompt_input(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+    await states.clear(user_id)
+    await show_settings(client, chat_id)
 
 
 async def start_set_kie_threshold(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:

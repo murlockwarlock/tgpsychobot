@@ -9,6 +9,15 @@ MAX_MESSAGE_TEXT_LEN = 3900
 def markdown_to_html(text: str | None) -> str:
     if not text:
         return ""
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = re.sub(r"^\s*#{1,6}\s*$", "•", raw_line)
+        line = re.sub(r"^\s*#{1,6}\s+(.+)$", r"• \1", line)
+        if line.count("*") % 2 == 1:
+            line = re.sub(r"(?<=\S)\*(?=\s|$)", "", line)
+            line = re.sub(r"(^|\s)\*(?=\S)", r"\1", line)
+        lines.append(line)
+    text = "\n".join(lines)
     escaped = html.escape(text)
     escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
     escaped = re.sub(r"__(.+?)__", r"<b>\1</b>", escaped)

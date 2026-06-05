@@ -41,6 +41,7 @@ class MaxApiClient:
         self.token = token
         self.base_url = base_url.rstrip("/")
         self._session: aiohttp.ClientSession | None = None
+        self.bot_name: str | None = None
 
     async def __aenter__(self) -> "MaxApiClient":
         self._session = aiohttp.ClientSession(
@@ -282,15 +283,20 @@ class MaxApiClient:
     ) -> dict[str, Any]:
         tmp_path: str | None = None
         try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tmp:
+            suffix = Path(filename).suffix or ".txt"
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=suffix, delete=False) as tmp:
                 tmp.write(content)
                 tmp_path = tmp.name
             result = await self.upload_file("file", tmp_path)
             token = result.get("token") or result.get("fileId") or result.get("id")
             if not token:
                 raise MaxApiError(f"MAX upload did not return file token: {result}")
-            attachment = {"type": "file", "payload": {"token": token, "filename": filename}}
-            return await self.send_message(chat_id=chat_id, text=caption or filename, attachments=[attachment])
+            return await self.send_media_attachment(
+                chat_id=chat_id,
+                media_type="file",
+                token=token,
+                caption=caption or filename,
+            )
         finally:
             if tmp_path:
                 Path(tmp_path).unlink(missing_ok=True)

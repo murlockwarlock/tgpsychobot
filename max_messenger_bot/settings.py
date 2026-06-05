@@ -48,6 +48,7 @@ class Settings:
     log_dir: str
     log_max_bytes: int
     log_backup_count: int
+    bot_name: str
 
 
 WEBHOOK_SECRET_RE = re.compile(r"^[a-zA-Z0-9_-]{5,256}$")
@@ -114,4 +115,5 @@ def get_settings() -> Settings:
         log_dir=os.getenv("MAX_LOG_DIR", str(PROJECT_ROOT / "logs" / "max_messenger_bot")),
         log_max_bytes=max(1024, int(os.getenv("MAX_LOG_MAX_BYTES", str(10 * 1024 * 1024)))),
         log_backup_count=max(1, int(os.getenv("MAX_LOG_BACKUP_COUNT", "5"))),
+        bot_name=os.getenv("MAX_BOT_NAME", parser.get(max_section, "bot_name", fallback="")).strip().lstrip("@"),
     )

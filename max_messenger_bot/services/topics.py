@@ -29,7 +29,7 @@ async def show_topics(client: MaxApiClient, chat_id: int, user_id: int) -> None:
 
     text = (
         f"Вы находитесь {current_status}.\n"
-        "Выберите тему для диалога. Для MAX список вынесен в inline-кнопки."
+        "Выберите тему для диалога."
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=topics_keyboard(topics, current_topic_id))
 

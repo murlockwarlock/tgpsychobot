@@ -62,18 +62,33 @@ def _log_background_task_result(task: asyncio.Task[None]) -> None:
         max_log.exception("MAX background task failed")
 
 
-def _spawn_update_task(app: web.Application, update: dict[str, Any]) -> None:
-    task = asyncio.create_task(app["bot_app"].handle_update(update))
-    tasks: set[asyncio.Task[None]] = app["background_tasks"]
+def _track_task(tasks: set[asyncio.Task[None]], task: asyncio.Task[None]) -> None:
     tasks.add(task)
     task.add_done_callback(tasks.discard)
     task.add_done_callback(_log_background_task_result)
+
+
+def _spawn_update_task(app: web.Application, update: dict[str, Any]) -> None:
+    task = asyncio.create_task(app["bot_app"].handle_update(update))
+    _track_task(app["background_tasks"], task)
 
 
 class MaxBotApplication:
     def __init__(self, client: MaxApiClient) -> None:
         self.client = client
         self.states = StateStore()
+        self.background_tasks: set[asyncio.Task[None]] = set()
+        self._user_locks: dict[int, asyncio.Lock] = {}
+
+    def spawn_user_task(self, user_id: int, coro) -> None:
+        lock = self._user_locks.setdefault(user_id, asyncio.Lock())
+
+        async def runner() -> None:
+            async with lock:
+                await coro
+
+        task = asyncio.create_task(runner())
+        _track_task(self.background_tasks, task)
 
     async def handle_update(self, update: dict[str, Any]) -> None:
         update_type = update.get("update_type") or update.get("type") or ""
@@ -411,10 +426,10 @@ class MaxBotApplication:
                     return
             # Handle media attachments
             if message.media_type in {"audio", "video"} and message.media_token:
-                await self._handle_voice(message)
+                self.spawn_user_task(message.sender.user_id, self._handle_voice(message))
                 return
             if message.media_type == "image" and message.media_token:
-                await self._handle_image(message, caption="")
+                self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=""))
                 return
             if message.media_type == "file" and message.media_token:
                 await self.client.send_message(chat_id=message.chat_id, text="📎 Файлы пока не поддерживаются в этом боте.")
@@ -501,9 +516,9 @@ class MaxBotApplication:
             return
         # If user sent image with caption, handle as vision
         if message.media_type == "image" and message.media_token:
-            await self._handle_image(message, caption=text)
+            self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=text))
             return
-        await common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text)
+        self.spawn_user_task(message.sender.user_id, common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text))
 
     async def _read_text_attachment(self, message: IncomingMessage) -> str | None:
         try:
@@ -594,7 +609,7 @@ class MaxBotApplication:
             await self.states.clear(user_id)
             await self.client.answer_callback(callback.callback_id, notification="Дисклеймер принят")
             if pending_prompt and user and await common.ensure_access_before_chat(self.client, chat_id, user):
-                await common.run_ai_dialogue(self.client, chat_id, user_id, pending_prompt)
+                self.spawn_user_task(user_id, common.run_ai_dialogue(self.client, chat_id, user_id, pending_prompt))
             return
         if data.startswith("gender_"):
             state_data = await settings_service.save_gender(self.client, self.states, chat_id, user_id, data.split("_", 1)[1])
@@ -612,7 +627,7 @@ class MaxBotApplication:
                     async with async_session_maker() as session:
                         user = await session.get(User, user_id, options=[selectinload(User.subscription)])
                     if user and await common.ensure_access_before_chat(self.client, chat_id, user):
-                        await common.run_ai_dialogue(self.client, chat_id, user_id, initial_prompt)
+                        self.spawn_user_task(user_id, common.run_ai_dialogue(self.client, chat_id, user_id, initial_prompt))
             return
         if data == "settings_back":
             await settings_service.show_settings(self.client, chat_id, user_id)
@@ -752,6 +767,9 @@ class MaxBotApplication:
                 return
             if data == "admin_ai_download_global_prompt_appendix":
                 await admin_ai_service.download_global_prompt_appendix(self.client, chat_id)
+                return
+            if data in {"admin_ai_cancel_system_prompt", "admin_ai_cancel_global_prompt_appendix"}:
+                await admin_ai_service.cancel_prompt_input(self.client, self.states, chat_id, user_id)
                 return
             if data == "admin_clients":
                 await admin_clients_service.list_clients(self.client, chat_id, 0)
@@ -993,6 +1011,13 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_topic_edit_name_"):
                 await admin_topics_service.start_edit_name(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_topic_prompt_download_"):
+                await admin_topics_service.download_prompt(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_topic_prompt_"):
+                await self.states.clear(user_id)
+                await admin_topics_service.show_topic_prompt(self.client, chat_id, int(data.rsplit("_", 1)[1]))
                 return
             if data.startswith("admin_topic_edit_prompt_"):
                 await admin_topics_service.start_edit_prompt(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
@@ -1507,14 +1532,15 @@ async def webhook_handler(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
-async def polling_loop(bot_app: MaxBotApplication, client: MaxApiClient) -> None:
+async def polling_loop(bot_app: MaxBotApplication, client: MaxApiClient, background_tasks: set[asyncio.Task[None]]) -> None:
     settings = get_settings()
     marker: int | None = None
     while True:
         try:
             data = await client.get_updates(marker, settings.polling_timeout, settings.polling_limit, settings.update_types)
             for update in data.get("updates", []):
-                await bot_app.handle_update(update)
+                task = asyncio.create_task(bot_app.handle_update(update))
+                _track_task(background_tasks, task)
             marker = data.get("marker", marker)
         except Exception:
             max_log.exception("MAX polling error marker=%s", marker)
@@ -1532,11 +1558,21 @@ async def create_web_app() -> web.Application:
 
     client = MaxApiClient(settings.max_token, settings.max_api_base)
     await client.__aenter__()
+    if settings.bot_name:
+        client.bot_name = settings.bot_name
+    else:
+        try:
+            me = await client.get_me()
+            client.bot_name = (me.get("username") or me.get("name") or "").strip().lstrip("@") or None
+        except Exception:
+            max_log.exception("Failed to load MAX bot name for deep links")
     await client.set_commands([
         {"name": "start", "description": "Запустить бота"},
         {"name": "ref", "description": "Реферальная программа"},
     ])
     bot_app = MaxBotApplication(client)
+    background_tasks: set[asyncio.Task[None]] = set()
+    bot_app.background_tasks = background_tasks
 
     if settings.webhook_base_url and not settings.use_polling:
         webhook_url = f"{settings.webhook_base_url}{settings.webhook_path}"
@@ -1547,12 +1583,12 @@ async def create_web_app() -> web.Application:
     app["settings"] = settings
     app["max_client"] = client
     app["bot_app"] = bot_app
-    app["background_tasks"] = set()
+    app["background_tasks"] = background_tasks
     app.router.add_post(settings.webhook_path, webhook_handler)
 
     async def on_startup(app: web.Application) -> None:
         if settings.use_polling:
-            app["polling_task"] = asyncio.create_task(polling_loop(bot_app, client))
+            app["polling_task"] = asyncio.create_task(polling_loop(bot_app, client, background_tasks))
             max_log.info("MAX polling started")
         else:
             max_log.info("MAX webhook app started path=%s", settings.webhook_path)

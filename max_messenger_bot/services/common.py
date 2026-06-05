@@ -103,8 +103,7 @@ async def show_help(client: MaxApiClient, chat_id: int, user_id: int) -> None:
     if not await is_admin(user_id):
         text = (
             "👋 Я персональный ИИ-помощник.\n\n"
-            "Пишите вопрос в чат или пользуйтесь кнопками меню. "
-            "В MAX навигация перенесена в inline-кнопки под сообщениями."
+            "Пишите вопрос в чат или пользуйтесь кнопками меню."
         )
     else:
         text = (

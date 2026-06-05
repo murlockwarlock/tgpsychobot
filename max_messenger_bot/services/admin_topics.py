@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import html
+from pathlib import Path
+from urllib.parse import quote
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
-from ..keyboards import admin_topic_editor_keyboard, admin_topics_list_keyboard
+from ..keyboards import admin_topic_editor_keyboard, admin_topic_prompt_input_keyboard, admin_topic_prompt_keyboard, admin_topics_list_keyboard
 from ..legacy import Topic, async_session_maker
 from ..storage import StateStore
+
+
+def _topic_url(client: MaxApiClient, topic_id: int) -> str | None:
+    if not client.bot_name:
+        return None
+    return f"https://max.ru/{quote(client.bot_name)}?start=topic_{topic_id}"
 
 
 async def list_topics(client: MaxApiClient, chat_id: int) -> None:
@@ -36,7 +44,6 @@ async def show_topic_editor(client: MaxApiClient, chat_id: int, topic_id: int) -
     if not topic:
         await client.send_message(chat_id=chat_id, text="Тема не найдена.")
         return
-    _PROMPT_LIMIT = 1200
     _INTRO_LIMIT = 500
 
     def _preview(s: str, limit: int) -> str:
@@ -44,18 +51,39 @@ async def show_topic_editor(client: MaxApiClient, chat_id: int, topic_id: int) -
 
     prompt_raw = topic.system_prompt or ""
     intro_raw = topic.start_message or ""
+    topic_payload = f"topic_{topic.id}"
+    topic_url = _topic_url(client, topic.id)
+    topic_link_line = f"<b>Ссылка:</b> {html.escape(topic_url)}\n" if topic_url else ""
     text = (
         f"<b>{html.escape(topic.name)}</b>\n\n"
         f"<b>ID:</b> {topic.id}\n"
+        f"<b>Старт-параметр:</b> <code>{topic_payload}</code>\n"
+        f"{topic_link_line}"
         f"<b>Активна:</b> {'да' if topic.is_active else 'нет'}\n"
         f"<b>Только для админов:</b> {'да' if topic.admin_only else 'нет'}\n"
         f"<b>В главном меню:</b> {'да' if topic.show_in_main_menu else 'нет'}\n"
         f"<b>В списке тем:</b> {'да' if topic.show_in_list else 'нет'}\n"
-        f"<b>Записей KB:</b> {len(topic.knowledge_base_files)}\n\n"
-        f"<b>Промпт ({len(prompt_raw)} симв.):</b>\n<pre><code>{html.escape(_preview(prompt_raw or 'Не задан', _PROMPT_LIMIT))}</code></pre>\n"
+        f"<b>Файлов базы знаний:</b> {len(topic.knowledge_base_files)}\n"
+        f"<b>Системный промпт:</b> {len(prompt_raw)} симв.\n\n"
         f"<b>Приветствие ({len(intro_raw)} симв.):</b>\n<pre><code>{html.escape(_preview(intro_raw or 'Не задано', _INTRO_LIMIT))}</code></pre>"
     )
-    await client.send_message(chat_id=chat_id, text=text, attachments=admin_topic_editor_keyboard(topic))
+    await client.send_message(chat_id=chat_id, text=text, attachments=admin_topic_editor_keyboard(topic, topic_url))
+
+
+async def show_topic_prompt(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+    if not topic:
+        await client.send_message(chat_id=chat_id, text="Тема не найдена.")
+        return
+    prompt_raw = topic.system_prompt or ""
+    preview = prompt_raw[:3000] + "…" if len(prompt_raw) > 3000 else prompt_raw
+    text = (
+        f"<b>Системный промпт темы «{html.escape(topic.name)}»</b>\n"
+        f"<b>Длина:</b> {len(prompt_raw)} симв.\n\n"
+        f"<pre><code>{html.escape(preview or 'Не задан')}</code></pre>"
+    )
+    await client.send_message(chat_id=chat_id, text=text, attachments=admin_topic_prompt_keyboard(topic_id))
 
 
 async def start_create_topic(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
@@ -106,7 +134,11 @@ async def save_name(client: MaxApiClient, states: StateStore, chat_id: int, user
 
 async def start_edit_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, topic_id: int) -> None:
     await states.set(user_id, chat_id, "admin_edit_topic_prompt", {"topic_id": topic_id})
-    await client.send_message(chat_id=chat_id, text="Отправьте новый системный промпт темы сообщением или загрузите .txt/.md файл.")
+    await client.send_message(
+        chat_id=chat_id,
+        text="Отправьте новый системный промпт темы сообщением или загрузите .txt/.md файл.",
+        attachments=admin_topic_prompt_input_keyboard(topic_id),
+    )
 
 
 async def save_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
@@ -124,6 +156,30 @@ async def save_prompt(client: MaxApiClient, states: StateStore, chat_id: int, us
         await session.commit()
     await states.clear(user_id)
     await show_topic_editor(client, chat_id, topic_id)
+
+
+async def download_prompt(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+    if not topic:
+        await client.send_message(chat_id=chat_id, text="Тема не найдена.")
+        return
+    filename = f"topic_{topic.id}_system_prompt.txt"
+    safe_name = Path(filename).name
+    try:
+        await client.send_text_file(
+            chat_id=chat_id,
+            filename=safe_name,
+            content=topic.system_prompt or "",
+            caption=f"📥 {safe_name}",
+        )
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"Не удалось отправить файл: {html.escape(str(exc))}")
+
+
+async def cancel_prompt_input(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, topic_id: int) -> None:
+    await states.clear(user_id)
+    await show_topic_prompt(client, chat_id, topic_id)
 
 
 async def start_edit_intro(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, topic_id: int) -> None:
