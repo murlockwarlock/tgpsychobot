@@ -296,7 +296,7 @@ def _user_label(user: User, anonymize: bool, index: int) -> str:
 def _date_label(date_from_str: str | None, date_to_str: str | None) -> str:
     if not date_from_str and not date_to_str:
         return ""
-    return f" | dates: {date_from_str or 'начало'} - {date_to_str or 'сегодня'}"
+    return f" | фильтр: {date_from_str or 'начало'} → {date_to_str or 'сегодня'}"
 
 
 async def run_mass_export(
@@ -327,9 +327,7 @@ async def run_mass_export(
 
     async with async_session_maker() as session:
         users_stmt = select(User).where(User.id >= MAX_ID_OFFSET)
-        if export_all:
-            users_stmt = users_stmt.where(User.is_admin == False)
-        else:
+        if not export_all:
             users_stmt = users_stmt.where(User.id.in_(selected_ids))
         users = (await session.execute(users_stmt.order_by(User.id.asc()))).scalars().all()
         user_ids = [user.id for user in users]
@@ -354,18 +352,17 @@ async def run_mass_export(
             topics = (await session.execute(select(Topic).where(Topic.id.in_(topic_ids)))).scalars().all()
             topic_map = {topic.id: topic.name for topic in topics}
 
-    exported_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     date_suffix = _date_label(date_from_str, date_to_str)
     if fmt == "txt":
-        content = _build_txt_export(users, messages_by_user, topic_map, anonymize, exported_at, date_suffix)
+        content = _build_txt_export(users, messages_by_user, topic_map, anonymize, timestamp, date_suffix)
         file_bytes = content.encode("utf-8")
         suffix = ".txt"
     else:
-        content_obj = _build_json_export(users, messages_by_user, topic_map, anonymize, exported_at, date_suffix)
+        content_obj = _build_json_export(users, messages_by_user, topic_map, anonymize)
         file_bytes = json.dumps(content_obj, ensure_ascii=False, indent=2).encode("utf-8")
         suffix = ".json"
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     base_name = f"mass_export_{timestamp}{suffix}"
     await _send_export_file(
         client,
@@ -381,24 +378,22 @@ def _build_txt_export(
     messages_by_user: dict[int, list[DBMessage]],
     topic_map: dict[int, str],
     anonymize: bool,
-    exported_at: str,
+    timestamp: str,
     date_suffix: str,
 ) -> str:
-    lines = [f"MASS EXPORT - {exported_at}{date_suffix}", "=" * 80, ""]
-    exported_index = 0
-    for user in users:
+    lines = [f"MASS EXPORT - {timestamp}{date_suffix}", "=" * 60, ""]
+    for index, user in enumerate(users, 1):
         messages = messages_by_user.get(user.id, [])
         if not messages:
             continue
-        exported_index += 1
-        lines.extend([f"ДАННЫЕ КЛИЕНТА: {_user_label(user, anonymize, exported_index)}", "-" * 80])
+        lines.extend([f"ДАННЫЕ КЛИЕНТА: {_user_label(user, anonymize, index)}", "-" * 40])
         for message in messages:
-            topic = topic_map.get(message.topic_id, "Общий")
+            topic = topic_map.get(message.topic_id, "General")
             role = "Client" if message.role == "user" else "Bot"
             timestamp = format_msk(message.timestamp, "%Y-%m-%d %H:%M МСК") if message.timestamp else ""
             lines.append(f"[{timestamp}] [{topic}] {role}: {message.content or ''}")
-        lines.append("")
-    if exported_index == 0:
+        lines.extend(["", "=" * 60, ""])
+    if len(lines) == 3:
         lines.append("Нет сообщений по выбранным условиям.")
     return "\n".join(lines)
 
@@ -408,43 +403,33 @@ def _build_json_export(
     messages_by_user: dict[int, list[DBMessage]],
     topic_map: dict[int, str],
     anonymize: bool,
-    exported_at: str,
-    date_suffix: str,
-) -> dict:
-    payload = {
-        "exported_at": exported_at,
-        "date_filter": date_suffix.lstrip(" | ") if date_suffix else None,
-        "users": [],
-    }
-    exported_index = 0
-    for user in users:
+) -> list[dict]:
+    export_data: list[dict] = []
+    for index, user in enumerate(users, 1):
         messages = messages_by_user.get(user.id, [])
         if not messages:
             continue
-        exported_index += 1
-        if anonymize:
-            user_info = {"label": f"user_{exported_index}"}
-        else:
-            user_info = {
-                "id": user.id,
-                "name": user.name or user.first_name,
-                "username": user.username,
-            }
-        payload["users"].append(
+        user_label = f"user_{index}" if anonymize else str(user.id)
+        export_data.append(
             {
-                "user_info": user_info,
+                "user_info": {
+                    "label": user_label,
+                    "id": None if anonymize else user.id,
+                    "name": None if anonymize else (user.name or user.first_name),
+                    "username": None if anonymize else user.username,
+                },
                 "history": [
                     {
                         "timestamp": format_msk(message.timestamp, "%Y-%m-%dT%H:%M:%S+03:00") if message.timestamp else None,
-                        "topic": topic_map.get(message.topic_id, "Общий"),
-                        "role": "Client" if message.role == "user" else "Bot",
+                        "topic": topic_map.get(message.topic_id, "General"),
+                        "role": message.role,
                         "content": message.content or "",
                     }
                     for message in messages
                 ],
             }
         )
-    return payload
+    return export_data
 
 
 async def _send_export_file(

@@ -4,6 +4,7 @@ import html
 import io
 import json
 import math
+import re
 import tempfile
 import zipfile
 from datetime import datetime
@@ -24,6 +25,16 @@ from ..time_utils import format_msk
 PAGE_SIZE = 10
 HISTORY_SAFE_LIMIT = 3500
 MAX_DIRECT_FILE_SIZE = 50 * 1024 * 1024
+
+
+def _remove_markdown(text: str) -> str:
+    text = re.sub(r"#+\s+", "", text or "")
+    text = re.sub(r"\*\*(.*?)\*\*|__(.*?)__", r"\1", text)
+    text = re.sub(r"\*(.*?)\*|_(.*?)_", r"\1", text)
+    text = re.sub(r"~~(.*?)~~", r"\1", text)
+    text = re.sub(r"`(.*?)`", r"\1", text)
+    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
+    return text
 
 
 async def list_clients(client: MaxApiClient, chat_id: int, page: int = 0) -> None:
@@ -221,7 +232,8 @@ async def run_single_export(
             topic = topic_map.get(message.topic_id, "General")
             role = "Client" if message.role == "user" else "Bot"
             timestamp = format_msk(message.timestamp, "%Y-%m-%d %H:%M МСК") if message.timestamp else ""
-            lines.append(f"[{timestamp}] [{topic}] {role}: {message.content or ''}\n")
+            text = _remove_markdown(message.content or "") if message.role == "assistant" else (message.content or "")
+            lines.append(f"[{timestamp}] [{topic}] {role}: {text}\n")
         file_bytes = "\n".join(lines).encode("utf-8")
     else:
         history_data = [
