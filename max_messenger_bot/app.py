@@ -189,7 +189,13 @@ class MaxBotApplication:
                 await subscriptions_service.apply_promo_code(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
             if state.state == "admin_edit_content_text":
-                await admin_content_service.save_text_edit(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                await admin_content_service.save_text_edit(
+                    self.client,
+                    self.states,
+                    message.chat_id,
+                    message.sender.user_id,
+                    message.html_text or text,
+                )
                 return
             if state.state == "admin_create_topic_name":
                 await admin_topics_service.create_topic(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -232,6 +238,9 @@ class MaxBotApplication:
                 return
             if state.state == "admin_mailing_text":
                 await admin_mailing_service.save_input(self.client, self.states, message.chat_id, message.sender.user_id, message)
+                return
+            if state.state == "admin_topics_button_name":
+                await admin_topics_service.save_topics_button_name(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
             if state.state == "admin_button_edit_title":
                 await admin_buttons_service.save_title(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -1003,6 +1012,15 @@ class MaxBotApplication:
             if data == "admin_topics":
                 await admin_topics_service.list_topics(self.client, chat_id)
                 return
+            if data == "admin_topics_toggle_enabled":
+                await admin_topics_service.toggle_topics_enabled(self.client, chat_id)
+                return
+            if data == "admin_topics_toggle_position":
+                await admin_topics_service.toggle_topics_position(self.client, chat_id)
+                return
+            if data == "admin_topics_edit_button_name":
+                await admin_topics_service.start_edit_topics_button_name(self.client, self.states, chat_id, user_id)
+                return
             if data == "admin_create_topic":
                 await admin_topics_service.start_create_topic(self.client, self.states, chat_id, user_id)
                 return
@@ -1432,13 +1450,6 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_plan_clear_upgrade_"):
                 await admin_billing_service.clear_upgrade_target(self.client, chat_id, int(data.rsplit("_", 1)[1]))
-                return
-            # ── Mailing extras ────────────────────────────────────────────
-            if data.startswith("mailing_send_test_"):
-                await admin_mailing_service.send_test(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]))
-                return
-            if data.startswith("mailing_toggle_enabled_"):
-                await admin_mailing_service.toggle_enabled(self.client, chat_id, int(data.rsplit("_", 1)[1]))
                 return
             # ── Collections ───────────────────────────────────────────────
             if data.startswith("admin_collections_page_"):

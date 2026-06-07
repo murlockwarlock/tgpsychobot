@@ -274,13 +274,11 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
     created = mailing.created_at.strftime("%d.%m.%Y %H:%M") if mailing.created_at else "N/A"
     started = mailing.start_time.strftime("%d.%m.%Y %H:%M") if mailing.start_time else "Еще не запускалась"
     ended = mailing.end_time.strftime("%d.%m.%Y %H:%M") if mailing.end_time else "N/A"
-    is_enabled = getattr(mailing, 'is_enabled', True)
     preview = mailing.text[:3000] + ("..." if mailing.text and len(mailing.text) > 3000 else "")
     text = (
         f"<b>Рассылка #{mailing.id}</b>\n\n"
         f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES.get(mailing.target_audience or '', mailing.target_audience or ''))}\n"
         f"<b>Статус:</b> {STATUS_NAMES.get(mailing.status, mailing.status)}\n"
-        f"<b>Активна:</b> {'✅' if is_enabled else '❌'}\n"
         f"<b>Создана:</b> {created}\n"
         f"<b>Старт:</b> {started}\n"
         f"<b>Завершение:</b> {ended}\n"
@@ -289,10 +287,7 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
         f"<b>Медиа:</b> {html.escape(mailing.media_file_type or 'нет')}\n\n"
         f"<pre><code>{html.escape(preview or 'Нет текста')}</code></pre>"
     )
-    toggle_label = "❌ Выключить" if is_enabled else "✅ Включить"
     detail_rows = [
-        [callback_button("📤 Тест (отправить себе)", f"mailing_send_test_{mailing_id}")],
-        [callback_button(toggle_label, f"mailing_toggle_enabled_{mailing_id}")],
         [callback_button("⬅️ К истории", "mailing_history_page_0")],
     ]
     attachments = []
@@ -300,38 +295,3 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
         attachments.append({"type": mailing.media_file_type, "payload": {"token": mailing.media_file_id}})
     attachments.extend(inline_keyboard(detail_rows))
     await client.send_message(chat_id=chat_id, text=text, attachments=attachments)
-
-
-async def send_test(client: MaxApiClient, chat_id: int, user_id: int, mailing_id: int) -> None:
-    async with async_session_maker() as session:
-        mailing = await session.get(Mailing, mailing_id)
-    if not mailing:
-        await client.send_message(chat_id=chat_id, text="Рассылка не найдена.")
-        return
-
-    from ..formatting import markdown_to_html
-    text = mailing.text or ""
-    formatted = markdown_to_html(text)
-
-    attachments = []
-    if mailing.media_file_type and mailing.media_file_id:
-        attachments.append({"type": mailing.media_file_type, "payload": {"token": mailing.media_file_id}})
-
-    try:
-        await client.send_message(user_id=user_id, text=f"🧪 <b>Тест рассылки:</b>\n\n{formatted}", attachments=attachments or None)
-        await client.send_message(chat_id=chat_id, text=f"✅ Тест рассылки #{mailing_id} отправлен вам.")
-    except Exception:
-        log.exception("Failed to send test mailing mailing_id=%s user_id=%s", mailing_id, user_id)
-        await client.send_message(chat_id=chat_id, text="❌ Не удалось отправить тест.")
-
-
-async def toggle_enabled(client: MaxApiClient, chat_id: int, mailing_id: int) -> None:
-    async with async_session_maker() as session:
-        mailing = await session.get(Mailing, mailing_id)
-        if not mailing:
-            await client.send_message(chat_id=chat_id, text="Рассылка не найдена.")
-            return
-        current = getattr(mailing, 'is_enabled', True)
-        mailing.is_enabled = not current
-        await session.commit()
-    await show_details(client, chat_id, mailing_id)

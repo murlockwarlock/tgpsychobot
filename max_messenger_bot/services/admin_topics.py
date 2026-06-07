@@ -9,7 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
 from ..keyboards import admin_topic_editor_keyboard, admin_topic_prompt_input_keyboard, admin_topic_prompt_keyboard, admin_topics_list_keyboard
-from ..legacy import Topic, async_session_maker
+from ..legacy import SubscriptionConfig, Topic, async_session_maker
 from ..storage import StateStore
 
 
@@ -24,17 +24,18 @@ async def list_topics(client: MaxApiClient, chat_id: int) -> None:
         topics = (
             await session.execute(select(Topic).order_by(Topic.sort_order.asc(), Topic.id.asc()))
         ).scalars().all()
+        config = await session.get(SubscriptionConfig, 1)
     if not topics:
         await client.send_message(
             chat_id=chat_id,
             text="💬 <b>Темы диалогов</b>\n\nТем пока нет.",
-            attachments=admin_topics_list_keyboard([]),
+            attachments=admin_topics_list_keyboard([], config),
         )
         return
     await client.send_message(
         chat_id=chat_id,
         text="💬 <b>Темы диалогов</b>\n\nВыберите тему для редактирования.",
-        attachments=admin_topics_list_keyboard(topics),
+        attachments=admin_topics_list_keyboard(topics, config),
     )
 
 
@@ -104,6 +105,52 @@ async def create_topic(client: MaxApiClient, states: StateStore, chat_id: int, u
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text=f"✅ Тема «{html.escape(name)}» создана.")
     await show_topic_editor(client, chat_id, topic_id)
+
+
+async def toggle_topics_enabled(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        config = await session.get(SubscriptionConfig, 1)
+        if not config:
+            config = SubscriptionConfig(id=1)
+            session.add(config)
+            await session.flush()
+        config.topics_enabled = not config.topics_enabled
+        await session.commit()
+    await list_topics(client, chat_id)
+
+
+async def toggle_topics_position(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        config = await session.get(SubscriptionConfig, 1)
+        if not config:
+            config = SubscriptionConfig(id=1)
+            session.add(config)
+            await session.flush()
+        config.topics_btn_on_top = not config.topics_btn_on_top
+        await session.commit()
+    await list_topics(client, chat_id)
+
+
+async def start_edit_topics_button_name(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+    await states.set(user_id, chat_id, "admin_topics_button_name", {})
+    await client.send_message(chat_id=chat_id, text="Введите новое название кнопки тем.")
+
+
+async def save_topics_button_name(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    name = text.strip()
+    if not name:
+        await client.send_message(chat_id=chat_id, text="Название не может быть пустым.")
+        return
+    async with async_session_maker() as session:
+        config = await session.get(SubscriptionConfig, 1)
+        if not config:
+            config = SubscriptionConfig(id=1)
+            session.add(config)
+            await session.flush()
+        config.topics_btn_name = name
+        await session.commit()
+    await states.clear(user_id)
+    await list_topics(client, chat_id)
 
 
 async def start_edit_name(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, topic_id: int) -> None:

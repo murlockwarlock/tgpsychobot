@@ -426,13 +426,19 @@ def admin_referral_template_input_cancel_keyboard() -> list[dict]:
     return inline_keyboard([[callback_button("⬅️ Отмена", "admin_referral_templates")]])
 
 
-def admin_topics_list_keyboard(topics: list) -> list[dict]:
+def admin_topics_list_keyboard(topics: list, config: SubscriptionConfig | None = None) -> list[dict]:
     rows: list[list[dict]] = []
     for topic in topics:
         status = "🟢" if topic.is_active else "⚪️"
         admin_only = " 🔒" if topic.admin_only else ""
         rows.append([callback_button(f"{status} {topic.name}{admin_only}", f"admin_edit_topic_{topic.id}")])
     rows.append([callback_button("➕ Создать тему", "admin_create_topic")])
+    if config:
+        status_text = "✅ Включены" if config.topics_enabled else "❌ Выключены"
+        position_text = "⬆️ Сверху" if config.topics_btn_on_top else "⬇️ Снизу"
+        rows.append([callback_button(f"Темы диалогов: {status_text}", "admin_topics_toggle_enabled")])
+        rows.append([callback_button(f"Кнопка тем: {position_text}", "admin_topics_toggle_position")])
+        rows.append([callback_button(f"Название: {config.topics_btn_name}", "admin_topics_edit_button_name")])
     rows.append([callback_button("⬅️ В админ-панель", "admin_panel")])
     return inline_keyboard(rows)
 

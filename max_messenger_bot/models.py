@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import html
 from typing import Any
 
 
@@ -37,6 +38,7 @@ class IncomingMessage:
     chat_id: int
     sender: Sender
     text: str | None
+    html_text: str | None = None
     attachments: list[dict[str, Any]] | None = None
     media_type: str | None = None
     media_token: str | None = None
@@ -72,6 +74,85 @@ def parse_sender(raw: dict[str, Any]) -> Sender:
         first_name=sender.get("first_name") or sender.get("name"),
         last_name=sender.get("last_name"),
     )
+
+
+def _markup_type(markup: dict[str, Any]) -> str:
+    raw_type = markup.get("type")
+    if isinstance(raw_type, dict):
+        raw_type = raw_type.get("type")
+    return str(raw_type or "").lower()
+
+
+def _markup_bounds(markup: dict[str, Any]) -> tuple[int, int] | None:
+    start = markup.get("from")
+    length = markup.get("length") or markup.get("len")
+    if start is None or length is None:
+        return None
+    try:
+        start_int = max(0, int(start))
+        end_int = max(start_int, start_int + int(length))
+    except (TypeError, ValueError):
+        return None
+    return start_int, end_int
+
+
+def _markup_tags(markup: dict[str, Any]) -> tuple[str, str] | None:
+    kind = _markup_type(markup)
+    if kind in {"strong", "bold"}:
+        return "<b>", "</b>"
+    if kind in {"emphasized", "italic"}:
+        return "<i>", "</i>"
+    if kind in {"monospaced", "code"}:
+        return "<code>", "</code>"
+    if kind in {"strikethrough", "strike"}:
+        return "<s>", "</s>"
+    if kind == "underline":
+        return "<u>", "</u>"
+    if kind in {"highlighted", "mark"}:
+        return "<mark>", "</mark>"
+    if kind in {"quote", "blockquote"}:
+        return "<blockquote>", "</blockquote>"
+    if kind in {"heading", "header"}:
+        return "<h1>", "</h1>"
+    if kind == "link":
+        url = markup.get("url")
+        if isinstance(markup.get("link"), dict):
+            url = markup["link"].get("url") or url
+        if url:
+            return f'<a href="{html.escape(str(url), quote=True)}">', "</a>"
+    if kind in {"user_mention", "user"}:
+        user_id = markup.get("user_id") or markup.get("userId")
+        if user_id:
+            return f'<a href="max://user/{html.escape(str(user_id), quote=True)}">', "</a>"
+    return None
+
+
+def _render_markup_html(text: str | None, markups: Any) -> str | None:
+    if not text or not isinstance(markups, list):
+        return None
+    chars = list(text)
+    openings: dict[int, list[str]] = {}
+    closings: dict[int, list[str]] = {}
+    for markup in markups:
+        if not isinstance(markup, dict):
+            continue
+        bounds = _markup_bounds(markup)
+        tags = _markup_tags(markup)
+        if not bounds or not tags:
+            continue
+        start, end = bounds
+        if start >= len(chars):
+            continue
+        end = min(end, len(chars))
+        opening, closing = tags
+        openings.setdefault(start, []).append(opening)
+        closings.setdefault(end, []).insert(0, closing)
+    parts: list[str] = []
+    for index, char in enumerate(chars):
+        parts.extend(openings.get(index, []))
+        parts.append(html.escape(char))
+        parts.extend(closings.get(index + 1, []))
+    return "".join(parts)
 
 
 def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
@@ -130,12 +211,21 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
                 media_url = str(url) if url else None
                 break
 
+    text = body.get("text") if isinstance(body, dict) else raw.get("text")
+    markups = None
+    if isinstance(body, dict):
+        markups = body.get("markup") or body.get("markups")
+    html_text = _render_markup_html(text, markups)
+    if not html_text and isinstance(body, dict) and body.get("format") == "html":
+        html_text = text
+
     return IncomingMessage(
         raw=raw,
         message_id=raw.get("mid") or raw.get("message_id") or raw.get("id"),
         chat_id=int(chat_id),
         sender=sender,
-        text=body.get("text") if isinstance(body, dict) else raw.get("text"),
+        text=text,
+        html_text=html_text,
         attachments=attachments,
         media_type=media_type,
         media_token=media_token,

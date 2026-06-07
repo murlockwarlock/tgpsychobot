@@ -43,7 +43,8 @@ async def show_content_editor(client: MaxApiClient, chat_id: int, content_key: s
     if not item:
         await client.send_message(chat_id=chat_id, text="Раздел контента не найден.")
         return
-    text_display = html.escape(item.text_content or "Текст не задан.")
+    source_display = html.escape(item.text_content or "Текст не задан.")
+    rendered_display = item.text_content or "Текст не задан."
     visible = "✅ Виден пользователям" if item.is_visible else "❌ Скрыт от пользователей"
     message = (
         f"📝 <b>{html.escape(_display_title(item))}</b>\n\n"
@@ -51,15 +52,22 @@ async def show_content_editor(client: MaxApiClient, chat_id: int, content_key: s
         f"<b>Статус:</b> {visible}\n"
         f"<b>Порядок:</b> {html.escape(item.content_order or 'media_top')}\n\n"
         f"<b>MAX-медиа:</b> {media_count or 0}\n\n"
-        f"<b>Текст:</b>\n<pre><code>{text_display}</code></pre>\n"
-        "Медиа для MAX хранятся отдельно; текст уже можно редактировать отсюда."
+        f"<b>Предпросмотр:</b>\n{rendered_display}\n\n"
+        f"<b>Исходник:</b>\n<pre><code>{source_display}</code></pre>\n"
+        "Поддерживается HTML-разметка: <b>жирный</b>, <i>курсив</i>, <u>подчёркнутый</u>."
     )
     await client.send_message(chat_id=chat_id, text=message, attachments=admin_content_editor_keyboard(content_key, bool(item.is_visible)))
 
 
 async def start_text_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, content_key: str) -> None:
     await states.set(user_id, chat_id, "admin_edit_content_text", {"content_key": content_key})
-    await client.send_message(chat_id=chat_id, text=f"Отправьте новый текст для <code>{content_key}</code> одним сообщением.")
+    await client.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Отправьте новый HTML-текст для <code>{content_key}</code> одним сообщением.\n\n"
+            "Пример: <code>&lt;b&gt;жирный&lt;/b&gt;</code>"
+        ),
+    )
 
 
 async def save_text_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
