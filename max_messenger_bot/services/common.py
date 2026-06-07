@@ -412,7 +412,7 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
     thinking_message_id = ((thinking.get("message") or {}).get("mid") if isinstance(thinking, dict) else None)
 
     try:
-        response_text = await analyze_image(image_bytes, prompt)
+        response_text = await analyze_image(user_id, image_bytes, prompt)
         await save_ai_message(user_id, response_text)
         html_text = markdown_to_html(response_text)
         chunks = split_text(html_text)

@@ -33,6 +33,29 @@ class InsufficientBalanceError(AIServiceError):
     pass
 
 
+def _build_user_system_prompt(user: User, ai_config: AIConfig) -> str:
+    system_prompt = user.current_topic.system_prompt if user.current_topic and user.current_topic.system_prompt else ai_config.system_prompt
+    if not system_prompt:
+        system_prompt = "Ты полезный ИИ-помощник."
+    system_prompt = apply_global_prompt_appendix(system_prompt, getattr(ai_config, 'shared_prompt_block', None))
+
+    safe_user_name = (getattr(user, "name", None) or getattr(user, "first_name", None) or "Не указано")
+    safe_user_gender = getattr(user, "gender", None) or "Не указан"
+    forced_user_header = f"ДАННЫЕ КЛИЕНТА:\nИМЯ: {safe_user_name}\nПОЛ: {safe_user_gender}\n"
+    if getattr(user, "age", None):
+        forced_user_header += f"ВОЗРАСТ: {user.age}\n"
+    forced_user_header += "\n"
+    try:
+        formatted_body = system_prompt.format(user_name=safe_user_name, user_gender=safe_user_gender)
+    except Exception:
+        formatted_body = system_prompt
+    final_prompt = forced_user_header.strip() + "\n\n" + formatted_body.strip()
+
+    if getattr(user, "response_length", "normal") == "short":
+        final_prompt += "\n\nОтвечай кратко, по делу, без длинных вступлений."
+    return final_prompt
+
+
 async def _call_openai(api_key: str, model: str, messages: list[dict], temperature: float) -> str:
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
     response = await client.chat.completions.create(
@@ -384,7 +407,7 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
         raise AIServiceError(f"Ошибка при транскрибации (KIE API): {e}")
 
 
-async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, prompt: str, temperature: float = 0.7) -> str:
+async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7) -> str:
     try:
         file_url = await _upload_file_to_kie(
             api_key, upload_base_url, image_bytes,
@@ -392,9 +415,9 @@ async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model:
         )
         return await _call_kie_multimodal(
             api_key, base_url, model,
-            prompt,
+            system_prompt,
             [
-                {"type": "text", "text": "Проанализируй это изображение согласно системной инструкции."},
+                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": file_url}},
             ],
             temperature=temperature,
@@ -522,26 +545,7 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
         if not ai_config:
             raise AIServiceError("AIConfig не найден")
 
-        system_prompt = user.current_topic.system_prompt if user.current_topic and user.current_topic.system_prompt else ai_config.system_prompt
-        if not system_prompt:
-            system_prompt = "Ты полезный ИИ-помощник."
-        system_prompt = apply_global_prompt_appendix(system_prompt, getattr(ai_config, 'shared_prompt_block', None))
-
-        # Inject user variables into system prompt template
-        safe_user_name = (getattr(user, "name", None) or getattr(user, "first_name", None) or "Не указано")
-        safe_user_gender = getattr(user, "gender", None) or "Не указан"
-        forced_user_header = f"ДАННЫЕ КЛИЕНТА:\nИМЯ: {safe_user_name}\nПОЛ: {safe_user_gender}\n"
-        if getattr(user, "age", None):
-            forced_user_header += f"ВОЗРАСТ: {user.age}\n"
-        forced_user_header += "\n"
-        try:
-            formatted_body = system_prompt.format(user_name=safe_user_name, user_gender=safe_user_gender)
-        except Exception:
-            formatted_body = system_prompt
-        system_prompt = forced_user_header.strip() + "\n\n" + formatted_body.strip()
-
-        if getattr(user, "response_length", "normal") == "short":
-            system_prompt += "\n\nОтвечай кратко, по делу, без длинных вступлений."
+        system_prompt = _build_user_system_prompt(user, ai_config)
 
         current_memory_mode = normalize_memory_mode(ai_config)
         history_rows = (
@@ -701,7 +705,7 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
 # Image Analysis (Vision)
 # ---------------------------------------------------------------------------
 
-async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, prompt: str, temperature: float) -> str:
+async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float) -> str:
     import httpx
 
     b64_data = base64.b64encode(image_bytes).decode()
@@ -714,6 +718,7 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, prompt: 
                 {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
             ]
         }],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096},
     }
     async with httpx.AsyncClient(timeout=60.0, transport=_build_gemini_proxy_transport()) as http:
@@ -726,31 +731,35 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, prompt: 
     return candidates[0]["content"]["parts"][0]["text"]
 
 
-async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, prompt: str, temperature: float) -> str:
+async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float) -> str:
     b64_data = base64.b64encode(image_bytes).decode()
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
     response = await client.chat.completions.create(
         model=model or "gpt-4o",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
-            ],
-        }],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
+                ],
+            },
+        ],
         max_tokens=4096,
         temperature=temperature,
     )
     return response.choices[0].message.content or ""
 
 
-async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, prompt: str, temperature: float) -> str:
+async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float) -> str:
     b64_data = base64.b64encode(image_bytes).decode()
     client = anthropic.AsyncAnthropic(api_key=api_key)
     response = await client.messages.create(
         model=model or "claude-sonnet-4-5-20250929",
         max_tokens=4096,
         temperature=temperature,
+        system=system_prompt,
         messages=[{
             "role": "user",
             "content": [
@@ -762,9 +771,16 @@ async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, prompt: 
     return response.content[0].text
 
 
-async def analyze_image(image_bytes: bytes, prompt: str) -> str:
+async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
     """Analyze image with the configured vision provider."""
     async with async_session_maker() as session:
+        user = await session.scalar(
+            select(User)
+            .options(selectinload(User.current_topic))
+            .where(User.id == user_id)
+        )
+        if not user:
+            raise AIServiceError("Пользователь не найден")
         config = await session.get(AIConfig, 1)
     if not config:
         raise AIServiceError("AIConfig не найден")
@@ -774,28 +790,29 @@ async def analyze_image(image_bytes: bytes, prompt: str) -> str:
 
     provider = (config.vision_provider or "Gemini").strip()
     temperature = getattr(config, "temperature", 0.7) or 0.7
+    system_prompt = _build_user_system_prompt(user, config)
 
     if provider == "Gemini":
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для vision не задан")
-        return await _analyze_gemini(api_key, config.vision_model or "gemini-2.0-flash", image_bytes, prompt, temperature)
+        return await _analyze_gemini(api_key, config.vision_model or "gemini-2.0-flash", image_bytes, system_prompt, prompt, temperature)
     if provider in {"Claude", "Anthropic"}:
         api_key = config.claude_api_key
         if not api_key:
             raise AIServiceError("API ключ Claude для vision не задан")
-        return await _analyze_claude(api_key, config.vision_model or "claude-sonnet-4-5-20250929", image_bytes, prompt, temperature)
+        return await _analyze_claude(api_key, config.vision_model or "claude-sonnet-4-5-20250929", image_bytes, system_prompt, prompt, temperature)
     if provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
         model = config.vision_model or "google/gemini-2.5-pro"
-        return await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, prompt, temperature)
+        return await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, system_prompt, prompt, temperature)
     # Default: OpenAI
     api_key = config.openai_api_key
     if not api_key:
         raise AIServiceError("API ключ OpenAI для vision не задан")
-    return await _analyze_openai(api_key, config.vision_model or "gpt-4o", image_bytes, prompt, temperature)
+    return await _analyze_openai(api_key, config.vision_model or "gpt-4o", image_bytes, system_prompt, prompt, temperature)
 
 
 # ---------------------------------------------------------------------------
