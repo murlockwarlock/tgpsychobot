@@ -1,22 +1,29 @@
 from __future__ import annotations
 
 import html
+import io
+import json
 import math
+import tempfile
+import zipfile
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
-from ..keyboards import admin_client_profile_keyboard, admin_client_search_keyboard, admin_clients_keyboard, admin_history_keyboard, callback_button, inline_keyboard
+from ..keyboards import admin_client_profile_keyboard, admin_client_search_keyboard, admin_clients_keyboard, admin_history_keyboard, callback_button, inline_keyboard, single_export_options_keyboard
 from ..legacy import Message as DBMessage, RobokassaPayment, Topic, User, UserSubscription, YookassaPayment, async_session_maker
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
+from ..time_utils import format_msk
 
 
 PAGE_SIZE = 10
 HISTORY_SAFE_LIMIT = 3500
+MAX_DIRECT_FILE_SIZE = 50 * 1024 * 1024
 
 
 async def list_clients(client: MaxApiClient, chat_id: int, page: int = 0) -> None:
@@ -173,8 +180,29 @@ async def search_clients(client: MaxApiClient, states: StateStore, chat_id: int,
 
 
 async def download_history_txt(client: MaxApiClient, chat_id: int, target_user_id: int) -> None:
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"Выберите формат и параметры экспорта для пользователя <code>{target_user_id}</code>:",
+        attachments=single_export_options_keyboard(target_user_id),
+    )
+
+
+async def run_single_export(
+    client: MaxApiClient,
+    chat_id: int,
+    target_user_id: int,
+    fmt: str,
+    anonymize: bool,
+) -> None:
+    if fmt not in {"txt", "json"}:
+        await client.send_message(chat_id=chat_id, text="❌ Неизвестный формат экспорта.")
+        return
+
     async with async_session_maker() as session:
         user = await session.get(User, target_user_id)
+        if not user or user.id < MAX_ID_OFFSET:
+            await client.send_message(chat_id=chat_id, text="❌ Пользователь не найден.")
+            return
         topics = (await session.execute(select(Topic))).scalars().all()
         topic_map = {t.id: t.name for t in topics}
         messages = (await session.execute(
@@ -185,22 +213,78 @@ async def download_history_txt(client: MaxApiClient, chat_id: int, target_user_i
         await client.send_message(chat_id=chat_id, text="История пуста.", attachments=admin_client_profile_keyboard(target_user_id))
         return
 
-    lines = [f"История: {user.name or user.first_name or str(target_user_id)} (ID: {target_user_id})", "=" * 40]
-    for m in messages:
-        dt = m.timestamp.strftime('%Y-%m-%d %H:%M')
-        topic = topic_map.get(m.topic_id, "Общий")
-        role = "Клиент" if m.role == "user" else "Бот"
-        lines.append(f"[{dt}] [{topic}] {role}:\n{m.content or ''}\n")
-    full_text = "\n".join(lines)
+    user_label = "user_1" if anonymize else str(user.id)
+    if fmt == "txt":
+        header = f"History: {user_label}\n" if anonymize else f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username})\n"
+        lines = [header + "=" * 50]
+        for message in messages:
+            topic = topic_map.get(message.topic_id, "General")
+            role = "Client" if message.role == "user" else "Bot"
+            timestamp = format_msk(message.timestamp, "%Y-%m-%d %H:%M МСК") if message.timestamp else ""
+            lines.append(f"[{timestamp}] [{topic}] {role}: {message.content or ''}\n")
+        file_bytes = "\n".join(lines).encode("utf-8")
+    else:
+        history_data = [
+            {
+                "timestamp": format_msk(message.timestamp, "%Y-%m-%dT%H:%M:%S+03:00") if message.timestamp else None,
+                "topic": topic_map.get(message.topic_id, "General"),
+                "role": message.role,
+                "content": message.content or "",
+            }
+            for message in messages
+        ]
+        file_bytes = json.dumps(history_data, ensure_ascii=False, indent=2).encode("utf-8")
 
-    chunks = split_text(f"<pre>{html.escape(full_text[:50000])}</pre>", 4000)
-    for chunk in chunks[:3]:
-        await client.send_message(chat_id=chat_id, text=chunk)
-    await client.send_message(
-        chat_id=chat_id,
-        text=f"📋 История пользователя <code>{target_user_id}</code> выведена выше ({len(messages)} сообщений).",
-        attachments=admin_client_profile_keyboard(target_user_id)
+    await _send_history_file(
+        client,
+        chat_id,
+        file_bytes,
+        f"{user_label}.{fmt}",
+        f"📋 История пользователя {html.escape(user_label)}",
     )
+
+
+async def _send_history_file(
+    client: MaxApiClient,
+    chat_id: int,
+    file_bytes: bytes,
+    filename: str,
+    caption: str,
+) -> None:
+    tmp_path = ""
+    try:
+        data = file_bytes
+        upload_name = filename
+        suffix = Path(filename).suffix
+        if len(file_bytes) > MAX_DIRECT_FILE_SIZE:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                zip_file.writestr(filename, file_bytes)
+            data = zip_buffer.getvalue()
+            upload_name = f"history_{Path(filename).stem}.zip"
+            suffix = ".zip"
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+
+        result = await client.upload_file("file", tmp_path)
+        token = result.get("token") or result.get("fileId")
+        if token:
+            zip_note = "\n📦 Файл превысил 50МБ и был заархивирован." if upload_name != filename else ""
+            await client.send_media_attachment(
+                chat_id=chat_id,
+                media_type="file",
+                token=token,
+                caption=f"{caption}{zip_note}",
+            )
+        else:
+            await client.send_message(chat_id=chat_id, text="Экспорт выполнен, но токен файла не получен.")
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"Ошибка при отправке файла: {exc}")
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 async def confirm_delete_history(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, target_user_id: int) -> None:

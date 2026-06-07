@@ -1384,6 +1384,13 @@ class MaxBotApplication:
             if data.startswith("download_history_"):
                 await admin_clients_service.download_history_txt(self.client, chat_id, int(data.rsplit("_", 1)[1]))
                 return
+            if data.startswith("run_single_"):
+                parts = data.split("_")
+                fmt = parts[2]
+                anonymize = parts[3] == "yes"
+                target_user_id = int(parts[4])
+                await admin_clients_service.run_single_export(self.client, chat_id, target_user_id, fmt, anonymize)
+                return
             if data.startswith("admin_delete_history_confirmed_"):
                 await admin_clients_service.delete_history_confirmed(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
                 return

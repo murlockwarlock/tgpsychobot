@@ -318,10 +318,8 @@ def admin_date_filter_keyboard() -> list[dict]:
 def mass_export_options_keyboard() -> list[dict]:
     return inline_keyboard(
         [
-            [callback_button("TXT (Обычный)", "run_export_txt_no")],
-            [callback_button("TXT (Анонимно)", "run_export_txt_yes")],
-            [callback_button("JSON (Обычный)", "run_export_json_no")],
-            [callback_button("JSON (Анонимно)", "run_export_json_yes")],
+            [callback_button("TXT (Обычный)", "run_export_txt_no"), callback_button("TXT (Анонимно)", "run_export_txt_yes")],
+            [callback_button("JSON (Обычный)", "run_export_json_no"), callback_button("JSON (Анонимно)", "run_export_json_yes")],
             [callback_button("⬅️ Назад к выбору", "admin_export_page_0")],
         ]
     )
@@ -336,6 +334,16 @@ def admin_client_profile_keyboard(user_id: int) -> list[dict]:
             [callback_button("🔄 Сбросить промокоды", f"reset_user_promos_{user_id}")],
             [callback_button("🗑️ Сбросить аккаунт", f"admin_reset_account_{user_id}")],
             [callback_button("⬅️ К клиентам", "admin_clients")],
+        ]
+    )
+
+
+def single_export_options_keyboard(user_id: int) -> list[dict]:
+    return inline_keyboard(
+        [
+            [callback_button("TXT (Обычный)", f"run_single_txt_no_{user_id}"), callback_button("TXT (Анонимно)", f"run_single_txt_yes_{user_id}")],
+            [callback_button("JSON (Обычный)", f"run_single_json_no_{user_id}"), callback_button("JSON (Анонимно)", f"run_single_json_yes_{user_id}")],
+            [callback_button("⬅️ Назад в профиль", f"view_client_{user_id}")],
         ]
     )
 
