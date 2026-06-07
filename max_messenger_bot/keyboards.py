@@ -245,28 +245,47 @@ def final_test_keyboard(marathon_url: str) -> list[dict]:
     )
 
 
-def admin_clients_keyboard(page: int, total_pages: int, clients: list) -> list[dict]:
+def admin_clients_keyboard(
+    page: int,
+    total_pages: int,
+    clients: list,
+    *,
+    export_mode: bool = False,
+    selected_ids: list[int] | None = None,
+) -> list[dict]:
+    selected = set(selected_ids or [])
     rows: list[list[dict]] = []
     for client in clients:
         name = client.name or client.first_name or str(client.id)
         username = f"@{client.username}" if client.username else "без username"
-        rows.append([callback_button(f"{name} ({username})", f"view_client_{client.id}")])
+        if export_mode:
+            mark = "✅ " if client.id in selected else ""
+            rows.append([callback_button(f"{mark}{name} ({username})", f"toggle_export_{client.id}_{page}")])
+        else:
+            rows.append([callback_button(f"{name} ({username})", f"view_client_{client.id}")])
 
     nav_row: list[dict] = []
+    page_prefix = "admin_export_page" if export_mode else "admin_clients_page"
     if page > 0:
-        nav_row.append(callback_button("⬅️", f"admin_clients_page_{page - 1}"))
+        nav_row.append(callback_button("⬅️", f"{page_prefix}_{page - 1}"))
     nav_row.append(callback_button(f"{page + 1}/{total_pages}", "noop"))
     if page < total_pages - 1:
-        nav_row.append(callback_button("➡️", f"admin_clients_page_{page + 1}"))
+        nav_row.append(callback_button("➡️", f"{page_prefix}_{page + 1}"))
     if nav_row:
         rows.append(nav_row)
     if total_pages > 1:
         rows.append([
-            callback_button("⏮ В начало", "admin_clients_page_0"),
-            callback_button("В конец ⏭", f"admin_clients_page_{total_pages - 1}"),
+            callback_button("⏮ В начало", f"{page_prefix}_0"),
+            callback_button("В конец ⏭", f"{page_prefix}_{total_pages - 1}"),
         ])
-    rows.append([callback_button("🔍 Поиск", "admin_client_search"), callback_button("📤 Экспорт", "admin_export")])
-    rows.append([callback_button("⬅️ В админ-панель", "admin_panel")])
+    if export_mode:
+        rows.append([callback_button("☑️ Выбрать всех (кроме админов)", "export_select_all_no_admins")])
+        rows.append([callback_button("📥 Экспортировать выбранных", "admin_export_confirm_options")])
+        rows.append([callback_button("📥 Экспортировать ВСЕХ", "admin_export_all_confirm")])
+        rows.append([callback_button("❌ Отмена", "admin_clients_reset_export")])
+    else:
+        rows.append([callback_button("🔍 Поиск", "admin_client_search"), callback_button("📤 Экспорт", "admin_export")])
+        rows.append([callback_button("⬅️ В админ-панель", "admin_panel")])
     return inline_keyboard(rows)
 
 
@@ -287,10 +306,23 @@ def admin_export_keyboard() -> list[dict]:
 def admin_date_filter_keyboard() -> list[dict]:
     return inline_keyboard(
         [
-            [callback_button("🗓 Все даты", "admin_export_date_all")],
-            [callback_button("📅 7 дней", "admin_export_date_preset_7"), callback_button("📅 30 дней", "admin_export_date_preset_30")],
-            [callback_button("📅 90 дней", "admin_export_date_preset_90"), callback_button("✏️ Вручную", "admin_export_date_manual")],
-            [callback_button("◀️ Назад", "admin_export")],
+            [callback_button("📅 За последние 7 дней", "export_date_preset_7")],
+            [callback_button("📅 За последние 30 дней", "export_date_preset_30")],
+            [callback_button("📅 За последние 90 дней", "export_date_preset_90")],
+            [callback_button("✏️ Ввести даты вручную", "export_date_manual")],
+            [callback_button("♾️ Все даты (без фильтра)", "export_date_preset_0")],
+        ]
+    )
+
+
+def mass_export_options_keyboard() -> list[dict]:
+    return inline_keyboard(
+        [
+            [callback_button("TXT (Обычный)", "run_export_txt_no")],
+            [callback_button("TXT (Анонимно)", "run_export_txt_yes")],
+            [callback_button("JSON (Обычный)", "run_export_json_no")],
+            [callback_button("JSON (Анонимно)", "run_export_json_yes")],
+            [callback_button("⬅️ Назад к выбору", "admin_export_page_0")],
         ]
     )
 

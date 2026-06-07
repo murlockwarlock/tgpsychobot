@@ -797,13 +797,27 @@ class MaxBotApplication:
                 await admin_clients_service.start_search(self.client, self.states, chat_id, user_id)
                 return
             if data == "admin_export":
-                await admin_export_service.show_export_menu(self.client, chat_id)
+                await admin_export_service.start_export_mode(self.client, self.states, chat_id, user_id)
                 return
-            if data == "admin_export_users_csv":
-                await admin_export_service.export_users_csv(self.client, chat_id)
+            if data.startswith("admin_export_page_"):
+                await admin_export_service.show_export_clients(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
                 return
-            if data == "admin_export_messages_csv":
-                await admin_export_service.show_date_filter_menu(self.client, self.states, chat_id, user_id)
+            if data.startswith("toggle_export_"):
+                _, _, target_id, page = data.split("_")
+                await admin_export_service.toggle_export_selection(self.client, self.states, chat_id, user_id, int(target_id), int(page))
+                return
+            if data == "export_select_all_no_admins":
+                await admin_export_service.select_all_no_admins(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_export_confirm_options":
+                await admin_export_service.confirm_selected_export(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_export_all_confirm":
+                await admin_export_service.confirm_all_export(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_clients_reset_export":
+                await self.states.clear(user_id)
+                await admin_clients_service.list_clients(self.client, chat_id, 0)
                 return
             if data == "admin_subscriptions":
                 await admin_service.show_subscriptions_summary(self.client, chat_id)
@@ -1517,13 +1531,17 @@ class MaxBotApplication:
             if data == "admin_export_date_manual":
                 await admin_export_service.start_date_manual_from(self.client, self.states, chat_id, user_id)
                 return
+            if data.startswith("export_date_preset_"):
+                await admin_export_service.set_date_preset(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data == "export_date_manual":
+                await admin_export_service.start_date_manual_from(self.client, self.states, chat_id, user_id)
+                return
             if data.startswith("run_export_"):
                 parts = data.split("_")
                 fmt = parts[2]
                 anonymize = parts[3] == "yes" if len(parts) > 3 else False
-                state_snap = await self.states.get(user_id)
-                sdata = state_snap.data if state_snap else {}
-                await admin_export_service.run_export(self.client, chat_id, sdata.get("date_from"), sdata.get("date_to"), anonymize)
+                await admin_export_service.run_mass_export(self.client, self.states, chat_id, user_id, fmt, anonymize)
                 return
         await self.client.answer_callback(callback.callback_id, notification="Команда пока не реализована в MAX-версии")
 
