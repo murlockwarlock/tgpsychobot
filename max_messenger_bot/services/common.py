@@ -37,6 +37,33 @@ log = get_bot_logger("common")
 MSK = timezone(timedelta(hours=3))
 
 
+async def _send_ai_text(
+    client: MaxApiClient,
+    chat_id: int,
+    thinking_message_id: str | None,
+    chunks: list[str],
+) -> None:
+    main_menu_kb = inline_keyboard([main_menu_row()])
+    if thinking_message_id and chunks:
+        await client.edit_message(
+            thinking_message_id,
+            text=chunks[0],
+            attachments=main_menu_kb if len(chunks) == 1 else None,
+        )
+        remaining_chunks = chunks[1:]
+    else:
+        remaining_chunks = chunks
+
+    if len(chunks) == 1 and not thinking_message_id:
+        await client.send_message(chat_id=chat_id, text=chunks[0], attachments=main_menu_kb)
+        return
+
+    for chunk in remaining_chunks:
+        await client.send_message(chat_id=chat_id, text=chunk)
+    if len(chunks) > 1:
+        await client.send_message(chat_id=chat_id, text="Главное меню:", attachments=main_menu_kb)
+
+
 async def is_admin(user_id: int) -> bool:
     from ..settings import apply_legacy_env_defaults
     from config import OWNER_IDS  # type: ignore
@@ -372,20 +399,7 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
 
         html_text = markdown_to_html(response_text)
         chunks = split_text(html_text)
-        main_menu_kb = inline_keyboard([main_menu_row()])
-        if thinking_message_id and chunks:
-            if len(chunks) == 1:
-                await client.edit_message(thinking_message_id, text=chunks[0], attachments=main_menu_kb)
-            else:
-                await client.edit_message(thinking_message_id, text=chunks[0])
-                for chunk in chunks[1:-1]:
-                    await client.send_message(chat_id=chat_id, text=chunk)
-                await client.send_message(chat_id=chat_id, text=chunks[-1], attachments=main_menu_kb)
-        else:
-            for chunk in chunks[:-1]:
-                await client.send_message(chat_id=chat_id, text=chunk)
-            if chunks:
-                await client.send_message(chat_id=chat_id, text=chunks[-1], attachments=main_menu_kb)
+        await _send_ai_text(client, chat_id, thinking_message_id, chunks)
         log.info("AI dialogue completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)

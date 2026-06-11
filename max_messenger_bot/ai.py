@@ -18,7 +18,7 @@ from sqlalchemy.orm import selectinload
 
 from .legacy import AIConfig, Message as DBMessage, Topic, User, async_session_maker
 from .logging_utils import configure_logging, get_ai_logger
-from memory_mode import build_history_scope, normalize_memory_mode
+from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
 from prompt_injection import apply_global_prompt_appendix
 
 configure_logging()
@@ -31,6 +31,22 @@ class AIServiceError(RuntimeError):
 
 class InsufficientBalanceError(AIServiceError):
     pass
+
+
+def _build_max_history_scope(user: User, memory_mode: str):
+    if memory_mode == MEMORY_MODE_TOPIC and user.current_topic_id is None:
+        return (
+            (DBMessage.user_id == user.id)
+            & (DBMessage.dialogue_id == (user.current_dialogue_id or 1))
+            & (DBMessage.topic_id.is_(None))
+        )
+    return build_history_scope(
+        DBMessage,
+        user.id,
+        user.current_dialogue_id,
+        user.current_topic_id,
+        memory_mode,
+    )
 
 
 def _build_user_system_prompt(user: User, ai_config: AIConfig) -> str:
@@ -385,7 +401,7 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
                 "tag_audio_events": False,
                 "diarize": False,
             })
-            task_payload = await _poll_kie_task(api_key, base_url, task_id)
+            task_payload = await _poll_kie_task(api_key, base_url, task_id, timeout_sec=60)
             result = _extract_kie_task_result(task_payload)
             transcription = _find_first_string_value(result, ("text", "transcript", "transcription", "content", "result"))
             if not transcription:
@@ -548,10 +564,11 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
         system_prompt = _build_user_system_prompt(user, ai_config)
 
         current_memory_mode = normalize_memory_mode(ai_config)
+        history_scope = _build_max_history_scope(user, current_memory_mode)
         history_rows = (
             await session.execute(
                 select(DBMessage)
-                .where(build_history_scope(DBMessage, user_id, user.current_dialogue_id, user.current_topic_id, current_memory_mode))
+                .where(history_scope)
                 .order_by(DBMessage.timestamp.asc())
             )
         ).scalars().all()
@@ -683,6 +700,8 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
         raise AIServiceError("AIConfig не найден")
 
     provider = (config.transcription_provider or "OpenAI").strip()
+    if provider == "None":
+        raise AIServiceError("Распознавание аудио отключено")
     if provider == "Gemini":
         api_key = config.gemini_api_key
         if not api_key:
@@ -693,7 +712,25 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
         if not api_key:
             raise AIServiceError("API ключ KIE для транскрибации не задан")
         model = getattr(config, "kie_transcription_model", None) or "elevenlabs/speech-to-text"
-        return await _transcribe_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, file_bytes, filename)
+        try:
+            return await _transcribe_kie(
+                api_key,
+                _get_kie_base_url(config),
+                _get_kie_upload_base_url(config),
+                model,
+                file_bytes,
+                filename,
+            )
+        except AIServiceError as exc:
+            if not config.gemini_api_key:
+                raise
+            log.warning("KIE transcription failed (%s), falling back to Gemini", exc)
+            return await _transcribe_gemini(
+                config.gemini_api_key,
+                config.gemini_model or "gemini-2.5-flash",
+                file_bytes,
+                filename,
+            )
     # Default: OpenAI
     api_key = config.openai_api_key
     if not api_key:
