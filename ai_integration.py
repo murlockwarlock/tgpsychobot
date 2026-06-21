@@ -1010,8 +1010,8 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         if provider_key in ['anthropic', 'claude'] and not model:
             model = _normalize_config_value(ai_config.claude_model)
 
-        limit_first = ai_config.context_limit_first
-        limit_recent = ai_config.context_limit_recent
+        limit_first = getattr(ai_config, "context_limit_first", 2) or 2
+        limit_recent = getattr(ai_config, "context_limit_recent", 10) or 10
 
         system_prompt_text = _load_configured_system_prompt(
             ai_config,
@@ -1110,10 +1110,25 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         result = await session.execute(stmt)
         all_messages = result.scalars().all()
 
-        if len(all_messages) <= limit_first + limit_recent:
-            selected_messages = list(all_messages)
+        pairs = []
+        current_pair = []
+        for msg in all_messages:
+            if msg.role == 'user' and any(m.role == 'assistant' for m in current_pair):
+                pairs.append(current_pair)
+                current_pair = [msg]
+            else:
+                current_pair.append(msg)
+        if current_pair:
+            pairs.append(current_pair)
+
+        if len(pairs) <= limit_first + limit_recent:
+            selected_pairs = pairs
         else:
-            selected_messages = all_messages[:limit_first] + all_messages[-limit_recent:]
+            selected_pairs = pairs[:limit_first] + pairs[-limit_recent:]
+
+        selected_messages = []
+        for pair in selected_pairs:
+            selected_messages.extend(pair)
 
         final_history, global_memory_context = _build_memory_aware_history(
             selected_messages,

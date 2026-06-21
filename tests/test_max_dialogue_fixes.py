@@ -94,5 +94,143 @@ class MaxTranscriptionFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class MaxBotDeduplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_duplicate_updates_are_ignored(self):
+        from max_messenger_bot.app import MaxBotApplication
+        client = MagicMock()
+        app = MaxBotApplication(client)
+
+        update = {
+            "type": "message_created",
+            "event_id": "unique-event-id-1",
+            "message": {
+                "chat_id": 123,
+                "sender": {"user_id": 456, "username": "user"},
+                "body": {"text": "hello"}
+            }
+        }
+
+        with patch.object(app, "handle_message", AsyncMock()) as mock_handle:
+            # First time: processes update
+            await app.handle_update(update)
+            self.assertEqual(mock_handle.call_count, 1)
+
+            # Second time: skips duplicate update
+            await app.handle_update(update)
+            self.assertEqual(mock_handle.call_count, 1)
+
+
+class MaxBotHistorySlicingTests(unittest.TestCase):
+    def test_qa_pairs_slicing_logic(self):
+        # Setup mock messages
+        class MockMsg:
+            def __init__(self, role, content):
+                self.role = role
+                self.content = content
+
+        history_rows = [
+            MockMsg('user', 'U1'),
+            MockMsg('assistant', 'A1'),
+            MockMsg('user', 'U2'),
+            MockMsg('user', 'U2_extra'),
+            MockMsg('assistant', 'A2'),
+            MockMsg('user', 'U3'),
+            MockMsg('assistant', 'A3'),
+            MockMsg('user', 'U4'),
+            MockMsg('assistant', 'A4'),
+        ]
+
+        # Slicing logic simulation (extracted from ai.py)
+        pairs = []
+        current_pair = []
+        for msg in history_rows:
+            if msg.role == 'user' and any(m.role == 'assistant' for m in current_pair):
+                pairs.append(current_pair)
+                current_pair = [msg]
+            else:
+                current_pair.append(msg)
+        if current_pair:
+            pairs.append(current_pair)
+
+        # Expected pairs:
+        # Pair 1: U1, A1
+        # Pair 2: U2, U2_extra, A2
+        # Pair 3: U3, A3
+        # Pair 4: U4, A4
+        self.assertEqual(len(pairs), 4)
+        self.assertEqual([m.content for m in pairs[0]], ['U1', 'A1'])
+        self.assertEqual([m.content for m in pairs[1]], ['U2', 'U2_extra', 'A2'])
+
+        limit_first = 1
+        limit_recent = 2
+
+        if len(pairs) <= limit_first + limit_recent:
+            selected_pairs = pairs
+        else:
+            selected_pairs = pairs[:limit_first] + pairs[-limit_recent:]
+
+        # Expected selected pairs:
+        # Pair 1 (first 1) + Pairs 3, 4 (recent 2)
+        self.assertEqual(len(selected_pairs), 3)
+        self.assertEqual([m.content for m in selected_pairs[0]], ['U1', 'A1'])
+        self.assertEqual([m.content for m in selected_pairs[1]], ['U3', 'A3'])
+        self.assertEqual([m.content for m in selected_pairs[2]], ['U4', 'A4'])
+
+
+class MaxBotUploadStateRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admin_kb_upload_file_state_routes_correctly(self):
+        from max_messenger_bot.app import MaxBotApplication
+        from max_messenger_bot.models import IncomingMessage, Sender
+
+        client = MagicMock()
+        client.send_message = AsyncMock()
+        app = MaxBotApplication(client)
+
+        message = IncomingMessage(
+            raw={},
+            message_id="msg1",
+            chat_id=123,
+            sender=Sender(user_id=456, username="user", first_name="User", last_name=""),
+            text="Done",
+            media_type=None,
+            media_token=None,
+            media_url=None
+        )
+
+        with (
+            patch.object(app.states, "get", AsyncMock(return_value=SimpleNamespace(state="admin_kb_upload_file", data={}))),
+            patch("max_messenger_bot.services.admin_kb.receive_upload_file", AsyncMock()) as mock_receive_file,
+            patch("max_messenger_bot.services.common.ensure_user", AsyncMock())
+        ):
+            await app.handle_message(message)
+            # Since message has no file attachment, it should prompt the user instead of doing run_ai_dialogue
+            client.send_message.assert_awaited_once_with(
+                chat_id=123,
+                text="Пожалуйста, отправьте файл (txt, md, pdf, docx, xlsx) или завершите загрузку кнопкой."
+            )
+            mock_receive_file.assert_not_awaited()
+
+        # Test when file attachment is present
+        message_with_file = IncomingMessage(
+            raw={},
+            message_id="msg2",
+            chat_id=123,
+            sender=Sender(user_id=456, username="user", first_name="User", last_name=""),
+            text="my_kb.txt",
+            media_type="file",
+            media_token="token123",
+            media_url="http://example.com"
+        )
+
+        with (
+            patch.object(app.states, "get", AsyncMock(return_value=SimpleNamespace(state="admin_kb_upload_file", data={}))),
+            patch("max_messenger_bot.services.admin_kb.receive_upload_file", AsyncMock()) as mock_receive_file,
+            patch("max_messenger_bot.services.common.ensure_user", AsyncMock())
+        ):
+            await app.handle_message(message_with_file)
+            # Should route to receive_upload_file since it is in upload state and has a file attachment
+            mock_receive_file.assert_awaited_once_with(client, app.states, message_with_file)
+
+
 if __name__ == "__main__":
     unittest.main()

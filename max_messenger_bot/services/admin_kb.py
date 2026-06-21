@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import html
+import io
+import logging
 import math
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
-from ..keyboards import admin_kb_editor_keyboard, admin_kb_list_keyboard, admin_topic_kb_keyboard
+from ..keyboards import (
+    admin_kb_editor_keyboard,
+    admin_kb_list_keyboard,
+    admin_topic_kb_keyboard,
+    admin_kb_finish_upload_keyboard,
+)
 from ..legacy import KnowledgeBase, Topic, async_session_maker
 from ..storage import StateStore
+from ..models import IncomingMessage
+from vector_store import update_vector_index, delete_document_vectors
 
+log = logging.getLogger("max_messenger_bot.services.admin_kb")
 
 PAGE_SIZE = 8
 
@@ -101,9 +111,105 @@ async def save_new_content(client: MaxApiClient, states: StateStore, chat_id: in
         session.add(entry)
         await session.commit()
         kb_id = entry.id
+
+    await update_vector_index(kb_id, content)
+
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text=f"✅ Запись «{html.escape(filename)}» создана.")
     await show_entry_editor(client, chat_id, kb_id)
+
+
+async def start_upload_file(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+    await states.set(user_id, chat_id, "admin_kb_upload_file", {})
+    await client.send_message(
+        chat_id=chat_id,
+        text="Вы вошли в режим добавления файлов в Базу Знаний.\n\n"
+             "Отправляйте файлы (txt, md, pdf, docx, xlsx) по одному. "
+             "Когда закончите, нажмите кнопку ниже.",
+        attachments=admin_kb_finish_upload_keyboard(),
+    )
+
+
+async def receive_upload_file(client: MaxApiClient, states: StateStore, message: IncomingMessage) -> None:
+    chat_id = message.chat_id
+    user_id = message.sender.user_id
+
+    filename = "uploaded_file"
+    if message.attachments:
+        for att in message.attachments:
+            payload = att.get("payload") or {}
+            for field in ["name", "filename", "file_name", "title"]:
+                if payload.get(field):
+                    filename = str(payload[field])
+                    break
+            if filename != "uploaded_file":
+                break
+            for field in ["name", "filename", "file_name", "title"]:
+                if att.get(field):
+                    filename = str(att[field])
+                    break
+            if filename != "uploaded_file":
+                break
+
+    progress_msg = await client.send_message(
+        chat_id=chat_id,
+        text=f"⏳ Начинаю обработку файла: `{filename}`...",
+    )
+    progress_msg_id = progress_msg.get("id") or progress_msg.get("message_id")
+
+    try:
+        if progress_msg_id:
+            await client.edit_message(
+                message_id=progress_msg_id,
+                text=f"⏳ Загружаю файл: `{filename}`...",
+            )
+        file_bytes = await client.download_attachment(message.media_token, message.media_url)
+
+        if progress_msg_id:
+            await client.edit_message(
+                message_id=progress_msg_id,
+                text=f"⏳ Анализирую и извлекаю текст из `{filename}`...",
+            )
+        from file_parser import parse_file
+        indexed_content = await parse_file(io.BytesIO(file_bytes), filename)
+
+        if not indexed_content:
+            raise ValueError("Не удалось извлечь текст из файла или файл пустой.")
+
+        if progress_msg_id:
+            await client.edit_message(
+                message_id=progress_msg_id,
+                text=f"⏳ Создаю векторы и индексирую `{filename}`...",
+            )
+
+        async with async_session_maker() as session:
+            entry = KnowledgeBase(filename=filename, indexed_content=indexed_content, use_in_general_mode=True)
+            session.add(entry)
+            await session.commit()
+            kb_id = entry.id
+
+        await update_vector_index(kb_id, indexed_content)
+
+        if progress_msg_id:
+            await client.delete_message(message_id=progress_msg_id)
+
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"✅ Файл `{filename}` полностью обработан и добавлен в Базу Знаний.",
+            attachments=admin_kb_finish_upload_keyboard(),
+        )
+    except Exception as e:
+        log.exception("Error processing KB file upload via MAX bot")
+        if progress_msg_id:
+            await client.edit_message(
+                message_id=progress_msg_id,
+                text=f"❌ Ошибка при обработке `{filename}`: {e}",
+            )
+        else:
+            await client.send_message(
+                chat_id=chat_id,
+                text=f"❌ Ошибка при обработке `{filename}`: {e}",
+            )
 
 
 async def start_edit_filename(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, kb_id: int) -> None:
@@ -154,6 +260,10 @@ async def save_content(client: MaxApiClient, states: StateStore, chat_id: int, u
             return
         entry.indexed_content = content
         await session.commit()
+
+    delete_document_vectors(kb_id)
+    await update_vector_index(kb_id, content)
+
     await states.clear(user_id)
     await show_entry_editor(client, chat_id, kb_id)
 
@@ -177,6 +287,9 @@ async def delete_entry(client: MaxApiClient, chat_id: int, kb_id: int) -> None:
             return
         await session.delete(entry)
         await session.commit()
+
+    delete_document_vectors(kb_id)
+
     await client.send_message(chat_id=chat_id, text="✅ Запись базы знаний удалена.")
     await list_entries(client, chat_id, 0)
 

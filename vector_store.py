@@ -1,11 +1,20 @@
 import chromadb
 import asyncio
 import os
+import sys
+import importlib.util
+# Workaround for broken torchvision in the environment
+_orig_find_spec = importlib.util.find_spec
+importlib.util.find_spec = lambda name, pkg=None: None if name == 'torchvision' else _orig_find_spec(name, pkg)
+
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 app_port = os.environ.get('APP_PORT', 'default')
-client = chromadb.PersistentClient(path=f"/root/telegram_bots/newbots/chroma_db_{app_port}")
+if "pytest" in sys.modules or os.environ.get("TESTING") == "true":
+    client = chromadb.EphemeralClient()
+else:
+    client = chromadb.PersistentClient(path=f"/root/telegram_bots/newbots/chroma_db_{app_port}")
 
 model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 

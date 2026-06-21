@@ -79,6 +79,8 @@ class MaxBotApplication:
         self.states = StateStore()
         self.background_tasks: set[asyncio.Task[None]] = set()
         self._user_locks: dict[int, asyncio.Lock] = {}
+        self._processed_updates: set[str] = set()
+        self._processed_updates_list: list[str] = []
 
     def spawn_user_task(self, user_id: int, coro) -> None:
         lock = self._user_locks.setdefault(user_id, asyncio.Lock())
@@ -93,6 +95,17 @@ class MaxBotApplication:
     async def handle_update(self, update: dict[str, Any]) -> None:
         update_type = update.get("update_type") or update.get("type") or ""
         update_id = update.get("update_id") or update.get("id") or update.get("event_id")
+        if update_id:
+            update_id_str = str(update_id)
+            if update_id_str in self._processed_updates:
+                max_log.info("MAX update already processed, skipping. update_id=%s", update_id_str)
+                return
+            self._processed_updates.add(update_id_str)
+            self._processed_updates_list.append(update_id_str)
+            if len(self._processed_updates_list) > 10000:
+                oldest = self._processed_updates_list.pop(0)
+                self._processed_updates.discard(oldest)
+
         try:
             max_log.info("MAX update received update_type=%s update_id=%s", update_type, update_id)
             if update_type in {"message_created", "bot_started"}:
@@ -259,6 +272,15 @@ class MaxBotApplication:
                 return
             if state.state == "admin_kb_edit_content":
                 await admin_kb_service.save_content(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "admin_kb_upload_file":
+                if message.media_type == "file" and message.media_token:
+                    await admin_kb_service.receive_upload_file(self.client, self.states, message)
+                else:
+                    await self.client.send_message(
+                        chat_id=message.chat_id,
+                        text="Пожалуйста, отправьте файл (txt, md, pdf, docx, xlsx) или завершите загрузку кнопкой."
+                    )
                 return
             if state.state == "admin_add_admin_id":
                 await admin_admins_service.add_admin(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -433,6 +455,7 @@ class MaxBotApplication:
                     else:
                         await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype)
                     return
+
             # Handle media attachments
             if message.media_type in {"audio", "video"} and message.media_token:
                 self.spawn_user_task(message.sender.user_id, self._handle_voice(message))
@@ -1090,6 +1113,9 @@ class MaxBotApplication:
                 return
             if data == "admin_kb_create":
                 await admin_kb_service.start_create_entry(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_kb_upload_start":
+                await admin_kb_service.start_upload_file(self.client, self.states, chat_id, user_id)
                 return
             if data.startswith("admin_kb_open_"):
                 await admin_kb_service.show_entry_editor(self.client, chat_id, int(data.rsplit("_", 1)[1]))

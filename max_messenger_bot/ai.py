@@ -16,10 +16,11 @@ from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from .legacy import AIConfig, Message as DBMessage, Topic, User, async_session_maker
+from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, async_session_maker
 from .logging_utils import configure_logging, get_ai_logger
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
 from prompt_injection import apply_global_prompt_appendix
+from vector_store import search_relevant_chunks
 
 configure_logging()
 log = get_ai_logger("service")
@@ -547,11 +548,32 @@ async def _dispatch_provider(ai_config: AIConfig, system_prompt: str, messages: 
     raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
 
 
+def _looks_like_prompt_kb_entry(filename: str | None, indexed_content: str | None) -> bool:
+    normalized_name = (filename or "").strip().lower()
+    prompt_name_markers = (
+        "prompt",
+        "промпт",
+        "system_prompt",
+        "system-prompt",
+        "system prompt",
+    )
+    if any(marker in normalized_name for marker in prompt_name_markers):
+        return True
+
+    normalized_head = (indexed_content or "")[:2000].strip().lower()
+    if not normalized_head:
+        return False
+
+    if "system prompt" in normalized_head or "системный промпт" in normalized_head:
+        return True
+    return False
+
+
 async def get_ai_response(user_id: int, user_prompt: str) -> str:
     async with async_session_maker() as session:
         user = await session.scalar(
             select(User)
-            .options(selectinload(User.current_topic))
+            .options(selectinload(User.current_topic).selectinload(Topic.knowledge_base_files))
             .where(User.id == user_id)
         )
         if not user:
@@ -562,6 +584,33 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
             raise AIServiceError("AIConfig не найден")
 
         system_prompt = _build_user_system_prompt(user, ai_config)
+
+        relevant_chunks = []
+        if user.current_topic:
+            doc_ids = [f.id for f in user.current_topic.knowledge_base_files]
+            if doc_ids:
+                relevant_chunks = await search_relevant_chunks(user_prompt, n_results=3, document_ids=doc_ids)
+        else:
+            gen_files_res = await session.execute(
+                select(KnowledgeBase.id, KnowledgeBase.filename, KnowledgeBase.indexed_content).where(
+                    KnowledgeBase.use_in_general_mode == True
+                )
+            )
+            gen_doc_ids = [
+                doc_id
+                for doc_id, filename, indexed_content in gen_files_res.all()
+                if not _looks_like_prompt_kb_entry(filename, indexed_content)
+            ]
+            if gen_doc_ids:
+                relevant_chunks = await search_relevant_chunks(user_prompt, n_results=3, document_ids=gen_doc_ids)
+
+        context = "\n\n".join(relevant_chunks)
+        if context:
+            provider, _ = _resolve_provider(ai_config)
+            if provider == "gemini":
+                system_prompt = f"{system_prompt}\n\nCONTEXT:\n{context}"
+            else:
+                system_prompt = f"{system_prompt}\n\nИспользуй следующие данные из базы знаний для ответа:\n{context}"
 
         current_memory_mode = normalize_memory_mode(ai_config)
         history_scope = _build_max_history_scope(user, current_memory_mode)
@@ -575,8 +624,26 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
 
         limit_first = getattr(ai_config, "context_limit_first", 2) or 2
         limit_recent = getattr(ai_config, "context_limit_recent", 10) or 10
-        if len(history_rows) > limit_first + limit_recent:
-            history_rows = history_rows[:limit_first] + history_rows[-limit_recent:]
+
+        pairs = []
+        current_pair = []
+        for msg in history_rows:
+            if msg.role == 'user' and any(m.role == 'assistant' for m in current_pair):
+                pairs.append(current_pair)
+                current_pair = [msg]
+            else:
+                current_pair.append(msg)
+        if current_pair:
+            pairs.append(current_pair)
+
+        if len(pairs) <= limit_first + limit_recent:
+            selected_pairs = pairs
+        else:
+            selected_pairs = pairs[:limit_first] + pairs[-limit_recent:]
+
+        history_rows = []
+        for pair in selected_pairs:
+            history_rows.extend(pair)
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend({"role": row.role, "content": row.content} for row in history_rows if row.content)

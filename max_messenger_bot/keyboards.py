@@ -537,9 +537,14 @@ def admin_kb_list_keyboard(entries: list, page: int, total_pages: int) -> list[d
         nav_row.append(callback_button("➡️", f"admin_kb_page_{page + 1}"))
     if nav_row:
         rows.append(nav_row)
-    rows.append([callback_button("➕ Добавить запись", "admin_kb_create")])
+    rows.append([callback_button("➕ Добавить вручную", "admin_kb_create")])
+    rows.append([callback_button("➕ Загрузить файл(ы)", "admin_kb_upload_start")])
     rows.append([callback_button("⬅️ В админ-панель", "admin_panel")])
     return inline_keyboard(rows)
+
+
+def admin_kb_finish_upload_keyboard() -> list[dict]:
+    return inline_keyboard([[callback_button("🏁 Завершить загрузку", "admin_kb")]])
 
 
 def admin_kb_editor_keyboard(kb_id: int, use_in_general_mode: bool) -> list[dict]:
