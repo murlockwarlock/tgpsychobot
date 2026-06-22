@@ -9,21 +9,31 @@ MAX_MESSAGE_TEXT_LEN = 3900
 def markdown_to_html(text: str | None) -> str:
     if not text:
         return ""
-    lines: list[str] = []
-    for raw_line in text.splitlines():
-        line = re.sub(r"^\s*#{1,6}\s*$", "•", raw_line)
-        line = re.sub(r"^\s*#{1,6}\s+(.+)$", r"• \1", line)
-        if line.count("*") % 2 == 1:
-            line = re.sub(r"(?<=\S)\*(?=\s|$)", "", line)
-            line = re.sub(r"(^|\s)\*(?=\S)", r"\1", line)
-        lines.append(line)
-    text = "\n".join(lines)
+
+    # 1. Escape HTML special characters first
     escaped = html.escape(text)
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"__(.+?)__", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"\*(.+?)\*", r"<i>\1</i>", escaped)
-    escaped = re.sub(r"_(.+?)_", r"<i>\1</i>", escaped)
-    # keep newlines as-is; MAX uses \n for line breaks (not <br/>)
+
+    # 2. Convert bullet lists to bullet points using • (U+2022)
+    # e.g., "- Item" or "* Item" -> "• Item"
+    escaped = re.sub(r'^\s*[-*+]\s+', '• ', escaped, flags=re.MULTILINE)
+
+    # 3. Convert headers to bold
+    # e.g., "### Header" -> "<b>Header</b>"
+    escaped = re.sub(r'^\s*#{1,6}\s+(.+)$', r'<b>\1</b>', escaped, flags=re.MULTILINE)
+
+    # 4. Convert bold and italic markdown tags to HTML
+    # Bold first: **text** or __text__ -> <b>text</b>
+    escaped = re.sub(r'\*\*(?=[^<>]*\*\*)((?:(?!\n\n)[^<>])+?)\*\*', r'<b>\1</b>', escaped)
+    escaped = re.sub(r'__(?=[^<>]*__)((?:(?!\n\n)[^<>])+?)__', r'<b>\1</b>', escaped)
+    
+    # Italic next: *text* or _text_ -> <i>text</i>
+    escaped = re.sub(r'(?<!\w)\*(?!\s)([^<>\n]+?)(?<!\s)\*(?!\w)', r'<i>\1</i>', escaped)
+    escaped = re.sub(r'(?<!\w)_(?!\s)([^<>\n]+?)(?<!\s)_(?!\w)', r'<i>\1</i>', escaped)
+
+    # Clean up unmatched bold/italic markers
+    escaped = escaped.replace('**', '').replace('__', '')
+    escaped = escaped.replace('<b></b>', '').replace('<i></i>', '')
+
     return escaped
 
 

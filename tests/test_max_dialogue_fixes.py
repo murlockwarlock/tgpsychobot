@@ -301,5 +301,25 @@ class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history_passed[1]["content"], "Hi there")
 
 
+class MaxFormattingTests(unittest.TestCase):
+    def test_markdown_to_html_converts_lists_and_bold(self):
+        from max_messenger_bot.formatting import markdown_to_html
+        
+        # Test bullet lists and bold text
+        text = "* **Item 1**\n- **Item 2**\n+ Item 3"
+        html_out = markdown_to_html(text)
+        self.assertEqual(html_out, "• <b>Item 1</b>\n• <b>Item 2</b>\n• Item 3")
+
+        # Test headings
+        text_headings = "### Heading 3\nSome text"
+        html_headings = markdown_to_html(text_headings)
+        self.assertEqual(html_headings, "<b>Heading 3</b>\nSome text")
+
+        # Test standard bold and italic text
+        text_bold_italic = "This is **bold** and *italic* text."
+        html_bold_italic = markdown_to_html(text_bold_italic)
+        self.assertEqual(html_bold_italic, "This is <b>bold</b> and <i>italic</i> text.")
+
+
 if __name__ == "__main__":
     unittest.main()
