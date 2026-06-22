@@ -647,7 +647,8 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend({"role": row.role, "content": row.content} for row in history_rows if row.content)
-        messages.append({"role": "user", "content": user_prompt})
+        if not messages or messages[-1]["role"] != "user" or messages[-1]["content"] != user_prompt:
+            messages.append({"role": "user", "content": user_prompt})
 
         stripped = [item for item in messages if item["role"] != "system"]
         temperature = getattr(ai_config, "temperature", 0.7) or 0.7
