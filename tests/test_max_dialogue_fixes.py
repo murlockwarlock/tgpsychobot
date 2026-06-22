@@ -232,5 +232,74 @@ class MaxBotUploadStateRoutingTests(unittest.IsolatedAsyncioTestCase):
             mock_receive_file.assert_awaited_once_with(client, app.states, message_with_file)
 
 
+class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
+    def test_extract_directive_payload(self):
+        from max_messenger_bot.services.common import _extract_ai_directive_payload
+        text = "Hello world\nEDIT_IMG: a cute cat"
+        payload, clean = _extract_ai_directive_payload(text, "EDIT_IMG")
+        self.assertEqual(payload, "a cute cat")
+        self.assertEqual(clean, "Hello world")
+
+        text2 = "Some response\nGEN_IMG: blue sky"
+        payload2, clean2 = _extract_ai_directive_payload(text2, "GEN_IMG")
+        self.assertEqual(payload2, "blue sky")
+        self.assertEqual(clean2, "Some response")
+
+    async def test_analyze_image_filters_out_last_image_message(self):
+        from max_messenger_bot import ai
+        
+        # Mock database session and queries
+        config = SimpleNamespace(
+            vision_provider="Gemini",
+            gemini_api_key="gemini-key",
+            vision_model="gemini-2.0-flash",
+            temperature=0.7,
+            system_prompt="some system prompt",
+        )
+        
+        class MockMsg:
+            def __init__(self, role, content):
+                self.role = role
+                self.content = content
+                self.timestamp = 100
+
+        user = SimpleNamespace(id=123, current_topic=None, current_dialogue_id=1, current_topic_id=None)
+        
+        history_rows = [
+            MockMsg("user", "Hello"),
+            MockMsg("assistant", "Hi there"),
+            MockMsg("user", "[Изображение] test caption"),  # Current message saved to DB beforehand
+        ]
+        
+        session = MagicMock()
+        session.get = AsyncMock(return_value=config)
+        session.scalar = AsyncMock(return_value=user)
+        
+        # Mocking execute().scalars().all()
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = history_rows
+        execute_mock = MagicMock()
+        execute_mock.scalars.return_value = scalars_mock
+        session.execute = AsyncMock(return_value=execute_mock)
+        
+        session_context = MagicMock()
+        session_context.__aenter__.return_value = session
+        session_context.__aexit__.return_value = False
+        
+        with (
+            patch.object(ai, "async_session_maker", return_value=session_context),
+            patch.object(ai, "_analyze_gemini", AsyncMock(return_value="analyzed result")) as gemini,
+        ):
+            res = await ai.analyze_image(123, b"image_data", "test caption")
+            
+        self.assertEqual(res, "analyzed result")
+        
+        # Verify history passed to _analyze_gemini does NOT include the [Изображение] message (which was filtered out)
+        history_passed = gemini.call_args.kwargs["history"]
+        self.assertEqual(len(history_passed), 2)
+        self.assertEqual(history_passed[0]["content"], "Hello")
+        self.assertEqual(history_passed[1]["content"], "Hi there")
+
+
 if __name__ == "__main__":
     unittest.main()

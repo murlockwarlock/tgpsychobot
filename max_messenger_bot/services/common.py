@@ -9,7 +9,7 @@ from pathlib import Path
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
 
-from ..ai import AIServiceError, generate_image, get_ai_response
+from ..ai import AIServiceError, generate_image, get_ai_response, edit_image
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
 from ..keyboards import build_main_menu, disclaimer_keyboard, inline_keyboard, main_menu_row
@@ -415,6 +415,17 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             await client.send_message(chat_id=chat_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
 
 
+def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None, str]:
+    pattern = rf"{directive}:\s*(.+?)(?=\n\s*\n|\n(?:[#>*-]|\d+\.)\s|\Z)"
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return None, text.strip()
+
+    payload = match.group(1).strip()
+    clean_text = (text[:match.start()] + text[match.end():]).strip()
+    return payload, clean_text
+
+
 async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id: int, image_bytes: bytes, caption: str) -> None:
     """Run AI vision analysis on the provided image bytes."""
     from ..ai import analyze_image
@@ -427,16 +438,79 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
 
     try:
         response_text = await analyze_image(user_id, image_bytes, prompt)
-        await save_ai_message(user_id, response_text)
-        html_text = markdown_to_html(response_text)
+        if not response_text or not response_text.strip():
+            raise AIServiceError("ИИ вернул пустой ответ при анализе изображения")
+
+        edit_prompt, clean_text = _extract_ai_directive_payload(response_text, "EDIT_IMG")
+        gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
+
+        await save_ai_message(user_id, clean_text)
+        html_text = markdown_to_html(clean_text)
         chunks = split_text(html_text)
+
         if thinking_message_id and chunks:
             await client.edit_message(thinking_message_id, text=chunks[0])
             for chunk in chunks[1:]:
                 await client.send_message(chat_id=chat_id, text=chunk)
-        else:
+            thinking_message_id = None
+        elif chunks:
             for chunk in chunks:
                 await client.send_message(chat_id=chat_id, text=chunk)
+
+        if edit_prompt:
+            edit_status = await client.send_message(chat_id=chat_id, text="🎨 Редактирую ваше фото...")
+            edit_status_id = ((edit_status.get("message") or {}).get("mid") if isinstance(edit_status, dict) else None)
+            try:
+                edited_data = await edit_image(edit_prompt, image_bytes)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(edited_data)
+                    tmp_path = tmp.name
+                try:
+                    result = await client.upload_file("image", tmp_path)
+                    token = result.get("token") or result.get("fileId")
+                    if token:
+                        await client.send_media_attachment(chat_id=chat_id, media_type="image", token=token)
+                    else:
+                        await client.send_message(chat_id=chat_id, text="⚠️ Фото отредактировано, но не удалось отправить.")
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
+            except Exception as img_exc:
+                log.exception("Image edit failed user_id=%s: %s", user_id, img_exc)
+                await client.send_message(chat_id=chat_id, text="⚠️ Не удалось изменить изображение.")
+            finally:
+                if edit_status_id:
+                    try:
+                        await client.delete_message(edit_status_id)
+                    except Exception:
+                        pass
+
+        elif gen_prompt:
+            gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
+            gen_status_id = ((gen_status.get("message") or {}).get("mid") if isinstance(gen_status, dict) else None)
+            try:
+                new_img = await generate_image(gen_prompt)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(new_img)
+                    tmp_path = tmp.name
+                try:
+                    result = await client.upload_file("image", tmp_path)
+                    token = result.get("token") or result.get("fileId")
+                    if token:
+                        await client.send_media_attachment(chat_id=chat_id, media_type="image", token=token)
+                    else:
+                        await client.send_message(chat_id=chat_id, text="⚠️ Изображение сгенерировано, но не удалось отправить.")
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
+            except Exception as img_exc:
+                log.exception("Image generation failed user_id=%s: %s", user_id, img_exc)
+                await client.send_message(chat_id=chat_id, text="⚠️ Не удалось сгенерировать изображение.")
+            finally:
+                if gen_status_id:
+                    try:
+                        await client.delete_message(gen_status_id)
+                    except Exception:
+                        pass
+
     except AIServiceError as exc:
         log.exception("Vision AIServiceError: %s", exc)
         if thinking_message_id:

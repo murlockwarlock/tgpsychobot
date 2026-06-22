@@ -424,15 +424,25 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
         raise AIServiceError(f"Ошибка при транскрибации (KIE API): {e}")
 
 
-async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7) -> str:
+async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None) -> str:
     try:
         file_url = await _upload_file_to_kie(
             api_key, upload_base_url, image_bytes,
             _guess_filename(image_bytes, "vision_input", "jpg"), "images",
         )
+        history_text = []
+        if history:
+            for msg in history:
+                if msg.get("content"):
+                    prefix = "Пользователь" if msg.get("role") == "user" else "Ассистент"
+                    history_text.append(f"{prefix}: {msg.get('content')}")
+        full_system_prompt = system_prompt
+        if history_text:
+            full_system_prompt = f"{system_prompt}\n\nКонтекст диалога:\n" + "\n".join(history_text[-12:])
+
         return await _call_kie_multimodal(
             api_key, base_url, model,
-            system_prompt,
+            full_system_prompt,
             [
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": file_url}},
@@ -810,19 +820,31 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
 # Image Analysis (Vision)
 # ---------------------------------------------------------------------------
 
-async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float) -> str:
+async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None) -> str:
     import httpx
 
     b64_data = base64.b64encode(image_bytes).decode()
     target_model = model or "gemini-2.0-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
+    
+    contents = []
+    if history:
+        for msg in history:
+            if not msg.get("content"):
+                continue
+            role = 'user' if msg.get("role") == 'user' else 'model'
+            contents.append({'role': role, 'parts': [{'text': msg.get("content")}]})
+            
+    contents.append({
+        "role": "user",
+        "parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
+        ]
+    })
+    
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
-            ]
-        }],
+        "contents": contents,
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096},
     }
@@ -836,35 +858,47 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
     return candidates[0]["content"]["parts"][0]["text"]
 
 
-async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float) -> str:
+async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None) -> str:
     b64_data = base64.b64encode(image_bytes).decode()
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
+    messages = [{"role": "system", "content": system_prompt}]
+    if history:
+        for msg in history:
+            messages.append({"role": msg.get("role"), "content": msg.get("content")})
+    messages.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
+        ],
+    })
     response = await client.chat.completions.create(
         model=model or "gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
-                ],
-            },
-        ],
+        messages=messages,
         max_tokens=4096,
         temperature=temperature,
     )
     return response.choices[0].message.content or ""
 
 
-async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float) -> str:
+async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None) -> str:
     b64_data = base64.b64encode(image_bytes).decode()
     client = anthropic.AsyncAnthropic(api_key=api_key)
+    history_text = []
+    if history:
+        for msg in history:
+            if msg.get("content"):
+                prefix = "Пользователь" if msg.get("role") == "user" else "Ассистент"
+                history_text.append(f"{prefix}: {msg.get('content')}")
+    full_prompt = system_prompt
+    if history_text:
+        full_prompt = f"{system_prompt}\n\nКонтекст диалога:\n" + "\n".join(history_text[-12:])
+        
     response = await client.messages.create(
         model=model or "claude-sonnet-4-5-20250929",
         max_tokens=4096,
         temperature=temperature,
-        system=system_prompt,
+        system=full_prompt,
         messages=[{
             "role": "user",
             "content": [
@@ -887,37 +921,83 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         if not user:
             raise AIServiceError("Пользователь не найден")
         config = await session.get(AIConfig, 1)
-    if not config:
-        raise AIServiceError("AIConfig не найден")
+        if not config:
+            raise AIServiceError("AIConfig не найден")
 
-    if not getattr(config, "vision_provider", None) or config.vision_provider == "None":
-        raise AIServiceError("Обработка изображений отключена администратором")
+        if not getattr(config, "vision_provider", None) or config.vision_provider == "None":
+            raise AIServiceError("Обработка изображений отключена администратором")
 
-    provider = (config.vision_provider or "Gemini").strip()
-    temperature = getattr(config, "temperature", 0.7) or 0.7
-    system_prompt = _build_user_system_prompt(user, config)
+        provider = (config.vision_provider or "Gemini").strip()
+        temperature = getattr(config, "temperature", 0.7) or 0.7
+        
+        photo_instructions = (
+            "\n\nИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"
+            "1. Если пользователь просит ИЗМЕНИТЬ это фото или 'сделать так же', добавь в конце: EDIT_IMG: <prompt on english>.\n"
+            "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"
+            "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
+        )
+        system_prompt = _build_user_system_prompt(user, config) + photo_instructions
+
+        current_memory_mode = normalize_memory_mode(config)
+        history_scope = _build_max_history_scope(user, current_memory_mode)
+        history_rows = (
+            await session.execute(
+                select(DBMessage)
+                .where(history_scope)
+                .order_by(DBMessage.timestamp.asc())
+            )
+        ).scalars().all()
+
+        limit_first = getattr(config, "context_limit_first", 2) or 2
+        limit_recent = getattr(config, "context_limit_recent", 10) or 10
+
+        # Filter out the message we just saved before calling this function, which ends with role == 'user' and starts with "[Изображение]"
+        if history_rows and history_rows[-1].role == "user" and history_rows[-1].content.startswith("[Изображение]"):
+            history_rows = history_rows[:-1]
+
+        pairs = []
+        current_pair = []
+        for msg in history_rows:
+            if msg.role == 'user' and any(m.role == 'assistant' for m in current_pair):
+                pairs.append(current_pair)
+                current_pair = [msg]
+            else:
+                current_pair.append(msg)
+        if current_pair:
+            pairs.append(current_pair)
+
+        if len(pairs) <= limit_first + limit_recent:
+            selected_pairs = pairs
+        else:
+            selected_pairs = pairs[:limit_first] + pairs[-limit_recent:]
+
+        history_rows = []
+        for pair in selected_pairs:
+            history_rows.extend(pair)
+
+        history_list = [{"role": row.role, "content": row.content} for row in history_rows if row.content]
 
     if provider == "Gemini":
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для vision не задан")
-        return await _analyze_gemini(api_key, config.vision_model or "gemini-2.0-flash", image_bytes, system_prompt, prompt, temperature)
+        return await _analyze_gemini(api_key, config.vision_model or "gemini-2.0-flash", image_bytes, system_prompt, prompt, temperature, history=history_list)
     if provider in {"Claude", "Anthropic"}:
         api_key = config.claude_api_key
         if not api_key:
             raise AIServiceError("API ключ Claude для vision не задан")
-        return await _analyze_claude(api_key, config.vision_model or "claude-sonnet-4-5-20250929", image_bytes, system_prompt, prompt, temperature)
+        return await _analyze_claude(api_key, config.vision_model or "claude-sonnet-4-5-20250929", image_bytes, system_prompt, prompt, temperature, history=history_list)
     if provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
         model = config.vision_model or "google/gemini-2.5-pro"
-        return await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, system_prompt, prompt, temperature)
+        return await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, system_prompt, prompt, temperature, history=history_list)
     # Default: OpenAI
     api_key = config.openai_api_key
     if not api_key:
         raise AIServiceError("API ключ OpenAI для vision не задан")
-    return await _analyze_openai(api_key, config.vision_model or "gpt-4o", image_bytes, system_prompt, prompt, temperature)
+    return await _analyze_openai(api_key, config.vision_model or "gpt-4o", image_bytes, system_prompt, prompt, temperature, history=history_list)
 
 
 # ---------------------------------------------------------------------------
