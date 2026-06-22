@@ -310,10 +310,22 @@ class MaxFormattingTests(unittest.TestCase):
         html_out = markdown_to_html(text)
         self.assertEqual(html_out, "• <b>Item 1</b>\n• <b>Item 2</b>\n• Item 3")
 
-        # Test headings
+        # Test headings and heading spacing
         text_headings = "### Heading 3\nSome text"
         html_headings = markdown_to_html(text_headings)
         self.assertEqual(html_headings, "<b>Heading 3</b>\nSome text")
+
+        text_spacing = "Some text.\n### Heading"
+        html_spacing = markdown_to_html(text_spacing)
+        self.assertEqual(html_spacing, "Some text.\n\n<b>Heading</b>")
+
+        # Test bullet lists remain close together but headings get spacing
+        text_complex = "Intro text.\n* Bullet 1\n* Bullet 2\n### Subheading\nSome other text."
+        html_complex = markdown_to_html(text_complex)
+        self.assertEqual(
+            html_complex,
+            "Intro text.\n• Bullet 1\n• Bullet 2\n\n<b>Subheading</b>\nSome other text."
+        )
 
         # Test standard bold and italic text
         text_bold_italic = "This is **bold** and *italic* text."

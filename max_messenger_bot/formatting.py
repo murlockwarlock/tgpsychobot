@@ -34,6 +34,10 @@ def markdown_to_html(text: str | None) -> str:
     escaped = escaped.replace('**', '').replace('__', '')
     escaped = escaped.replace('<b></b>', '').replace('<i></i>', '')
 
+    # 5. Enforce line breaks before headers (bold tags that start on a new line)
+    escaped = re.sub(r'([^\n])\n(<b>)', r'\1\n\n\2', escaped)
+    escaped = re.sub(r'\n{3,}', '\n\n', escaped)
+
     return escaped
 
 
