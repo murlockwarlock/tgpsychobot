@@ -44,24 +44,34 @@ async def _send_ai_text(
     chunks: list[str],
 ) -> None:
     main_menu_kb = inline_keyboard([main_menu_row()])
-    if thinking_message_id and chunks:
+    if not chunks:
+        return
+
+    if len(chunks) == 1:
+        if thinking_message_id:
+            await client.edit_message(
+                thinking_message_id,
+                text=chunks[0],
+                attachments=main_menu_kb,
+            )
+        else:
+            await client.send_message(chat_id=chat_id, text=chunks[0], attachments=main_menu_kb)
+        return
+
+    if thinking_message_id:
         await client.edit_message(
             thinking_message_id,
             text=chunks[0],
-            attachments=main_menu_kb if len(chunks) == 1 else None,
+            attachments=None,
         )
         remaining_chunks = chunks[1:]
     else:
         remaining_chunks = chunks
 
-    if len(chunks) == 1 and not thinking_message_id:
-        await client.send_message(chat_id=chat_id, text=chunks[0], attachments=main_menu_kb)
-        return
-
-    for chunk in remaining_chunks:
-        await client.send_message(chat_id=chat_id, text=chunk)
-    if len(chunks) > 1:
-        await client.send_message(chat_id=chat_id, text="Главное меню:", attachments=main_menu_kb)
+    for i, chunk in enumerate(remaining_chunks):
+        is_last = (i == len(remaining_chunks) - 1)
+        kb = main_menu_kb if is_last else None
+        await client.send_message(chat_id=chat_id, text=chunk, attachments=kb)
 
 
 async def is_admin(user_id: int) -> bool:

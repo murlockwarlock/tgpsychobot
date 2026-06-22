@@ -37,7 +37,7 @@ class MaxHistoryScopeTests(unittest.TestCase):
 
 
 class MaxChunkedResponseTests(unittest.IsolatedAsyncioTestCase):
-    async def test_multichunk_response_sends_separate_main_menu(self):
+    async def test_multichunk_response_appends_menu_to_last_chunk(self):
         client = SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock())
 
         await _send_ai_text(client, 123, "thinking-id", ["first", "second"])
@@ -47,9 +47,9 @@ class MaxChunkedResponseTests(unittest.IsolatedAsyncioTestCase):
             text="first",
             attachments=None,
         )
-        self.assertEqual(client.send_message.await_count, 2)
+        self.assertEqual(client.send_message.await_count, 1)
         final_call = client.send_message.await_args_list[-1]
-        self.assertEqual(final_call.kwargs["text"], "Главное меню:")
+        self.assertEqual(final_call.kwargs["text"], "second")
         self.assertTrue(final_call.kwargs["attachments"])
 
     async def test_single_chunk_keeps_menu_on_answer(self):
