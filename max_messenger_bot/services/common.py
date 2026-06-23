@@ -129,7 +129,11 @@ async def get_content_attachments(content_key: str) -> list[dict]:
                 select(MaxContentMedia).where(MaxContentMedia.content_key == content_key).order_by(MaxContentMedia.id.asc())
             )
         ).scalars().all()
-    return [{"type": row.media_type, "payload": {"token": row.token}} for row in media_rows]
+    attachments = []
+    for row in media_rows:
+        mtype = "image" if row.media_type == "photo" else row.media_type
+        attachments.append({"type": mtype, "payload": {"token": row.token}})
+    return attachments
 
 
 async def send_main_menu(client: MaxApiClient, chat_id: int, text: str = "Главное меню:") -> None:
