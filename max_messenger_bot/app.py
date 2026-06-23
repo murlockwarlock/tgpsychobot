@@ -531,13 +531,41 @@ class MaxBotApplication:
             user = await session.get(User, message.sender.user_id, options=[selectinload(User.subscription)])
         if content:
             from .keyboards import inline_keyboard, main_menu_row
+            import asyncio
             content_attachments = await common.get_content_attachments(content.key)
             nav = inline_keyboard([main_menu_row()])
-            await self.client.send_message(
-                chat_id=message.chat_id,
-                text=content.text_content or "Раздел пока пуст.",
-                attachments=(content_attachments or []) + nav,
-            )
+            order = content.content_order or "media_top"
+
+            if content_attachments and order == "media_top":
+                await self.client.send_message(
+                    chat_id=message.chat_id,
+                    text="",
+                    attachments=content_attachments,
+                )
+                await asyncio.sleep(0.2)
+                await self.client.send_message(
+                    chat_id=message.chat_id,
+                    text=content.text_content or "Раздел пока пуст.",
+                    attachments=nav,
+                )
+            elif content_attachments and order == "text_top":
+                await self.client.send_message(
+                    chat_id=message.chat_id,
+                    text=content.text_content or "Раздел пока пуст.",
+                    attachments=nav,
+                )
+                await asyncio.sleep(0.2)
+                await self.client.send_message(
+                    chat_id=message.chat_id,
+                    text="",
+                    attachments=content_attachments,
+                )
+            else:
+                await self.client.send_message(
+                    chat_id=message.chat_id,
+                    text=content.text_content or "Раздел пока пуст.",
+                    attachments=(content_attachments or []) + nav,
+                )
             return
 
         if not user:
