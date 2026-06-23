@@ -333,5 +333,110 @@ class MaxFormattingTests(unittest.TestCase):
         self.assertEqual(html_bold_italic, "This is <b>bold</b> and <i>italic</i> text.")
 
 
+class MockStateStore:
+    def __init__(self):
+        self.states = {}
+
+    async def get(self, user_id):
+        from max_messenger_bot.storage import StateSnapshot
+        if user_id in self.states:
+            return StateSnapshot(state=self.states[user_id]["state"], data=self.states[user_id]["data"])
+        return None
+
+    async def set(self, user_id, chat_id, state, data=None):
+        self.states[user_id] = {"chat_id": chat_id, "state": state, "data": data or {}}
+
+    async def clear(self, user_id):
+        self.states.pop(user_id, None)
+
+
+class MaxAdminContentEditorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admin_content_editor_flow(self):
+        from max_messenger_bot.services import admin_content
+        from max_messenger_bot.legacy import Content
+        from max_messenger_bot.storage import MaxContentMedia
+
+        # Mock database session
+        session = MagicMock()
+        session.commit = AsyncMock()
+        content_item = Content(key="about_me", text_content="old text", content_order="media_top", is_visible=True)
+        session.get = AsyncMock(return_value=content_item)
+
+        media_rows = [
+            MaxContentMedia(content_key="about_me", media_type="photo", token="tok123"),
+        ]
+        content_list_rows = [
+            content_item,
+        ]
+
+        def mock_execute(query):
+            query_str = str(query)
+            scalars_mock = MagicMock()
+            if "max_content_media" in query_str:
+                scalars_mock.all.return_value = media_rows
+            else:
+                scalars_mock.all.return_value = content_list_rows
+            execute_mock = MagicMock()
+            execute_mock.scalars.return_value = scalars_mock
+            return execute_mock
+
+        session.execute = AsyncMock(side_effect=mock_execute)
+
+        session_context = MagicMock()
+        session_context.__aenter__.return_value = session
+        session_context.__aexit__.return_value = False
+
+        client = MagicMock()
+        client.send_message = AsyncMock()
+
+        states = MockStateStore()
+
+        with patch("max_messenger_bot.services.admin_content.async_session_maker", return_value=session_context):
+            # 1. Test show_content_editor initializes state
+            await admin_content.show_content_editor(client, states, chat_id=111, user_id=222, content_key="about_me")
+
+            # Verify state was initialized
+            snapshot = await states.get(222)
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.state, "admin_edit_content")
+            self.assertEqual(snapshot.data["content_key"], "about_me")
+            self.assertEqual(snapshot.data["text_content"], "old text")
+            self.assertEqual(len(snapshot.data["media_files"]), 1)
+            self.assertEqual(snapshot.data["media_files"][0]["token"], "tok123")
+
+            # 2. Test receive_message updates state with text and media
+            await admin_content.receive_message(client, states, chat_id=111, user_id=222, text="new text", media_token=None, media_type=None)
+            snapshot = await states.get(222)
+            self.assertEqual(snapshot.data["text_content"], "new text")
+
+            await admin_content.receive_message(client, states, chat_id=111, user_id=222, text=None, media_token="tok456", media_type="image")
+            snapshot = await states.get(222)
+            self.assertEqual(len(snapshot.data["media_files"]), 2)
+            self.assertEqual(snapshot.data["media_files"][1]["token"], "tok456")
+            self.assertEqual(snapshot.data["media_files"][1]["type"], "photo")
+
+            # 3. Test handle_order_toggle toggles ordering
+            await admin_content.handle_order_toggle(client, states, chat_id=111, user_id=222, content_key="about_me")
+            snapshot = await states.get(222)
+            self.assertEqual(snapshot.data["content_order"], "text_top")
+
+            # 4. Test handle_media_delete deletes media file
+            await admin_content.handle_media_delete(client, states, chat_id=111, user_id=222, content_key="about_me", index=0)
+            snapshot = await states.get(222)
+            self.assertEqual(len(snapshot.data["media_files"]), 1)
+            self.assertEqual(snapshot.data["media_files"][0]["token"], "tok456")
+
+            # 5. Test handle_save_content commits to db
+            await admin_content.handle_save_content(client, states, chat_id=111, user_id=222, content_key="about_me")
+            # Verify state was cleared
+            snapshot = await states.get(222)
+            self.assertIsNone(snapshot)
+
+            # Verify session calls to update Content and MaxContentMedia
+            self.assertEqual(content_item.text_content, "new text")
+            self.assertEqual(content_item.content_order, "text_top")
+            session.commit.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()

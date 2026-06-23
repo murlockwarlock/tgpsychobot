@@ -374,15 +374,34 @@ def admin_content_list_keyboard(items: list[tuple[str, str, bool]]) -> list[dict
     return inline_keyboard(rows)
 
 
-def admin_content_editor_keyboard(content_key: str, is_visible: bool) -> list[dict]:
-    status_text = "Скрыть" if is_visible else "Показать"
-    return inline_keyboard(
-        [
-            [callback_button("✏️ Изменить текст", f"admin_content_edit_text_{content_key}")],
-            [callback_button(f"👁 {status_text}", f"admin_toggle_content_visibility_{content_key}")],
-            [callback_button("⬅️ К контенту", "admin_content")],
-        ]
-    )
+def admin_content_editor_keyboard(
+    content_key: str,
+    media_files: list[dict],
+    content_order: str,
+    is_visible: bool
+) -> list[dict]:
+    rows: list[list[dict]] = []
+
+    # 1. Order toggle button
+    order_text = "🖼 Медиа сверху ⬇️ Текст снизу" if content_order == 'media_top' else "📝 Текст сверху ⬇️ Медиа снизу"
+    rows.append([callback_button(order_text, f"admin_content_toggle_order_{content_key}")])
+
+    # 2. Visibility toggle button
+    status_text = "👁 Скрыть раздел" if is_visible else "👁 Показать раздел"
+    rows.append([callback_button(status_text, f"admin_toggle_content_visibility_{content_key}")])
+
+    # 3. Delete buttons for media
+    for i, mf in enumerate(media_files):
+        emoji = "🖼️" if mf["type"] == "photo" else "📹"
+        rows.append([callback_button(f"❌ Удалить {emoji} #{i + 1}", f"admin_content_delete_media_{content_key}_{i}")])
+
+    # 4. Save and Cancel buttons
+    rows.append([
+        callback_button("✅ Сохранить", f"admin_content_save_{content_key}"),
+        callback_button("❌ Отмена", f"admin_content_cancel_{content_key}")
+    ])
+
+    return inline_keyboard(rows)
 
 
 def admin_buttons_keyboard(items: list) -> list[dict]:

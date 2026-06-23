@@ -39,6 +39,7 @@ log = get_bot_logger("app")
 max_log = get_max_logger("transport")
 
 TEXT_FILE_INPUT_STATES = {
+    "admin_edit_content",
     "admin_edit_content_text",
     "admin_edit_topic_prompt",
     "admin_edit_topic_intro",
@@ -201,13 +202,15 @@ class MaxBotApplication:
             if state.state == "awaiting_promo_code":
                 await subscriptions_service.apply_promo_code(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
-            if state.state == "admin_edit_content_text":
-                await admin_content_service.save_text_edit(
+            if state.state == "admin_edit_content":
+                await admin_content_service.receive_message(
                     self.client,
                     self.states,
                     message.chat_id,
                     message.sender.user_id,
-                    message.html_text or text,
+                    message.html_text or text or None,
+                    message.media_token,
+                    message.media_type,
                 )
                 return
             if state.state == "admin_create_topic_name":
@@ -1136,22 +1139,60 @@ class MaxBotApplication:
                 await admin_content_service.show_content_list(self.client, chat_id)
                 return
             if data.startswith("admin_edit_content_"):
-                await admin_content_service.show_content_editor(self.client, chat_id, data.replace("admin_edit_content_", "", 1))
-                return
-            if data.startswith("admin_content_edit_text_"):
-                await admin_content_service.start_text_edit(
+                await admin_content_service.show_content_editor(
                     self.client,
                     self.states,
                     chat_id,
                     user_id,
-                    data.replace("admin_content_edit_text_", "", 1),
+                    data.replace("admin_edit_content_", "", 1)
+                )
+                return
+            if data.startswith("admin_content_toggle_order_"):
+                await admin_content_service.handle_order_toggle(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    data.replace("admin_content_toggle_order_", "", 1)
                 )
                 return
             if data.startswith("admin_toggle_content_visibility_"):
                 await admin_content_service.toggle_visibility(
                     self.client,
+                    self.states,
                     chat_id,
+                    user_id,
                     data.replace("admin_toggle_content_visibility_", "", 1),
+                )
+                return
+            if data.startswith("admin_content_delete_media_"):
+                payload = data.replace("admin_content_delete_media_", "", 1)
+                content_key, index_str = payload.rsplit("_", 1)
+                await admin_content_service.handle_media_delete(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    content_key,
+                    int(index_str),
+                )
+                return
+            if data.startswith("admin_content_save_"):
+                await admin_content_service.handle_save_content(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    data.replace("admin_content_save_", "", 1),
+                )
+                return
+            if data.startswith("admin_content_cancel_"):
+                await admin_content_service.handle_cancel_edit(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    data.replace("admin_content_cancel_", "", 1),
                 )
                 return
             if data == "admin_referral_menu":
