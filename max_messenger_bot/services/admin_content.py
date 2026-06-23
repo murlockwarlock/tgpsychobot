@@ -89,8 +89,16 @@ async def show_content_editor(
     else:
         media_display = "<i>Медиафайлы не добавлены.</i>"
 
-    source_display = html.escape(text_content or "Текст не задан.")
-    rendered_display = text_content or "Текст не задан."
+    preview_limit = 700
+    if text_content and len(text_content) > preview_limit:
+        truncated = text_content[:preview_limit]
+        from ..formatting import _open_tags
+        unclosed = _open_tags(truncated)
+        rendered_display = truncated + "".join(f"</{t}>" for t in reversed(unclosed)) + "\n... (текст обрезан для предпросмотра)"
+        source_display = html.escape(text_content[:preview_limit]) + "\n... (исходный код обрезан)"
+    else:
+        rendered_display = text_content or "Текст не задан."
+        source_display = html.escape(text_content or "Текст не задан.")
 
     message = (
         f"📝 <b>{html.escape(title)}</b>\n\n"

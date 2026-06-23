@@ -130,7 +130,9 @@ def _markup_tags(markup: dict[str, Any]) -> tuple[str, str] | None:
 def _render_markup_html(text: str | None, markups: Any) -> str | None:
     if not text or not isinstance(markups, list):
         return None
-    chars = list(text)
+    # MAX platform uses UTF-16 code unit offsets (Telegram-compatible)
+    utf16_bytes = text.encode('utf-16-le')
+    code_units = [utf16_bytes[i:i+2].decode('utf-16-le', errors='surrogatepass') for i in range(0, len(utf16_bytes), 2)]
     openings: dict[int, list[str]] = {}
     closings: dict[int, list[str]] = {}
     for markup in markups:
@@ -141,18 +143,19 @@ def _render_markup_html(text: str | None, markups: Any) -> str | None:
         if not bounds or not tags:
             continue
         start, end = bounds
-        if start >= len(chars):
+        if start >= len(code_units):
             continue
-        end = min(end, len(chars))
+        end = min(end, len(code_units))
         opening, closing = tags
         openings.setdefault(start, []).append(opening)
         closings.setdefault(end, []).insert(0, closing)
     parts: list[str] = []
-    for index, char in enumerate(chars):
+    for index, cu in enumerate(code_units):
         parts.extend(openings.get(index, []))
-        parts.append(html.escape(char))
+        parts.append(html.escape(cu))
         parts.extend(closings.get(index + 1, []))
-    return "".join(parts)
+    raw_html = "".join(parts)
+    return raw_html.encode('utf-16-le', errors='surrogatepass').decode('utf-16-le')
 
 
 def parse_message(update: dict[str, Any]) -> IncomingMessage | None:

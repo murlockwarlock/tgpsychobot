@@ -332,6 +332,19 @@ class MaxFormattingTests(unittest.TestCase):
         html_bold_italic = markdown_to_html(text_bold_italic)
         self.assertEqual(html_bold_italic, "This is <b>bold</b> and <i>italic</i> text.")
 
+    def test_render_markup_html_utf16(self):
+        from max_messenger_bot.models import _render_markup_html
+        
+        # Test surrogate pair emoji causes offset shift.
+        # "👥" is 2 UTF-16 code units.
+        # " " is 1 UTF-16 code unit.
+        # So "НАШИ ЭКСПЕРТЫ" starts at index 3 in UTF-16 and has length 13.
+        text = "👥 НАШИ ЭКСПЕРТЫ"
+        markups = [{'from': 3, 'length': 13, 'type': 'strong'}]
+        
+        rendered = _render_markup_html(text, markups)
+        self.assertEqual(rendered, "👥 <b>НАШИ ЭКСПЕРТЫ</b>")
+
 
 class MockStateStore:
     def __init__(self):
