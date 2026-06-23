@@ -91,3 +91,22 @@ def split_text(text: str, max_len: int = MAX_MESSAGE_TEXT_LEN) -> list[str]:
         prefix = "".join(f"<{tag}>" for tag in active)
         rest = rest[boundary:].strip()
     return [part for part in parts if part]
+
+
+def translate_telegram_links_to_max(text: str | None) -> str:
+    if not text:
+        return ""
+    from .settings import get_settings
+    bot_name = get_settings().bot_name
+    if not bot_name:
+        return text
+
+    # Matches tg://resolve?domain=botname&start=payload or tg://resolve?domain=botname&amp;start=payload
+    pattern_tg = r'tg://resolve\?domain=[a-zA-Z0-9_]+&(?:amp;)?start=([a-zA-Z0-9_]+)'
+    text = re.sub(pattern_tg, f'https://max.ru/{bot_name}?start=\\1', text)
+
+    # Matches https://t.me/botname?start=payload or http://t.me/botname?start=payload etc.
+    pattern_http = r'https?://(?:t\.me|telegram\.me)/[a-zA-Z0-9_]+\?start=([a-zA-Z0-9_]+)'
+    text = re.sub(pattern_http, f'https://max.ru/{bot_name}?start=\\1', text)
+
+    return text

@@ -532,9 +532,11 @@ class MaxBotApplication:
         if content:
             from .keyboards import inline_keyboard, main_menu_row
             import asyncio
+            from .formatting import translate_telegram_links_to_max
             content_attachments = await common.get_content_attachments(content.key)
             nav = inline_keyboard([main_menu_row()])
             order = content.content_order or "media_top"
+            content_text = translate_telegram_links_to_max(content.text_content) or "Раздел пока пуст."
 
             if content_attachments and order == "media_top":
                 await self.client.send_message(
@@ -545,13 +547,13 @@ class MaxBotApplication:
                 await asyncio.sleep(0.2)
                 await self.client.send_message(
                     chat_id=message.chat_id,
-                    text=content.text_content or "Раздел пока пуст.",
+                    text=content_text,
                     attachments=nav,
                 )
             elif content_attachments and order == "text_top":
                 await self.client.send_message(
                     chat_id=message.chat_id,
-                    text=content.text_content or "Раздел пока пуст.",
+                    text=content_text,
                     attachments=nav,
                 )
                 await asyncio.sleep(0.2)
@@ -563,7 +565,7 @@ class MaxBotApplication:
             else:
                 await self.client.send_message(
                     chat_id=message.chat_id,
-                    text=content.text_content or "Раздел пока пуст.",
+                    text=content_text,
                     attachments=(content_attachments or []) + nav,
                 )
             return

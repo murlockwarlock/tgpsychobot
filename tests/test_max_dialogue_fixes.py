@@ -345,6 +345,25 @@ class MaxFormattingTests(unittest.TestCase):
         rendered = _render_markup_html(text, markups)
         self.assertEqual(rendered, "👥 <b>НАШИ ЭКСПЕРТЫ</b>")
 
+    def test_translate_telegram_links_to_max(self):
+        from max_messenger_bot.formatting import translate_telegram_links_to_max
+        from unittest.mock import patch, MagicMock
+        
+        # Test rewriting telegram links to max platform links using settings bot name
+        settings_mock = MagicMock()
+        settings_mock.bot_name = "test_bot_name"
+        
+        with patch("max_messenger_bot.settings.get_settings", return_value=settings_mock):
+            # Test tg://resolve format with start payload
+            text_tg = "Click here: tg://resolve?domain=yourself_way_bot&start=about"
+            text_tg_amp = "Click here: tg://resolve?domain=yourself_way_bot&amp;start=about"
+            # Test http/https format
+            text_http = "Click here: https://t.me/yourself_way_bot?start=about_me"
+            
+            self.assertEqual(translate_telegram_links_to_max(text_tg), "Click here: https://max.ru/test_bot_name?start=about")
+            self.assertEqual(translate_telegram_links_to_max(text_tg_amp), "Click here: https://max.ru/test_bot_name?start=about")
+            self.assertEqual(translate_telegram_links_to_max(text_http), "Click here: https://max.ru/test_bot_name?start=about_me")
+
 
 class MockStateStore:
     def __init__(self):

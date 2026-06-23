@@ -260,9 +260,11 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
             return
         content = await get_content(start_payload)
         if content and content.is_visible:
+            from ..formatting import translate_telegram_links_to_max
+            content_text = translate_telegram_links_to_max(content.text_content) or "Раздел пока пуст."
             await client.send_message(
                 chat_id=chat_id,
-                text=content.text_content or "Раздел пока пуст.",
+                text=content_text,
                 attachments=await get_content_attachments(start_payload) or None,
             )
             await send_main_menu(client, chat_id)
