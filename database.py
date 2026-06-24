@@ -154,6 +154,8 @@ class AIConfig(Base):
     allow_image_edit = Column(Boolean, default=False, nullable=False)
     use_proxy = Column(Boolean, default=True, nullable=False)
     fallback_timeout = Column(Integer, default=60, nullable=False)
+    system_prompt_updated_at = Column(DateTime, nullable=True)
+
 
 
 class KnowledgeBase(Base):
@@ -181,6 +183,7 @@ class Topic(Base):
     start_message = Column(Text, nullable=True)
     start_button_text = Column(String, nullable=True)
     start_button_payload = Column(Text, nullable=True)
+    system_prompt_updated_at = Column(DateTime, nullable=True)
 
     knowledge_base_files = relationship("KnowledgeBase", secondary=topic_knowledgebase_association,
                                         back_populates="topics")

@@ -271,16 +271,17 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
             return
 
     start_content = await get_content("start_message")
+    from ..formatting import translate_telegram_links_to_max
     if start_content and start_content.text_content:
         await client.send_message(
             chat_id=chat_id,
-            text=start_content.text_content,
+            text=translate_telegram_links_to_max(start_content.text_content),
             attachments=await get_content_attachments("start_message") or None,
         )
     else:
         await client.send_message(chat_id=chat_id, text="Здравствуйте. Бот в MAX готов к работе.")
     if welcome_bonus_text:
-        await client.send_message(chat_id=chat_id, text=welcome_bonus_text)
+        await client.send_message(chat_id=chat_id, text=translate_telegram_links_to_max(welcome_bonus_text))
     await send_main_menu(client, chat_id)
 
 
@@ -464,14 +465,9 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
         html_text = markdown_to_html(clean_text)
         chunks = split_text(html_text)
 
-        if thinking_message_id and chunks:
-            await client.edit_message(thinking_message_id, text=chunks[0])
-            for chunk in chunks[1:]:
-                await client.send_message(chat_id=chat_id, text=chunk)
+        if chunks:
+            await _send_ai_text(client, chat_id, thinking_message_id, chunks)
             thinking_message_id = None
-        elif chunks:
-            for chunk in chunks:
-                await client.send_message(chat_id=chat_id, text=chunk)
 
         if edit_prompt:
             edit_status = await client.send_message(chat_id=chat_id, text="🎨 Редактирую ваше фото...")

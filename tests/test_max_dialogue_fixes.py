@@ -354,15 +354,19 @@ class MaxFormattingTests(unittest.TestCase):
         settings_mock.bot_name = "test_bot_name"
         
         with patch("max_messenger_bot.settings.get_settings", return_value=settings_mock):
-            # Test tg://resolve format with start payload
+             # Test tg://resolve format with start payload
             text_tg = "Click here: tg://resolve?domain=yourself_way_bot&start=about"
             text_tg_amp = "Click here: tg://resolve?domain=yourself_way_bot&amp;start=about"
             # Test http/https format
             text_http = "Click here: https://t.me/yourself_way_bot?start=about_me"
+            text_hyphen = "Click here: tg://resolve?domain=yourself_way_bot&start=about-me-now"
+            text_http_hyphen = "Click here: https://t.me/yourself_way_bot?start=about-me-now"
             
             self.assertEqual(translate_telegram_links_to_max(text_tg), "Click here: https://max.ru/test_bot_name?start=about")
             self.assertEqual(translate_telegram_links_to_max(text_tg_amp), "Click here: https://max.ru/test_bot_name?start=about")
             self.assertEqual(translate_telegram_links_to_max(text_http), "Click here: https://max.ru/test_bot_name?start=about_me")
+            self.assertEqual(translate_telegram_links_to_max(text_hyphen), "Click here: https://max.ru/test_bot_name?start=about-me-now")
+            self.assertEqual(translate_telegram_links_to_max(text_http_hyphen), "Click here: https://max.ru/test_bot_name?start=about-me-now")
 
 
 class MockStateStore:

@@ -55,8 +55,9 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         return
     current_memory_mode = normalize_memory_mode(config)
     restored = await _apply_topic_switch(user, topic_id, current_memory_mode)
+    from ..formatting import translate_telegram_links_to_max
     if topic.start_message:
-        text = topic.start_message
+        text = translate_telegram_links_to_max(topic.start_message)
     elif current_memory_mode == "global":
         text = f"✅ Переключились на тему: <b>{topic.name}</b>.\n\nТекущий диалог продолжается. Память сохранена."
     elif restored:

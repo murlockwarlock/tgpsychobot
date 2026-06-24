@@ -3125,13 +3125,18 @@ async def edit_system_prompt(callback: CallbackQuery, state: FSMContext):
         config = await session.get(AIConfig, 1)
 
     prompt_too_long = False
+    from time_helpers import to_msk
+    time_str = ""
+    if getattr(config, 'system_prompt_updated_at', None):
+        time_str = f"\nЗагружен: {to_msk(config.system_prompt_updated_at).strftime('%d.%m.%y %H:%M')}"
+
     if config.prompt_mode == 'file':
         prompt_too_long = True
-        prompt_info = f"Текущий промпт загружен из файла: `{config.prompt_filename}`"
+        prompt_info = f"Текущий промпт загружен из файла: `{config.prompt_filename}`{time_str}"
         message_text_content = "Отправьте новый текст или .txt файл, чтобы его заменить."
         message_text = f"{prompt_info}\n\n{message_text_content}"
     else:
-        prompt_info = "Текущий промпт сохранен как текст."
+        prompt_info = f"Текущий промпт сохранен как текст.{time_str}"
         prompt_text = config.system_prompt or ""
         display_text = prompt_text
         if len(prompt_text) > 3500:
@@ -3184,12 +3189,14 @@ async def download_system_prompt(callback: CallbackQuery):
 
 @router.message(AdminStates.set_system_prompt, (F.text | F.document))
 async def process_system_prompt(message: Message, state: FSMContext, bot: Bot):
+    from datetime import datetime
     async with async_session_maker() as session:
         if message.text:
             stmt = update(AIConfig).where(AIConfig.id == 1).values(
                 system_prompt=message.text,
                 prompt_mode='text',
-                prompt_filename=None
+                prompt_filename=None,
+                system_prompt_updated_at=datetime.utcnow()
             )
             await session.execute(stmt)
             await session.commit()
@@ -3219,7 +3226,8 @@ async def process_system_prompt(message: Message, state: FSMContext, bot: Bot):
 
             stmt = update(AIConfig).where(AIConfig.id == 1).values(
                 prompt_mode='file',
-                prompt_filename=document.file_name
+                prompt_filename=document.file_name,
+                system_prompt_updated_at=datetime.utcnow()
             )
             await session.execute(stmt)
             await session.commit()
@@ -5035,6 +5043,9 @@ async def show_edit_topic_menu(callback: CallbackQuery, topic_id: int):
 
     kb_files_count = len(topic.knowledge_base_files)
     prompt_status = "✅ Задан" if topic.system_prompt else "❌ Не задан (используется общий)"
+    if topic.system_prompt and getattr(topic, 'system_prompt_updated_at', None):
+        from time_helpers import to_msk
+        prompt_status += f" (Загружен: {to_msk(topic.system_prompt_updated_at).strftime('%d.%m.%y %H:%M')})"
     active_status = "🟢 Активна" if topic.is_active else "⚪️ Неактивна"
 
     text = (
@@ -5239,7 +5250,11 @@ async def admin_edit_topic_prompt_process(message: Message, state: FSMContext, b
             return
 
     async with async_session_maker() as session:
-        stmt = update(Topic).where(Topic.id == topic_id).values(system_prompt=new_prompt)
+        from datetime import datetime
+        stmt = update(Topic).where(Topic.id == topic_id).values(
+            system_prompt=new_prompt,
+            system_prompt_updated_at=datetime.utcnow()
+        )
         await session.execute(stmt)
         await session.commit()
 
@@ -9408,6 +9423,9 @@ async def _show_edit_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_i
     kb_files_count = len(topic.knowledge_base_files)
     colls_info = ", ".join(assigned_coll_names) if assigned_coll_names else "не привязаны"
     prompt_status = "✅ Задан" if topic.system_prompt else "❌ Не задан (используется общий)"
+    if topic.system_prompt and getattr(topic, 'system_prompt_updated_at', None):
+        from time_helpers import to_msk
+        prompt_status += f" (Загружен: {to_msk(topic.system_prompt_updated_at).strftime('%d.%m.%y %H:%M')})"
     active_status = "🟢 Активна" if topic.is_active else "⚪️ Неактивна"
     admin_only = getattr(topic, 'admin_only', False)
     admin_only_status = "🔒 Только для админов" if admin_only else "🔓 Видна всем"
@@ -9475,7 +9493,10 @@ async def download_topic_prompt(callback: CallbackQuery):
 async def reset_topic_prompt(callback: CallbackQuery, state: FSMContext, bot: Bot):
     topic_id = int(callback.data.split("_")[-1])
     async with async_session_maker() as session:
-        stmt = update(Topic).where(Topic.id == topic_id).values(system_prompt=None)
+        stmt = update(Topic).where(Topic.id == topic_id).values(
+            system_prompt=None,
+            system_prompt_updated_at=None
+        )
         await session.execute(stmt)
         await session.commit()
 

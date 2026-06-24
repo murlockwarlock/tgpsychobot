@@ -365,9 +365,15 @@ async def start_edit_system_prompt(client: MaxApiClient, states: StateStore, cha
     config = await _get_config()
     preview = (config.system_prompt or "Не задан.")[:3000]
     await states.set(user_id, chat_id, "admin_ai_set_system_prompt", {})
+    from ..time_utils import format_msk
+    time_str = ""
+    if config.system_prompt and config.system_prompt_updated_at:
+        time_str = f"<b>Загружен:</b> {format_msk(config.system_prompt_updated_at, '%d.%m.%y %H:%M')}\n\n"
+    elif config.system_prompt:
+        time_str = "<b>Загружен:</b> —\n\n"
     await client.send_message(
         chat_id=chat_id,
-        text=f"<b>Текущий системный промпт</b>\n<pre><code>{html.escape(preview)}</code></pre>\nОтправьте новый текст промпта сообщением или загрузите <b>.txt/.md</b> файл.",
+        text=f"<b>Текущий системный промпт</b>\n<pre><code>{html.escape(preview)}</code></pre>\n{time_str}Отправьте новый текст промпта сообщением или загрузите <b>.txt/.md</b> файл.",
         attachments=_prompt_input_keyboard("admin_ai_cancel_system_prompt"),
     )
 
@@ -408,9 +414,11 @@ async def download_global_prompt_appendix(client: MaxApiClient, chat_id: int) ->
 async def save_system_prompt(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
+        from datetime import datetime
         config.system_prompt = text
         config.prompt_mode = "text"
         config.prompt_filename = None
+        config.system_prompt_updated_at = datetime.utcnow()
         await session.commit()
     await states.clear(user_id)
     await show_settings(client, chat_id)

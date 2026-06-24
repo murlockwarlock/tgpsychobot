@@ -11,6 +11,7 @@ from ..api import MaxApiClient
 from ..keyboards import admin_topic_editor_keyboard, admin_topic_prompt_input_keyboard, admin_topic_prompt_keyboard, admin_topics_list_keyboard
 from ..legacy import SubscriptionConfig, Topic, async_session_maker
 from ..storage import StateStore
+from ..time_utils import format_msk
 
 
 def _topic_url(client: MaxApiClient, topic_id: int) -> str | None:
@@ -65,8 +66,9 @@ async def show_topic_editor(client: MaxApiClient, chat_id: int, topic_id: int) -
         f"<b>В главном меню:</b> {'да' if topic.show_in_main_menu else 'нет'}\n"
         f"<b>В списке тем:</b> {'да' if topic.show_in_list else 'нет'}\n"
         f"<b>Файлов базы знаний:</b> {len(topic.knowledge_base_files)}\n"
-        f"<b>Системный промпт:</b> {len(prompt_raw)} симв.\n\n"
-        f"<b>Приветствие ({len(intro_raw)} симв.):</b>\n<pre><code>{html.escape(_preview(intro_raw or 'Не задано', _INTRO_LIMIT))}</code></pre>"
+        f"<b>Системный промпт:</b> {len(prompt_raw)} симв.\n"
+        + (f"<b>Загружен:</b> {format_msk(topic.system_prompt_updated_at, '%d.%m.%y %H:%M')}\n\n" if topic.system_prompt and topic.system_prompt_updated_at else ("<b>Загружен:</b> —\n\n" if topic.system_prompt else "\n"))
+        + f"<b>Приветствие ({len(intro_raw)} симв.):</b>\n<pre><code>{html.escape(_preview(intro_raw or 'Не задано', _INTRO_LIMIT))}</code></pre>"
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_topic_editor_keyboard(topic, topic_url))
 
@@ -199,7 +201,9 @@ async def save_prompt(client: MaxApiClient, states: StateStore, chat_id: int, us
         if not topic:
             await client.send_message(chat_id=chat_id, text="Тема не найдена.")
             return
+        from datetime import datetime
         topic.system_prompt = text
+        topic.system_prompt_updated_at = datetime.utcnow()
         await session.commit()
     await states.clear(user_id)
     await show_topic_editor(client, chat_id, topic_id)
