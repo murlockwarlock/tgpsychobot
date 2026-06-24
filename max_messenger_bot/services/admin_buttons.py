@@ -45,9 +45,14 @@ async def show_button_editor(client: MaxApiClient, chat_id: int, button_key: str
     if not button:
         await client.send_message(chat_id=chat_id, text="Кнопка не найдена.")
         return
+    link_line = ""
+    if client.bot_name and isinstance(client.bot_name, str):
+        from urllib.parse import quote
+        link_line = f"<b>Ссылка:</b> <code>https://max.ru/{quote(client.bot_name)}?start={button.key}</code>\n"
     text = (
         f"<b>{button.button_title or button.key}</b>\n\n"
         f"<b>ID:</b> <code>{button.key}</code>\n"
+        f"{link_line}"
         f"<b>Видимость:</b> {'да' if button.is_visible else 'нет'}\n"
         f"<b>Порядок:</b> {button.sort_order or 0}\n\n"
         f"<b>Текст контента:</b>\n<pre><code>{(button.text_content or 'Не задан').replace('<', '&lt;').replace('>', '&gt;')[:2500]}</code></pre>"

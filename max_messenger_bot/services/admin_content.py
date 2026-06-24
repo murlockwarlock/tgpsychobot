@@ -100,9 +100,15 @@ async def show_content_editor(
         rendered_display = text_content or "Текст не задан."
         source_display = html.escape(text_content or "Текст не задан.")
 
+    link_line = ""
+    if client.bot_name and isinstance(client.bot_name, str):
+        from urllib.parse import quote
+        link_line = f"<b>Ссылка:</b> <code>https://max.ru/{quote(client.bot_name)}?start={content_key}</code>\n"
+
     message = (
         f"📝 <b>{html.escape(title)}</b>\n\n"
         f"<b>Ключ:</b> <code>{content_key}</code>\n"
+        f"{link_line}"
         f"<b>Статус:</b> {visible_str}\n"
         f"<b>Порядок:</b> {order_desc}\n\n"
         f"<b>Текущие медиафайлы:</b>\n{media_display}\n\n"

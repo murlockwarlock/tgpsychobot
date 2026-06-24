@@ -3505,7 +3505,7 @@ async def process_selection(callback: CallbackQuery, state: FSMContext, bot: Bot
         await admin_ai_keys_models(callback)
 
 
-async def get_content_display(state: FSMContext):
+async def get_content_display(state: FSMContext, bot: Bot = None):
     data = await state.get_data()
     content_key = data.get('content_key')
 
@@ -3554,6 +3554,14 @@ async def get_content_display(state: FSMContext):
     order_desc = "Сначала медиа, потом текст" if content_order == 'media_top' else "Сначала текст, потом медиа"
     visibility_status = "✅ <b>Виден пользователям</b>" if is_visible else "❌ <b>Скрыт от пользователей</b>"
 
+    link_line = ""
+    if bot:
+        try:
+            bot_info = await bot.get_me()
+            link_line = f"<b><u>Ссылка:</u></b> <code>https://t.me/{bot_info.username}?start={content_key}</code>\n"
+        except Exception as e:
+            logging.error(f"Error getting bot info in get_content_display: {e}")
+
     btn_info = ""
     if content_key == "start_message":
         btn_info = f"\n<b><u>Кнопка действия:</u></b>\nНазвание: {btn_text or 'Нет'}\nТекст отправки: {btn_payload or 'Нет'}\n"
@@ -3561,7 +3569,9 @@ async def get_content_display(state: FSMContext):
     response_text = (
         f"📝 <b>Редактирование: '{html.escape(display_name)}'</b>\n\n"
         f"<b><u>Статус:</u></b> {visibility_status}\n"
-        f"<b><u>Порядок вывода:</u></b> {order_desc}\n{btn_info}\n"
+        f"<b><u>Порядок вывода:</u></b> {order_desc}\n"
+        f"{link_line}"
+        f"{btn_info}\n"
         f"<b><u>Текущий текст:</u></b>\n{text_display}\n\n"
         f"<b><u>Текущие медиафайлы:</u></b>\n{media_display}\n\n"
         f"Отправьте новый текст (сохранится форматирование), чтобы изменить его, или медиа, чтобы добавить. "
@@ -3609,7 +3619,7 @@ async def start_content_edit(callback: CallbackQuery, state: FSMContext):
         message_id_to_edit=callback.message.message_id
     )
 
-    text, keyboard = await get_content_display(state)
+    text, keyboard = await get_content_display(state, callback.bot)
     await callback.message.edit_text(text, reply_markup=keyboard)
 
 
@@ -3662,7 +3672,7 @@ async def process_content_update(message: Message, state: FSMContext, bot: Bot):
     await message.delete()
 
     try:
-        text, keyboard = await get_content_display(state)
+        text, keyboard = await get_content_display(state, bot)
         if not text:
             await message.answer("Ошибка: данные сессии утеряны. Вернитесь в админ-панель.")
             return
@@ -3681,7 +3691,7 @@ async def process_content_update(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(AdminStates.edit_content, F.data.startswith("delete_media_"))
 async def handle_media_delete(callback: CallbackQuery, state: FSMContext):
-    text, keyboard = await get_content_display(state)
+    text, keyboard = await get_content_display(state, callback.bot)
     if not text:
         await callback.answer("Ошибка: сессия истекла или данные не найдены.", show_alert=True)
         await callback.message.delete()
@@ -3700,7 +3710,7 @@ async def handle_media_delete(callback: CallbackQuery, state: FSMContext):
     else:
         await callback.answer("Ошибка: неверный индекс файла.", show_alert=True)
 
-    text, keyboard = await get_content_display(state)
+    text, keyboard = await get_content_display(state, callback.bot)
     if text:
         await callback.message.edit_text(text, reply_markup=keyboard)
 
@@ -3759,7 +3769,7 @@ async def toggle_content_order_handler(callback: CallbackQuery, state: FSMContex
 
     await state.update_data(content_order=new_order)
 
-    text, keyboard = await get_content_display(state)
+    text, keyboard = await get_content_display(state, callback.bot)
     if text:
         await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer(f"Порядок изменен: {new_order}")
@@ -11965,7 +11975,7 @@ async def toggle_content_visibility_handler(callback: CallbackQuery, state: FSMC
         else:
             is_visible = False
 
-    text, keyboard = await get_content_display(state)
+    text, keyboard = await get_content_display(state, callback.bot)
     if text:
         try:
             await callback.message.edit_text(text, reply_markup=keyboard)
@@ -12297,7 +12307,7 @@ async def admin_save_content_btn_fields(message: Message, state: FSMContext, bot
         message_id_to_edit=message_id_to_edit
     )
 
-    text, keyboard = await get_content_display(state)
+    text, keyboard = await get_content_display(state, bot)
     if message_id_to_edit:
         try:
             await bot.edit_message_text(text, chat_id=message.chat.id, message_id=message_id_to_edit,
@@ -12336,7 +12346,7 @@ async def clear_content_btn_handler(callback: CallbackQuery, state: FSMContext, 
         message_id_to_edit=callback.message.message_id
     )
 
-    text, keyboard = await get_content_display(state)
+    text, keyboard = await get_content_display(state, bot)
     try:
         await callback.message.edit_text(text, reply_markup=keyboard)
     except TelegramBadRequest:
