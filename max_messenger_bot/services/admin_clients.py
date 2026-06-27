@@ -330,8 +330,18 @@ async def show_client_payment_info(client: MaxApiClient, chat_id: int, target_us
         yoo_payments = (await session.execute(
             select(YookassaPayment).where(YookassaPayment.user_id == target_user_id).order_by(YookassaPayment.created_at.desc()).limit(10)
         )).scalars().all()
-        total_robo = (await session.execute(select(func.sum(RobokassaPayment.amount)).where(RobokassaPayment.user_id == target_user_id))).scalar() or 0.0
-        total_yoo = (await session.execute(select(func.sum(YookassaPayment.amount)).where(YookassaPayment.user_id == target_user_id))).scalar() or 0.0
+        total_robo = (await session.execute(
+            select(func.sum(RobokassaPayment.amount)).where(
+                RobokassaPayment.user_id == target_user_id,
+                RobokassaPayment.status == 'completed'
+            )
+        )).scalar() or 0.0
+        total_yoo = (await session.execute(
+            select(func.sum(YookassaPayment.amount)).where(
+                YookassaPayment.user_id == target_user_id,
+                YookassaPayment.status == 'completed'
+            )
+        )).scalar() or 0.0
 
     name = user.name or user.first_name or str(target_user_id) if user else str(target_user_id)
     text = (
