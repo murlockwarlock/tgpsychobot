@@ -179,11 +179,39 @@ async def choose_payment_provider(client: MaxApiClient, chat_id: int, user_id: i
     if discount_percent > 0 and not plan.is_trial:
         final_price = plan.price * (1 - discount_percent / 100)
 
+    import html
+    duration_unit_text = "дн." if plan.duration_unit == 'days' else "мес."
     text = (
-        f"<b>Тариф:</b> {plan.name}\n"
-        f"<b>Стоимость:</b> {final_price:.2f} руб.\n\n"
-        "Выберите способ оплаты:"
+        f"<b>Тариф:</b> {plan.name} ({plan.duration_value} {duration_unit_text})\n"
+        f"<b>Стоимость:</b> {final_price:.2f} руб.\n"
     )
+    if plan.description:
+        text += f"{html.escape(plan.description)}\n"
+    text += "\n"
+
+    if plan.is_trial and plan.upgrades_to_plan:
+        upgrade_plan = plan.upgrades_to_plan
+        upgrade_price = upgrade_plan.price
+        upgrade_plan_allows_renewal = getattr(upgrade_plan, 'allow_auto_renewal', True)
+
+        if discount_percent > 0:
+            upgrade_price = upgrade_price * (1 - discount_percent / 100)
+
+        upgrade_duration_unit_text = "дн." if upgrade_plan.duration_unit == 'days' else "мес."
+        if upgrade_plan_allows_renewal:
+            text += (
+                f"<b>Далее:</b> {upgrade_price:.2f} руб. / "
+                f"{upgrade_plan.duration_value} {upgrade_duration_unit_text}\n"
+                f"(автопереход на «{upgrade_plan.name}»)\n\n"
+            )
+        else:
+            text += (
+                f"<b>После пробного периода:</b> {upgrade_price:.2f} руб. / "
+                f"{upgrade_plan.duration_value} {upgrade_duration_unit_text}\n"
+                f"(тариф «{upgrade_plan.name}», оформление вручную)\n\n"
+            )
+
+    text += "Выберите способ оплаты:"
     providers = []
     if config.yookassa_shop_id and config.yookassa_secret_key:
         providers.append(callback_button("ЮKassa", f"pay_yookassa_{plan_id}"))
@@ -239,7 +267,20 @@ async def create_yookassa_link(client: MaxApiClient, chat_id: int, user_id: int,
             )
             await session.commit()
         log.info("Yookassa payment created user_id=%s plan_id=%s payment_id=%s amount=%.2f", user_id, plan_id, payment.id, price)
-        text = f"Ссылка на оплату готова.\n\n<b>Сумма:</b> {price:.2f} руб."
+        privacy_url = config.privacy_policy_url or "#"
+        offer_url = config.offer_agreement_url or "#"
+        plan_allows_renewal = getattr(plan, 'allow_auto_renewal', True)
+        payment_type_line = (
+            "Регулярная оплата, можно отключить в любой момент"
+            if (plan_allows_renewal or plan.is_trial)
+            else "Разовая оплата"
+        )
+        text = (
+            "Ваша ссылка на оплату готова.\n\n"
+            f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>.\n\n"
+            f"<b>Сумма:</b> {price:.2f} руб.\n"
+            f"{payment_type_line}"
+        )
         await client.send_message(chat_id=chat_id, text=text, attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через ЮKassa", payment.confirmation.confirmation_url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")], main_menu_row()]}}])
     except Exception:
         log.exception("Yookassa payment creation failed user_id=%s plan_id=%s amount=%.2f", user_id, plan_id, price)
@@ -279,9 +320,23 @@ async def create_robokassa_link(client: MaxApiClient, chat_id: int, user_id: int
             f"Подписка {plan.name}",
         )
         log.info("Robokassa payment link created user_id=%s plan_id=%s invoice_id=%s amount=%.2f", user_id, plan_id, invoice_id, price)
+        privacy_url = config.privacy_policy_url or "#"
+        offer_url = config.offer_agreement_url or "#"
+        plan_allows_renewal = getattr(plan, 'allow_auto_renewal', True)
+        payment_type_line = (
+            "Регулярная оплата, можно отключить в любой момент"
+            if (plan_allows_renewal or plan.is_trial)
+            else "Разовая оплата"
+        )
+        text = (
+            "Ваша ссылка на оплату готова.\n\n"
+            f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>.\n\n"
+            f"<b>Сумма:</b> {price:.2f} руб.\n"
+            f"{payment_type_line}"
+        )
         await client.send_message(
             chat_id=chat_id,
-            text=f"Ссылка на оплату готова.\n\n<b>Сумма:</b> {price:.2f} руб.",
+            text=text,
             attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через Robokassa", url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")], main_menu_row()]}}],
         )
     except Exception:

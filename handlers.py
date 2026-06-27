@@ -12439,11 +12439,14 @@ async def admin_payment_stats(callback: CallbackQuery):
         active_trials_count = (await session.execute(active_trial_stmt)).scalar() or 0
 
         expired_stmt = select(func.count(UserSubscription.id)).where(
-            UserSubscription.end_date <= now
+            UserSubscription.end_date <= now,
+            UserSubscription.plan_id.is_not(None)
         )
         expired_count = (await session.execute(expired_stmt)).scalar() or 0
 
-        robo_revenue_stmt = select(func.sum(RobokassaPayment.amount))
+        robo_revenue_stmt = select(func.sum(RobokassaPayment.amount)).where(
+            RobokassaPayment.status == 'completed'
+        )
         total_robo_revenue = (await session.execute(robo_revenue_stmt)).scalar() or 0.0
 
         plan_stats_stmt = select(

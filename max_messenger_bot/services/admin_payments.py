@@ -162,15 +162,22 @@ async def show_payment_stats(client: MaxApiClient, chat_id: int) -> None:
         expired_count = (await session.execute(
             select(func.count(UserSubscription.id)).where(
                 UserSubscription.end_date <= now,
+                UserSubscription.plan_id.is_not(None),
                 UserSubscription.user_id >= MAX_ID_OFFSET,
             )
         )).scalar() or 0
 
         total_robo_revenue = (await session.execute(
-            select(func.sum(RobokassaPayment.amount)).where(RobokassaPayment.user_id >= MAX_ID_OFFSET)
+            select(func.sum(RobokassaPayment.amount)).where(
+                RobokassaPayment.user_id >= MAX_ID_OFFSET,
+                RobokassaPayment.status == 'completed'
+            )
         )).scalar() or 0.0
         total_yoo_revenue = (await session.execute(
-            select(func.sum(YookassaPayment.amount)).where(YookassaPayment.user_id >= MAX_ID_OFFSET)
+            select(func.sum(YookassaPayment.amount)).where(
+                YookassaPayment.user_id >= MAX_ID_OFFSET,
+                YookassaPayment.status == 'completed'
+            )
         )).scalar() or 0.0
 
         plan_breakdown = (await session.execute(
