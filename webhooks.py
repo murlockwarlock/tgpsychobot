@@ -19,9 +19,48 @@ from aiogram.fsm.context import FSMContext
 from subscription_retry_policy import get_next_retry_at
 from error_reporting import notify_admins_about_error
 
+import os
+import re
+
 log = logging.getLogger(__name__)
 plog = logging.getLogger("payment_events")
 ROBOKASSA_INVOICE_LIFETIME = timedelta(hours=2)
+
+
+def clean_html_for_max(text: str) -> str:
+    # Remove HTML tags like <b>, </b>, <i>, </i>, <code>, </code>, etc.
+    return re.sub(r'<[^>]+>', '', text)
+
+
+async def send_msg_universal(bot: Bot, user_id: int, text: str, parse_mode: str | None = None) -> bool:
+    if user_id < 100_000_000_000:
+        # Telegram notification
+        try:
+            await bot.send_message(user_id, text, parse_mode=parse_mode)
+            return True
+        except Exception as e:
+            log.error(f"Failed to send Telegram message to {user_id}: {e}")
+            return False
+    else:
+        # MAX notification
+        token = os.environ.get("MAX_BOT_TOKEN")
+        if not token:
+            log.warning(f"Cannot send MAX message to {user_id}: MAX_BOT_TOKEN not configured in env")
+            return False
+        base_url = os.environ.get("MAX_API_BASE", "https://platform-api.max.ru")
+        try:
+            from max_messenger_bot.api import MaxApiClient
+            from max_messenger_bot.models import MAX_ID_OFFSET
+            async with MaxApiClient(token=token, base_url=base_url) as client:
+                max_api_user_id = user_id - MAX_ID_OFFSET
+                clean_text = clean_html_for_max(text)
+                await client.send_message(user_id=max_api_user_id, text=clean_text)
+                return True
+        except Exception as e:
+            log.error(f"Failed to send MAX message to {user_id}: {e}", exc_info=e)
+            return False
+
+
 
 
 def calculate_signature(*args) -> str:
@@ -410,28 +449,23 @@ async def handle_yookassa_webhook(request: web.Request):
                 user_ref_log = f"[id={user_id}]"
 
             plog.info(f"ОПЛАТА | Yookassa | {user_ref_log} | {plan_name_for_notif} | {plan_price_for_notif:.2f} руб | PayId={payment_id}")
-            # Skip TG notifications for MAX users (user_id >= MAX_ID_OFFSET = 100_000_000_000)
-            if user_id < 100_000_000_000:
-                await bot.send_message(user_id, f"✅ Ваша подписка на тариф «{plan_name_for_notif}» успешно оформлена!")
+            await send_msg_universal(bot, user_id, f"✅ Ваша подписка на тариф «{plan_name_for_notif}» успешно оформлена!")
             if referrer_bonus_user_id and referrer_bonus_days > 0:
-                try:
-                    if referrer_bonus_user_id < 100_000_000_000:
-                        await bot.send_message(
-                            referrer_bonus_user_id,
-                            f"💰 Ваш реферал оформил подписку! Вам начислено <b>{referrer_bonus_days} бонусных дн.</b>",
-                            parse_mode="HTML"
-                        )
-                except Exception:
-                    pass
+                await send_msg_universal(
+                    bot,
+                    referrer_bonus_user_id,
+                    f"💰 Ваш реферал оформил подписку! Вам начислено <b>{referrer_bonus_days} бонусных дн.</b>",
+                    parse_mode="HTML"
+                )
 
             config = await session.get(SubscriptionConfig, 1)
             if config and config.notifications_enabled:
                 for admin_id in await get_all_admin_ids():
-                    try:
-                        await bot.send_message(admin_id,
-                                               f"🔔 Новый платеж (YooKassa)!\n\nПользователь: {user_display}\nТариф: {plan_name_for_notif}\nСумма: {plan_price_for_notif:.2f} руб.\nPayId: {payment_id}")
-                    except Exception:
-                        pass
+                    await send_msg_universal(
+                        bot,
+                        admin_id,
+                        f"🔔 Новый платеж (YooKassa)!\n\nПользователь: {user_display}\nТариф: {plan_name_for_notif}\nСумма: {plan_price_for_notif:.2f} руб.\nPayId: {payment_id}"
+                    )
 
         return web.Response(status=200)
 
@@ -744,26 +778,24 @@ async def handle_robokassa_result(request: web.Request):
                     ))
                     await session.commit()
                     if ref_config_rk.referral_pay_bonus_enabled and ref_config_rk.referral_pay_bonus_days > 0:
-                        if not already_paid_rk and referrer_bonus_user_id_rk < 100_000_000_000:
-                            try:
-                                await bot.send_message(
-                                    referrer_bonus_user_id_rk,
-                                    f"💰 Ваш реферал оформил подписку! "
-                                    f"Вам начислено <b>{referrer_bonus_days_rk} бонусных дн.</b>",
-                                    parse_mode="HTML"
-                                )
-                            except Exception:
-                                pass
+                        if not already_paid_rk:
+                            await send_msg_universal(
+                                bot,
+                                referrer_bonus_user_id_rk,
+                                f"💰 Ваш реферал оформил подписку! Вам начислено <b>{referrer_bonus_days_rk} бонусных дн.</b>",
+                                parse_mode="HTML"
+                            )
 
         end_date_msk = end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M')
 
-        # Skip TG notification for MAX users (user_id >= MAX_ID_OFFSET = 100_000_000_000)
-        if payment_user_id < 100_000_000_000:
-            await bot.send_message(payment_user_id,
-                                   f"Мы получили оплату {payment_amount_for_notif:.2f} руб по вашему тарифу «{plan_name_for_notif}».\n"
-                                   f"Действие тарифа продлено до {end_date_msk} МСК.\n\n"
-                                   f"Благодарим, что продолжаете пользоваться ботом!\n"
-                                   f"Вы всегда можете направить нам свои пожелания, предложения по его работе.")
+        await send_msg_universal(
+            bot,
+            payment_user_id,
+            f"Мы получили оплату {payment_amount_for_notif:.2f} руб по вашему тарифу «{plan_name_for_notif}».\n"
+            f"Действие тарифа продлено до {end_date_msk} МСК.\n\n"
+            f"Благодарим, что продолжаете пользоваться ботом!\n"
+            f"Вы всегда можете направить нам свои пожелания, предложения по его работе."
+        )
 
         if is_renewal:
             plog.info(f"ПРОДЛЕНИЕ | Robokassa | {user_display} | {plan_name_for_notif} | {payment_amount_for_notif:.2f} руб | InvId={inv_id}")
@@ -772,11 +804,11 @@ async def handle_robokassa_result(request: web.Request):
 
         if config and config.notifications_enabled:
             for admin_id in await get_all_admin_ids():
-                try:
-                    await bot.send_message(admin_id,
-                                           f"🔔 Новый платеж (Robokassa)!\n\nПользователь: {user_display}\nТариф: {plan_name_for_notif}\nСумма: {payment_amount_for_notif} руб.")
-                except Exception:
-                    pass
+                await send_msg_universal(
+                    bot,
+                    admin_id,
+                    f"🔔 Новый платеж (Robokassa)!\n\nПользователь: {user_display}\nТариф: {plan_name_for_notif}\nСумма: {payment_amount_for_notif} руб."
+                )
 
         return web.Response(text=f"OK{inv_id}")
 
