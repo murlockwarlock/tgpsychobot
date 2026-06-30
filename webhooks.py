@@ -32,11 +32,11 @@ def clean_html_for_max(text: str) -> str:
     return re.sub(r'<[^>]+>', '', text)
 
 
-async def send_msg_universal(bot: Bot, user_id: int, text: str, parse_mode: str | None = None) -> bool:
+async def send_msg_universal(bot: Bot, user_id: int, text: str, parse_mode: str | None = None, reply_markup=None) -> bool:
     if user_id < 100_000_000_000:
         # Telegram notification
         try:
-            await bot.send_message(user_id, text, parse_mode=parse_mode)
+            await bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
             return True
         except Exception as e:
             log.error(f"Failed to send Telegram message to {user_id}: {e}")
@@ -48,13 +48,29 @@ async def send_msg_universal(bot: Bot, user_id: int, text: str, parse_mode: str 
             log.warning(f"Cannot send MAX message to {user_id}: MAX_BOT_TOKEN not configured in env")
             return False
         base_url = os.environ.get("MAX_API_BASE", "https://platform-api.max.ru")
+        
+        attachments = None
+        if reply_markup and hasattr(reply_markup, "inline_keyboard"):
+            max_rows = []
+            for row in reply_markup.inline_keyboard:
+                max_row = []
+                for btn in row:
+                    if getattr(btn, "callback_data", None):
+                        max_row.append({"type": "callback", "text": btn.text, "payload": btn.callback_data})
+                    elif getattr(btn, "url", None):
+                        max_row.append({"type": "link", "text": btn.text, "url": btn.url})
+                if max_row:
+                    max_rows.append(max_row)
+            if max_rows:
+                attachments = [{"type": "inline_keyboard", "payload": {"buttons": max_rows}}]
+
         try:
             from max_messenger_bot.api import MaxApiClient
             from max_messenger_bot.models import MAX_ID_OFFSET
             async with MaxApiClient(token=token, base_url=base_url) as client:
                 max_api_user_id = user_id - MAX_ID_OFFSET
                 clean_text = clean_html_for_max(text)
-                await client.send_message(user_id=max_api_user_id, text=clean_text)
+                await client.send_message(user_id=max_api_user_id, text=clean_text, attachments=attachments)
                 return True
         except Exception as e:
             log.error(f"Failed to send MAX message to {user_id}: {e}", exc_info=e)

@@ -178,7 +178,66 @@ async def _send_deduplicated_notification(
     return True
 
 
+def patch_bot_send_message(bot: Bot):
+    if hasattr(bot, "_original_send_message"):
+        return
+
+    bot._original_send_message = bot.send_message
+
+    async def patched_send_message(chat_id, text, *args, **kwargs):
+        # Determine if it's a MAX user
+        try:
+            chat_id_int = int(chat_id)
+        except (ValueError, TypeError):
+            chat_id_int = 0
+
+        if chat_id_int >= 100_000_000_000:
+            # MAX notification
+            import os
+            import re
+            token = os.environ.get("MAX_BOT_TOKEN")
+            if not token:
+                logging.getLogger("scheduler").warning(f"Cannot send MAX message to {chat_id_int}: MAX_BOT_TOKEN not configured in env")
+                return None
+            base_url = os.environ.get("MAX_API_BASE", "https://platform-api.max.ru")
+            
+            # Map reply_markup to attachments if present
+            attachments = None
+            reply_markup = kwargs.get("reply_markup")
+            if reply_markup and hasattr(reply_markup, "inline_keyboard"):
+                max_rows = []
+                for row in reply_markup.inline_keyboard:
+                    max_row = []
+                    for btn in row:
+                        if getattr(btn, "callback_data", None):
+                            max_row.append({"type": "callback", "text": btn.text, "payload": btn.callback_data})
+                        elif getattr(btn, "url", None):
+                            max_row.append({"type": "link", "text": btn.text, "url": btn.url})
+                    if max_row:
+                        max_rows.append(max_row)
+                if max_rows:
+                    attachments = [{"type": "inline_keyboard", "payload": {"buttons": max_rows}}]
+            
+            try:
+                from max_messenger_bot.api import MaxApiClient
+                from max_messenger_bot.models import MAX_ID_OFFSET
+                async with MaxApiClient(token=token, base_url=base_url) as client:
+                    max_api_user_id = chat_id_int - MAX_ID_OFFSET
+                    # Clean HTML tags
+                    clean_text = re.sub(r'<[^>]+>', '', text)
+                    await client.send_message(user_id=max_api_user_id, text=clean_text, attachments=attachments)
+                    return None
+            except Exception as e:
+                logging.getLogger("scheduler").error(f"Failed to send MAX message to {chat_id_int}: {e}", exc_info=e)
+                return None
+        else:
+            return await bot._original_send_message(chat_id, text, *args, **kwargs)
+
+    bot.send_message = patched_send_message
+
+
 async def check_kie_credit_balance(bot: Bot):
+    patch_bot_send_message(bot)
     try:
         async with async_session_maker() as session:
             config = await session.get(AIConfig, 1)
@@ -368,6 +427,7 @@ async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: Subsc
 
 
 async def check_subscriptions(bot: Bot):
+    patch_bot_send_message(bot)
     log.info("Running subscription check...")
     now = datetime.utcnow()
 
