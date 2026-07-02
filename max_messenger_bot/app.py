@@ -492,14 +492,17 @@ class MaxBotApplication:
         if text == "/test" or text == "📝 Пройти тест":
             await tests_service.start_test(self.client, message.chat_id, message.sender.user_id)
             return
-        if text == "⭐️ Подписка":
+        if text == "/subscription" or text == "⭐️ Подписка":
             await subscriptions_service.show_subscription_info(self.client, message.chat_id, message.sender.user_id)
             return
-        if text == "⚙️ Настройки":
+        if text == "/settings" or text == "⚙️ Настройки":
             await settings_service.show_settings(self.client, message.chat_id, message.sender.user_id)
             return
-        if text == "🗑️ Сбросить диалог":
+        if text == "/new_dialogue" or text == "🗑️ Сбросить диалог":
             await common.reset_dialogue(self.client, message.chat_id, message.sender.user_id)
+            return
+        if text == "/topics":
+            await topics_service.show_topics(self.client, message.chat_id, message.sender.user_id)
             return
         if text == "💬 Начать/продолжить диалог":
             await self.client.send_message(
@@ -1699,10 +1702,37 @@ async def create_web_app() -> web.Application:
             client.bot_name = (me.get("username") or me.get("name") or "").strip().lstrip("@") or None
         except Exception:
             max_log.exception("Failed to load MAX bot name for deep links")
-    await client.set_commands([
-        {"name": "start", "description": "Запустить бота"},
-        {"name": "ref", "description": "Реферальная программа"},
-    ])
+    # Load flags from database
+    referral_enabled = False
+    topics_enabled = True
+    subscriptions_enabled = True
+
+    try:
+        async with async_session_maker() as session:
+            sub_config = await session.get(SubscriptionConfig, 1)
+            if sub_config:
+                referral_enabled = bool(sub_config.referral_enabled)
+                topics_enabled = bool(sub_config.topics_enabled)
+                subscriptions_enabled = bool(sub_config.subscriptions_enabled)
+    except Exception:
+        max_log.exception("Failed to load SubscriptionConfig on startup to set commands")
+
+    commands = [
+        {"name": "start", "description": "Запустить / Перезапустить бота"},
+        {"name": "help", "description": "Помощь"},
+    ]
+    if topics_enabled:
+        commands.append({"name": "topics", "description": "Выбрать тему"})
+    commands.append({"name": "new_dialogue", "description": "Новый диалог"})
+    commands.append({"name": "settings", "description": "Настройки"})
+    if subscriptions_enabled:
+        commands.append({"name": "subscription", "description": "Подписка"})
+    if referral_enabled:
+        commands.append({"name": "ref", "description": "🤝 Пригласить друзей"})
+    
+    commands.append({"name": "admin", "description": "Админ-панель"})
+
+    await client.set_commands(commands)
     bot_app = MaxBotApplication(client)
     background_tasks: set[asyncio.Task[None]] = set()
     bot_app.background_tasks = background_tasks

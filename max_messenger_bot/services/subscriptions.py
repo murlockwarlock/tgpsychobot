@@ -130,11 +130,12 @@ async def show_plans(client: MaxApiClient, chat_id: int, user_id: int) -> None:
         trial_history = (
             await session.execute(select(TrialUsageHistory).where(TrialUsageHistory.user_id == user_id))
         ).scalars().all()
+        stmt = select(SubscriptionPlan).where(SubscriptionPlan.is_active == True)
+        if not (user and user.is_admin):
+            stmt = stmt.where(SubscriptionPlan.admin_only == False)
         all_plans = (
             await session.execute(
-                select(SubscriptionPlan)
-                .where(SubscriptionPlan.is_active == True)
-                .options(selectinload(SubscriptionPlan.upgrades_to_plan))
+                stmt.options(selectinload(SubscriptionPlan.upgrades_to_plan))
                 .order_by(SubscriptionPlan.price.asc())
             )
         ).scalars().all()
