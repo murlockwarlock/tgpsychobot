@@ -40,11 +40,23 @@ async def show_admins(client: MaxApiClient, chat_id: int) -> None:
                 .order_by(User.first_name.asc(), User.id.asc())
             )
         ).scalars().all()
+        # Load owner users from DB to get their names
+        owner_users = (
+            await session.execute(
+                select(User).where(User.id.in_(owners))
+            )
+        ).scalars().all()
+
+    owner_map = {u.id: u.first_name for u in owner_users}
     db_admins = [admin for admin in admins if admin.id not in owners]
     lines = ["👮 <b>Управление администраторами</b>\n\n", "<b>Владельцы:</b>\n"]
     if owners:
         for owner_id in owners:
-            lines.append(f"• <code>{owner_id}</code>\n")
+            name = owner_map.get(owner_id)
+            if name:
+                lines.append(f"• {name} - <code>{owner_id}</code>\n")
+            else:
+                lines.append(f"• <code>{owner_id}</code>\n")
     else:
         lines.append("не заданы\n")
     lines.append("\n<b>Администраторы из БД:</b>\n")

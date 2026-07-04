@@ -10473,15 +10473,39 @@ async def _show_admin_manage_admins(bot: Bot, chat_id: int, message_id: int):
     async with async_session_maker() as session:
         admins_result = await session.execute(select(User).where(User.is_admin == True))
         admins = admins_result.scalars().all()
+        # Query owner users from DB to resolve their names
+        owner_users = (
+            await session.execute(
+                select(User).where(User.id.in_(OWNER_IDS))
+            )
+        ).scalars().all()
+        owner_map = {u.id: u for u in owner_users}
 
     text = "👮‍♂️ <b>Управление администраторами</b>\n\n"
     text += "👑 <b>Владельцы (из конфига):</b>\n"
     for owner_id in OWNER_IDS:
-        try:
-            chat = await bot.get_chat(owner_id)
-            text += f" • {chat.full_name} (@{chat.username or 'N/A'}) - <code>{owner_id}</code>\n"
-        except TelegramBadRequest:
-            text += f" • Не удалось получить инфо - <code>{owner_id}</code>\n"
+        if owner_id < 100_000_000_000:
+            try:
+                chat = await bot.get_chat(owner_id)
+                text += f" • {chat.full_name} (@{chat.username or 'N/A'}) - <code>{owner_id}</code>\n"
+            except TelegramBadRequest:
+                u = owner_map.get(owner_id)
+                if u:
+                    name = u.first_name
+                    if u.username:
+                        name += f" (@{u.username})"
+                    text += f" • {name} - <code>{owner_id}</code>\n"
+                else:
+                    text += f" • Не удалось получить инфо - <code>{owner_id}</code>\n"
+        else:
+            u = owner_map.get(owner_id)
+            if u:
+                name = u.first_name
+                if u.username:
+                    name += f" (@{u.username})"
+                text += f" • {name} [MAX] - <code>{owner_id}</code>\n"
+            else:
+                text += f" • <code>{owner_id}</code> [MAX]\n"
 
     text += "\n"
     text += "👮‍♂️ <b>Администраторы (из БД):</b>\n"
