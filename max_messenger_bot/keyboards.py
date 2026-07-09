@@ -223,6 +223,13 @@ def test_answers_keyboard() -> list[dict]:
     )
 
 
+def universal_test_answers_keyboard(options, horizontal: bool = False) -> list[dict]:
+    buttons = [callback_button(getattr(option, "text", str(option)), f"test_opt_{index}") for index, option in enumerate(options)]
+    if horizontal:
+        return inline_keyboard([buttons])
+    return inline_keyboard([[button] for button in buttons])
+
+
 def case_study_keyboard() -> list[dict]:
     return inline_keyboard([[callback_button("✅ Показать результаты", "test_confirm_case")]])
 

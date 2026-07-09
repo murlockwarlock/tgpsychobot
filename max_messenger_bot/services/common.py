@@ -155,7 +155,7 @@ async def show_help(client: MaxApiClient, chat_id: int, user_id: int) -> None:
     await client.send_message(chat_id=chat_id, text=text)
 
 
-async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, start_payload: str | None = None) -> None:
+async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, start_payload: str | None = None, states: StateStore | None = None) -> None:
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.current_topic), selectinload(User.subscription)])
         if not user:
@@ -251,7 +251,7 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
         if start_payload == "test":
             from .tests import start_test
 
-            await start_test(client, chat_id, user_id)
+            await start_test(client, chat_id, user_id, states)
             return
         if start_payload.startswith("topic_"):
             from .topics import select_topic
@@ -364,7 +364,7 @@ async def save_ai_message(user_id: int, response_text: str) -> None:
         await session.commit()
 
 
-async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prompt_text: str) -> None:
+async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prompt_text: str, states: StateStore | None = None) -> None:
     log.info("AI dialogue requested user_id=%s chat_id=%s", user_id, chat_id)
     await save_user_message(user_id, prompt_text)
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Думаю...")
@@ -384,6 +384,17 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ")
         await save_ai_message(user_id, response_text)
+
+        if re.search(r"\b(START_TEST|RUN_TEST)\b|\[(START_TEST|RUN_TEST)\]", response_text or "", re.IGNORECASE):
+            clean_text = re.sub(r"\b(START_TEST|RUN_TEST)\b|\[(START_TEST|RUN_TEST)\]", "", response_text, flags=re.IGNORECASE).strip()
+            if clean_text:
+                await client.edit_message(thinking_message_id, text=markdown_to_html(clean_text))
+            elif thinking_message_id:
+                await client.edit_message(thinking_message_id, text="Запускаю тест.")
+            from .tests import start_test
+
+            await start_test(client, chat_id, user_id, states)
+            return
 
         # Check for image generation directive GEN_IMG: [...] or [IMG: ...]
         img_match = re.search(r"GEN_IMG:\s*\[(.*?)\]|\[IMG:\s*(.*?)\]", response_text, re.DOTALL)

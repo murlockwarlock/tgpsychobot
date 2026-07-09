@@ -101,11 +101,32 @@ def admin_panel_keyboard():
     return builder.as_markup()
 
 
-def admin_test_menu_keyboard(is_enabled: bool):
+def admin_test_menu_keyboard(config_or_enabled):
     builder = InlineKeyboardBuilder()
+    is_enabled = config_or_enabled if isinstance(config_or_enabled, bool) else bool(config_or_enabled.is_enabled)
+    show_progress = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "show_progress", True))
+    formulas_enabled = False if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "formulas_enabled", False))
+    input_mode = "all" if isinstance(config_or_enabled, bool) else (getattr(config_or_enabled, "interpretation_input_mode", "all") or "all")
     status_text = "✅ Включен" if is_enabled else "❌ Выключен"
+    progress_text = "✅ Да" if show_progress else "❌ Нет"
+    formulas_text = "✅ Да" if formulas_enabled else "❌ Нет"
+    if input_mode == "formulas":
+        mode_text = "только формулы"
+    elif input_mode == "selected":
+        mode_text = "выбранные"
+    else:
+        mode_text = "вопросы и ответы"
 
     builder.button(text=f"Статус теста: {status_text}", callback_data="admin_test_toggle_status")
+    builder.button(text=f"Прогресс: {progress_text}", callback_data="admin_test_toggle_progress")
+    builder.button(text=f"Формулы: {formulas_text}", callback_data="admin_test_toggle_formulas")
+    builder.button(text=f"В интерпретацию: {mode_text}", callback_data="admin_test_toggle_input_mode")
+    builder.button(text="🎯 Выбранные переменные", callback_data="admin_test_set_selected_vars")
+    if not isinstance(config_or_enabled, bool):
+        separate_enabled = bool(getattr(config_or_enabled, "separate_result_prompt_enabled", False))
+        separate_text = "✅ Да" if separate_enabled else "❌ Нет"
+        builder.button(text=f"Отдельный промпт результата: {separate_text}", callback_data="admin_test_toggle_separate_prompt")
+        builder.button(text="📝 Промпт результата", callback_data="admin_edit_result_prompt")
     builder.button(text="✏️ Приветствие теста", callback_data="edit_content_test_intro")
     builder.button(text="✏️ Результаты теста", callback_data="edit_content_test_results")
     builder.button(text="✏️ Финал секретного теста", callback_data="edit_content_secret_test_outro")
@@ -1173,6 +1194,15 @@ def test_answer_keyboard():
     return builder.as_markup()
 
 
+def universal_test_answer_keyboard(options, horizontal: bool = False):
+    builder = InlineKeyboardBuilder()
+    for index, option in enumerate(options):
+        label = getattr(option, "text", str(option))
+        builder.button(text=label, callback_data=f"test_opt_{index}")
+    builder.adjust(len(options) if horizontal and options else 1)
+    return builder.as_markup()
+
+
 def case_study_confirmation_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="Поехали дальше", callback_data="test_confirm_case")
@@ -1180,9 +1210,9 @@ def case_study_confirmation_keyboard():
     return builder.as_markup()
 
 
-def test_prompt_keyboard():
+def test_prompt_keyboard(download_callback: str = "download_test_prompt"):
     builder = InlineKeyboardBuilder()
-    builder.button(text="📥 Скачать промпт (.txt)", callback_data="download_test_prompt")
+    builder.button(text="📥 Скачать промпт (.txt)", callback_data=download_callback)
     builder.button(text="⬅️ Назад", callback_data="cancel_state_admin_test_menu")
     builder.adjust(1)
     return builder.as_markup()

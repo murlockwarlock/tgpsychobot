@@ -157,7 +157,7 @@ class MaxBotApplication:
         )
         await common.ensure_user(message.sender.user_id, message.sender.username, message.sender.full_name)
         if force_start:
-            await common.show_start_screen(self.client, message.chat_id, message.sender.user_id, message.start_payload)
+            await common.show_start_screen(self.client, message.chat_id, message.sender.user_id, message.start_payload, self.states)
             return
 
         text = (message.text or "").strip()
@@ -197,7 +197,10 @@ class MaxBotApplication:
             if state.state == "awaiting_age":
                 snapshot = await settings_service.save_age(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 if snapshot and not snapshot.get("is_settings"):
-                    await tests_service.start_test(self.client, message.chat_id, message.sender.user_id)
+                    await tests_service.start_test(self.client, message.chat_id, message.sender.user_id, self.states)
+                return
+            if state.state == "test_answering":
+                await tests_service.process_text_answer(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
             if state.state == "awaiting_promo_code":
                 await subscriptions_service.apply_promo_code(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -474,7 +477,7 @@ class MaxBotApplication:
 
         if text.startswith("/start"):
             payload = text.split(" ", 1)[1].strip() if " " in text else None
-            await common.show_start_screen(self.client, message.chat_id, message.sender.user_id, payload)
+            await common.show_start_screen(self.client, message.chat_id, message.sender.user_id, payload, self.states)
             return
         if text == "/help":
             await common.show_help(self.client, message.chat_id, message.sender.user_id)
@@ -490,7 +493,7 @@ class MaxBotApplication:
             await subscriptions_service.show_referral_info(self.client, message.chat_id, message.sender.user_id)
             return
         if text == "/test" or text == "📝 Пройти тест":
-            await tests_service.start_test(self.client, message.chat_id, message.sender.user_id)
+            await tests_service.start_test(self.client, message.chat_id, message.sender.user_id, self.states)
             return
         if text == "/subscription" or text == "⭐️ Подписка":
             await subscriptions_service.show_subscription_info(self.client, message.chat_id, message.sender.user_id)
@@ -586,7 +589,7 @@ class MaxBotApplication:
         if message.media_type == "image" and message.media_token:
             self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=text))
             return
-        self.spawn_user_task(message.sender.user_id, common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text))
+        self.spawn_user_task(message.sender.user_id, common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text, self.states))
 
     async def _read_text_attachment(self, message: IncomingMessage) -> str | None:
         try:
@@ -677,7 +680,7 @@ class MaxBotApplication:
             await self.states.clear(user_id)
             await self.client.answer_callback(callback.callback_id, notification="Дисклеймер принят")
             if pending_prompt and user and await common.ensure_access_before_chat(self.client, chat_id, user):
-                self.spawn_user_task(user_id, common.run_ai_dialogue(self.client, chat_id, user_id, pending_prompt))
+                self.spawn_user_task(user_id, common.run_ai_dialogue(self.client, chat_id, user_id, pending_prompt, self.states))
             return
         if data.startswith("gender_"):
             state_data = await settings_service.save_gender(self.client, self.states, chat_id, user_id, data.split("_", 1)[1])
@@ -695,7 +698,7 @@ class MaxBotApplication:
                     async with async_session_maker() as session:
                         user = await session.get(User, user_id, options=[selectinload(User.subscription)])
                     if user and await common.ensure_access_before_chat(self.client, chat_id, user):
-                        self.spawn_user_task(user_id, common.run_ai_dialogue(self.client, chat_id, user_id, initial_prompt))
+                        self.spawn_user_task(user_id, common.run_ai_dialogue(self.client, chat_id, user_id, initial_prompt, self.states))
             return
         if data == "settings_back":
             await settings_service.show_settings(self.client, chat_id, user_id)
@@ -760,8 +763,11 @@ class MaxBotApplication:
         if data == "referral_sub_info":
             await subscriptions_service.show_referral_info(self.client, chat_id, user_id)
             return
+        if data.startswith("test_opt_"):
+            await tests_service.process_answer(self.client, chat_id, user_id, data, self.states)
+            return
         if data.startswith("test_ans_"):
-            await tests_service.process_answer(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+            await tests_service.process_answer(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states)
             return
         if data == "test_confirm_case":
             await tests_service.show_results(self.client, chat_id, user_id)

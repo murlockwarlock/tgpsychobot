@@ -7,10 +7,23 @@ from sqlalchemy import delete, func, select, update
 
 from ..ai import AIServiceError, get_ai_response_direct
 from ..api import MaxApiClient
-from ..keyboards import case_study_keyboard, final_test_keyboard, secret_test_keyboard, test_answers_keyboard
+from ..keyboards import case_study_keyboard, final_test_keyboard, secret_test_keyboard, universal_test_answers_keyboard
 from ..legacy import CaseStudy, Content, Message as DBMessage, SecretTestQuestion, TestConfig, TestQuestion, TestSession, User, async_session_maker
 from ..logging_utils import get_ai_logger, get_bot_logger
 from ..storage import StateStore
+from universal_tests import (
+    build_prompt_payload,
+    build_question_text,
+    calculate_formulas,
+    get_answer_options,
+    json_dumps,
+    json_loads,
+    make_answer_record,
+    parse_answers,
+    question_accepts_text,
+    question_buttons_are_horizontal,
+    serialize_answers,
+)
 
 
 log = get_bot_logger("tests")
@@ -149,7 +162,7 @@ async def _build_ai_summary(
         return _fallback_ai_summary(ranking)
 
 
-async def start_test(client: MaxApiClient, chat_id: int, user_id: int) -> None:
+async def start_test(client: MaxApiClient, chat_id: int, user_id: int, states: StateStore | None = None) -> None:
     async with async_session_maker() as session:
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
         if not questions:
@@ -157,57 +170,116 @@ async def start_test(client: MaxApiClient, chat_id: int, user_id: int) -> None:
             await client.send_message(chat_id=chat_id, text="Вопросы теста не загружены.")
             return
         await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
-        session.add(TestSession(user_id=user_id, current_question_index=0, answers=""))
+        session.add(TestSession(user_id=user_id, current_question_index=0, answers="[]"))
         await session.commit()
+    if states:
+        await states.set(user_id, chat_id, "test_answering", {})
     await _send_question(client, chat_id, user_id, 0)
 
 
 async def _send_question(client: MaxApiClient, chat_id: int, user_id: int, index: int) -> None:
     async with async_session_maker() as session:
-        user = await session.get(User, user_id)
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        config = await session.get(TestConfig, 1)
     question = questions[index]
-    suffix = "ен" if user and user.gender == "male" else "на"
-    neutral = "Нейтрален" if user and user.gender == "male" else "Нейтральна"
-    legend = (
-        f"1 — Совершенно не соглас{suffix}\n"
-        f"2 — Скорее не соглас{suffix}\n"
-        f"3 — {neutral}\n"
-        f"4 — Скорее соглас{suffix}\n"
-        f"5 — Полностью соглас{suffix}"
-    )
-    text = (
-        f"<b>Вопрос {index + 1}/{len(questions)}</b>\n"
-        f"{_progress_bar(index, len(questions))}\n\n"
-        f"<b>{question.text}</b>\n\n{legend}"
-    )
-    await client.send_message(chat_id=chat_id, text=text, attachments=test_answers_keyboard())
+    options = get_answer_options(question)
+    text = build_question_text(question, index, len(questions), getattr(config, "show_progress", True) if config else True)
+    keyboard = universal_test_answers_keyboard(options, question_buttons_are_horizontal(question)) if options else None
+    await client.send_message(chat_id=chat_id, text=text, attachments=keyboard)
 
 
-async def process_answer(client: MaxApiClient, chat_id: int, user_id: int, answer_value: int) -> None:
+async def process_answer(client: MaxApiClient, chat_id: int, user_id: int, answer_payload: int | str, states: StateStore | None = None) -> None:
     async with async_session_maker() as session:
         test_session = await session.get(TestSession, user_id)
         if not test_session or test_session.is_finished:
             await client.send_message(chat_id=chat_id, text="Сессия теста не найдена.")
             return
-        answers = [int(item) for item in test_session.answers.split(",") if item]
-        answers.append(answer_value)
-        test_session.answers = ",".join(str(item) for item in answers)
-        test_session.current_question_index += 1
-        total_questions = await session.scalar(select(func.count()).select_from(TestQuestion)) or 0
-        await session.commit()
+        questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        question_index = test_session.current_question_index
+        if question_index >= len(questions):
+            await client.send_message(chat_id=chat_id, text="Вопросы теста уже закончились.")
+            return
+        question = questions[question_index]
+        options = get_answer_options(question)
+        if isinstance(answer_payload, str) and answer_payload.startswith("test_opt_"):
+            option_index = int(answer_payload.rsplit("_", 1)[1])
+            if option_index < 0 or option_index >= len(options):
+                await client.send_message(chat_id=chat_id, text="Такого варианта ответа нет.")
+                return
+            option = options[option_index]
+            answer_text = option.text
+            numeric_value = option.value
+        else:
+            answer_text = str(answer_payload)
+            numeric_value = float(answer_text) if answer_text.isdigit() else None
 
-    if test_session.current_question_index < total_questions:
-        await _send_question(client, chat_id, user_id, test_session.current_question_index)
+        answers = parse_answers(test_session.answers)
+        answers.append(make_answer_record(question, question_index, answer_text, numeric_value))
+        test_session.answers = serialize_answers(answers)
+        test_session.current_question_index += 1
+        await session.commit()
+        next_index = test_session.current_question_index
+        total_questions = len(questions)
+
+    if next_index < total_questions:
+        await _send_question(client, chat_id, user_id, next_index)
         return
 
-    async with async_session_maker() as session:
-        questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
-        answers = [int(item) for item in test_session.answers.split(",") if item]
-        await session.execute(update(TestSession).where(TestSession.user_id == user_id).values(is_finished=True))
-        await session.commit()
-
+    await _finish_universal_test(client, chat_id, user_id, states)
     await client.send_message(chat_id=chat_id, text="Диаграмма готова. Ниже можно открыть результат и историю-зеркало.", attachments=case_study_keyboard())
+
+
+async def process_text_answer(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
+    async with async_session_maker() as session:
+        test_session = await session.get(TestSession, user_id)
+        if not test_session or test_session.is_finished:
+            await states.clear(user_id)
+            await client.send_message(chat_id=chat_id, text="Сессия теста не найдена.")
+            return
+        questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        question_index = test_session.current_question_index
+        if question_index >= len(questions):
+            await _finish_universal_test(client, chat_id, user_id, states)
+            return
+        question = questions[question_index]
+        if not question_accepts_text(question):
+            await client.send_message(chat_id=chat_id, text="Пожалуйста, выберите один из вариантов ниже.")
+            return
+        answers = parse_answers(test_session.answers)
+        answers.append(make_answer_record(question, question_index, text.strip(), None))
+        test_session.answers = serialize_answers(answers)
+        test_session.current_question_index += 1
+        await session.commit()
+        next_index = test_session.current_question_index
+
+    if next_index < len(questions):
+        await _send_question(client, chat_id, user_id, next_index)
+    else:
+        await _finish_universal_test(client, chat_id, user_id, states)
+        await client.send_message(chat_id=chat_id, text="Диаграмма готова. Ниже можно открыть результат и историю-зеркало.", attachments=case_study_keyboard())
+
+
+async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: int, states: StateStore | None = None) -> None:
+    async with async_session_maker() as session:
+        test_session = await session.get(TestSession, user_id)
+        test_config = await session.get(TestConfig, 1)
+        questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        answers = parse_answers(test_session.answers if test_session else "[]")
+        formulas = json_loads(test_config.formulas_json, []) if test_config and test_config.formulas_enabled else []
+        formula_results = calculate_formulas(answers, formulas) if formulas else {}
+        report_text = build_prompt_payload(questions, answers, formula_results, mode="all")
+        await session.execute(
+            update(TestSession)
+            .where(TestSession.user_id == user_id)
+            .values(
+                answers=report_text,
+                formula_results=json_dumps(formula_results) if formula_results else None,
+                is_finished=True,
+            )
+        )
+        await session.commit()
+    if states:
+        await states.clear(user_id)
 
 
 async def show_results(client: MaxApiClient, chat_id: int, user_id: int) -> None:
@@ -220,6 +292,52 @@ async def show_results(client: MaxApiClient, chat_id: int, user_id: int) -> None
         user = await session.get(User, user_id)
     if content and content.text_content:
         await client.send_message(chat_id=chat_id, text=content.text_content)
+    if test_session and test_session.answers and "Результаты теста:" in test_session.answers:
+        await client.send_message(chat_id=chat_id, text=test_session.answers)
+        formula_results = json_loads(getattr(test_session, "formula_results", None), {})
+        input_mode = getattr(test_config, "interpretation_input_mode", "all") if test_config else "all"
+        if input_mode == "formulas" and formula_results:
+            prompt_payload = "\n".join(f"{name}: {value}" for name, value in formula_results.items())
+        else:
+            prompt_payload = test_session.answers
+        if user and test_config and test_config.test_system_prompt:
+            user_name = user.name or user.first_name or "пользователь"
+            user_gender = "Женский" if user.gender == "female" else "Мужской" if user.gender == "male" else "Не определен"
+            system_prompt = (
+                test_config.result_system_prompt
+                if getattr(test_config, "separate_result_prompt_enabled", False) and getattr(test_config, "result_system_prompt", None)
+                else test_config.test_system_prompt
+            )
+            user_prompt = (
+                f"Интерпретируй результаты теста.\n\n"
+                f"Пользователь: {user_name}\n"
+                f"Возраст: {user.age or 'Не указан'}\n"
+                f"Пол: {user_gender}\n\n"
+                f"Данные для интерпретации:\n{prompt_payload}"
+            )
+            try:
+                ai_summary = await get_ai_response_direct(user.id, system_prompt, user_prompt)
+                await client.send_message(chat_id=chat_id, text=ai_summary)
+                async with async_session_maker() as msg_session:
+                    msg_session.add(
+                        DBMessage(
+                            user_id=user_id,
+                            role="assistant",
+                            content=ai_summary,
+                            dialogue_id=user.current_dialogue_id,
+                            topic_id=user.current_topic_id,
+                        )
+                    )
+                    await msg_session.commit()
+            except Exception:
+                ai_log.exception("Universal Max test AI interpretation failed user_id=%s", user_id)
+        marathon_url = test_config.marathon_url if test_config else "https://max.ru"
+        await client.send_message(
+            chat_id=chat_id,
+            text="Секретный блок вопросов уже доступен. После него можно продолжить диалог с ботом по результатам теста.",
+            attachments=secret_test_keyboard(marathon_url),
+        )
+        return
     answers_raw = [int(item) for item in (test_session.answers or "").split(",") if item.isdigit()] if test_session else []
     ranking: list[tuple[str, float]] = []
     diagram_text = ""

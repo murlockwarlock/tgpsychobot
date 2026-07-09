@@ -384,6 +384,7 @@ class TestSession(Base):
     user_id = Column(BigInteger, ForeignKey('users.id'), primary_key=True)
     current_question_index = Column(Integer, default=0)
     answers = Column(Text, default="[]")
+    formula_results = Column(Text, nullable=True)
     secret_answers = Column(Text, nullable=True)
     is_finished = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -396,6 +397,11 @@ class TestQuestion(Base):
     category = Column(String, nullable=False)
     is_reverse = Column(Boolean, default=False)
     sort_order = Column(Integer, default=0)
+    comment = Column(Text, nullable=True)
+    variable_name = Column(String, nullable=True)
+    allow_custom_answer = Column(Boolean, default=False, nullable=False)
+    buttons_layout = Column(String, default='vertical', nullable=False)
+    answer_options_json = Column(Text, nullable=True)
 
 
 class TestConfig(Base):
@@ -404,6 +410,13 @@ class TestConfig(Base):
     is_enabled = Column(Boolean, default=True)
     admin_username = Column(String, default="AlenaVV2004")
     marathon_url = Column(String, default="https://t.me/psihogipno")
+    show_progress = Column(Boolean, default=True, nullable=False)
+    formulas_enabled = Column(Boolean, default=False, nullable=False)
+    formulas_json = Column(Text, nullable=True)
+    separate_result_prompt_enabled = Column(Boolean, default=False, nullable=False)
+    result_system_prompt = Column(Text, nullable=True)
+    interpretation_input_mode = Column(String, default='all', nullable=False)
+    interpretation_selected_variables = Column(Text, nullable=True)
     test_system_prompt = Column(Text, default=textwrap.dedent("""
 # РОЛЬ И МИССИЯ
 Ты — Алёна Верловицкая, профессиональный психолог-гипнокоуч, автор марафона "Апгрейд самооценки".
@@ -539,6 +552,38 @@ async def init_db():
             if 'allow_image_edit' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_image_edit BOOLEAN DEFAULT FALSE NOT NULL"))
 
+            test_session_columns = [c['name'] for c in insp.get_columns('test_sessions')]
+            if 'formula_results' not in test_session_columns:
+                sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN formula_results TEXT"))
+
+            test_question_columns = [c['name'] for c in insp.get_columns('test_questions')]
+            if 'comment' not in test_question_columns:
+                sync_conn.execute(text("ALTER TABLE test_questions ADD COLUMN comment TEXT"))
+            if 'variable_name' not in test_question_columns:
+                sync_conn.execute(text("ALTER TABLE test_questions ADD COLUMN variable_name VARCHAR"))
+            if 'allow_custom_answer' not in test_question_columns:
+                sync_conn.execute(text("ALTER TABLE test_questions ADD COLUMN allow_custom_answer BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'buttons_layout' not in test_question_columns:
+                sync_conn.execute(text("ALTER TABLE test_questions ADD COLUMN buttons_layout VARCHAR DEFAULT 'vertical' NOT NULL"))
+            if 'answer_options_json' not in test_question_columns:
+                sync_conn.execute(text("ALTER TABLE test_questions ADD COLUMN answer_options_json TEXT"))
+
+            test_config_columns = [c['name'] for c in insp.get_columns('test_config')]
+            if 'show_progress' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN show_progress BOOLEAN DEFAULT TRUE NOT NULL"))
+            if 'formulas_enabled' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN formulas_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'formulas_json' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN formulas_json TEXT"))
+            if 'separate_result_prompt_enabled' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN separate_result_prompt_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'result_system_prompt' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN result_system_prompt TEXT"))
+            if 'interpretation_input_mode' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN interpretation_input_mode VARCHAR DEFAULT 'all' NOT NULL"))
+            if 'interpretation_selected_variables' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN interpretation_selected_variables TEXT"))
+
             mailing_columns = [c['name'] for c in insp.get_columns('mailings')]
             if 'recurring_type' not in mailing_columns:
                 sync_conn.execute(text("ALTER TABLE mailings ADD COLUMN recurring_type VARCHAR"))
@@ -597,6 +642,15 @@ async def init_db():
             session.add(TestConfig(id=1))
         elif test_conf.test_system_prompt is None:
             test_conf.test_system_prompt = "Ты — психолог Алёны Верловицкой. Действуй строго по разделу 'ЗАДАЧА 1: СЦЕНАРИСТ'. Твоя цель: написать историю персонажа-двойника. Не показывай цифры. Только история."
+        else:
+            if getattr(test_conf, 'show_progress', None) is None:
+                test_conf.show_progress = True
+            if getattr(test_conf, 'formulas_enabled', None) is None:
+                test_conf.formulas_enabled = False
+            if getattr(test_conf, 'separate_result_prompt_enabled', None) is None:
+                test_conf.separate_result_prompt_enabled = False
+            if getattr(test_conf, 'interpretation_input_mode', None) is None:
+                test_conf.interpretation_input_mode = 'all'
 
         # Seed default content sections for new bots (won't overwrite existing)
         default_content = [
