@@ -1151,54 +1151,12 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                     details=str(e),
                     exception=e,
                 )
-
-            spread = user_spread_state.get(user_id)
-            if spread:
-                spread.setdefault('selected_file_ids', []).append(media.file_id)
-            if spread and spread['rounds_left'] > 0:
-                spread['chosen_card_ids'].append(card_id)
-                spread['rounds_left'] -= 1
-                async with async_session_maker() as s3:
-                    spread_coll_ids = await _get_topic_media_ids(s3, spread['topic_id'])
-                    spread_decks = await _get_assigned_decks(s3, spread['topic_id']) if spread_coll_ids is None else None
-                    exclude_ids = spread['chosen_card_ids']
-                    stmt = select(MediaLibrary).where(
-                        _media_filter(spread['topic_id'], spread_coll_ids, spread_decks, spread['category']),
-                        MediaLibrary.media_type == 'photo',
-                        MediaLibrary.file_name != '_back',
-                        MediaLibrary.id.notin_(exclude_ids),
-                    ).order_by(func.random()).limit(spread['cards_per_round'])
-                    res = await s3.execute(stmt)
-                    next_cards = res.scalars().all()
-                    if next_cards:
-                        if spread['hidden']:
-                            back_stmt = select(MediaLibrary).where(
-                                MediaLibrary.category == spread['category'],
-                                MediaLibrary.file_name == '_back',
-                            ).limit(1)
-                            back_media = await s3.scalar(back_stmt)
-                            if back_media:
-                                await send_card_album(
-                                    bot,
-                                    user_id,
-                                    [back_media.file_id for _ in next_cards],
-                                    context="process_card_selection.hidden_next_cards",
-                                )
-                        else:
-                            await send_card_album(
-                                bot,
-                                user_id,
-                                [c.file_id for c in next_cards],
-                                context="process_card_selection.next_cards",
-                            )
-                        kb = keyboards.card_selection_keyboard(spread['category'], [c.id for c in next_cards])
-                        await bot.send_message(chat_id=user_id, text="Выбери следующую карту:", reply_markup=kb)
-                    else:
-                        user_spread_state.pop(user_id, None)
-            elif spread:
-                spread['chosen_card_ids'].append(card_id)
-                final_spread_file_ids = list(spread.get('selected_file_ids', []))
-                user_spread_state.pop(user_id, None)
+            final_spread_file_ids = await _advance_card_spread_after_selection(
+                bot=bot,
+                user_id=user_id,
+                card_id=card_id,
+                selected_file_id=media.file_id,
+            )
         else:
             await callback.answer("Ошибка: Карта не найдена.", show_alert=True)
 
@@ -1210,6 +1168,89 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
             final_spread_file_ids,
             context="process_card_selection.final_spread",
         )
+
+
+async def _advance_card_spread_after_selection(
+    *,
+    bot: Bot,
+    user_id: int,
+    card_id: int,
+    selected_file_id: str,
+) -> list[str]:
+    spread = user_spread_state.get(user_id)
+    if not spread:
+        return []
+
+    spread.setdefault('selected_file_ids', []).append(selected_file_id)
+    spread.setdefault('chosen_card_ids', []).append(card_id)
+
+    if spread.get('rounds_left', 0) <= 0:
+        final_file_ids = list(spread.get('selected_file_ids', []))
+        user_spread_state.pop(user_id, None)
+        return final_file_ids
+
+    spread['rounds_left'] -= 1
+    try:
+        async with async_session_maker() as session:
+            spread_coll_ids = await _get_topic_media_ids(session, spread['topic_id'])
+            spread_decks = await _get_assigned_decks(session, spread['topic_id']) if spread_coll_ids is None else None
+            stmt = select(MediaLibrary).where(
+                _media_filter(spread['topic_id'], spread_coll_ids, spread_decks, spread['category']),
+                MediaLibrary.media_type == 'photo',
+                MediaLibrary.file_name != '_back',
+                MediaLibrary.id.notin_(spread['chosen_card_ids']),
+            ).order_by(func.random()).limit(spread['cards_per_round'])
+            result = await session.execute(stmt)
+            next_cards = result.scalars().all()
+
+            if not next_cards:
+                final_file_ids = list(spread.get('selected_file_ids', []))
+                user_spread_state.pop(user_id, None)
+                log.warning("Card spread stopped: no next cards user_id=%s category=%s", user_id, spread.get('category'))
+                return final_file_ids
+
+            if spread.get('hidden'):
+                back_stmt = select(MediaLibrary).where(
+                    MediaLibrary.category == spread['category'],
+                    MediaLibrary.file_name == '_back',
+                ).limit(1)
+                back_media = await session.scalar(back_stmt)
+                if back_media:
+                    await send_card_album(
+                        bot,
+                        user_id,
+                        [back_media.file_id for _ in next_cards],
+                        context="process_card_selection.hidden_next_cards",
+                    )
+                else:
+                    log.warning("Hidden card spread has no _back media user_id=%s category=%s", user_id, spread.get('category'))
+                    await send_card_album(
+                        bot,
+                        user_id,
+                        [card.file_id for card in next_cards],
+                        context="process_card_selection.hidden_next_cards_no_back",
+                    )
+            else:
+                await send_card_album(
+                    bot,
+                    user_id,
+                    [card.file_id for card in next_cards],
+                    context="process_card_selection.next_cards",
+                )
+
+            await bot.send_message(
+                chat_id=user_id,
+                text="Выбери следующую карту:",
+                reply_markup=keyboards.card_selection_keyboard(spread['category'], [card.id for card in next_cards]),
+            )
+            return []
+    except Exception:
+        log.exception("Failed to continue card spread user_id=%s card_id=%s", user_id, card_id)
+        await bot.send_message(
+            chat_id=user_id,
+            text="Не удалось показать следующие карты. Попробуй выбрать карту ещё раз или начни расклад заново.",
+        )
+        return []
 
 
 def calculate_signature(*args) -> str:
