@@ -1738,7 +1738,10 @@ async def create_web_app() -> web.Application:
     
     commands.append({"name": "admin", "description": "Админ-панель"})
 
-    await client.set_commands(commands)
+    try:
+        await client.set_commands(commands)
+    except Exception:
+        max_log.exception("Failed to set MAX commands; continuing startup")
     bot_app = MaxBotApplication(client)
     background_tasks: set[asyncio.Task[None]] = set()
     bot_app.background_tasks = background_tasks
