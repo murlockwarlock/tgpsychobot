@@ -109,6 +109,7 @@ from universal_tests import (
     get_answer_options,
     json_dumps,
     json_loads,
+    is_universal_test_report,
     make_answer_record,
     make_option_answer_record,
     make_text_answer_record,
@@ -11232,7 +11233,9 @@ async def finish_test_generation(
         f"Возраст: {user_age}\n"
         f"Пол: {user_gender_str}\n\n"
         f"ДАННЫЕ ДЛЯ ИНТЕРПРЕТАЦИИ:\n{prompt_payload}\n\n"
-        "Дай понятную, персональную интерпретацию результата."
+        "Дай понятную, персональную интерпретацию результата. "
+        "Не показывай технические имена переменных и формул. Не придумывай максимальные баллы, "
+        "знаменатели или нормы, которых нет в данных. Используй как имя только имя из блока данных пользователя."
     )
 
     preliminary_interpretation = None
@@ -11243,7 +11246,7 @@ async def finish_test_generation(
                 result_system_prompt,
                 interpretation_prompt,
             )
-        handoff_prompt = build_result_handoff_prompt(prompt_payload, preliminary_interpretation)
+        handoff_prompt = build_result_handoff_prompt(prompt_payload, preliminary_interpretation, user_name)
         interpretation_text = await get_ai_response(
             user_id,
             handoff_prompt,
@@ -11258,8 +11261,6 @@ async def finish_test_generation(
 
     html_story = markdown_to_html(interpretation_text)
 
-    final_message_text = f"{html_story}\n\n<i>Результат сохранён. Его можно продолжить обсуждать в этом диалоге.</i>"
-
     async with async_session_maker() as session:
         session.add(DBMessage(
             user_id=user_id,
@@ -11270,7 +11271,7 @@ async def finish_test_generation(
         ))
         await session.commit()
 
-    await message.edit_text(final_message_text, reply_markup=kb.case_study_confirmation_keyboard())
+    await message.edit_text(html_story, reply_markup=kb.case_study_confirmation_keyboard())
 
 
 @router.callback_query(F.data == "test_confirm_case")
@@ -11339,9 +11340,11 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
                 await asyncio.sleep(0.3)
                 await send_media()
 
-    await callback.message.answer(diagram_text)
+    universal_report = is_universal_test_report(diagram_text)
+    if not universal_report:
+        await callback.message.answer(diagram_text)
 
-    if "ОБЩИЙ ИТОГ:" not in (diagram_text or ""):
+    if universal_report or "ОБЩИЙ ИТОГ:" not in (diagram_text or ""):
         secret_test_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔐 Пройти секретный тест", callback_data="start_secret_test")],
             [InlineKeyboardButton(text="Сразу на марафон 🚀", url=marathon_url)]

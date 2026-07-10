@@ -236,7 +236,7 @@ def universal_test_answers_keyboard(options, horizontal: bool = False, question_
 
 
 def case_study_keyboard() -> list[dict]:
-    return inline_keyboard([[callback_button("📋 Показать ответы и расчёты", "test_confirm_case")]])
+    return inline_keyboard([[callback_button("Продолжить", "test_confirm_case")]])
 
 
 def secret_test_keyboard(marathon_url: str) -> list[dict]:

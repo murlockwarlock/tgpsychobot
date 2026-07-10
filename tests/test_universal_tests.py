@@ -19,6 +19,7 @@ from universal_tests import (
     build_result_handoff_prompt,
     calculate_formulas,
     get_answer_options,
+    is_universal_test_report,
     json_dumps,
     make_option_answer_record,
     make_text_answer_record,
@@ -417,6 +418,40 @@ class MaxCompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         session.execute.assert_not_awaited()
         self.assertIn("отключено", client.send_message.await_args.kwargs["text"])
 
+    async def test_max_continue_does_not_send_internal_report_to_client(self):
+        from max_messenger_bot.services import tests as tests_service
+
+        internal_report = "Результаты теста:\n\nОтвет: Да\n\nРасчётные показатели:\ntotal_score: 8"
+        test_session = SimpleNamespace(answers=internal_report)
+        config = SimpleNamespace(marathon_url="https://example.test")
+        user = SimpleNamespace(current_dialogue_id=1, current_topic_id=None)
+
+        async def get_model(model, _key, **_kwargs):
+            return {
+                "TestSession": test_session,
+                "TestConfig": config,
+                "Content": None,
+                "User": user,
+            }[model.__name__]
+
+        session = MagicMock()
+        session.get = AsyncMock(side_effect=get_model)
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = []
+        session.execute = AsyncMock(return_value=result)
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        client = SimpleNamespace(send_message=AsyncMock())
+
+        with patch.object(tests_service, "async_session_maker", return_value=context):
+            await tests_service.show_results(client, 10, 20)
+
+        visible_texts = [call.kwargs.get("text", "") for call in client.send_message.await_args_list]
+        self.assertTrue(visible_texts)
+        self.assertFalse(any("total_score" in text for text in visible_texts))
+        self.assertFalse(any("Результаты теста:" in text for text in visible_texts))
+
 
 class UniversalFormulaAndPromptTests(unittest.TestCase):
     def test_duplicate_variables_and_formula_names_are_rejected(self):
@@ -462,10 +497,17 @@ class UniversalFormulaAndPromptTests(unittest.TestCase):
         self.assertIn("2. Второй", selected)
 
     def test_separate_interpretation_is_handed_to_calling_prompt(self):
-        prompt = build_result_handoff_prompt("score: 3", "Предварительный вывод")
+        prompt = build_result_handoff_prompt("score: 3", "Предварительный вывод", "Анна")
         self.assertIn("Предварительная интерпретация", prompt)
         self.assertIn("Предварительный вывод", prompt)
         self.assertIn("текущего системного промпта", prompt)
+        self.assertIn("Не придумывай максимальные баллы", prompt)
+        self.assertIn("Имя пользователя из профиля: Анна", prompt)
+        self.assertIn("total_score", prompt)
+
+    def test_internal_report_is_detected_for_client_side_hiding(self):
+        self.assertTrue(is_universal_test_report("\nРезультаты теста:\n\ntotal_score: 8"))
+        self.assertFalse(is_universal_test_report("ОБЩИЙ ИТОГ: 8/10"))
 
 
 if __name__ == "__main__":

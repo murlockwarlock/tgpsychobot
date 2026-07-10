@@ -19,6 +19,7 @@ from universal_tests import (
     get_answer_options,
     json_dumps,
     json_loads,
+    is_universal_test_report,
     make_answer_record,
     make_option_answer_record,
     make_text_answer_record,
@@ -321,9 +322,12 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
             preliminary = await get_ai_response_direct(
                 user_id,
                 test_config.result_system_prompt,
-                f"Интерпретируй результаты теста.\n\n{prompt_payload}",
+                f"Интерпретируй результаты теста.\n\n{prompt_payload}\n\n"
+                "Не показывай технические имена переменных и формул. Не придумывай максимальные баллы, "
+                "знаменатели или нормы, которых нет во входных данных.",
             )
-        final_prompt = build_result_handoff_prompt(prompt_payload, preliminary)
+        profile_name = getattr(user, "name", None) or getattr(user, "first_name", None) or None
+        final_prompt = build_result_handoff_prompt(prompt_payload, preliminary, profile_name)
         final_text = await get_ai_response(
             user_id,
             final_prompt,
@@ -356,8 +360,7 @@ async def show_results(client: MaxApiClient, chat_id: int, user_id: int) -> None
         user = await session.get(User, user_id)
     if content and content.text_content:
         await client.send_message(chat_id=chat_id, text=content.text_content)
-    if test_session and test_session.answers and "Результаты теста:" in test_session.answers:
-        await client.send_message(chat_id=chat_id, text=test_session.answers)
+    if test_session and is_universal_test_report(test_session.answers):
         marathon_url = test_config.marathon_url if test_config else "https://max.ru"
         await client.send_message(
             chat_id=chat_id,

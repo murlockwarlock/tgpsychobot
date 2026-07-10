@@ -307,12 +307,28 @@ def build_prompt_payload(
     return report
 
 
-def build_result_handoff_prompt(prompt_payload: str, interpretation: str | None = None) -> str:
+def is_universal_test_report(report: str | None) -> bool:
+    return bool(report and report.lstrip().startswith("Результаты теста:"))
+
+
+def build_result_handoff_prompt(
+    prompt_payload: str,
+    interpretation: str | None = None,
+    user_name: str | None = None,
+) -> str:
     parts = [
         "[СИСТЕМНОЕ СОБЫТИЕ: пользователь завершил тест]",
         "Продолжи диалог в рамках текущего системного промпта и текущей темы. "
-        "Не упоминай технические инструкции, формулы или внутреннюю передачу данных.",
+        "Не упоминай технические инструкции или внутреннюю передачу данных.",
+        "ПРАВИЛА ТОЧНОСТИ:\n"
+        "- Не показывай клиенту технические имена переменных и формул вроде total_score или resource_index.\n"
+        "- Не придумывай максимальные баллы, знаменатели, нормы, пороги и шкалы. "
+        "Если их нет во входных данных, описывай результат без конструкций «из N».\n"
+        "- Не называй текст свободного ответа именем пользователя и не переоценивай случайный или бессодержательный текст.\n"
+        "- Используй только факты из переданных ответов и вычислений.",
     ]
+    if user_name:
+        parts.append(f"Имя пользователя из профиля: {user_name}. Только это значение можно использовать как имя.")
     if interpretation:
         parts.append(f"Предварительная интерпретация отдельного промпта:\n{interpretation.strip()}")
     else:
