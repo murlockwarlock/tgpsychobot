@@ -11445,6 +11445,21 @@ async def admin_upload_questions_start(callback: CallbackQuery, state: FSMContex
     await callback.message.edit_text(text, reply_markup=kb.back_to_previous_menu("admin_test_menu"))
 
 
+async def _send_admin_test_menu_after_upload(message: Message):
+    async with async_session_maker() as session:
+        config = await session.get(TestConfig, 1)
+        if not config:
+            config = TestConfig(id=1)
+            session.add(config)
+            await session.commit()
+
+    await message.answer(
+        "🧩 <b>Управление разделом 'Тест'</b>\n\n"
+        "Вопросы загружены. Теперь можно включить формулы, выбрать режим интерпретации или пройти тест.",
+        reply_markup=kb.admin_test_menu_keyboard(config)
+    )
+
+
 @router.message(AdminStates.upload_test_questions_file, F.document)
 async def admin_process_questions_file(message: Message, state: FSMContext, bot: Bot):
     try:
@@ -11460,30 +11475,12 @@ async def admin_process_questions_file(message: Message, state: FSMContext, bot:
         except:
             pass
 
-    async def send_new_menu(text, reply_markup=None, **kwargs):
-        await message.answer(text, reply_markup=reply_markup, **kwargs)
-
-    mock_message = type('MockMessage', (object,), {
-        'chat': message.chat,
-        'message_id': message.message_id,
-        'edit_text': send_new_menu,
-        'answer': message.answer
-    })()
-
-    call_mock = type('MockCallback', (object,), {
-        'message': mock_message,
-        'bot': bot,
-        'from_user': message.from_user,
-        'answer': lambda *a, **k: None,
-        'data': 'admin_test_menu'
-    })()
-
     document = message.document
     file_ext = document.file_name.split('.')[-1].lower()
 
     if file_ext not in ['xlsx', 'txt', 'csv']:
         await message.answer("❌ Поддерживаются только файлы .xlsx, .csv и .txt")
-        await admin_test_menu(call_mock)
+        await _send_admin_test_menu_after_upload(message)
         await state.clear()
         return
 
@@ -11501,7 +11498,7 @@ async def admin_process_questions_file(message: Message, state: FSMContext, bot:
 
         if not questions_data:
             await message.answer("❌ Не удалось найти вопросы в файле. Проверьте формат.")
-            await admin_test_menu(call_mock)
+            await _send_admin_test_menu_after_upload(message)
             await state.clear()
             return
 
@@ -11521,7 +11518,7 @@ async def admin_process_questions_file(message: Message, state: FSMContext, bot:
         formula_errors = validate_formulas(preview_questions, formulas_data)
         if formula_errors:
             await message.answer("❌ Ошибка в формулах:\n" + "\n".join(f"- {item}" for item in formula_errors[:10]))
-            await admin_test_menu(call_mock)
+            await _send_admin_test_menu_after_upload(message)
             await state.clear()
             return
 
@@ -11552,13 +11549,13 @@ async def admin_process_questions_file(message: Message, state: FSMContext, bot:
 
         formula_text = f"\nФормул: {len(formulas_data)}" if formulas_data else ""
         await message.answer(f"✅ Успешно загружено {len(questions_data)} вопросов!{formula_text}")
-        await admin_test_menu(call_mock)
+        await _send_admin_test_menu_after_upload(message)
         await state.clear()
 
     except Exception as e:
         logging.error(f"Error uploading questions: {e}")
         await message.answer(f"❌ Произошла ошибка: {e}")
-        await admin_test_menu(call_mock)
+        await _send_admin_test_menu_after_upload(message)
         await state.clear()
 
 
