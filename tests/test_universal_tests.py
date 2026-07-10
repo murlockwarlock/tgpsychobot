@@ -394,6 +394,29 @@ class MaxCompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         states.clear.assert_awaited_once_with(20)
         self.assertEqual(client.send_message.await_args.kwargs["text"], "Финальный ответ")
 
+    async def test_disabled_max_test_does_not_start_for_regular_user(self):
+        from max_messenger_bot.services import tests as tests_service
+
+        user = SimpleNamespace(is_admin=False)
+        config = SimpleNamespace(is_enabled=False)
+
+        async def get_model(model, _key, **_kwargs):
+            return {"User": user, "TestConfig": config}[model.__name__]
+
+        session = MagicMock()
+        session.get = AsyncMock(side_effect=get_model)
+        session.execute = AsyncMock()
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        client = SimpleNamespace(send_message=AsyncMock())
+
+        with patch.object(tests_service, "async_session_maker", return_value=context):
+            await tests_service.start_test(client, 10, 20)
+
+        session.execute.assert_not_awaited()
+        self.assertIn("отключено", client.send_message.await_args.kwargs["text"])
+
 
 class UniversalFormulaAndPromptTests(unittest.TestCase):
     def test_duplicate_variables_and_formula_names_are_rejected(self):
