@@ -44,6 +44,7 @@ TEXT_FILE_INPUT_STATES = {
     "admin_edit_topic_prompt",
     "admin_edit_topic_intro",
     "admin_test_set_prompt",
+    "admin_test_set_result_prompt",
     "admin_kb_create_content",
     "admin_kb_edit_content",
     "admin_ai_set_system_prompt",
@@ -171,6 +172,16 @@ class MaxBotApplication:
             await self.states.clear(message.sender.user_id)
             state = None
         if state:
+            if state.state in {"admin_test_upload_questions", "admin_test_upload_formulas"}:
+                if message.media_type == "file" and message.media_token:
+                    kind = "questions" if state.state.endswith("questions") else "formulas"
+                    await admin_tests_service.receive_test_file(self.client, self.states, message, kind)
+                else:
+                    await self.client.send_message(
+                        chat_id=message.chat_id,
+                        text="Отправьте файл .xlsx, .csv или .txt. Для выхода используйте /admin.",
+                    )
+                return
             if state.state == "awaiting_tg_id":
                 from .services.link_tg import process_tg_link
 
@@ -239,6 +250,12 @@ class MaxBotApplication:
                 return
             if state.state == "admin_test_set_prompt":
                 await admin_tests_service.save_prompt(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "admin_test_set_result_prompt":
+                await admin_tests_service.save_result_prompt(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "admin_test_set_selected_vars":
+                await admin_tests_service.save_selected_variables(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
             if state.state == "admin_test_question_create_text":
                 await admin_test_content_service.save_new_question_text(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -764,6 +781,7 @@ class MaxBotApplication:
             await subscriptions_service.show_referral_info(self.client, chat_id, user_id)
             return
         if data.startswith("test_opt_"):
+            await self.client.answer_callback(callback.callback_id)
             await tests_service.process_answer(self.client, chat_id, user_id, data, self.states)
             return
         if data.startswith("test_ans_"):
@@ -1387,6 +1405,30 @@ class MaxBotApplication:
                 return
             if data == "admin_test_toggle_status":
                 await admin_tests_service.toggle_status(self.client, chat_id)
+                return
+            if data == "admin_test_toggle_progress":
+                await admin_tests_service.toggle_progress(self.client, chat_id)
+                return
+            if data == "admin_test_toggle_formulas":
+                await admin_tests_service.toggle_formulas(self.client, chat_id)
+                return
+            if data == "admin_test_toggle_input_mode":
+                await admin_tests_service.toggle_input_mode(self.client, chat_id)
+                return
+            if data == "admin_test_set_selected_vars":
+                await admin_tests_service.start_selected_variables(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_test_toggle_separate_prompt":
+                await admin_tests_service.toggle_separate_prompt(self.client, chat_id)
+                return
+            if data == "admin_edit_test_result_prompt":
+                await admin_tests_service.start_edit_result_prompt(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_test_upload_questions":
+                await admin_tests_service.start_upload(self.client, self.states, chat_id, user_id, "questions")
+                return
+            if data == "admin_test_upload_formulas":
+                await admin_tests_service.start_upload(self.client, self.states, chat_id, user_id, "formulas")
                 return
             if data == "admin_test_links":
                 await admin_tests_service.show_links(self.client, chat_id)

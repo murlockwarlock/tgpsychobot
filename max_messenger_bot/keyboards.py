@@ -223,15 +223,20 @@ def test_answers_keyboard() -> list[dict]:
     )
 
 
-def universal_test_answers_keyboard(options, horizontal: bool = False) -> list[dict]:
-    buttons = [callback_button(getattr(option, "text", str(option)), f"test_opt_{index}") for index, option in enumerate(options)]
+def universal_test_answers_keyboard(options, horizontal: bool = False, question_index: int = 0) -> list[dict]:
+    from universal_tests import answer_callback_data
+
+    buttons = [
+        callback_button(getattr(option, "text", str(option)), answer_callback_data(question_index, index))
+        for index, option in enumerate(options)
+    ]
     if horizontal:
-        return inline_keyboard([buttons])
+        return inline_keyboard([buttons[index:index + 8] for index in range(0, len(buttons), 8)])
     return inline_keyboard([[button] for button in buttons])
 
 
 def case_study_keyboard() -> list[dict]:
-    return inline_keyboard([[callback_button("✅ Показать результаты", "test_confirm_case")]])
+    return inline_keyboard([[callback_button("📋 Показать ответы и расчёты", "test_confirm_case")]])
 
 
 def secret_test_keyboard(marathon_url: str) -> list[dict]:
@@ -606,9 +611,22 @@ def admin_topic_kb_keyboard(topic_id: int, entries: list, assigned_ids: set[int]
 
 def admin_test_menu_keyboard(config) -> list[dict]:
     status_text = "✅ Включен" if config.is_enabled else "❌ Выключен"
+    progress_text = "✅ Да" if getattr(config, "show_progress", True) else "❌ Нет"
+    formulas_text = "✅ Да" if getattr(config, "formulas_enabled", False) else "❌ Нет"
+    mode = getattr(config, "interpretation_input_mode", "all") or "all"
+    mode_text = {"all": "вопросы и ответы", "selected": "выбранные", "formulas": "только формулы"}.get(mode, "вопросы и ответы")
+    separate_text = "✅ Да" if getattr(config, "separate_result_prompt_enabled", False) else "❌ Нет"
     return inline_keyboard(
         [
             [callback_button(f"Статус теста: {status_text}", "admin_test_toggle_status")],
+            [callback_button(f"Прогресс: {progress_text}", "admin_test_toggle_progress")],
+            [callback_button(f"Формулы: {formulas_text}", "admin_test_toggle_formulas")],
+            [callback_button(f"В интерпретацию: {mode_text}", "admin_test_toggle_input_mode")],
+            [callback_button("🎯 Выбранные переменные", "admin_test_set_selected_vars")],
+            [callback_button(f"Отдельный промпт: {separate_text}", "admin_test_toggle_separate_prompt")],
+            [callback_button("📝 Промпт результата", "admin_edit_test_result_prompt")],
+            [callback_button("📥 Загрузить вопросы", "admin_test_upload_questions")],
+            [callback_button("📐 Загрузить формулы", "admin_test_upload_formulas")],
             [callback_button("✏️ Приветствие теста", "admin_edit_content_test_intro")],
             [callback_button("✏️ Результаты теста", "admin_edit_content_test_results")],
             [callback_button("✏️ Финал секретного теста", "admin_edit_content_secret_test_outro")],

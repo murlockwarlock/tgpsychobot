@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import html
 import json
 import re
 from dataclasses import dataclass
@@ -96,15 +97,35 @@ def build_question_text(question: Any, index: int, total: int, show_progress: bo
     if show_progress:
         lines.append(progress_bar(index + 1, total))
     lines.append("")
-    lines.append(f"<b>{getattr(question, 'text', '')}</b>")
+    question_text = html.escape(str(getattr(question, "text", "") or ""))
+    lines.append(f"<b>{question_text}</b>")
     comment = (getattr(question, "comment", None) or "").strip()
     if comment:
-        lines.extend(["", comment])
+        lines.extend(["", html.escape(comment)])
     if get_answer_options(question) and question_accepts_text(question):
         lines.extend(["", "Напишите свой ответ или выберите из предложенных ниже."])
     elif not get_answer_options(question):
         lines.extend(["", "Напишите ответ сообщением."])
     return "\n".join(lines)
+
+
+def answer_callback_data(question_index: int, option_index: int) -> str:
+    return f"test_opt_{question_index}_{option_index}"
+
+
+def parse_answer_callback(payload: str, current_question_index: int) -> int:
+    match = re.fullmatch(r"test_opt_(\d+)_(\d+)", payload or "")
+    if match:
+        callback_question_index = int(match.group(1))
+        if callback_question_index != current_question_index:
+            raise ValueError("Этот вопрос уже закрыт. Ответьте на текущий вопрос.")
+        return int(match.group(2))
+
+    # Keep active keyboards from the previous release usable during deployment.
+    legacy_match = re.fullmatch(r"test_opt_(\d+)", payload or "")
+    if legacy_match:
+        return int(legacy_match.group(1))
+    raise ValueError("Некорректный вариант ответа.")
 
 
 def parse_answers(raw: str | None) -> list[dict[str, Any]]:
@@ -138,6 +159,24 @@ def make_answer_record(question: Any, question_index: int, answer_text: str, num
         "answer": answer_text,
         "numeric_value": numeric_value,
     }
+
+
+def make_option_answer_record(question: Any, question_index: int, callback_payload: str) -> dict[str, Any]:
+    option_index = parse_answer_callback(callback_payload, question_index)
+    options = get_answer_options(question)
+    if option_index < 0 or option_index >= len(options):
+        raise ValueError("Такого варианта ответа нет.")
+    option = options[option_index]
+    return make_answer_record(question, question_index, option.text, option.value)
+
+
+def make_text_answer_record(question: Any, question_index: int, answer_text: str) -> dict[str, Any]:
+    normalized = str(answer_text or "").strip()
+    if not normalized:
+        raise ValueError("Пожалуйста, напишите ответ текстом.")
+    if not question_accepts_text(question):
+        raise ValueError("Пожалуйста, выберите один из вариантов ниже.")
+    return make_answer_record(question, question_index, normalized, None)
 
 
 def build_answers_report(questions: list[Any], answers: list[dict[str, Any]]) -> str:
@@ -178,6 +217,46 @@ def validate_formulas(questions: list[Any], formulas: list[dict[str, str]]) -> l
     return errors
 
 
+def validate_test_definition(questions: list[Any], formulas: list[dict[str, str]] | None = None) -> list[str]:
+    errors: list[str] = []
+    variables: dict[str, int] = {}
+
+    for index, question in enumerate(questions):
+        number = index + 1
+        text = str(getattr(question, "text", "") or "").strip()
+        if not text:
+            errors.append(f"Вопрос {number}: текст вопроса пуст.")
+
+        variable = get_question_variable(question, index)
+        if not variable.isidentifier():
+            errors.append(f"Вопрос {number}: имя переменной '{variable}' нельзя использовать в формуле.")
+        elif variable in variables:
+            errors.append(
+                f"Вопрос {number}: переменная '{variable}' уже используется в вопросе {variables[variable]}."
+            )
+        else:
+            variables[variable] = number
+
+        options = get_answer_options(question)
+        option_names: set[str] = set()
+        for option in options:
+            normalized = option.text.casefold()
+            if normalized in option_names:
+                errors.append(f"Вопрос {number}: вариант ответа '{option.text}' указан несколько раз.")
+            option_names.add(normalized)
+
+    formula_names: dict[str, int] = {}
+    for index, formula in enumerate(formulas or [], start=1):
+        name = normalize_variable_name(formula.get("name"), f"formula_{index}")
+        if name in formula_names:
+            errors.append(f"Формула {index}: результат '{name}' уже задан в формуле {formula_names[name]}.")
+        else:
+            formula_names[name] = index
+
+    errors.extend(validate_formulas(questions, formulas or []))
+    return errors
+
+
 def calculate_formulas(answers: list[dict[str, Any]], formulas: list[dict[str, str]]) -> dict[str, float]:
     values = {
         str(item.get("variable")): float(item["numeric_value"])
@@ -207,20 +286,39 @@ def build_prompt_payload(
     if mode == "selected":
         selected = {item for item in (selected_variables or []) if item}
         if selected:
-            questions = [
-                question
-                for index, question in enumerate(questions)
-                if get_question_variable(question, index) in selected
-            ]
             answers = [answer for answer in answers if answer.get("variable") in selected]
         elif not selected:
             return "Выбранные переменные для интерпретации не заданы."
+
+        lines = ["Результаты теста:"]
+        for answer in sorted(answers, key=lambda item: item.get("question_number", 0)):
+            numeric = answer.get("numeric_value")
+            suffix = f" ({numeric:g})" if isinstance(numeric, (int, float)) else ""
+            lines.append(
+                f"{answer.get('question_number', '')}. {answer.get('question', '')}\n"
+                f"Ответ: {answer.get('answer', '')}{suffix}"
+            )
+        return "\n\n".join(lines)
 
     report = build_answers_report(questions, answers)
     if formula_results:
         formulas = "\n".join(f"{name}: {value:g}" for name, value in formula_results.items())
         report = f"{report}\n\nРасчётные показатели:\n{formulas}"
     return report
+
+
+def build_result_handoff_prompt(prompt_payload: str, interpretation: str | None = None) -> str:
+    parts = [
+        "[СИСТЕМНОЕ СОБЫТИЕ: пользователь завершил тест]",
+        "Продолжи диалог в рамках текущего системного промпта и текущей темы. "
+        "Не упоминай технические инструкции, формулы или внутреннюю передачу данных.",
+    ]
+    if interpretation:
+        parts.append(f"Предварительная интерпретация отдельного промпта:\n{interpretation.strip()}")
+    else:
+        parts.append(f"Данные теста для интерпретации:\n{prompt_payload.strip()}")
+    parts.append("Сформируй итоговый персональный ответ пользователю по результатам теста.")
+    return "\n\n".join(parts)
 
 
 def _to_float_or_none(value: Any) -> float | None:

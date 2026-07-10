@@ -38,7 +38,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      ReferralTemplate)
 from aiogram.types import LabeledPrice
 import keyboards as kb
-from file_parser import parse_file, parse_questions_file
+from file_parser import parse_file, parse_formulas_file, parse_questions_file
 from ai_integration import (
     get_ai_response,
     generate_openai_image,
@@ -102,6 +102,7 @@ from subscription_dates import extend_subscription_end_date
 from subscription_retry_policy import can_retry_manually
 from bot_commands import refresh_commands_for_user
 from universal_tests import (
+    build_result_handoff_prompt,
     build_prompt_payload,
     build_question_text,
     calculate_formulas,
@@ -109,10 +110,12 @@ from universal_tests import (
     json_dumps,
     json_loads,
     make_answer_record,
+    make_option_answer_record,
+    make_text_answer_record,
     parse_answers,
-    question_accepts_text,
     question_buttons_are_horizontal,
     serialize_answers,
+    validate_test_definition,
     validate_formulas,
 )
 
@@ -308,6 +311,7 @@ class AdminStates(StatesGroup):
     set_temperature = State()
     set_kie_credit_threshold = State()
     upload_test_questions_file = State()
+    upload_test_formulas_file = State()
     set_test_system_prompt = State()
     set_test_selected_variables = State()
     set_welcome_bonus_days = State()
@@ -833,6 +837,7 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
             await bot.send_message(chat_id=user_id, text="⚠️ Тест временно недоступен: вопросы еще не загружены.")
             return
 
+        user = await session.get(User, user_id)
         await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
         session.add(
             TestSession(
@@ -841,6 +846,9 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
                 answers="[]",
                 is_finished=False,
                 current_question_index=0,
+                invocation_topic_id=user.current_topic_id if user else None,
+                invocation_dialogue_id=user.current_dialogue_id if user else 1,
+                invocation_platform="telegram",
             )
         )
         await session.commit()
@@ -853,7 +861,7 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
     options = get_answer_options(question)
     show_progress = getattr(config, "show_progress", True) if config else True
     text = build_question_text(question, 0, total_count, show_progress)
-    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question)) if options else None
+    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question), 0) if options else None
     await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
 
 
@@ -10858,7 +10866,15 @@ async def start_psych_test(message: Message, state: FSMContext, user_id: int):
             return
 
         await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
-        new_session = TestSession(user_id=user_id, current_question_index=0, answers="[]")
+        user = await session.get(User, user_id)
+        new_session = TestSession(
+            user_id=user_id,
+            current_question_index=0,
+            answers="[]",
+            invocation_topic_id=user.current_topic_id if user else None,
+            invocation_dialogue_id=user.current_dialogue_id if user else 1,
+            invocation_platform="telegram",
+        )
         session.add(new_session)
         await session.commit()
 
@@ -10868,7 +10884,7 @@ async def start_psych_test(message: Message, state: FSMContext, user_id: int):
 
 async def _process_universal_test_answer(message: Message, user_id: int, state: FSMContext, bot: Bot, callback_data: str):
     async with async_session_maker() as session:
-        test_session = await session.get(TestSession, user_id)
+        test_session = await session.get(TestSession, user_id, with_for_update=True)
         if not test_session or test_session.is_finished:
             await message.answer("Эта сессия уже завершена или не существует.")
             return
@@ -10882,19 +10898,18 @@ async def _process_universal_test_answer(message: Message, user_id: int, state: 
         question = questions[question_index]
         options = get_answer_options(question)
         if callback_data.startswith("test_opt_"):
-            option_index = int(callback_data.rsplit("_", 1)[1])
-            if option_index < 0 or option_index >= len(options):
-                await message.answer("Такого варианта ответа нет.")
+            try:
+                answer_record = make_option_answer_record(question, question_index, callback_data)
+            except ValueError as exc:
+                await message.answer(str(exc))
                 return
-            option = options[option_index]
-            answer_text = option.text
-            numeric_value = option.value
         else:
             answer_text = callback_data.rsplit("_", 1)[1]
             numeric_value = float(answer_text) if answer_text.isdigit() else None
+            answer_record = make_answer_record(question, question_index, answer_text, numeric_value)
 
         answers = parse_answers(test_session.answers)
-        answers.append(make_answer_record(question, question_index, answer_text, numeric_value))
+        answers.append(answer_record)
         test_session.answers = serialize_answers(answers)
         test_session.current_question_index += 1
         await session.commit()
@@ -10910,15 +10925,15 @@ async def _process_universal_test_answer(message: Message, user_id: int, state: 
         await send_next_question(message, user_id, state, bot)
     else:
         loading_msg = await message.answer("🤖 Спасибо! Анализирую ответы...")
-        await finish_test_generation(loading_msg, user_id, answers, questions)
+        await finish_test_generation(loading_msg, user_id, answers, questions, state)
 
 
 @router.callback_query(F.data.startswith("test_opt_"))
 @router.callback_query(F.data.startswith("test_ans_"))
 async def process_test_answer(callback: CallbackQuery, state: FSMContext, bot: Bot):
     user_id = callback.from_user.id
-    await _process_universal_test_answer(callback.message, user_id, state, bot, callback.data)
     await callback.answer()
+    await _process_universal_test_answer(callback.message, user_id, state, bot, callback.data)
 
 
 @router.callback_query(UserStates.awaiting_gender, F.data.startswith("gender_"))
@@ -11015,13 +11030,13 @@ async def send_next_question(message: Message, user_id: int, state: FSMContext, 
 
     if current_index >= total_count:
         answers_list = parse_answers(test_session.answers)
-        await finish_test_generation(message, user_id, answers_list, questions)
+        await finish_test_generation(message, user_id, answers_list, questions, state)
         return
 
     question = questions[current_index]
     options = get_answer_options(question)
     text = build_question_text(question, current_index, total_count, getattr(config, 'show_progress', True) if config else True)
-    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question)) if options else None
+    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question), current_index) if options else None
 
     try:
         await message.edit_text(text, reply_markup=reply_markup)
@@ -11038,22 +11053,24 @@ async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot
         return
 
     async with async_session_maker() as session:
-        test_session = await session.get(TestSession, user_id)
+        test_session = await session.get(TestSession, user_id, with_for_update=True)
         if not test_session or test_session.is_finished:
             await message.answer("Эта сессия уже завершена или не существует.")
             return
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
         question_index = test_session.current_question_index
         if question_index >= len(questions):
-            await finish_test_generation(message, user_id, parse_answers(test_session.answers), questions)
+            await finish_test_generation(message, user_id, parse_answers(test_session.answers), questions, state)
             return
         question = questions[question_index]
-        if not question_accepts_text(question):
-            await message.answer("Пожалуйста, выберите один из вариантов ниже.")
+        try:
+            answer_record = make_text_answer_record(question, question_index, answer_text)
+        except ValueError as exc:
+            await message.answer(str(exc))
             return
 
         answers = parse_answers(test_session.answers)
-        answers.append(make_answer_record(question, question_index, answer_text, None))
+        answers.append(answer_record)
         test_session.answers = serialize_answers(answers)
         test_session.current_question_index += 1
         await session.commit()
@@ -11063,7 +11080,7 @@ async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot
         await send_next_question(message, user_id, state, bot)
     else:
         loading_msg = await message.answer("🤖 Спасибо! Анализирую ответы...")
-        await finish_test_generation(loading_msg, user_id, answers, questions)
+        await finish_test_generation(loading_msg, user_id, answers, questions, state)
 
 
 @router.message(UserStates.awaiting_age)
@@ -11114,19 +11131,26 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
         await session.execute(stmt)
 
         existing_session = await session.get(TestSession, user_id)
+        user = await session.get(User, user_id)
 
         if existing_session:
             existing_session.created_at = datetime.utcnow()
             existing_session.answers = ""
             existing_session.is_finished = False
             existing_session.current_question_index = 0
+            existing_session.invocation_topic_id = user.current_topic_id if user else None
+            existing_session.invocation_dialogue_id = user.current_dialogue_id if user else 1
+            existing_session.invocation_platform = "telegram"
         else:
             new_session = TestSession(
                 user_id=user_id,
                 created_at=datetime.utcnow(),
                 answers="",
                 is_finished=False,
-                current_question_index=0
+                current_question_index=0,
+                invocation_topic_id=user.current_topic_id if user else None,
+                invocation_dialogue_id=user.current_dialogue_id if user else 1,
+                invocation_platform="telegram",
             )
             session.add(new_session)
 
@@ -11137,7 +11161,13 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
     await send_next_question(message, user_id, state, bot)
 
 
-async def finish_test_generation(message: Message, user_id: int, answers: list, questions: list):
+async def finish_test_generation(
+    message: Message,
+    user_id: int,
+    answers: list,
+    questions: list,
+    state: FSMContext | None = None,
+):
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         user_name = user.name or "Незнакомец"
@@ -11145,15 +11175,17 @@ async def finish_test_generation(message: Message, user_id: int, answers: list, 
         user_gender_raw = user.gender or "unknown"
         user_gender_str = "Женский" if user_gender_raw == 'female' else "Мужской" if user_gender_raw == 'male' else "Не определен"
 
-        dialogue_id = user.current_dialogue_id
-        topic_id = user.current_topic_id
+        test_session = await session.get(TestSession, user_id)
+        dialogue_id = getattr(test_session, "invocation_dialogue_id", None) or user.current_dialogue_id
+        topic_id = getattr(test_session, "invocation_topic_id", None)
         test_config = await session.get(TestConfig, 1)
         formulas = json_loads(test_config.formulas_json, []) if test_config and test_config.formulas_enabled else []
-        system_instruction = (
-            test_config.result_system_prompt
-            if test_config and test_config.separate_result_prompt_enabled and test_config.result_system_prompt
-            else test_config.test_system_prompt
+        separate_prompt_enabled = bool(
+            test_config
+            and test_config.separate_result_prompt_enabled
+            and test_config.result_system_prompt
         )
+        result_system_prompt = test_config.result_system_prompt if test_config else None
         input_mode = test_config.interpretation_input_mode if test_config else "all"
         selected_variables = json_loads(getattr(test_config, "interpretation_selected_variables", None), []) if test_config else []
 
@@ -11190,7 +11222,10 @@ async def finish_test_generation(message: Message, user_id: int, answers: list, 
         await session.execute(stmt)
         await session.commit()
 
-    user_prompt_data = (
+    if state is not None:
+        await state.clear()
+
+    interpretation_prompt = (
         f"Интерпретируй результаты теста.\n\n"
         f"ДАННЫЕ ПОЛЬЗОВАТЕЛЯ:\n"
         f"Имя: {user_name}\n"
@@ -11200,15 +11235,30 @@ async def finish_test_generation(message: Message, user_id: int, answers: list, 
         "Дай понятную, персональную интерпретацию результата."
     )
 
+    preliminary_interpretation = None
     try:
-        interpretation_text = await get_ai_response_direct(user_id, system_instruction, user_prompt_data)
+        if separate_prompt_enabled:
+            preliminary_interpretation = await get_ai_response_direct(
+                user_id,
+                result_system_prompt,
+                interpretation_prompt,
+            )
+        handoff_prompt = build_result_handoff_prompt(prompt_payload, preliminary_interpretation)
+        interpretation_text = await get_ai_response(
+            user_id,
+            handoff_prompt,
+            user_name,
+            user_gender_raw,
+            topic_id_override=topic_id,
+            dialogue_id_override=dialogue_id,
+        )
     except Exception:
         logging.exception("Universal test interpretation failed")
-        interpretation_text = "Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже."
+        interpretation_text = preliminary_interpretation or "Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже."
 
     html_story = markdown_to_html(interpretation_text)
 
-    final_message_text = f"{html_story}\n\n<i>Присмотрись. Возможно, ты мог узнать себя в этой истории</i>"
+    final_message_text = f"{html_story}\n\n<i>Результат сохранён. Его можно продолжить обсуждать в этом диалоге.</i>"
 
     async with async_session_maker() as session:
         session.add(DBMessage(
@@ -11493,7 +11543,7 @@ async def admin_upload_questions_start(callback: CallbackQuery, state: FSMContex
     await state.set_state(AdminStates.upload_test_questions_file)
 
     text = (
-        "<b>Загрузка вопросов для теста</b>\n\n"
+        "<b>Загрузка вопросов теста</b>\n\n"
         "Загрузите файл <b>.xlsx</b>, <b>.csv</b> или <b>.txt</b> с вопросами и настройками ответов.\n\n"
         "<b>Формат файла:</b>\n"
         "A: Номер\n"
@@ -11502,9 +11552,11 @@ async def admin_upload_questions_start(callback: CallbackQuery, state: FSMContex
         "D: Переменная\n"
         "E: Свой ответ (ДА/1)\n"
         "F: Кнопки в ряд (1)\n"
-        "G и дальше: варианты ответа, затем числовые значения для них.\n\n"
+        "G и дальше: сначала варианты ответа, затем числовые значения для них.\n"
+        "Первая строка с заголовками обязательна: по ней числовые варианты отделяются от их значений.\n\n"
         "<b>Формулы:</b>\n"
-        "Добавьте лист <b>formulas</b> или <b>формулы</b>: переменная результата | формула."
+        "Можно добавить лист <b>formulas</b> или <b>формулы</b>: переменная результата | формула. "
+        "Формулы также можно загрузить отдельно из меню теста."
     )
 
     await state.update_data(instruction_msg_id=callback.message.message_id)
@@ -11581,9 +11633,9 @@ async def admin_process_questions_file(message: Message, state: FSMContext, bot:
             )
             for q_data in questions_data
         ]
-        formula_errors = validate_formulas(preview_questions, formulas_data)
+        formula_errors = validate_test_definition(preview_questions, formulas_data)
         if formula_errors:
-            await message.answer("❌ Ошибка в формулах:\n" + "\n".join(f"- {item}" for item in formula_errors[:10]))
+            await message.answer("❌ Файл не применён:\n" + "\n".join(f"- {item}" for item in formula_errors[:10]))
             await _send_admin_test_menu_after_upload(message)
             await state.clear()
             return
@@ -11623,6 +11675,59 @@ async def admin_process_questions_file(message: Message, state: FSMContext, bot:
         await message.answer(f"❌ Произошла ошибка: {e}")
         await _send_admin_test_menu_after_upload(message)
         await state.clear()
+
+
+@router.callback_query(F.data == "admin_upload_formulas")
+async def admin_upload_formulas_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.upload_test_formulas_file)
+    await callback.message.edit_text(
+        "<b>Загрузка формул</b>\n\n"
+        "Загрузите <b>.xlsx</b>, <b>.csv</b> или <b>.txt</b>.\n"
+        "Каждая строка: <code>имя результата | формула</code>.\n\n"
+        "Для Excel используйте лист <b>formulas</b> или <b>формулы</b>. "
+        "Перед сохранением бот проверит переменные и не изменит текущие формулы при ошибке.",
+        reply_markup=kb.back_to_previous_menu("admin_test_menu"),
+    )
+
+
+@router.message(AdminStates.upload_test_formulas_file, F.document)
+async def admin_process_formulas_file(message: Message, state: FSMContext, bot: Bot):
+    document = message.document
+    filename = document.file_name or "formulas.txt"
+    if filename.rsplit('.', 1)[-1].lower() not in {'xlsx', 'csv', 'txt'}:
+        await message.answer("❌ Поддерживаются только файлы .xlsx, .csv и .txt.")
+        return
+
+    try:
+        file_info = await bot.get_file(document.file_id)
+        file_bytes = await bot.download_file(file_info.file_path)
+        formulas = await parse_formulas_file(file_bytes, filename)
+        if not formulas:
+            await message.answer("❌ В файле не найдено ни одной формулы. Текущие формулы не изменены.")
+            return
+
+        async with async_session_maker() as session:
+            questions = (
+                await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))
+            ).scalars().all()
+            errors = validate_test_definition(questions, formulas)
+            if errors:
+                await message.answer("❌ Формулы не сохранены:\n" + "\n".join(f"- {item}" for item in errors[:15]))
+                return
+            config = await session.get(TestConfig, 1)
+            if not config:
+                config = TestConfig(id=1)
+                session.add(config)
+            config.formulas_json = json_dumps(formulas)
+            config.formulas_enabled = True
+            await session.commit()
+
+        await state.clear()
+        await message.answer(f"✅ Загружено и включено формул: {len(formulas)}.")
+        await _send_admin_test_menu_after_upload(message)
+    except Exception as exc:
+        logging.exception("Error uploading test formulas")
+        await message.answer(f"❌ Формулы не изменены: {html.escape(str(exc))}")
 
 
 async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: str) -> str:
@@ -11705,10 +11810,14 @@ async def admin_test_menu(callback: CallbackQuery):
             config = TestConfig(id=1)
             session.add(config)
             await session.commit()
+        question_count = await session.scalar(select(func.count(TestQuestion.id))) or 0
+        formula_count = len(json_loads(getattr(config, "formulas_json", None), []))
 
     await callback.message.edit_text(
         "🧩 <b>Управление разделом 'Тест'</b>\n\n"
-        "Здесь вы можете настроить всё, что касается прохождения теста пользователем.",
+        f"Вопросов: <b>{question_count}</b>\n"
+        f"Формул: <b>{formula_count}</b>\n\n"
+        "Настройки применяются к Telegram и MAX, использующим эту базу.",
         reply_markup=kb.admin_test_menu_keyboard(config)
     )
 
@@ -11752,6 +11861,8 @@ async def admin_test_toggle_formulas(callback: CallbackQuery):
             await callback.answer("Формулы ещё не загружены.", show_alert=True)
             return
         config.formulas_enabled = not bool(getattr(config, "formulas_enabled", False))
+        if not config.formulas_enabled and config.interpretation_input_mode == "formulas":
+            config.interpretation_input_mode = "all"
         await session.commit()
     await admin_test_menu(callback)
 
@@ -11765,7 +11876,11 @@ async def admin_test_toggle_input_mode(callback: CallbackQuery):
             session.add(config)
         current = getattr(config, "interpretation_input_mode", "all") or "all"
         next_modes = {"all": "selected", "selected": "formulas", "formulas": "all"}
-        config.interpretation_input_mode = next_modes.get(current, "all")
+        next_mode = next_modes.get(current, "all")
+        if next_mode == "formulas" and not config.formulas_json:
+            next_mode = "all"
+            await callback.answer("Режим «только формулы» пропущен: формулы не загружены.", show_alert=True)
+        config.interpretation_input_mode = next_mode
         await session.commit()
     await admin_test_menu(callback)
 
@@ -11797,6 +11912,15 @@ async def admin_save_test_selected_vars(message: Message, state: FSMContext, bot
     selected = [] if raw == "-" else [item.strip() for item in re.split(r"[,\\s]+", raw) if item.strip()]
     data = await state.get_data()
     async with async_session_maker() as session:
+        questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        available = {
+            getattr(question, "variable_name", None) or f"answer_{index + 1:02d}"
+            for index, question in enumerate(questions)
+        }
+        unknown = sorted(set(selected) - available)
+        if unknown:
+            await message.answer("❌ Неизвестные переменные: " + ", ".join(unknown))
+            return
         config = await session.get(TestConfig, 1)
         if not config:
             config = TestConfig(id=1)
@@ -11832,6 +11956,9 @@ async def admin_test_toggle_separate_prompt(callback: CallbackQuery):
         if not config:
             config = TestConfig(id=1)
             session.add(config)
+        if not config.separate_result_prompt_enabled and not (config.result_system_prompt or "").strip():
+            await callback.answer("Сначала загрузите или задайте промпт результата.", show_alert=True)
+            return
         config.separate_result_prompt_enabled = not bool(getattr(config, "separate_result_prompt_enabled", False))
         await session.commit()
     await admin_test_menu(callback)

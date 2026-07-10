@@ -7,7 +7,11 @@ from urllib.parse import urlencode
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
-from yookassa import Configuration, Payment
+try:
+    from yookassa import Configuration, Payment
+except ModuleNotFoundError:
+    Configuration = None
+    Payment = None
 
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard, link_button, main_menu_row, payment_providers_keyboard, plans_keyboard, retry_subscription_keyboard, subscription_keyboard
@@ -223,6 +227,9 @@ async def choose_payment_provider(client: MaxApiClient, chat_id: int, user_id: i
 
 
 async def create_yookassa_link(client: MaxApiClient, chat_id: int, user_id: int, plan_id: int) -> None:
+    if Configuration is None or Payment is None:
+        await client.send_message(chat_id=chat_id, text="ЮKassa недоступна: модуль оплаты не установлен.")
+        return
     user, config = await _get_user_and_subscription(user_id)
     if not user or not config:
         return

@@ -9,13 +9,10 @@ from config import DATABASE_URL
 from memory_mode import MEMORY_MODE_RESET, MEMORY_MODE_TOPIC, get_memory_mode
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE, DEFAULT_SHARED_PROMPT_BLOCK
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_use_lifo=True,
-)
+_engine_options = {"echo": False, "pool_pre_ping": True}
+if not DATABASE_URL.startswith("sqlite"):
+    _engine_options.update(pool_recycle=1800, pool_use_lifo=True)
+engine = create_async_engine(DATABASE_URL, **_engine_options)
 async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 Base = declarative_base()
@@ -385,6 +382,9 @@ class TestSession(Base):
     current_question_index = Column(Integer, default=0)
     answers = Column(Text, default="[]")
     formula_results = Column(Text, nullable=True)
+    invocation_topic_id = Column(Integer, nullable=True)
+    invocation_dialogue_id = Column(Integer, nullable=True)
+    invocation_platform = Column(String, nullable=True)
     secret_answers = Column(Text, nullable=True)
     is_finished = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -555,6 +555,12 @@ async def init_db():
             test_session_columns = [c['name'] for c in insp.get_columns('test_sessions')]
             if 'formula_results' not in test_session_columns:
                 sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN formula_results TEXT"))
+            if 'invocation_topic_id' not in test_session_columns:
+                sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN invocation_topic_id INTEGER"))
+            if 'invocation_dialogue_id' not in test_session_columns:
+                sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN invocation_dialogue_id INTEGER"))
+            if 'invocation_platform' not in test_session_columns:
+                sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN invocation_platform VARCHAR"))
 
             test_question_columns = [c['name'] for c in insp.get_columns('test_questions')]
             if 'comment' not in test_question_columns:

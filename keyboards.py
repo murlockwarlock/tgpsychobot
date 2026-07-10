@@ -131,7 +131,8 @@ def admin_test_menu_keyboard(config_or_enabled):
     builder.button(text="✏️ Результаты теста", callback_data="edit_content_test_results")
     builder.button(text="✏️ Финал секретного теста", callback_data="edit_content_secret_test_outro")
     builder.button(text="📝 Промпт теста", callback_data="admin_edit_test_prompt")
-    builder.button(text="❓ Вопросы и формулы", callback_data="admin_upload_questions")
+    builder.button(text="📥 Загрузить вопросы", callback_data="admin_upload_questions")
+    builder.button(text="📐 Загрузить формулы", callback_data="admin_upload_formulas")
     builder.button(text="🔐 Секретные вопросы", callback_data="admin_secret_questions")
     builder.button(text="📖 Истории/Кейсы", callback_data="admin_case_studies_page_0")
     builder.button(text="🔗 Настройка ссылок", callback_data="admin_test_links")
@@ -1194,12 +1195,18 @@ def test_answer_keyboard():
     return builder.as_markup()
 
 
-def universal_test_answer_keyboard(options, horizontal: bool = False):
+def universal_test_answer_keyboard(options, horizontal: bool = False, question_index: int = 0):
+    from universal_tests import answer_callback_data
+
     builder = InlineKeyboardBuilder()
     for index, option in enumerate(options):
         label = getattr(option, "text", str(option))
-        builder.button(text=label, callback_data=f"test_opt_{index}")
-    builder.adjust(len(options) if horizontal and options else 1)
+        builder.button(text=label, callback_data=answer_callback_data(question_index, index))
+    if horizontal and options:
+        row_width = min(len(options), 8)
+        builder.adjust(row_width)
+    else:
+        builder.adjust(1)
     return builder.as_markup()
 
 

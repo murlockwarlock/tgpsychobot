@@ -40,6 +40,9 @@ class AIResponseError(AIServiceError):
     pass
 
 
+_CURRENT_AI_CONTEXT = object()
+
+
 def _build_async_transport_from_env(env_var_name: str, use_proxy: bool = True):
     if not use_proxy:
         return None
@@ -913,7 +916,16 @@ async def _call_openai_api(api_key: str, model: str, history: list, context: str
         raise AIServiceError(f"Ошибка при обращении к OpenAI API: {e}")
 
 
-async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_gender: str, bot=None) -> str:
+async def get_ai_response(
+    user_id: int,
+    user_prompt: str,
+    user_name: str,
+    user_gender: str,
+    bot=None,
+    *,
+    topic_id_override: int | None | object = _CURRENT_AI_CONTEXT,
+    dialogue_id_override: int | None = None,
+) -> str:
     async with async_session_maker() as session:
         user_result = await session.execute(
             select(User).options(
@@ -927,6 +939,23 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         if not user:
             return "❌ Ошибка: Пользователь не найден."
 
+        active_topic_id = (
+            user.current_topic_id
+            if topic_id_override is _CURRENT_AI_CONTEXT
+            else topic_id_override
+        )
+        active_dialogue_id = dialogue_id_override or user.current_dialogue_id
+        if active_topic_id == user.current_topic_id:
+            active_topic = user.current_topic
+        elif active_topic_id is not None:
+            active_topic = await session.scalar(
+                select(Topic)
+                .options(selectinload(Topic.knowledge_base_files))
+                .where(Topic.id == active_topic_id)
+            )
+        else:
+            active_topic = None
+
         ai_config = await session.get(AIConfig, 1)
         if not ai_config:
             return "❌ Ошибка: Конфигурация ИИ не найдена."
@@ -934,10 +963,10 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         temperature = getattr(ai_config, 'temperature', 0.7) or 0.7
 
         available_media_text = ""
-        if user.current_topic_id:
+        if active_topic_id:
             # Получаем ID коллекций, привязанных к этому топику
             coll_stmt = select(topic_collection_association.c.collection_id).where(
-                topic_collection_association.c.topic_id == user.current_topic_id
+                topic_collection_association.c.topic_id == active_topic_id
             )
             coll_res = await session.execute(coll_stmt)
             assigned_coll_ids = [r[0] for r in coll_res.all()]
@@ -951,13 +980,13 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
                                 media_collection_items.c.collection_id.in_(assigned_coll_ids)
                             )
                         ),
-                        MediaLibrary.topic_id == user.current_topic_id
+                        MediaLibrary.topic_id == active_topic_id
                     )
                 )
             else:
                 # Фоллбэк: старые колоды (topic_media_deck) или прямой topic_id
                 deck_stmt = select(TopicMediaDeck.deck_name).where(
-                    TopicMediaDeck.topic_id == user.current_topic_id
+                    TopicMediaDeck.topic_id == active_topic_id
                 )
                 deck_res = await session.execute(deck_stmt)
                 assigned_decks = [r[0] for r in deck_res.all()]
@@ -965,12 +994,12 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
                     media_stmt = select(MediaLibrary).where(
                         or_(
                             MediaLibrary.category.in_(assigned_decks),
-                            MediaLibrary.topic_id == user.current_topic_id
+                            MediaLibrary.topic_id == active_topic_id
                         )
                     )
                 else:
                     media_stmt = select(MediaLibrary).where(
-                        MediaLibrary.topic_id == user.current_topic_id
+                        MediaLibrary.topic_id == active_topic_id
                     )
 
             media_res = await session.execute(media_stmt)
@@ -1015,7 +1044,7 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
 
         system_prompt_text = _load_configured_system_prompt(
             ai_config,
-            user.current_topic.system_prompt if user.current_topic else None
+            active_topic.system_prompt if active_topic else None
         )
 
         test_results_txt = ""
@@ -1029,7 +1058,7 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
                 secret_answers_txt = test_session.secret_answers
 
         test_context_injection = ""
-        if user.current_topic_id is None and (test_results_txt or secret_answers_txt):
+        if active_topic_id is None and (test_results_txt or secret_answers_txt):
             context_parts = []
             status_instruction = ""
             if test_results_txt:
@@ -1078,8 +1107,8 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         system_prompt = "\n\n".join(part for part in prompt_parts if part)
 
         relevant_chunks = []
-        if user.current_topic:
-            doc_ids = [f.id for f in user.current_topic.knowledge_base_files]
+        if active_topic:
+            doc_ids = [f.id for f in active_topic.knowledge_base_files]
             if doc_ids:
                 relevant_chunks = await search_relevant_chunks(user_prompt, n_results=3, document_ids=doc_ids)
         else:
@@ -1102,10 +1131,10 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
         memory_mode = get_memory_mode(ai_config)
         stmt = select(DBMessage).where(
             DBMessage.user_id == user.id,
-            DBMessage.dialogue_id == user.current_dialogue_id,
+            DBMessage.dialogue_id == active_dialogue_id,
         )
         if not is_global_memory_mode(memory_mode):
-            stmt = stmt.where(DBMessage.topic_id == user.current_topic_id)
+            stmt = stmt.where(DBMessage.topic_id == active_topic_id)
         stmt = stmt.options(selectinload(DBMessage.topic)).order_by(DBMessage.timestamp.asc())
         result = await session.execute(stmt)
         all_messages = result.scalars().all()
@@ -1132,8 +1161,8 @@ async def get_ai_response(user_id: int, user_prompt: str, user_name: str, user_g
 
         final_history, global_memory_context = _build_memory_aware_history(
             selected_messages,
-            user.current_topic_id,
-            user.current_topic.name if user.current_topic else None,
+            active_topic_id,
+            active_topic.name if active_topic else None,
             memory_mode,
         )
         if global_memory_context:

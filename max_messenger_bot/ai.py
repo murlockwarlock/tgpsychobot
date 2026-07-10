@@ -34,24 +34,35 @@ class InsufficientBalanceError(AIServiceError):
     pass
 
 
-def _build_max_history_scope(user: User, memory_mode: str):
-    if memory_mode == MEMORY_MODE_TOPIC and user.current_topic_id is None:
+_CURRENT_AI_CONTEXT = object()
+
+
+def _build_max_history_scope(
+    user: User,
+    memory_mode: str,
+    topic_id: int | None | object = _CURRENT_AI_CONTEXT,
+    dialogue_id: int | None = None,
+):
+    active_topic_id = user.current_topic_id if topic_id is _CURRENT_AI_CONTEXT else topic_id
+    active_dialogue_id = dialogue_id or user.current_dialogue_id
+    if memory_mode == MEMORY_MODE_TOPIC and active_topic_id is None:
         return (
             (DBMessage.user_id == user.id)
-            & (DBMessage.dialogue_id == (user.current_dialogue_id or 1))
+            & (DBMessage.dialogue_id == (active_dialogue_id or 1))
             & (DBMessage.topic_id.is_(None))
         )
     return build_history_scope(
         DBMessage,
         user.id,
-        user.current_dialogue_id,
-        user.current_topic_id,
+        active_dialogue_id,
+        active_topic_id,
         memory_mode,
     )
 
 
-def _build_user_system_prompt(user: User, ai_config: AIConfig) -> str:
-    system_prompt = user.current_topic.system_prompt if user.current_topic and user.current_topic.system_prompt else ai_config.system_prompt
+def _build_user_system_prompt(user: User, ai_config: AIConfig, topic: Topic | None | object = _CURRENT_AI_CONTEXT) -> str:
+    active_topic = user.current_topic if topic is _CURRENT_AI_CONTEXT else topic
+    system_prompt = active_topic.system_prompt if active_topic and active_topic.system_prompt else ai_config.system_prompt
     if not system_prompt:
         system_prompt = "Ты полезный ИИ-помощник."
     system_prompt = apply_global_prompt_appendix(system_prompt, getattr(ai_config, 'shared_prompt_block', None))
@@ -579,7 +590,13 @@ def _looks_like_prompt_kb_entry(filename: str | None, indexed_content: str | Non
     return False
 
 
-async def get_ai_response(user_id: int, user_prompt: str) -> str:
+async def get_ai_response(
+    user_id: int,
+    user_prompt: str,
+    *,
+    topic_id_override: int | None | object = _CURRENT_AI_CONTEXT,
+    dialogue_id_override: int | None = None,
+) -> str:
     async with async_session_maker() as session:
         user = await session.scalar(
             select(User)
@@ -589,15 +606,28 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
         if not user:
             raise AIServiceError("Пользователь не найден")
 
+        active_topic_id = user.current_topic_id if topic_id_override is _CURRENT_AI_CONTEXT else topic_id_override
+        active_dialogue_id = dialogue_id_override or user.current_dialogue_id
+        if active_topic_id == user.current_topic_id:
+            active_topic = user.current_topic
+        elif active_topic_id is not None:
+            active_topic = await session.scalar(
+                select(Topic)
+                .options(selectinload(Topic.knowledge_base_files))
+                .where(Topic.id == active_topic_id)
+            )
+        else:
+            active_topic = None
+
         ai_config = await session.get(AIConfig, 1)
         if not ai_config:
             raise AIServiceError("AIConfig не найден")
 
-        system_prompt = _build_user_system_prompt(user, ai_config)
+        system_prompt = _build_user_system_prompt(user, ai_config, active_topic)
 
         relevant_chunks = []
-        if user.current_topic:
-            doc_ids = [f.id for f in user.current_topic.knowledge_base_files]
+        if active_topic:
+            doc_ids = [f.id for f in active_topic.knowledge_base_files]
             if doc_ids:
                 relevant_chunks = await search_relevant_chunks(user_prompt, n_results=3, document_ids=doc_ids)
         else:
@@ -623,7 +653,7 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
                 system_prompt = f"{system_prompt}\n\nИспользуй следующие данные из базы знаний для ответа:\n{context}"
 
         current_memory_mode = normalize_memory_mode(ai_config)
-        history_scope = _build_max_history_scope(user, current_memory_mode)
+        history_scope = _build_max_history_scope(user, current_memory_mode, active_topic_id, active_dialogue_id)
         history_rows = (
             await session.execute(
                 select(DBMessage)
@@ -664,7 +694,7 @@ async def get_ai_response(user_id: int, user_prompt: str) -> str:
         temperature = getattr(ai_config, "temperature", 0.7) or 0.7
         try:
             result = await _dispatch_provider(ai_config, system_prompt, stripped)
-            log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
+            log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, active_topic_id)
             return result
         except InsufficientBalanceError:
             raise
