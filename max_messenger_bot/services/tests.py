@@ -293,7 +293,6 @@ async def show_results(client: MaxApiClient, chat_id: int, user_id: int) -> None
     if content and content.text_content:
         await client.send_message(chat_id=chat_id, text=content.text_content)
     if test_session and test_session.answers and "Результаты теста:" in test_session.answers:
-        await client.send_message(chat_id=chat_id, text=test_session.answers)
         formula_results = json_loads(getattr(test_session, "formula_results", None), {})
         input_mode = getattr(test_config, "interpretation_input_mode", "all") if test_config else "all"
         if input_mode == "formulas" and formula_results:
@@ -331,6 +330,10 @@ async def show_results(client: MaxApiClient, chat_id: int, user_id: int) -> None
                     await msg_session.commit()
             except Exception:
                 ai_log.exception("Universal Max test AI interpretation failed user_id=%s", user_id)
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже.",
+                )
         marathon_url = test_config.marathon_url if test_config else "https://max.ru"
         await client.send_message(
             chat_id=chat_id,

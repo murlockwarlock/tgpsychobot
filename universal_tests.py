@@ -201,7 +201,7 @@ def build_prompt_payload(
     formula_results = formula_results or {}
     if mode == "formulas":
         if not formula_results:
-            return "Результаты формул отсутствуют."
+            return "Расчётные показатели отсутствуют."
         return "\n".join(f"{name}: {value:g}" for name, value in formula_results.items())
 
     if mode == "selected":
@@ -219,7 +219,7 @@ def build_prompt_payload(
     report = build_answers_report(questions, answers)
     if formula_results:
         formulas = "\n".join(f"{name}: {value:g}" for name, value in formula_results.items())
-        report = f"{report}\n\nВычисления по формулам:\n{formulas}"
+        report = f"{report}\n\nРасчётные показатели:\n{formulas}"
     return report
 
 

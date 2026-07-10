@@ -11138,7 +11138,7 @@ async def finish_test_generation(message: Message, user_id: int, answers: list, 
         interpretation_text = await get_ai_response_direct(user_id, system_instruction, user_prompt_data)
     except Exception:
         logging.exception("Universal test interpretation failed")
-        interpretation_text = report_text
+        interpretation_text = "Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже."
 
     html_story = markdown_to_html(interpretation_text)
 
