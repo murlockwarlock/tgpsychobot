@@ -35,6 +35,18 @@ log = get_bot_logger("common")
 
 
 MSK = timezone(timedelta(hours=3))
+TEST_START_DIRECTIVE_RE = re.compile(r"(?<!\w)\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)", re.IGNORECASE)
+
+
+def _extract_test_start_directive(text: str | None) -> tuple[bool, str]:
+    raw = text or ""
+    has_directive = bool(TEST_START_DIRECTIVE_RE.search(raw))
+    if not has_directive:
+        return False, raw.strip()
+    clean_text = TEST_START_DIRECTIVE_RE.sub("", raw)
+    clean_text = re.sub(r"\s+([.,!?;:])", r"\1", clean_text)
+    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
+    return True, clean_text.strip(" \t\r\n-—–:;")
 
 
 async def _send_ai_text(
@@ -383,10 +395,12 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
         response_text = await get_ai_response(user_id, final_prompt)
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ")
-        await save_ai_message(user_id, response_text)
 
-        if re.search(r"\b(START_TEST|RUN_TEST)\b|\[(START_TEST|RUN_TEST)\]", response_text or "", re.IGNORECASE):
-            clean_text = re.sub(r"\b(START_TEST|RUN_TEST)\b|\[(START_TEST|RUN_TEST)\]", "", response_text, flags=re.IGNORECASE).strip()
+        should_start_test, response_without_test_directive = _extract_test_start_directive(response_text)
+        await save_ai_message(user_id, response_without_test_directive)
+
+        if should_start_test:
+            clean_text = response_without_test_directive
             if clean_text:
                 await client.edit_message(thinking_message_id, text=markdown_to_html(clean_text))
             elif thinking_message_id:
@@ -397,10 +411,10 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             return
 
         # Check for image generation directive GEN_IMG: [...] or [IMG: ...]
-        img_match = re.search(r"GEN_IMG:\s*\[(.*?)\]|\[IMG:\s*(.*?)\]", response_text, re.DOTALL)
+        img_match = re.search(r"GEN_IMG:\s*\[(.*?)\]|\[IMG:\s*(.*?)\]", response_without_test_directive, re.DOTALL)
         if img_match:
             img_prompt = (img_match.group(1) or img_match.group(2) or "").strip()
-            clean_text = re.sub(r"GEN_IMG:\s*\[.*?\]|\[IMG:\s*.*?\]", "", response_text, flags=re.DOTALL).strip()
+            clean_text = re.sub(r"GEN_IMG:\s*\[.*?\]|\[IMG:\s*.*?\]", "", response_without_test_directive, flags=re.DOTALL).strip()
             if thinking_message_id and clean_text:
                 await client.edit_message(thinking_message_id, text=markdown_to_html(clean_text))
                 thinking_message_id = None
@@ -425,7 +439,7 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
                 await client.send_message(chat_id=chat_id, text=f"⚠️ Не удалось создать изображение: {img_exc}")
             return
 
-        html_text = markdown_to_html(response_text)
+        html_text = markdown_to_html(response_without_test_directive)
         chunks = split_text(html_text)
         await _send_ai_text(client, chat_id, thinking_message_id, chunks)
         log.info("AI dialogue completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))

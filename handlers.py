@@ -122,6 +122,8 @@ plog = logging.getLogger("payment_events")
 user_locks = {}
 user_message_buffers = {}
 user_processing_tasks = {}
+
+TEST_START_DIRECTIVE_RE = re.compile(r"(?<!\w)\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)", re.IGNORECASE)
 user_spread_state = {}  # {user_id: {category, topic_id, rounds_left, cards_per_round, hidden, chosen_card_ids, selected_file_ids}}
 PAGE_SIZE = 5
 USER_HISTORY_PAGE_SIZE = 10
@@ -808,7 +810,54 @@ def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None
     return payload, clean_text
 
 
-async def process_buffered_messages(user_id: int, bot: Bot):
+def _extract_test_start_directive(text: str | None) -> tuple[bool, str]:
+    raw = text or ""
+    has_directive = bool(TEST_START_DIRECTIVE_RE.search(raw))
+    if not has_directive:
+        return False, raw.strip()
+    clean_text = TEST_START_DIRECTIVE_RE.sub("", raw)
+    clean_text = re.sub(r"\s+([.,!?;:])", r"\1", clean_text)
+    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
+    return True, clean_text.strip(" \t\r\n-—–:;")
+
+
+async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContext | None):
+    async with async_session_maker() as session:
+        config = await session.get(TestConfig, 1)
+        if config and not config.is_enabled and not await is_admin(user_id):
+            await bot.send_message(chat_id=user_id, text="⚠️ Тестирование в данный момент отключено.")
+            return
+
+        questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        if not questions:
+            await bot.send_message(chat_id=user_id, text="⚠️ Тест временно недоступен: вопросы еще не загружены.")
+            return
+
+        await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
+        session.add(
+            TestSession(
+                user_id=user_id,
+                created_at=datetime.utcnow(),
+                answers="[]",
+                is_finished=False,
+                current_question_index=0,
+            )
+        )
+        await session.commit()
+
+    if state is not None:
+        await state.set_state(UserStates.in_test)
+
+    total_count = len(questions)
+    question = questions[0]
+    options = get_answer_options(question)
+    show_progress = getattr(config, "show_progress", True) if config else True
+    text = build_question_text(question, 0, total_count, show_progress)
+    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question)) if options else None
+    await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+
+
+async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | None = None):
     if user_id not in user_message_buffers:
         return
     messages = user_message_buffers.pop(user_id)
@@ -828,6 +877,26 @@ async def process_buffered_messages(user_id: int, bot: Bot):
     try:
         response_text = await ai_integration.generate_response(user_id, full_text, bot=bot)
         typing_task.cancel()
+
+        should_start_test, directive_clean_text = _extract_test_start_directive(response_text)
+        if should_start_test:
+            if directive_clean_text:
+                html_response = markdown_to_html(directive_clean_text)
+                for chunk in split_html_text(html_response):
+                    await _safe_send_html(
+                        lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
+                        chunk,
+                    )
+
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                if user:
+                    session.add(DBMessage(user_id=user.id, role='user', content=full_text, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                    session.add(DBMessage(user_id=user.id, role='assistant', content=directive_clean_text, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                    await session.commit()
+
+            await _start_test_from_ai_directive(bot, user_id, state)
+            return
 
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_text)
 
@@ -4151,23 +4220,20 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
     try:
         response_text = await get_ai_response(user_id, ai_prompt_text, user_name, user_gender)
         
-        clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_text)
+        should_start_test, response_without_test_directive = _extract_test_start_directive(response_text)
+        clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_without_test_directive)
 
-        if re.search(r"\b(START_TEST|RUN_TEST)\b|\[(START_TEST|RUN_TEST)\]", clean_text or "", re.IGNORECASE):
-            clean_text = re.sub(r"\b(START_TEST|RUN_TEST)\b|\[(START_TEST|RUN_TEST)\]", "", clean_text, flags=re.IGNORECASE).strip()
+        if should_start_test:
             if clean_text:
                 await thinking_msg.edit_text(markdown_to_html(clean_text), parse_mode="HTML")
             else:
                 await thinking_msg.delete()
-            if state is not None:
-                await start_psych_test(message, state, user_id)
-            else:
-                await message.answer("Чтобы пройти тест, нажмите /test.")
+            await _start_test_from_ai_directive(bot, user_id, state)
             return
 
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
-            session.add(DBMessage(user_id=user_id, role='assistant', content=response_text,
+            session.add(DBMessage(user_id=user_id, role='assistant', content=response_without_test_directive,
                                   dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
             await session.commit()
             topic_id = user.current_topic_id if user else None
@@ -13566,7 +13632,7 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
 
     async def debounced_process():
         await asyncio.sleep(0.8)
-        await process_buffered_messages(user_id, bot)
+        await process_buffered_messages(user_id, bot, state)
 
     user_processing_tasks[user_id] = asyncio.create_task(debounced_process())
 
