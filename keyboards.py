@@ -131,7 +131,7 @@ def admin_test_menu_keyboard(config_or_enabled):
     builder.button(text="✏️ Результаты теста", callback_data="edit_content_test_results")
     builder.button(text="✏️ Финал секретного теста", callback_data="edit_content_secret_test_outro")
     builder.button(text="📝 Промпт теста", callback_data="admin_edit_test_prompt")
-    builder.button(text="❓ Вопросы (Excel)", callback_data="admin_upload_questions")
+    builder.button(text="❓ Вопросы и формулы", callback_data="admin_upload_questions")
     builder.button(text="🔐 Секретные вопросы", callback_data="admin_secret_questions")
     builder.button(text="📖 Истории/Кейсы", callback_data="admin_case_studies_page_0")
     builder.button(text="🔗 Настройка ссылок", callback_data="admin_test_links")
