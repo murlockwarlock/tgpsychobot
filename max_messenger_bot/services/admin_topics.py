@@ -11,6 +11,7 @@ from ..api import MaxApiClient
 from ..keyboards import admin_topic_editor_keyboard, admin_topic_prompt_input_keyboard, admin_topic_prompt_keyboard, admin_topics_list_keyboard
 from ..legacy import SubscriptionConfig, Topic, async_session_maker
 from ..storage import StateStore
+from topic_management import delete_topic_with_dependencies
 from ..time_utils import format_msk
 
 
@@ -293,9 +294,10 @@ async def toggle_list(client: MaxApiClient, chat_id: int, topic_id: int) -> None
 
 async def delete_topic(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
     async with async_session_maker() as session:
-        topic = await session.get(Topic, topic_id)
-        if topic:
-            await session.delete(topic)
-            await session.commit()
+        async with session.begin():
+            deleted = await delete_topic_with_dependencies(session, topic_id)
+    if not deleted:
+        await client.send_message(chat_id=chat_id, text="Тема уже удалена.")
+        return
     await client.send_message(chat_id=chat_id, text="✅ Тема удалена.")
     await list_topics(client, chat_id)

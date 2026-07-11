@@ -100,6 +100,7 @@ from scheduler import (
 )
 from subscription_dates import extend_subscription_end_date
 from subscription_retry_policy import can_retry_manually
+from topic_management import delete_topic_with_dependencies
 from bot_commands import refresh_commands_for_user
 from universal_tests import (
     build_result_handoff_prompt,
@@ -5435,22 +5436,9 @@ async def admin_delete_topic_start(callback: CallbackQuery):
     if not topic:
         await callback.answer("Тема уже удалена.", show_alert=True)
         return
+    await callback.answer()
     await callback.message.edit_text(
-        f"Вы уверены, что хотите удалить тему «{topic.name}»? Это действие необратимо.",
-        reply_markup=kb.confirm_delete_topic_keyboard(topic_id)
-    )
-
-
-@router.callback_query(F.data.startswith("delete_topic_"), StateFilter('*'))
-async def admin_delete_topic_start(callback: CallbackQuery):
-    topic_id = int(callback.data.split("_")[-1])
-    async with async_session_maker() as session:
-        topic = await session.get(Topic, topic_id)
-    if not topic:
-        await callback.answer("Тема уже удалена.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        f"Вы уверены, что хотите удалить тему «{topic.name}»? Это действие необратимо.",
+        f"Вы уверены, что хотите удалить тему «{html.escape(topic.name)}»? Это действие необратимо.",
         reply_markup=kb.confirm_delete_topic_keyboard(topic_id)
     )
 
@@ -5458,12 +5446,19 @@ async def admin_delete_topic_start(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("confirm_delete_topic_"))
 async def admin_delete_topic_confirm(callback: CallbackQuery):
     topic_id = int(callback.data.split("_")[-1])
-    async with async_session_maker() as session:
-        stmt = delete(Topic).where(Topic.id == topic_id)
-        await session.execute(stmt)
-        await session.commit()
-    await callback.answer("Тема удалена.", show_alert=True)
-    await show_topics_admin_list(callback, 0)
+    await callback.answer()
+    try:
+        async with async_session_maker() as session:
+            async with session.begin():
+                deleted = await delete_topic_with_dependencies(session, topic_id)
+        if not deleted:
+            await callback.message.edit_text("Тема уже удалена.")
+            return
+        await show_topics_admin_list(callback, 0)
+        await callback.message.answer("✅ Тема удалена. История сообщений и медиа сохранены.")
+    except Exception:
+        logging.exception("Failed to delete topic topic_id=%s", topic_id)
+        await callback.message.answer("❌ Не удалось удалить тему. Данные не изменены, попробуйте ещё раз.")
 
 
 async def _show_assign_kb_to_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_id: int, page: int = 0):
