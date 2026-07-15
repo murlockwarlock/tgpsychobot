@@ -98,6 +98,26 @@ async def is_admin(user_id: int) -> bool:
         return bool(user and user.is_admin)
 
 
+async def notify_telegram_admins(text: str) -> None:
+    import os
+    bot_token = os.getenv("BOT_TOKEN")
+    if bot_token:
+        from aiogram import Bot
+        from database import get_all_admin_ids, SubscriptionConfig
+        
+        async with async_session_maker() as session:
+            config = await session.get(SubscriptionConfig, 1)
+            if not config or not config.notifications_enabled:
+                return
+
+        async with Bot(token=bot_token) as bot:
+            for admin_id in await get_all_admin_ids():
+                try:
+                    await bot.send_message(admin_id, text, parse_mode="HTML")
+                except Exception:
+                    pass
+
+
 async def ensure_user(user_id: int, username: str | None, full_name: str) -> User:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)

@@ -415,6 +415,19 @@ async def apply_promo_code(client: MaxApiClient, states: StateStore, chat_id: in
             promo.discount_percent,
         )
 
+        user_ref_pc = f"{user.first_name or ''}"
+        if user.username:
+            user_ref_pc += f" (@{user.username})"
+        user_ref_pc += f" [id=<code>{user_id}</code>]"
+
+        from .common import notify_telegram_admins
+        await notify_telegram_admins(
+            f"🎁 Активирован промокод «{promo.code}»\n"
+            f"Пользователь: {user_ref_pc} (MAX)\n"
+            f"Скидка: {promo.discount_percent}%\n"
+            f"Дней: {promo.free_days}"
+        )
+
     await states.clear(user_id)
     if promo.free_days > 0 and (not is_active_sub):
         await client.send_message(chat_id=chat_id, text=f"✅ Пробный период активирован: {promo.free_days} дн.")
@@ -434,6 +447,25 @@ async def set_renewal(client: MaxApiClient, chat_id: int, user_id: int, enabled:
             sub.payment_attempt_count = 0
             sub.last_payment_attempt = None
             sub.pending_robokassa_invoice_id = None
+            
+            user = await session.get(User, user_id)
+            user_ref_cr = f"{user.first_name or ''}" if user else ""
+            if user and user.username:
+                user_ref_cr += f" (@{user.username})"
+            user_ref_cr += f" [id=<code>{user_id}</code>]"
+            
+            plan_name_cr = sub.plan.name if sub.plan else "Unknown"
+            from datetime import timezone, timedelta
+            MSK = timezone(timedelta(hours=3))
+            end_date_msk_cr = sub.end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M') if sub.end_date else "Неизвестно"
+            
+            from .common import notify_telegram_admins
+            await notify_telegram_admins(
+                f"🔕 Пользователь отключил автопродление\n"
+                f"Пользователь: {user_ref_cr} (MAX)\n"
+                f"Тариф: {plan_name_cr}\n"
+                f"Подписка до: {end_date_msk_cr} МСК"
+            )
         await session.commit()
     await show_subscription_info(client, chat_id, user_id)
 
