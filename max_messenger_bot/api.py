@@ -211,9 +211,15 @@ class MaxApiClient:
                 payload["message"]["attachments"] = attachments
         if notification:
             payload["notification"] = notification
-        result = await self._request("POST", "/answers", params={"callback_id": callback_id}, json_data=payload)
-        log.info("MAX callback answered callback_id=%s has_message=%s has_notification=%s", callback_id, "message" in payload, bool(notification))
-        return result
+        if not payload and not notification:
+            payload["notification"] = "✓"
+        try:
+            result = await self._request("POST", "/answers", params={"callback_id": callback_id}, json_data=payload)
+            log.info("MAX callback answered callback_id=%s has_message=%s has_notification=%s", callback_id, "message" in payload, bool(notification))
+            return result
+        except Exception as e:
+            log.warning("Failed to answer callback_id=%s: %s", callback_id, e)
+            return {}
 
     async def create_upload(self, media_type: str) -> dict[str, Any]:
         return await self._request("POST", "/uploads", params={"type": media_type})
