@@ -348,7 +348,9 @@ class TestButtonFilter(Filter):
         async with async_session_maker() as session:
             stmt = select(Content.button_title).where(Content.key == "test_button").limit(1)
             title = await session.scalar(stmt)
-            return title is not None and message.text == title
+            if not title:
+                title = "📝 Пройти тест"
+            return message.text == title
 
 
 class TopicsButtonFilter(Filter):
