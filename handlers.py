@@ -10932,6 +10932,20 @@ async def process_test_answer(callback: CallbackQuery, state: FSMContext, bot: B
     await _process_universal_test_answer(callback.message, user_id, state, bot, callback.data)
 
 
+@router.callback_query(F.data == "cancel_test")
+async def process_cancel_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+    await callback.answer("❌ Тест прерван")
+    await callback.message.answer(
+        "Тестирование прервано. Возвращаемся в главное меню.",
+        reply_markup=await kb.main_client_keyboard()
+    )
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
 @router.callback_query(UserStates.awaiting_gender, F.data.startswith("gender_"))
 async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: Bot):
     gender_code = callback.data.split("_")[-1]
@@ -11780,7 +11794,7 @@ async def cmd_start_test(message: Message, state: FSMContext):
     text = content.get('text', "Привет! Для начала выбери свой пол:")
     media = content.get('media', [])
 
-    keyboard = kb.gender_selection_keyboard()
+    keyboard = kb.gender_selection_keyboard(is_test=True)
 
     if media:
         if len(media) == 1 and len(text) < 1024:

@@ -684,6 +684,14 @@ class MaxBotApplication:
         if data == "noop":
             await self.client.answer_callback(callback.callback_id)
             return
+        if data == "cancel_test":
+            await self.states.clear(user_id)
+            await self.client.send_message(
+                chat_id=chat_id,
+                text="❌ Тестирование прервано.",
+                attachments=await build_main_menu()
+            )
+            return
         if data == "admin_panel":
             await admin_service.show_admin_panel(self.client, chat_id)
             return

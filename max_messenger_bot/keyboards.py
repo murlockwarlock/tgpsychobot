@@ -231,8 +231,11 @@ def universal_test_answers_keyboard(options, horizontal: bool = False, question_
         for index, option in enumerate(options)
     ]
     if horizontal:
-        return inline_keyboard([buttons[index:index + 8] for index in range(0, len(buttons), 8)])
-    return inline_keyboard([[button] for button in buttons])
+        rows = [buttons[index:index + 8] for index in range(0, len(buttons), 8)]
+    else:
+        rows = [[button] for button in buttons]
+    rows.append([callback_button("❌ Выйти из теста", "cancel_test")])
+    return inline_keyboard(rows)
 
 
 def case_study_keyboard() -> list[dict]:

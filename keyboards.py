@@ -1207,6 +1207,7 @@ def universal_test_answer_keyboard(options, horizontal: bool = False, question_i
         builder.adjust(row_width)
     else:
         builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="❌ Выйти из теста", callback_data="cancel_test"))
     return builder.as_markup()
 
 
@@ -1225,11 +1226,13 @@ def test_prompt_keyboard(download_callback: str = "download_test_prompt"):
     return builder.as_markup()
 
 
-def gender_selection_keyboard():
+def gender_selection_keyboard(is_test: bool = False):
     builder = InlineKeyboardBuilder()
     builder.button(text="👨 Мужской", callback_data="gender_male")
     builder.button(text="👩 Женский", callback_data="gender_female")
     builder.adjust(2)
+    if is_test:
+        builder.row(InlineKeyboardButton(text="❌ Выйти из теста", callback_data="cancel_test"))
     return builder.as_markup()
 
 
