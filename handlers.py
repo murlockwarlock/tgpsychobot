@@ -11794,6 +11794,8 @@ async def cmd_start_test(message: Message, state: FSMContext):
     await state.set_state(UserStates.awaiting_gender)
 
     text = content.get('text', "Привет! Для начала выбери свой пол:")
+    if not text or text == "Контент не найден.":
+        text = "Привет! Для начала выбери свой пол:"
     media = content.get('media', [])
 
     keyboard = kb.gender_selection_keyboard(is_test=True)
