@@ -60,7 +60,7 @@ async def main_client_keyboard(user_id: int | None = None):
     keyboard_rows.extend(topic_rows)
 
     static_row = []
-    if test_active and is_user_admin:
+    if test_active or is_user_admin:
         static_row.append(KeyboardButton(text="📝 Пройти тест"))
     if subscriptions_active:
         static_row.append(KeyboardButton(text="⭐️ Подписка"))

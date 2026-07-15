@@ -69,7 +69,7 @@ async def build_main_menu(user_id: int | None = None) -> list[dict]:
         is_user_admin = await is_admin(user_id)
 
     static_row: list[dict] = []
-    if test_config and test_config.is_enabled and is_user_admin:
+    if test_config and (test_config.is_enabled or is_user_admin):
         static_row.append(message_button("📝 Пройти тест"))
     if not sub_config or sub_config.subscriptions_enabled:
         static_row.append(message_button("⭐️ Подписка"))

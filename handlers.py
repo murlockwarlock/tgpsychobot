@@ -11797,9 +11797,6 @@ async def cmd_start_test(message: Message, state: FSMContext):
 
         content = await get_content_from_db("test_intro")
         user = await session.get(User, user_id)
-    if user and not (user.is_admin or user_id in OWNER_IDS):
-        await message.answer("⚠️ Тестирование доступно только администраторам.")
-        return
 
     if user and not user.name:
         await state.set_state(UserStates.awaiting_name)
