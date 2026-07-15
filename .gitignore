@@ -33,4 +33,7 @@ update_dbs.py
 .agents/
 .claude/
 
+# Client-specific prompt files
+system_prompts/
+
 html_utils.py
