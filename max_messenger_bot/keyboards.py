@@ -27,7 +27,7 @@ def main_menu_row(text: str = "⬅️ В главное меню") -> list[dict]
     return [callback_button(text, "main_menu")]
 
 
-async def build_main_menu() -> list[dict]:
+async def build_main_menu(user_id: int | None = None) -> list[dict]:
     async with async_session_maker() as session:
         content_items = (
             await session.execute(
@@ -63,8 +63,13 @@ async def build_main_menu() -> list[dict]:
     for index in range(0, len(topics), 2):
         rows.append([message_button(item.name) for item in topics[index:index + 2]])
 
+    is_user_admin = False
+    if user_id is not None:
+        from .services.common import is_admin
+        is_user_admin = await is_admin(user_id)
+
     static_row: list[dict] = []
-    if test_config and test_config.is_enabled:
+    if test_config and test_config.is_enabled and is_user_admin:
         static_row.append(message_button("📝 Пройти тест"))
     if not sub_config or sub_config.subscriptions_enabled:
         static_row.append(message_button("⭐️ Подписка"))

@@ -2130,7 +2130,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
         stmt = select(Content).where(Content.key == "start_message").options(selectinload(Content.media))
         content_obj = await session.scalar(stmt)
 
-    main_kb = await kb.main_client_keyboard()
+    main_kb = await kb.main_client_keyboard(message.from_user.id)
     if not content_obj:
         text = "Приветствие не задано."
         await message.answer(text, reply_markup=main_kb, parse_mode="HTML")
@@ -4086,7 +4086,7 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
     except TelegramBadRequest:
         pass
 
-    main_kb = await kb.main_client_keyboard()
+    main_kb = await kb.main_client_keyboard(callback.from_user.id)
 
     if not content_obj:
         await bot.send_message(callback.from_user.id, "✅ Память очищена.", reply_markup=main_kb)
@@ -5027,7 +5027,7 @@ async def process_topic_reset(callback: CallbackQuery, bot: Bot):
     except TelegramBadRequest:
         pass
 
-    main_kb = await kb.main_client_keyboard()
+    main_kb = await kb.main_client_keyboard(callback.from_user.id)
     chat_id = callback.from_user.id
 
     if not content_obj:
@@ -10946,7 +10946,7 @@ async def process_cancel_test(callback: CallbackQuery, state: FSMContext, bot: B
     await callback.answer("❌ Тест прерван")
     await callback.message.answer(
         "Тестирование прервано. Возвращаемся в главное меню.",
-        reply_markup=await kb.main_client_keyboard()
+        reply_markup=await kb.main_client_keyboard(callback.from_user.id)
     )
     try:
         await callback.message.delete()
@@ -11797,6 +11797,9 @@ async def cmd_start_test(message: Message, state: FSMContext):
 
         content = await get_content_from_db("test_intro")
         user = await session.get(User, user_id)
+    if user and not (user.is_admin or user_id in OWNER_IDS):
+        await message.answer("⚠️ Тестирование доступно только администраторам.")
+        return
 
     if user and not user.name:
         await state.set_state(UserStates.awaiting_name)
@@ -12933,7 +12936,7 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
     except TelegramBadRequest:
         pass
 
-    main_kb = await kb.main_client_keyboard()
+    main_kb = await kb.main_client_keyboard(callback.from_user.id)
     chat_id = callback.from_user.id
 
     if not content_obj:

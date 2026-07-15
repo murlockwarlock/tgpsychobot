@@ -676,7 +676,7 @@ class MaxBotApplication:
         chat_id = callback.chat_id
 
         if data == "main_menu":
-            await common.send_main_menu(self.client, chat_id)
+            await common.send_main_menu(self.client, chat_id, user_id=user_id)
             return
         if data == "topic_start_dialogue":
             await self.client.send_message(chat_id=chat_id, text="✍️ Напишите ваш первый вопрос, и я отвечу.")
@@ -689,7 +689,7 @@ class MaxBotApplication:
             await self.client.send_message(
                 chat_id=chat_id,
                 text="❌ Тестирование прервано.",
-                attachments=await build_main_menu()
+                attachments=await build_main_menu(user_id)
             )
             return
         if data == "admin_panel":
@@ -712,7 +712,7 @@ class MaxBotApplication:
             await self.client.answer_callback(callback.callback_id, notification="Пол сохранён")
             if state_data.get("is_onboarding"):
                 # Onboarding complete — show main menu and continue with initial prompt
-                main_menu_kb = await build_main_menu()
+                main_menu_kb = await build_main_menu(user_id)
                 await self.client.send_message(
                     chat_id=chat_id,
                     text="✅ Отлично! Теперь можете начать диалог. Используйте меню ниже или просто напишите сообщение.",

@@ -9,8 +9,14 @@ from memory_mode import memory_mode_label
 from time_helpers import to_msk
 
 
-async def main_client_keyboard():
+async def main_client_keyboard(user_id: int | None = None):
     async with async_session_maker() as session:
+        is_user_admin = False
+        if user_id is not None:
+            from database import User
+            user = await session.get(User, user_id)
+            is_user_admin = bool((user and user.is_admin) or user_id in OWNER_IDS)
+
         stmt = select(Content).where(
             Content.is_visible == True,
             Content.button_title != None,
@@ -54,7 +60,7 @@ async def main_client_keyboard():
     keyboard_rows.extend(topic_rows)
 
     static_row = []
-    if test_active:
+    if test_active and is_user_admin:
         static_row.append(KeyboardButton(text="📝 Пройти тест"))
     if subscriptions_active:
         static_row.append(KeyboardButton(text="⭐️ Подписка"))

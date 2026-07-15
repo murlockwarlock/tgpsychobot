@@ -148,8 +148,9 @@ async def get_content_attachments(content_key: str) -> list[dict]:
     return attachments
 
 
-async def send_main_menu(client: MaxApiClient, chat_id: int, text: str = "Главное меню:") -> None:
-    await client.send_message(chat_id=chat_id, text=text, attachments=await build_main_menu())
+async def send_main_menu(client: MaxApiClient, chat_id: int, text: str = "Главное меню:", user_id: int | None = None) -> None:
+    target_user_id = user_id or chat_id
+    await client.send_message(chat_id=chat_id, text=text, attachments=await build_main_menu(target_user_id))
 
 
 async def show_help(client: MaxApiClient, chat_id: int, user_id: int) -> None:
@@ -279,7 +280,7 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                 text=content_text,
                 attachments=await get_content_attachments(start_payload) or None,
             )
-            await send_main_menu(client, chat_id)
+            await send_main_menu(client, chat_id, user_id=user_id)
             return
 
     start_content = await get_content("start_message")
@@ -294,7 +295,7 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
         await client.send_message(chat_id=chat_id, text="Здравствуйте. Бот в MAX готов к работе.")
     if welcome_bonus_text:
         await client.send_message(chat_id=chat_id, text=translate_telegram_links_to_max(welcome_bonus_text))
-    await send_main_menu(client, chat_id)
+    await send_main_menu(client, chat_id, user_id=user_id)
 
 
 async def reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> None:

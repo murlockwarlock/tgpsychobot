@@ -83,7 +83,7 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int) -> None:
     start_message = await async_get_start_message()
     if start_message:
         await client.send_message(chat_id=chat_id, text=start_message)
-    await client.send_message(chat_id=chat_id, text="✅ Тема сброшена.", attachments=await build_main_menu())
+    await client.send_message(chat_id=chat_id, text="✅ Тема сброшена.", attachments=await build_main_menu(user_id))
 
 
 async def async_get_start_message() -> str | None:
