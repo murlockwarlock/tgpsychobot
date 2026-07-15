@@ -167,10 +167,11 @@ async def _build_ai_summary(
 
 
 async def start_test(client: MaxApiClient, chat_id: int, user_id: int, states: StateStore | None = None) -> None:
+    from .common import is_admin
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         config = await session.get(TestConfig, 1)
-        if (not config or not config.is_enabled) and not bool(getattr(user, "is_admin", False)):
+        if (not config or not config.is_enabled) and not await is_admin(user_id):
             await client.send_message(chat_id=chat_id, text="Тестирование сейчас отключено.")
             return
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
