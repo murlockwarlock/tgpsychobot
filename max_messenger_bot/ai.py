@@ -19,7 +19,7 @@ from sqlalchemy.orm import selectinload
 from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, async_session_maker
 from .logging_utils import configure_logging, get_ai_logger
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
-from prompt_injection import apply_global_prompt_appendix
+from prompt_context import apply_global_prompt_appendix
 from vector_store import search_relevant_chunks
 
 configure_logging()

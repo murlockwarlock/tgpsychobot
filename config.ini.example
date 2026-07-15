@@ -1,0 +1,6 @@
+[bot]
+token = <telegram-bot-token>
+owner_ids = <comma-separated-telegram-user-ids>
+
+[database]
+url = <database-connection-url>
