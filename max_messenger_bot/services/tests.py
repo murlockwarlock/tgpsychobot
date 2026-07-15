@@ -169,7 +169,7 @@ async def start_test(client: MaxApiClient, chat_id: int, user_id: int, states: S
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         config = await session.get(TestConfig, 1)
-        if config and not config.is_enabled and not bool(getattr(user, "is_admin", False)):
+        if (not config or not config.is_enabled) and not bool(getattr(user, "is_admin", False)):
             await client.send_message(chat_id=chat_id, text="Тестирование сейчас отключено.")
             return
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()

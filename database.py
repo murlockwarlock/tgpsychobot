@@ -407,7 +407,7 @@ class TestQuestion(Base):
 class TestConfig(Base):
     __tablename__ = 'test_config'
     id = Column(Integer, primary_key=True, default=1)
-    is_enabled = Column(Boolean, default=True)
+    is_enabled = Column(Boolean, default=False)
     admin_username = Column(String, default="AlenaVV2004")
     marathon_url = Column(String, default="https://t.me/psihogipno")
     show_progress = Column(Boolean, default=True, nullable=False)

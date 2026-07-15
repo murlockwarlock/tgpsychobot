@@ -11763,7 +11763,7 @@ async def cmd_start_test(message: Message, state: FSMContext):
     user_id = message.from_user.id
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
-        if config and not config.is_enabled:
+        if not config or not config.is_enabled:
             if not await is_admin(user_id):
                 await message.answer("⚠️ Тестирование в данный момент отключено.")
                 return

@@ -30,7 +30,7 @@ async def main_client_keyboard():
         referral_btn_name = sub_config.referral_btn_name if sub_config else "👥 Пригласить друзей"
 
         test_config = await session.get(TestConfig, 1)
-        test_active = test_config.is_enabled if test_config else True
+        test_active = test_config.is_enabled if test_config else False
 
         topic_stmt = select(Topic).where(Topic.is_active == True, Topic.show_in_main_menu == True).order_by(Topic.sort_order.asc(), Topic.id.asc())
         topic_res = await session.execute(topic_stmt)

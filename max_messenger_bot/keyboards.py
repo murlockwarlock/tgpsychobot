@@ -64,7 +64,7 @@ async def build_main_menu() -> list[dict]:
         rows.append([message_button(item.name) for item in topics[index:index + 2]])
 
     static_row: list[dict] = []
-    if not test_config or test_config.is_enabled:
+    if test_config and test_config.is_enabled:
         static_row.append(message_button("📝 Пройти тест"))
     if not sub_config or sub_config.subscriptions_enabled:
         static_row.append(message_button("⭐️ Подписка"))
