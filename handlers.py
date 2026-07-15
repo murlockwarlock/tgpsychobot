@@ -4187,8 +4187,14 @@ async def process_user_name(message: Message, state: FSMContext, bot: Bot):
         await session.execute(stmt)
         await session.commit()
 
-    await message.answer(f"Приятно познакомиться, {html.escape(user_name)}! Укажи свой пол:", reply_markup=kb.gender_selection_keyboard())
-    await state.update_data(is_onboarding=True)
+    data = await state.get_data()
+    is_test = data.get('is_test', False)
+
+    await message.answer(f"Приятно познакомиться, {html.escape(user_name)}! Укажи свой пол:", reply_markup=kb.gender_selection_keyboard(is_test=is_test))
+    if is_test:
+        await state.update_data(is_test=True)
+    else:
+        await state.update_data(is_onboarding=True)
     await state.set_state(UserStates.awaiting_gender)
 
 
@@ -11790,6 +11796,13 @@ async def cmd_start_test(message: Message, state: FSMContext):
             return
 
         content = await get_content_from_db("test_intro")
+        user = await session.get(User, user_id)
+
+    if user and not user.name:
+        await state.set_state(UserStates.awaiting_name)
+        await state.update_data(is_test=True)
+        await message.answer("Прежде чем мы начнем, подскажите, как я могу к вам обращаться?")
+        return
 
     await state.set_state(UserStates.awaiting_gender)
 
