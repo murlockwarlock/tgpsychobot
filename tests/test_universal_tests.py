@@ -229,6 +229,13 @@ class UniversalFileParserTests(unittest.IsolatedAsyncioTestCase):
         options = json.loads(result["questions"][0]["answer_options_json"])
         self.assertEqual([item["value"] for item in options], [1.0, 2.0, 3.0])
 
+    async def test_short_button_labels_are_preserved(self):
+        header = HEADER + ["Кнопка 1", "Кнопка 2", "Кнопка 3"]
+        rows = [header, [1, "Вопрос", "", "choice", "", "", "Полный вариант", "", "", "", "", "", "Коротко"]]
+        result = await parse_questions_file(io.BytesIO(delimited_bytes(rows)), "labels.csv")
+        options = json.loads(result["questions"][0]["answer_options_json"])
+        self.assertEqual(options, [{"text": "Полный вариант", "value": None, "button_text": "Коротко"}])
+
 
 class UniversalAnswerFlowTests(unittest.TestCase):
     def setUp(self):

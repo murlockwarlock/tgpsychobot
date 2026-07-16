@@ -229,6 +229,7 @@ def _parse_answer_options(cells) -> list[dict]:
 def _parse_answer_options_from_row(row, schema: dict) -> list[dict]:
     option_columns = schema.get("option_columns", [])
     value_columns = schema.get("value_columns", [])
+    button_columns = schema.get("button_columns", [])
     options = []
     for option_index, column in enumerate(option_columns):
         label = _cell_text(row[column] if column < len(row) else None)
@@ -236,7 +237,12 @@ def _parse_answer_options_from_row(row, schema: dict) -> list[dict]:
             continue
         value_column = value_columns[option_index] if option_index < len(value_columns) else None
         value_text = _cell_text(row[value_column] if value_column is not None and value_column < len(row) else None)
-        options.append({"text": label, "value": _to_float_or_none(value_text or label)})
+        option = {"text": label, "value": _to_float_or_none(value_text or label)}
+        button_column = button_columns[option_index] if option_index < len(button_columns) else None
+        button_text = _cell_text(row[button_column] if button_column is not None and button_column < len(row) else None)
+        if button_text:
+            option["button_text"] = button_text
+        options.append(option)
     return options
 
 
@@ -275,6 +281,7 @@ def _looks_like_question_header(row) -> bool:
 def _build_question_schema(header) -> dict:
     option_columns = []
     value_columns = []
+    button_columns = []
     for index, raw_cell in enumerate(header):
         if index < 6:
             continue
@@ -283,9 +290,15 @@ def _build_question_schema(header) -> dict:
             continue
         if "значен" in cell or "балл" in cell or cell.startswith("value"):
             value_columns.append(index)
+        elif "кнопк" in cell or "подпис" in cell or cell.startswith("button"):
+            button_columns.append(index)
         elif "вариант" in cell or cell.startswith("option") or cell.startswith("answer"):
             option_columns.append(index)
-    return {"option_columns": option_columns, "value_columns": value_columns}
+    return {
+        "option_columns": option_columns,
+        "value_columns": value_columns,
+        "button_columns": button_columns,
+    }
 
 
 def _decode_tabular_text(raw: bytes) -> str:
