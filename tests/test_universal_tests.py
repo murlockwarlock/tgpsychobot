@@ -283,8 +283,12 @@ class UniversalAnswerFlowTests(unittest.TestCase):
         telegram_payloads = [button.callback_data for row in telegram_markup.inline_keyboard for button in row]
         max_markup = universal_test_answers_keyboard(options, True, 4)
         max_payloads = [button["payload"] for row in max_markup[0]["payload"]["buttons"] for button in row]
-        self.assertEqual(telegram_payloads, ["test_opt_4_0", "test_opt_4_1"])
-        self.assertEqual(max_payloads, telegram_payloads)
+        option_payloads = [payload for payload in telegram_payloads if payload.startswith("test_opt_")]
+        max_option_payloads = [payload for payload in max_payloads if payload.startswith("test_opt_")]
+        self.assertEqual(option_payloads, ["test_opt_4_0", "test_opt_4_1"])
+        self.assertIn("cancel_test", telegram_payloads)
+        self.assertEqual(max_option_payloads, option_payloads)
+        self.assertIn("cancel_test", max_payloads)
 
 
 class MaxAnswerHandlerIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -412,7 +416,10 @@ class MaxCompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         context.__aexit__ = AsyncMock(return_value=False)
         client = SimpleNamespace(send_message=AsyncMock())
 
-        with patch.object(tests_service, "async_session_maker", return_value=context):
+        with (
+            patch.object(tests_service, "async_session_maker", return_value=context),
+            patch("max_messenger_bot.services.common.is_admin", new=AsyncMock(return_value=False)),
+        ):
             await tests_service.start_test(client, 10, 20)
 
         session.execute.assert_not_awaited()
