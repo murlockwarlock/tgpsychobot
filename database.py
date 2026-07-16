@@ -413,6 +413,7 @@ class TestConfig(Base):
     admin_username = Column(String, default="AlenaVV2004")
     marathon_url = Column(String, default="https://t.me/psihogipno")
     show_progress = Column(Boolean, default=True, nullable=False)
+    collect_profile_before_test = Column(Boolean, default=True, nullable=False)
     formulas_enabled = Column(Boolean, default=False, nullable=False)
     formulas_json = Column(Text, nullable=True)
     separate_result_prompt_enabled = Column(Boolean, default=False, nullable=False)
@@ -581,6 +582,8 @@ async def init_db():
             test_config_columns = [c['name'] for c in insp.get_columns('test_config')]
             if 'show_progress' not in test_config_columns:
                 sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN show_progress BOOLEAN DEFAULT TRUE NOT NULL"))
+            if 'collect_profile_before_test' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN collect_profile_before_test BOOLEAN DEFAULT TRUE NOT NULL"))
             if 'formulas_enabled' not in test_config_columns:
                 sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN formulas_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
             if 'formulas_json' not in test_config_columns:
@@ -655,6 +658,8 @@ async def init_db():
         else:
             if getattr(test_conf, 'show_progress', None) is None:
                 test_conf.show_progress = True
+            if getattr(test_conf, 'collect_profile_before_test', None) is None:
+                test_conf.collect_profile_before_test = True
             if getattr(test_conf, 'formulas_enabled', None) is None:
                 test_conf.formulas_enabled = False
             if getattr(test_conf, 'separate_result_prompt_enabled', None) is None:

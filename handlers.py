@@ -11898,8 +11898,13 @@ async def cmd_start_test(message: Message, state: FSMContext):
             await message.answer("⚠️ Тест временно недоступен: вопросы еще не загружены.")
             return
 
+        collect_profile_before_test = bool(getattr(config, "collect_profile_before_test", True))
         content = await get_content_from_db("test_intro")
         user = await session.get(User, user_id)
+
+    if not collect_profile_before_test:
+        await start_psych_test(message, state, user_id)
+        return
 
     if user and not user.name:
         await state.set_state(UserStates.awaiting_name)
@@ -11978,6 +11983,18 @@ async def admin_test_toggle_progress(callback: CallbackQuery):
             config = TestConfig(id=1)
             session.add(config)
         config.show_progress = not bool(getattr(config, "show_progress", True))
+        await session.commit()
+    await admin_test_menu(callback)
+
+
+@router.callback_query(F.data == "admin_test_toggle_profile_collection")
+async def admin_test_toggle_profile_collection(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(TestConfig, 1)
+        if not config:
+            config = TestConfig(id=1)
+            session.add(config)
+        config.collect_profile_before_test = not bool(getattr(config, "collect_profile_before_test", True))
         await session.commit()
     await admin_test_menu(callback)
 
