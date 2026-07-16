@@ -51,6 +51,8 @@ from ai_integration import (
     _call_openai_api,
     _call_deepseek_api,
     _call_claude_api,
+    _call_kie_chat,
+    _get_kie_base_url,
     _describe_subscription_status,
 )
 from error_reporting import notify_admins_about_error
@@ -11852,6 +11854,15 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
             response_text = await _call_claude_api(api_key, model, fake_history, "", system_prompt)
         elif provider_key == 'deepseek':
             response_text = await _call_deepseek_api(api_key, model, fake_history, "", system_prompt)
+        elif provider_key == 'kie':
+            response_text = await _call_kie_chat(
+                api_key,
+                _get_kie_base_url(ai_config),
+                model,
+                fake_history,
+                "",
+                system_prompt,
+            )
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
 
