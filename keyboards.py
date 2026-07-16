@@ -112,11 +112,13 @@ def admin_test_menu_keyboard(config_or_enabled):
     is_enabled = config_or_enabled if isinstance(config_or_enabled, bool) else bool(config_or_enabled.is_enabled)
     show_progress = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "show_progress", True))
     collect_profile = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "collect_profile_before_test", True))
+    secret_test_enabled = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "secret_test_enabled", True))
     formulas_enabled = False if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "formulas_enabled", False))
     input_mode = "all" if isinstance(config_or_enabled, bool) else (getattr(config_or_enabled, "interpretation_input_mode", "all") or "all")
     status_text = "✅ Включен" if is_enabled else "❌ Выключен"
     progress_text = "✅ Да" if show_progress else "❌ Нет"
     profile_text = "✅ Да" if collect_profile else "❌ Нет"
+    secret_text = "✅ Да" if secret_test_enabled else "❌ Нет"
     formulas_text = "✅ Да" if formulas_enabled else "❌ Нет"
     if input_mode == "formulas":
         mode_text = "только формулы"
@@ -128,6 +130,7 @@ def admin_test_menu_keyboard(config_or_enabled):
     builder.button(text=f"Статус теста: {status_text}", callback_data="admin_test_toggle_status")
     builder.button(text=f"Прогресс: {progress_text}", callback_data="admin_test_toggle_progress")
     builder.button(text=f"Анкета перед тестом: {profile_text}", callback_data="admin_test_toggle_profile_collection")
+    builder.button(text=f"Секретные вопросы: {secret_text}", callback_data="admin_test_toggle_secret_test")
     builder.button(text=f"Формулы: {formulas_text}", callback_data="admin_test_toggle_formulas")
     builder.button(text=f"В интерпретацию: {mode_text}", callback_data="admin_test_toggle_input_mode")
     builder.button(text="🎯 Выбранные переменные", callback_data="admin_test_set_selected_vars")

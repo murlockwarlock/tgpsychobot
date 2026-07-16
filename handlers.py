@@ -11383,6 +11383,7 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
         test_config = await session.get(TestConfig, 1)
         system_instruction = test_config.test_system_prompt
         marathon_url = test_config.marathon_url
+        secret_test_enabled = bool(getattr(test_config, "secret_test_enabled", True))
 
         user = await session.get(User, user_id)
         dialogue_id = user.current_dialogue_id
@@ -11441,6 +11442,8 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(diagram_text)
 
     if universal_report or "ОБЩИЙ ИТОГ:" not in (diagram_text or ""):
+        if not secret_test_enabled:
+            return
         secret_test_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔐 Пройти секретный тест", callback_data="start_secret_test")],
             [InlineKeyboardButton(text="Сразу на марафон 🚀", url=marathon_url)]
@@ -11529,15 +11532,16 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
         )
         await asyncio.sleep(0.3)
 
-    secret_test_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔐 Пройти секретный тест", callback_data="start_secret_test")],
-        [InlineKeyboardButton(text="Сразу на марафон 🚀", url=marathon_url)]
-    ])
+    if secret_test_enabled:
+        secret_test_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔐 Пройти секретный тест", callback_data="start_secret_test")],
+            [InlineKeyboardButton(text="Сразу на марафон 🚀", url=marathon_url)]
+        ])
 
-    await callback.message.answer(
-        "Готовы копнуть глубже и получить личный разбор от меня?",
-        reply_markup=secret_test_kb
-    )
+        await callback.message.answer(
+            "Готовы копнуть глубже и получить личный разбор от меня?",
+            reply_markup=secret_test_kb
+        )
 
 
 @router.callback_query(F.data == "start_secret_test")
@@ -11995,6 +11999,18 @@ async def admin_test_toggle_profile_collection(callback: CallbackQuery):
             config = TestConfig(id=1)
             session.add(config)
         config.collect_profile_before_test = not bool(getattr(config, "collect_profile_before_test", True))
+        await session.commit()
+    await admin_test_menu(callback)
+
+
+@router.callback_query(F.data == "admin_test_toggle_secret_test")
+async def admin_test_toggle_secret_test(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(TestConfig, 1)
+        if not config:
+            config = TestConfig(id=1)
+            session.add(config)
+        config.secret_test_enabled = not bool(getattr(config, "secret_test_enabled", True))
         await session.commit()
     await admin_test_menu(callback)
 
