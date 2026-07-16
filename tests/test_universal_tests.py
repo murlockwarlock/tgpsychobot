@@ -267,6 +267,17 @@ class UniversalAnswerFlowTests(unittest.TestCase):
         self.assertEqual(make_text_answer_record(custom, 0, "  свой вариант  ")["answer"], "свой вариант")
         self.assertEqual(make_text_answer_record(opened, 0, "текст")["answer"], "текст")
 
+    def test_short_button_label_keeps_full_answer_for_storage(self):
+        from keyboards import universal_test_answer_keyboard
+
+        item = question(options=[{"text": "Когда мной командуют и не дают решать самому", "button_text": "Когда командуют"}])
+        option = get_answer_options(item)[0]
+        markup = universal_test_answer_keyboard([option], question_index=0)
+        record = make_option_answer_record(item, 0, answer_callback_data(0, 0))
+
+        self.assertEqual(markup.inline_keyboard[0][0].text, "Когда командуют")
+        self.assertEqual(record["answer"], "Когда мной командуют и не дают решать самому")
+
     def test_question_output_escapes_html_and_keeps_multiline_comment(self):
         item = question(text="2 < 3 & 5 > 4", comment="Строка <1>\nСтрока &2")
         rendered = build_question_text(item, 0, 5, True)

@@ -1209,7 +1209,7 @@ def universal_test_answer_keyboard(options, horizontal: bool = False, question_i
 
     builder = InlineKeyboardBuilder()
     for index, option in enumerate(options):
-        label = getattr(option, "text", str(option))
+        label = getattr(option, "button_text", None) or getattr(option, "text", str(option))
         builder.button(text=label, callback_data=answer_callback_data(question_index, index))
     if horizontal and options:
         row_width = min(len(options), 8)

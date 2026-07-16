@@ -17,6 +17,7 @@ LEGACY_CATEGORIES = {"body", "face", "age", "health", "abilities", "relations", 
 class AnswerOption:
     text: str
     value: float | None = None
+    button_text: str | None = None
 
 
 def is_truthy(value: Any) -> bool:
@@ -63,11 +64,13 @@ def get_answer_options(question: Any) -> list[AnswerOption]:
             if isinstance(item, dict):
                 text = str(item.get("text") or item.get("label") or "").strip()
                 value = _to_float_or_none(item.get("value"))
+                button_text = str(item.get("button_text") or "").strip() or None
             else:
                 text = str(item).strip()
                 value = _to_float_or_none(item)
+                button_text = None
             if text:
-                options.append(AnswerOption(text=text, value=value))
+                options.append(AnswerOption(text=text, value=value, button_text=button_text))
     if options:
         return options
     if is_legacy_scale_question(question):

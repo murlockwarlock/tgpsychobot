@@ -232,7 +232,10 @@ def universal_test_answers_keyboard(options, horizontal: bool = False, question_
     from universal_tests import answer_callback_data
 
     buttons = [
-        callback_button(getattr(option, "text", str(option)), answer_callback_data(question_index, index))
+        callback_button(
+            getattr(option, "button_text", None) or getattr(option, "text", str(option)),
+            answer_callback_data(question_index, index),
+        )
         for index, option in enumerate(options)
     ]
     if horizontal:
