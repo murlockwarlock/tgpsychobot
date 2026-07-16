@@ -331,6 +331,7 @@ def clients_paginator_keyboard(page: int, total_pages: int, clients: list, is_se
             builder.row(InlineKeyboardButton(text="🔍 Поиск", callback_data="admin_clients_start_search"))
 
         builder.row(InlineKeyboardButton(text="📦 Режим экспорта истории", callback_data="admin_export_mode_start"))
+        builder.row(InlineKeyboardButton(text="🧩 Режим экспорта метаданных", callback_data="admin_metadata_export_mode_start"))
         builder.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel"))
 
     return builder.as_markup()
@@ -341,6 +342,8 @@ def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view
     builder.button(text="💳 Платежная инфо", callback_data=f"client_payment_info_{user_id}")
     builder.button(text="📜 История диалога", callback_data=f"client_history_{user_id}")
     builder.button(text="📥 Скачать историю", callback_data=f"download_history_{user_id}")
+    builder.button(text="🧩 Метаданные", callback_data=f"client_metadata_{user_id}_0")
+    builder.button(text="📥 Скачать метаданные", callback_data=f"download_metadata_{user_id}")
     builder.button(text="🎁 Сбросить промокоды", callback_data=f"reset_user_promos_{user_id}")
     builder.button(text="🔄 Сбросить подписку", callback_data=f"admin_reset_sub_{user_id}")
     builder.button(text="🗑️ Удалить историю", callback_data=f"admin_delete_client_history_{user_id}")

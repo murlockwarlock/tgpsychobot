@@ -25,6 +25,7 @@ from prompt_blocks import (
 )
 from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
+from user_metadata import extract_data_blocks, load_metadata, merge_metadata
 
 class InsufficientBalanceError(Exception):
     pass
@@ -1229,7 +1230,18 @@ async def get_ai_response(
                     f"Основной провайдер ({provider}) и резервный ({fb_provider}) недоступны"
                 ) from fb_err
 
-        return response_text
+        visible_text, new_metadata, invalid_data_blocks = extract_data_blocks(response_text)
+        if invalid_data_blocks:
+            logging.warning("AI returned %s invalid [DATA] block(s) for user %s", invalid_data_blocks, user_id)
+        if new_metadata:
+            user.metadata_json = json.dumps(
+                merge_metadata(load_metadata(user.metadata_json), new_metadata),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            await session.commit()
+
+        return visible_text
 
 
 async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, filename: str) -> str:

@@ -76,6 +76,7 @@ from mailing_utils import (
     send_mailing_content,
 )
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE
+from user_metadata import extract_data_blocks, load_metadata, merge_metadata
 from sqlalchemy import delete
 from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
@@ -2446,7 +2447,9 @@ async def admin_clients_list(callback: CallbackQuery, state: FSMContext):
 
     header = f"👥 Список клиентов (Страница {page + 1}/{total_pages})"
     if export_mode:
-        header = f"📦 Выберите клиентов для экспорта ({len(selected_ids)} выбрано)"
+        export_kind = data.get("export_kind", "history")
+        export_label = "метаданных" if export_kind == "metadata" else "истории"
+        header = f"📦 Выберите клиентов для экспорта {export_label} ({len(selected_ids)} выбрано)"
     elif search_query:
         header = f"🔎 Результаты поиска по запросу: «{html.escape(search_query)}»\n(Стр. {page + 1}/{total_pages})"
 
@@ -2570,6 +2573,8 @@ async def view_client_profile(callback: CallbackQuery, state: FSMContext):
                 if (
                     "client_history_" not in button.callback_data
                     and "download_history_" not in button.callback_data
+                    and "client_metadata_" not in button.callback_data
+                    and "download_metadata_" not in button.callback_data
                     and "admin_delete_client_history_" not in button.callback_data
                 ):
                     new_row.append(button)
@@ -4585,6 +4590,78 @@ async def download_client_history(callback: CallbackQuery, state: FSMContext):
         f"Выберите формат и параметры экспорта для пользователя <code>{client_id}</code>:",
         reply_markup=kb.single_export_options_keyboard(client_id)
     )
+
+
+@router.callback_query(F.data.startswith("client_metadata_"))
+async def view_client_metadata(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на просмотр метаданных.", show_alert=True)
+        return
+
+    try:
+        _, _, client_id, page = callback.data.split("_")
+        client_id, page = int(client_id), int(page)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+
+    async with async_session_maker() as session:
+        user = await session.get(User, client_id)
+    if not user:
+        await callback.answer("Клиент не найден.", show_alert=True)
+        return
+
+    metadata = load_metadata(user.metadata_json)
+    rendered = json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else "{}"
+    chunk_size = 3200
+    pages = [rendered[index:index + chunk_size] for index in range(0, len(rendered), chunk_size)] or ["{}"]
+    page = max(0, min(page, len(pages) - 1))
+    display_name = html.escape(user.name or user.first_name or str(user.id))
+    text = (
+        f"<b>🧩 Метаданные клиента:</b> {display_name}\n"
+        f"<code>{html.escape(pages[page])}</code>\n\n"
+        f"Страница {page + 1}/{len(pages)}"
+    )
+    buttons = []
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"client_metadata_{client_id}_{page - 1}"))
+    if page < len(pages) - 1:
+        navigation.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"client_metadata_{client_id}_{page + 1}"))
+    if navigation:
+        buttons.append(navigation)
+    buttons.append([InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")])
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("download_metadata_"))
+async def download_client_metadata(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на скачивание метаданных.", show_alert=True)
+        return
+
+    client_id = int(callback.data.split("_")[-1])
+    async with async_session_maker() as session:
+        user = await session.get(User, client_id)
+    if not user:
+        await callback.answer("Клиент не найден.", show_alert=True)
+        return
+
+    export_data = {
+        "user_info": {
+            "id": user.id,
+            "name": user.name or user.first_name,
+            "username": user.username,
+        },
+        "metadata": load_metadata(user.metadata_json),
+    }
+    data = json.dumps(export_data, ensure_ascii=False, indent=2).encode("utf-8")
+    await callback.message.answer_document(
+        BufferedInputFile(data, filename=f"metadata_{client_id}.json"),
+        caption=f"🧩 Метаданные пользователя {client_id}",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("run_single_"))
@@ -11768,15 +11845,30 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         fake_history = [DBMessage(role='user', content=user_prompt)]
 
         if provider_key == 'gemini':
-            return await _call_gemini_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_gemini_api(api_key, model, fake_history, "", system_prompt)
         elif provider_key == 'openai':
-            return await _call_openai_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_openai_api(api_key, model, fake_history, "", system_prompt)
         elif provider_key in ['anthropic', 'claude']:
-            return await _call_claude_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_claude_api(api_key, model, fake_history, "", system_prompt)
         elif provider_key == 'deepseek':
-            return await _call_deepseek_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_deepseek_api(api_key, model, fake_history, "", system_prompt)
+        else:
+            return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
 
-        return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
+    visible_text, new_metadata, invalid_data_blocks = extract_data_blocks(response_text)
+    if invalid_data_blocks:
+        logging.warning("AI returned %s invalid [DATA] block(s) for user %s", invalid_data_blocks, user_id)
+    if new_metadata:
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if user:
+                user.metadata_json = json.dumps(
+                    merge_metadata(load_metadata(user.metadata_json), new_metadata),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                await session.commit()
+    return visible_text
 
 
 @router.message(Command("test"))
@@ -13796,8 +13888,19 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
 @router.callback_query(F.data == "admin_export_mode_start")
 async def admin_export_mode_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.selecting_for_export)
-    await state.update_data(selected_export_ids=[])
+    await state.update_data(selected_export_ids=[], export_kind="history")
     await admin_clients_list(callback, state)
+
+
+@router.callback_query(F.data == "admin_metadata_export_mode_start")
+async def admin_metadata_export_mode_start(callback: CallbackQuery, state: FSMContext):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на выгрузку метаданных.", show_alert=True)
+        return
+    await state.set_state(AdminStates.selecting_for_export)
+    await state.update_data(selected_export_ids=[], export_kind="metadata")
+    callback_mock = callback.model_copy(update={"data": "admin_export_page_0"})
+    await admin_clients_list(callback_mock, state)
 
 
 @router.callback_query(F.data.startswith("toggle_export_"))
@@ -13871,6 +13974,13 @@ async def export_select_all_no_admins(callback: CallbackQuery, state: FSMContext
 @router.callback_query(F.data == "admin_export_all_confirm")
 async def admin_export_all_confirm(callback: CallbackQuery, state: FSMContext):
     await state.update_data(export_all=True, export_date_from=None, export_date_to=None)
+    data = await state.get_data()
+    if data.get("export_kind") == "metadata":
+        await callback.message.edit_text(
+            "🧩 Выберите формат выгрузки метаданных для ВСЕХ пользователей:",
+            reply_markup=kb.mass_export_options_keyboard(),
+        )
+        return
     await callback.message.edit_text(
         "📅 Фильтр по датам для ВСЕХ пользователей:\n\nВыберите диапазон сообщений для экспорта:",
         reply_markup=kb.export_date_filter_keyboard()
@@ -13885,6 +13995,12 @@ async def admin_export_confirm_options(callback: CallbackQuery, state: FSMContex
         await callback.answer("Вы не выбрали ни одного клиента!", show_alert=True)
         return
     await state.update_data(export_all=False, export_date_from=None, export_date_to=None)
+    if data.get("export_kind") == "metadata":
+        await callback.message.edit_text(
+            f"🧩 Выберите формат выгрузки метаданных для {len(selected_ids)} пользователей:",
+            reply_markup=kb.mass_export_options_keyboard(),
+        )
+        return
     await callback.message.edit_text(
         f"📅 Фильтр по датам для {len(selected_ids)} пользователей:\n\nВыберите диапазон сообщений для экспорта:",
         reply_markup=kb.export_date_filter_keyboard()
@@ -13979,9 +14095,10 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
 
     data = await state.get_data()
     export_all = data.get("export_all", False)
+    export_kind = data.get("export_kind", "history")
 
-    date_from_str = data.get("export_date_from")
-    date_to_str = data.get("export_date_to")
+    date_from_str = data.get("export_date_from") if export_kind == "history" else None
+    date_to_str = data.get("export_date_to") if export_kind == "history" else None
     date_from_dt = datetime.strptime(date_from_str, "%d-%m-%Y") if date_from_str else None
     date_to_dt = datetime.strptime(date_to_str, "%d-%m-%Y").replace(hour=23, minute=59, second=59) if date_to_str else None
 
@@ -13989,7 +14106,8 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
     if date_from_dt or date_to_dt:
         date_label = f" | фильтр: {date_from_str or 'начало'} → {date_to_str or 'сегодня'}"
 
-    await callback.message.edit_text(f"⏳ Начинаю сбор данных и формирование файла{date_label}. Это может занять время...")
+    export_title = "метаданных" if export_kind == "metadata" else "данных"
+    await callback.message.edit_text(f"⏳ Начинаю сбор {export_title} и формирование файла{date_label}. Это может занять время...")
 
     async with async_session_maker() as session:
         if export_all:
@@ -14004,20 +14122,53 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
             await callback.message.edit_text("Ошибка: Пользователи не найдены.")
             return
 
-        topics_res = await session.execute(select(Topic))
-        topic_map = {t.id: t.name for t in topics_res.scalars().all()}
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
-        def build_msg_stmt(user_id):
-            stmt = select(DBMessage).where(DBMessage.user_id == user_id)
-            if date_from_dt:
-                stmt = stmt.where(DBMessage.timestamp >= date_from_dt)
-            if date_to_dt:
-                stmt = stmt.where(DBMessage.timestamp <= date_to_dt)
-            return stmt.order_by(DBMessage.timestamp)
+        if export_kind == "metadata":
+            metadata_users = [(i, user, load_metadata(user.metadata_json)) for i, user in enumerate(users, 1)]
+            metadata_users = [(i, user, value) for i, user, value in metadata_users if value]
+            if fmt == "txt":
+                full_content = f"MASS METADATA EXPORT - {timestamp}\n" + "=" * 60 + "\n\n"
+                for i, user, metadata in metadata_users:
+                    label = f"user_{i}" if anonymize else f"{user.name or user.first_name} (ID: {user.id}, @{user.username})"
+                    full_content += f"ДАННЫЕ КЛИЕНТА: {label}\n" + "-" * 40 + "\n"
+                    full_content += json.dumps(metadata, ensure_ascii=False, indent=2) + "\n\n"
+                final_bytes = full_content.encode("utf-8") if metadata_users else b""
+                extension = "txt"
+            else:
+                export_data = [
+                    {
+                        "user_info": {
+                            "label": f"user_{i}" if anonymize else str(user.id),
+                            "id": None if anonymize else user.id,
+                            "name": None if anonymize else (user.name or user.first_name),
+                            "username": None if anonymize else user.username,
+                        },
+                        "metadata": metadata,
+                    }
+                    for i, user, metadata in metadata_users
+                ]
+                final_bytes = json.dumps(export_data, ensure_ascii=False, indent=2).encode("utf-8") if export_data else b""
+                extension = "json"
 
-        if fmt == "txt":
+            if not final_bytes:
+                await callback.message.edit_text("Метаданные отсутствуют у выбранных пользователей.")
+                return
+
+            # The common sending code below is shared with history export.
+        else:
+            topics_res = await session.execute(select(Topic))
+            topic_map = {t.id: t.name for t in topics_res.scalars().all()}
+
+            def build_msg_stmt(user_id):
+                stmt = select(DBMessage).where(DBMessage.user_id == user_id)
+                if date_from_dt:
+                    stmt = stmt.where(DBMessage.timestamp >= date_from_dt)
+                if date_to_dt:
+                    stmt = stmt.where(DBMessage.timestamp <= date_to_dt)
+                return stmt.order_by(DBMessage.timestamp)
+
+        if export_kind == "history" and fmt == "txt":
             full_content = f"MASS EXPORT - {timestamp}{date_label}\n"
             full_content += "=" * 60 + "\n\n"
 
@@ -14042,7 +14193,7 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
             final_bytes = full_content.encode("utf-8")
             extension = "txt"
 
-        else:
+        elif export_kind == "history":
             export_data = []
             for i, user in enumerate(users, 1):
                 user_label = f"user_{i}" if anonymize else str(user.id)

@@ -83,6 +83,8 @@ class User(Base):
     promo_codes = relationship("PromoCode", secondary=user_promo_association, back_populates="users")
     referred_by = Column(BigInteger, nullable=True)
     tg_user_id = Column(BigInteger, nullable=True)
+    # JSON as text keeps the schema open for arbitrary prompt-defined fields.
+    metadata_json = Column(Text, default="{}", nullable=False)
 
 
 class Message(Base):
@@ -511,6 +513,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN referred_by BIGINT"))
             if 'tg_user_id' not in user_columns:
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN tg_user_id BIGINT"))
+            if 'metadata_json' not in user_columns:
+                sync_conn.execute(text("ALTER TABLE users ADD COLUMN metadata_json TEXT DEFAULT '{}' NOT NULL"))
 
             ai_columns = [c['name'] for c in insp.get_columns('ai_config')]
             if 'memory_mode' not in ai_columns:
