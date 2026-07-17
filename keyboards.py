@@ -137,7 +137,10 @@ def admin_test_menu_keyboard(config_or_enabled):
     if not isinstance(config_or_enabled, bool):
         separate_enabled = bool(getattr(config_or_enabled, "separate_result_prompt_enabled", False))
         separate_text = "✅ Да" if separate_enabled else "❌ Нет"
+        result_final = bool(getattr(config_or_enabled, "result_prompt_is_final", False))
+        result_final_text = "✅ Да" if result_final else "❌ Нет"
         builder.button(text=f"Отдельный промпт результата: {separate_text}", callback_data="admin_test_toggle_separate_prompt")
+        builder.button(text=f"Промпт результата выдаёт итог: {result_final_text}", callback_data="admin_test_toggle_result_prompt_final")
         builder.button(text="📝 Промпт результата", callback_data="admin_edit_result_prompt")
     builder.button(text="✏️ Приветствие теста", callback_data="edit_content_test_intro")
     builder.button(text="✏️ Результаты теста", callback_data="edit_content_test_results")

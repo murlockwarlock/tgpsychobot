@@ -10957,6 +10957,7 @@ async def start_psych_test(message: Message, state: FSMContext, user_id: int):
             invocation_topic_id=user.current_topic_id if user else None,
             invocation_dialogue_id=user.current_dialogue_id if user else 1,
             invocation_platform="telegram",
+            question_message_id=None,
         )
         session.add(new_session)
         await session.commit()
@@ -11133,12 +11134,15 @@ async def send_next_question(message: Message, user_id: int, state: FSMContext, 
     question = questions[current_index]
     options = get_answer_options(question)
     text = build_question_text(question, current_index, total_count, getattr(config, 'show_progress', True) if config else True)
-    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question), current_index) if options else None
-
-    try:
-        await message.edit_text(text, reply_markup=reply_markup)
-    except TelegramBadRequest:
-        await message.answer(text, reply_markup=reply_markup)
+    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question), current_index)
+    question_message = await message.answer(text, reply_markup=reply_markup)
+    async with async_session_maker() as session:
+        await session.execute(
+            update(TestSession)
+            .where(TestSession.user_id == user_id)
+            .values(question_message_id=question_message.message_id)
+        )
+        await session.commit()
 
 
 @router.message(UserStates.in_test, F.text)
@@ -11170,8 +11174,19 @@ async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot
         answers.append(answer_record)
         test_session.answers = serialize_answers(answers)
         test_session.current_question_index += 1
+        question_message_id = test_session.question_message_id
         await session.commit()
         next_index = test_session.current_question_index
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if question_message_id:
+        try:
+            await bot.delete_message(message.chat.id, question_message_id)
+        except Exception:
+            pass
 
     if next_index < len(questions):
         await send_next_question(message, user_id, state, bot)
@@ -11238,6 +11253,7 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
             existing_session.invocation_topic_id = user.current_topic_id if user else None
             existing_session.invocation_dialogue_id = user.current_dialogue_id if user else 1
             existing_session.invocation_platform = "telegram"
+            existing_session.question_message_id = None
         else:
             new_session = TestSession(
                 user_id=user_id,
@@ -11248,6 +11264,7 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
                 invocation_topic_id=user.current_topic_id if user else None,
                 invocation_dialogue_id=user.current_dialogue_id if user else 1,
                 invocation_platform="telegram",
+                question_message_id=None,
             )
             session.add(new_session)
 
@@ -11283,6 +11300,7 @@ async def finish_test_generation(
             and test_config.result_system_prompt
         )
         result_system_prompt = test_config.result_system_prompt if test_config else None
+        result_prompt_is_final = bool(test_config and test_config.result_prompt_is_final)
         input_mode = test_config.interpretation_input_mode if test_config else "all"
         selected_variables = json_loads(getattr(test_config, "interpretation_selected_variables", None), []) if test_config else []
 
@@ -11342,15 +11360,18 @@ async def finish_test_generation(
                 result_system_prompt,
                 interpretation_prompt,
             )
-        handoff_prompt = build_result_handoff_prompt(prompt_payload, preliminary_interpretation, user_name)
-        interpretation_text = await get_ai_response(
-            user_id,
-            handoff_prompt,
-            user_name,
-            user_gender_raw,
-            topic_id_override=topic_id,
-            dialogue_id_override=dialogue_id,
-        )
+        if preliminary_interpretation and result_prompt_is_final:
+            interpretation_text = preliminary_interpretation
+        else:
+            handoff_prompt = build_result_handoff_prompt(prompt_payload, preliminary_interpretation, user_name)
+            interpretation_text = await get_ai_response(
+                user_id,
+                handoff_prompt,
+                user_name,
+                user_gender_raw,
+                topic_id_override=topic_id,
+                dialogue_id_override=dialogue_id,
+            )
     except Exception:
         logging.exception("Universal test interpretation failed")
         interpretation_text = preliminary_interpretation or "Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже."
@@ -12125,6 +12146,21 @@ async def admin_test_toggle_separate_prompt(callback: CallbackQuery):
             await callback.answer("Сначала загрузите или задайте промпт результата.", show_alert=True)
             return
         config.separate_result_prompt_enabled = not bool(getattr(config, "separate_result_prompt_enabled", False))
+        await session.commit()
+    await admin_test_menu(callback)
+
+
+@router.callback_query(F.data == "admin_test_toggle_result_prompt_final")
+async def admin_test_toggle_result_prompt_final(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(TestConfig, 1)
+        if not config:
+            config = TestConfig(id=1)
+            session.add(config)
+        if not config.separate_result_prompt_enabled or not (config.result_system_prompt or "").strip():
+            await callback.answer("Сначала включите и задайте отдельный промпт результата.", show_alert=True)
+            return
+        config.result_prompt_is_final = not bool(getattr(config, "result_prompt_is_final", False))
         await session.commit()
     await admin_test_menu(callback)
 

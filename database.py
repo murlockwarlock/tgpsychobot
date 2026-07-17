@@ -387,6 +387,7 @@ class TestSession(Base):
     invocation_topic_id = Column(Integer, nullable=True)
     invocation_dialogue_id = Column(Integer, nullable=True)
     invocation_platform = Column(String, nullable=True)
+    question_message_id = Column(BigInteger, nullable=True)
     secret_answers = Column(Text, nullable=True)
     is_finished = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -418,6 +419,7 @@ class TestConfig(Base):
     formulas_enabled = Column(Boolean, default=False, nullable=False)
     formulas_json = Column(Text, nullable=True)
     separate_result_prompt_enabled = Column(Boolean, default=False, nullable=False)
+    result_prompt_is_final = Column(Boolean, default=False, nullable=False)
     result_system_prompt = Column(Text, nullable=True)
     interpretation_input_mode = Column(String, default='all', nullable=False)
     interpretation_selected_variables = Column(Text, nullable=True)
@@ -567,6 +569,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN invocation_dialogue_id INTEGER"))
             if 'invocation_platform' not in test_session_columns:
                 sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN invocation_platform VARCHAR"))
+            if 'question_message_id' not in test_session_columns:
+                sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN question_message_id BIGINT"))
 
             test_question_columns = [c['name'] for c in insp.get_columns('test_questions')]
             if 'comment' not in test_question_columns:
@@ -593,6 +597,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN formulas_json TEXT"))
             if 'separate_result_prompt_enabled' not in test_config_columns:
                 sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN separate_result_prompt_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'result_prompt_is_final' not in test_config_columns:
+                sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN result_prompt_is_final BOOLEAN DEFAULT FALSE NOT NULL"))
             if 'result_system_prompt' not in test_config_columns:
                 sync_conn.execute(text("ALTER TABLE test_config ADD COLUMN result_system_prompt TEXT"))
             if 'interpretation_input_mode' not in test_config_columns:
@@ -669,6 +675,8 @@ async def init_db():
                 test_conf.formulas_enabled = False
             if getattr(test_conf, 'separate_result_prompt_enabled', None) is None:
                 test_conf.separate_result_prompt_enabled = False
+            if getattr(test_conf, 'result_prompt_is_final', None) is None:
+                test_conf.result_prompt_is_final = False
             if getattr(test_conf, 'interpretation_input_mode', None) is None:
                 test_conf.interpretation_input_mode = 'all'
 
