@@ -132,11 +132,58 @@ user_message_buffers = {}
 user_processing_tasks = {}
 
 TEST_START_DIRECTIVE_RE = re.compile(r"(?<!\w)\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)", re.IGNORECASE)
-user_spread_state = {}  # {user_id: {category, topic_id, rounds_left, cards_per_round, hidden, chosen_card_ids, selected_file_ids}}
+user_spread_state = {}  # {user_id: {category, topic_id, rounds_left, total_rounds, cards_per_round, hidden, chosen_card_ids, selected_file_ids, pending_card_ids}}
 PAGE_SIZE = 5
 USER_HISTORY_PAGE_SIZE = 10
 KB_PAGE_SIZE = 6
 ROBOKASSA_INVOICE_LIFETIME = timedelta(hours=2)
+
+
+def _new_card_spread_state(
+    *,
+    category: str,
+    topic_id: int,
+    rounds: int,
+    cards_per_round: int,
+    hidden: bool,
+    pending_card_ids: list[int],
+) -> dict:
+    return {
+        'category': category,
+        'topic_id': topic_id,
+        'rounds_left': rounds - 1,
+        'total_rounds': rounds,
+        'cards_per_round': cards_per_round,
+        'hidden': hidden,
+        'chosen_card_ids': [],
+        'selected_file_ids': [],
+        'pending_card_ids': list(pending_card_ids),
+    }
+
+
+def _card_spread_progress(spread: dict, *, selected_now: bool = False) -> tuple[int, int, int]:
+    selected_count = len(spread.get('selected_file_ids', [])) + (1 if selected_now else 0)
+    total_rounds = int(spread.get('total_rounds') or (selected_count + spread.get('rounds_left', 0)))
+    current_round = min(selected_count + 1, total_rounds)
+    return selected_count, current_round, total_rounds
+
+
+def _card_selection_system_message(card_info: str, spread: dict | None) -> str:
+    base = f"[СИСТЕМА: Пользователь выбрал карту: {card_info}. Дай интерпретацию этой карты.]"
+    if not spread:
+        return base
+
+    selected_round, _, total_rounds = _card_spread_progress(spread, selected_now=True)
+    if selected_round < total_rounds:
+        next_round = selected_round + 1
+        return (
+            f"{base}\n"
+            f"[СИСТЕМА: Идёт многораундовый расклад. Выбран раунд {selected_round} из {total_rounds}. "
+            f"После интерпретации бот сам покажет выбор для раунда {next_round} из {total_rounds}. "
+            "Не выбирай следующую карту за пользователя, не утверждай, что карты не показались, "
+            "и не завершай расклад.]"
+        )
+    return f"{base}\n[СИСТЕМА: Это последний, раунд {selected_round} из {total_rounds}. Заверши расклад после интерпретации.]"
 
 
 async def _sync_user_birthdate_from_telegram(bot: Bot, user: User) -> bool:
@@ -739,11 +786,11 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             cards = res.scalars().all()
             if cards:
                 if rounds > 1:
-                    user_spread_state[user_id] = {
-                        'category': category, 'topic_id': topic_id,
-                        'rounds_left': rounds - 1, 'cards_per_round': cards_per_round,
-                        'hidden': False, 'chosen_card_ids': [], 'selected_file_ids': []
-                    }
+                    user_spread_state[user_id] = _new_card_spread_state(
+                        category=category, topic_id=topic_id, rounds=rounds,
+                        cards_per_round=cards_per_round, hidden=False,
+                        pending_card_ids=[card.id for card in cards],
+                    )
                 await send_card_album(
                     bot,
                     message.chat.id,
@@ -768,11 +815,11 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             cards = res.scalars().all()
             if cards:
                 if rounds > 1:
-                    user_spread_state[user_id] = {
-                        'category': cat_stripped, 'topic_id': topic_id,
-                        'rounds_left': rounds - 1, 'cards_per_round': cards_per_round,
-                        'hidden': True, 'chosen_card_ids': [], 'selected_file_ids': []
-                    }
+                    user_spread_state[user_id] = _new_card_spread_state(
+                        category=cat_stripped, topic_id=topic_id, rounds=rounds,
+                        cards_per_round=cards_per_round, hidden=True,
+                        pending_card_ids=[card.id for card in cards],
+                    )
                 back_stmt = select(MediaLibrary).where(
                     MediaLibrary.category == cat_stripped,
                     MediaLibrary.file_name == '_back',
@@ -876,6 +923,8 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
     if user_id not in user_message_buffers:
         return
     messages = user_message_buffers.pop(user_id)
+    if await _resend_active_spread_choice(bot, user_id):
+        return
     full_text = "\n".join(messages)
 
     async def keep_typing_loop():
@@ -1034,11 +1083,11 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 cards = res.scalars().all()
                 if cards:
                     if rounds > 1:
-                        user_spread_state[user_id] = {
-                            'category': cat, 'topic_id': topic_id,
-                            'rounds_left': rounds - 1, 'cards_per_round': cards_per_round,
-                            'hidden': False, 'chosen_card_ids': [], 'selected_file_ids': []
-                        }
+                        user_spread_state[user_id] = _new_card_spread_state(
+                            category=cat, topic_id=topic_id, rounds=rounds,
+                            cards_per_round=cards_per_round, hidden=False,
+                            pending_card_ids=[card.id for card in cards],
+                        )
                     await send_card_album(
                         bot,
                         user_id,
@@ -1060,11 +1109,11 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 cards = res.scalars().all()
                 if cards:
                     if rounds > 1:
-                        user_spread_state[user_id] = {
-                            'category': cat_stripped, 'topic_id': topic_id,
-                            'rounds_left': rounds - 1, 'cards_per_round': cards_per_round,
-                            'hidden': True, 'chosen_card_ids': [], 'selected_file_ids': []
-                        }
+                        user_spread_state[user_id] = _new_card_spread_state(
+                            category=cat_stripped, topic_id=topic_id, rounds=rounds,
+                            cards_per_round=cards_per_round, hidden=True,
+                            pending_card_ids=[card.id for card in cards],
+                        )
                     back_stmt = select(MediaLibrary).where(
                         MediaLibrary.category == cat_stripped,
                         MediaLibrary.file_name == '_back',
@@ -1163,6 +1212,11 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
     card_id = int(callback.data.rsplit("_", 1)[-1])
     user_id = callback.from_user.id
     final_spread_file_ids = []
+    spread = user_spread_state.get(user_id)
+    pending_card_ids = spread.get('pending_card_ids', []) if spread else []
+    if pending_card_ids and card_id not in pending_card_ids:
+        await callback.answer("Эта карта уже не участвует в текущем выборе.", show_alert=True)
+        return
 
     async with async_session_maker() as cfg_session:
         ai_config = await cfg_session.get(AIConfig, 1)
@@ -1188,7 +1242,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
             await callback.answer()
 
             card_info = f"{media.file_name}: {media.description or 'без описания'}"
-            card_system_msg = f"[СИСТЕМА: Пользователь выбрал карту: {card_info}. Дай интерпретацию этой карты.]"
+            card_system_msg = _card_selection_system_message(card_info, spread)
             user = await session.get(User, user_id)
             if user:
                 session.add(DBMessage(user_id=user_id, role='user', content=card_system_msg,
@@ -1267,6 +1321,7 @@ async def _advance_card_spread_after_selection(
 
     spread.setdefault('selected_file_ids', []).append(selected_file_id)
     spread.setdefault('chosen_card_ids', []).append(card_id)
+    spread['pending_card_ids'] = []
 
     if spread.get('rounds_left', 0) <= 0:
         final_file_ids = list(spread.get('selected_file_ids', []))
@@ -1292,6 +1347,8 @@ async def _advance_card_spread_after_selection(
                 user_spread_state.pop(user_id, None)
                 log.warning("Card spread stopped: no next cards user_id=%s category=%s", user_id, spread.get('category'))
                 return final_file_ids
+
+            spread['pending_card_ids'] = [card.id for card in next_cards]
 
             if spread.get('hidden'):
                 back_stmt = select(MediaLibrary).where(
@@ -1335,6 +1392,46 @@ async def _advance_card_spread_after_selection(
             text="Не удалось показать следующие карты. Попробуй выбрать карту ещё раз или начни расклад заново.",
         )
         return []
+
+
+async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
+    spread = user_spread_state.get(user_id)
+    if not spread:
+        return False
+
+    pending_ids = spread.get('pending_card_ids') or []
+    if not pending_ids:
+        return False
+
+    async with async_session_maker() as session:
+        result = await session.execute(select(MediaLibrary).where(MediaLibrary.id.in_(pending_ids)))
+        media_by_id = {media.id: media for media in result.scalars().all()}
+        cards = [media_by_id[card_id] for card_id in pending_ids if card_id in media_by_id]
+        if not cards:
+            user_spread_state.pop(user_id, None)
+            return False
+
+        if spread.get('hidden'):
+            back_media = await session.scalar(
+                select(MediaLibrary).where(
+                    MediaLibrary.category == spread['category'],
+                    MediaLibrary.file_name == '_back',
+                ).limit(1)
+            )
+            file_ids = [back_media.file_id for _ in cards] if back_media else [card.file_id for card in cards]
+            context = "resend_active_spread_choice.hidden"
+        else:
+            file_ids = [card.file_id for card in cards]
+            context = "resend_active_spread_choice.visible"
+
+    _, current_round, total_rounds = _card_spread_progress(spread)
+    await send_card_album(bot, user_id, file_ids, context=context)
+    await bot.send_message(
+        chat_id=user_id,
+        text=f"Сейчас раунд {current_round} из {total_rounds}. Выбери одну из карт кнопкой ниже:",
+        reply_markup=keyboards.card_selection_keyboard(spread['category'], [card.id for card in cards]),
+    )
+    return True
 
 
 def calculate_signature(*args) -> str:
@@ -4216,6 +4313,9 @@ async def get_random_message_by_topic(topic_id: int) -> str | None:
 
 
 async def process_user_prompt(message: Message, user_id: int, prompt_text: str, bot: Bot, state: FSMContext | None = None):
+    if await _resend_active_spread_choice(bot, user_id):
+        return
+
     user_name = ""
     user_gender = "unknown"
     dialogue_id = 1
@@ -4404,11 +4504,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cards = res.scalars().all()
                 if cards:
                     if rounds > 1:
-                        user_spread_state[user_id] = {
-                            'category': cat, 'topic_id': topic_id,
-                            'rounds_left': rounds - 1, 'cards_per_round': cards_per_round,
-                            'hidden': False, 'chosen_card_ids': [], 'selected_file_ids': []
-                        }
+                        user_spread_state[user_id] = _new_card_spread_state(
+                            category=cat, topic_id=topic_id, rounds=rounds,
+                            cards_per_round=cards_per_round, hidden=False,
+                            pending_card_ids=[card.id for card in cards],
+                        )
                     await send_card_album(
                         bot,
                         user_id,
@@ -4430,11 +4530,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cards = res.scalars().all()
                 if cards:
                     if rounds > 1:
-                        user_spread_state[user_id] = {
-                            'category': cat_stripped, 'topic_id': topic_id,
-                            'rounds_left': rounds - 1, 'cards_per_round': cards_per_round,
-                            'hidden': True, 'chosen_card_ids': [], 'selected_file_ids': []
-                        }
+                        user_spread_state[user_id] = _new_card_spread_state(
+                            category=cat_stripped, topic_id=topic_id, rounds=rounds,
+                            cards_per_round=cards_per_round, hidden=True,
+                            pending_card_ids=[card.id for card in cards],
+                        )
                     back_stmt = select(MediaLibrary).where(
                         MediaLibrary.category == cat_stripped,
                         MediaLibrary.file_name == '_back',
