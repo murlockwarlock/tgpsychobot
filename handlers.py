@@ -105,6 +105,7 @@ from subscription_dates import extend_subscription_end_date
 from subscription_retry_policy import can_retry_manually
 from topic_management import delete_topic_with_dependencies
 from bot_commands import refresh_commands_for_user
+from card_spreads import extract_numbered_spread_definition
 from universal_tests import (
     build_result_handoff_prompt,
     build_prompt_payload,
@@ -229,6 +230,57 @@ async def _clear_card_spread_state(user_id: int) -> None:
 async def _clear_card_spread_state_in_session(session, user_id: int) -> None:
     user_spread_state.pop(user_id, None)
     await session.execute(delete(CardSpreadState).where(CardSpreadState.user_id == user_id))
+
+
+async def _resolve_card_spread_rounds(
+    *,
+    user_id: int,
+    topic_id: int | None,
+    category: str,
+    cards_per_round: int,
+    hidden: bool,
+    explicit_rounds: int,
+) -> int:
+    if explicit_rounds > 1 or not topic_id:
+        return explicit_rounds
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        topic = await session.get(Topic, topic_id)
+        if not user or not topic or not topic.system_prompt:
+            return explicit_rounds
+        recent_user_messages = (await session.execute(
+            select(DBMessage.content).where(
+                DBMessage.user_id == user_id,
+                DBMessage.topic_id == topic_id,
+                DBMessage.dialogue_id == user.current_dialogue_id,
+                DBMessage.role == 'user',
+            ).order_by(DBMessage.id.desc()).limit(20)
+        )).scalars().all()
+
+    for content in recent_user_messages:
+        number_match = re.fullmatch(r"\s*(?:расклад\s*)?(\d{1,2})[.)]?\s*", content or "", re.IGNORECASE)
+        if not number_match:
+            continue
+        definition = extract_numbered_spread_definition(topic.system_prompt, int(number_match.group(1)))
+        if not definition:
+            continue
+        if (
+            definition['hidden'] == hidden
+            and definition['category'].casefold() == category.strip().casefold()
+            and definition['cards_per_round'] == cards_per_round
+            and definition['rounds'] > 1
+        ):
+            log.info(
+                "Restored omitted spread rounds user_id=%s choice=%s rounds=%s",
+                user_id,
+                number_match.group(1),
+                definition['rounds'],
+            )
+            return definition['rounds']
+        break
+
+    return explicit_rounds
 
 
 def _card_spread_progress(spread: dict, *, selected_now: bool = False) -> tuple[int, int, int]:
@@ -847,6 +899,10 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             category = match[0].strip()
             cards_per_round = int(match[1])
             rounds = int(match[2]) if match[2] else 1
+            rounds = await _resolve_card_spread_rounds(
+                user_id=user_id, topic_id=topic_id, category=category,
+                cards_per_round=cards_per_round, hidden=False, explicit_rounds=rounds,
+            )
             stmt = select(MediaLibrary).where(
                 _media_filter(topic_id, coll_media_ids, assigned_decks, category),
                 MediaLibrary.media_type == 'photo',
@@ -876,6 +932,10 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             cat_stripped = match[0].strip()
             cards_per_round = int(match[1])
             rounds = int(match[2]) if match[2] else 1
+            rounds = await _resolve_card_spread_rounds(
+                user_id=user_id, topic_id=topic_id, category=cat_stripped,
+                cards_per_round=cards_per_round, hidden=True, explicit_rounds=rounds,
+            )
             stmt = select(MediaLibrary).where(
                 _media_filter(topic_id, coll_media_ids, assigned_decks, cat_stripped),
                 MediaLibrary.media_type == 'photo',
@@ -1144,6 +1204,10 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 cat = match[0].strip()
                 cards_per_round = int(match[1])
                 rounds = int(match[2]) if match[2] else 1
+                rounds = await _resolve_card_spread_rounds(
+                    user_id=user_id, topic_id=topic_id, category=cat,
+                    cards_per_round=cards_per_round, hidden=False, explicit_rounds=rounds,
+                )
                 stmt = select(MediaLibrary).where(
                     _media_filter(topic_id, coll_media_ids, assigned_decks, cat),
                     MediaLibrary.media_type == 'photo',
@@ -1170,6 +1234,10 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 cat_stripped = match[0].strip()
                 cards_per_round = int(match[1])
                 rounds = int(match[2]) if match[2] else 1
+                rounds = await _resolve_card_spread_rounds(
+                    user_id=user_id, topic_id=topic_id, category=cat_stripped,
+                    cards_per_round=cards_per_round, hidden=True, explicit_rounds=rounds,
+                )
                 stmt = select(MediaLibrary).where(
                     _media_filter(topic_id, coll_media_ids, assigned_decks, cat_stripped),
                     MediaLibrary.media_type == 'photo',
@@ -4576,6 +4644,10 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cat = match[0].strip()
                 cards_per_round = int(match[1])
                 rounds = int(match[2]) if match[2] else 1
+                rounds = await _resolve_card_spread_rounds(
+                    user_id=user_id, topic_id=topic_id, category=cat,
+                    cards_per_round=cards_per_round, hidden=False, explicit_rounds=rounds,
+                )
                 stmt = select(MediaLibrary).where(
                     _media_filter(topic_id, coll_media_ids, msg_assigned_decks, cat),
                     MediaLibrary.media_type == 'photo',
@@ -4602,6 +4674,10 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cat_stripped = match[0].strip()
                 cards_per_round = int(match[1])
                 rounds = int(match[2]) if match[2] else 1
+                rounds = await _resolve_card_spread_rounds(
+                    user_id=user_id, topic_id=topic_id, category=cat_stripped,
+                    cards_per_round=cards_per_round, hidden=True, explicit_rounds=rounds,
+                )
                 stmt = select(MediaLibrary).where(
                     _media_filter(topic_id, coll_media_ids, msg_assigned_decks, cat_stripped),
                     MediaLibrary.media_type == 'photo',
