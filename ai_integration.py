@@ -14,7 +14,7 @@ from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 
-from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestSession,
+from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestConfig, TestSession,
                      MediaLibrary, TopicMediaDeck, MediaCollection, media_collection_items, topic_collection_association,
                      UserSubscription, KnowledgeBase)
 from memory_mode import get_memory_mode, is_global_memory_mode
@@ -926,6 +926,7 @@ async def get_ai_response(
     *,
     topic_id_override: int | None | object = _CURRENT_AI_CONTEXT,
     dialogue_id_override: int | None = None,
+    include_test_context: bool = True,
 ) -> str:
     async with async_session_maker() as session:
         user_result = await session.execute(
@@ -1059,7 +1060,7 @@ async def get_ai_response(
                 secret_answers_txt = test_session.secret_answers
 
         test_context_injection = ""
-        if active_topic_id is None and (test_results_txt or secret_answers_txt):
+        if include_test_context and active_topic_id is None and (test_results_txt or secret_answers_txt):
             context_parts = []
             status_instruction = ""
             if test_results_txt:
@@ -1068,7 +1069,11 @@ async def get_ai_response(
                 context_parts.append(f"Ответы пользователя на СЕКРЕТНЫЙ тест (УЖЕ ПРОЙДЕН):\n{secret_answers_txt}")
                 status_instruction = "Пользователь УЖЕ прошел все тесты. Обсуждай результаты."
             elif test_results_txt:
-                status_instruction = "Пользователь прошел основной тест. Предложи пройти секретный блок."
+                test_config = await session.get(TestConfig, 1)
+                if test_config is not None and not bool(getattr(test_config, "secret_test_enabled", True)):
+                    status_instruction = "Пользователь завершил основной тест. Продолжи диалог по его результатам. Не предлагай секретный блок."
+                else:
+                    status_instruction = "Пользователь прошел основной тест. Предложи пройти секретный блок."
 
             if context_parts:
                 joined_results = "\n\n".join(context_parts)

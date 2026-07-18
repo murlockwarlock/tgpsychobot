@@ -11301,6 +11301,7 @@ async def finish_test_generation(
         )
         result_system_prompt = test_config.result_system_prompt if test_config else None
         result_prompt_is_final = bool(test_config and test_config.result_prompt_is_final)
+        secret_test_enabled = bool(getattr(test_config, "secret_test_enabled", True)) if test_config else True
         input_mode = test_config.interpretation_input_mode if test_config else "all"
         selected_variables = json_loads(getattr(test_config, "interpretation_selected_variables", None), []) if test_config else []
 
@@ -11371,6 +11372,7 @@ async def finish_test_generation(
                 user_gender_raw,
                 topic_id_override=topic_id,
                 dialogue_id_override=dialogue_id,
+                include_test_context=False,
             )
     except Exception:
         logging.exception("Universal test interpretation failed")
@@ -11388,7 +11390,8 @@ async def finish_test_generation(
         ))
         await session.commit()
 
-    await message.edit_text(html_story, reply_markup=kb.case_study_confirmation_keyboard())
+    reply_markup = kb.case_study_confirmation_keyboard() if secret_test_enabled else None
+    await message.edit_text(html_story, reply_markup=reply_markup)
 
 
 @router.callback_query(F.data == "test_confirm_case")
