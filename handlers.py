@@ -221,12 +221,14 @@ async def _get_card_spread_state(user_id: int) -> dict | None:
 
 
 async def _clear_card_spread_state(user_id: int) -> None:
-    user_spread_state.pop(user_id, None)
     async with async_session_maker() as session:
-        saved = await session.get(CardSpreadState, user_id)
-        if saved:
-            await session.delete(saved)
-            await session.commit()
+        await _clear_card_spread_state_in_session(session, user_id)
+        await session.commit()
+
+
+async def _clear_card_spread_state_in_session(session, user_id: int) -> None:
+    user_spread_state.pop(user_id, None)
+    await session.execute(delete(CardSpreadState).where(CardSpreadState.user_id == user_id))
 
 
 def _card_spread_progress(spread: dict, *, selected_now: bool = False) -> tuple[int, int, int]:
@@ -5069,6 +5071,7 @@ async def show_subscription_info_from_chat(callback: CallbackQuery, state: FSMCo
 
 
 async def _apply_topic_switch(session, user, topic_key: int, memory_mode: str) -> bool:
+    await _clear_card_spread_state_in_session(session, user.id)
     if is_global_memory_mode(memory_mode):
         return True
     if is_topic_memory_mode(memory_mode):
@@ -5170,6 +5173,7 @@ async def _request_profile_onboarding_if_needed(
 
 
 async def _new_dialogue_update_state(session, user, topic_key: int, memory_mode: str):
+    await _clear_card_spread_state_in_session(session, user.id)
     user.current_dialogue_id += 1
     if is_global_memory_mode(memory_mode):
         return
@@ -12936,6 +12940,7 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
     if payload_text:
         await callback.answer()
         await callback.message.edit_reply_markup(reply_markup=None)
+        await _clear_card_spread_state(user_id)
 
         if await _request_profile_onboarding_if_needed(
             callback.message,
