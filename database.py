@@ -702,6 +702,14 @@ class UserTopicState(Base):
     dialogue_id = Column(Integer, nullable=False)
 
 
+class CardSpreadState(Base):
+    __tablename__ = 'card_spread_states'
+
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    state_json = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class RobokassaPayment(Base):
     __tablename__ = 'robokassa_payments'
     __table_args__ = (

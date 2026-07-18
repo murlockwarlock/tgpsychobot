@@ -35,7 +35,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
                      ReferralPaymentLog, MailingDeliveryLog, TopicMediaDeck,
                      MediaCollection, media_collection_items, topic_collection_association,
-                     ReferralTemplate)
+                     ReferralTemplate, CardSpreadState)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
@@ -132,7 +132,7 @@ user_message_buffers = {}
 user_processing_tasks = {}
 
 TEST_START_DIRECTIVE_RE = re.compile(r"(?<!\w)\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)", re.IGNORECASE)
-user_spread_state = {}  # {user_id: {category, topic_id, rounds_left, total_rounds, cards_per_round, hidden, chosen_card_ids, selected_file_ids, pending_card_ids}}
+user_spread_state = {}  # Runtime cache; the source of truth is card_spread_states in the database.
 PAGE_SIZE = 5
 USER_HISTORY_PAGE_SIZE = 10
 KB_PAGE_SIZE = 6
@@ -159,6 +159,74 @@ def _new_card_spread_state(
         'selected_file_ids': [],
         'pending_card_ids': list(pending_card_ids),
     }
+
+
+def _normalize_card_spread_state(raw_state: dict) -> dict | None:
+    try:
+        state = {
+            'category': str(raw_state['category']),
+            'topic_id': int(raw_state['topic_id']),
+            'rounds_left': max(0, int(raw_state['rounds_left'])),
+            'total_rounds': max(1, int(raw_state['total_rounds'])),
+            'cards_per_round': max(1, int(raw_state['cards_per_round'])),
+            'hidden': bool(raw_state['hidden']),
+            'chosen_card_ids': [int(card_id) for card_id in raw_state.get('chosen_card_ids', [])],
+            'selected_file_ids': [str(file_id) for file_id in raw_state.get('selected_file_ids', [])],
+            'pending_card_ids': [int(card_id) for card_id in raw_state.get('pending_card_ids', [])],
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    return state
+
+
+async def _save_card_spread_state(user_id: int, spread: dict) -> None:
+    normalized = _normalize_card_spread_state(spread)
+    if not normalized:
+        raise ValueError(f"Invalid card spread state for user {user_id}")
+    user_spread_state[user_id] = normalized
+    async with async_session_maker() as session:
+        await session.merge(CardSpreadState(
+            user_id=user_id,
+            state_json=json.dumps(normalized, ensure_ascii=False),
+        ))
+        await session.commit()
+
+
+async def _get_card_spread_state(user_id: int) -> dict | None:
+    cached = user_spread_state.get(user_id)
+    if cached:
+        return cached
+
+    async with async_session_maker() as session:
+        saved = await session.get(CardSpreadState, user_id)
+        if not saved:
+            return None
+        try:
+            raw_state = json.loads(saved.state_json)
+        except (TypeError, json.JSONDecodeError):
+            raw_state = None
+
+    state = _normalize_card_spread_state(raw_state) if raw_state else None
+    if not state:
+        await _clear_card_spread_state(user_id)
+        return None
+    user_spread_state[user_id] = state
+    log.info(
+        "Restored card spread user_id=%s round=%s/%s",
+        user_id,
+        len(state['selected_file_ids']) + 1,
+        state['total_rounds'],
+    )
+    return state
+
+
+async def _clear_card_spread_state(user_id: int) -> None:
+    user_spread_state.pop(user_id, None)
+    async with async_session_maker() as session:
+        saved = await session.get(CardSpreadState, user_id)
+        if saved:
+            await session.delete(saved)
+            await session.commit()
 
 
 def _card_spread_progress(spread: dict, *, selected_now: bool = False) -> tuple[int, int, int]:
@@ -786,11 +854,11 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             cards = res.scalars().all()
             if cards:
                 if rounds > 1:
-                    user_spread_state[user_id] = _new_card_spread_state(
+                    await _save_card_spread_state(user_id, _new_card_spread_state(
                         category=category, topic_id=topic_id, rounds=rounds,
                         cards_per_round=cards_per_round, hidden=False,
                         pending_card_ids=[card.id for card in cards],
-                    )
+                    ))
                 await send_card_album(
                     bot,
                     message.chat.id,
@@ -815,11 +883,11 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             cards = res.scalars().all()
             if cards:
                 if rounds > 1:
-                    user_spread_state[user_id] = _new_card_spread_state(
+                    await _save_card_spread_state(user_id, _new_card_spread_state(
                         category=cat_stripped, topic_id=topic_id, rounds=rounds,
                         cards_per_round=cards_per_round, hidden=True,
                         pending_card_ids=[card.id for card in cards],
-                    )
+                    ))
                 back_stmt = select(MediaLibrary).where(
                     MediaLibrary.category == cat_stripped,
                     MediaLibrary.file_name == '_back',
@@ -1083,11 +1151,11 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 cards = res.scalars().all()
                 if cards:
                     if rounds > 1:
-                        user_spread_state[user_id] = _new_card_spread_state(
+                        await _save_card_spread_state(user_id, _new_card_spread_state(
                             category=cat, topic_id=topic_id, rounds=rounds,
                             cards_per_round=cards_per_round, hidden=False,
                             pending_card_ids=[card.id for card in cards],
-                        )
+                        ))
                     await send_card_album(
                         bot,
                         user_id,
@@ -1109,11 +1177,11 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 cards = res.scalars().all()
                 if cards:
                     if rounds > 1:
-                        user_spread_state[user_id] = _new_card_spread_state(
+                        await _save_card_spread_state(user_id, _new_card_spread_state(
                             category=cat_stripped, topic_id=topic_id, rounds=rounds,
                             cards_per_round=cards_per_round, hidden=True,
                             pending_card_ids=[card.id for card in cards],
-                        )
+                        ))
                     back_stmt = select(MediaLibrary).where(
                         MediaLibrary.category == cat_stripped,
                         MediaLibrary.file_name == '_back',
@@ -1212,7 +1280,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
     card_id = int(callback.data.rsplit("_", 1)[-1])
     user_id = callback.from_user.id
     final_spread_file_ids = []
-    spread = user_spread_state.get(user_id)
+    spread = await _get_card_spread_state(user_id)
     pending_card_ids = spread.get('pending_card_ids', []) if spread else []
     if pending_card_ids and card_id not in pending_card_ids:
         await callback.answer("Эта карта уже не участвует в текущем выборе.", show_alert=True)
@@ -1315,8 +1383,9 @@ async def _advance_card_spread_after_selection(
     card_id: int,
     selected_file_id: str,
 ) -> list[str]:
-    spread = user_spread_state.get(user_id)
+    spread = await _get_card_spread_state(user_id)
     if not spread:
+        log.warning("Card spread state is missing after selection user_id=%s card_id=%s", user_id, card_id)
         return []
 
     spread.setdefault('selected_file_ids', []).append(selected_file_id)
@@ -1325,7 +1394,7 @@ async def _advance_card_spread_after_selection(
 
     if spread.get('rounds_left', 0) <= 0:
         final_file_ids = list(spread.get('selected_file_ids', []))
-        user_spread_state.pop(user_id, None)
+        await _clear_card_spread_state(user_id)
         return final_file_ids
 
     spread['rounds_left'] -= 1
@@ -1344,11 +1413,21 @@ async def _advance_card_spread_after_selection(
 
             if not next_cards:
                 final_file_ids = list(spread.get('selected_file_ids', []))
-                user_spread_state.pop(user_id, None)
+                await _clear_card_spread_state(user_id)
                 log.warning("Card spread stopped: no next cards user_id=%s category=%s", user_id, spread.get('category'))
                 return final_file_ids
 
             spread['pending_card_ids'] = [card.id for card in next_cards]
+            await _save_card_spread_state(user_id, spread)
+            selected_round, current_round, total_rounds = _card_spread_progress(spread)
+            log.info(
+                "Sending next card spread choice user_id=%s selected=%s next_round=%s/%s cards=%s",
+                user_id,
+                selected_round,
+                current_round,
+                total_rounds,
+                spread['pending_card_ids'],
+            )
 
             if spread.get('hidden'):
                 back_stmt = select(MediaLibrary).where(
@@ -1395,7 +1474,7 @@ async def _advance_card_spread_after_selection(
 
 
 async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
-    spread = user_spread_state.get(user_id)
+    spread = await _get_card_spread_state(user_id)
     if not spread:
         return False
 
@@ -1408,7 +1487,7 @@ async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
         media_by_id = {media.id: media for media in result.scalars().all()}
         cards = [media_by_id[card_id] for card_id in pending_ids if card_id in media_by_id]
         if not cards:
-            user_spread_state.pop(user_id, None)
+            await _clear_card_spread_state(user_id)
             return False
 
         if spread.get('hidden'):
@@ -4504,11 +4583,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cards = res.scalars().all()
                 if cards:
                     if rounds > 1:
-                        user_spread_state[user_id] = _new_card_spread_state(
+                        await _save_card_spread_state(user_id, _new_card_spread_state(
                             category=cat, topic_id=topic_id, rounds=rounds,
                             cards_per_round=cards_per_round, hidden=False,
                             pending_card_ids=[card.id for card in cards],
-                        )
+                        ))
                     await send_card_album(
                         bot,
                         user_id,
@@ -4530,11 +4609,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cards = res.scalars().all()
                 if cards:
                     if rounds > 1:
-                        user_spread_state[user_id] = _new_card_spread_state(
+                        await _save_card_spread_state(user_id, _new_card_spread_state(
                             category=cat_stripped, topic_id=topic_id, rounds=rounds,
                             cards_per_round=cards_per_round, hidden=True,
                             pending_card_ids=[card.id for card in cards],
-                        )
+                        ))
                     back_stmt = select(MediaLibrary).where(
                         MediaLibrary.category == cat_stripped,
                         MediaLibrary.file_name == '_back',
@@ -12855,6 +12934,7 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
                 payload_text = content.action_btn_payload
 
     if payload_text:
+        await callback.answer()
         await callback.message.edit_reply_markup(reply_markup=None)
 
         if await _request_profile_onboarding_if_needed(
@@ -12863,7 +12943,6 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
             user,
             initial_prompt=payload_text,
         ):
-            await callback.answer()
             return
 
         mock_message = type('obj', (object,), {
@@ -12877,7 +12956,6 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
         await callback.message.answer(html.escape(payload_text))
 
         await process_user_prompt(mock_message, user_id, payload_text, bot, state)
-        await callback.answer()
     else:
         await callback.answer("Действие не назначено.", show_alert=True)
 
