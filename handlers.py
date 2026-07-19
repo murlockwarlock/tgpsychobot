@@ -78,7 +78,7 @@ from mailing_utils import (
     send_mailing_content,
 )
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE
-from user_metadata import append_metadata_records, extract_data_blocks, load_metadata_records
+from user_metadata import append_metadata_records, extend_system_prompt_with_metadata, extract_data_blocks, load_metadata_records
 from sqlalchemy import delete
 from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
@@ -12180,6 +12180,7 @@ async def admin_process_formulas_file(message: Message, state: FSMContext, bot: 
 async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: str) -> str:
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
+        user = await session.get(User, user_id)
         provider = ai_config.provider
 
         provider_key = provider.strip().lower() if provider else ""
@@ -12192,16 +12193,20 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         if provider_key in ['anthropic', 'claude'] and not model:
             model = ai_config.claude_model
 
+        effective_system_prompt = extend_system_prompt_with_metadata(
+            system_prompt,
+            user.metadata_json if user else None,
+        )
         fake_history = [DBMessage(role='user', content=user_prompt)]
 
         if provider_key == 'gemini':
-            response_text = await _call_gemini_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_gemini_api(api_key, model, fake_history, "", effective_system_prompt)
         elif provider_key == 'openai':
-            response_text = await _call_openai_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_openai_api(api_key, model, fake_history, "", effective_system_prompt)
         elif provider_key in ['anthropic', 'claude']:
-            response_text = await _call_claude_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_claude_api(api_key, model, fake_history, "", effective_system_prompt)
         elif provider_key == 'deepseek':
-            response_text = await _call_deepseek_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_deepseek_api(api_key, model, fake_history, "", effective_system_prompt)
         elif provider_key == 'kie':
             response_text = await _call_kie_chat(
                 api_key,
@@ -12209,7 +12214,7 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
                 model,
                 fake_history,
                 "",
-                system_prompt,
+                effective_system_prompt,
             )
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."

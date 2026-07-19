@@ -25,7 +25,7 @@ from prompt_blocks import (
 )
 from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
-from user_metadata import append_metadata_records, extract_data_blocks
+from user_metadata import append_metadata_records, extend_system_prompt_with_metadata, extract_data_blocks
 
 class InsufficientBalanceError(Exception):
     pass
@@ -1111,6 +1111,7 @@ async def get_ai_response(
         if service_prompt_block:
             prompt_parts.append(service_prompt_block)
         system_prompt = "\n\n".join(part for part in prompt_parts if part)
+        system_prompt = extend_system_prompt_with_metadata(system_prompt, user.metadata_json)
 
         relevant_chunks = []
         if active_topic:
