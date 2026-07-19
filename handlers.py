@@ -4918,7 +4918,7 @@ async def view_client_metadata(callback: CallbackQuery):
     chunk_size = 3000
     pages = []
     for record_index, record in enumerate(records):
-        rendered = record.get("raw_json") or json.dumps(record.get("data", {}), ensure_ascii=False, indent=2)
+        rendered = json.dumps(record.get("data", {}), ensure_ascii=False, indent=2)
         chunks = [rendered[index:index + chunk_size] for index in range(0, len(rendered), chunk_size)] or ["{}"]
         for chunk_index, chunk in enumerate(chunks):
             pages.append((record_index, chunk_index, len(chunks), record, chunk))
