@@ -78,7 +78,7 @@ from mailing_utils import (
     send_mailing_content,
 )
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE
-from user_metadata import extract_data_blocks, load_metadata, merge_metadata
+from user_metadata import append_metadata_records, extract_data_blocks, load_metadata_records
 from sqlalchemy import delete
 from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
@@ -2448,7 +2448,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
         if bonus_messages:
             await send_bonus_messages(reply_markup=main_kb)
         else:
-            await message.answer("🔽 Воспользуйтесь меню ниже для навигации:", reply_markup=main_kb)
+            await message.answer("Нажмите на кнопку или воспользуйтесь меню для навигации", reply_markup=main_kb)
     elif bonus_messages:
         await asyncio.sleep(0.3)
         await send_bonus_messages()
@@ -4914,16 +4914,33 @@ async def view_client_metadata(callback: CallbackQuery):
         await callback.answer("Клиент не найден.", show_alert=True)
         return
 
-    metadata = load_metadata(user.metadata_json)
-    rendered = json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else "{}"
-    chunk_size = 3200
-    pages = [rendered[index:index + chunk_size] for index in range(0, len(rendered), chunk_size)] or ["{}"]
+    records = load_metadata_records(user.metadata_json)
+    chunk_size = 3000
+    pages = []
+    for record_index, record in enumerate(records):
+        rendered = record.get("raw_json") or json.dumps(record.get("data", {}), ensure_ascii=False, indent=2)
+        chunks = [rendered[index:index + chunk_size] for index in range(0, len(rendered), chunk_size)] or ["{}"]
+        for chunk_index, chunk in enumerate(chunks):
+            pages.append((record_index, chunk_index, len(chunks), record, chunk))
+    if not pages:
+        pages = [(0, 0, 1, {"saved_at": None, "data": {}}, "{}")]
     page = max(0, min(page, len(pages) - 1))
+    record_index, chunk_index, chunk_count, record, rendered_chunk = pages[page]
+    saved_at = record.get("saved_at")
+    if saved_at:
+        try:
+            saved_label = format_msk(datetime.fromisoformat(saved_at), "%d.%m.%Y %H:%M:%S МСК")
+        except (TypeError, ValueError):
+            saved_label = str(saved_at)
+    else:
+        saved_label = "дата неизвестна (старые данные)"
     display_name = html.escape(user.name or user.first_name or str(user.id))
+    part_label = f", часть {chunk_index + 1}/{chunk_count}" if chunk_count > 1 else ""
     text = (
         f"<b>🧩 Метаданные клиента:</b> {display_name}\n"
-        f"<code>{html.escape(pages[page])}</code>\n\n"
-        f"Страница {page + 1}/{len(pages)}"
+        f"<b>Метаданные сохранены:</b> {html.escape(saved_label)}\n\n"
+        f"<code>{html.escape(rendered_chunk)}</code>\n\n"
+        f"Запись {record_index + 1}/{max(len(records), 1)}{part_label}"
     )
     buttons = []
     navigation = []
@@ -4957,7 +4974,7 @@ async def download_client_metadata(callback: CallbackQuery):
             "name": user.name or user.first_name,
             "username": user.username,
         },
-        "metadata": load_metadata(user.metadata_json),
+        "metadata": load_metadata_records(user.metadata_json),
     }
     data = json.dumps(export_data, ensure_ascii=False, indent=2).encode("utf-8")
     await callback.message.answer_document(
@@ -12197,18 +12214,14 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
 
-    visible_text, new_metadata, invalid_data_blocks = extract_data_blocks(response_text)
+    visible_text, metadata_blocks, invalid_data_blocks = extract_data_blocks(response_text)
     if invalid_data_blocks:
         logging.warning("AI returned %s invalid [DATA] block(s) for user %s", invalid_data_blocks, user_id)
-    if new_metadata:
+    if metadata_blocks:
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             if user:
-                user.metadata_json = json.dumps(
-                    merge_metadata(load_metadata(user.metadata_json), new_metadata),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
+                user.metadata_json = append_metadata_records(user.metadata_json, metadata_blocks)
                 await session.commit()
     return visible_text
 
@@ -14490,7 +14503,7 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
         if export_kind == "metadata":
-            metadata_users = [(i, user, load_metadata(user.metadata_json)) for i, user in enumerate(users, 1)]
+            metadata_users = [(i, user, load_metadata_records(user.metadata_json)) for i, user in enumerate(users, 1)]
             metadata_users = [(i, user, value) for i, user, value in metadata_users if value]
             if fmt == "txt":
                 full_content = f"MASS METADATA EXPORT - {timestamp}\n" + "=" * 60 + "\n\n"

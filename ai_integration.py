@@ -25,7 +25,7 @@ from prompt_blocks import (
 )
 from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
-from user_metadata import extract_data_blocks, load_metadata, merge_metadata
+from user_metadata import append_metadata_records, extract_data_blocks
 
 class InsufficientBalanceError(Exception):
     pass
@@ -1235,15 +1235,11 @@ async def get_ai_response(
                     f"Основной провайдер ({provider}) и резервный ({fb_provider}) недоступны"
                 ) from fb_err
 
-        visible_text, new_metadata, invalid_data_blocks = extract_data_blocks(response_text)
+        visible_text, metadata_blocks, invalid_data_blocks = extract_data_blocks(response_text)
         if invalid_data_blocks:
             logging.warning("AI returned %s invalid [DATA] block(s) for user %s", invalid_data_blocks, user_id)
-        if new_metadata:
-            user.metadata_json = json.dumps(
-                merge_metadata(load_metadata(user.metadata_json), new_metadata),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+        if metadata_blocks:
+            user.metadata_json = append_metadata_records(user.metadata_json, metadata_blocks)
             await session.commit()
 
         return visible_text
