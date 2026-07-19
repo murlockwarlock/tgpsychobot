@@ -1040,6 +1040,8 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
     if state is not None:
         await state.set_state(UserStates.in_test)
 
+    await _send_configured_test_intro(bot, user_id)
+
     total_count = len(questions)
     question = questions[0]
     options = get_answer_options(question)
@@ -2217,7 +2219,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
             elif args == "test":
                 if bonus_messages:
                     await send_bonus_messages()
-                await cmd_start_test(message, state)
+                await cmd_start_test(message, state, bot)
                 return
 
             elif args.startswith("ref_"):
@@ -3780,8 +3782,50 @@ async def get_content_from_db(key: str) -> dict:
                 {'type': media.file_type, 'file_id': media.file_id}
                 for media in content_obj.media
             ]
-            return {"text": content_obj.text_content, "media": media_list, "is_visible": content_obj.is_visible}
-        return {"text": "Контент не найден.", "media": [], "is_visible": False}
+            return {
+                "text": content_obj.text_content,
+                "media": media_list,
+                "is_visible": content_obj.is_visible,
+                "content_order": content_obj.content_order,
+            }
+        return {"text": "Контент не найден.", "media": [], "is_visible": False, "content_order": "media_top"}
+
+
+async def _send_configured_test_intro(bot: Bot, chat_id: int) -> bool:
+    content = await get_content_from_db("test_intro")
+    if not content.get("is_visible", True):
+        return False
+
+    text = (content.get("text") or "").strip()
+    if text == "Контент не найден.":
+        text = ""
+    media = content.get("media") or []
+    if not text and not media:
+        return False
+
+    async def send_text():
+        if not text:
+            return
+        for chunk in split_html_text(text, 4000):
+            await _safe_send_html(
+                lambda value, parse_mode: bot.send_message(chat_id, value, parse_mode=parse_mode),
+                chunk,
+            )
+
+    async def send_media():
+        for item in media:
+            if item["type"] == "photo":
+                await bot.send_photo(chat_id, item["file_id"])
+            elif item["type"] == "video":
+                await bot.send_video(chat_id, item["file_id"])
+
+    if content.get("content_order") == "text_top":
+        await send_text()
+        await send_media()
+    else:
+        await send_media()
+        await send_text()
+    return True
 
 
 @router.message(DynamicButtonFilter(), StateFilter(None))
@@ -12171,7 +12215,7 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
 
 @router.message(Command("test"))
 @router.message(TestButtonFilter())
-async def cmd_start_test(message: Message, state: FSMContext):
+async def cmd_start_test(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
@@ -12186,8 +12230,9 @@ async def cmd_start_test(message: Message, state: FSMContext):
             return
 
         collect_profile_before_test = bool(getattr(config, "collect_profile_before_test", True))
-        content = await get_content_from_db("test_intro")
         user = await session.get(User, user_id)
+
+    await _send_configured_test_intro(bot, message.chat.id)
 
     if not collect_profile_before_test:
         await start_psych_test(message, state, user_id)
@@ -12200,30 +12245,8 @@ async def cmd_start_test(message: Message, state: FSMContext):
         return
 
     await state.set_state(UserStates.awaiting_gender)
-
-    text = content.get('text', "Привет! Для начала выбери свой пол:")
-    if not text or text == "Контент не найден.":
-        text = "Привет! Для начала выбери свой пол:"
-    media = content.get('media', [])
-
     keyboard = kb.gender_selection_keyboard(is_test=True)
-
-    if media:
-        if len(media) == 1 and len(text) < 1024:
-            item = media[0]
-            if item['type'] == 'photo':
-                await message.answer_photo(item['file_id'], caption=text, reply_markup=keyboard)
-            elif item['type'] == 'video':
-                await message.answer_video(item['file_id'], caption=text, reply_markup=keyboard)
-        else:
-            for item in media:
-                if item['type'] == 'photo':
-                    await message.answer_photo(item['file_id'])
-                elif item['type'] == 'video':
-                    await message.answer_video(item['file_id'])
-            await message.answer(text, reply_markup=keyboard)
-    else:
-        await message.answer(text, reply_markup=keyboard)
+    await message.answer("Перед началом выбери свой пол:", reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "admin_test_menu")
