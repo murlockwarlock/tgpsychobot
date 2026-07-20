@@ -9,14 +9,12 @@ from memory_mode import memory_mode_label
 from time_helpers import to_msk
 
 
+def should_show_test_button(test_config) -> bool:
+    return bool(test_config and test_config.is_enabled)
+
+
 async def main_client_keyboard(user_id: int | None = None):
     async with async_session_maker() as session:
-        is_user_admin = False
-        if user_id is not None:
-            from database import User
-            user = await session.get(User, user_id)
-            is_user_admin = bool((user and user.is_admin) or user_id in OWNER_IDS)
-
         stmt = select(Content).where(
             Content.is_visible == True,
             Content.button_title != None,
@@ -36,7 +34,7 @@ async def main_client_keyboard(user_id: int | None = None):
         referral_btn_name = sub_config.referral_btn_name if sub_config else "👥 Пригласить друзей"
 
         test_config = await session.get(TestConfig, 1)
-        test_active = test_config.is_enabled if test_config else False
+        test_active = should_show_test_button(test_config)
 
         topic_stmt = select(Topic).where(Topic.is_active == True, Topic.show_in_main_menu == True).order_by(Topic.sort_order.asc(), Topic.id.asc())
         topic_res = await session.execute(topic_stmt)
@@ -60,7 +58,7 @@ async def main_client_keyboard(user_id: int | None = None):
     keyboard_rows.extend(topic_rows)
 
     static_row = []
-    if test_active or is_user_admin:
+    if test_active:
         static_row.append(KeyboardButton(text="📝 Пройти тест"))
     if subscriptions_active:
         static_row.append(KeyboardButton(text="⭐️ Подписка"))
@@ -111,13 +109,17 @@ def admin_test_menu_keyboard(config_or_enabled):
     builder = InlineKeyboardBuilder()
     is_enabled = config_or_enabled if isinstance(config_or_enabled, bool) else bool(config_or_enabled.is_enabled)
     show_progress = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "show_progress", True))
-    collect_profile = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "collect_profile_before_test", True))
+    collect_name = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "profile_collect_name", True))
+    collect_gender = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "profile_collect_gender", True))
+    collect_age = False if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "profile_collect_age", False))
     secret_test_enabled = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "secret_test_enabled", True))
     formulas_enabled = False if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "formulas_enabled", False))
     input_mode = "all" if isinstance(config_or_enabled, bool) else (getattr(config_or_enabled, "interpretation_input_mode", "all") or "all")
     status_text = "✅ Включен" if is_enabled else "❌ Выключен"
     progress_text = "✅ Да" if show_progress else "❌ Нет"
-    profile_text = "✅ Да" if collect_profile else "❌ Нет"
+    name_text = "✅" if collect_name else "❌"
+    gender_text = "✅" if collect_gender else "❌"
+    age_text = "✅" if collect_age else "❌"
     secret_text = "✅ Да" if secret_test_enabled else "❌ Нет"
     formulas_text = "✅ Да" if formulas_enabled else "❌ Нет"
     if input_mode == "formulas":
@@ -129,7 +131,9 @@ def admin_test_menu_keyboard(config_or_enabled):
 
     builder.button(text=f"Статус теста: {status_text}", callback_data="admin_test_toggle_status")
     builder.button(text=f"Прогресс: {progress_text}", callback_data="admin_test_toggle_progress")
-    builder.button(text=f"Анкета перед тестом: {profile_text}", callback_data="admin_test_toggle_profile_collection")
+    builder.button(text=f"Анкета — имя: {name_text}", callback_data="admin_test_toggle_profile_name")
+    builder.button(text=f"Анкета — пол: {gender_text}", callback_data="admin_test_toggle_profile_gender")
+    builder.button(text=f"Анкета — возраст: {age_text}", callback_data="admin_test_toggle_profile_age")
     builder.button(text=f"Секретные вопросы: {secret_text}", callback_data="admin_test_toggle_secret_test")
     builder.button(text=f"Формулы: {formulas_text}", callback_data="admin_test_toggle_formulas")
     builder.button(text=f"В интерпретацию: {mode_text}", callback_data="admin_test_toggle_input_mode")
@@ -1309,6 +1313,15 @@ def single_export_options_keyboard(user_id: int):
     builder.button(text="JSON (Анонимно)", callback_data=f"run_single_json_yes_{user_id}")
     builder.button(text="⬅️ Назад в профиль", callback_data=f"view_client_{user_id}")
     builder.adjust(2, 2, 1)
+    return builder.as_markup()
+
+
+def metadata_export_options_keyboard(user_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="JSON (Обычный)", callback_data=f"run_metadata_export_no_{user_id}")
+    builder.button(text="JSON (Обезличенный)", callback_data=f"run_metadata_export_yes_{user_id}")
+    builder.button(text="⬅️ Назад в профиль", callback_data=f"view_client_{user_id}")
+    builder.adjust(1)
     return builder.as_markup()
 
 

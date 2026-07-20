@@ -79,6 +79,8 @@ from mailing_utils import (
 )
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE
 from user_metadata import append_metadata_records, extend_system_prompt_with_metadata, extract_data_blocks, load_metadata_records
+from metadata_export import metadata_export_entry
+from profile_onboarding import missing_profile_fields
 from sqlalchemy import delete
 from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
@@ -1022,32 +1024,47 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
             return
 
         user = await session.get(User, user_id)
-        await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
-        session.add(
-            TestSession(
-                user_id=user_id,
-                created_at=datetime.utcnow(),
-                answers="[]",
-                is_finished=False,
-                current_question_index=0,
-                invocation_topic_id=user.current_topic_id if user else None,
-                invocation_dialogue_id=user.current_dialogue_id if user else 1,
-                invocation_platform="telegram",
-            )
-        )
-        await session.commit()
 
-    if state is not None:
-        await state.set_state(UserStates.in_test)
+    async def answer(text, **kwargs):
+        return await bot.send_message(chat_id=user_id, text=text, **kwargs)
+
+    message_proxy = SimpleNamespace(
+        answer=answer,
+        chat=SimpleNamespace(id=user_id),
+    )
+    if state is not None and user and await _request_profile_onboarding_if_needed(
+        message_proxy,
+        state,
+        user,
+        resume_test=True,
+    ):
+        return
 
     await _send_configured_test_intro(bot, user_id)
+    if state is not None:
+        await start_psych_test(message_proxy, state, user_id)
+        return
 
-    total_count = len(questions)
+    async with async_session_maker() as session:
+        await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
+        session.add(TestSession(
+            user_id=user_id,
+            current_question_index=0,
+            answers="[]",
+            is_finished=False,
+            invocation_topic_id=user.current_topic_id if user else None,
+            invocation_dialogue_id=user.current_dialogue_id if user else 1,
+            invocation_platform="telegram",
+        ))
+        await session.commit()
     question = questions[0]
     options = get_answer_options(question)
-    show_progress = getattr(config, "show_progress", True) if config else True
-    text = build_question_text(question, 0, total_count, show_progress)
-    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question), 0) if options else None
+    text = build_question_text(question, 0, len(questions), getattr(config, "show_progress", True))
+    reply_markup = kb.universal_test_answer_keyboard(
+        options,
+        question_buttons_are_horizontal(question),
+        0,
+    ) if options else None
     await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
 
 
@@ -2109,6 +2126,8 @@ async def cmd_help(message: Message):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: CommandObject = None):
+    resume_state_data = await state.get_data()
+    resumed_new_user = bool(resume_state_data.get("_resume_start_new_user"))
     await state.clear()
     bonus_messages = []
 
@@ -2166,6 +2185,21 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 )
         await session.commit()
         await refresh_commands_for_user(bot, message.from_user.id, is_admin_user_for_commands)
+
+        profile_config = await session.get(TestConfig, 1)
+        if missing_profile_fields(profile_config, user):
+            if bonus_messages:
+                await send_bonus_messages()
+                bonus_messages.clear()
+            if await _request_profile_onboarding_if_needed(
+                message,
+                state,
+                user,
+                resume_start=True,
+                resume_start_args=command.args if command else None,
+                resume_start_new_user=is_new_user or resumed_new_user,
+            ):
+                return
 
         if command and command.args:
             args = command.args
@@ -2230,7 +2264,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 except ValueError:
                     pass
 
-                if ref_id and ref_id != message.from_user.id and is_new_user:
+                if ref_id and ref_id != message.from_user.id and (is_new_user or resumed_new_user):
                     sub_config_ref = await session.get(SubscriptionConfig, 1)
                     if sub_config_ref and sub_config_ref.referral_enabled:
                         referrer = await session.get(User, ref_id)
@@ -4485,6 +4519,10 @@ async def process_user_name(message: Message, state: FSMContext, bot: Bot):
         await session.commit()
 
     data = await state.get_data()
+    if data.get("profile_flow"):
+        await _continue_profile_onboarding(message, state, bot, user_id, actor=message.from_user)
+        return
+
     is_test = data.get('is_test', False)
 
     await message.answer(f"Приятно познакомиться, {html.escape(user_name)}! Укажи свой пол:", reply_markup=kb.gender_selection_keyboard(is_test=is_test))
@@ -4861,9 +4899,20 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
     data = await state.get_data()
     prompt_text = data.get('initial_prompt')
 
-    await state.clear()
-
     await callback.message.delete()
+
+    if data.get("profile_flow"):
+        await _resume_after_profile_onboarding(
+            data,
+            callback.message,
+            state,
+            bot,
+            user_id,
+            actor=callback.from_user,
+        )
+        return
+
+    await state.clear()
 
     if await _send_pending_topic_intro(data, bot, callback.from_user.id):
         return
@@ -4968,18 +5017,43 @@ async def download_client_metadata(callback: CallbackQuery):
         await callback.answer("Клиент не найден.", show_alert=True)
         return
 
-    export_data = {
-        "user_info": {
-            "id": user.id,
-            "name": user.name or user.first_name,
-            "username": user.username,
-        },
-        "metadata": load_metadata_records(user.metadata_json),
-    }
+    await callback.message.edit_text(
+        f"Выберите вариант выгрузки метаданных пользователя <code>{client_id}</code>:",
+        reply_markup=kb.metadata_export_options_keyboard(client_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("run_metadata_export_"))
+async def run_client_metadata_export(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на скачивание метаданных.", show_alert=True)
+        return
+
+    try:
+        _, _, _, anonymize_value, client_id_value = callback.data.split("_")
+        client_id = int(client_id_value)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    anonymize = anonymize_value == "yes"
+
+    async with async_session_maker() as session:
+        user = await session.get(User, client_id)
+    if not user:
+        await callback.answer("Клиент не найден.", show_alert=True)
+        return
+
+    export_data = metadata_export_entry(
+        user,
+        load_metadata_records(user.metadata_json),
+        anonymize=anonymize,
+    )
     data = json.dumps(export_data, ensure_ascii=False, indent=2).encode("utf-8")
+    file_label = "user_1" if anonymize else str(client_id)
     await callback.message.answer_document(
-        BufferedInputFile(data, filename=f"metadata_{client_id}.json"),
-        caption=f"🧩 Метаданные пользователя {client_id}",
+        BufferedInputFile(data, filename=f"metadata_{file_label}.json"),
+        caption=f"🧩 Метаданные пользователя {file_label}",
     )
     await callback.answer()
 
@@ -5276,6 +5350,84 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int) -> bool:
     return True
 
 
+async def _send_profile_field_prompt(message: Message, state: FSMContext, field: str) -> None:
+    if field == "name":
+        await state.set_state(UserStates.awaiting_name)
+        await message.answer("Прежде чем мы начнем, подскажите, как я могу к вам обращаться?")
+    elif field == "gender":
+        await state.set_state(UserStates.awaiting_gender)
+        await message.answer("Укажите ваш пол:", reply_markup=kb.gender_selection_keyboard())
+    else:
+        await state.set_state(UserStates.awaiting_age)
+        await message.answer("Укажите ваш возраст:")
+
+
+async def _resume_after_profile_onboarding(
+    data: dict,
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    user_id: int,
+    *,
+    actor=None,
+) -> None:
+    if data.get("resume_start"):
+        resume_message = message
+        if actor is not None and hasattr(message, "model_copy"):
+            resume_message = message.model_copy(update={"from_user": actor})
+        await state.update_data(_resume_start_new_user=bool(data.get("resume_start_new_user")))
+        start_args = data.get("resume_start_args")
+        command = SimpleNamespace(args=start_args) if start_args else None
+        await cmd_start(resume_message, state, bot, command)
+        return
+
+    if data.get("resume_test"):
+        await state.clear()
+        await _send_configured_test_intro(bot, user_id)
+        await start_psych_test(message, state, user_id)
+        return
+
+    await state.clear()
+    if await _send_pending_topic_intro(data, bot, user_id):
+        return
+
+    prompt_text = data.get("initial_prompt")
+    if prompt_text:
+        await process_user_prompt(message, user_id, prompt_text, bot, state)
+
+
+async def _continue_profile_onboarding(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    user_id: int,
+    *,
+    actor=None,
+) -> None:
+    data = await state.get_data()
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        config = await session.get(TestConfig, 1)
+
+    missing = missing_profile_fields(config, user) if user else []
+    if missing:
+        await _send_profile_field_prompt(message, state, missing[0])
+        return
+
+    if user and not user.accepted_disclaimer:
+        disclaimer_content = await get_content_from_db("disclaimer")
+        if disclaimer_content.get("is_visible", True):
+            await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+            text_to_send = disclaimer_content.get("text") or "Текст дисклеймера не задан."
+            await message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+            return
+        async with async_session_maker() as session:
+            await session.execute(update(User).where(User.id == user_id).values(accepted_disclaimer=True))
+            await session.commit()
+
+    await _resume_after_profile_onboarding(data, message, state, bot, user_id, actor=actor)
+
+
 async def _request_profile_onboarding_if_needed(
     message: Message,
     state: FSMContext,
@@ -5285,8 +5437,27 @@ async def _request_profile_onboarding_if_needed(
     topic_intro_after: int | None = None,
     topic_intro_restored: bool = False,
     topic_intro_memory_mode: str = MEMORY_MODE_RESET,
+    resume_start: bool = False,
+    resume_start_args: str | None = None,
+    resume_start_new_user: bool = False,
+    resume_test: bool = False,
 ) -> bool:
-    state_data = {"initial_prompt": initial_prompt}
+    async with async_session_maker() as session:
+        config = await session.get(TestConfig, 1)
+
+    missing = missing_profile_fields(config, user)
+    if not missing:
+        return False
+
+    state_data = {
+        "initial_prompt": initial_prompt,
+        "is_onboarding": True,
+        "profile_flow": True,
+        "resume_start": resume_start,
+        "resume_start_args": resume_start_args,
+        "resume_start_new_user": resume_start_new_user,
+        "resume_test": resume_test,
+    }
     if topic_intro_after is not None:
         state_data.update({
             "topic_intro_after_onboarding": topic_intro_after,
@@ -5294,19 +5465,9 @@ async def _request_profile_onboarding_if_needed(
             "topic_intro_memory_mode": topic_intro_memory_mode,
         })
 
-    if not user.name:
-        await state.set_state(UserStates.awaiting_name)
-        await state.update_data(**state_data)
-        await message.answer("Прежде чем мы начнем, подскажите, как я могу к вам обращаться?")
-        return True
-
-    if not user.gender:
-        await state.set_state(UserStates.awaiting_gender)
-        await state.update_data(is_onboarding=True, **state_data)
-        await message.answer("Укажите ваш пол:", reply_markup=kb.gender_selection_keyboard())
-        return True
-
-    return False
+    await state.update_data(**state_data)
+    await _send_profile_field_prompt(message, state, missing[0])
+    return True
 
 
 async def _new_dialogue_update_state(session, user, topic_key: int, memory_mode: str):
@@ -11370,6 +11531,20 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
 
     gender_label = "👨 Мужской" if gender_code == "male" else "👩 Женский"
 
+    if data.get("profile_flow"):
+        try:
+            await callback.message.edit_text(f"Пол: {gender_label} ✅")
+        except Exception:
+            pass
+        await _continue_profile_onboarding(
+            callback.message,
+            state,
+            bot,
+            user_id,
+            actor=callback.from_user,
+        )
+        return
+
     if data.get('is_settings'):
         await state.clear()
         async with async_session_maker() as session:
@@ -11529,6 +11704,17 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
 
     data = await state.get_data()
+
+    if data.get("profile_flow"):
+        async with async_session_maker() as session:
+            await session.execute(update(User).where(User.id == user_id).values(age=str(age)))
+            await session.commit()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await _continue_profile_onboarding(message, state, bot, user_id, actor=message.from_user)
+        return
 
     if data.get('is_settings'):
         async with async_session_maker() as session:
@@ -12247,24 +12433,18 @@ async def cmd_start_test(message: Message, state: FSMContext, bot: Bot):
             await message.answer("⚠️ Тест временно недоступен: вопросы еще не загружены.")
             return
 
-        collect_profile_before_test = bool(getattr(config, "collect_profile_before_test", True))
         user = await session.get(User, user_id)
 
+    if user and await _request_profile_onboarding_if_needed(
+        message,
+        state,
+        user,
+        resume_test=True,
+    ):
+        return
+
     await _send_configured_test_intro(bot, message.chat.id)
-
-    if not collect_profile_before_test:
-        await start_psych_test(message, state, user_id)
-        return
-
-    if user and not user.name:
-        await state.set_state(UserStates.awaiting_name)
-        await state.update_data(is_test=True)
-        await message.answer("Прежде чем мы начнем, подскажите, как я могу к вам обращаться?")
-        return
-
-    await state.set_state(UserStates.awaiting_gender)
-    keyboard = kb.gender_selection_keyboard(is_test=True)
-    await message.answer("Перед началом выбери свой пол:", reply_markup=keyboard)
+    await start_psych_test(message, state, user_id)
 
 
 @router.callback_query(F.data == "admin_test_menu")
@@ -12282,7 +12462,7 @@ async def admin_test_menu(callback: CallbackQuery):
         "🧩 <b>Управление разделом 'Тест'</b>\n\n"
         f"Вопросов: <b>{question_count}</b>\n"
         f"Формул: <b>{formula_count}</b>\n\n"
-        "Настройки применяются к Telegram и MAX, использующим эту базу.",
+        "Поля анкеты запрашиваются в Telegram до приветствия или запуска теста.",
         reply_markup=kb.admin_test_menu_keyboard(config)
     )
 
@@ -12315,14 +12495,20 @@ async def admin_test_toggle_progress(callback: CallbackQuery):
     await admin_test_menu(callback)
 
 
-@router.callback_query(F.data == "admin_test_toggle_profile_collection")
-async def admin_test_toggle_profile_collection(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("admin_test_toggle_profile_"))
+async def admin_test_toggle_profile_field(callback: CallbackQuery):
+    field = callback.data.removeprefix("admin_test_toggle_profile_")
+    if field not in {"name", "gender", "age"}:
+        await callback.answer("Неизвестное поле анкеты.", show_alert=True)
+        return
+    column_name = f"profile_collect_{field}"
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
         if not config:
             config = TestConfig(id=1)
             session.add(config)
-        config.collect_profile_before_test = not bool(getattr(config, "collect_profile_before_test", True))
+        current_value = bool(getattr(config, column_name, field != "age"))
+        setattr(config, column_name, not current_value)
         await session.commit()
     await admin_test_menu(callback)
 
@@ -14520,15 +14706,7 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
                 extension = "txt"
             else:
                 export_data = [
-                    {
-                        "user_info": {
-                            "label": f"user_{i}" if anonymize else str(user.id),
-                            "id": None if anonymize else user.id,
-                            "name": None if anonymize else (user.name or user.first_name),
-                            "username": None if anonymize else user.username,
-                        },
-                        "metadata": metadata,
-                    }
+                    metadata_export_entry(user, metadata, anonymize=anonymize, anonymous_index=i)
                     for i, user, metadata in metadata_users
                 ]
                 final_bytes = json.dumps(export_data, ensure_ascii=False, indent=2).encode("utf-8") if export_data else b""
