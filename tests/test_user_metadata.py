@@ -3,75 +3,12 @@ import json
 
 from user_metadata import (
     append_metadata_records,
-    build_metadata_context,
-    extend_system_prompt_with_metadata,
     extract_data_blocks,
     load_metadata_records,
 )
 
 
 class UserMetadataTests(unittest.TestCase):
-    def test_saved_records_are_rendered_as_hidden_model_context(self):
-        raw = append_metadata_records(
-            None,
-            [{"data": {"stage": "test"}, "raw_json": '{"stage":"test"}'}],
-            saved_at="2026-07-19T10:00:00+00:00",
-        )
-
-        context = build_metadata_context(raw)
-
-        self.assertIn("СЛУЖЕБНАЯ ИСТОРИЯ МЕТАДАННЫХ", context)
-        self.assertIn("2026-07-19T10:00:00+00:00", context)
-        self.assertIn('[DATA]\n{"stage":"test"}\n[/DATA]', context)
-        self.assertIn("сформируй его один раз", context)
-
-    def test_metadata_context_keeps_only_latest_records(self):
-        raw = None
-        for value in range(3):
-            raw = append_metadata_records(
-                raw,
-                [{"data": {"value": value}, "raw_json": json.dumps({"value": value})}],
-                saved_at=f"2026-07-19T10:0{value}:00+00:00",
-            )
-
-        context = build_metadata_context(raw, record_limit=2)
-
-        self.assertIn("не включённых в контекст: 1", context)
-        self.assertNotIn('{"value":0}', context)
-        self.assertIn('{"value":1}', context)
-        self.assertIn('{"value":2}', context)
-
-    def test_metadata_context_includes_all_records_by_default(self):
-        raw = None
-        for value in range(3):
-            raw = append_metadata_records(
-                raw,
-                [{"data": {"value": value}, "raw_json": json.dumps({"value": value})}],
-                saved_at=f"2026-07-19T10:0{value}:00+00:00",
-            )
-
-        context = build_metadata_context(raw)
-
-        self.assertNotIn("не включённых в контекст", context)
-        self.assertLess(context.index('{"value":0}'), context.index('{"value":1}'))
-        self.assertLess(context.index('{"value":1}'), context.index('{"value":2}'))
-
-    def test_empty_metadata_adds_no_context(self):
-        self.assertEqual(build_metadata_context(None), "")
-        self.assertEqual(build_metadata_context("{}"), "")
-        self.assertEqual(extend_system_prompt_with_metadata("Основной промпт", "{}"), "Основной промпт")
-
-    def test_metadata_context_is_appended_to_existing_system_prompt(self):
-        raw = append_metadata_records(
-            None,
-            [{"data": {"stage": "test"}, "raw_json": '{"stage":"test"}'}],
-            saved_at="2026-07-19T10:00:00+00:00",
-        )
-
-        prompt = extend_system_prompt_with_metadata("Основной промпт", raw)
-
-        self.assertTrue(prompt.startswith("Основной промпт\n\n"))
-        self.assertIn('[DATA]\n{"stage":"test"}\n[/DATA]', prompt)
 
     def test_extracts_json_and_keeps_only_visible_answer(self):
         visible, blocks, invalid = extract_data_blocks(
