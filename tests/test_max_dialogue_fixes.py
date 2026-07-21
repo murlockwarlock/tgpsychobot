@@ -20,8 +20,9 @@ def _sqlite_compatible_engine(*args, **kwargs):
 
 with patch.object(sqlalchemy_asyncio, "create_async_engine", _sqlite_compatible_engine):
     from max_messenger_bot import ai
-    from max_messenger_bot.services.common import _send_ai_text
+    from max_messenger_bot.services.common import _notify_referrer_about_registration, _send_ai_text
     from memory_mode import MEMORY_MODE_TOPIC
+    from response_buttons import ResponseButton
 
 
 class MaxHistoryScopeTests(unittest.TestCase):
@@ -59,6 +60,34 @@ class MaxChunkedResponseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(client.edit_message.await_args.kwargs["attachments"])
         client.send_message.assert_not_awaited()
+
+    async def test_generated_buttons_are_attached_to_last_chunk(self):
+        client = SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock())
+        buttons = [[
+            ResponseButton("YouTube", "url", "https://youtube.com/watch?v=1"),
+            ResponseButton("Да", "action", "yes"),
+        ]]
+
+        await _send_ai_text(client, 123, "thinking-id", ["first", "second"], buttons)
+
+        attachment = client.send_message.await_args.kwargs["attachments"][0]
+        rows = attachment["payload"]["buttons"]
+        self.assertEqual(rows[0][0]["type"], "link")
+        self.assertEqual(rows[0][0]["url"], "https://youtube.com/watch?v=1")
+        self.assertEqual(rows[0][1]["payload"], "ai_btn:yes")
+
+
+class MaxReferralNotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_referrer_receives_registration_bonus_notification(self):
+        client = SimpleNamespace(send_message=AsyncMock())
+
+        await _notify_referrer_about_registration(client, 100_123_456_789, 5)
+
+        client.send_message.assert_awaited_once()
+        call = client.send_message.await_args.kwargs
+        self.assertEqual(call["user_id"], 123_456_789)
+        self.assertIn("зарегистрировался новый пользователь", call["text"])
+        self.assertIn("5 бонусных дн.", call["text"])
 
 
 class MaxTranscriptionFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -119,6 +148,28 @@ class MaxBotDeduplicationTests(unittest.IsolatedAsyncioTestCase):
             await app.handle_update(update)
             self.assertEqual(mock_handle.call_count, 1)
 
+
+class MaxGeneratedButtonActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_test_action_uses_existing_test_flow(self):
+        from max_messenger_bot.app import MaxBotApplication
+        from max_messenger_bot.models import IncomingCallback, Sender
+
+        client = SimpleNamespace(answer_callback=AsyncMock())
+        app = MaxBotApplication(client)
+        callback = IncomingCallback(
+            raw={},
+            callback_id="callback-1",
+            payload="ai_btn:start_test",
+            chat_id=321,
+            message_id="message-1",
+            sender=Sender(user_id=100_123, username="user", first_name="User", last_name=""),
+        )
+
+        with patch("max_messenger_bot.app.tests_service.start_test", AsyncMock()) as start_test:
+            await app.handle_callback(callback)
+
+        client.answer_callback.assert_awaited_once_with("callback-1")
+        start_test.assert_awaited_once_with(client, 321, 100_123, app.states)
 
 class MaxBotHistorySlicingTests(unittest.TestCase):
     def test_qa_pairs_slicing_logic(self):

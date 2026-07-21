@@ -81,6 +81,7 @@ from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE
 from user_metadata import append_metadata_records, extract_data_blocks, load_metadata_records
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
+from response_buttons import ResponseButton, extract_response_buttons
 from sqlalchemy import delete
 from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
@@ -1011,6 +1012,43 @@ def _extract_test_start_directive(text: str | None) -> tuple[bool, str]:
     return True, clean_text.strip(" \t\r\n-—–:;")
 
 
+def _telegram_response_buttons_markup(rows: list[list[ResponseButton]]) -> InlineKeyboardMarkup | None:
+    if not rows:
+        return None
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        keyboard_row = []
+        for button in row:
+            if button.kind == "url":
+                keyboard_row.append(InlineKeyboardButton(text=button.text, url=button.value))
+            else:
+                keyboard_row.append(InlineKeyboardButton(text=button.text, callback_data=f"ai_btn:{button.value}"))
+        if keyboard_row:
+            keyboard_rows.append(keyboard_row)
+    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
+
+
+async def _send_generated_response(bot: Bot, user_id: int, text: str) -> None:
+    clean_text, button_rows = extract_response_buttons(text)
+    markup = _telegram_response_buttons_markup(button_rows)
+    if not clean_text and markup:
+        await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=markup)
+        return
+    html_text = markdown_to_html(clean_text)
+    chunks = split_html_text(html_text)
+    for index, chunk in enumerate(chunks):
+        chunk_markup = markup if index == len(chunks) - 1 else None
+        await _safe_send_html(
+            lambda value, parse_mode, reply_markup=chunk_markup: bot.send_message(
+                chat_id=user_id,
+                text=value,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            ),
+            chunk,
+        )
+
+
 async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContext | None):
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
@@ -1112,6 +1150,8 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
             return
 
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_text)
+        clean_text, response_button_rows = extract_response_buttons(clean_text)
+        response_markup = _telegram_response_buttons_markup(response_button_rows)
 
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
@@ -1122,14 +1162,20 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
             # --- 1. Текст AI (сначала предисловие) ---
 
             image_prompt, text_part = _extract_ai_directive_payload(clean_text, "GEN_IMG")
+            response_buttons_sent = False
             if image_prompt:
                 if text_part:
                     html_text = markdown_to_html(text_part)
-                    for chunk in split_html_text(html_text):
+                    chunks = split_html_text(html_text)
+                    for index, chunk in enumerate(chunks):
+                        chunk_markup = response_markup if index == len(chunks) - 1 else None
                         await _safe_send_html(
-                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
+                            lambda text, pm, markup=chunk_markup: bot.send_message(
+                                chat_id=user_id, text=text, parse_mode=pm, reply_markup=markup
+                            ),
                             chunk,
                         )
+                    response_buttons_sent = bool(response_markup)
                 if image_prompt:
                     upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
                     try:
@@ -1151,14 +1197,22 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                         await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
                     finally:
                         upload_task.cancel()
+                if response_markup and not response_buttons_sent:
+                    await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=response_markup)
             else:
                 if clean_text:
                     html_response = markdown_to_html(clean_text)
-                    for chunk in split_html_text(html_response):
+                    chunks = split_html_text(html_response)
+                    for index, chunk in enumerate(chunks):
+                        chunk_markup = response_markup if index == len(chunks) - 1 else None
                         await _safe_send_html(
-                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
+                            lambda text, pm, markup=chunk_markup: bot.send_message(
+                                chat_id=user_id, text=text, parse_mode=pm, reply_markup=markup
+                            ),
                             chunk,
                         )
+                elif response_markup:
+                    await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=response_markup)
 
             # --- 2. Медиа (карты, аудио) после текста ---
 
@@ -1306,12 +1360,7 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 typing_task_interp.cancel()
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
                 if clean_interpretation:
-                    html_interp = markdown_to_html(clean_interpretation)
-                    for chunk in split_html_text(html_interp):
-                        await _safe_send_html(
-                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
-                            chunk,
-                        )
+                    await _send_generated_response(bot, user_id, clean_interpretation)
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation, dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
@@ -1362,6 +1411,59 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
             exception=e,
         )
         await bot.send_message(chat_id=user_id, text="Произошла ошибка при обработке сообщения.")
+
+
+@router.callback_query(F.data.startswith("ai_btn:"))
+async def process_response_button(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    action = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    delegates_topic_callback = action.startswith("topic_") and action[6:].isdigit()
+    if not delegates_topic_callback:
+        await callback.answer()
+
+    if action == "start_test":
+        await _start_test_from_ai_directive(bot, user_id, state)
+        return
+    if action == "topics":
+        message_proxy = SimpleNamespace(
+            from_user=callback.from_user,
+            chat=callback.message.chat,
+            answer=callback.message.answer,
+        )
+        await select_topic_menu(message_proxy)
+        return
+    if delegates_topic_callback:
+        topic_callback = callback.model_copy(update={"data": f"select_topic_{action[6:]}"})
+        await process_topic_selection(topic_callback, state, bot)
+        return
+    if action == "new_dialogue":
+        message_proxy = SimpleNamespace(
+            from_user=callback.from_user,
+            answer=callback.message.answer,
+        )
+        await ask_delete_history(message_proxy, state)
+        return
+    if action == "main_menu":
+        await callback.message.answer("Главное меню:", reply_markup=await kb.main_client_keyboard(user_id))
+        return
+    if action == "subscription":
+        message_proxy = SimpleNamespace(
+            from_user=callback.from_user,
+            answer=callback.message.answer,
+        )
+        await show_subscription_info(message_proxy, state, bot)
+        return
+    if action == "referral":
+        message_proxy = SimpleNamespace(
+            from_user=callback.from_user,
+            chat=callback.message.chat,
+            answer=callback.message.answer,
+        )
+        await show_referral_info(message_proxy, bot)
+        return
+
+    user_message_buffers[user_id] = [action]
+    await process_buffered_messages(user_id, bot, state)
 
 
 @router.callback_query(F.data.startswith("card_select_"))
@@ -1421,12 +1523,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 typing_task_interp.cancel()
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
                 if clean_interpretation:
-                    html_interp = markdown_to_html(clean_interpretation)
-                    for chunk in split_html_text(html_interp):
-                        await _safe_send_html(
-                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
-                            chunk,
-                        )
+                    await _send_generated_response(bot, user_id, clean_interpretation)
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation,
@@ -3079,9 +3176,20 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     fb_provider = getattr(config, 'fallback_provider', None) if config else None
     fb_model = getattr(config, 'fallback_model', None) if config else None
     use_proxy = getattr(config, 'use_proxy', True) if config else True
+    api_keys = {
+        'Deepseek': getattr(config, 'deepseek_api_key', None) if config else None,
+        'Claude': getattr(config, 'claude_api_key', None) if config else None,
+        'Gemini': getattr(config, 'gemini_api_key', None) if config else None,
+        'KIE': getattr(config, 'kie_api_key', None) if config else None,
+        'OpenAI': getattr(config, 'openai_api_key', None) if config else None,
+    }
+    keys_text = "\n".join(
+        f"<b>{provider}:</b> <code>{html.escape(kb.mask_api_key(value))}</code>"
+        for provider, value in api_keys.items()
+    )
 
     await callback.message.edit_text(
-        "🔑 Настройка ключей, моделей и глубины контекста (памяти)",
+        "🔑 <b>Ключи, модели и глубина контекста</b>\n\n" + keys_text,
         reply_markup=kb.ai_keys_models_keyboard(
             trans_provider,
             c_first,
@@ -3097,8 +3205,10 @@ async def admin_ai_keys_models(callback: CallbackQuery):
             memory_mode,
             fb_provider,
             fb_model,
-            use_proxy=use_proxy
-        )
+            use_proxy=use_proxy,
+            api_keys=api_keys,
+        ),
+        parse_mode="HTML",
     )
 
 
@@ -4578,6 +4688,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         
         should_start_test, response_without_test_directive = _extract_test_start_directive(response_text)
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_without_test_directive)
+        clean_text, response_button_rows = extract_response_buttons(clean_text)
+        response_markup = _telegram_response_buttons_markup(response_button_rows)
 
         if should_start_test:
             if clean_text:
@@ -4601,19 +4713,25 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             if text_part:
                 html_text = markdown_to_html(text_part)
                 try:
-                    await thinking_msg.edit_text(html_text, parse_mode="HTML")
+                    await thinking_msg.edit_text(html_text, parse_mode="HTML", reply_markup=response_markup)
                 except Exception:
                     fixed_html = _fix_unclosed_html_tags(html_text)
                     try:
-                        await thinking_msg.edit_text(fixed_html, parse_mode="HTML")
+                        await thinking_msg.edit_text(fixed_html, parse_mode="HTML", reply_markup=response_markup)
                     except Exception:
                         await thinking_msg.delete()
-                        for chunk in split_html_text(html_text):
+                        chunks = split_html_text(html_text)
+                        for index, chunk in enumerate(chunks):
+                            chunk_markup = response_markup if index == len(chunks) - 1 else None
                             await _safe_send_html(
-                                lambda text, pm: message.answer(text, parse_mode=pm),
+                                lambda text, pm, markup=chunk_markup: message.answer(
+                                    text, parse_mode=pm, reply_markup=markup
+                                ),
                                 chunk,
                             )
                             await asyncio.sleep(0.3)
+            elif response_markup:
+                await thinking_msg.edit_text("Выберите действие:", reply_markup=response_markup)
             else:
                 await thinking_msg.delete()
 
@@ -4642,20 +4760,25 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             if clean_text:
                 html_response = markdown_to_html(clean_text)
                 try:
-                    await thinking_msg.edit_text(html_response, parse_mode="HTML")
+                    await thinking_msg.edit_text(html_response, parse_mode="HTML", reply_markup=response_markup)
                 except Exception:
                     fixed_html = _fix_unclosed_html_tags(html_response)
                     try:
-                        await thinking_msg.edit_text(fixed_html, parse_mode="HTML")
+                        await thinking_msg.edit_text(fixed_html, parse_mode="HTML", reply_markup=response_markup)
                     except Exception:
                         await thinking_msg.delete()
                         chunks = split_html_text(html_response, 4000)
-                        for chunk in chunks:
+                        for index, chunk in enumerate(chunks):
+                            chunk_markup = response_markup if index == len(chunks) - 1 else None
                             await _safe_send_html(
-                                lambda text, pm: message.answer(text, parse_mode=pm),
+                                lambda text, pm, markup=chunk_markup: message.answer(
+                                    text, parse_mode=pm, reply_markup=markup
+                                ),
                                 chunk,
                             )
                             await asyncio.sleep(0.3)
+            elif response_markup:
+                await thinking_msg.edit_text("Выберите действие:", reply_markup=response_markup)
             else:
                 await thinking_msg.delete()
 
@@ -4817,12 +4940,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 typing_task_interp.cancel()
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
                 if clean_interpretation:
-                    html_interp = markdown_to_html(clean_interpretation)
-                    for chunk in split_html_text(html_interp):
-                        await _safe_send_html(
-                            lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
-                            chunk,
-                        )
+                    await _send_generated_response(bot, user_id, clean_interpretation)
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation, dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
@@ -5539,7 +5657,7 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
 
         topic = await session.get(Topic, topic_id)
 
-    if not topic:
+    if not topic or not topic.is_active or (topic.admin_only and not (user and user.is_admin)):
         await callback.answer("Тема больше недоступна.", show_alert=True)
         return
 
@@ -10947,13 +11065,28 @@ async def process_audio_limit(message: Message, state: FSMContext, bot: Bot):
                 message_id=message_id_to_edit,
                 text="🔑 Настройка ключей и моделей API",
                 reply_markup=kb.ai_keys_models_keyboard(
-                    transcription_provider,
-                    config.context_limit_first if config else 2,
-                    config.context_limit_recent if config else 10,
-                    config.vision_provider if config else 'Gemini',
-                    config.vision_model if config else 'gemini-3-flash-preview',
-                    getattr(config, 'temperature', 0.7) if config else 0.7,
-                    get_memory_mode(config) if config else MEMORY_MODE_RESET
+                    current_transcription_provider=transcription_provider,
+                    context_first=config.context_limit_first if config else 2,
+                    context_recent=config.context_limit_recent if config else 10,
+                    current_vision_provider=config.vision_provider if config else 'Gemini',
+                    current_vision_model=config.vision_model if config else 'gemini-3-flash-preview',
+                    image_generation_provider=getattr(config, 'image_generation_provider', 'Gemini') if config else 'Gemini',
+                    image_generation_model=getattr(config, 'image_generation_model', 'imagen-4.0-generate-001') if config else 'imagen-4.0-generate-001',
+                    image_edit_provider=getattr(config, 'image_edit_provider', 'Gemini') if config else 'Gemini',
+                    image_edit_model=getattr(config, 'image_edit_model', 'gemini-3-pro-image-preview') if config else 'gemini-3-pro-image-preview',
+                    kie_credit_alert_threshold=getattr(config, 'kie_credit_alert_threshold', 0) if config else 0,
+                    temperature=getattr(config, 'temperature', 0.7) if config else 0.7,
+                    memory_mode=get_memory_mode(config) if config else MEMORY_MODE_RESET,
+                    fallback_provider=getattr(config, 'fallback_provider', None) if config else None,
+                    fallback_model=getattr(config, 'fallback_model', None) if config else None,
+                    use_proxy=getattr(config, 'use_proxy', True) if config else True,
+                    api_keys={
+                        'Deepseek': getattr(config, 'deepseek_api_key', None) if config else None,
+                        'Claude': getattr(config, 'claude_api_key', None) if config else None,
+                        'Gemini': getattr(config, 'gemini_api_key', None) if config else None,
+                        'KIE': getattr(config, 'kie_api_key', None) if config else None,
+                        'OpenAI': getattr(config, 'openai_api_key', None) if config else None,
+                    },
                 )
             )
         except TelegramBadRequest:
@@ -11884,7 +12017,8 @@ async def finish_test_generation(
         logging.exception("Universal test interpretation failed")
         interpretation_text = preliminary_interpretation or "Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже."
 
-    html_story = markdown_to_html(interpretation_text)
+    visible_interpretation, interpretation_buttons = extract_response_buttons(interpretation_text)
+    html_story = markdown_to_html(visible_interpretation or ("Выберите действие:" if interpretation_buttons else ""))
 
     async with async_session_maker() as session:
         session.add(DBMessage(
@@ -11896,7 +12030,15 @@ async def finish_test_generation(
         ))
         await session.commit()
 
-    reply_markup = kb.case_study_confirmation_keyboard() if secret_test_enabled else None
+    reply_markup = _telegram_response_buttons_markup(interpretation_buttons)
+    if secret_test_enabled:
+        case_markup = kb.case_study_confirmation_keyboard()
+        if reply_markup:
+            reply_markup = InlineKeyboardMarkup(
+                inline_keyboard=[*reply_markup.inline_keyboard, *case_markup.inline_keyboard]
+            )
+        else:
+            reply_markup = case_markup
     await message.edit_text(html_story, reply_markup=reply_markup)
 
 
@@ -12039,8 +12181,12 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
     interpretation_response = await get_ai_response_direct(user_id, system_instruction, user_prompt_data)
 
     interpretation_response = interpretation_response.replace("{user_name}", user_name)
+    visible_interpretation, interpretation_buttons = extract_response_buttons(interpretation_response)
+    interpretation_markup = _telegram_response_buttons_markup(interpretation_buttons)
 
-    html_response = markdown_to_html(interpretation_response)
+    html_response = markdown_to_html(
+        visible_interpretation or ("Выберите действие:" if interpretation_buttons else "")
+    )
 
     async with async_session_maker() as session:
         session.add(DBMessage(
@@ -12055,9 +12201,12 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
     await loading_msg.delete()
 
     chunks = split_message(html_response, 4000)
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
+        chunk_markup = interpretation_markup if index == len(chunks) - 1 else None
         await _safe_send_html(
-            lambda text, pm: callback.message.answer(text, parse_mode=pm),
+            lambda text, pm, markup=chunk_markup: callback.message.answer(
+                text, parse_mode=pm, reply_markup=markup
+            ),
             chunk,
         )
         await asyncio.sleep(0.3)
@@ -15637,7 +15786,14 @@ async def save_ai_timeout(message: Message, state: FSMContext):
                 memory_mode=get_memory_mode(conf2) if conf2 else "reset",
                 fallback_provider=getattr(conf2, 'fallback_provider', None) if conf2 else None,
                 fallback_model=getattr(conf2, 'fallback_model', None) if conf2 else None,
-                use_proxy=getattr(conf2, 'use_proxy', True) if conf2 else True
+                use_proxy=getattr(conf2, 'use_proxy', True) if conf2 else True,
+                api_keys={
+                    'Deepseek': getattr(conf2, 'deepseek_api_key', None) if conf2 else None,
+                    'Claude': getattr(conf2, 'claude_api_key', None) if conf2 else None,
+                    'Gemini': getattr(conf2, 'gemini_api_key', None) if conf2 else None,
+                    'KIE': getattr(conf2, 'kie_api_key', None) if conf2 else None,
+                    'OpenAI': getattr(conf2, 'openai_api_key', None) if conf2 else None,
+                },
             )
             await message.answer(text, reply_markup=kb)
             

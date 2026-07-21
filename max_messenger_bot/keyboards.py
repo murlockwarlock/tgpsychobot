@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from sqlalchemy import select
+from response_buttons import ResponseButton
 
 from .legacy import Content, SubscriptionConfig, SubscriptionPlan, TestConfig, Topic, async_session_maker
 
@@ -21,6 +22,26 @@ def link_button(text: str, url: str) -> dict:
 
 def inline_keyboard(rows: list[list[dict]]) -> list[dict]:
     return [{"type": "inline_keyboard", "payload": {"buttons": rows}}]
+
+
+def response_buttons_keyboard(
+    rows: list[list[ResponseButton]],
+    *,
+    include_main_menu: bool = False,
+) -> list[dict]:
+    converted_rows: list[list[dict]] = []
+    for row in rows:
+        converted = [
+            link_button(button.text, button.value)
+            if button.kind == "url"
+            else callback_button(button.text, f"ai_btn:{button.value}")
+            for button in row
+        ]
+        if converted:
+            converted_rows.append(converted)
+    if include_main_menu:
+        converted_rows.append(main_menu_row())
+    return inline_keyboard(converted_rows) if converted_rows else []
 
 
 def main_menu_row(text: str = "⬅️ В главное меню") -> list[dict]:

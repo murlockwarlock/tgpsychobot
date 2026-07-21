@@ -254,11 +254,12 @@ async def handle_yookassa_webhook(request: web.Request):
                 plan_part = plan_name_log or f"plan_id={plan_id_raw}"
                 plog.info(f"ОПЛАТА_ПРЕРВАНА | Yookassa | {user_part} | {plan_part} | PayId={payment_id}")
                 uid_int = int(user_id_str)
-                if is_recurring_payment and attempt_num and uid_int < 100_000_000_000:
+                if is_recurring_payment and attempt_num:
                     try:
                         if auto_renewal_disabled:
                             end_date_text = user_end_date.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M МСК') if user_end_date else "неизвестной даты"
-                            await bot.send_message(
+                            await send_msg_universal(
+                                bot,
                                 uid_int,
                                 f"Не удалось списать средства (ЮKassa) после 3 попыток. Автопродление отключено.\n\n"
                                 f"Текущая подписка активна до {end_date_text}."
@@ -270,9 +271,9 @@ async def handle_yookassa_webhook(request: web.Request):
                                 if attempt_num == 1
                                 else f"Не удалось списать средства (ЮKassa). Последняя попытка — {next_retry_text}."
                             )
-                            await bot.send_message(uid_int, retry_text)
+                            await send_msg_universal(bot, uid_int, retry_text)
                         else:
-                            await bot.send_message(uid_int, "Не удалось списать средства (ЮKassa).")
+                            await send_msg_universal(bot, uid_int, "Не удалось списать средства (ЮKassa).")
                     except Exception:
                         pass
                 if config and config.notifications_enabled:

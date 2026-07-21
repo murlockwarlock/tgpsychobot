@@ -219,6 +219,14 @@ def ai_settings_keyboard(current_provider: str):
     return builder.as_markup()
 
 
+def mask_api_key(value: str | None) -> str:
+    if not value:
+        return "Не задан"
+    if len(value) <= 8:
+        return value
+    return f"{value[:4]}...{value[-4:]}"
+
+
 def ai_keys_models_keyboard(current_transcription_provider: str, context_first: int, context_recent: int,
                             current_vision_provider: str, current_vision_model: str,
                             image_generation_provider: str, image_generation_model: str,
@@ -226,7 +234,8 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                             kie_credit_alert_threshold: float,
                             temperature: float = 0.7, memory_mode: str = "reset",
                             fallback_provider: str | None = None, fallback_model: str | None = None,
-                            use_proxy: bool = True):
+                            use_proxy: bool = True,
+                            api_keys: dict[str, str | None] | None = None):
     def short_model(model: str, limit: int = 16) -> str:
         if len(model) <= limit:
             return model
@@ -234,11 +243,12 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
 
     builder = InlineKeyboardBuilder()
 
-    builder.button(text="🔑 Deepseek", callback_data="set_key_Deepseek")
-    builder.button(text="🔑 Claude", callback_data="set_key_Claude")
-    builder.button(text="🔑 Gemini", callback_data="set_key_Gemini")
-    builder.button(text="🔑 KIE", callback_data="set_key_KIE")
-    builder.button(text="🔑 OpenAI", callback_data="set_key_OpenAI")
+    api_keys = api_keys or {}
+    builder.button(text=f"🔑 Deepseek: {mask_api_key(api_keys.get('Deepseek'))}", callback_data="set_key_Deepseek")
+    builder.button(text=f"🔑 Claude: {mask_api_key(api_keys.get('Claude'))}", callback_data="set_key_Claude")
+    builder.button(text=f"🔑 Gemini: {mask_api_key(api_keys.get('Gemini'))}", callback_data="set_key_Gemini")
+    builder.button(text=f"🔑 KIE: {mask_api_key(api_keys.get('KIE'))}", callback_data="set_key_KIE")
+    builder.button(text=f"🔑 OpenAI: {mask_api_key(api_keys.get('OpenAI'))}", callback_data="set_key_OpenAI")
 
     builder.button(text="🧠 Deepseek", callback_data="view_models_Deepseek")
     builder.button(text="🧠 Claude", callback_data="view_models_Claude")

@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 from ..ai import AIServiceError, generate_image, get_ai_response, edit_image
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
-from ..keyboards import build_main_menu, disclaimer_keyboard, inline_keyboard, main_menu_row
+from ..keyboards import build_main_menu, disclaimer_keyboard, inline_keyboard, main_menu_row, response_buttons_keyboard
 from ..logging_utils import get_bot_logger
 from ..legacy import (
     AIConfig,
@@ -29,6 +29,7 @@ from ..legacy import (
 from ..storage import MaxContentMedia, StateStore
 from ..time_utils import utc_now
 from memory_mode import normalize_memory_mode, start_new_dialogue
+from response_buttons import ResponseButton, extract_response_buttons
 
 
 log = get_bot_logger("common")
@@ -49,13 +50,35 @@ def _extract_test_start_directive(text: str | None) -> tuple[bool, str]:
     return True, clean_text.strip(" \t\r\n-—–:;")
 
 
+async def _notify_referrer_about_registration(
+    client: MaxApiClient,
+    referrer_id: int,
+    bonus_days: int,
+) -> None:
+    from ..models import MAX_ID_OFFSET
+
+    await client.send_message(
+        user_id=referrer_id - MAX_ID_OFFSET,
+        text=(
+            "🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!\n"
+            f"Вам начислено <b>{bonus_days} бонусных дн.</b> к доступу. "
+            "Спасибо, что рекомендуете нас!"
+        ),
+    )
+
+
+def _response_buttons_keyboard(response_buttons: list[list[ResponseButton]] | None) -> list[dict]:
+    return response_buttons_keyboard(response_buttons or [], include_main_menu=True)
+
+
 async def _send_ai_text(
     client: MaxApiClient,
     chat_id: int,
     thinking_message_id: str | None,
     chunks: list[str],
+    response_buttons: list[list[ResponseButton]] | None = None,
 ) -> None:
-    main_menu_kb = inline_keyboard([main_menu_row()])
+    main_menu_kb = _response_buttons_keyboard(response_buttons)
     if not chunks:
         return
 
@@ -189,6 +212,7 @@ async def show_help(client: MaxApiClient, chat_id: int, user_id: int) -> None:
 
 
 async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, start_payload: str | None = None, states: StateStore | None = None) -> None:
+    referrer_notification: tuple[int, int] | None = None
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.current_topic), selectinload(User.subscription)])
         if not user:
@@ -240,6 +264,13 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                     if sub_config.referral_bonus_days_referrer > 0:
                         if referrer.subscription and referrer.subscription.end_date > now:
                             referrer.subscription.end_date += timedelta(days=sub_config.referral_bonus_days_referrer)
+                        elif referrer.subscription:
+                            referrer.subscription.plan_id = None
+                            referrer.subscription.start_date = now
+                            referrer.subscription.end_date = now + timedelta(days=sub_config.referral_bonus_days_referrer)
+                            referrer.subscription.payment_provider = "Trial Referral Bonus"
+                            referrer.subscription.auto_renewal = False
+                            referrer.subscription.payment_attempt_count = 0
                         else:
                             session.add(
                                 UserSubscription(
@@ -253,6 +284,10 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                                     discount_percent=0,
                                 )
                             )
+                        referrer_notification = (
+                            referrer_id,
+                            sub_config.referral_bonus_days_referrer,
+                        )
                     await session.commit()
 
         if is_new_trial_needed and sub_config and sub_config.subscriptions_enabled and sub_config.welcome_bonus_days > 0:
@@ -274,6 +309,16 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                 f"Бесплатный доступ на {sub_config.welcome_bonus_days} дн."
             )
             await session.commit()
+
+    if referrer_notification:
+        referrer_id, bonus_days = referrer_notification
+        try:
+            await _notify_referrer_about_registration(client, referrer_id, bonus_days)
+        except Exception:
+            log.exception(
+                "Failed to notify MAX referrer user_id=%s about registration",
+                referrer_id,
+            )
 
     if start_payload:
         if start_payload == "sub":
@@ -431,16 +476,29 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             await start_test(client, chat_id, user_id, states)
             return
 
+        clean_response_text, response_buttons = extract_response_buttons(response_without_test_directive)
+
         # Check for image generation directive GEN_IMG: [...] or [IMG: ...]
-        img_match = re.search(r"GEN_IMG:\s*\[(.*?)\]|\[IMG:\s*(.*?)\]", response_without_test_directive, re.DOTALL)
+        img_match = re.search(r"GEN_IMG:\s*\[(.*?)\]|\[IMG:\s*(.*?)\]", clean_response_text, re.DOTALL)
         if img_match:
             img_prompt = (img_match.group(1) or img_match.group(2) or "").strip()
-            clean_text = re.sub(r"GEN_IMG:\s*\[.*?\]|\[IMG:\s*.*?\]", "", response_without_test_directive, flags=re.DOTALL).strip()
+            clean_text = re.sub(r"GEN_IMG:\s*\[.*?\]|\[IMG:\s*.*?\]", "", clean_response_text, flags=re.DOTALL).strip()
+            buttons_sent = False
             if thinking_message_id and clean_text:
-                await client.edit_message(thinking_message_id, text=markdown_to_html(clean_text))
+                await client.edit_message(
+                    thinking_message_id,
+                    text=markdown_to_html(clean_text),
+                    attachments=_response_buttons_keyboard(response_buttons),
+                )
                 thinking_message_id = None
+                buttons_sent = bool(response_buttons)
             elif clean_text:
-                await client.send_message(chat_id=chat_id, text=markdown_to_html(clean_text))
+                await client.send_message(
+                    chat_id=chat_id,
+                    text=markdown_to_html(clean_text),
+                    attachments=_response_buttons_keyboard(response_buttons),
+                )
+                buttons_sent = bool(response_buttons)
             try:
                 img_bytes = await generate_image(img_prompt)
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -458,11 +516,19 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             except Exception as img_exc:
                 log.exception("Image generation failed user_id=%s: %s", user_id, img_exc)
                 await client.send_message(chat_id=chat_id, text=f"⚠️ Не удалось создать изображение: {img_exc}")
+            if response_buttons and not buttons_sent:
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Выберите действие:",
+                    attachments=_response_buttons_keyboard(response_buttons),
+                )
             return
 
-        html_text = markdown_to_html(response_without_test_directive)
+        if not clean_response_text and response_buttons:
+            clean_response_text = "Выберите действие:"
+        html_text = markdown_to_html(clean_response_text)
         chunks = split_text(html_text)
-        await _send_ai_text(client, chat_id, thinking_message_id, chunks)
+        await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
         log.info("AI dialogue completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)

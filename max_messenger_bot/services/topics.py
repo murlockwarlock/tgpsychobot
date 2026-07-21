@@ -50,7 +50,12 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         user = await session.get(User, user_id)
         topic = await session.get(Topic, topic_id)
         config = await session.get(AIConfig, 1)
-    if not user or not topic or not topic.is_active:
+    if (
+        not user
+        or not topic
+        or not topic.is_active
+        or (topic.admin_only and not user.is_admin)
+    ):
         await client.send_message(chat_id=chat_id, text="Тема недоступна.")
         return
     current_memory_mode = normalize_memory_mode(config)

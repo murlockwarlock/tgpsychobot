@@ -684,6 +684,39 @@ class MaxBotApplication:
         if data == "noop":
             await self.client.answer_callback(callback.callback_id)
             return
+        if data.startswith("ai_btn:"):
+            action = data.split(":", 1)[1]
+            await self.client.answer_callback(callback.callback_id)
+            if action == "start_test":
+                await tests_service.start_test(self.client, chat_id, user_id, self.states)
+                return
+            if action == "topics":
+                await topics_service.show_topics(self.client, chat_id, user_id)
+                return
+            if action.startswith("topic_") and action[6:].isdigit():
+                await topics_service.select_topic(self.client, chat_id, user_id, int(action[6:]))
+                return
+            if action == "new_dialogue":
+                await common.reset_dialogue(self.client, chat_id, user_id)
+                return
+            if action == "main_menu":
+                await common.send_main_menu(self.client, chat_id, user_id=user_id)
+                return
+            if action == "subscription":
+                await subscriptions_service.show_subscription_info(self.client, chat_id, user_id)
+                return
+            if action == "referral":
+                await subscriptions_service.show_referral_info(self.client, chat_id, user_id)
+                return
+
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id, options=[selectinload(User.subscription)])
+            if user and await common.ensure_access_before_chat(self.client, chat_id, user):
+                self.spawn_user_task(
+                    user_id,
+                    common.run_ai_dialogue(self.client, chat_id, user_id, action, self.states),
+                )
+            return
         if data == "cancel_test":
             await self.states.clear(user_id)
             await self.client.send_message(

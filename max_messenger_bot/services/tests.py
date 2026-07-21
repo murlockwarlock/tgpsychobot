@@ -8,10 +8,11 @@ from sqlalchemy import delete, func, select, update
 from ..ai import AIServiceError, get_ai_response, get_ai_response_direct
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html
-from ..keyboards import case_study_keyboard, final_test_keyboard, secret_test_keyboard, universal_test_answers_keyboard
+from ..keyboards import case_study_keyboard, final_test_keyboard, response_buttons_keyboard, secret_test_keyboard, universal_test_answers_keyboard
 from ..legacy import CaseStudy, Content, Message as DBMessage, SecretTestQuestion, TestConfig, TestQuestion, TestSession, User, async_session_maker
 from ..logging_utils import get_ai_logger, get_bot_logger
 from ..storage import StateStore
+from response_buttons import extract_response_buttons
 from universal_tests import (
     build_result_handoff_prompt,
     build_prompt_payload,
@@ -340,7 +341,12 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
         ai_log.exception("Universal Max test final interpretation failed user_id=%s", user_id)
         final_text = preliminary or "Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже."
 
-    await client.send_message(chat_id=chat_id, text=markdown_to_html(final_text))
+    visible_text, button_rows = extract_response_buttons(final_text)
+    await client.send_message(
+        chat_id=chat_id,
+        text=markdown_to_html(visible_text or ("Выберите действие:" if button_rows else "")),
+        attachments=response_buttons_keyboard(button_rows) or None,
+    )
     async with async_session_maker() as session:
         session.add(DBMessage(
             user_id=user_id,
@@ -379,7 +385,12 @@ async def show_results(client: MaxApiClient, chat_id: int, user_id: int) -> None
     case_study = _pick_relevant_case(case_studies, ranking)
     await client.send_message(chat_id=chat_id, text=_render_case_block(case_study, ranking))
     ai_summary = await _build_ai_summary(user, test_config, diagram_text, ranking, case_study)
-    await client.send_message(chat_id=chat_id, text=markdown_to_html(ai_summary))
+    visible_summary, summary_buttons = extract_response_buttons(ai_summary)
+    await client.send_message(
+        chat_id=chat_id,
+        text=markdown_to_html(visible_summary or ("Выберите действие:" if summary_buttons else "")),
+        attachments=response_buttons_keyboard(summary_buttons) or None,
+    )
     async with async_session_maker() as session:
         if ai_summary:
             session.add(
