@@ -81,7 +81,7 @@ from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE
 from user_metadata import append_metadata_records, extract_data_blocks, load_metadata_records
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
-from response_buttons import ResponseButton, extract_response_buttons
+from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
 from sqlalchemy import delete
 from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
@@ -135,7 +135,6 @@ user_locks = {}
 user_message_buffers = {}
 user_processing_tasks = {}
 
-TEST_START_DIRECTIVE_RE = re.compile(r"(?<!\w)\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)", re.IGNORECASE)
 user_spread_state = {}  # Runtime cache; the source of truth is card_spread_states in the database.
 PAGE_SIZE = 5
 USER_HISTORY_PAGE_SIZE = 10
@@ -1001,17 +1000,6 @@ def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None
     return payload, clean_text
 
 
-def _extract_test_start_directive(text: str | None) -> tuple[bool, str]:
-    raw = text or ""
-    has_directive = bool(TEST_START_DIRECTIVE_RE.search(raw))
-    if not has_directive:
-        return False, raw.strip()
-    clean_text = TEST_START_DIRECTIVE_RE.sub("", raw)
-    clean_text = re.sub(r"\s+([.,!?;:])", r"\1", clean_text)
-    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
-    return True, clean_text.strip(" \t\r\n-—–:;")
-
-
 def _telegram_response_buttons_markup(rows: list[list[ResponseButton]]) -> InlineKeyboardMarkup | None:
     if not rows:
         return None
@@ -1129,7 +1117,7 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
         response_text = await ai_integration.generate_response(user_id, full_text, bot=bot)
         typing_task.cancel()
 
-        should_start_test, directive_clean_text = _extract_test_start_directive(response_text)
+        should_start_test, directive_clean_text = extract_test_start_directive(response_text)
         if should_start_test:
             if directive_clean_text:
                 html_response = markdown_to_html(directive_clean_text)
@@ -4686,7 +4674,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
     try:
         response_text = await get_ai_response(user_id, ai_prompt_text, user_name, user_gender)
         
-        should_start_test, response_without_test_directive = _extract_test_start_directive(response_text)
+        should_start_test, response_without_test_directive = extract_test_start_directive(response_text)
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_without_test_directive)
         clean_text, response_button_rows = extract_response_buttons(clean_text)
         response_markup = _telegram_response_buttons_markup(response_button_rows)

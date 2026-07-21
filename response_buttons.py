@@ -11,6 +11,10 @@ MAX_BUTTONS_PER_ROW = 8
 MAX_BUTTON_ROWS = 20
 BUTTON_RE = re.compile(r"\[([^\]\n]{1,64})\]\((.+)\)")
 ACTION_RE = re.compile(r"[A-Za-z0-9_.-]{1,30}")
+TEST_START_DIRECTIVE_RE = re.compile(
+    r"(?<![:\w])\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -62,3 +66,15 @@ def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseB
     clean_text = "\n".join(clean_lines).strip()
     clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
     return clean_text, rows
+
+
+def extract_test_start_directive(text: str | None) -> tuple[bool, str]:
+    """Extract a standalone test directive without executing btn:start_test buttons."""
+    raw = text or ""
+    has_directive = bool(TEST_START_DIRECTIVE_RE.search(raw))
+    if not has_directive:
+        return False, raw.strip()
+    clean_text = TEST_START_DIRECTIVE_RE.sub("", raw)
+    clean_text = re.sub(r"\s+([.,!?;:])", r"\1", clean_text)
+    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
+    return True, clean_text.strip(" \t\r\n-—–:;")

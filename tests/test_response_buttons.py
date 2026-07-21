@@ -4,7 +4,7 @@ import unittest
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-from response_buttons import extract_response_buttons
+from response_buttons import extract_response_buttons, extract_test_start_directive
 from keyboards import ai_keys_models_keyboard, mask_api_key
 
 
@@ -53,6 +53,27 @@ class ResponseButtonsTests(unittest.TestCase):
         text, rows = extract_response_buttons(source)
         self.assertEqual(text, source)
         self.assertEqual(rows, [])
+
+    def test_start_test_button_is_not_executed_as_directive(self):
+        source = (
+            "Проверка кнопок:\n\n"
+            "[YouTube](https://www.youtube.com/) | [Пройти тест](btn:start_test)"
+        )
+
+        should_start_test, clean_text = extract_test_start_directive(source)
+        visible_text, rows = extract_response_buttons(clean_text)
+
+        self.assertFalse(should_start_test)
+        self.assertEqual(visible_text, "Проверка кнопок:")
+        self.assertEqual([button.text for button in rows[0]], ["YouTube", "Пройти тест"])
+
+    def test_standalone_start_test_directive_still_works(self):
+        should_start_test, clean_text = extract_test_start_directive(
+            "Можно начинать.\n\n[START_TEST]"
+        )
+
+        self.assertTrue(should_start_test)
+        self.assertEqual(clean_text, "Можно начинать.")
 
 
 class ApiKeyDisplayTests(unittest.TestCase):

@@ -29,25 +29,13 @@ from ..legacy import (
 from ..storage import MaxContentMedia, StateStore
 from ..time_utils import utc_now
 from memory_mode import normalize_memory_mode, start_new_dialogue
-from response_buttons import ResponseButton, extract_response_buttons
+from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
 
 
 log = get_bot_logger("common")
 
 
 MSK = timezone(timedelta(hours=3))
-TEST_START_DIRECTIVE_RE = re.compile(r"(?<!\w)\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)", re.IGNORECASE)
-
-
-def _extract_test_start_directive(text: str | None) -> tuple[bool, str]:
-    raw = text or ""
-    has_directive = bool(TEST_START_DIRECTIVE_RE.search(raw))
-    if not has_directive:
-        return False, raw.strip()
-    clean_text = TEST_START_DIRECTIVE_RE.sub("", raw)
-    clean_text = re.sub(r"\s+([.,!?;:])", r"\1", clean_text)
-    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
-    return True, clean_text.strip(" \t\r\n-—–:;")
 
 
 async def _notify_referrer_about_registration(
@@ -462,7 +450,7 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ")
 
-        should_start_test, response_without_test_directive = _extract_test_start_directive(response_text)
+        should_start_test, response_without_test_directive = extract_test_start_directive(response_text)
         await save_ai_message(user_id, response_without_test_directive)
 
         if should_start_test:
