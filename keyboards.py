@@ -367,6 +367,8 @@ def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view
     builder.button(text="📥 Скачать историю", callback_data=f"download_history_{user_id}")
     builder.button(text="🧩 Метаданные", callback_data=f"client_metadata_{user_id}_0")
     builder.button(text="📥 Скачать метаданные", callback_data=f"download_metadata_{user_id}")
+    builder.button(text="🧪 Результаты тестов", callback_data=f"client_test_attempts_{user_id}_0")
+    builder.button(text="📥 Скачать результаты тестов", callback_data=f"download_test_attempts_{user_id}")
     builder.button(text="🎁 Сбросить промокоды", callback_data=f"reset_user_promos_{user_id}")
     builder.button(text="🔄 Сбросить подписку", callback_data=f"admin_reset_sub_{user_id}")
     builder.button(text="🗑️ Удалить историю", callback_data=f"admin_delete_client_history_{user_id}")
@@ -1330,6 +1332,15 @@ def metadata_export_options_keyboard(user_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="JSON (Обычный)", callback_data=f"run_metadata_export_no_{user_id}")
     builder.button(text="JSON (Обезличенный)", callback_data=f"run_metadata_export_yes_{user_id}")
+    builder.button(text="⬅️ Назад в профиль", callback_data=f"view_client_{user_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def test_attempt_export_options_keyboard(user_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="JSON (Обычный)", callback_data=f"run_test_attempts_export_no_{user_id}")
+    builder.button(text="JSON (Обезличенный)", callback_data=f"run_test_attempts_export_yes_{user_id}")
     builder.button(text="⬅️ Назад в профиль", callback_data=f"view_client_{user_id}")
     builder.adjust(1)
     return builder.as_markup()

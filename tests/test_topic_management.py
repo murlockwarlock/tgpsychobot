@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime
 
 from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -15,6 +16,7 @@ from database import (  # noqa: E402
     Message,
     RandomMessage,
     TestSession as DBTestSession,
+    TestAttempt as DBTestAttempt,
     Topic,
     TopicMediaDeck,
     User,
@@ -55,6 +57,7 @@ class TopicDeletionTests(unittest.IsolatedAsyncioTestCase):
             phrase.topic_id = topic.id
             session.add_all([
                 DBTestSession(user_id=user.id, invocation_topic_id=topic.id, answers="[]"),
+                DBTestAttempt(user_id=user.id, topic_id=topic.id, completed_at=datetime.utcnow()),
                 UserTopicState(user_id=user.id, topic_id=topic.id, dialogue_id=1),
                 TopicMediaDeck(topic_id=topic.id, deck_name="cards"),
             ])
@@ -74,6 +77,8 @@ class TopicDeletionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone((await session.get(Message, message.id)).topic_id)
             self.assertIsNone((await session.get(MediaLibrary, media.id)).topic_id)
             self.assertIsNone((await session.get(DBTestSession, 100)).invocation_topic_id)
+            attempt = await session.scalar(select(DBTestAttempt).where(DBTestAttempt.user_id == 100))
+            self.assertIsNone(attempt.topic_id)
             self.assertEqual(await session.scalar(select(func.count(RandomMessage.id))), 0)
             self.assertEqual(await session.scalar(select(func.count(UserTopicState.user_id))), 0)
             self.assertEqual(await session.scalar(select(func.count(TopicMediaDeck.topic_id))), 0)

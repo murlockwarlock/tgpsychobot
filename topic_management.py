@@ -6,6 +6,7 @@ from database import (
     MediaLibrary,
     Message,
     RandomMessage,
+    TestAttempt,
     TestSession,
     Topic,
     TopicMediaDeck,
@@ -26,6 +27,7 @@ async def delete_topic_with_dependencies(session, topic_id: int) -> bool:
     await session.execute(update(Message).where(Message.topic_id == topic_id).values(topic_id=None))
     await session.execute(update(MediaLibrary).where(MediaLibrary.topic_id == topic_id).values(topic_id=None))
     await session.execute(update(TestSession).where(TestSession.invocation_topic_id == topic_id).values(invocation_topic_id=None))
+    await session.execute(update(TestAttempt).where(TestAttempt.topic_id == topic_id).values(topic_id=None))
 
     await session.execute(delete(RandomMessage).where(RandomMessage.topic_id == topic_id))
     await session.execute(delete(UserTopicState).where(UserTopicState.topic_id == topic_id))

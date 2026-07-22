@@ -1,7 +1,7 @@
 import asyncio
 import textwrap
 from sqlalchemy import (create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, BigInteger, Table,
-                        Float, Interval, Index, func)
+                        Float, Interval, Index, UniqueConstraint, func)
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from datetime import datetime, timedelta
@@ -393,6 +393,26 @@ class TestSession(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class TestAttempt(Base):
+    __tablename__ = 'test_attempts'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'source_session_created_at', name='uq_test_attempt_user_session'),
+        Index('idx_test_attempt_user_completed', 'user_id', 'completed_at'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    completed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    source_session_created_at = Column(DateTime, nullable=True)
+    platform = Column(String, nullable=True)
+    topic_id = Column(Integer, ForeignKey('topics.id', ondelete='SET NULL'), nullable=True)
+    dialogue_id = Column(Integer, nullable=True)
+    answers_json = Column(Text, nullable=True)
+    report_text = Column(Text, nullable=True)
+    formula_results_json = Column(Text, nullable=True)
+    interpretation_text = Column(Text, nullable=True)
+    secret_answers = Column(Text, nullable=True)
+
+
 class TestQuestion(Base):
     __tablename__ = 'test_questions'
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -574,6 +594,33 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN invocation_platform VARCHAR"))
             if 'question_message_id' not in test_session_columns:
                 sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN question_message_id BIGINT"))
+
+            sync_conn.execute(text("""
+                INSERT INTO test_attempts (
+                    user_id,
+                    completed_at,
+                    source_session_created_at,
+                    platform,
+                    topic_id,
+                    dialogue_id,
+                    report_text,
+                    formula_results_json,
+                    secret_answers
+                )
+                SELECT
+                    user_id,
+                    created_at,
+                    created_at,
+                    invocation_platform,
+                    invocation_topic_id,
+                    invocation_dialogue_id,
+                    answers,
+                    formula_results,
+                    secret_answers
+                FROM test_sessions
+                WHERE is_finished = TRUE AND created_at IS NOT NULL
+                ON CONFLICT (user_id, source_session_created_at) DO NOTHING
+            """))
 
             test_question_columns = [c['name'] for c in insp.get_columns('test_questions')]
             if 'comment' not in test_question_columns:

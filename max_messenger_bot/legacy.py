@@ -23,6 +23,7 @@ from database import (  # noqa: E402
     SecretTestQuestion,
     SubscriptionConfig,
     SubscriptionPlan,
+    TestAttempt,
     TestConfig,
     TestQuestion,
     TestSession,

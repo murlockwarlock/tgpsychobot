@@ -12,7 +12,7 @@ import zipfile
 from types import SimpleNamespace
 import ai_integration
 import keyboards
-from database import TestSession, TestQuestion, TestConfig, SecretTestQuestion, CaseStudy
+from database import TestSession, TestAttempt, TestQuestion, TestConfig, SecretTestQuestion, CaseStudy
 from aiogram import Router, F, Bot
 from pydantic import ValidationError
 from aiogram.types import (Message, CallbackQuery, FSInputFile, Document,
@@ -82,6 +82,7 @@ from user_metadata import append_metadata_records, extract_data_blocks, load_met
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
 from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
+from result_history import attach_secret_answers, attempt_to_dict, build_test_attempt_pages, save_test_attempt
 from sqlalchemy import delete
 from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
@@ -2945,6 +2946,8 @@ async def view_client_profile(callback: CallbackQuery, state: FSMContext):
                     and "download_history_" not in button.callback_data
                     and "client_metadata_" not in button.callback_data
                     and "download_metadata_" not in button.callback_data
+                    and "client_test_attempts_" not in button.callback_data
+                    and "download_test_attempts_" not in button.callback_data
                     and "admin_delete_client_history_" not in button.callback_data
                 ):
                     new_row.append(button)
@@ -5161,6 +5164,153 @@ async def run_client_metadata_export(callback: CallbackQuery):
     await callback.message.answer_document(
         BufferedInputFile(data, filename=f"metadata_{file_label}.json"),
         caption=f"🧩 Метаданные пользователя {file_label}",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("client_test_attempts_"))
+async def view_client_test_attempts(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на просмотр результатов тестов.", show_alert=True)
+        return
+
+    try:
+        client_id = int(callback.data.split("_")[-2])
+        page = int(callback.data.split("_")[-1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+
+    async with async_session_maker() as session:
+        user = await session.get(User, client_id)
+        attempts = (
+            await session.execute(
+                select(TestAttempt)
+                .where(TestAttempt.user_id == client_id)
+                .order_by(TestAttempt.completed_at.desc(), TestAttempt.id.desc())
+            )
+        ).scalars().all()
+        topic_rows = (await session.execute(select(Topic.id, Topic.name))).all()
+
+    if not user:
+        await callback.answer("Клиент не найден.", show_alert=True)
+        return
+    if not attempts:
+        await callback.message.edit_text(
+            f"<b>🧪 Результаты тестов:</b> {html.escape(user.name or user.first_name or str(user.id))}\n\n"
+            "Пользователь пока не завершил ни одного теста.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")]
+            ]),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    pages = build_test_attempt_pages(
+        attempts,
+        client_name=user.name or user.first_name or str(user.id),
+        topic_names={topic_id: topic_name for topic_id, topic_name in topic_rows},
+    )
+    page = max(0, min(page, len(pages) - 1))
+    current = pages[page]
+    text = f"{current['html']}\n\n<i>{html.escape(current['part'])} · Страница {page + 1}/{len(pages)}</i>"
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(
+            text="⬅️ Пред.",
+            callback_data=f"client_test_attempts_{client_id}_{page - 1}",
+        ))
+    if page < len(pages) - 1:
+        navigation.append(InlineKeyboardButton(
+            text="След. ➡️",
+            callback_data=f"client_test_attempts_{client_id}_{page + 1}",
+        ))
+    buttons = [navigation] if navigation else []
+    buttons.append([InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")])
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("download_test_attempts_"))
+async def download_client_test_attempts(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на скачивание результатов тестов.", show_alert=True)
+        return
+
+    client_id = int(callback.data.split("_")[-1])
+    await callback.message.edit_text(
+        f"Выберите вариант выгрузки результатов тестов пользователя <code>{client_id}</code>:",
+        reply_markup=kb.test_attempt_export_options_keyboard(client_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("run_test_attempts_export_"))
+async def run_client_test_attempts_export(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на скачивание результатов тестов.", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    try:
+        anonymize = parts[-2] == "yes"
+        client_id = int(parts[-1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+
+    async with async_session_maker() as session:
+        user = await session.get(User, client_id)
+        attempts = (
+            await session.execute(
+                select(TestAttempt)
+                .where(TestAttempt.user_id == client_id)
+                .order_by(TestAttempt.completed_at.asc(), TestAttempt.id.asc())
+            )
+        ).scalars().all()
+        topic_rows = (await session.execute(select(Topic.id, Topic.name))).all()
+
+    if not user:
+        await callback.answer("Клиент не найден.", show_alert=True)
+        return
+    if not attempts:
+        await callback.answer("У пользователя нет завершённых тестов.", show_alert=True)
+        return
+
+    topic_names = {topic_id: topic_name for topic_id, topic_name in topic_rows}
+    attempt_data = []
+    for attempt in attempts:
+        item = attempt_to_dict(attempt)
+        item["topic"] = topic_names.get(
+            attempt.topic_id,
+            "Основной диалог" if attempt.topic_id is None else f"ID {attempt.topic_id}",
+        )
+        attempt_data.append(item)
+
+    if anonymize:
+        client_data = {"label": "user_1"}
+        file_label = "user_1"
+    else:
+        client_data = {
+            "id": user.id,
+            "username": user.username,
+            "name": user.name or user.first_name,
+        }
+        file_label = str(user.id)
+
+    payload = {"client": client_data, "test_attempts": attempt_data}
+    await callback.message.answer_document(
+        BufferedInputFile(
+            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            filename=f"test_results_{file_label}.json",
+        ),
+        caption=f"🧪 Результаты тестов пользователя {file_label}",
     )
     await callback.answer()
 
@@ -11510,6 +11660,7 @@ async def reset_client_account_confirm(callback: CallbackQuery):
         await session.execute(delete(UserSubscription).where(UserSubscription.user_id == user_id))
         await session.execute(delete(TrialUsageHistory).where(TrialUsageHistory.user_id == user_id))
         await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
+        await session.execute(delete(TestAttempt).where(TestAttempt.user_id == user_id))
         await session.execute(delete(UserTopicState).where(UserTopicState.user_id == user_id))
         await session.execute(delete(ReferralPaymentLog).where(
             or_(
@@ -11920,6 +12071,8 @@ async def finish_test_generation(
         test_session = await session.get(TestSession, user_id)
         dialogue_id = getattr(test_session, "invocation_dialogue_id", None) or user.current_dialogue_id
         topic_id = getattr(test_session, "invocation_topic_id", None)
+        source_session_created_at = getattr(test_session, "created_at", None)
+        invocation_platform = getattr(test_session, "invocation_platform", None) or "telegram"
         test_config = await session.get(TestConfig, 1)
         formulas = json_loads(test_config.formulas_json, []) if test_config and test_config.formulas_enabled else []
         separate_prompt_enabled = bool(
@@ -12010,6 +12163,19 @@ async def finish_test_generation(
     html_story = markdown_to_html(visible_interpretation or ("Выберите действие:" if interpretation_buttons else ""))
 
     async with async_session_maker() as session:
+        await save_test_attempt(
+            session,
+            user_id=user_id,
+            source_session_created_at=source_session_created_at,
+            completed_at=datetime.utcnow(),
+            platform=invocation_platform,
+            topic_id=topic_id,
+            dialogue_id=dialogue_id,
+            answers=structured_answers,
+            report_text=report_text,
+            formula_results=formula_results,
+            interpretation_text=interpretation_text,
+        )
         session.add(DBMessage(
             user_id=user_id,
             role='assistant',
@@ -12235,6 +12401,7 @@ async def process_secret_answers(message: Message, state: FSMContext):
     async with async_session_maker() as session:
         stmt = update(TestSession).where(TestSession.user_id == message.from_user.id).values(secret_answers=message.text)
         await session.execute(stmt)
+        await attach_secret_answers(session, message.from_user.id, message.text)
         await session.commit()
 
         config = await session.get(TestConfig, 1)

@@ -13,6 +13,7 @@ from ..legacy import CaseStudy, Content, Message as DBMessage, SecretTestQuestio
 from ..logging_utils import get_ai_logger, get_bot_logger
 from ..storage import StateStore
 from response_buttons import extract_response_buttons
+from result_history import attach_secret_answers, save_test_attempt
 from universal_tests import (
     build_result_handoff_prompt,
     build_prompt_payload,
@@ -302,6 +303,8 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
         )
         topic_id = getattr(test_session, "invocation_topic_id", None) if test_session else None
         dialogue_id = getattr(test_session, "invocation_dialogue_id", None) if test_session else None
+        source_session_created_at = getattr(test_session, "created_at", None) if test_session else None
+        invocation_platform = getattr(test_session, "invocation_platform", None) if test_session else "max"
         user = await session.get(User, user_id)
         await session.execute(
             update(TestSession)
@@ -348,6 +351,19 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
         attachments=response_buttons_keyboard(button_rows) or None,
     )
     async with async_session_maker() as session:
+        await save_test_attempt(
+            session,
+            user_id=user_id,
+            source_session_created_at=source_session_created_at,
+            completed_at=datetime.utcnow(),
+            platform=invocation_platform or "max",
+            topic_id=topic_id,
+            dialogue_id=dialogue_id or user.current_dialogue_id,
+            answers=answers,
+            report_text=report_text,
+            formula_results=formula_results,
+            interpretation_text=final_text,
+        )
         session.add(DBMessage(
             user_id=user_id,
             role="assistant",
@@ -424,6 +440,7 @@ async def start_secret_test(client: MaxApiClient, states: StateStore, chat_id: i
 async def save_secret_answers(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, text: str) -> None:
     async with async_session_maker() as session:
         await session.execute(update(TestSession).where(TestSession.user_id == user_id).values(secret_answers=text))
+        await attach_secret_answers(session, user_id, text)
         content = await session.get(Content, "secret_test_outro")
         config = await session.get(TestConfig, 1)
         await session.commit()
