@@ -395,6 +395,7 @@ class MaxCompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         result.scalars.return_value.all.return_value = [item]
         session.execute = AsyncMock(return_value=result)
         session.commit = AsyncMock()
+        session.flush = AsyncMock()
         session.add = MagicMock()
         context = MagicMock()
         context.__aenter__ = AsyncMock(return_value=session)
@@ -416,6 +417,13 @@ class MaxCompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calling_prompt.await_args.kwargs["dialogue_id_override"], 5)
         states.clear.assert_awaited_once_with(20)
         self.assertEqual(client.send_message.await_args.kwargs["text"], "Финальный ответ")
+        added_roles = [
+            call.args[0].role
+            for call in session.add.call_args_list
+            if getattr(call.args[0], "role", None)
+        ]
+        self.assertIn("test_result", added_roles)
+        self.assertIn("assistant", added_roles)
 
     async def test_disabled_max_test_does_not_start_for_regular_user(self):
         from max_messenger_bot.services import tests as tests_service

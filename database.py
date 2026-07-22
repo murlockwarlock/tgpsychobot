@@ -92,6 +92,7 @@ class Message(Base):
     __table_args__ = (
         Index('idx_message_user_dialogue', 'user_id', 'dialogue_id'),
         Index('idx_message_user_topic_ts', 'user_id', 'topic_id', 'timestamp'),
+        UniqueConstraint('test_attempt_id', name='uq_message_test_attempt'),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey('users.id'))
@@ -102,6 +103,7 @@ class Message(Base):
     user = relationship("User", back_populates="messages")
     topic_id = Column(Integer, ForeignKey('topics.id'), nullable=True)
     topic = relationship("Topic")
+    test_attempt_id = Column(Integer, ForeignKey('test_attempts.id', ondelete='SET NULL'), nullable=True)
 
 
 class AIConfig(Base):
@@ -622,6 +624,17 @@ async def init_db():
                 ON CONFLICT (user_id, source_session_created_at) DO NOTHING
             """))
 
+            message_columns = [c['name'] for c in insp.get_columns('messages')]
+            if 'test_attempt_id' not in message_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE messages ADD COLUMN test_attempt_id INTEGER "
+                    "REFERENCES test_attempts(id) ON DELETE SET NULL"
+                ))
+            sync_conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_test_attempt_unique "
+                "ON messages (test_attempt_id)"
+            ))
+
             test_question_columns = [c['name'] for c in insp.get_columns('test_questions')]
             if 'comment' not in test_question_columns:
                 sync_conn.execute(text("ALTER TABLE test_questions ADD COLUMN comment TEXT"))
@@ -754,6 +767,9 @@ async def init_db():
             if not existing:
                 session.add(item)
 
+        from result_history import backfill_test_history_messages
+
+        await backfill_test_history_messages(session)
         await session.commit()
 
 

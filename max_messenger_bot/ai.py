@@ -20,6 +20,7 @@ from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, 
 from .logging_utils import configure_logging, get_ai_logger
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
 from prompt_context import apply_global_prompt_appendix
+from result_history import conversation_role_filter
 from vector_store import search_relevant_chunks
 
 configure_logging()
@@ -657,7 +658,7 @@ async def get_ai_response(
         history_rows = (
             await session.execute(
                 select(DBMessage)
-                .where(history_scope)
+                .where(history_scope, conversation_role_filter(DBMessage))
                 .order_by(DBMessage.timestamp.asc())
             )
         ).scalars().all()
@@ -973,7 +974,7 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         history_rows = (
             await session.execute(
                 select(DBMessage)
-                .where(history_scope)
+                .where(history_scope, conversation_role_filter(DBMessage))
                 .order_by(DBMessage.timestamp.asc())
             )
         ).scalars().all()

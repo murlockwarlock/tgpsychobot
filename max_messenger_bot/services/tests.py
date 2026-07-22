@@ -13,7 +13,7 @@ from ..legacy import CaseStudy, Content, Message as DBMessage, SecretTestQuestio
 from ..logging_utils import get_ai_logger, get_bot_logger
 from ..storage import StateStore
 from response_buttons import extract_response_buttons
-from result_history import attach_secret_answers, save_test_attempt
+from result_history import attach_secret_answers, save_test_attempt, save_test_history_message
 from universal_tests import (
     build_result_handoff_prompt,
     build_prompt_payload,
@@ -351,7 +351,7 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
         attachments=response_buttons_keyboard(button_rows) or None,
     )
     async with async_session_maker() as session:
-        await save_test_attempt(
+        attempt = await save_test_attempt(
             session,
             user_id=user_id,
             source_session_created_at=source_session_created_at,
@@ -363,6 +363,16 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
             report_text=report_text,
             formula_results=formula_results,
             interpretation_text=final_text,
+        )
+        await save_test_history_message(
+            session,
+            attempt=attempt,
+            user_id=user_id,
+            dialogue_id=dialogue_id or user.current_dialogue_id,
+            topic_id=topic_id,
+            answers=answers,
+            formula_results=formula_results,
+            report_text=report_text,
         )
         session.add(DBMessage(
             user_id=user_id,

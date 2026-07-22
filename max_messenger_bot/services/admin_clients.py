@@ -20,6 +20,7 @@ from ..legacy import Message as DBMessage, RobokassaPayment, Topic, User, UserSu
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 from ..time_utils import format_msk
+from result_history import TEST_RESULT_ROLE
 
 
 PAGE_SIZE = 10
@@ -117,7 +118,7 @@ async def show_client_history(client: MaxApiClient, chat_id: int, target_user_id
         if msg.dialogue_id != last_dialogue_id:
             rendered_parts.append(f"\n--- <b>Диалог №{msg.dialogue_id}</b> ---\n")
             last_dialogue_id = msg.dialogue_id
-        role = "👤 Клиент" if msg.role == "user" else "🤖 Бот"
+        role = "👤 Клиент" if msg.role == "user" else "🧪 Тест" if msg.role == TEST_RESULT_ROLE else "🤖 Бот"
         topic_name = topic_map.get(msg.topic_id, "Общий")
         content = html.escape(msg.content or "")
         if msg.role == "assistant":
@@ -230,7 +231,7 @@ async def run_single_export(
         lines = [header + "=" * 50]
         for message in messages:
             topic = topic_map.get(message.topic_id, "General")
-            role = "Client" if message.role == "user" else "Bot"
+            role = "Client" if message.role == "user" else "Test" if message.role == TEST_RESULT_ROLE else "Bot"
             timestamp = format_msk(message.timestamp, "%Y-%m-%d %H:%M МСК") if message.timestamp else ""
             text = _remove_markdown(message.content or "") if message.role == "assistant" else (message.content or "")
             lines.append(f"[{timestamp}] [{topic}] {role}: {text}\n")

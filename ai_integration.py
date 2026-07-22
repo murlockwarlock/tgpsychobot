@@ -23,6 +23,7 @@ from prompt_blocks import (
     DEFAULT_SHORT_RESPONSE_INSTRUCTION,
     render_prompt_block,
 )
+from result_history import conversation_role_filter
 from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
 from user_metadata import append_metadata_records, extract_data_blocks
@@ -1138,6 +1139,7 @@ async def get_ai_response(
         stmt = select(DBMessage).where(
             DBMessage.user_id == user.id,
             DBMessage.dialogue_id == active_dialogue_id,
+            conversation_role_filter(DBMessage),
         )
         if not is_global_memory_mode(memory_mode):
             stmt = stmt.where(DBMessage.topic_id == active_topic_id)

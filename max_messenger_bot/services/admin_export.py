@@ -17,6 +17,7 @@ from ..legacy import Message as DBMessage, User, async_session_maker
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 from ..time_utils import format_msk
+from result_history import TEST_RESULT_ROLE
 
 
 PAGE_SIZE = 10
@@ -389,7 +390,7 @@ def _build_txt_export(
         lines.extend([f"ДАННЫЕ КЛИЕНТА: {_user_label(user, anonymize, index)}", "-" * 40])
         for message in messages:
             topic = topic_map.get(message.topic_id, "General")
-            role = "Client" if message.role == "user" else "Bot"
+            role = "Client" if message.role == "user" else "Test" if message.role == TEST_RESULT_ROLE else "Bot"
             timestamp = format_msk(message.timestamp, "%Y-%m-%d %H:%M МСК") if message.timestamp else ""
             lines.append(f"[{timestamp}] [{topic}] {role}: {message.content or ''}")
         lines.extend(["", "=" * 60, ""])

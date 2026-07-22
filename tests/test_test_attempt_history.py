@@ -13,11 +13,16 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-from database import Base, TestAttempt as DBTestAttempt, User
+from database import Base, Message as DBMessage, TestAttempt as DBTestAttempt, User
 from result_history import (
+    TEST_RESULT_ROLE,
     attach_secret_answers,
+    backfill_test_history_messages,
+    build_test_history_entry,
     build_test_attempt_pages,
+    conversation_role_filter,
     save_test_attempt,
+    save_test_history_message,
     attempt_to_dict,
 )
 
@@ -145,6 +150,117 @@ class TestAttemptHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exported["answers"][0]["answer"], "Ответ")
         self.assertEqual(exported["formula_results"], {"Итого": 4})
 
+    def test_builds_plain_history_block_with_answers_and_formulas(self):
+        content = build_test_history_entry(
+            [{
+                "question_number": 1,
+                "question": "Сколько тебе лет?",
+                "answer": "15",
+                "numeric_value": 15.0,
+            }],
+            {"Смысл": 9},
+        )
+
+        self.assertIn("🧪 Результаты теста", content)
+        self.assertIn("1. Сколько тебе лет?", content)
+        self.assertIn("Ответ: 15", content)
+        self.assertIn("Числовое значение: 15.0", content)
+        self.assertIn("• Смысл: 9", content)
+
+    async def test_history_message_is_linked_once_and_excluded_from_conversation(self):
+        started_at = datetime(2026, 7, 22, 12, 0)
+        async with self.sessions() as session:
+            attempt = await save_test_attempt(
+                session,
+                user_id=123,
+                source_session_created_at=started_at,
+                completed_at=started_at + timedelta(minutes=3),
+                platform="telegram",
+                topic_id=None,
+                dialogue_id=3,
+                answers=[{"question": "Вопрос", "answer": "Ответ"}],
+                report_text="report",
+                formula_results={},
+                interpretation_text="result",
+            )
+            await save_test_history_message(
+                session,
+                attempt=attempt,
+                user_id=123,
+                dialogue_id=3,
+                topic_id=None,
+                answers=[{"question": "Вопрос", "answer": "Ответ"}],
+                formula_results={},
+                report_text="report",
+            )
+            session.add_all([
+                DBMessage(user_id=123, dialogue_id=3, role="user", content="hello"),
+                DBMessage(user_id=123, dialogue_id=3, role="assistant", content="hi"),
+            ])
+            await session.commit()
+
+        async with self.sessions() as session:
+            attempt = await session.scalar(select(DBTestAttempt).where(DBTestAttempt.user_id == 123))
+            await save_test_history_message(
+                session,
+                attempt=attempt,
+                user_id=123,
+                dialogue_id=3,
+                topic_id=None,
+                answers=[{"question": "Вопрос", "answer": "Новый ответ"}],
+                formula_results={},
+                report_text="report",
+            )
+            await session.commit()
+
+        async with self.sessions() as session:
+            history_rows = (
+                await session.execute(
+                    select(DBMessage)
+                    .where(DBMessage.user_id == 123)
+                    .order_by(DBMessage.id)
+                )
+            ).scalars().all()
+            test_rows = [row for row in history_rows if row.role == TEST_RESULT_ROLE]
+            conversation_rows = (
+                await session.execute(
+                    select(DBMessage)
+                    .where(DBMessage.user_id == 123, conversation_role_filter(DBMessage))
+                    .order_by(DBMessage.id)
+                )
+            ).scalars().all()
+
+        self.assertEqual(len(test_rows), 1)
+        self.assertIsNotNone(test_rows[0].test_attempt_id)
+        self.assertIn("Новый ответ", test_rows[0].content)
+        self.assertEqual([row.role for row in conversation_rows], ["user", "assistant"])
+
+    async def test_backfills_existing_attempt_into_history_once(self):
+        async with self.sessions() as session:
+            session.add(DBTestAttempt(
+                user_id=123,
+                completed_at=datetime(2026, 7, 22, 13, 0),
+                dialogue_id=4,
+                answers_json='[{"question":"Старый вопрос","answer":"Старый ответ"}]',
+                formula_results_json='{"Итого":3}',
+                report_text="legacy report",
+            ))
+            await session.commit()
+
+        async with self.sessions() as session:
+            self.assertEqual(await backfill_test_history_messages(session), 1)
+            await session.commit()
+        async with self.sessions() as session:
+            self.assertEqual(await backfill_test_history_messages(session), 0)
+            await session.commit()
+            message = await session.scalar(
+                select(DBMessage).where(DBMessage.role == TEST_RESULT_ROLE)
+            )
+
+        self.assertEqual(message.dialogue_id, 4)
+        self.assertIn("Старый ответ", message.content)
+        self.assertIn("• Итого: 3", message.content)
+
     def test_long_markup_is_escaped_and_split_within_telegram_limit(self):
         attempt = DBTestAttempt(
             id=8,
@@ -180,10 +296,30 @@ class TestAttemptHistoryTests(unittest.IsolatedAsyncioTestCase):
             import asyncio
             from datetime import datetime
             from sqlalchemy import func, select
-            from database import TestAttempt, TestSession, User, async_session_maker, init_db
+            from database import Message, TestAttempt, TestSession, User, async_session_maker, engine, init_db
 
             async def main():
+                async with engine.begin() as connection:
+                    await connection.exec_driver_sql('''
+                        CREATE TABLE messages (
+                            id INTEGER PRIMARY KEY,
+                            user_id BIGINT,
+                            dialogue_id INTEGER NOT NULL DEFAULT 1,
+                            role VARCHAR,
+                            content TEXT,
+                            timestamp DATETIME,
+                            topic_id INTEGER
+                        )
+                    ''')
                 await init_db()
+                async with engine.begin() as connection:
+                    columns = await connection.run_sync(
+                        lambda sync_connection: {
+                            item["name"]
+                            for item in __import__("sqlalchemy").inspect(sync_connection).get_columns("messages")
+                        }
+                    )
+                    assert "test_attempt_id" in columns
                 async with async_session_maker() as session:
                     session.add(User(id=987654321, first_name="Legacy"))
                     session.add(TestSession(
@@ -205,7 +341,14 @@ class TestAttemptHistoryTests(unittest.IsolatedAsyncioTestCase):
                     attempt = await session.scalar(
                         select(TestAttempt).where(TestAttempt.user_id == 987654321)
                     )
+                    message_count = await session.scalar(
+                        select(func.count(Message.id)).where(
+                            Message.user_id == 987654321,
+                            Message.role == "test_result",
+                        )
+                    )
                     assert count == 1
+                    assert message_count == 1
                     assert attempt.report_text == "legacy report"
                     assert attempt.formula_results_json == '{"total":5}'
 

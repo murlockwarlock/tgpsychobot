@@ -82,7 +82,15 @@ from user_metadata import append_metadata_records, extract_data_blocks, load_met
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
 from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
-from result_history import attach_secret_answers, attempt_to_dict, build_test_attempt_pages, save_test_attempt
+from result_history import (
+    TEST_RESULT_ROLE,
+    attach_secret_answers,
+    attempt_to_dict,
+    build_test_attempt_pages,
+    conversation_role_filter,
+    save_test_attempt,
+    save_test_history_message,
+)
 from sqlalchemy import delete
 from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
@@ -4401,7 +4409,13 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
                 last_dialogue_id = msg.dialogue_id
 
             t_name = topic_map.get(msg.topic_id, "Общий")
-            header = f"<b>{'👤 (Клиент)' if msg.role == 'user' else '🤖 (Бот)'}</b> [<i>{format_msk(msg.timestamp, '%d-%m-%Y %H:%M МСК')}</i>] [<i>{t_name}</i>]:\n"
+            if msg.role == 'user':
+                role_label = '👤 (Клиент)'
+            elif msg.role == TEST_RESULT_ROLE:
+                role_label = '🧪 (Тест)'
+            else:
+                role_label = '🤖 (Бот)'
+            header = f"<b>{role_label}</b> [<i>{format_msk(msg.timestamp, '%d-%m-%Y %H:%M МСК')}</i>] [<i>{t_name}</i>]:\n"
 
             content = msg.content or ""
             if msg.role == 'assistant':
@@ -4424,7 +4438,7 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
         current_page_content = ""
         for item in renderable_items:
             role, content = item['role'], item['content']
-            if role == 'assistant':
+            if role in {'assistant', TEST_RESULT_ROLE}:
                 entry = f"<blockquote>{content}</blockquote>\n"
             else:
                 entry = f"{content}\n"
@@ -5347,7 +5361,7 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
             content_str = header + "=" * 50 + "\n"
             for m in messages:
                 t_name = topic_map.get(m.topic_id, "General")
-                role = "Client" if m.role == "user" else "Bot"
+                role = "Client" if m.role == "user" else "Test" if m.role == TEST_RESULT_ROLE else "Bot"
                 text = remove_markdown(m.content) if m.role == 'assistant' else m.content
                 content_str += f"[{format_msk(m.timestamp, '%Y-%m-%d %H:%M МСК')}] [{t_name}] {role}: {text}\n\n"
         else:
@@ -12163,7 +12177,7 @@ async def finish_test_generation(
     html_story = markdown_to_html(visible_interpretation or ("Выберите действие:" if interpretation_buttons else ""))
 
     async with async_session_maker() as session:
-        await save_test_attempt(
+        attempt = await save_test_attempt(
             session,
             user_id=user_id,
             source_session_created_at=source_session_created_at,
@@ -12175,6 +12189,16 @@ async def finish_test_generation(
             report_text=report_text,
             formula_results=formula_results,
             interpretation_text=interpretation_text,
+        )
+        await save_test_history_message(
+            session,
+            attempt=attempt,
+            user_id=user_id,
+            dialogue_id=dialogue_id,
+            topic_id=topic_id,
+            answers=structured_answers,
+            formula_results=formula_results,
+            report_text=report_text,
         )
         session.add(DBMessage(
             user_id=user_id,
@@ -14100,6 +14124,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             stmt = select(DBMessage).where(
                 DBMessage.user_id == user.id,
                 DBMessage.dialogue_id == user.current_dialogue_id,
+                conversation_role_filter(DBMessage),
             )
             if not is_global_memory_mode(memory_mode):
                 stmt = stmt.where(DBMessage.topic_id == current_topic_id)
@@ -15046,7 +15071,7 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
 
                 for m in messages:
                     t_name = topic_map.get(m.topic_id, "General")
-                    role = "Client" if m.role == "user" else "Bot"
+                    role = "Client" if m.role == "user" else "Test" if m.role == TEST_RESULT_ROLE else "Bot"
                     full_content += f"[{format_msk(m.timestamp, '%Y-%m-%d %H:%M МСК')}] [{t_name}] {role}: {m.content}\n"
 
                 full_content += "\n" + "=" * 60 + "\n\n"

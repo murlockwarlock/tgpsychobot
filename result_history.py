@@ -7,12 +7,20 @@ import json
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
-from database import TestAttempt
+from database import Message, TestAttempt
 from response_buttons import extract_response_buttons
 from time_helpers import format_msk
 from user_metadata import extract_data_blocks
+
+
+TEST_RESULT_ROLE = "test_result"
+CONVERSATION_ROLES = ("user", "assistant")
+
+
+def conversation_role_filter(message_model=Message):
+    return message_model.role.in_(CONVERSATION_ROLES)
 
 
 def _json_list(raw: str | None) -> list[dict[str, Any]]:
@@ -81,6 +89,107 @@ async def attach_secret_answers(session, user_id: int, text: str) -> None:
     )
     if attempt is not None:
         attempt.secret_answers = text
+
+
+def build_test_history_entry(
+    answers: list[dict[str, Any]],
+    formula_results: dict[str, Any],
+    report_text: str | None = None,
+) -> str:
+    lines = ["🧪 Результаты теста"]
+    if answers:
+        lines.extend(["", "📝 Ответы"])
+        for fallback_number, answer in enumerate(answers, start=1):
+            number = answer.get("question_number") or fallback_number
+            question = str(answer.get("question") or "Вопрос без текста").strip()
+            value = str(answer.get("answer") or "—").strip()
+            lines.extend(["", f"{number}. {question}", f"Ответ: {value}"])
+            numeric = answer.get("numeric_value")
+            if numeric is not None:
+                lines.append(f"Числовое значение: {numeric}")
+    elif report_text:
+        lines.extend(["", "📝 Сохранённый результат", "", report_text.strip()])
+
+    if formula_results:
+        lines.extend(["", "📊 Расчётные показатели"])
+        for name, value in formula_results.items():
+            rendered = (
+                json.dumps(value, ensure_ascii=False, sort_keys=True)
+                if isinstance(value, (dict, list))
+                else str(value)
+            )
+            lines.append(f"• {name}: {rendered}")
+    return "\n".join(lines).strip()
+
+
+async def save_test_history_message(
+    session,
+    *,
+    attempt: TestAttempt,
+    user_id: int,
+    dialogue_id: int,
+    topic_id: int | None,
+    answers: list[dict[str, Any]],
+    formula_results: dict[str, Any],
+    report_text: str,
+) -> Message:
+    await session.flush()
+    message = None
+    if attempt.id is not None:
+        message = await session.scalar(
+            select(Message).where(Message.test_attempt_id == attempt.id)
+        )
+    if message is None:
+        message = Message(user_id=user_id, test_attempt_id=attempt.id)
+        session.add(message)
+
+    message.dialogue_id = dialogue_id
+    message.topic_id = topic_id
+    message.role = TEST_RESULT_ROLE
+    message.content = build_test_history_entry(answers, formula_results, report_text)
+    message.timestamp = attempt.completed_at
+    return message
+
+
+async def backfill_test_history_messages(session) -> int:
+    """Add missing history blocks for attempts saved before this feature existed."""
+    attempts = (
+        await session.execute(
+            select(TestAttempt)
+            .outerjoin(Message, Message.test_attempt_id == TestAttempt.id)
+            .where(Message.id.is_(None))
+            .order_by(TestAttempt.id)
+        )
+    ).scalars().all()
+
+    for attempt in attempts:
+        content = build_test_history_entry(
+            _json_list(attempt.answers_json),
+            _json_dict(attempt.formula_results_json),
+            attempt.report_text,
+        )
+        await session.execute(
+            text(
+                """
+                INSERT INTO messages (
+                    user_id, dialogue_id, role, content, timestamp, topic_id, test_attempt_id
+                ) VALUES (
+                    :user_id, :dialogue_id, :role, :content, :timestamp, :topic_id, :test_attempt_id
+                )
+                ON CONFLICT (test_attempt_id) DO NOTHING
+                """
+            ),
+            {
+                "user_id": attempt.user_id,
+                "dialogue_id": attempt.dialogue_id or 1,
+                "role": TEST_RESULT_ROLE,
+                "content": content,
+                "timestamp": attempt.completed_at,
+                "topic_id": attempt.topic_id,
+                "test_attempt_id": attempt.id,
+            },
+        )
+    return len(attempts)
 
 
 def attempt_to_dict(attempt: TestAttempt) -> dict[str, Any]:
