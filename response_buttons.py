@@ -9,8 +9,10 @@ from urllib.parse import urlsplit
 
 MAX_BUTTONS_PER_ROW = 8
 MAX_BUTTON_ROWS = 20
+MAX_ACTION_CHARS = 30
+MAX_CALLBACK_DATA_BYTES = 64
+ACTION_CALLBACK_PREFIX = "ai_btn:"
 BUTTON_RE = re.compile(r"\[([^\]\n]{1,64})\]\((.+)\)")
-ACTION_RE = re.compile(r"[A-Za-z0-9_.-]{1,30}")
 TEST_START_DIRECTIVE_RE = re.compile(
     r"(?<![:\w])\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)",
     re.IGNORECASE,
@@ -22,6 +24,16 @@ class ResponseButton:
     text: str
     kind: str
     value: str
+
+
+def _is_valid_action(action: str) -> bool:
+    if not 1 <= len(action) <= MAX_ACTION_CHARS:
+        return False
+    if not all(char.isprintable() for char in action):
+        return False
+    if any(char in "[]()|" for char in action):
+        return False
+    return len(f"{ACTION_CALLBACK_PREFIX}{action}".encode("utf-8")) <= MAX_CALLBACK_DATA_BYTES
 
 
 def _parse_button_row(line: str) -> list[ResponseButton] | None:
@@ -40,7 +52,7 @@ def _parse_button_row(line: str) -> list[ResponseButton] | None:
             return None
         if target.lower().startswith("btn:"):
             action = target[4:]
-            if not ACTION_RE.fullmatch(action):
+            if not _is_valid_action(action):
                 return None
             row.append(ResponseButton(text=text, kind="action", value=action))
         else:

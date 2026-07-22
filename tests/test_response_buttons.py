@@ -30,8 +30,20 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertEqual(text, source)
         self.assertEqual(rows, [])
 
-    def test_keeps_malformed_action_visible(self):
-        source = "[Кнопка](btn:код с пробелом)"
+    def test_accepts_cyrillic_multiword_action(self):
+        source = "[Готова. Начинаем](btn:я готова)"
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, "")
+        self.assertEqual(rows[0][0].value, "я готова")
+
+    def test_keeps_empty_action_visible(self):
+        source = "[Кнопка](btn:)"
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_rejects_action_over_telegram_callback_byte_limit(self):
+        source = f"[Кнопка](btn:{'я' * 29})"
         text, rows = extract_response_buttons(source)
         self.assertEqual(text, source)
         self.assertEqual(rows, [])
