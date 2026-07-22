@@ -134,6 +134,7 @@ plog = logging.getLogger("payment_events")
 user_locks = {}
 user_message_buffers = {}
 user_processing_tasks = {}
+NAVIGATION_MENU_HINT = "Нажмите на кнопку или воспользуйтесь меню для навигации"
 
 user_spread_state = {}  # Runtime cache; the source of truth is card_spread_states in the database.
 PAGE_SIZE = 5
@@ -2567,7 +2568,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
         if bonus_messages:
             await send_bonus_messages(reply_markup=main_kb)
         else:
-            await message.answer("Нажмите на кнопку или воспользуйтесь меню для навигации", reply_markup=main_kb)
+            await message.answer(NAVIGATION_MENU_HINT, reply_markup=main_kb)
     elif bonus_messages:
         await asyncio.sleep(0.3)
         await send_bonus_messages()
@@ -4586,7 +4587,7 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
     keyboard_was_sent = sent_combined or media_sent_with_kb or text_sent_with_kb
 
     if inline_kb:
-        await bot.send_message(chat_id, "Главное меню:", reply_markup=main_kb)
+        await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
     elif not keyboard_was_sent and not inline_kb:
         await bot.send_message(chat_id, "✅ Память очищена.", reply_markup=main_kb)
 
@@ -5764,7 +5765,7 @@ async def process_topic_reset(callback: CallbackQuery, bot: Bot):
     keyboard_was_sent = sent_combined or media_sent_with_kb or text_sent_with_kb
 
     if inline_kb:
-        await bot.send_message(chat_id, "Главное меню:", reply_markup=main_kb)
+        await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
     elif not keyboard_was_sent:
         await bot.send_message(chat_id, "✅ Тема сброшена. Мы вернулись в общий режим диалога.", reply_markup=main_kb)
 
@@ -13800,7 +13801,7 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
     keyboard_was_sent = sent_combined or media_sent_with_kb or text_sent_with_kb
 
     if inline_kb:
-        await bot.send_message(chat_id, "Главное меню:", reply_markup=main_kb)
+        await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
     elif not keyboard_was_sent and not inline_kb:
         text = "✅ Вы вернулись в основной режим. Память очищена."
         if is_global_memory_mode(memory_mode):
