@@ -19,6 +19,7 @@ from ..legacy import KnowledgeBase, Topic, async_session_maker
 from ..storage import StateStore
 from ..models import IncomingMessage
 from vector_store import update_vector_index, delete_document_vectors
+from knowledge_base_admin import delete_knowledge_base_record
 
 log = logging.getLogger("max_messenger_bot.services.admin_kb")
 
@@ -281,11 +282,10 @@ async def toggle_general_mode(client: MaxApiClient, chat_id: int, kb_id: int) ->
 
 async def delete_entry(client: MaxApiClient, chat_id: int, kb_id: int) -> None:
     async with async_session_maker() as session:
-        entry = await session.get(KnowledgeBase, kb_id)
-        if not entry:
+        filename = await delete_knowledge_base_record(session, kb_id)
+        if filename is None:
             await client.send_message(chat_id=chat_id, text="Запись базы знаний не найдена.")
             return
-        await session.delete(entry)
         await session.commit()
 
     delete_document_vectors(kb_id)

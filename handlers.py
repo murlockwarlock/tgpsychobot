@@ -56,6 +56,11 @@ from ai_integration import (
     _describe_subscription_status,
 )
 from error_reporting import notify_admins_about_error
+from knowledge_base_admin import (
+    delete_knowledge_base_record,
+    find_original_kb_file_id,
+    kb_text_export_filename,
+)
 from bot_restart import get_current_pm2_identity, schedule_pm2_restart, write_restart_marker
 from memory_mode import (
     MEMORY_MODE_GLOBAL,
@@ -5409,6 +5414,38 @@ async def prompt_delete_kb_file(callback: CallbackQuery):
     )
 
 
+@router.callback_query(F.data.startswith("download_kb_"))
+async def download_kb_file(callback: CallbackQuery):
+    file_id = int(callback.data.split("_")[-1])
+    async with async_session_maker() as session:
+        kb_file = await session.get(KnowledgeBase, file_id)
+        if not kb_file:
+            await callback.answer("Файл не найден.", show_alert=True)
+            return
+        original_file_id = await find_original_kb_file_id(session, kb_file)
+        filename = kb_file.filename or f"knowledge_base_{file_id}.txt"
+        indexed_content = kb_file.indexed_content or ""
+
+    await callback.answer("Отправляю файл…")
+    if original_file_id:
+        try:
+            await callback.message.answer_document(
+                document=original_file_id,
+                caption=f"📚 {html.escape(filename)}",
+            )
+            return
+        except TelegramBadRequest:
+            logging.warning("Original KB file is unavailable, sending indexed text: kb_id=%s", file_id)
+
+    await callback.message.answer_document(
+        BufferedInputFile(
+            indexed_content.encode("utf-8"),
+            filename=kb_text_export_filename(filename),
+        ),
+        caption="📚 Извлечённое содержимое файла из базы знаний.",
+    )
+
+
 @router.callback_query(F.data.startswith("confirm_delete_kb_"))
 async def confirm_delete_kb_file(callback: CallbackQuery, bot: Bot):
     file_id = int(callback.data.split("_")[-1])
@@ -5420,9 +5457,7 @@ async def confirm_delete_kb_file(callback: CallbackQuery, bot: Bot):
             await _display_kb_page(callback.message, 0)
             return
 
-        filename = kb_file.filename
-        stmt = delete(KnowledgeBase).where(KnowledgeBase.id == file_id)
-        await session.execute(stmt)
+        filename = await delete_knowledge_base_record(session, file_id)
         await session.commit()
 
     delete_document_vectors(file_id)

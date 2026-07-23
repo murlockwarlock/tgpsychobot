@@ -386,7 +386,7 @@ def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view
 def knowledge_base_paginator_keyboard(page: int, total_pages: int, files: list):
     builder = InlineKeyboardBuilder()
     for file in files:
-        builder.button(text=f"📄 {file.filename}", callback_data=f"noop_kb_{file.id}")
+        builder.button(text=f"📥 {file.filename}", callback_data=f"download_kb_{file.id}")
 
         gen_status = "✅" if file.use_in_general_mode else "⭕️"
         builder.button(text=f"Gen: {gen_status}", callback_data=f"toggle_kb_general_{page}_{file.id}")
