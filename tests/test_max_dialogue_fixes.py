@@ -173,6 +173,25 @@ class MaxMailingInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.media_type, "share")
         self.assertEqual(message.media_token, "share-token")
 
+    def test_forwarded_message_link_text_is_parsed(self):
+        from max_messenger_bot.models import parse_message
+
+        message = parse_message({
+            "message": {
+                "timestamp": 2000,
+                "sender": {"user_id": 55},
+                "recipient": {"chat_id": 321, "user_id": 999},
+                "body": {"mid": "forward-1", "seq": 10, "text": ""},
+                "link": {
+                    "type": "forward",
+                    "message": {"mid": "source-1", "seq": 2, "text": "Текст пересылки"},
+                },
+            },
+        })
+
+        self.assertIsNotNone(message)
+        self.assertEqual(message.text, "Текст пересылки")
+
     async def test_recovers_forwarded_message_from_chat_history(self):
         from max_messenger_bot.services import admin_mailing
 
@@ -215,6 +234,44 @@ class MaxMailingInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state_call.args[3]["media_type"], "share")
         preview_attachments = client.send_message.await_args.kwargs["attachments"]
         self.assertEqual(preview_attachments[0], {"type": "share", "payload": {"token": "share-token"}})
+
+    async def test_watcher_recovers_forward_link_from_chat_history(self):
+        from max_messenger_bot.services import admin_mailing
+
+        user_id = 100_000_000_055
+        snapshot = SimpleNamespace(
+            state="admin_mailing_text",
+            data={"audience": "self", "input_after_ms": 1000, "input_request_id": "request-2"},
+        )
+        states = SimpleNamespace(get=AsyncMock(return_value=snapshot), set=AsyncMock())
+        client = SimpleNamespace(
+            get_messages=AsyncMock(return_value={
+                "messages": [{
+                    "timestamp": 2000,
+                    "sender": {"user_id": 55},
+                    "recipient": {"chat_id": 321, "user_id": 999},
+                    "body": {"mid": "forward-2", "seq": 10, "text": ""},
+                    "link": {
+                        "type": "forward",
+                        "message": {"mid": "source-2", "seq": 2, "text": "Текст пересылки"},
+                    },
+                }],
+            }),
+            send_message=AsyncMock(),
+        )
+
+        captured = await admin_mailing.capture_latest_input(
+            client,
+            states,
+            321,
+            user_id,
+            shares_only=True,
+        )
+
+        self.assertTrue(captured)
+        state_call = states.set.await_args
+        self.assertEqual(state_call.args[2], "admin_mailing_preview")
+        self.assertEqual(state_call.args[3]["text"], "Текст пересылки")
 
     async def test_audience_step_exposes_manual_history_fallback(self):
         from max_messenger_bot.services import admin_mailing

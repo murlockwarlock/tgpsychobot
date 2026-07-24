@@ -161,6 +161,9 @@ def _render_markup_html(text: str | None, markups: Any) -> str | None:
 def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
     raw = update.get("message") or update.get("body") or update.get("data") or update
     body = raw.get("body") or raw
+    link = raw.get("link") if isinstance(raw, dict) else None
+    forwarded = link.get("message") if isinstance(link, dict) and link.get("type") == "forward" else None
+    forwarded_body = (forwarded.get("body") or forwarded) if isinstance(forwarded, dict) else None
     recipient = raw.get("recipient") or raw.get("chat") or {}
     sender = parse_sender(raw)
     sender = Sender(
@@ -188,6 +191,8 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
         if isinstance(body, dict)
         else None
     ) or raw.get("attachments") or []
+    if not possible_attachments and isinstance(forwarded_body, dict):
+        possible_attachments = forwarded_body.get("attachments") or []
     if isinstance(possible_attachments, list):
         attachments = possible_attachments
         for item in possible_attachments:
@@ -215,11 +220,15 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
                 break
 
     text = body.get("text") if isinstance(body, dict) else raw.get("text")
+    content_body = body
+    if not text and isinstance(forwarded_body, dict):
+        text = forwarded_body.get("text")
+        content_body = forwarded_body
     markups = None
-    if isinstance(body, dict):
-        markups = body.get("markup") or body.get("markups")
+    if isinstance(content_body, dict):
+        markups = content_body.get("markup") or content_body.get("markups")
     html_text = _render_markup_html(text, markups)
-    if not html_text and isinstance(body, dict) and body.get("format") == "html":
+    if not html_text and isinstance(content_body, dict) and content_body.get("format") == "html":
         html_text = text
 
     return IncomingMessage(

@@ -159,7 +159,11 @@ async def _find_latest_history_input(
         if timestamp < input_after_ms or not _is_inbound_history_message(raw_message, user_id):
             continue
         attachments = ((raw_message.get("body") or {}).get("attachments") or [])
-        if shares_only and not any(item.get("type") == "share" for item in attachments if isinstance(item, dict)):
+        link = raw_message.get("link") or {}
+        is_forward = isinstance(link, dict) and link.get("type") == "forward"
+        if shares_only and not is_forward and not any(
+            item.get("type") == "share" for item in attachments if isinstance(item, dict)
+        ):
             continue
         message = parse_message({"message": raw_message})
         if message and ((message.text or "").strip() or (message.media_type and message.media_token)):
