@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import math
+import time
 
 from sqlalchemy import exists, func, not_, or_, select
 
@@ -10,12 +12,13 @@ from ..keyboards import (
     admin_mailing_audience_keyboard,
     admin_mailing_details_keyboard,
     admin_mailing_history_keyboard,
+    admin_mailing_input_keyboard,
     admin_mailing_menu_keyboard,
     admin_mailing_preview_keyboard,
 )
 from ..logging_utils import get_bot_logger
 from ..legacy import Mailing, Message as DBMessage, User, UserSubscription, async_session_maker
-from ..models import IncomingMessage
+from ..models import MAX_ID_OFFSET, IncomingMessage, parse_message
 from ..storage import StateStore
 from ..time_utils import utc_now
 
@@ -57,18 +60,32 @@ async def start_create(client: MaxApiClient, states: StateStore, chat_id: int, u
     )
 
 
-async def choose_audience(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, audience: str) -> None:
+async def choose_audience(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, audience: str) -> str | None:
     if audience not in AUDIENCE_NAMES:
         await client.send_message(chat_id=chat_id, text="Неизвестная аудитория.")
         return
-    await states.set(user_id, chat_id, "admin_mailing_text", {"audience": audience})
+    request_id = str(time.time_ns())
+    await states.set(
+        user_id,
+        chat_id,
+        "admin_mailing_text",
+        {
+            "audience": audience,
+            "input_after_ms": int(time.time() * 1000),
+            "input_request_id": request_id,
+        },
+    )
     await client.send_message(
         chat_id=chat_id,
         text=(
             f"Выбрана аудитория: <b>{html.escape(AUDIENCE_NAMES[audience])}</b>\n\n"
-            "Отправьте текст рассылки или медиа с подписью одним сообщением."
+            "Отправьте текст рассылки или медиа с подписью одним сообщением.\n\n"
+            "Пересланные сообщения бот подхватит автоматически. Если предпросмотр не появился, "
+            "нажмите «Взять последнее сообщение»."
         ),
+        attachments=admin_mailing_input_keyboard(),
     )
+    return request_id
 
 
 def _preview_attachments(media_type: str | None, media_token: str | None, include_keyboard: bool = True) -> list[dict] | None:
@@ -116,14 +133,129 @@ async def save_input(client: MaxApiClient, states: StateStore, chat_id: int, use
     )
 
 
-async def restart_text_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+def _is_inbound_history_message(raw_message: dict, user_id: int) -> bool:
+    recipient = raw_message.get("recipient") or {}
+    raw_user_id = user_id - MAX_ID_OFFSET if user_id >= MAX_ID_OFFSET else user_id
+    return recipient.get("user_id") != raw_user_id
+
+
+async def _find_latest_history_input(
+    client: MaxApiClient,
+    chat_id: int,
+    user_id: int,
+    input_after_ms: int,
+    *,
+    shares_only: bool,
+) -> IncomingMessage | None:
+    result = await client.get_messages(chat_id, count=50)
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+    for raw_message in messages:
+        if not isinstance(raw_message, dict):
+            continue
+        try:
+            timestamp = int(raw_message.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            continue
+        if timestamp < input_after_ms or not _is_inbound_history_message(raw_message, user_id):
+            continue
+        attachments = ((raw_message.get("body") or {}).get("attachments") or [])
+        if shares_only and not any(item.get("type") == "share" for item in attachments if isinstance(item, dict)):
+            continue
+        message = parse_message({"message": raw_message})
+        if message and ((message.text or "").strip() or (message.media_type and message.media_token)):
+            return message
+    return None
+
+
+async def capture_latest_input(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    *,
+    notify_if_missing: bool = True,
+    shares_only: bool = False,
+) -> bool:
+    snapshot = await states.get(user_id)
+    if not snapshot or snapshot.state != "admin_mailing_text":
+        if notify_if_missing:
+            await client.send_message(chat_id=chat_id, text="Сначала выберите аудиторию рассылки.")
+        return False
+    message = await _find_latest_history_input(
+        client,
+        chat_id,
+        user_id,
+        int(snapshot.data.get("input_after_ms") or 0),
+        shares_only=shares_only,
+    )
+    if message is None:
+        if notify_if_missing:
+            await client.send_message(
+                chat_id=chat_id,
+                text="После выбора аудитории новых сообщений не найдено. Отправьте сообщение и нажмите кнопку ещё раз.",
+                attachments=admin_mailing_input_keyboard(),
+            )
+        return False
+    await save_input(client, states, chat_id, user_id, message)
+    return True
+
+
+async def watch_for_shared_input(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    request_id: str,
+    *,
+    poll_interval: float = 2.0,
+    max_checks: int = 90,
+) -> None:
+    for _ in range(max_checks):
+        snapshot = await states.get(user_id)
+        if (
+            not snapshot
+            or snapshot.state != "admin_mailing_text"
+            or snapshot.data.get("input_request_id") != request_id
+        ):
+            return
+        try:
+            if await capture_latest_input(
+                client,
+                states,
+                chat_id,
+                user_id,
+                notify_if_missing=False,
+                shares_only=True,
+            ):
+                return
+        except Exception:
+            log.exception("Failed to capture shared mailing input user_id=%s chat_id=%s", user_id, chat_id)
+        await asyncio.sleep(poll_interval)
+
+
+async def restart_text_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> str | None:
     snapshot = await states.get(user_id)
     audience = snapshot.data.get("audience") if snapshot else None
     if not audience:
         await client.send_message(chat_id=chat_id, text="Состояние рассылки потеряно.")
         return
-    await states.set(user_id, chat_id, "admin_mailing_text", {"audience": audience})
-    await client.send_message(chat_id=chat_id, text="Отправьте новый текст или медиа с подписью.")
+    request_id = str(time.time_ns())
+    await states.set(
+        user_id,
+        chat_id,
+        "admin_mailing_text",
+        {
+            "audience": audience,
+            "input_after_ms": int(time.time() * 1000),
+            "input_request_id": request_id,
+        },
+    )
+    await client.send_message(
+        chat_id=chat_id,
+        text="Отправьте новый текст или медиа с подписью.",
+        attachments=admin_mailing_input_keyboard(),
+    )
+    return request_id
 
 
 async def _get_recipient_ids(session, audience: str, user_id: int) -> list[int]:

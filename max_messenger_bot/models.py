@@ -194,7 +194,7 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
-            if item_type not in {"image", "video", "audio", "file"}:
+            if item_type not in {"image", "video", "audio", "file", "share"}:
                 continue
             payload = item.get("payload") or {}
             token = (

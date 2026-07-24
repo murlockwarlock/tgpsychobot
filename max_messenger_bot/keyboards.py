@@ -796,6 +796,15 @@ def admin_mailing_preview_keyboard() -> list[dict]:
     )
 
 
+def admin_mailing_input_keyboard() -> list[dict]:
+    return inline_keyboard(
+        [
+            [callback_button("📥 Взять последнее сообщение", "mailing_use_latest")],
+            [callback_button("❌ Отмена", "admin_mailing_menu")],
+        ]
+    )
+
+
 def admin_mailing_history_keyboard(mailings: list, page: int, total_pages: int) -> list[dict]:
     rows: list[list[dict]] = []
     status_map = {"pending": "⏳", "sending": "🚀", "completed": "✅", "failed": "❌"}

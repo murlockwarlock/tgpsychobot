@@ -149,6 +149,120 @@ class MaxBotDeduplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mock_handle.call_count, 1)
 
 
+class MaxMailingInputTests(unittest.IsolatedAsyncioTestCase):
+    def test_shared_message_attachment_is_parsed(self):
+        from max_messenger_bot.models import parse_message
+
+        message = parse_message({
+            "message": {
+                "timestamp": 2000,
+                "sender": {"user_id": 55},
+                "recipient": {"chat_id": 321, "user_id": 999},
+                "body": {
+                    "mid": "shared-1",
+                    "text": "Текст пересланной публикации",
+                    "attachments": [{
+                        "type": "share",
+                        "payload": {"token": "share-token", "url": "https://max.ru/example"},
+                    }],
+                },
+            },
+        })
+
+        self.assertIsNotNone(message)
+        self.assertEqual(message.media_type, "share")
+        self.assertEqual(message.media_token, "share-token")
+
+    async def test_recovers_forwarded_message_from_chat_history(self):
+        from max_messenger_bot.services import admin_mailing
+
+        user_id = 100_000_000_055
+        snapshot = SimpleNamespace(
+            state="admin_mailing_text",
+            data={"audience": "self", "input_after_ms": 1000, "input_request_id": "request-1"},
+        )
+        states = SimpleNamespace(get=AsyncMock(return_value=snapshot), set=AsyncMock())
+        client = SimpleNamespace(
+            get_messages=AsyncMock(return_value={
+                "messages": [
+                    {
+                        "timestamp": 2100,
+                        "sender": {"user_id": 999},
+                        "recipient": {"chat_id": 321, "user_id": 55},
+                        "body": {"text": "Подсказка бота", "attachments": []},
+                    },
+                    {
+                        "timestamp": 2000,
+                        "sender": {"user_id": 55},
+                        "recipient": {"chat_id": 321, "user_id": 999},
+                        "body": {
+                            "mid": "shared-2",
+                            "text": "Готовая публикация",
+                            "attachments": [{"type": "share", "payload": {"token": "share-token"}}],
+                        },
+                    },
+                ],
+            }),
+            send_message=AsyncMock(),
+        )
+
+        captured = await admin_mailing.capture_latest_input(client, states, 321, user_id)
+
+        self.assertTrue(captured)
+        state_call = states.set.await_args
+        self.assertEqual(state_call.args[2], "admin_mailing_preview")
+        self.assertEqual(state_call.args[3]["text"], "Готовая публикация")
+        self.assertEqual(state_call.args[3]["media_type"], "share")
+        preview_attachments = client.send_message.await_args.kwargs["attachments"]
+        self.assertEqual(preview_attachments[0], {"type": "share", "payload": {"token": "share-token"}})
+
+    async def test_audience_step_exposes_manual_history_fallback(self):
+        from max_messenger_bot.services import admin_mailing
+
+        states = SimpleNamespace(set=AsyncMock())
+        client = SimpleNamespace(send_message=AsyncMock())
+
+        request_id = await admin_mailing.choose_audience(client, states, 321, 100_000_000_055, "self")
+
+        self.assertTrue(request_id)
+        payload = states.set.await_args.args[3]
+        self.assertEqual(payload["audience"], "self")
+        self.assertEqual(payload["input_request_id"], request_id)
+        rows = client.send_message.await_args.kwargs["attachments"][0]["payload"]["buttons"]
+        callbacks = [button.get("payload") for row in rows for button in row]
+        self.assertIn("mailing_use_latest", callbacks)
+
+    async def test_watcher_automatically_captures_shared_message(self):
+        from max_messenger_bot.services import admin_mailing
+
+        snapshot = SimpleNamespace(
+            state="admin_mailing_text",
+            data={"input_request_id": "request-1"},
+        )
+        states = SimpleNamespace(get=AsyncMock(return_value=snapshot))
+        client = SimpleNamespace()
+
+        with patch.object(admin_mailing, "capture_latest_input", AsyncMock(return_value=True)) as capture:
+            await admin_mailing.watch_for_shared_input(
+                client,
+                states,
+                321,
+                100_000_000_055,
+                "request-1",
+                poll_interval=0,
+                max_checks=1,
+            )
+
+        capture.assert_awaited_once_with(
+            client,
+            states,
+            321,
+            100_000_000_055,
+            notify_if_missing=False,
+            shares_only=True,
+        )
+
+
 class MaxGeneratedButtonActionTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_test_action_uses_existing_test_flow(self):
         from max_messenger_bot.app import MaxBotApplication

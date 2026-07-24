@@ -1421,16 +1421,32 @@ class MaxBotApplication:
                 await admin_mailing_service.start_create(self.client, self.states, chat_id, user_id)
                 return
             if data.startswith("mailing_audience_"):
-                await admin_mailing_service.choose_audience(
+                request_id = await admin_mailing_service.choose_audience(
                     self.client,
                     self.states,
                     chat_id,
                     user_id,
                     data.replace("mailing_audience_", "", 1),
                 )
+                if request_id:
+                    task = asyncio.create_task(admin_mailing_service.watch_for_shared_input(
+                        self.client, self.states, chat_id, user_id, request_id
+                    ))
+                    _track_task(self.background_tasks, task)
                 return
             if data == "mailing_edit_content":
-                await admin_mailing_service.restart_text_edit(self.client, self.states, chat_id, user_id)
+                request_id = await admin_mailing_service.restart_text_edit(self.client, self.states, chat_id, user_id)
+                if request_id:
+                    task = asyncio.create_task(admin_mailing_service.watch_for_shared_input(
+                        self.client, self.states, chat_id, user_id, request_id
+                    ))
+                    _track_task(self.background_tasks, task)
+                return
+            if data == "mailing_use_latest":
+                await self.client.answer_callback(callback.callback_id)
+                await admin_mailing_service.capture_latest_input(
+                    self.client, self.states, chat_id, user_id
+                )
                 return
             if data == "mailing_confirm_send":
                 await admin_mailing_service.confirm_send(self.client, self.states, chat_id, user_id)

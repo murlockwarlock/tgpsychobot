@@ -141,6 +141,13 @@ class MaxApiClient:
         log.info("MAX updates fetched marker=%s count=%s", marker, len(updates))
         return result
 
+    async def get_messages(self, chat_id: int, count: int = 50) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            "/messages",
+            params={"chat_id": chat_id, "count": max(1, min(count, 100))},
+        )
+
     async def send_message(
         self,
         *,
