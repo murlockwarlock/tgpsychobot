@@ -18,7 +18,7 @@ from ..keyboards import (
 )
 from ..logging_utils import get_bot_logger
 from ..legacy import Mailing, Message as DBMessage, User, UserSubscription, async_session_maker
-from ..models import MAX_ID_OFFSET, IncomingMessage, parse_message
+from ..models import MAX_ID_OFFSET, REUSABLE_ATTACHMENT_TYPES, IncomingMessage, parse_message
 from ..storage import StateStore
 from ..time_utils import utc_now
 
@@ -88,8 +88,16 @@ async def choose_audience(client: MaxApiClient, states: StateStore, chat_id: int
     return request_id
 
 
+def _normalize_media(media_type: str | None, media_token: str | None) -> tuple[str | None, str | None]:
+    normalized_type = str(media_type or "").lower()
+    if normalized_type not in REUSABLE_ATTACHMENT_TYPES or not media_token:
+        return None, None
+    return normalized_type, str(media_token)
+
+
 def _preview_attachments(media_type: str | None, media_token: str | None, include_keyboard: bool = True) -> list[dict] | None:
     rows: list[dict] = []
+    media_type, media_token = _normalize_media(media_type, media_token)
     if media_type and media_token:
         rows.append({"type": media_type, "payload": {"token": media_token}})
     if include_keyboard:
@@ -99,8 +107,8 @@ def _preview_attachments(media_type: str | None, media_token: str | None, includ
 
 async def save_input(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, message: IncomingMessage) -> None:
     mailing_text = (message.text or "").strip()
-    media_type = message.media_type
-    media_token = message.media_token
+    formatted_text = (message.html_text or "").strip() or None
+    media_type, media_token = _normalize_media(message.media_type, message.media_token)
     if not mailing_text and not (media_type and media_token):
         await client.send_message(chat_id=chat_id, text="Отправьте текст, медиа или медиа с подписью.")
         return
@@ -116,21 +124,34 @@ async def save_input(client: MaxApiClient, states: StateStore, chat_id: int, use
         {
             "audience": audience,
             "text": mailing_text,
+            "formatted_text": formatted_text,
             "media_type": media_type,
             "media_token": media_token,
         },
     )
     preview = mailing_text[:3000] + ("..." if len(mailing_text) > 3000 else "")
-    await client.send_message(
-        chat_id=chat_id,
-        text=(
-            "<b>Предпросмотр рассылки</b>\n\n"
-            f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES[audience])}\n\n"
-            f"<b>Медиа:</b> {html.escape(media_type or 'нет')}\n\n"
-            f"<pre><code>{html.escape(preview or 'Без текста')}</code></pre>"
-        ),
-        attachments=_preview_attachments(media_type, media_token, include_keyboard=True),
-    )
+    try:
+        await client.send_message(
+            chat_id=chat_id,
+            text=(
+                "<b>Предпросмотр рассылки</b>\n\n"
+                f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES[audience])}\n\n"
+                f"<b>Медиа:</b> {html.escape(media_type or 'нет')}\n\n"
+                f"<pre><code>{html.escape(preview or 'Без текста')}</code></pre>"
+            ),
+            attachments=_preview_attachments(media_type, media_token, include_keyboard=True),
+        )
+    except Exception:
+        await states.set(user_id, chat_id, snapshot.state, dict(snapshot.data))
+        log.exception("Failed to show mailing preview user_id=%s chat_id=%s", user_id, chat_id)
+        try:
+            await client.send_message(
+                chat_id=chat_id,
+                text="Не удалось сформировать предпросмотр. Сообщение не потеряно — попробуйте отправить его ещё раз.",
+                attachments=admin_mailing_input_keyboard(),
+            )
+        except Exception:
+            log.exception("Failed to notify about mailing preview error user_id=%s chat_id=%s", user_id, chat_id)
 
 
 def _is_inbound_history_message(raw_message: dict, user_id: int) -> bool:
@@ -307,8 +328,11 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
         return
     audience = snapshot.data.get("audience")
     mailing_text = snapshot.data.get("text")
-    media_type = snapshot.data.get("media_type")
-    media_token = snapshot.data.get("media_token")
+    formatted_text = snapshot.data.get("formatted_text")
+    media_type, media_token = _normalize_media(
+        snapshot.data.get("media_type"),
+        snapshot.data.get("media_token"),
+    )
     if not audience or (not mailing_text and not (media_type and media_token)):
         await client.send_message(chat_id=chat_id, text="Состояние рассылки потеряно.")
         return
@@ -341,7 +365,12 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
             attachments = _preview_attachments(media_type, media_token, include_keyboard=False)
             from ..models import MAX_ID_OFFSET
             max_api_user_id = recipient_id - MAX_ID_OFFSET if recipient_id >= MAX_ID_OFFSET else recipient_id
-            await client.send_message(user_id=max_api_user_id, text=mailing_text, attachments=attachments)
+            await client.send_message(
+                user_id=max_api_user_id,
+                text=formatted_text or mailing_text,
+                attachments=attachments,
+                format_="html" if formatted_text else "",
+            )
             success_count += 1
             log.info("Mailing delivered mailing_id=%s target_id=%s", mailing_id, recipient_id)
         except Exception:
@@ -427,7 +456,8 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
         [callback_button("⬅️ К истории", "mailing_history_page_0")],
     ]
     attachments = []
-    if mailing.media_file_type and mailing.media_file_id:
-        attachments.append({"type": mailing.media_file_type, "payload": {"token": mailing.media_file_id}})
+    media_type, media_token = _normalize_media(mailing.media_file_type, mailing.media_file_id)
+    if media_type and media_token:
+        attachments.append({"type": media_type, "payload": {"token": media_token}})
     attachments.extend(inline_keyboard(detail_rows))
     await client.send_message(chat_id=chat_id, text=text, attachments=attachments)

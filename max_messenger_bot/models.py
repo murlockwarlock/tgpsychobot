@@ -6,6 +6,7 @@ from typing import Any
 
 
 MAX_ID_OFFSET = 100_000_000_000
+REUSABLE_ATTACHMENT_TYPES = frozenset({"image", "video", "audio", "file"})
 
 
 def _nested_get(data: dict[str, Any] | None, *path: str) -> Any:
@@ -176,6 +177,7 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
     media_type = None
     media_token = None
     media_url = None
+    shared_url = None
 
     chat_id = (
         recipient.get("chat_id")
@@ -198,10 +200,16 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
         for item in possible_attachments:
             if not isinstance(item, dict):
                 continue
-            item_type = item.get("type")
-            if item_type not in {"image", "video", "audio", "file", "share"}:
-                continue
+            item_type = str(item.get("type") or "").lower()
             payload = item.get("payload") or {}
+            if item_type == "share":
+                share_link = payload.get("link")
+                if isinstance(share_link, dict):
+                    share_link = share_link.get("url")
+                shared_url = payload.get("url") or share_link or shared_url
+                continue
+            if item_type not in REUSABLE_ATTACHMENT_TYPES:
+                continue
             token = (
                 payload.get("token")
                 or payload.get("file_token")
@@ -224,6 +232,8 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
     if not text and isinstance(forwarded_body, dict):
         text = forwarded_body.get("text")
         content_body = forwarded_body
+    if not text and shared_url:
+        text = str(shared_url)
     markups = None
     if isinstance(content_body, dict):
         markups = content_body.get("markup") or content_body.get("markups")

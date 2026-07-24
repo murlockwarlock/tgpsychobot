@@ -150,7 +150,7 @@ class MaxBotDeduplicationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MaxMailingInputTests(unittest.IsolatedAsyncioTestCase):
-    def test_shared_message_attachment_is_parsed(self):
+    def test_shared_link_is_kept_as_text_without_reusing_share_token(self):
         from max_messenger_bot.models import parse_message
 
         message = parse_message({
@@ -170,8 +170,106 @@ class MaxMailingInputTests(unittest.IsolatedAsyncioTestCase):
         })
 
         self.assertIsNotNone(message)
-        self.assertEqual(message.media_type, "share")
-        self.assertEqual(message.media_token, "share-token")
+        self.assertEqual(message.text, "Текст пересланной публикации")
+        self.assertIsNone(message.media_type)
+        self.assertIsNone(message.media_token)
+
+    def test_share_only_message_uses_attachment_url_as_text(self):
+        from max_messenger_bot.models import parse_message
+
+        message = parse_message({
+            "message": {
+                "sender": {"user_id": 55},
+                "recipient": {"chat_id": 321, "user_id": 999},
+                "body": {
+                    "mid": "shared-url-1",
+                    "text": "",
+                    "attachments": [{
+                        "type": "share",
+                        "payload": {"token": "share-token", "url": "https://max.ru/example"},
+                    }],
+                },
+            },
+        })
+
+        self.assertIsNotNone(message)
+        self.assertEqual(message.text, "https://max.ru/example")
+        self.assertIsNone(message.media_type)
+
+    def test_nested_share_link_is_used_as_text(self):
+        from max_messenger_bot.models import parse_message
+
+        message = parse_message({
+            "message": {
+                "sender": {"user_id": 55},
+                "recipient": {"chat_id": 321, "user_id": 999},
+                "body": {
+                    "mid": "shared-url-2",
+                    "attachments": [{
+                        "type": "share",
+                        "payload": {"token": "share-token", "link": {"url": "https://max.ru/nested"}},
+                    }],
+                },
+            },
+        })
+
+        self.assertIsNotNone(message)
+        self.assertEqual(message.text, "https://max.ru/nested")
+        self.assertIsNone(message.media_type)
+
+    def test_unknown_attachment_is_not_reused(self):
+        from max_messenger_bot.models import parse_message
+
+        message = parse_message({
+            "message": {
+                "sender": {"user_id": 55},
+                "recipient": {"chat_id": 321, "user_id": 999},
+                "body": {
+                    "mid": "unknown-1",
+                    "text": "Текст с неизвестным вложением",
+                    "attachments": [{"type": "sticker", "payload": {"token": "sticker-token"}}],
+                },
+            },
+        })
+
+        self.assertIsNotNone(message)
+        self.assertEqual(message.text, "Текст с неизвестным вложением")
+        self.assertIsNone(message.media_type)
+        self.assertIsNone(message.media_token)
+
+    async def test_mailing_preserves_supported_text_markup(self):
+        from max_messenger_bot.models import IncomingMessage, Sender
+        from max_messenger_bot.services import admin_mailing
+
+        user_id = 100_000_000_055
+        snapshot = SimpleNamespace(state="admin_mailing_text", data={"audience": "self"})
+        states = SimpleNamespace(get=AsyncMock(return_value=snapshot), set=AsyncMock())
+        client = SimpleNamespace(send_message=AsyncMock())
+        message = IncomingMessage(
+            raw={},
+            message_id="message-rich",
+            chat_id=321,
+            sender=Sender(user_id=user_id, username=None, first_name="Admin", last_name=None),
+            text="Жирный текст и ссылка",
+            html_text='<b>Жирный</b> текст и <a href="https://example.com">ссылка</a>',
+        )
+
+        await admin_mailing.save_input(client, states, 321, user_id, message)
+
+        payload = states.set.await_args.args[3]
+        self.assertEqual(payload["text"], "Жирный текст и ссылка")
+        self.assertEqual(
+            payload["formatted_text"],
+            '<b>Жирный</b> текст и <a href="https://example.com">ссылка</a>',
+        )
+
+    def test_any_unsupported_media_is_removed_from_outgoing_attachments(self):
+        from max_messenger_bot.services import admin_mailing
+
+        attachments = admin_mailing._preview_attachments("sticker", "sticker-token", include_keyboard=True)
+
+        self.assertTrue(attachments)
+        self.assertFalse(any(item.get("type") == "sticker" for item in attachments))
 
     def test_forwarded_message_link_text_is_parsed(self):
         from max_messenger_bot.models import parse_message
@@ -231,9 +329,37 @@ class MaxMailingInputTests(unittest.IsolatedAsyncioTestCase):
         state_call = states.set.await_args
         self.assertEqual(state_call.args[2], "admin_mailing_preview")
         self.assertEqual(state_call.args[3]["text"], "Готовая публикация")
-        self.assertEqual(state_call.args[3]["media_type"], "share")
+        self.assertIsNone(state_call.args[3]["media_type"])
         preview_attachments = client.send_message.await_args.kwargs["attachments"]
-        self.assertEqual(preview_attachments[0], {"type": "share", "payload": {"token": "share-token"}})
+        self.assertFalse(any(item.get("type") == "share" for item in preview_attachments))
+
+    async def test_preview_failure_restores_input_state_and_notifies_admin(self):
+        from max_messenger_bot.models import IncomingMessage, Sender
+        from max_messenger_bot.services import admin_mailing
+
+        user_id = 100_000_000_055
+        snapshot = SimpleNamespace(
+            state="admin_mailing_text",
+            data={"audience": "self", "input_after_ms": 1000, "input_request_id": "request-3"},
+        )
+        states = SimpleNamespace(get=AsyncMock(return_value=snapshot), set=AsyncMock())
+        client = SimpleNamespace(send_message=AsyncMock(side_effect=[RuntimeError("preview failed"), None]))
+        message = IncomingMessage(
+            raw={},
+            message_id="message-1",
+            chat_id=321,
+            sender=Sender(user_id=user_id, username=None, first_name="Admin", last_name=None),
+            text="Текст рассылки",
+        )
+
+        await admin_mailing.save_input(client, states, 321, user_id, message)
+
+        self.assertEqual(states.set.await_count, 2)
+        restored = states.set.await_args_list[-1]
+        self.assertEqual(restored.args[2], "admin_mailing_text")
+        self.assertEqual(restored.args[3], snapshot.data)
+        self.assertEqual(client.send_message.await_count, 2)
+        self.assertIn("не потеряно", client.send_message.await_args.kwargs["text"])
 
     async def test_watcher_recovers_forward_link_from_chat_history(self):
         from max_messenger_bot.services import admin_mailing
