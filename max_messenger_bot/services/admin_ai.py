@@ -8,10 +8,11 @@ from ..keyboards import admin_ai_model_selection_keyboard, admin_ai_settings_key
 from ..legacy import AIConfig, async_session_maker
 from ..storage import StateStore
 from memory_mode import MEMORY_MODE_RESET, memory_mode_label, next_memory_mode, normalize_memory_mode
+from provider_models import DEEPSEEK_MODELS
 
 
 PROVIDER_MODELS = {
-    "Deepseek": ["deepseek-chat", "deepseek-coder"],
+    "Deepseek": list(DEEPSEEK_MODELS),
     "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001", "claude-3-haiku-20240307"],
     "Gemini": ["gemini-2.5-pro", "gemini-2.5-flash"],
     "OpenAI": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
@@ -19,7 +20,7 @@ PROVIDER_MODELS = {
 }
 
 FALLBACK_MODELS = {
-    "Deepseek": ["deepseek-chat", "deepseek-reasoner"],
+    "Deepseek": list(DEEPSEEK_MODELS),
     "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
     "Gemini": ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-2.5-pro-preview-05-06"],
     "KIE": ["gemini-3-flash", "gemini-2.5-flash"],

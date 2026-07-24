@@ -22,6 +22,7 @@ from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory
 from prompt_context import apply_global_prompt_appendix
 from result_history import conversation_role_filter
 from vector_store import search_relevant_chunks
+from provider_models import normalize_deepseek_model
 
 configure_logging()
 log = get_ai_logger("service")
@@ -99,7 +100,7 @@ async def _call_openai(api_key: str, model: str, messages: list[dict], temperatu
 async def _call_deepseek(api_key: str, model: str, messages: list[dict], temperature: float) -> str:
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
     response = await client.chat.completions.create(
-        model=model,
+        model=normalize_deepseek_model(model),
         messages=messages,
         max_tokens=4096,
         temperature=temperature,

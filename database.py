@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from config import DATABASE_URL
 from memory_mode import MEMORY_MODE_RESET, MEMORY_MODE_TOPIC, get_memory_mode
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE, DEFAULT_SHARED_PROMPT_BLOCK
+from provider_models import DEEPSEEK_DEFAULT_MODEL
 
 _engine_options = {"echo": False, "pool_pre_ping": True}
 if not DATABASE_URL.startswith("sqlite"):
@@ -131,7 +132,7 @@ class AIConfig(Base):
     kie_credit_alert_threshold = Column(Float, default=0, nullable=False)
     kie_credit_alert_sent = Column(Boolean, default=False, nullable=False)
     claude_model = Column(String, default='claude-sonnet-4-5-20250929')
-    deepseek_model = Column(String, default='deepseek-chat')
+    deepseek_model = Column(String, default=DEEPSEEK_DEFAULT_MODEL)
     openai_model = Column(String, default='gpt-4o')
     max_voice_duration_sec = Column(Integer, default=180, nullable=False)
     transcription_provider = Column(String, default='OpenAI', nullable=False)
@@ -515,6 +516,22 @@ async def get_all_admin_ids() -> set:
     return all_ids
 
 
+def _migrate_deepseek_models(sync_conn) -> None:
+    from sqlalchemy import text
+
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET deepseek_model = 'deepseek-v4-flash'
+        WHERE deepseek_model IN ('deepseek-chat', 'deepseek-reasoner', 'deepseek-coder')
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET fallback_model = 'deepseek-v4-flash'
+        WHERE fallback_provider = 'Deepseek'
+          AND fallback_model IN ('deepseek-chat', 'deepseek-reasoner', 'deepseek-coder')
+    """))
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -578,12 +595,18 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN use_proxy BOOLEAN DEFAULT TRUE NOT NULL"))
             if 'fallback_timeout' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN fallback_timeout INTEGER DEFAULT 60 NOT NULL"))
+            if 'fallback_provider' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN fallback_provider VARCHAR"))
+            if 'fallback_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN fallback_model VARCHAR"))
             if 'allow_fallback' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_fallback BOOLEAN DEFAULT FALSE NOT NULL"))
             if 'allow_image_generation' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_image_generation BOOLEAN DEFAULT FALSE NOT NULL"))
             if 'allow_image_edit' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_image_edit BOOLEAN DEFAULT FALSE NOT NULL"))
+
+            _migrate_deepseek_models(sync_conn)
 
             test_session_columns = [c['name'] for c in insp.get_columns('test_sessions')]
             if 'formula_results' not in test_session_columns:

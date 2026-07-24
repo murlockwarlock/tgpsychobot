@@ -27,6 +27,7 @@ from result_history import conversation_role_filter
 from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
 from user_metadata import append_metadata_records, extract_data_blocks
+from provider_models import normalize_deepseek_model
 
 class InsufficientBalanceError(Exception):
     pass
@@ -785,7 +786,7 @@ async def _call_deepseek_api(api_key: str, model: str, history: list, context: s
         ]
 
         chat_completion = await client.chat.completions.create(
-            model=model,
+            model=normalize_deepseek_model(model),
             messages=messages_with_system,
             max_tokens=4096,
             temperature=temperature

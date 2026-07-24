@@ -83,6 +83,7 @@ from mailing_utils import (
     send_mailing_content,
 )
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE
+from provider_models import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MODELS
 from user_metadata import append_metadata_records, extract_data_blocks, load_metadata_records
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
@@ -386,15 +387,15 @@ MODELS_INFO = {
         'pricing': '<b>Sonnet 4.5:</b> $3 / $15\n<b>Opus 4.1:</b> $15 / $75\n<b>Haiku 4.5:</b> $1 / $5\n<b>Haiku 3:</b> $0.25 / $1.25\n(Вход / Выход за 1M токенов)'
     },
     "Deepseek": {
-        'deepseek-chat': {
-            'name': 'Deepseek Chat',
-            'desc': 'Основная модель для общения, оптимизированная для диалогов и ответов на вопросы.'
+        'deepseek-v4-flash': {
+            'name': 'DeepSeek V4 Flash',
+            'desc': 'Быстрая и экономичная модель для повседневных диалогов и большинства задач.'
         },
-        'deepseek-coder': {
-            'name': 'Deepseek Coder',
-            'desc': 'Специализированная модель для написания и отладки программного кода.'
+        'deepseek-v4-pro': {
+            'name': 'DeepSeek V4 Pro',
+            'desc': 'Более мощная модель для сложных рассуждений и требовательных задач.'
         },
-        'pricing': '<b>Вход:</b> $0.14 / 1M токенов\n<b>Выход:</b> $0.28 / 1M токенов'
+        'pricing': '<b>V4 Flash:</b> $0.14 / $0.28\n<b>V4 Pro:</b> $0.435 / $0.87\n(Вход / выход за 1M токенов, без учёта кеша)'
     },
     "OpenAI": {
         'gpt-4o': {
@@ -3513,7 +3514,7 @@ async def admin_toggle_image_edit(callback: CallbackQuery):
 
 _FALLBACK_CYCLE = [None, "Deepseek", "Claude", "Gemini", "KIE", "OpenAI"]
 _FALLBACK_DEFAULT_MODELS = {
-    "Deepseek": "deepseek-chat",
+    "Deepseek": DEEPSEEK_DEFAULT_MODEL,
     "Claude": "claude-sonnet-4-5-20250929",
     "Gemini": "gemini-2.0-flash",
     "KIE": "gemini-3-flash",
@@ -3575,7 +3576,7 @@ async def admin_change_fallback_model_list(callback: CallbackQuery):
 
     builder = InlineKeyboardBuilder()
     model_map = {
-        "Deepseek": ["deepseek-chat", "deepseek-reasoner"],
+        "Deepseek": list(DEEPSEEK_MODELS),
         "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
         "Gemini": ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-2.5-pro-preview-05-06"],
         "KIE": ["gemini-3-flash", "gemini-2.5-flash"],
