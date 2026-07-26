@@ -26,7 +26,6 @@ ecosystem.config.js
 backup_postgres_remote.sh
 deploy_prod.sh
 snapshot_prod.sh
-monitor_psychobots.py
 update_dbs.py
 
 # Local assistant metadata
