@@ -26,6 +26,7 @@ from bot_commands import (
     refresh_chat_commands,
     refresh_default_commands,
 )
+from telegram_client import create_telegram_bot
 
 WEB_SERVER_HOST = '0.0.0.0'
 APP_PORT = int(os.environ.get('APP_PORT', 8080))
@@ -329,7 +330,10 @@ def main():
         logging.critical("SERVER_IP не задан. Остановка.")
         return
 
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    bot = create_telegram_bot(
+        BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 

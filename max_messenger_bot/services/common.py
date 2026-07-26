@@ -30,6 +30,7 @@ from ..storage import MaxContentMedia, StateStore
 from ..time_utils import utc_now
 from memory_mode import normalize_memory_mode, start_new_dialogue
 from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
+from telegram_client import create_telegram_bot
 
 
 log = get_bot_logger("common")
@@ -113,7 +114,6 @@ async def notify_telegram_admins(text: str) -> None:
     import os
     bot_token = os.getenv("BOT_TOKEN")
     if bot_token:
-        from aiogram import Bot
         from database import get_all_admin_ids, SubscriptionConfig
         
         async with async_session_maker() as session:
@@ -121,7 +121,7 @@ async def notify_telegram_admins(text: str) -> None:
             if not config or not config.notifications_enabled:
                 return
 
-        async with Bot(token=bot_token) as bot:
+        async with create_telegram_bot(bot_token) as bot:
             for admin_id in await get_all_admin_ids():
                 try:
                     await bot.send_message(admin_id, text, parse_mode="HTML")
