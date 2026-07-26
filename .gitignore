@@ -24,7 +24,6 @@ ecosystem.config.js
 
 # Local production operations
 backup_postgres_remote.sh
-deploy_prod.sh
 snapshot_prod.sh
 update_dbs.py
 
