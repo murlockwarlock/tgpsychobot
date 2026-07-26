@@ -27,10 +27,6 @@ backup_postgres_remote.sh
 snapshot_prod.sh
 update_dbs.py
 
-# Local assistant metadata
-.agents/
-.claude/
-
 # Client-specific prompt files
 system_prompts/
 
