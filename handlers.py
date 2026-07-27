@@ -109,6 +109,7 @@ import hashlib
 from urllib import parse
 from urllib.parse import urlparse
 from dateutil.relativedelta import relativedelta
+from payment_failure_reasons import format_yookassa_admin_reason_line
 from scheduler import (
     process_recurring_payment,
     process_recurring_robokassa_payment,
@@ -121,6 +122,7 @@ from scheduler import (
 )
 from subscription_dates import extend_subscription_end_date
 from subscription_retry_policy import can_retry_manually
+from subscription_context import should_include_subscription_status
 from topic_management import delete_topic_with_dependencies
 from bot_commands import refresh_commands_for_user
 from card_spreads import extract_numbered_spread_definition
@@ -7468,7 +7470,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 final_price,
                 user_sub.payment_method_id,
             )
-            res, yk_payment_id, yk_payment_status = await process_recurring_payment(
+            res, yk_payment_id, yk_payment_status, yk_failure_reason = await process_recurring_payment(
                 bot, user_sub, plan_to_charge, final_price, config, attempt_started_at
             )
             plog.info(
@@ -7575,7 +7577,8 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
             else:
                 attempt_num = user_sub.payment_attempt_count + 1
                 pay_id_suffix = f" | PayId={yk_payment_id}" if yk_payment_id else ""
-                plog.warning(f"ОШИБКА_СПИСАНИЯ | Yookassa | {user_ref} | попытка {attempt_num} | {plan_to_charge.name}{pay_id_suffix}")
+                reason_suffix = f" | Причина={yk_failure_reason}" if yk_failure_reason else ""
+                plog.warning(f"ОШИБКА_СПИСАНИЯ | Yookassa | {user_ref} | попытка {attempt_num} | {plan_to_charge.name}{pay_id_suffix}{reason_suffix}")
                 user_sub.payment_attempt_count += 1
                 user_sub.last_payment_attempt = attempt_started_at
                 if attempt_num >= 3:
@@ -7601,11 +7604,12 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                        "Не удалось списать средства (YooKassa). Проверьте состояние карты и попробуйте позже.")
                 cfg = await session.get(SubscriptionConfig, 1)
                 if cfg and cfg.notifications_enabled:
+                    reason_line = format_yookassa_admin_reason_line(yk_failure_reason)
                     for admin_id in await get_all_admin_ids():
                         try:
                             await bot.send_message(
                                 admin_id,
-                                f"⚠️ Ошибка автосписания [{attempt_num}/3]\nПользователь: {user_ref}\nТариф: {plan_to_charge.name}\nСумма: {final_price:.2f} руб\nПровайдер: Yookassa" + (f"\nPayId: {yk_payment_id}" if yk_payment_id else "")
+                                f"⚠️ Ошибка автосписания [{attempt_num}/3]\nПользователь: {user_ref}\nТариф: {plan_to_charge.name}\nСумма: {final_price:.2f} руб\nПровайдер: Yookassa{reason_line}" + (f"\nPayId: {yk_payment_id}" if yk_payment_id else "")
                             )
                         except Exception:
                             pass
@@ -14114,7 +14118,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 await session.flush()
 
             sub_config = await session.get(SubscriptionConfig, 1)
-            subscriptions_active = sub_config.subscriptions_enabled if sub_config else True
+            subscriptions_active = should_include_subscription_status(sub_config)
             is_user_admin = await is_admin(user_id)
 
             if not is_user_admin and subscriptions_active:
@@ -14146,10 +14150,15 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             if not base_prompt_text:
                 base_prompt_text = "Ты — профессиональный эксперт. Проанализируй это изображение максимально подробно."
 
+            subscription_context = ""
+            if subscriptions_active:
+                subscription_context = (
+                    f"ДАННЫЕ КЛИЕНТА:\n"
+                    f"{_describe_subscription_status(user.subscription)}\n\n"
+                )
+
             system_prompt = (
-                f"ДАННЫЕ КЛИЕНТА:\n"
-                f"{_describe_subscription_status(user.subscription)}\n\n"
-                f"{base_prompt_text}\n\n"
+                f"{subscription_context}{base_prompt_text}\n\n"
                 "ИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"
                 "1. Если пользователь просит ИЗМЕНИТЬ это фото или 'сделать так же', добавь в конце: EDIT_IMG: <prompt on english>.\n"
                 "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"

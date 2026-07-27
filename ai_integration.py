@@ -16,7 +16,7 @@ from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestE
 
 from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestConfig, TestSession,
                      MediaLibrary, TopicMediaDeck, MediaCollection, media_collection_items, topic_collection_association,
-                     UserSubscription, KnowledgeBase)
+                     UserSubscription, KnowledgeBase, SubscriptionConfig)
 from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
@@ -28,6 +28,7 @@ from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
 from user_metadata import append_metadata_records, extract_data_blocks
 from provider_models import normalize_deepseek_model
+from subscription_context import should_include_subscription_status
 
 class InsufficientBalanceError(Exception):
     pass
@@ -1086,7 +1087,9 @@ async def get_ai_response(
         forced_user_header = f"ДАННЫЕ КЛИЕНТА:\nИМЯ: {safe_user_name}\nПОЛ: {safe_user_gender}\n"
         if user.age:
             forced_user_header += f"ВОЗРАСТ: {user.age}\n"
-        forced_user_header += f"{_describe_subscription_status(user.subscription)}\n"
+        subscription_config = await session.get(SubscriptionConfig, 1)
+        if should_include_subscription_status(subscription_config):
+            forced_user_header += f"{_describe_subscription_status(user.subscription)}\n"
         forced_user_header += "\n"
 
         try:

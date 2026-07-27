@@ -28,6 +28,10 @@ from birthday_mailings import process_birthday_mailings
 from subscription_notifications import should_send_upcoming_charge_notification
 from subscription_retry_policy import can_retry_now, get_next_retry_at
 from error_reporting import notify_admins_about_error
+from payment_failure_reasons import (
+    format_yookassa_admin_reason_line,
+    get_yookassa_cancellation_reason,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -36,7 +40,6 @@ ROBOKASSA_PENDING_TIMEOUT = timedelta(hours=3)
 EXPIRATION_DEDUP_WINDOW = timedelta(hours=2)
 UTC = timezone.utc
 MSK = timezone(timedelta(hours=3))
-
 
 def _sanitize_log_value(value, limit: int = 2000) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ").strip()
@@ -91,6 +94,7 @@ def _serialize_yookassa_payment(payment) -> dict[str, object]:
     amount = getattr(payment, "amount", None)
     confirmation = getattr(payment, "confirmation", None)
     payment_method = getattr(payment, "payment_method", None)
+    cancellation_details = getattr(payment, "cancellation_details", None)
     metadata = getattr(payment, "metadata", None)
     return {
         "id": getattr(payment, "id", None),
@@ -110,6 +114,10 @@ def _serialize_yookassa_payment(payment) -> dict[str, object]:
             "type": getattr(payment_method, "type", None),
             "saved": getattr(payment_method, "saved", None),
         } if payment_method else None,
+        "cancellation_details": {
+            "party": getattr(cancellation_details, "party", None),
+            "reason": getattr(cancellation_details, "reason", None),
+        } if cancellation_details else None,
         "metadata": metadata if isinstance(metadata, dict) else None,
     }
 
@@ -388,13 +396,14 @@ async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: Subsc
 
         if payment.status == 'succeeded':
             log.info(f"Successfully charged user {sub.user_id} for plan {plan.name}")
-            return True, payment.id, payment.status
+            return True, payment.id, payment.status, None
         if payment.status in ('pending', 'waiting_for_capture'):
             log.info(f"Recurring payment for user {sub.user_id} is pending: {payment.id}")
-            return 'pending', payment.id, payment.status
+            return 'pending', payment.id, payment.status, None
         else:
+            cancellation_reason = get_yookassa_cancellation_reason(payment)
             log.warning(f"Payment for user {sub.user_id} was created but status is {payment.status}")
-            return False, payment.id, payment.status
+            return False, payment.id, payment.status, cancellation_reason
 
     except BadRequestError as e:
         log.error(f"Failed to charge user {sub.user_id}. API BadRequestError: {e}")
@@ -406,8 +415,8 @@ async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: Subsc
             Body=_encode_log_json(e.content) if isinstance(e.content, dict) else str(e),
         )
         if error_code == 'payment_method_not_found':
-            return 'deactivate', None, None
-        return 'integration_error', None, None
+            return 'deactivate', None, None, error_code
+        return 'integration_error', None, None, error_code
     except (ForbiddenError, InternalServerError, TooManyRequestsError, UnauthorizedError) as e:
         log.error(f"Failed to charge user {sub.user_id}. API Error: {e}")
         _plog_yookassa_tech(
@@ -415,7 +424,7 @@ async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: Subsc
             ErrorClass=type(e).__name__,
             Body=_encode_log_json(e.content) if isinstance(getattr(e, "content", None), dict) else str(e),
         )
-        return 'provider_error', None, None
+        return 'provider_error', None, None, None
     except Exception as e:
         log.error(f"Unknown error during payment processing for user {sub.user_id}: {e}")
         _plog_yookassa_tech(
@@ -423,7 +432,7 @@ async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: Subsc
             ErrorClass=type(e).__name__,
             Body=str(e),
         )
-        return 'provider_error', None, None
+        return 'provider_error', None, None, None
 
 
 async def check_subscriptions(bot: Bot):
@@ -830,7 +839,7 @@ async def check_subscriptions(bot: Bot):
 
                     if sub.payment_provider == 'Yookassa' and sub.payment_method_id:
                         attempt_started_at = sub.last_payment_attempt or now
-                        res, yk_payment_id, yk_payment_status = await process_recurring_payment(
+                        res, yk_payment_id, yk_payment_status, yk_failure_reason = await process_recurring_payment(
                             bot, sub, plan_to_charge, final_price, config, attempt_started_at
                         )
                         existing_yk_payment = (
@@ -988,7 +997,8 @@ async def check_subscriptions(bot: Bot):
                         else:
                             attempt_num_yk = sub.payment_attempt_count + 1
                             pay_id_suffix = f" | PayId={yk_payment_id}" if yk_payment_id else ""
-                            plog.warning(f"ОШИБКА_СПИСАНИЯ | Yookassa | {user_ref} | попытка {attempt_num_yk} | {plan_to_charge.name}{pay_id_suffix}")
+                            reason_suffix = f" | Причина={yk_failure_reason}" if yk_failure_reason else ""
+                            plog.warning(f"ОШИБКА_СПИСАНИЯ | Yookassa | {user_ref} | попытка {attempt_num_yk} | {plan_to_charge.name}{pay_id_suffix}{reason_suffix}")
                             sub.payment_attempt_count += 1
                             sub.last_payment_attempt = attempt_started_at
                             if attempt_num_yk >= 3:
@@ -1022,10 +1032,11 @@ async def check_subscriptions(bot: Bot):
                                 window=timedelta(days=1),
                             )
                             if config and config.notifications_enabled:
+                                reason_line = format_yookassa_admin_reason_line(yk_failure_reason)
                                 for admin_id in all_admin_ids:
                                     try:
                                         await bot.send_message(admin_id,
-                                                               f"⚠️ Ошибка автосписания [{attempt_num_yk}/3]\nПользователь: {user_ref}\nТариф: {plan_to_charge.name}\nСумма: {final_price:.2f} руб\nПровайдер: Yookassa")
+                                                               f"⚠️ Ошибка автосписания [{attempt_num_yk}/3]\nПользователь: {user_ref}\nТариф: {plan_to_charge.name}\nСумма: {final_price:.2f} руб\nПровайдер: Yookassa{reason_line}")
                                     except Exception:
                                         pass
 
