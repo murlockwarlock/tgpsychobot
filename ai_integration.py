@@ -28,7 +28,7 @@ from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
 from user_metadata import append_metadata_records, extract_data_blocks
 from provider_models import normalize_deepseek_model
-from subscription_context import should_include_subscription_status
+from subscription_context import active_subscription_flag
 
 class InsufficientBalanceError(Exception):
     pass
@@ -157,28 +157,6 @@ def _guess_image_media_type(file_bytes: bytes) -> str:
     if header.startswith(b"RIFF") and file_bytes[8:12] == b"WEBP":
         return "image/webp"
     return "image/jpeg"
-
-
-def _describe_subscription_status(user_sub) -> str:
-    from datetime import datetime
-    now = datetime.utcnow()
-    if not user_sub or not user_sub.end_date or user_sub.end_date <= now:
-        return "СТАТУС ПОДПИСКИ: неактивен"
-
-    if user_sub.plan_id is not None:
-        reason = "оплаченный тариф"
-    else:
-        provider = user_sub.payment_provider or ""
-        if provider in ("Trial Referral", "Trial Referral Bonus"):
-            reason = "реферальный бонус"
-        elif provider == "Trial Promo":
-            reason = "промокод"
-        elif provider == "Trial Welcome":
-            reason = "приветственный бонус"
-        else:
-            reason = "бонус"
-
-    return f"СТАТУС ПОДПИСКИ: активен (основание: {reason})"
 
 
 def _extract_kie_chat_text(payload: dict) -> str:
@@ -1088,8 +1066,9 @@ async def get_ai_response(
         if user.age:
             forced_user_header += f"ВОЗРАСТ: {user.age}\n"
         subscription_config = await session.get(SubscriptionConfig, 1)
-        if should_include_subscription_status(subscription_config):
-            forced_user_header += f"{_describe_subscription_status(user.subscription)}\n"
+        subscription_flag = active_subscription_flag(subscription_config, user.subscription)
+        if subscription_flag:
+            forced_user_header += f"{subscription_flag}\n"
         forced_user_header += "\n"
 
         try:

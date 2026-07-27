@@ -53,7 +53,6 @@ from ai_integration import (
     _call_claude_api,
     _call_kie_chat,
     _get_kie_base_url,
-    _describe_subscription_status,
 )
 from error_reporting import notify_admins_about_error
 from knowledge_base_admin import (
@@ -122,7 +121,7 @@ from scheduler import (
 )
 from subscription_dates import extend_subscription_end_date
 from subscription_retry_policy import can_retry_manually
-from subscription_context import should_include_subscription_status
+from subscription_context import active_subscription_flag, should_include_subscription_status
 from topic_management import delete_topic_with_dependencies
 from bot_commands import refresh_commands_for_user
 from card_spreads import extract_numbered_spread_definition
@@ -14151,10 +14150,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 base_prompt_text = "Ты — профессиональный эксперт. Проанализируй это изображение максимально подробно."
 
             subscription_context = ""
-            if subscriptions_active:
+            subscription_flag = active_subscription_flag(sub_config, user.subscription)
+            if subscription_flag:
                 subscription_context = (
                     f"ДАННЫЕ КЛИЕНТА:\n"
-                    f"{_describe_subscription_status(user.subscription)}\n\n"
+                    f"{subscription_flag}\n\n"
                 )
 
             system_prompt = (
