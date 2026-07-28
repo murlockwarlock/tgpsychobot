@@ -68,3 +68,58 @@ async def test_nl_check_covers_all_required_ports(monkeypatch):
 
     assert issues == []
     assert {port for _, port, _ in checked_ports} == {3128, 443, 4430, 62050, 2053, 2069}
+
+
+@pytest.mark.asyncio
+async def test_payment_webhook_check_accepts_expected_bad_request():
+    class Response:
+        status = 400
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        def get(self, url, **kwargs):
+            assert url == "https://bots.example:8443/bot_legacy_1/webhooks/robokassa/result"
+            assert kwargs == {"allow_redirects": False}
+            return Response()
+
+    issues = await monitor.check_payment_webhooks(
+        {
+            "webhook_base_url": "https://bots.example:8443/",
+            "webhook_path_prefix": "/bot_legacy_1",
+        },
+        Session(),
+    )
+
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_payment_webhook_check_reports_unavailable_route():
+    class Session:
+        def get(self, url, **kwargs):
+            raise asyncio.TimeoutError
+
+    issues = await monitor.check_payment_webhooks(
+        {
+            "webhook_base_url": "https://bots.example:8443",
+            "webhook_path_prefix": "bot1",
+        },
+        Session(),
+    )
+
+    assert issues == [
+        "Payment webhook is unavailable: TimeoutError: "
+        "https://bots.example:8443/bot1/webhooks/robokassa/result"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_payment_webhook_check_skips_apps_without_public_route():
+    issues = await monitor.check_payment_webhooks({}, object())
+
+    assert issues == []

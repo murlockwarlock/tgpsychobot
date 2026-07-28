@@ -131,6 +131,8 @@ def get_bot_apps() -> list[dict]:
                 "owner_ids": parse_owner_ids(env.get("OWNER_IDS", "")),
                 "delivery_mode": str(env.get("TELEGRAM_DELIVERY_MODE", "")).lower(),
                 "error_log": env.get("pm_err_log_path"),
+                "webhook_base_url": env.get("BASE_WEBHOOK_URL"),
+                "webhook_path_prefix": env.get("WEBHOOK_PATH_PREFIX"),
             }
         )
     return apps
@@ -233,6 +235,22 @@ async def check_telegram(app: dict, http: aiohttp.ClientSession) -> list[str]:
     except Exception as exc:
         issues.append(f"Telegram getWebhookInfo failed: {type(exc).__name__}: {exc}")
     return issues
+
+
+async def check_payment_webhooks(app: dict, http: aiohttp.ClientSession) -> list[str]:
+    base_url = str(app.get("webhook_base_url") or "").rstrip("/")
+    prefix = str(app.get("webhook_path_prefix") or "").strip("/")
+    if not base_url or not prefix:
+        return []
+
+    url = f"{base_url}/{prefix}/webhooks/robokassa/result"
+    try:
+        async with http.get(url, allow_redirects=False) as resp:
+            if resp.status != 400:
+                return [f"Payment webhook check returned HTTP {resp.status}: {url}"]
+    except Exception as exc:
+        return [f"Payment webhook is unavailable: {type(exc).__name__}: {url}"]
+    return []
 
 
 async def check_tcp_port(host: str, port: int, label: str) -> str | None:
@@ -384,6 +402,7 @@ async def run_check(include_existing_log_errors: bool) -> int:
                 issues.append(f"PM2: status is {app['status']}")
             issues.extend(await check_db_schema(app))
             issues.extend(await check_telegram(app, http))
+            issues.extend(await check_payment_webhooks(app, http))
             issues.extend(read_new_log_errors(app, state, include_existing_log_errors))
             if issues:
                 all_issues.append((app["name"], issues))
