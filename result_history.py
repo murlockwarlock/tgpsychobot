@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -17,10 +18,58 @@ from user_metadata import extract_data_blocks
 
 TEST_RESULT_ROLE = "test_result"
 CONVERSATION_ROLES = ("user", "assistant")
+AI_HISTORY_ROLES = (*CONVERSATION_ROLES, TEST_RESULT_ROLE)
+
+
+@dataclass(frozen=True)
+class AIHistoryMessage:
+    role: str
+    content: str
+    topic_id: int | None
+    topic: Any = None
+    source_role: str = "user"
 
 
 def conversation_role_filter(message_model=Message):
     return message_model.role.in_(CONVERSATION_ROLES)
+
+
+def ai_history_role_filter(message_model=Message):
+    return message_model.role.in_(AI_HISTORY_ROLES)
+
+
+def select_ai_history_messages(
+    messages: list[Any],
+    limit_first: int,
+    limit_recent: int,
+) -> list[Any]:
+    normalized: list[Any] = []
+    for message in messages:
+        if message.role == TEST_RESULT_ROLE:
+            normalized.append(AIHistoryMessage(
+                role="user",
+                content=f"[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]\n{message.content}",
+                topic_id=getattr(message, "topic_id", None),
+                topic=getattr(message, "topic", None),
+                source_role=TEST_RESULT_ROLE,
+            ))
+        else:
+            normalized.append(message)
+
+    pairs: list[list[Any]] = []
+    current_pair: list[Any] = []
+    for message in normalized:
+        if message.role == "user" and any(item.role == "assistant" for item in current_pair):
+            pairs.append(current_pair)
+            current_pair = [message]
+        else:
+            current_pair.append(message)
+    if current_pair:
+        pairs.append(current_pair)
+
+    if len(pairs) > limit_first + limit_recent:
+        pairs = pairs[:limit_first] + pairs[-limit_recent:]
+    return [message for pair in pairs for message in pair]
 
 
 def _json_list(raw: str | None) -> list[dict[str, Any]]:
