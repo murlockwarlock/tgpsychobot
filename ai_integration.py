@@ -21,6 +21,7 @@ from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
     DEFAULT_SHORT_RESPONSE_INSTRUCTION,
+    build_test_context_injection,
     render_prompt_block,
 )
 from result_history import conversation_role_filter
@@ -1041,24 +1042,18 @@ async def get_ai_response(
                 secret_answers_txt = test_session.secret_answers
 
         test_context_injection = ""
-        if include_test_context and active_topic_id is None and (test_results_txt or secret_answers_txt):
-            context_parts = []
-            status_instruction = ""
-            if test_results_txt:
-                context_parts.append(f"Результаты основного теста (пройден):\n{test_results_txt}")
-            if secret_answers_txt:
-                context_parts.append(f"Ответы пользователя на СЕКРЕТНЫЙ тест (УЖЕ ПРОЙДЕН):\n{secret_answers_txt}")
-                status_instruction = "Пользователь УЖЕ прошел все тесты. Обсуждай результаты."
-            elif test_results_txt:
-                test_config = await session.get(TestConfig, 1)
-                if test_config is not None and not bool(getattr(test_config, "secret_test_enabled", True)):
-                    status_instruction = "Пользователь завершил основной тест. Продолжи диалог по его результатам. Не предлагай секретный блок."
-                else:
-                    status_instruction = "Пользователь прошел основной тест. Предложи пройти секретный блок."
-
-            if context_parts:
-                joined_results = "\n\n".join(context_parts)
-                test_context_injection = f"\n\n[КОНТЕКСТ ТЕСТА]\n{joined_results}\nИНСТРУКЦИЯ: {status_instruction}"
+        if include_test_context and (test_results_txt or secret_answers_txt):
+            test_config = await session.get(TestConfig, 1)
+            secret_test_enabled = bool(
+                getattr(test_config, "secret_test_enabled", True)
+                if test_config is not None
+                else True
+            )
+            test_context_injection = build_test_context_injection(
+                test_results_txt,
+                secret_answers_txt,
+                secret_test_enabled=secret_test_enabled,
+            )
 
         safe_user_name = user_name if user_name else "Не указано"
         safe_user_gender = user_gender if user_gender else "Не указан"

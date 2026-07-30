@@ -53,3 +53,31 @@ def render_prompt_block(template: str, **values: str) -> str:
     for key, value in values.items():
         rendered = rendered.replace(f"{{{key}}}", value or "")
     return rendered.strip()
+
+
+def build_test_context_injection(
+    test_results: str | None,
+    secret_answers: str | None,
+    *,
+    secret_test_enabled: bool = True,
+) -> str:
+    context_parts = []
+    if test_results:
+        context_parts.append(f"Результаты основного теста (пройден):\n{test_results}")
+    if secret_answers:
+        context_parts.append(
+            f"Ответы пользователя на СЕКРЕТНЫЙ тест (УЖЕ ПРОЙДЕН):\n{secret_answers}"
+        )
+        status_instruction = "Пользователь УЖЕ прошел все тесты. Обсуждай результаты."
+    elif test_results and secret_test_enabled:
+        status_instruction = "Пользователь прошел основной тест. Предложи пройти секретный блок."
+    elif test_results:
+        status_instruction = (
+            "Пользователь завершил основной тест. Продолжи диалог по его результатам. "
+            "Не предлагай секретный блок."
+        )
+    else:
+        return ""
+
+    joined_results = "\n\n".join(context_parts)
+    return f"\n\n[КОНТЕКСТ ТЕСТА]\n{joined_results}\nИНСТРУКЦИЯ: {status_instruction}"
