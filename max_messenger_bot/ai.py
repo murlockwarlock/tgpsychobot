@@ -20,7 +20,7 @@ from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, 
 from .logging_utils import configure_logging, get_ai_logger
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
 from prompt_context import apply_global_prompt_appendix
-from result_history import conversation_role_filter
+from result_history import ai_history_role_filter, select_ai_history_messages
 from vector_store import search_relevant_chunks
 from provider_models import normalize_deepseek_model
 
@@ -659,7 +659,7 @@ async def get_ai_response(
         history_rows = (
             await session.execute(
                 select(DBMessage)
-                .where(history_scope, conversation_role_filter(DBMessage))
+                .where(history_scope, ai_history_role_filter(DBMessage))
                 .order_by(DBMessage.timestamp.asc())
             )
         ).scalars().all()
@@ -667,25 +667,7 @@ async def get_ai_response(
         limit_first = getattr(ai_config, "context_limit_first", 2) or 2
         limit_recent = getattr(ai_config, "context_limit_recent", 10) or 10
 
-        pairs = []
-        current_pair = []
-        for msg in history_rows:
-            if msg.role == 'user' and any(m.role == 'assistant' for m in current_pair):
-                pairs.append(current_pair)
-                current_pair = [msg]
-            else:
-                current_pair.append(msg)
-        if current_pair:
-            pairs.append(current_pair)
-
-        if len(pairs) <= limit_first + limit_recent:
-            selected_pairs = pairs
-        else:
-            selected_pairs = pairs[:limit_first] + pairs[-limit_recent:]
-
-        history_rows = []
-        for pair in selected_pairs:
-            history_rows.extend(pair)
+        history_rows = select_ai_history_messages(history_rows, limit_first, limit_recent)
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend({"role": row.role, "content": row.content} for row in history_rows if row.content)
@@ -975,7 +957,7 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         history_rows = (
             await session.execute(
                 select(DBMessage)
-                .where(history_scope, conversation_role_filter(DBMessage))
+                .where(history_scope, ai_history_role_filter(DBMessage))
                 .order_by(DBMessage.timestamp.asc())
             )
         ).scalars().all()
@@ -987,25 +969,7 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         if history_rows and history_rows[-1].role == "user" and history_rows[-1].content.startswith("[Изображение]"):
             history_rows = history_rows[:-1]
 
-        pairs = []
-        current_pair = []
-        for msg in history_rows:
-            if msg.role == 'user' and any(m.role == 'assistant' for m in current_pair):
-                pairs.append(current_pair)
-                current_pair = [msg]
-            else:
-                current_pair.append(msg)
-        if current_pair:
-            pairs.append(current_pair)
-
-        if len(pairs) <= limit_first + limit_recent:
-            selected_pairs = pairs
-        else:
-            selected_pairs = pairs[:limit_first] + pairs[-limit_recent:]
-
-        history_rows = []
-        for pair in selected_pairs:
-            history_rows.extend(pair)
+        history_rows = select_ai_history_messages(history_rows, limit_first, limit_recent)
 
         history_list = [{"role": row.role, "content": row.content} for row in history_rows if row.content]
 

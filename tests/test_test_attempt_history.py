@@ -6,6 +6,7 @@ import tempfile
 import textwrap
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -16,11 +17,13 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 from database import Base, Message as DBMessage, TestAttempt as DBTestAttempt, User
 from result_history import (
     TEST_RESULT_ROLE,
+    ai_history_role_filter,
     attach_secret_answers,
     backfill_test_history_messages,
     build_test_history_entry,
     build_test_attempt_pages,
     conversation_role_filter,
+    select_ai_history_messages,
     save_test_attempt,
     save_test_history_message,
     attempt_to_dict,
@@ -234,6 +237,42 @@ class TestAttemptHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(test_rows[0].test_attempt_id)
         self.assertIn("Новый ответ", test_rows[0].content)
         self.assertEqual([row.role for row in conversation_rows], ["user", "assistant"])
+
+    async def test_history_message_is_available_to_ai_history(self):
+        async with self.sessions() as session:
+            session.add_all([
+                DBMessage(user_id=123, dialogue_id=1, role="user", content="Вопрос"),
+                DBMessage(user_id=123, dialogue_id=1, role=TEST_RESULT_ROLE, content="Результат"),
+                DBMessage(user_id=123, dialogue_id=1, role="assistant", content="Ответ"),
+            ])
+            await session.commit()
+            rows = (
+                await session.execute(
+                    select(DBMessage)
+                    .where(DBMessage.user_id == 123, ai_history_role_filter(DBMessage))
+                    .order_by(DBMessage.id)
+                )
+            ).scalars().all()
+
+        self.assertEqual([row.role for row in rows], ["user", TEST_RESULT_ROLE, "assistant"])
+
+    def test_result_stays_inside_configured_first_and_recent_window(self):
+        messages = []
+        for number in range(1, 25):
+            role = TEST_RESULT_ROLE if number == 12 else "user"
+            content = "Итог теста" if role == TEST_RESULT_ROLE else f"U{number}"
+            messages.extend([
+                SimpleNamespace(role=role, content=content, topic_id=None, topic=None),
+                SimpleNamespace(role="assistant", content=f"A{number}", topic_id=None, topic=None),
+            ])
+
+        selected = select_ai_history_messages(messages, limit_first=5, limit_recent=15)
+
+        selected_contents = [message.content for message in selected]
+        self.assertNotIn("U6", selected_contents)
+        self.assertIn("[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]\nИтог теста", selected_contents)
+        result = next(message for message in selected if "Итог теста" in message.content)
+        self.assertEqual(result.role, "user")
 
     async def test_backfills_existing_attempt_into_history_once(self):
         async with self.sessions() as session:

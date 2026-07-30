@@ -24,7 +24,11 @@ from prompt_blocks import (
     build_test_context_injection,
     render_prompt_block,
 )
-from result_history import conversation_role_filter
+from result_history import (
+    TEST_RESULT_ROLE,
+    ai_history_role_filter,
+    select_ai_history_messages,
+)
 from error_reporting import notify_admins_about_error
 from vector_store import search_relevant_chunks
 from user_metadata import append_metadata_records, extract_data_blocks
@@ -1076,21 +1080,6 @@ async def get_ai_response(
         if getattr(user, 'response_length', 'normal') == 'short':
             short_response_instruction = DEFAULT_SHORT_RESPONSE_INSTRUCTION
 
-        service_prompt_template = getattr(ai_config, 'service_prompt_block', None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
-        service_prompt_block = render_prompt_block(
-            service_prompt_template,
-            available_media_text=available_media_text,
-            test_context_injection=test_context_injection,
-            short_response_instruction=short_response_instruction,
-        )
-
-        prompt_parts = [forced_user_header.strip(), formatted_body.strip()]
-        if shared_prompt_block:
-            prompt_parts.append(shared_prompt_block)
-        if service_prompt_block:
-            prompt_parts.append(service_prompt_block)
-        system_prompt = "\n\n".join(part for part in prompt_parts if part)
-
         relevant_chunks = []
         if active_topic:
             doc_ids = [f.id for f in active_topic.knowledge_base_files]
@@ -1117,7 +1106,7 @@ async def get_ai_response(
         stmt = select(DBMessage).where(
             DBMessage.user_id == user.id,
             DBMessage.dialogue_id == active_dialogue_id,
-            conversation_role_filter(DBMessage),
+            ai_history_role_filter(DBMessage),
         )
         if not is_global_memory_mode(memory_mode):
             stmt = stmt.where(DBMessage.topic_id == active_topic_id)
@@ -1125,25 +1114,30 @@ async def get_ai_response(
         result = await session.execute(stmt)
         all_messages = result.scalars().all()
 
-        pairs = []
-        current_pair = []
-        for msg in all_messages:
-            if msg.role == 'user' and any(m.role == 'assistant' for m in current_pair):
-                pairs.append(current_pair)
-                current_pair = [msg]
-            else:
-                current_pair.append(msg)
-        if current_pair:
-            pairs.append(current_pair)
+        has_persisted_test_context = any(
+            message.role == TEST_RESULT_ROLE for message in all_messages
+        )
+        selected_messages = select_ai_history_messages(
+            all_messages,
+            limit_first,
+            limit_recent,
+        )
 
-        if len(pairs) <= limit_first + limit_recent:
-            selected_pairs = pairs
-        else:
-            selected_pairs = pairs[:limit_first] + pairs[-limit_recent:]
-
-        selected_messages = []
-        for pair in selected_pairs:
-            selected_messages.extend(pair)
+        if has_persisted_test_context:
+            test_context_injection = ""
+        service_prompt_template = getattr(ai_config, 'service_prompt_block', None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
+        service_prompt_block = render_prompt_block(
+            service_prompt_template,
+            available_media_text=available_media_text,
+            test_context_injection=test_context_injection,
+            short_response_instruction=short_response_instruction,
+        )
+        prompt_parts = [forced_user_header.strip(), formatted_body.strip()]
+        if shared_prompt_block:
+            prompt_parts.append(shared_prompt_block)
+        if service_prompt_block:
+            prompt_parts.append(service_prompt_block)
+        system_prompt = "\n\n".join(part for part in prompt_parts if part)
 
         final_history, global_memory_context = _build_memory_aware_history(
             selected_messages,
