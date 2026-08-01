@@ -54,7 +54,7 @@ from ai_integration import (
     _call_kie_chat,
     _get_kie_base_url,
 )
-from error_reporting import notify_admins_about_error
+from error_reporting import exception_summary, notify_admins_about_error
 from knowledge_base_admin import (
     delete_knowledge_base_record,
     find_original_kb_file_id,
@@ -678,19 +678,23 @@ async def _report_ai_failure(
     details: str | None = None,
     extra: dict | None = None,
     exception: Exception | None = None,
+    include_traceback: bool = True,
 ) -> None:
+    provider_attempts = getattr(exception, "provider_attempts", None) if exception else None
     await notify_admins_about_error(
         bot,
         title=title,
         user_id=getattr(user, "id", None),
         username=getattr(user, "username", None),
         full_name=getattr(user, "full_name", None),
-        provider=provider,
-        model=model,
+        provider=None if provider_attempts else provider,
+        model=None if provider_attempts else model,
         stage=stage,
-        details=details or (str(exception) if exception else None),
+        details=None if provider_attempts else (details or (exception_summary(exception) if exception else None)),
         extra=extra,
+        provider_attempts=provider_attempts,
         exception=exception,
+        include_traceback=include_traceback,
         logger=log,
     )
 
@@ -11107,6 +11111,7 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
             details=str(e),
             extra={"duration_sec": message.voice.duration},
             exception=e,
+            include_traceback=False,
         )
         await thinking_msg.edit_text(
             "К сожалению, сервис транскрибации временно недоступен из-за технической проблемы. Мы уже работаем над ее решением.")
@@ -11123,6 +11128,7 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
             details=str(e),
             extra={"duration_sec": message.voice.duration},
             exception=e,
+            include_traceback=False,
         )
         await thinking_msg.edit_text(
             "Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
@@ -11140,6 +11146,7 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
             details=str(e),
             extra={"duration_sec": message.voice.duration},
             exception=e,
+            include_traceback=False,
         )
         await thinking_msg.edit_text(
             f"Произошла непредвиденная ошибка при обработке аудио.\n<code>{html.escape(str(e))}</code>")

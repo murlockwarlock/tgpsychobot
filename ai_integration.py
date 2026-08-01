@@ -29,7 +29,7 @@ from result_history import (
     ai_history_role_filter,
     select_ai_history_messages,
 )
-from error_reporting import notify_admins_about_error
+from error_reporting import exception_summary, notify_admins_about_error
 from vector_store import search_relevant_chunks
 from user_metadata import append_metadata_records, extract_data_blocks
 from provider_models import normalize_deepseek_model
@@ -199,6 +199,13 @@ def _extract_openai_chat_text(response, *, provider: str) -> str:
 def _is_kie_transient_failure(error: Exception | str) -> bool:
     text = str(error).lower()
     markers = [
+        "connecterror",
+        "readerror",
+        "remoteprotocolerror",
+        "server exception",
+        "temporarily",
+        "timed out",
+        "timeout",
         "maintained",
         "maintenance",
         "internal error",
@@ -206,6 +213,65 @@ def _is_kie_transient_failure(error: Exception | str) -> bool:
         "server is currently being maintained",
     ]
     return any(marker in text for marker in markers)
+
+
+async def _prepare_kie_transcription_audio(
+    file_bytes: bytes,
+    filename: str,
+) -> tuple[bytes, str]:
+    if not filename.lower().endswith((".ogg", ".oga", ".opus")):
+        return file_bytes, filename
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "wav",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        wav_bytes, stderr = await process.communicate(file_bytes)
+    except Exception as exc:
+        raise AIServiceError(f"Не удалось запустить конвертацию OGG для KIE: {exception_summary(exc)}") from exc
+
+    if process.returncode != 0 or not wav_bytes:
+        ffmpeg_error = stderr.decode("utf-8", errors="replace").strip()
+        raise AIServiceError(
+            f"Не удалось конвертировать OGG в WAV для KIE: {ffmpeg_error or f'ffmpeg exit {process.returncode}'}"
+        )
+
+    stem = os.path.splitext(filename)[0]
+    return wav_bytes, f"{stem}.wav"
+
+
+async def _retry_kie_transcription_step(step: str, operation, attempts: int = 3):
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except InsufficientBalanceError:
+            raise
+        except AIServiceError as exc:
+            if attempt >= attempts or not _is_kie_transient_failure(exc):
+                raise
+            logging.warning(
+                "Retrying KIE transcription step=%s attempt=%s/%s error=%s",
+                step,
+                attempt + 1,
+                attempts,
+                exc,
+            )
+            await asyncio.sleep(attempt)
 
 
 def _validate_kie_json_response(status_code: int, payload: dict, *, context: str) -> dict:
@@ -490,7 +556,7 @@ async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: by
         raise
     except Exception as e:
         logging.error("KIE upload error", exc_info=e)
-        raise AIServiceError(f"Ошибка загрузки файла в KIE: {e}")
+        raise AIServiceError(f"Ошибка загрузки файла в KIE: {exception_summary(e)}")
 
 
 async def _call_kie_multimodal(api_key: str, base_url: str, model: str, system_prompt: str, user_content: list, temperature: float = 0.7) -> str:
@@ -550,7 +616,7 @@ async def _create_kie_task(api_key: str, base_url: str, model: str, input_payloa
         raise
     except Exception as e:
         logging.error("KIE create task error", exc_info=e)
-        raise AIServiceError(f"Ошибка создания задачи KIE: {e}")
+        raise AIServiceError(f"Ошибка создания задачи KIE: {exception_summary(e)}")
 
 
 def _extract_kie_task_result(task_payload: dict) -> dict:
@@ -624,33 +690,48 @@ async def _get_kie_download_url(api_key: str, base_url: str, url: str) -> str:
 
 
 async def get_kie_remaining_credits(api_key: str, base_url: str) -> float:
-    import httpx
-
     endpoint = f"{base_url}/api/v1/chat/credit"
     headers = {"Authorization": f"Bearer {api_key}"}
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-            response = await client.get(endpoint, headers=headers)
-        if response.status_code != 200:
-            raise AIServiceError(f"KIE credits check failed: status={response.status_code} body={response.text}")
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        for attempt in range(1, 4):
+            try:
+                response = await client.get(endpoint, headers=headers)
+                if response.status_code != 200:
+                    raise AIServiceError(
+                        f"KIE credits check failed: status={response.status_code} body={response.text}"
+                    )
 
-        payload = response.json()
-        data = payload.get("data")
-        if isinstance(data, (int, float, str)):
-            return float(data)
-        if data is None:
-            raise AIResponseError(f"KIE credits response has no data field: {payload}")
-        for key in ("remainingCredits", "remaining_credits", "credits", "balance", "creditBalance"):
-            value = data.get(key)
-            if value is not None:
-                return float(value)
-        raise AIResponseError(f"KIE credits response has no remaining credits field: {payload}")
-    except (AIServiceError, AIResponseError):
-        raise
-    except Exception as e:
-        logging.error("KIE credits check error", exc_info=e)
-        raise AIServiceError(f"Ошибка проверки остатка кредитов KIE: {e}")
+                payload = response.json()
+                data = payload.get("data")
+                if isinstance(data, (int, float, str)):
+                    return float(data)
+                if data is None:
+                    raise AIResponseError(f"KIE credits response has no data field: {payload}")
+                for key in ("remainingCredits", "remaining_credits", "credits", "balance", "creditBalance"):
+                    value = data.get(key)
+                    if value is not None:
+                        return float(value)
+                raise AIResponseError(f"KIE credits response has no remaining credits field: {payload}")
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                if attempt >= 3:
+                    logging.error("KIE credits check transport error", exc_info=exc)
+                    raise AIServiceError(
+                        f"Ошибка проверки остатка кредитов KIE: {exception_summary(exc)} после 3 попыток"
+                    ) from exc
+                logging.warning(
+                    "Retrying KIE credits check attempt=%s/3 error=%s",
+                    attempt + 1,
+                    exception_summary(exc),
+                )
+                await asyncio.sleep(attempt)
+            except (AIServiceError, AIResponseError):
+                raise
+            except Exception as exc:
+                logging.error("KIE credits check error", exc_info=exc)
+                raise AIServiceError(
+                    f"Ошибка проверки остатка кредитов KIE: {exception_summary(exc)}"
+                ) from exc
 
 
 async def _call_claude_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, timeout: float = 60.0):
@@ -859,7 +940,22 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                     model,
                     kie_exc,
                 )
-                response_text = await _call_openai_transcribe(openai_api_key, file_bytes, filename)
+                try:
+                    response_text = await _call_openai_transcribe(openai_api_key, file_bytes, filename)
+                except (InsufficientBalanceError, AIServiceError) as fallback_exc:
+                    fallback_exc.provider_attempts = (
+                        {
+                            "provider": "KIE",
+                            "model": model,
+                            "error": exception_summary(kie_exc),
+                        },
+                        {
+                            "provider": "OpenAI",
+                            "model": "whisper-1",
+                            "error": exception_summary(fallback_exc),
+                        },
+                    )
+                    raise fallback_exc from kie_exc
 
         else:
             return f"❌ Ошибка: Неизвестный провайдер транскрибации: {provider}"
@@ -1284,18 +1380,31 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
 
 async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str, model: str, file_bytes: bytes, filename: str) -> str:
     try:
-        file_url = await _upload_file_to_kie(api_key, upload_base_url, file_bytes, filename, "audio")
-        if model == "elevenlabs/speech-to-text":
-            task_id = await _create_kie_task(
+        upload_bytes, upload_filename = await _prepare_kie_transcription_audio(file_bytes, filename)
+        file_url = await _retry_kie_transcription_step(
+            "upload",
+            lambda: _upload_file_to_kie(
                 api_key,
-                base_url,
-                model,
-                {
-                    "audio_url": file_url,
-                    "language_code": "ru",
-                    "tag_audio_events": False,
-                    "diarize": False,
-                },
+                upload_base_url,
+                upload_bytes,
+                upload_filename,
+                "audio",
+            ),
+        )
+        if model == "elevenlabs/speech-to-text":
+            task_id = await _retry_kie_transcription_step(
+                "create_task",
+                lambda: _create_kie_task(
+                    api_key,
+                    base_url,
+                    model,
+                    {
+                        "audio_url": file_url,
+                        "language_code": "ru",
+                        "tag_audio_events": False,
+                        "diarize": False,
+                    },
+                ),
             )
             task_payload = await _poll_kie_task(api_key, base_url, task_id)
             result = _extract_kie_task_result(task_payload)

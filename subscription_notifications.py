@@ -1,3 +1,18 @@
+TRIAL_BONUS_PAYMENT_PROVIDERS = frozenset({
+    "Trial Referral",
+    "Trial Referral Bonus",
+    "Trial Referral Pay Bonus",
+})
+
+
+def is_trial_bonus_subscription(subscription) -> bool:
+    return bool(
+        subscription
+        and getattr(subscription, "plan_id", None) is None
+        and getattr(subscription, "payment_provider", None) in TRIAL_BONUS_PAYMENT_PROVIDERS
+    )
+
+
 def get_target_plan(plan):
     if not plan:
         return None

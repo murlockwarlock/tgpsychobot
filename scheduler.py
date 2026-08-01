@@ -24,8 +24,9 @@ import decimal
 import math
 import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
+from alert_cooldown import AlertCooldown
 from birthday_mailings import process_birthday_mailings
-from subscription_notifications import should_send_upcoming_charge_notification
+from subscription_notifications import is_trial_bonus_subscription, should_send_upcoming_charge_notification
 from subscription_retry_policy import can_retry_now, get_next_retry_at
 from error_reporting import notify_admins_about_error
 from payment_failure_reasons import (
@@ -40,6 +41,7 @@ ROBOKASSA_PENDING_TIMEOUT = timedelta(hours=3)
 EXPIRATION_DEDUP_WINDOW = timedelta(hours=2)
 UTC = timezone.utc
 MSK = timezone(timedelta(hours=3))
+_kie_credit_error_alert_cooldown = AlertCooldown(timedelta(hours=3))
 
 def _sanitize_log_value(value, limit: int = 2000) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ").strip()
@@ -285,26 +287,30 @@ async def check_kie_credit_balance(bot: Bot):
                     await session.commit()
     except AIServiceError as exc:
         log.error("KIE credit balance check failed: %s", exc, exc_info=exc)
-        await notify_admins_about_error(
-            bot,
-            title="Сбой проверки баланса KIE",
-            provider="KIE",
-            stage="check_credit_balance",
-            details=str(exc),
-            exception=exc,
-            logger=log,
-        )
+        if _kie_credit_error_alert_cooldown.should_send():
+            await notify_admins_about_error(
+                bot,
+                title="Сбой проверки баланса KIE",
+                provider="KIE",
+                stage="check_credit_balance",
+                details=str(exc),
+                exception=exc,
+                include_traceback=False,
+                logger=log,
+            )
     except Exception as exc:
         log.error("Unexpected KIE credit balance check error: %s", exc, exc_info=exc)
-        await notify_admins_about_error(
-            bot,
-            title="Сбой проверки баланса KIE",
-            provider="KIE",
-            stage="check_credit_balance",
-            details=str(exc),
-            exception=exc,
-            logger=log,
-        )
+        if _kie_credit_error_alert_cooldown.should_send():
+            await notify_admins_about_error(
+                bot,
+                title="Сбой проверки баланса KIE",
+                provider="KIE",
+                stage="check_credit_balance",
+                details=str(exc),
+                exception=exc,
+                include_traceback=False,
+                logger=log,
+            )
 
 
 async def disable_auto_renewal_after_failed_attempts(
@@ -617,7 +623,11 @@ async def check_subscriptions(bot: Bot):
                                     )
                                 except Exception:
                                     pass
-                                if config and config.notifications_enabled:
+                                if (
+                                    config
+                                    and config.notifications_enabled
+                                    and not is_trial_bonus_subscription(sub)
+                                ):
                                     for admin_id in all_admin_ids:
                                         try:
                                             await bot.send_message(admin_id,
