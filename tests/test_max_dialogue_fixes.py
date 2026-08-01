@@ -20,6 +20,7 @@ def _sqlite_compatible_engine(*args, **kwargs):
 
 with patch.object(sqlalchemy_asyncio, "create_async_engine", _sqlite_compatible_engine):
     from max_messenger_bot import ai
+    from max_messenger_bot.services.admin import _build_stats_text
     from max_messenger_bot.services.common import _notify_referrer_about_registration, _send_ai_text
     from memory_mode import MEMORY_MODE_TOPIC
     from response_buttons import ResponseButton
@@ -35,6 +36,28 @@ class MaxHistoryScopeTests(unittest.TestCase):
         self.assertIn("messages.user_id = 123", sql)
         self.assertIn("messages.dialogue_id = 7", sql)
         self.assertIn("messages.topic_id IS NULL", sql)
+
+
+class MaxAdminStatsTests(unittest.TestCase):
+    def test_stats_distinguish_registrations_from_active_access(self):
+        text = _build_stats_text(
+            total_users=18,
+            users_today=2,
+            users_week=5,
+            users_month=11,
+            total_messages=42,
+            active_subs=7,
+            active_paid_subs=3,
+            active_bonus_subs=4,
+        )
+
+        self.assertIn("Всего зарегистрировано: <b>18</b>", text)
+        self.assertIn("Новые регистрации:", text)
+        self.assertIn("За текущую неделю: 5", text)
+        self.assertIn("За текущий месяц: 11", text)
+        self.assertIn("Активный доступ сейчас:", text)
+        self.assertIn("По тарифу: 3", text)
+        self.assertIn("Бонусный или пробный: 4", text)
 
 
 class MaxChunkedResponseTests(unittest.IsolatedAsyncioTestCase):

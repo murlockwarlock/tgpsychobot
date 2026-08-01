@@ -14,6 +14,33 @@ async def show_admin_panel(client: MaxApiClient, chat_id: int) -> None:
     await client.send_message(chat_id=chat_id, text="Добро пожаловать в админ-панель MAX.", attachments=admin_panel_keyboard())
 
 
+def _build_stats_text(
+    *,
+    total_users: int,
+    users_today: int,
+    users_week: int,
+    users_month: int,
+    total_messages: int,
+    active_subs: int,
+    active_paid_subs: int,
+    active_bonus_subs: int,
+) -> str:
+    return (
+        "📊 <b>Статистика MAX</b>\n\n"
+        "👥 <b>Пользователи MAX:</b>\n"
+        f"• Всего зарегистрировано: <b>{total_users}</b>\n\n"
+        "🆕 <b>Новые регистрации:</b>\n"
+        f"• Сегодня: {users_today}\n"
+        f"• За текущую неделю: {users_week}\n"
+        f"• За текущий месяц: {users_month}\n\n"
+        "⭐️ <b>Активный доступ сейчас:</b>\n"
+        f"• Всего: <b>{active_subs}</b>\n"
+        f"• По тарифу: {active_paid_subs}\n"
+        f"• Бонусный или пробный: {active_bonus_subs}\n\n"
+        f"💬 <b>Сообщений всего:</b> {total_messages}"
+    )
+
+
 async def show_stats(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         now = datetime.utcnow()
@@ -42,16 +69,30 @@ async def show_stats(client: MaxApiClient, chat_id: int) -> None:
                 UserSubscription.end_date > now,
             )
         ) or 0
+        active_paid_subs = await session.scalar(
+            select(func.count()).select_from(UserSubscription).where(
+                UserSubscription.user_id >= MAX_ID_OFFSET,
+                UserSubscription.end_date > now,
+                UserSubscription.plan_id.is_not(None),
+            )
+        ) or 0
+        active_bonus_subs = await session.scalar(
+            select(func.count()).select_from(UserSubscription).where(
+                UserSubscription.user_id >= MAX_ID_OFFSET,
+                UserSubscription.end_date > now,
+                UserSubscription.plan_id.is_(None),
+            )
+        ) or 0
 
-    text = (
-        "📊 <b>Статистика</b>\n\n"
-        f"👥 <b>Пользователи:</b>\n"
-        f"• Всего: <b>{total_users}</b>\n"
-        f"• Сегодня: {users_today}\n"
-        f"• Эта неделя: {users_week}\n"
-        f"• Этот месяц: {users_month}\n\n"
-        f"💬 <b>Сообщений всего:</b> {total_messages}\n"
-        f"⭐️ <b>Активных подписок:</b> {active_subs}"
+    text = _build_stats_text(
+        total_users=total_users,
+        users_today=users_today,
+        users_week=users_week,
+        users_month=users_month,
+        total_messages=total_messages,
+        active_subs=active_subs,
+        active_paid_subs=active_paid_subs,
+        active_bonus_subs=active_bonus_subs,
     )
     await client.send_message(
         chat_id=chat_id,
