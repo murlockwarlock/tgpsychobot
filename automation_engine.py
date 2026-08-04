@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from sqlalchemy import select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import (
@@ -25,6 +25,23 @@ class AutomationApplyResult:
     previous_step: str | None
     current_step: str | None
     event_names: tuple[str, ...]
+
+
+async def get_automation_summary(session: AsyncSession) -> dict[str, int]:
+    """Return the compact algorithm counters used by the general statistics screen."""
+    return {
+        "users": await session.scalar(
+            select(func.count(distinct(AutomationStepTransition.user_id)))
+        ) or 0,
+        "current_users": await session.scalar(
+            select(func.count(distinct(AutomationConversationState.user_id))).where(
+                AutomationConversationState.current_step.is_not(None)
+            )
+        ) or 0,
+        "transitions": await session.scalar(
+            select(func.count(AutomationStepTransition.id))
+        ) or 0,
+    }
 
 
 def _load_object(raw: str | None) -> dict[str, Any]:

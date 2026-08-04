@@ -6,13 +6,15 @@ from unittest.mock import AsyncMock, patch
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
 import automation_admin
+import automation_engine
 import keyboards
 from database import (
+    AutomationCondition,
     AutomationConversationState,
     AutomationHandler,
     AutomationStepTransition,
@@ -61,6 +63,38 @@ class AdminStructureTests(unittest.IsolatedAsyncioTestCase):
         callbacks = callback_values(keyboards.admin_panel_keyboard())
         self.assertIn("admin_general_settings", callbacks)
         self.assertIn("automation_menu", callbacks)
+
+    async def test_compact_algorithm_summary_counts_unique_users(self):
+        async with self.sessions() as session:
+            session.add(User(id=42, first_name="Иван"))
+            session.add_all([
+                AutomationStepTransition(
+                    user_id=42, dialogue_id=1, topic_id=0, current_step="START", state_json="{}"
+                ),
+                AutomationStepTransition(
+                    user_id=42, dialogue_id=2, topic_id=0, current_step="RESULT", state_json="{}"
+                ),
+                AutomationConversationState(
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=0,
+                    current_step="START",
+                    current_state_json="{}",
+                ),
+                AutomationConversationState(
+                    user_id=42,
+                    dialogue_id=2,
+                    topic_id=0,
+                    current_step="RESULT",
+                    current_state_json="{}",
+                ),
+            ])
+            await session.commit()
+
+        async with self.sessions() as session:
+            summary = await automation_engine.get_automation_summary(session)
+
+        self.assertEqual(summary, {"users": 1, "current_users": 1, "transitions": 2})
 
     def test_topic_editor_has_all_three_automation_entries(self):
         callbacks = callback_values(keyboards.edit_topic_keyboard(17, True))
@@ -342,6 +376,179 @@ class AdminStructureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("📍 Сейчас:", text)
         self.assertIn("automation_menu", callbacks)
         self.assertNotIn("edit_topic_1", callbacks)
+
+    async def test_admin_statistics_origin_returns_to_general_statistics(self):
+        async with self.sessions() as session:
+            session.add_all([
+                User(id=42, first_name="Иван"),
+                AutomationStepTransition(
+                    user_id=42, dialogue_id=1, topic_id=0, current_step="START", state_json="{}"
+                ),
+            ])
+            await session.commit()
+        message = SimpleNamespace(edit_text=AsyncMock())
+
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin._show_automation_stage_stats(
+                SimpleNamespace(message=message), origin="a"
+            )
+
+        callbacks = callback_values(message.edit_text.await_args.kwargs["reply_markup"])
+        self.assertIn("admin_stats", callbacks)
+        self.assertTrue(any(value.endswith("_a") for value in callbacks))
+
+    async def test_stage_and_user_lists_are_paginated_and_current_users_are_unique(self):
+        async with self.sessions() as session:
+            topic = Topic(id=1, name="Самооценка", is_active=True)
+            users = [
+                User(id=user_id, first_name=f"Пользователь {user_id}", username=f"user{user_id}")
+                for user_id in range(1, 12)
+            ]
+            session.add_all([topic, *users])
+            await session.flush()
+            for user in users:
+                session.add(AutomationStepTransition(
+                    user_id=user.id,
+                    dialogue_id=1,
+                    topic_id=1,
+                    current_step="COMMON_STEP",
+                    state_json="{}",
+                ))
+            for index in range(1, 10):
+                session.add(AutomationStepTransition(
+                    user_id=1,
+                    dialogue_id=index + 1,
+                    topic_id=1,
+                    current_step=f"STEP_{index}",
+                    state_json="{}",
+                ))
+            session.add_all([
+                AutomationConversationState(
+                    user_id=1,
+                    dialogue_id=1,
+                    topic_id=1,
+                    current_step="COMMON_STEP",
+                    current_state_json="{}",
+                ),
+                AutomationConversationState(
+                    user_id=1,
+                    dialogue_id=2,
+                    topic_id=1,
+                    current_step="COMMON_STEP",
+                    current_state_json="{}",
+                ),
+            ])
+            await session.commit()
+
+        stats_message = SimpleNamespace(edit_text=AsyncMock())
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin._show_automation_stage_stats(
+                SimpleNamespace(message=stats_message), topic_id=1
+            )
+
+        stats_text = stats_message.edit_text.await_args.args[0]
+        stats_callbacks = callback_values(stats_message.edit_text.await_args.kwargs["reply_markup"])
+        self.assertIn("Страница <b>1/2</b>", stats_text)
+        self.assertIn("📍 Сейчас: <b>1</b>", stats_text)
+        self.assertIn("topic_automation_stats_page_1_1", stats_callbacks)
+        async with self.sessions() as session:
+            anchor_id = await session.scalar(
+                select(func.min(AutomationStepTransition.id)).where(
+                    AutomationStepTransition.current_step == "COMMON_STEP"
+                )
+            )
+
+        users_message = SimpleNamespace(edit_text=AsyncMock())
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin._show_automation_stage_users(
+                SimpleNamespace(message=users_message),
+                anchor_id=anchor_id,
+                page=0,
+                origin="t",
+            )
+
+        users_text = users_message.edit_text.await_args.args[0]
+        users_callbacks = callback_values(users_message.edit_text.await_args.kwargs["reply_markup"])
+        self.assertIn("Уникальных пользователей: <b>11</b>", users_text)
+        self.assertIn("Страница: <b>1/2</b>", users_text)
+        self.assertIn("topic_automation_stats_1", users_callbacks)
+        self.assertTrue(any(value.endswith("_1_t") for value in users_callbacks))
+
+    async def test_callback_middleware_answers_once_and_deletion_refreshes_menu(self):
+        async with self.sessions() as session:
+            item = AutomationHandler(name="Проверка")
+            session.add(item)
+            await session.flush()
+            condition = AutomationCondition(
+                handler_id=item.id,
+                condition_type="event",
+                operator="equals",
+                expected_value="READY",
+            )
+            session.add(condition)
+            await session.commit()
+            handler_id = item.id
+            condition_id = condition.id
+
+        callback = SimpleNamespace(
+            id="delete-condition",
+            data=f"automation_condition_delete_{handler_id}_{condition_id}",
+            answer=AsyncMock(),
+            message=SimpleNamespace(edit_text=AsyncMock()),
+        )
+
+        async def run_handler(event, _data):
+            await automation_admin.automation_condition_delete(event)
+
+        automation_admin._answered_callback_ids.clear()
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.EnsureCallbackAnsweredMiddleware()(run_handler, callback, {})
+
+        callback.answer.assert_awaited_once()
+        callback.message.edit_text.assert_awaited_once()
+        async with self.sessions() as session:
+            self.assertIsNone(await session.get(AutomationCondition, condition_id))
+
+    async def test_callback_middleware_does_not_duplicate_explicit_answer(self):
+        callback = SimpleNamespace(id="explicit-answer", answer=AsyncMock())
+
+        async def run_handler(event, _data):
+            await automation_admin._answer_callback(event, "Готово")
+
+        automation_admin._answered_callback_ids.clear()
+        await automation_admin.EnsureCallbackAnsweredMiddleware()(run_handler, callback, {})
+
+        callback.answer.assert_awaited_once_with("Готово")
+
+    async def test_topic_selection_refreshes_and_closes_callback(self):
+        async with self.sessions() as session:
+            topic = Topic(id=1, name="Самооценка", is_active=True)
+            item = AutomationHandler(name="Выбор тем", include_main_dialogue=False)
+            session.add_all([topic, item])
+            await session.commit()
+            handler_id = item.id
+
+        callback = SimpleNamespace(
+            id="select-handler-topic",
+            data=f"automation_htopic_{handler_id}_1",
+            answer=AsyncMock(),
+            message=SimpleNamespace(edit_text=AsyncMock()),
+        )
+
+        async def run_handler(event, _data):
+            await automation_admin.automation_handler_topic_toggle(event)
+
+        automation_admin._answered_callback_ids.clear()
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.EnsureCallbackAnsweredMiddleware()(run_handler, callback, {})
+
+        callback.answer.assert_awaited_once()
+        callback.message.edit_text.assert_awaited_once()
+        async with self.sessions() as session:
+            item = await session.scalar(
+                select(AutomationHandler).options(selectinload(AutomationHandler.topics))
+            )
+            self.assertEqual([topic.id for topic in item.topics], [1])
 
     async def test_handler_card_returns_to_topic_handler_list(self):
         async with self.sessions() as session:

@@ -7,7 +7,7 @@ import json
 import re
 from datetime import datetime
 
-from aiogram import F, Router
+from aiogram import BaseMiddleware, F, Router
 from aiogram.filters import Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,14 +25,40 @@ from database import (
     FollowupCampaign,
     FollowupStep,
     Topic,
+    User,
     async_session_maker,
     event_handler_topic_association,
     followup_campaign_topic_association,
     get_all_admin_ids,
 )
+from time_helpers import format_msk
 
 
 router = Router(name="automation_admin")
+_answered_callback_ids: set[str] = set()
+
+
+async def _answer_callback(callback: CallbackQuery, *args, **kwargs) -> None:
+    await callback.answer(*args, **kwargs)
+    callback_id = getattr(callback, "id", None)
+    if callback_id:
+        _answered_callback_ids.add(callback_id)
+
+
+class EnsureCallbackAnsweredMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: CallbackQuery, data):
+        try:
+            return await handler(event, data)
+        finally:
+            if event.id in _answered_callback_ids:
+                _answered_callback_ids.discard(event.id)
+            else:
+                try:
+                    await event.answer()
+                except Exception:
+                    # A late/expired callback must not turn a successful DB action
+                    # into an application error.
+                    pass
 
 
 class DatabaseAdminFilter(Filter):
@@ -42,6 +68,10 @@ class DatabaseAdminFilter(Filter):
 
 router.callback_query.filter(DatabaseAdminFilter())
 router.message.filter(DatabaseAdminFilter())
+router.callback_query.middleware(EnsureCallbackAnsweredMiddleware())
+
+STAGE_STATS_PAGE_SIZE = 8
+STAGE_USERS_PAGE_SIZE = 10
 
 
 class AutomationAdminStates(StatesGroup):
@@ -132,12 +162,53 @@ async def automation_stage_stats(callback: CallbackQuery):
     await _show_automation_stage_stats(callback)
 
 
+@router.callback_query(F.data.regexp(r"^automation_stage_stats_page_(\d+)$"))
+async def automation_stage_stats_page(callback: CallbackQuery):
+    await _show_automation_stage_stats(callback, page=int(callback.data.rsplit("_", 1)[1]))
+
+
+@router.callback_query(F.data == "admin_automation_stage_stats")
+async def admin_automation_stage_stats(callback: CallbackQuery):
+    await _show_automation_stage_stats(callback, origin="a")
+
+
+@router.callback_query(F.data.regexp(r"^admin_automation_stats_page_(\d+)$"))
+async def admin_automation_stage_stats_page(callback: CallbackQuery):
+    await _show_automation_stage_stats(
+        callback,
+        page=int(callback.data.rsplit("_", 1)[1]),
+        origin="a",
+    )
+
+
 @router.callback_query(F.data.regexp(r"^topic_automation_stats_(\d+)$"))
 async def topic_automation_stage_stats(callback: CallbackQuery):
     await _show_automation_stage_stats(callback, topic_id=int(callback.data.rsplit("_", 1)[1]))
 
 
-async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | None = None):
+@router.callback_query(F.data.regexp(r"^topic_automation_stats_page_(\d+)_(\d+)$"))
+async def topic_automation_stage_stats_page(callback: CallbackQuery):
+    topic_id, page = map(int, callback.data.rsplit("_", 2)[-2:])
+    await _show_automation_stage_stats(callback, topic_id=topic_id, page=page)
+
+
+@router.callback_query(F.data.regexp(r"^automation_stage_users_(\d+)_(\d+)_(g|t|a)$"))
+async def automation_stage_users(callback: CallbackQuery):
+    _, _, _, anchor_id, page, origin = callback.data.split("_")
+    await _show_automation_stage_users(
+        callback,
+        anchor_id=int(anchor_id),
+        page=int(page),
+        origin=origin,
+    )
+
+
+async def _show_automation_stage_stats(
+    callback: CallbackQuery,
+    topic_id: int | None = None,
+    page: int = 0,
+    origin: str = "g",
+):
     selected_topic_id = topic_id
     async with async_session_maker() as session:
         transition_stmt = select(
@@ -145,11 +216,12 @@ async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | 
             AutomationStepTransition.current_step,
             func.count(AutomationStepTransition.id),
             func.count(distinct(AutomationStepTransition.user_id)),
+            func.min(AutomationStepTransition.id),
         )
         current_stmt = select(
             AutomationConversationState.topic_id,
             AutomationConversationState.current_step,
-            func.count(AutomationConversationState.id),
+            func.count(distinct(AutomationConversationState.user_id)),
         ).where(AutomationConversationState.current_step.is_not(None))
         if selected_topic_id is not None:
             transition_stmt = transition_stmt.where(AutomationStepTransition.topic_id == selected_topic_id)
@@ -172,6 +244,10 @@ async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | 
         selected_topic = await session.get(Topic, selected_topic_id) if selected_topic_id is not None else None
 
     current_map = {(topic_id, step): count for topic_id, step, count in current_rows}
+    total_pages = max(1, (len(transition_rows) + STAGE_STATS_PAGE_SIZE - 1) // STAGE_STATS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    page_rows = transition_rows[page * STAGE_STATS_PAGE_SIZE:(page + 1) * STAGE_STATS_PAGE_SIZE]
+    builder = InlineKeyboardBuilder()
     if not transition_rows:
         text = (
             f"📊 <b>Статистика этапов{f' — {html.escape(selected_topic.name)}' if selected_topic else ''}</b>\n\n"
@@ -183,10 +259,12 @@ async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | 
         lines = [
             f"📊 <b>{heading}</b>",
             "",
-            "Считаются только реальные смены <code>current_step</code>.",
+            "Считаются уникальные пользователи и реальные смены <code>current_step</code>.",
         ]
+        if total_pages > 1:
+            lines.append(f"Страница <b>{page + 1}/{total_pages}</b>.")
         active_topic = object()
-        for row_topic_id, step, entries, users in transition_rows:
+        for row_topic_id, step, entries, users, anchor_id in page_rows:
             if row_topic_id != active_topic:
                 active_topic = row_topic_id
                 title = (
@@ -201,23 +279,153 @@ async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | 
                 f"<code>{html.escape(step)}</code>",
                 f"👥 Вошли: <b>{users}</b>   ·   🔁 Переходы: <b>{entries}</b>   ·   📍 Сейчас: <b>{current}</b>",
             ])
-            if len("\n".join(lines)) > 3600:
-                lines.extend([
-                    "",
-                    "…Показаны первые этапы. Полные данные доступны в экспорте клиентов.",
-                ])
-                break
+            button_step = step if len(step) <= 30 else f"{step[:27]}…"
+            builder.row(InlineKeyboardButton(
+                text=f"👥 {button_step} · {users}",
+                callback_data=f"automation_stage_users_{anchor_id}_0_{'t' if selected_topic_id is not None else origin}",
+            ))
         text = "\n".join(lines)
+
+    pagination = []
+    if page > 0:
+        previous_callback = (
+            f"topic_automation_stats_page_{selected_topic_id}_{page - 1}"
+            if selected_topic_id is not None
+            else (
+                f"admin_automation_stats_page_{page - 1}"
+                if origin == "a"
+                else f"automation_stage_stats_page_{page - 1}"
+            )
+        )
+        pagination.append(InlineKeyboardButton(text="⬅️", callback_data=previous_callback))
+    if page + 1 < total_pages:
+        next_callback = (
+            f"topic_automation_stats_page_{selected_topic_id}_{page + 1}"
+            if selected_topic_id is not None
+            else (
+                f"admin_automation_stats_page_{page + 1}"
+                if origin == "a"
+                else f"automation_stage_stats_page_{page + 1}"
+            )
+        )
+        pagination.append(InlineKeyboardButton(text="➡️", callback_data=next_callback))
+    if pagination:
+        builder.row(*pagination)
     back_callback = (
         f"edit_topic_{selected_topic_id}"
         if selected_topic_id is not None
-        else "automation_menu"
+        else ("admin_stats" if origin == "a" else "automation_menu")
     )
+    builder.row(_back(back_callback))
     await callback.message.edit_text(
         text,
-        reply_markup=InlineKeyboardBuilder().row(
-            _back(back_callback)
-        ).as_markup(),
+        reply_markup=builder.as_markup(),
+    )
+
+
+async def _show_automation_stage_users(
+    callback: CallbackQuery,
+    *,
+    anchor_id: int,
+    page: int,
+    origin: str,
+):
+    async with async_session_maker() as session:
+        anchor = await session.get(AutomationStepTransition, anchor_id)
+        if anchor is None:
+            await _answer_callback(callback, "Этап больше не найден.", show_alert=True)
+            return
+
+        topic_id = anchor.topic_id
+        current_step = anchor.current_step
+        total_users = await session.scalar(
+            select(func.count(distinct(AutomationStepTransition.user_id))).where(
+                AutomationStepTransition.topic_id == topic_id,
+                AutomationStepTransition.current_step == current_step,
+            )
+        ) or 0
+        total_pages = max(1, (total_users + STAGE_USERS_PAGE_SIZE - 1) // STAGE_USERS_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        rows = (
+            await session.execute(
+                select(
+                    User.id,
+                    User.name,
+                    User.first_name,
+                    User.username,
+                    func.count(AutomationStepTransition.id),
+                    func.max(AutomationStepTransition.created_at),
+                )
+                .join(User, User.id == AutomationStepTransition.user_id)
+                .where(
+                    AutomationStepTransition.topic_id == topic_id,
+                    AutomationStepTransition.current_step == current_step,
+                )
+                .group_by(User.id, User.name, User.first_name, User.username)
+                .order_by(func.max(AutomationStepTransition.created_at).desc(), User.id)
+                .offset(page * STAGE_USERS_PAGE_SIZE)
+                .limit(STAGE_USERS_PAGE_SIZE)
+            )
+        ).all()
+        current_user_ids = set((await session.scalars(
+            select(distinct(AutomationConversationState.user_id)).where(
+                AutomationConversationState.topic_id == topic_id,
+                AutomationConversationState.current_step == current_step,
+            )
+        )).all())
+        topic = await session.get(Topic, topic_id) if topic_id else None
+
+    topic_name = topic.name if topic else "Основной диалог"
+    lines = [
+        "👥 <b>Пользователи этапа</b>",
+        f"Тема: <b>{html.escape(topic_name)}</b>",
+        f"Этап: <code>{html.escape(current_step)}</code>",
+        f"Уникальных пользователей: <b>{total_users}</b>",
+        f"Страница: <b>{page + 1}/{total_pages}</b>",
+    ]
+    if not rows:
+        lines.extend(["", "Пользователей пока нет."])
+    for index, (user_id, name, first_name, username, entries, last_entry) in enumerate(
+        rows,
+        start=page * STAGE_USERS_PAGE_SIZE + 1,
+    ):
+        display_name = name or first_name or (f"@{username}" if username else f"ID {user_id}")
+        display_name = display_name[:60]
+        safe_username = username[:32] if username else None
+        username_text = f" · @{html.escape(safe_username)}" if safe_username else ""
+        current_text = " · 📍 сейчас" if user_id in current_user_ids else ""
+        lines.extend([
+            "",
+            f"{index}. <a href=\"tg://user?id={user_id}\">{html.escape(display_name)}</a>{username_text}",
+            f"<code>{user_id}</code> · входов: <b>{entries}</b>{current_text}",
+            f"Последний вход: {format_msk(last_entry)}",
+        ])
+
+    builder = InlineKeyboardBuilder()
+    pagination = []
+    if page > 0:
+        pagination.append(InlineKeyboardButton(
+            text="⬅️",
+            callback_data=f"automation_stage_users_{anchor_id}_{page - 1}_{origin}",
+        ))
+    if page + 1 < total_pages:
+        pagination.append(InlineKeyboardButton(
+            text="➡️",
+            callback_data=f"automation_stage_users_{anchor_id}_{page + 1}_{origin}",
+        ))
+    if pagination:
+        builder.row(*pagination)
+    if origin == "t":
+        stats_callback = f"topic_automation_stats_{topic_id}"
+    elif origin == "a":
+        stats_callback = "admin_automation_stage_stats"
+    else:
+        stats_callback = "automation_stage_stats"
+    builder.row(_back(stats_callback))
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=builder.as_markup(),
+        disable_web_page_preview=True,
     )
 
 
@@ -337,7 +545,7 @@ async def topic_automation_handler_unlink(callback: CallbackQuery):
             if not remaining_topics and not item.include_main_dialogue:
                 item.is_active = False
             await session.commit()
-    await callback.answer("Обработчик отвязан от темы.")
+    await _answer_callback(callback, "Обработчик отвязан от темы.")
     callback.data = f"topic_automation_handlers_{topic_id}"
     await topic_automation_handlers(callback)
 
@@ -465,12 +673,12 @@ async def automation_handler_toggle(callback: CallbackQuery, state: FSMContext |
     async with async_session_maker() as session:
         item = await _handler_with_relations(session, handler_id)
         if item is None:
-            await callback.answer("Обработчик не найден", show_alert=True)
+            await _answer_callback(callback, "Обработчик не найден", show_alert=True)
             return
         if not item.is_active and not (
             item.conditions and item.actions and (item.all_topics or item.include_main_dialogue or item.topics)
         ):
-            await callback.answer("Сначала выберите область, добавьте условие и действие.", show_alert=True)
+            await _answer_callback(callback, "Сначала выберите область, добавьте условие и действие.", show_alert=True)
             return
         item.is_active = not item.is_active
         await session.commit()
@@ -484,7 +692,7 @@ async def automation_handler_topics(callback: CallbackQuery):
         item = await _handler_with_relations(session, handler_id)
         topics = (await session.execute(select(Topic).order_by(Topic.name))).scalars().all()
     if item is None:
-        await callback.answer("Обработчик не найден", show_alert=True)
+        await _answer_callback(callback, "Обработчик не найден", show_alert=True)
         return
     selected = {topic.id for topic in item.topics}
     builder = InlineKeyboardBuilder()
@@ -515,6 +723,7 @@ async def automation_handler_topics(callback: CallbackQuery):
 async def automation_handler_scope_toggle(callback: CallbackQuery):
     parts = callback.data.split("_")
     scope, handler_id = parts[-2], int(parts[-1])
+    await _answer_callback(callback)
     async with async_session_maker() as session:
         item = await session.get(AutomationHandler, handler_id)
         if item:
@@ -531,6 +740,7 @@ async def automation_handler_scope_toggle(callback: CallbackQuery):
 async def automation_handler_topic_toggle(callback: CallbackQuery):
     _, _, handler_id_raw, topic_id_raw = callback.data.split("_")
     handler_id, topic_id = int(handler_id_raw), int(topic_id_raw)
+    await _answer_callback(callback)
     async with async_session_maker() as session:
         exists = await session.scalar(
             select(event_handler_topic_association.c.handler_id).where(
@@ -633,6 +843,7 @@ async def automation_condition_received(message: Message, state: FSMContext):
 @router.callback_query(F.data.regexp(r"^automation_condition_delete_(\d+)_(\d+)$"))
 async def automation_condition_delete(callback: CallbackQuery):
     _, _, _, handler_id_raw, condition_id_raw = callback.data.split("_")
+    await _answer_callback(callback)
     async with async_session_maker() as session:
         condition = await session.get(AutomationCondition, int(condition_id_raw))
         if condition and condition.handler_id == int(handler_id_raw):
@@ -738,6 +949,7 @@ async def automation_action_received(message: Message, state: FSMContext):
 @router.callback_query(F.data.regexp(r"^automation_action_delete_(\d+)_(\d+)$"))
 async def automation_action_delete(callback: CallbackQuery):
     _, _, _, handler_id_raw, action_id_raw = callback.data.split("_")
+    await _answer_callback(callback)
     async with async_session_maker() as session:
         action = await session.get(AutomationAction, int(action_id_raw))
         if action and action.handler_id == int(handler_id_raw):
@@ -865,7 +1077,7 @@ async def topic_followup_campaign_unlink(callback: CallbackQuery):
             if not remaining_topics and not item.include_main_dialogue:
                 item.is_active = False
             await session.commit()
-    await callback.answer("Цепочка отвязана от темы.")
+    await _answer_callback(callback, "Цепочка отвязана от темы.")
     callback.data = f"topic_followup_campaigns_{topic_id}"
     await topic_followup_campaigns(callback)
 
@@ -992,7 +1204,7 @@ async def followup_toggle(callback: CallbackQuery, state: FSMContext | None = No
         if item is None:
             return
         if not item.is_active and not (item.steps and (item.all_topics or item.include_main_dialogue or item.topics)):
-            await callback.answer("Сначала выберите область и добавьте шаг.", show_alert=True)
+            await _answer_callback(callback, "Сначала выберите область и добавьте шаг.", show_alert=True)
             return
         item.is_active = not item.is_active
         await session.commit()
@@ -1030,6 +1242,7 @@ async def followup_topics(callback: CallbackQuery):
 async def followup_scope_toggle(callback: CallbackQuery):
     scope, campaign_id_raw = callback.data.split("_")[-2:]
     campaign_id = int(campaign_id_raw)
+    await _answer_callback(callback)
     async with async_session_maker() as session:
         item = await session.get(FollowupCampaign, campaign_id)
         if item:
@@ -1046,6 +1259,7 @@ async def followup_scope_toggle(callback: CallbackQuery):
 async def followup_topic_toggle(callback: CallbackQuery):
     campaign_id_raw, topic_id_raw = callback.data.split("_")[-2:]
     campaign_id, topic_id = int(campaign_id_raw), int(topic_id_raw)
+    await _answer_callback(callback)
     async with async_session_maker() as session:
         exists = await session.scalar(
             select(followup_campaign_topic_association.c.campaign_id).where(

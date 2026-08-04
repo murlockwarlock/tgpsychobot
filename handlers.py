@@ -84,7 +84,7 @@ from mailing_utils import (
 from prompt_blocks import DATA_PROTOCOL_INSTRUCTION, DEFAULT_SERVICE_PROMPT_TEMPLATE
 from provider_models import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MODELS
 from user_metadata import append_metadata_records, extract_data_blocks, extract_service_data, load_metadata_records
-from automation_engine import apply_service_data_blocks, build_runtime_automation_context
+from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
 from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
@@ -2767,25 +2767,32 @@ async def admin_stats(callback: CallbackQuery):
             )
         )
 
-    text = f"""
-📊 **Статистика бота:**
+        algorithm_summary = await get_automation_summary(session)
 
-**Общая:**
-- Всего клиентов: {total_users}
-- Активных подписчиков: {active_subscribers}
-- Прошли тест всего: {total_tests_passed}
-- Всего сообщений (клиент+бот): {total_messages}
-
-**Активность сегодня:**
-- Новых клиентов: {new_users_today}
-- Активных клиентов: {active_users_today}
-- Прошли тест сегодня: {tests_passed_today}
-- Сообщений за сегодня: {messages_today}
-
-**Новые клиенты за неделю:**
-- За последние 7 дней: {new_users_week}
-"""
-    await callback.message.edit_text(text, parse_mode='Markdown', reply_markup=kb.back_to_admin_panel())
+    text = (
+        "📊 <b>Статистика бота</b>\n\n"
+        "<b>Пользователи</b>\n"
+        f"• Всего зарегистрировано: <b>{total_users}</b>\n"
+        f"• Новых сегодня: <b>{new_users_today}</b>\n"
+        f"• Новых за последние 7 дней: <b>{new_users_week}</b>\n"
+        f"• Писали боту сегодня: <b>{active_users_today}</b>\n"
+        f"• С активной подпиской: <b>{active_subscribers}</b>\n\n"
+        "<b>Тест и сообщения</b>\n"
+        f"• Завершили тест всего: <b>{total_tests_passed}</b>\n"
+        f"• Завершили тест сегодня: <b>{tests_passed_today}</b>\n"
+        f"• Сообщений всего: <b>{total_messages}</b>\n"
+        f"• Сообщений сегодня: <b>{messages_today}</b>\n\n"
+        "<b>Этапы алгоритмов</b>\n"
+        f"• Проходили хотя бы один этап: <b>{algorithm_summary['users']}</b>\n"
+        f"• Сейчас находятся на этапах: <b>{algorithm_summary['current_users']}</b>\n"
+        f"• Зафиксировано переходов: <b>{algorithm_summary['transitions']}</b>"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📈 Подробно по этапам", callback_data="admin_automation_stage_stats")
+    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_clients_page_") | F.data.startswith("admin_export_page_"))
@@ -4340,6 +4347,7 @@ async def save_content(callback: CallbackQuery, state: FSMContext):
     else:
         await callback.message.edit_text("✅ Раздел успешно обновлен!",
                                          reply_markup=await kb.content_management_keyboard())
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("cancel_content_edit_"), StateFilter(AdminStates.edit_content))
@@ -4351,6 +4359,7 @@ async def cancel_content_edit_handler(callback: CallbackQuery, state: FSMContext
         await admin_test_menu(callback)
     else:
         await admin_content(callback, state)
+    await callback.answer()
 
 
 @router.callback_query(AdminStates.edit_content, F.data.startswith("toggle_order_"))
@@ -5858,12 +5867,12 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
         await callback.answer("Тема больше недоступна.", show_alert=True)
         return
 
+    await callback.answer()
     if already_in_topic:
         try:
             await callback.message.delete()
         except TelegramBadRequest:
             pass
-        await callback.answer()
         return
 
     await callback.message.delete()
@@ -5876,15 +5885,14 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
         topic_intro_restored=restored,
         topic_intro_memory_mode=memory_mode,
     ):
-        await callback.answer()
         return
 
     await _send_topic_intro(bot, callback.from_user.id, topic, restored, memory_mode)
-    await callback.answer()
 
 
 @router.callback_query(F.data == "reset_topic")
 async def process_topic_reset(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
     async with async_session_maker() as session:
         user = await session.get(User, callback.from_user.id)
         if user:
@@ -6060,11 +6068,13 @@ async def admin_move_topic(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("admin_topics_page_"))
 async def admin_topics_paginated(callback: CallbackQuery):
     page = int(callback.data.split("_")[-1])
+    await callback.answer()
     await show_topics_admin_list(callback, page)
 
 
 @router.callback_query(F.data == "create_topic")
 async def admin_create_topic_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     await state.set_state(AdminStates.set_topic_name)
     await state.update_data(topic_id=None, message_id_to_edit=callback.message.message_id)
     await callback.message.edit_text("Введите название для новой темы:",
@@ -6126,6 +6136,7 @@ async def admin_toggle_topic_admin_only(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("edit_topic_"), StateFilter('*'))
 async def topic_editor_router(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     await state.clear()
 
     parts = callback.data.split('_')
@@ -6370,6 +6381,7 @@ async def admin_assign_kb_to_topic(callback: CallbackQuery):
     parts = callback.data.split("_")
     topic_id = int(parts[3])
     page = int(parts[5])
+    await callback.answer()
     await _show_assign_kb_to_topic_menu(
         bot=callback.bot,
         chat_id=callback.message.chat.id,
@@ -6468,6 +6480,7 @@ async def admin_assign_deck_to_topic(callback: CallbackQuery):
     # assign_deck_topic_{topic_id}_page_{page}
     topic_id = int(parts[3])
     page = int(parts[5])
+    await callback.answer()
     await _show_assign_deck_to_topic_menu(
         bot=callback.bot,
         chat_id=callback.message.chat.id,
@@ -6892,6 +6905,7 @@ async def admin_assign_coll_to_topic(callback: CallbackQuery, state: FSMContext)
     parts = callback.data.split("_")
     topic_id = int(parts[3])
     page = int(parts[5])
+    await callback.answer()
     await _show_assign_collections_to_topic(
         callback.bot, callback.message.chat.id, callback.message.message_id, topic_id, page
     )
@@ -12841,6 +12855,8 @@ async def cmd_start_test(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data == "admin_test_menu")
 async def admin_test_menu(callback: CallbackQuery):
+    if getattr(callback, "data", None) == "admin_test_menu":
+        await callback.answer()
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
         if not config:
@@ -12873,6 +12889,7 @@ async def admin_test_toggle_status(callback: CallbackQuery):
         await session.commit()
 
     await admin_test_menu(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_test_toggle_progress")
@@ -12885,6 +12902,7 @@ async def admin_test_toggle_progress(callback: CallbackQuery):
         config.show_progress = not bool(getattr(config, "show_progress", True))
         await session.commit()
     await admin_test_menu(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_test_toggle_profile_"))
@@ -12904,10 +12922,13 @@ async def admin_test_toggle_profile_field(callback: CallbackQuery):
         setattr(config, column_name, not current_value)
         await session.commit()
     await admin_general_settings(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_general_settings")
 async def admin_general_settings(callback: CallbackQuery):
+    if getattr(callback, "data", None) == "admin_general_settings":
+        await callback.answer()
     async with async_session_maker() as session:
         config = await session.get(BotGeneralConfig, 1)
         if not config:
@@ -12943,6 +12964,7 @@ async def admin_general_toggle_profile_field(callback: CallbackQuery):
         await session.commit()
 
     await admin_general_settings(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_test_toggle_secret_test")
@@ -12955,6 +12977,7 @@ async def admin_test_toggle_secret_test(callback: CallbackQuery):
         config.secret_test_enabled = not bool(getattr(config, "secret_test_enabled", True))
         await session.commit()
     await admin_test_menu(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_test_toggle_formulas")
@@ -12972,10 +12995,12 @@ async def admin_test_toggle_formulas(callback: CallbackQuery):
             config.interpretation_input_mode = "all"
         await session.commit()
     await admin_test_menu(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_test_toggle_input_mode")
 async def admin_test_toggle_input_mode(callback: CallbackQuery):
+    answer_sent = False
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
         if not config:
@@ -12987,13 +13012,17 @@ async def admin_test_toggle_input_mode(callback: CallbackQuery):
         if next_mode == "formulas" and not config.formulas_json:
             next_mode = "all"
             await callback.answer("Режим «только формулы» пропущен: формулы не загружены.", show_alert=True)
+            answer_sent = True
         config.interpretation_input_mode = next_mode
         await session.commit()
     await admin_test_menu(callback)
+    if not answer_sent:
+        await callback.answer()
 
 
 @router.callback_query(F.data == "admin_test_set_selected_vars")
 async def admin_test_set_selected_vars(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
         selected = json_loads(getattr(config, "interpretation_selected_variables", None), []) if config else []
@@ -13069,6 +13098,7 @@ async def admin_test_toggle_separate_prompt(callback: CallbackQuery):
         config.separate_result_prompt_enabled = not bool(getattr(config, "separate_result_prompt_enabled", False))
         await session.commit()
     await admin_test_menu(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_test_toggle_result_prompt_final")
@@ -13084,10 +13114,12 @@ async def admin_test_toggle_result_prompt_final(callback: CallbackQuery):
         config.result_prompt_is_final = not bool(getattr(config, "result_prompt_is_final", False))
         await session.commit()
     await admin_test_menu(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_test_links")
 async def admin_test_links_menu(callback: CallbackQuery):
+    await callback.answer()
     await _show_admin_test_links_menu(callback.bot, callback.message.chat.id, callback.message.message_id)
 
 
