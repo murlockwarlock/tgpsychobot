@@ -16,7 +16,7 @@ DATA_BLOCK_RE = re.compile(
     r"(?:\r?\n[ \t]*```[ \t]*(?=\r?\n|$))?",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
-SERVICE_DATA_KEYS = frozenset({"schema_version", "current_state", "events", "metadata", "save_mode"})
+SERVICE_DATA_KEYS = frozenset({"current_state", "events", "metadata", "save_mode"})
 
 
 @dataclass(frozen=True)

@@ -16,7 +16,7 @@ DATA_PROTOCOL_INSTRUCTION = textwrap.dedent("""
 
 Формат:
 <DATA>
-{"schema_version":1,"current_state":{"current_step":"STEP_ID"},"events":[],"save_mode":"merge","metadata":{}}
+{"current_state":{"current_step":"STEP_ID"},"events":[],"save_mode":"merge","metadata":{}}
 </DATA>
 """).strip()
 

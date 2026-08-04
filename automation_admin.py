@@ -136,7 +136,6 @@ async def automation_data_help(callback: CallbackQuery):
     example = html.escape(
         '<DATA>\n'
         '{\n'
-        '  "schema_version": 1,\n'
         '  "current_state": {"current_step": "STAGE_1_HOBBY"},\n'
         '  "events": ["HOBBY_RECEIVED"],\n'
         '  "save_mode": "merge",\n'

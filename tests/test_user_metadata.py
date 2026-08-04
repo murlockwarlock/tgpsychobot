@@ -112,7 +112,6 @@ class UserMetadataTests(unittest.TestCase):
         visible, blocks, invalid = extract_service_data("""Ответ пользователю.
 <DATA>
 {
-  "schema_version": 1,
   "current_state": {"current_step": "STAGE_1_HOBBY", "attempt": 2},
   "events": ["HOBBY_RECEIVED", {"name": "LEAD_UPDATED"}],
   "save_mode": "snapshot",

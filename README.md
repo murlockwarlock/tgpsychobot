@@ -91,7 +91,6 @@
 ```text
 <DATA>
 {
-  "schema_version": 1,
   "current_state": {"current_step": "RESULT_READY"},
   "events": ["TEST_COMPLETED"],
   "save_mode": "merge",
