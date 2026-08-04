@@ -9,7 +9,7 @@ module.exports = {
         BOT_TOKEN: process.env.PSY5D_FULLTEST_BOT_TOKEN,
         DATABASE_URL: process.env.PSY5D_FULLTEST_DATABASE_URL,
         OWNER_IDS: process.env.PSY5D_FULLTEST_OWNER_IDS || "806750628",
-        APP_PORT: 8096,
+        APP_PORT: 8100,
         WEBHOOK_PATH_PREFIX: "/psy5d_fulltest",
         TELEGRAM_DELIVERY_MODE: "polling",
         SERVER_IP: process.env.SERVER_IP || "127.0.0.1",
