@@ -90,7 +90,9 @@ def admin_panel_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="📊 Статистика", callback_data="admin_stats")
     builder.button(text="👥 Клиенты", callback_data="admin_clients_page_0")
+    builder.button(text="⚙️ Общие настройки", callback_data="admin_general_settings")
     builder.button(text="🧩 Управление Тестом", callback_data="admin_test_menu")
+    builder.button(text="⚙️ Автоматизации", callback_data="automation_menu")
     builder.button(text="🤖 Настройки ИИ", callback_data="admin_ai_settings")
     builder.button(text="⭐️ Подписки", callback_data="admin_subscriptions")
     builder.button(text="📚 База знаний", callback_data="admin_kb_page_0")
@@ -109,17 +111,11 @@ def admin_test_menu_keyboard(config_or_enabled):
     builder = InlineKeyboardBuilder()
     is_enabled = config_or_enabled if isinstance(config_or_enabled, bool) else bool(config_or_enabled.is_enabled)
     show_progress = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "show_progress", True))
-    collect_name = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "profile_collect_name", True))
-    collect_gender = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "profile_collect_gender", True))
-    collect_age = False if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "profile_collect_age", False))
     secret_test_enabled = True if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "secret_test_enabled", True))
     formulas_enabled = False if isinstance(config_or_enabled, bool) else bool(getattr(config_or_enabled, "formulas_enabled", False))
     input_mode = "all" if isinstance(config_or_enabled, bool) else (getattr(config_or_enabled, "interpretation_input_mode", "all") or "all")
     status_text = "✅ Включен" if is_enabled else "❌ Выключен"
     progress_text = "✅ Да" if show_progress else "❌ Нет"
-    name_text = "✅" if collect_name else "❌"
-    gender_text = "✅" if collect_gender else "❌"
-    age_text = "✅" if collect_age else "❌"
     secret_text = "✅ Да" if secret_test_enabled else "❌ Нет"
     formulas_text = "✅ Да" if formulas_enabled else "❌ Нет"
     if input_mode == "formulas":
@@ -131,9 +127,6 @@ def admin_test_menu_keyboard(config_or_enabled):
 
     builder.button(text=f"Статус теста: {status_text}", callback_data="admin_test_toggle_status")
     builder.button(text=f"Прогресс: {progress_text}", callback_data="admin_test_toggle_progress")
-    builder.button(text=f"Анкета — имя: {name_text}", callback_data="admin_test_toggle_profile_name")
-    builder.button(text=f"Анкета — пол: {gender_text}", callback_data="admin_test_toggle_profile_gender")
-    builder.button(text=f"Анкета — возраст: {age_text}", callback_data="admin_test_toggle_profile_age")
     builder.button(text=f"Секретные вопросы: {secret_text}", callback_data="admin_test_toggle_secret_test")
     builder.button(text=f"Формулы: {formulas_text}", callback_data="admin_test_toggle_formulas")
     builder.button(text=f"В интерпретацию: {mode_text}", callback_data="admin_test_toggle_input_mode")
@@ -155,6 +148,24 @@ def admin_test_menu_keyboard(config_or_enabled):
     builder.button(text="🔐 Секретные вопросы", callback_data="admin_secret_questions")
     builder.button(text="📖 Истории/Кейсы", callback_data="admin_case_studies_page_0")
     builder.button(text="🔗 Настройка ссылок", callback_data="admin_test_links")
+    builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_general_settings_keyboard(config):
+    builder = InlineKeyboardBuilder()
+    fields = (
+        ("name", "Имя", bool(getattr(config, "profile_collect_name", True))),
+        ("gender", "Пол", bool(getattr(config, "profile_collect_gender", True))),
+        ("age", "Возраст", bool(getattr(config, "profile_collect_age", False))),
+    )
+    for field, title, enabled in fields:
+        status = "✅ запрашивать" if enabled else "❌ не запрашивать"
+        builder.button(
+            text=f"{title}: {status}",
+            callback_data=f"admin_general_toggle_profile_{field}",
+        )
     builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
     builder.adjust(1)
     return builder.as_markup()
@@ -423,7 +434,12 @@ async def content_management_keyboard():
             status = "✅" if disclaimer_msg.is_visible else "❌"
             builder.button(text=f"✏️ Дисклеймер {status}", callback_data="edit_content_disclaimer")
 
-        stmt = select(Content).where(Content.button_title != None).order_by(Content.key)
+        test_only_keys = ("test_button", "test_intro", "test_results", "secret_test_outro")
+        stmt = (
+            select(Content)
+            .where(Content.button_title != None, Content.key.notin_(test_only_keys))
+            .order_by(Content.key)
+        )
         result = await session.execute(stmt)
         content_items = result.scalars().all()
 

@@ -4,6 +4,7 @@ import json
 from user_metadata import (
     append_metadata_records,
     extract_data_blocks,
+    extract_service_data,
     load_metadata_records,
 )
 
@@ -106,3 +107,52 @@ class UserMetadataTests(unittest.TestCase):
 
         self.assertEqual(invalid, 0)
         self.assertEqual([record["data"]["test"] for record in records], [1, 2])
+
+    def test_unified_xml_envelope_is_parsed_atomically(self):
+        visible, blocks, invalid = extract_service_data("""Ответ пользователю.
+<DATA>
+{
+  "schema_version": 1,
+  "current_state": {"current_step": "STAGE_1_HOBBY", "attempt": 2},
+  "events": ["HOBBY_RECEIVED", {"name": "LEAD_UPDATED"}],
+  "save_mode": "snapshot",
+  "metadata": {"profile": {"hobby": "игры"}}
+}
+</DATA>""")
+
+        self.assertEqual(visible, "Ответ пользователю.")
+        self.assertEqual(invalid, 0)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].current_state["current_step"], "STAGE_1_HOBBY")
+        self.assertEqual(blocks[0].events, ["HOBBY_RECEIVED", "LEAD_UPDATED"])
+        self.assertEqual(blocks[0].save_mode, "snapshot")
+        self.assertEqual(blocks[0].metadata, {"profile": {"hobby": "игры"}})
+        self.assertFalse(blocks[0].legacy)
+
+    def test_legacy_events_field_is_not_executed(self):
+        _, blocks, invalid = extract_service_data(
+            '[DATA]{"events": ["this is ordinary legacy metadata"], "score": 5}[/DATA]'
+        )
+
+        self.assertEqual(invalid, 0)
+        self.assertTrue(blocks[0].legacy)
+        self.assertEqual(blocks[0].events, [])
+        self.assertEqual(blocks[0].metadata["score"], 5)
+
+    def test_markdown_fence_around_xml_data_is_hidden(self):
+        visible, blocks, invalid = extract_service_data(
+            'Готово\n```json\n<DATA>{"current_state":{"current_step":"DONE"}}</DATA>\n```'
+        )
+
+        self.assertEqual(visible, "Готово")
+        self.assertEqual(invalid, 0)
+        self.assertEqual(blocks[0].current_state["current_step"], "DONE")
+
+    def test_visible_code_fence_is_preserved(self):
+        visible, blocks, invalid = extract_service_data(
+            'Пример:\n```python\nprint("ok")\n```\n\n<DATA>{"events":["CODE_SHOWN"]}</DATA>'
+        )
+
+        self.assertEqual(visible, 'Пример:\n```python\nprint("ok")\n```')
+        self.assertEqual(blocks[0].events, ["CODE_SHOWN"])
+        self.assertEqual(invalid, 0)

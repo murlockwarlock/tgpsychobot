@@ -12,7 +12,7 @@ import zipfile
 from types import SimpleNamespace
 import ai_integration
 import keyboards
-from database import TestSession, TestAttempt, TestQuestion, TestConfig, SecretTestQuestion, CaseStudy
+from database import TestSession, TestAttempt, TestQuestion, TestConfig, BotGeneralConfig, SecretTestQuestion, CaseStudy
 from aiogram import Router, F, Bot
 from pydantic import ValidationError
 from aiogram.types import (Message, CallbackQuery, FSInputFile, Document,
@@ -81,9 +81,10 @@ from mailing_utils import (
     render_mailing_text,
     send_mailing_content,
 )
-from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE
+from prompt_blocks import DATA_PROTOCOL_INSTRUCTION, DEFAULT_SERVICE_PROMPT_TEMPLATE
 from provider_models import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MODELS
-from user_metadata import append_metadata_records, extract_data_blocks, load_metadata_records
+from user_metadata import append_metadata_records, extract_data_blocks, extract_service_data, load_metadata_records
+from automation_engine import apply_service_data_blocks, build_runtime_automation_context
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
 from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
@@ -447,11 +448,13 @@ PROMPT_BLOCKS = {
         "download_callback": "download_service_prompt_block",
         "filename": "service_prompt_block.txt",
         "description": (
-            "Этот блок добавляется после основного промпта и содержит служебные инструкции, "
-            "которые раньше были захардкожены в коде."
+            "Этот статический блок добавляется после основного промпта и содержит общие служебные правила. "
+            "Персональные значения передаются модели отдельным runtime-сообщением, поэтому системный префикс "
+            "остаётся неизменным и может кешироваться провайдером. Протокол <code>&lt;DATA&gt;</code> "
+            "добавляется приложением автоматически и дублировать его здесь не нужно."
         ),
         "placeholders": (
-            "Доступные плейсхолдеры:\n"
+            "Места динамических данных (сами значения уйдут отдельным сообщением):\n"
             "<code>{available_media_text}</code>\n"
             "<code>{test_context_injection}</code>\n"
             "<code>{short_response_instruction}</code>"
@@ -2292,7 +2295,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
         await session.commit()
         await refresh_commands_for_user(bot, message.from_user.id, is_admin_user_for_commands)
 
-        profile_config = await session.get(TestConfig, 1)
+        profile_config = await session.get(BotGeneralConfig, 1)
         if missing_profile_fields(profile_config, user):
             if bonus_messages:
                 await send_bonus_messages()
@@ -5719,7 +5722,7 @@ async def _continue_profile_onboarding(
     data = await state.get_data()
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
-        config = await session.get(TestConfig, 1)
+        config = await session.get(BotGeneralConfig, 1)
 
     missing = missing_profile_fields(config, user) if user else []
     if missing:
@@ -5755,7 +5758,7 @@ async def _request_profile_onboarding_if_needed(
     resume_test: bool = False,
 ) -> bool:
     async with async_session_maker() as session:
-        config = await session.get(TestConfig, 1)
+        config = await session.get(BotGeneralConfig, 1)
 
     missing = missing_profile_fields(config, user)
     if not missing:
@@ -12753,16 +12756,29 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         if provider_key in ['anthropic', 'claude'] and not model:
             model = ai_config.claude_model
 
-        fake_history = [DBMessage(role='user', content=user_prompt)]
+        user = await session.get(User, user_id)
+        if not user:
+            return "Ошибка: Пользователь не найден."
+        runtime_context = await build_runtime_automation_context(
+            session,
+            user_id=user.id,
+            dialogue_id=user.current_dialogue_id,
+            topic_id=user.current_topic_id,
+        )
+        fake_history = [DBMessage(
+            role='user',
+            content=f"{runtime_context}\n\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{user_prompt}",
+        )]
+        full_system_prompt = f"{system_prompt}\n\n{DATA_PROTOCOL_INSTRUCTION}"
 
         if provider_key == 'gemini':
-            response_text = await _call_gemini_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_gemini_api(api_key, model, fake_history, "", full_system_prompt)
         elif provider_key == 'openai':
-            response_text = await _call_openai_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_openai_api(api_key, model, fake_history, "", full_system_prompt)
         elif provider_key in ['anthropic', 'claude']:
-            response_text = await _call_claude_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_claude_api(api_key, model, fake_history, "", full_system_prompt)
         elif provider_key == 'deepseek':
-            response_text = await _call_deepseek_api(api_key, model, fake_history, "", system_prompt)
+            response_text = await _call_deepseek_api(api_key, model, fake_history, "", full_system_prompt)
         elif provider_key == 'kie':
             response_text = await _call_kie_chat(
                 api_key,
@@ -12770,19 +12786,25 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
                 model,
                 fake_history,
                 "",
-                system_prompt,
+                full_system_prompt,
             )
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
 
-    visible_text, metadata_blocks, invalid_data_blocks = extract_data_blocks(response_text)
+    visible_text, service_blocks, invalid_data_blocks = extract_service_data(response_text)
     if invalid_data_blocks:
-        logging.warning("AI returned %s invalid [DATA] block(s) for user %s", invalid_data_blocks, user_id)
-    if metadata_blocks:
+        logging.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+    if service_blocks:
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             if user:
-                user.metadata_json = append_metadata_records(user.metadata_json, metadata_blocks)
+                await apply_service_data_blocks(
+                    session,
+                    user=user,
+                    dialogue_id=user.current_dialogue_id,
+                    topic_id=user.current_topic_id,
+                    blocks=service_blocks,
+                )
                 await session.commit()
     return visible_text
 
@@ -12832,7 +12854,7 @@ async def admin_test_menu(callback: CallbackQuery):
         "🧩 <b>Управление разделом 'Тест'</b>\n\n"
         f"Вопросов: <b>{question_count}</b>\n"
         f"Формул: <b>{formula_count}</b>\n\n"
-        "Поля анкеты запрашиваются в Telegram до приветствия или запуска теста.",
+        "Здесь настраивается только логика теста, его тексты, вопросы и расчёты.",
         reply_markup=kb.admin_test_menu_keyboard(config)
     )
 
@@ -12867,20 +12889,60 @@ async def admin_test_toggle_progress(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_test_toggle_profile_"))
 async def admin_test_toggle_profile_field(callback: CallbackQuery):
+    """Backward-compatible callback from already sent old admin keyboards."""
     field = callback.data.removeprefix("admin_test_toggle_profile_")
     if field not in {"name", "gender", "age"}:
         await callback.answer("Неизвестное поле анкеты.", show_alert=True)
         return
     column_name = f"profile_collect_{field}"
     async with async_session_maker() as session:
-        config = await session.get(TestConfig, 1)
+        config = await session.get(BotGeneralConfig, 1)
         if not config:
-            config = TestConfig(id=1)
+            config = BotGeneralConfig(id=1)
             session.add(config)
         current_value = bool(getattr(config, column_name, field != "age"))
         setattr(config, column_name, not current_value)
         await session.commit()
-    await admin_test_menu(callback)
+    await admin_general_settings(callback)
+
+
+@router.callback_query(F.data == "admin_general_settings")
+async def admin_general_settings(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        if not config:
+            config = BotGeneralConfig(id=1)
+            session.add(config)
+            await session.commit()
+
+    await callback.message.edit_text(
+        "⚙️ <b>Общие настройки</b>\n\n"
+        "Выберите, какие данные бот должен запросить у нового пользователя при входе. "
+        "Настройки действуют на весь бот, а не только на тест.\n\n"
+        "Если поле уже заполнено в профиле, бот повторно его не спрашивает. "
+        "Отключённое поле можно заполнить позже через настройки пользователя.",
+        reply_markup=kb.admin_general_settings_keyboard(config),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_general_toggle_profile_"))
+async def admin_general_toggle_profile_field(callback: CallbackQuery):
+    field = callback.data.removeprefix("admin_general_toggle_profile_")
+    if field not in {"name", "gender", "age"}:
+        await callback.answer("Неизвестное поле анкеты.", show_alert=True)
+        return
+
+    column_name = f"profile_collect_{field}"
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        if not config:
+            config = BotGeneralConfig(id=1)
+            session.add(config)
+        current_value = bool(getattr(config, column_name, field != "age"))
+        setattr(config, column_name, not current_value)
+        await session.commit()
+
+    await admin_general_settings(callback)
 
 
 @router.callback_query(F.data == "admin_test_toggle_secret_test")

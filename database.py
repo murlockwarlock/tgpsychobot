@@ -46,6 +46,20 @@ topic_collection_association = Table(
     Column('collection_id', Integer, ForeignKey('media_collections.id', ondelete='CASCADE'), primary_key=True),
 )
 
+event_handler_topic_association = Table(
+    'event_handler_topics',
+    Base.metadata,
+    Column('handler_id', Integer, ForeignKey('automation_handlers.id', ondelete='CASCADE'), primary_key=True),
+    Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE'), primary_key=True),
+)
+
+followup_campaign_topic_association = Table(
+    'followup_campaign_topics',
+    Base.metadata,
+    Column('campaign_id', Integer, ForeignKey('followup_campaigns.id', ondelete='CASCADE'), primary_key=True),
+    Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE'), primary_key=True),
+)
+
 promocode_plan_association = Table(
     'promocode_plan_association',
     Base.metadata,
@@ -437,6 +451,8 @@ class TestConfig(Base):
     admin_username = Column(String, default="AlenaVV2004")
     marathon_url = Column(String, default="https://t.me/psihogipno")
     show_progress = Column(Boolean, default=True, nullable=False)
+    # Legacy copies retained for safe rolling upgrades. Runtime onboarding uses
+    # BotGeneralConfig; init_db copies these values on its first creation.
     collect_profile_before_test = Column(Boolean, default=True, nullable=False)
     profile_collect_name = Column(Boolean, default=True, nullable=False)
     profile_collect_gender = Column(Boolean, default=True, nullable=False)
@@ -475,7 +491,17 @@ class TestConfig(Base):
 
 # ЗАДАЧА 3: ПСИХОДИАГНОСТ (СЕКРЕТНЫЙ ТЕСТ)
 Если пользователь согласился на секретный тест (Задача 3), задай вопросы, переданные тебе в инструкции.
-""").strip())
+    """).strip())
+
+
+class BotGeneralConfig(Base):
+    """Settings that apply to onboarding throughout the whole bot."""
+
+    __tablename__ = 'bot_general_config'
+    id = Column(Integer, primary_key=True, default=1)
+    profile_collect_name = Column(Boolean, default=True, nullable=False)
+    profile_collect_gender = Column(Boolean, default=True, nullable=False)
+    profile_collect_age = Column(Boolean, default=False, nullable=False)
 
 
 class SecretTestQuestion(Base):
@@ -778,6 +804,18 @@ async def init_db():
             if getattr(test_conf, 'interpretation_input_mode', None) is None:
                 test_conf.interpretation_input_mode = 'all'
 
+        general_conf = await session.get(BotGeneralConfig, 1)
+        if not general_conf:
+            # One-time migration from the former test-specific storage keeps the
+            # behavior of existing bots while removing the runtime dependency.
+            general_conf = BotGeneralConfig(
+                id=1,
+                profile_collect_name=bool(getattr(test_conf, 'profile_collect_name', True)),
+                profile_collect_gender=bool(getattr(test_conf, 'profile_collect_gender', True)),
+                profile_collect_age=bool(getattr(test_conf, 'profile_collect_age', False)),
+            )
+            session.add(general_conf)
+
         # Seed default content sections for new bots (won't overwrite existing)
         default_content = [
             Content(key="start_message", button_title=None, is_visible=True, text_content="Приветствие не настроено.", content_order="text_top", sort_order=0),
@@ -801,6 +839,211 @@ class UserTopicState(Base):
     user_id = Column(BigInteger, ForeignKey('users.id'), primary_key=True)
     topic_id = Column(Integer, primary_key=True)
     dialogue_id = Column(Integer, nullable=False)
+
+
+class AutomationConversationState(Base):
+    """Current algorithm state scoped to one dialogue and one topic."""
+
+    __tablename__ = 'automation_conversation_states'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'dialogue_id', 'topic_id', name='uq_automation_state_scope'),
+        Index('idx_automation_state_step', 'topic_id', 'current_step'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    dialogue_id = Column(Integer, nullable=False)
+    # Zero is the main dialogue without a selected topic.
+    topic_id = Column(Integer, nullable=False, default=0)
+    current_step = Column(String, nullable=True)
+    current_state_json = Column(Text, default='{}', nullable=False)
+    metadata_json = Column(Text, default='{}', nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class AutomationStepTransition(Base):
+    """Append-only stage history used for funnel/algorithm statistics."""
+
+    __tablename__ = 'automation_step_transitions'
+    __table_args__ = (
+        Index('idx_automation_transition_scope', 'user_id', 'dialogue_id', 'topic_id'),
+        Index('idx_automation_transition_step_ts', 'topic_id', 'current_step', 'created_at'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    dialogue_id = Column(Integer, nullable=False)
+    topic_id = Column(Integer, nullable=False, default=0)
+    previous_step = Column(String, nullable=True)
+    current_step = Column(String, nullable=False)
+    state_json = Column(Text, default='{}', nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AutomationMetadataRecord(Base):
+    __tablename__ = 'automation_metadata_records'
+    __table_args__ = (
+        Index('idx_automation_metadata_scope', 'user_id', 'dialogue_id', 'topic_id', 'created_at'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    dialogue_id = Column(Integer, nullable=False)
+    topic_id = Column(Integer, nullable=False, default=0)
+    save_mode = Column(String, default='merge', nullable=False)
+    data_json = Column(Text, default='{}', nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AutomationEvent(Base):
+    __tablename__ = 'automation_events'
+    __table_args__ = (
+        Index('idx_automation_event_pending', 'processed_at', 'created_at'),
+        Index('idx_automation_event_scope', 'user_id', 'dialogue_id', 'topic_id'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    dialogue_id = Column(Integer, nullable=False)
+    topic_id = Column(Integer, nullable=False, default=0)
+    name = Column(String, nullable=False)
+    state_json = Column(Text, default='{}', nullable=False)
+    metadata_json = Column(Text, default='{}', nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    processing_started_at = Column(DateTime, nullable=True)
+    processed_at = Column(DateTime, nullable=True)
+
+
+class AutomationHandler(Base):
+    __tablename__ = 'automation_handlers'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=False, nullable=False)
+    all_topics = Column(Boolean, default=False, nullable=False)
+    include_main_dialogue = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    topics = relationship('Topic', secondary=event_handler_topic_association)
+    conditions = relationship(
+        'AutomationCondition',
+        back_populates='handler',
+        cascade='all, delete-orphan',
+        order_by='AutomationCondition.sort_order',
+    )
+    actions = relationship(
+        'AutomationAction',
+        back_populates='handler',
+        cascade='all, delete-orphan',
+        order_by='AutomationAction.sort_order',
+    )
+
+
+class AutomationCondition(Base):
+    __tablename__ = 'automation_conditions'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    handler_id = Column(Integer, ForeignKey('automation_handlers.id', ondelete='CASCADE'), nullable=False)
+    condition_type = Column(String, nullable=False)
+    field_path = Column(String, nullable=True)
+    operator = Column(String, default='equals', nullable=False)
+    expected_value = Column(Text, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    handler = relationship('AutomationHandler', back_populates='conditions')
+
+
+class AutomationAction(Base):
+    __tablename__ = 'automation_actions'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    handler_id = Column(Integer, ForeignKey('automation_handlers.id', ondelete='CASCADE'), nullable=False)
+    action_type = Column(String, nullable=False)
+    recipient_type = Column(String, nullable=True)
+    recipient_user_id = Column(BigInteger, nullable=True)
+    message_template = Column(Text, nullable=True)
+    metadata_json = Column(Text, nullable=True)
+    sort_order = Column(Integer, default=0, nullable=False)
+    handler = relationship('AutomationHandler', back_populates='actions')
+
+
+class AutomationActionExecution(Base):
+    __tablename__ = 'automation_action_executions'
+    __table_args__ = (
+        UniqueConstraint('event_id', 'action_id', name='uq_automation_action_event'),
+        Index('idx_automation_execution_event', 'event_id'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(Integer, ForeignKey('automation_events.id', ondelete='CASCADE'), nullable=False)
+    handler_id = Column(Integer, ForeignKey('automation_handlers.id', ondelete='CASCADE'), nullable=False)
+    action_id = Column(Integer, ForeignKey('automation_actions.id', ondelete='CASCADE'), nullable=False)
+    executed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class FollowupCampaign(Base):
+    __tablename__ = 'followup_campaigns'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)
+    is_active = Column(Boolean, default=False, nullable=False)
+    all_topics = Column(Boolean, default=False, nullable=False)
+    include_main_dialogue = Column(Boolean, default=True, nullable=False)
+    timezone = Column(String, default='Europe/Moscow', nullable=False)
+    quiet_start_minute = Column(Integer, default=22 * 60, nullable=False)
+    quiet_end_minute = Column(Integer, default=9 * 60, nullable=False)
+    jitter_min_seconds = Column(Integer, default=0, nullable=False)
+    jitter_max_seconds = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    topics = relationship('Topic', secondary=followup_campaign_topic_association)
+    steps = relationship(
+        'FollowupStep',
+        back_populates='campaign',
+        cascade='all, delete-orphan',
+        order_by='FollowupStep.sort_order',
+    )
+    runs = relationship('FollowupRun', back_populates='campaign', cascade='all, delete-orphan')
+
+
+class FollowupStep(Base):
+    __tablename__ = 'followup_steps'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    campaign_id = Column(Integer, ForeignKey('followup_campaigns.id', ondelete='CASCADE'), nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    delay_minutes = Column(Integer, nullable=False)
+    message_type = Column(String, default='static', nullable=False)
+    message_text = Column(Text, nullable=True)
+    ai_instruction = Column(Text, nullable=True)
+    campaign = relationship('FollowupCampaign', back_populates='steps')
+
+
+class FollowupRun(Base):
+    __tablename__ = 'followup_runs'
+    __table_args__ = (
+        UniqueConstraint(
+            'campaign_id', 'user_id', 'dialogue_id', 'topic_id',
+            name='uq_followup_run_scope',
+        ),
+        Index('idx_followup_run_due', 'status', 'due_at'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    campaign_id = Column(Integer, ForeignKey('followup_campaigns.id', ondelete='CASCADE'), nullable=False)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    dialogue_id = Column(Integer, nullable=False)
+    topic_id = Column(Integer, nullable=False, default=0)
+    next_step_index = Column(Integer, default=0, nullable=False)
+    generation = Column(Integer, default=1, nullable=False)
+    last_activity_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    due_at = Column(DateTime, nullable=False)
+    status = Column(String, default='active', nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    campaign = relationship('FollowupCampaign', back_populates='runs')
+
+
+class FollowupDelivery(Base):
+    __tablename__ = 'followup_deliveries'
+    __table_args__ = (
+        UniqueConstraint('run_id', 'generation', 'step_id', name='uq_followup_delivery_step'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(Integer, ForeignKey('followup_runs.id', ondelete='CASCADE'), nullable=False)
+    step_id = Column(Integer, ForeignKey('followup_steps.id', ondelete='CASCADE'), nullable=False)
+    generation = Column(Integer, default=1, nullable=False)
+    sent_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    telegram_message_id = Column(BigInteger, nullable=True)
 
 
 class CardSpreadState(Base):

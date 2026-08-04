@@ -12,6 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN, OWNER_IDS
 from handlers import router
+from automation_admin import router as automation_admin_router
 from database import init_db
 from background_worker import process_queue, process_mailings
 from scheduler import check_subscriptions, check_kie_credit_balance
@@ -27,6 +28,8 @@ from bot_commands import (
     refresh_default_commands,
 )
 from telegram_client import create_telegram_bot
+from automation_events import process_pending_events
+from followups import FollowupActivityMiddleware, process_due_followups
 
 WEB_SERVER_HOST = '0.0.0.0'
 APP_PORT = int(os.environ.get('APP_PORT', 8080))
@@ -197,6 +200,8 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
     scheduler.add_job(check_kie_credit_balance, 'interval', minutes=15, args=(bot,))
+    scheduler.add_job(process_pending_events, 'interval', minutes=1, args=(bot,), max_instances=1)
+    scheduler.add_job(process_due_followups, 'interval', minutes=1, args=(bot,), max_instances=1)
     scheduler.start()
     dispatcher['_scheduler'] = scheduler
 
@@ -337,6 +342,13 @@ def main():
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
+    activity_middleware = FollowupActivityMiddleware()
+    dp.message.outer_middleware(activity_middleware)
+    dp.callback_query.outer_middleware(activity_middleware)
+
+    # FSM messages from automation settings must be routed before the general
+    # dialogue handler.
+    dp.include_router(automation_admin_router)
     dp.include_router(router)
 
     app = web.Application()
