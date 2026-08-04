@@ -1,5 +1,8 @@
 import os
+import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("BOT_TOKEN", "test")
@@ -9,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from automation_engine import apply_service_data_blocks, get_conversation_automation_state
 from database import (
+    AIConfig,
     AutomationConversationState,
     AutomationEvent,
     AutomationMetadataRecord,
@@ -24,6 +28,7 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         tables = [
+            AIConfig.__table__,
             User.__table__,
             AutomationConversationState.__table__,
             AutomationStepTransition.__table__,
@@ -34,6 +39,7 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
             await connection.run_sync(lambda conn: Base.metadata.create_all(conn, tables=tables))
         async with self.sessions() as session:
             session.add(User(id=42, first_name="Иван", current_dialogue_id=1, metadata_json="{}"))
+            session.add(AIConfig(id=1, provider="Gemini", gemini_api_key="test", gemini_model="test"))
             await session.commit()
 
     async def asyncTearDown(self):
@@ -140,3 +146,53 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(load_metadata(state.metadata_json), {"stable": 1})
         self.assertEqual([record.save_mode for record in records], ["merge", "snapshot"])
+
+    async def test_test_result_ai_path_applies_atomic_data_block(self):
+        with patch.dict(
+            sys.modules,
+            {
+                "yookassa": SimpleNamespace(Configuration=object, Payment=object),
+                "yookassa.domain": SimpleNamespace(),
+                "yookassa.domain.exceptions": SimpleNamespace(
+                    BadRequestError=Exception,
+                    ForbiddenError=Exception,
+                    InternalServerError=Exception,
+                    TooManyRequestsError=Exception,
+                    UnauthorizedError=Exception,
+                ),
+                "dateutil": SimpleNamespace(),
+                "dateutil.relativedelta": SimpleNamespace(relativedelta=object),
+            },
+        ):
+            import handlers
+
+        provider_response = (
+            "Результат теста готов.\n"
+            '<DATA>{"current_state":{"current_step":"TEST_RESULT_READY"},'
+            '"events":["TEST_COMPLETED"],"save_mode":"merge",'
+            '"metadata":{"test":{"score":17}}}</DATA>'
+        )
+        call = AsyncMock(return_value=provider_response)
+
+        with (
+            patch.object(handlers, "async_session_maker", self.sessions),
+            patch.object(handlers, "_call_gemini_api", call),
+        ):
+            visible = await handlers.get_ai_response_direct(
+                42,
+                "Сформируй результат психологического теста.",
+                "Ответы пользователя.",
+            )
+
+        self.assertEqual(visible, "Результат теста готов.")
+        sent_system_prompt = call.await_args.args[4]
+        self.assertIn("<DATA>", sent_system_prompt)
+        async with self.sessions() as session:
+            state = await get_conversation_automation_state(
+                session, user_id=42, dialogue_id=1, topic_id=None
+            )
+            event_count = await session.scalar(select(func.count(AutomationEvent.id)))
+
+        self.assertEqual(state.current_step, "TEST_RESULT_READY")
+        self.assertEqual(load_metadata(state.metadata_json), {"test": {"score": 17}})
+        self.assertEqual(event_count, 1)

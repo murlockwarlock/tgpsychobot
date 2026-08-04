@@ -18,6 +18,7 @@ REMOTE_DIR="${PROD_REMOTE_DIR:-/root/telegram_bots/newbots}"
 REMOTE_PY="${PROD_REMOTE_PY:-/root/telegram_bots/venv/bin/python}"
 REMOTE_RUNTIME_ENV="${PROD_RUNTIME_ENV:-/root/telegram_bots/runtime.env}"
 PM2_NAMES="${PROD_PM2_NAMES:-psy5d_new,veraveda_new,someone01_new,someone02_new,veraveda_legacy,someone02_legacy,someone01_legacy,psy5d_legacy,test01_legacy,test02_legacy,someone03_new,someone04_new,someone05_new,someone06_new,someone07_new,yourself_way_bot,max_veraveda_legacy,max_yourself_way}"
+PM2_CONFIG="${PROD_PM2_CONFIG:-ecosystem.config.js}"
 
 ALLOW_DIRTY=0
 
@@ -114,7 +115,7 @@ tar czf - -- "${TRACKED_FILES[@]}" | \
              fi; \
          done; \
      done && \
-     pm2 reload ecosystem.config.js --only ${PM2_NAMES} --update-env && \
+     pm2 startOrReload '${PM2_CONFIG}' --only ${PM2_NAMES} --update-env && \
      sleep 10 && \
      pm2 status"
 
