@@ -660,10 +660,14 @@ def edit_topic_keyboard(topic_id: int, is_active: bool, in_menu: bool = False, i
     builder.button(text="📁 Медиа-файлы темы", callback_data=f"admin_topic_media_{topic_id}")
     builder.button(text="🎨 Привязать коллекции", callback_data=f"assign_coll_topic_{topic_id}_page_0")
 
+    builder.button(text="⚡ Обработчики событий", callback_data=f"topic_automation_handlers_{topic_id}")
+    builder.button(text="💬 Догоняющие сообщения", callback_data=f"topic_followup_campaigns_{topic_id}")
+    builder.button(text="📊 Статистика этапов", callback_data=f"topic_automation_stats_{topic_id}")
+
     builder.button(text="🗑️ Удалить тему", callback_data=f"delete_topic_{topic_id}")
     builder.button(text="⬅️ К списку тем", callback_data="admin_topics_page_0")
 
-    builder.adjust(1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1)
+    builder.adjust(1)
     return builder.as_markup()
 
 

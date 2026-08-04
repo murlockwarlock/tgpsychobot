@@ -110,42 +110,57 @@ async def automation_data_help(callback: CallbackQuery):
 
 @router.callback_query(F.data == "automation_stage_stats")
 async def automation_stage_stats(callback: CallbackQuery):
+    await _show_automation_stage_stats(callback)
+
+
+@router.callback_query(F.data.regexp(r"^topic_automation_stats_(\d+)$"))
+async def topic_automation_stage_stats(callback: CallbackQuery):
+    await _show_automation_stage_stats(callback, topic_id=int(callback.data.rsplit("_", 1)[1]))
+
+
+async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | None = None):
     async with async_session_maker() as session:
+        transition_stmt = select(
+            AutomationStepTransition.topic_id,
+            AutomationStepTransition.current_step,
+            func.count(AutomationStepTransition.id),
+            func.count(distinct(AutomationStepTransition.user_id)),
+        )
+        current_stmt = select(
+            AutomationConversationState.topic_id,
+            AutomationConversationState.current_step,
+            func.count(AutomationConversationState.id),
+        ).where(AutomationConversationState.current_step.is_not(None))
+        if topic_id is not None:
+            transition_stmt = transition_stmt.where(AutomationStepTransition.topic_id == topic_id)
+            current_stmt = current_stmt.where(AutomationConversationState.topic_id == topic_id)
         transition_rows = (
             await session.execute(
-                select(
-                    AutomationStepTransition.topic_id,
-                    AutomationStepTransition.current_step,
-                    func.count(AutomationStepTransition.id),
-                    func.count(distinct(AutomationStepTransition.user_id)),
-                )
+                transition_stmt
                 .group_by(AutomationStepTransition.topic_id, AutomationStepTransition.current_step)
                 .order_by(AutomationStepTransition.topic_id, func.min(AutomationStepTransition.id))
             )
         ).all()
         current_rows = (
             await session.execute(
-                select(
-                    AutomationConversationState.topic_id,
-                    AutomationConversationState.current_step,
-                    func.count(AutomationConversationState.id),
-                )
-                .where(AutomationConversationState.current_step.is_not(None))
+                current_stmt
                 .group_by(AutomationConversationState.topic_id, AutomationConversationState.current_step)
             )
         ).all()
         topic_ids = {row[0] for row in transition_rows if row[0]}
         topic_names = dict((await session.execute(select(Topic.id, Topic.name).where(Topic.id.in_(topic_ids)))).all()) if topic_ids else {}
+        selected_topic = await session.get(Topic, topic_id) if topic_id is not None else None
 
     current_map = {(topic_id, step): count for topic_id, step, count in current_rows}
     if not transition_rows:
         text = (
-            "📊 <b>Статистика этапов</b>\n\n"
+            f"📊 <b>Статистика этапов{f' — {html.escape(selected_topic.name)}' if selected_topic else ''}</b>\n\n"
             "Переходов пока нет. Они появятся, когда модель впервые вернёт "
             "<code>current_state.current_step</code> в новом DATA-блоке."
         )
     else:
-        lines = ["📊 <b>Статистика этапов</b>", ""]
+        heading = f"Статистика этапов — {html.escape(selected_topic.name)}" if selected_topic else "Статистика этапов"
+        lines = [f"📊 <b>{heading}</b>", ""]
         active_topic = object()
         for topic_id, step, entries, users in transition_rows:
             if topic_id != active_topic:
@@ -164,7 +179,9 @@ async def automation_stage_stats(callback: CallbackQuery):
         text = "\n".join(lines)
     await callback.message.edit_text(
         text,
-        reply_markup=InlineKeyboardBuilder().row(_back("automation_menu")).as_markup(),
+        reply_markup=InlineKeyboardBuilder().row(
+            _back(f"edit_topic_{topic_id}" if topic_id is not None else "automation_menu")
+        ).as_markup(),
     )
 
 
@@ -200,33 +217,123 @@ def _action_label(action: AutomationAction) -> str:
 
 @router.callback_query(F.data == "automation_handlers")
 async def automation_handlers(callback: CallbackQuery, state: FSMContext | None = None):
+    await _show_automation_handlers(callback, state=state)
+
+
+@router.callback_query(F.data.regexp(r"^topic_automation_handlers_(\d+)$"))
+async def topic_automation_handlers(callback: CallbackQuery, state: FSMContext | None = None):
+    await _show_automation_handlers(
+        callback,
+        state=state,
+        topic_id=int(callback.data.rsplit("_", 1)[1]),
+    )
+
+
+def _handler_applies_to_topic(handler: AutomationHandler, topic_id: int) -> bool:
+    return bool(handler.all_topics or topic_id in {topic.id for topic in handler.topics})
+
+
+async def _show_automation_handlers(
+    callback: CallbackQuery,
+    *,
+    state: FSMContext | None = None,
+    topic_id: int | None = None,
+):
     if state is not None:
         await state.clear()
     async with async_session_maker() as session:
-        handlers = (await session.execute(select(AutomationHandler).order_by(AutomationHandler.id))).scalars().all()
+        handlers = (
+            await session.execute(
+                select(AutomationHandler)
+                .options(selectinload(AutomationHandler.topics))
+                .order_by(AutomationHandler.id)
+            )
+        ).scalars().all()
+        topic = await session.get(Topic, topic_id) if topic_id is not None else None
+    if topic_id is not None:
+        handlers = [item for item in handlers if _handler_applies_to_topic(item, topic_id)]
     builder = InlineKeyboardBuilder()
     for item in handlers:
         status = "✅" if item.is_active else "⏸"
-        builder.button(text=f"{status} {item.name}", callback_data=f"automation_handler_{item.id}")
-    builder.button(text="➕ Новый обработчик", callback_data="automation_handler_add")
-    builder.row(_back("automation_menu"))
-    builder.adjust(1)
+        view_button = InlineKeyboardButton(
+            text=f"{'🌐' if item.all_topics else status} {item.name}",
+            callback_data=f"automation_handler_{item.id}",
+        )
+        if topic_id is not None and not item.all_topics:
+            builder.row(
+                view_button,
+                InlineKeyboardButton(
+                    text="✖️ Отвязать",
+                    callback_data=f"topic_automation_handler_unlink_{topic_id}_{item.id}",
+                ),
+            )
+        else:
+            builder.row(view_button)
+    add_callback = f"topic_automation_handler_add_{topic_id}" if topic_id is not None else "automation_handler_add"
+    back_callback = f"edit_topic_{topic_id}" if topic_id is not None else "automation_menu"
+    builder.row(InlineKeyboardButton(text="➕ Новый обработчик", callback_data=add_callback))
+    builder.row(_back(back_callback))
     await callback.message.edit_text(
-        "⚡ <b>Обработчики событий</b>\n\n"
+        f"⚡ <b>Обработчики событий{f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
         "Обработчик срабатывает только когда совпали тема и все его условия. "
-        "Действия выполняются по порядку и не повторяются для одного события.",
+        "Действия выполняются по порядку и не повторяются для одного события."
+        + ("\n\nЗдесь показаны обработчики этой темы. Созданный здесь обработчик привяжется к ней автоматически." if topic else ""),
         reply_markup=builder.as_markup(),
     )
 
 
+@router.callback_query(F.data.regexp(r"^topic_automation_handler_unlink_(\d+)_(\d+)$"))
+async def topic_automation_handler_unlink(callback: CallbackQuery):
+    topic_id, handler_id = map(int, callback.data.rsplit("_", 2)[-2:])
+    async with async_session_maker() as session:
+        item = await session.get(AutomationHandler, handler_id)
+        if item is not None and not item.all_topics:
+            await session.execute(
+                delete(event_handler_topic_association).where(
+                    event_handler_topic_association.c.handler_id == handler_id,
+                    event_handler_topic_association.c.topic_id == topic_id,
+                )
+            )
+            remaining_topics = await session.scalar(
+                select(func.count()).select_from(event_handler_topic_association).where(
+                    event_handler_topic_association.c.handler_id == handler_id
+                )
+            )
+            if not remaining_topics and not item.include_main_dialogue:
+                item.is_active = False
+            await session.commit()
+    await callback.answer("Обработчик отвязан от темы.")
+    callback.data = f"topic_automation_handlers_{topic_id}"
+    await topic_automation_handlers(callback)
+
+
 @router.callback_query(F.data == "automation_handler_add")
 async def automation_handler_add(callback: CallbackQuery, state: FSMContext):
+    await _start_automation_handler_add(callback, state)
+
+
+@router.callback_query(F.data.regexp(r"^topic_automation_handler_add_(\d+)$"))
+async def topic_automation_handler_add(callback: CallbackQuery, state: FSMContext):
+    await _start_automation_handler_add(
+        callback,
+        state,
+        topic_id=int(callback.data.rsplit("_", 1)[1]),
+    )
+
+
+async def _start_automation_handler_add(
+    callback: CallbackQuery,
+    state: FSMContext,
+    topic_id: int | None = None,
+):
     await state.set_state(AutomationAdminStates.handler_name)
+    await state.update_data(preset_topic_id=topic_id)
+    back_callback = f"topic_automation_handlers_{topic_id}" if topic_id is not None else "automation_handlers"
     await callback.message.edit_text(
         "<b>Название обработчика</b>\n\n"
         "Введите понятное внутреннее название, например: «Лид готов к консультации». "
         "После создания обработчик будет выключен, пока вы не добавите условия и действия.",
-        reply_markup=InlineKeyboardBuilder().row(_back("automation_handlers")).as_markup(),
+        reply_markup=InlineKeyboardBuilder().row(_back(back_callback)).as_markup(),
     )
 
 
@@ -236,8 +343,21 @@ async def automation_handler_name_received(message: Message, state: FSMContext):
     if not 2 <= len(name) <= 100:
         await message.answer("Название должно содержать от 2 до 100 символов.")
         return
+    data = await state.get_data()
+    preset_topic_id = data.get("preset_topic_id")
     async with async_session_maker() as session:
-        item = AutomationHandler(name=name, is_active=False, include_main_dialogue=True)
+        item = AutomationHandler(
+            name=name,
+            is_active=False,
+            include_main_dialogue=preset_topic_id is None,
+        )
+        if preset_topic_id is not None:
+            topic = await session.get(Topic, int(preset_topic_id))
+            if topic is None:
+                await message.answer("Тема больше не существует. Обработчик не создан.")
+                await state.clear()
+                return
+            item.topics.append(topic)
         session.add(item)
         await session.commit()
         await session.refresh(item)
@@ -610,34 +730,121 @@ async def _campaign_with_relations(session, campaign_id: int):
 
 @router.callback_query(F.data == "followup_campaigns")
 async def followup_campaigns(callback: CallbackQuery, state: FSMContext | None = None):
+    await _show_followup_campaigns(callback, state=state)
+
+
+@router.callback_query(F.data.regexp(r"^topic_followup_campaigns_(\d+)$"))
+async def topic_followup_campaigns(callback: CallbackQuery, state: FSMContext | None = None):
+    await _show_followup_campaigns(
+        callback,
+        state=state,
+        topic_id=int(callback.data.rsplit("_", 1)[1]),
+    )
+
+
+def _campaign_applies_to_topic(campaign: FollowupCampaign, topic_id: int) -> bool:
+    return bool(campaign.all_topics or topic_id in {topic.id for topic in campaign.topics})
+
+
+async def _show_followup_campaigns(
+    callback: CallbackQuery,
+    *,
+    state: FSMContext | None = None,
+    topic_id: int | None = None,
+):
     if state is not None:
         await state.clear()
     async with async_session_maker() as session:
-        campaigns = (await session.execute(select(FollowupCampaign).order_by(FollowupCampaign.id))).scalars().all()
+        campaigns = (
+            await session.execute(
+                select(FollowupCampaign)
+                .options(selectinload(FollowupCampaign.topics))
+                .order_by(FollowupCampaign.id)
+            )
+        ).scalars().all()
+        topic = await session.get(Topic, topic_id) if topic_id is not None else None
+    if topic_id is not None:
+        campaigns = [item for item in campaigns if _campaign_applies_to_topic(item, topic_id)]
     builder = InlineKeyboardBuilder()
     for item in campaigns:
-        builder.button(
-            text=f"{'✅' if item.is_active else '⏸'} {item.name}",
+        view_button = InlineKeyboardButton(
+            text=f"{'🌐' if item.all_topics else ('✅' if item.is_active else '⏸')} {item.name}",
             callback_data=f"followup_campaign_{item.id}",
         )
-    builder.button(text="➕ Новая цепочка", callback_data="followup_campaign_add")
-    builder.row(_back("automation_menu"))
-    builder.adjust(1)
+        if topic_id is not None and not item.all_topics:
+            builder.row(
+                view_button,
+                InlineKeyboardButton(
+                    text="✖️ Отвязать",
+                    callback_data=f"topic_followup_campaign_unlink_{topic_id}_{item.id}",
+                ),
+            )
+        else:
+            builder.row(view_button)
+    add_callback = f"topic_followup_campaign_add_{topic_id}" if topic_id is not None else "followup_campaign_add"
+    back_callback = f"edit_topic_{topic_id}" if topic_id is not None else "automation_menu"
+    builder.row(InlineKeyboardButton(text="➕ Новая цепочка", callback_data=add_callback))
+    builder.row(_back(back_callback))
     await callback.message.edit_text(
-        "💬 <b>Догоняющие сообщения</b>\n\n"
+        f"💬 <b>Догоняющие сообщения{f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
         "Таймер начинается заново после каждого сообщения или нажатия пользователя. "
         "При смене темы либо создании нового диалога старая цепочка отменяется. "
-        "Шаги отправляются только вне тихих часов.",
+        "Шаги отправляются только вне тихих часов."
+        + ("\n\nЗдесь показаны цепочки этой темы. Новая цепочка привяжется к ней автоматически." if topic else ""),
         reply_markup=builder.as_markup(),
     )
 
 
+@router.callback_query(F.data.regexp(r"^topic_followup_campaign_unlink_(\d+)_(\d+)$"))
+async def topic_followup_campaign_unlink(callback: CallbackQuery):
+    topic_id, campaign_id = map(int, callback.data.rsplit("_", 2)[-2:])
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, campaign_id)
+        if item is not None and not item.all_topics:
+            await session.execute(
+                delete(followup_campaign_topic_association).where(
+                    followup_campaign_topic_association.c.campaign_id == campaign_id,
+                    followup_campaign_topic_association.c.topic_id == topic_id,
+                )
+            )
+            remaining_topics = await session.scalar(
+                select(func.count()).select_from(followup_campaign_topic_association).where(
+                    followup_campaign_topic_association.c.campaign_id == campaign_id
+                )
+            )
+            if not remaining_topics and not item.include_main_dialogue:
+                item.is_active = False
+            await session.commit()
+    await callback.answer("Цепочка отвязана от темы.")
+    callback.data = f"topic_followup_campaigns_{topic_id}"
+    await topic_followup_campaigns(callback)
+
+
 @router.callback_query(F.data == "followup_campaign_add")
 async def followup_campaign_add(callback: CallbackQuery, state: FSMContext):
+    await _start_followup_campaign_add(callback, state)
+
+
+@router.callback_query(F.data.regexp(r"^topic_followup_campaign_add_(\d+)$"))
+async def topic_followup_campaign_add(callback: CallbackQuery, state: FSMContext):
+    await _start_followup_campaign_add(
+        callback,
+        state,
+        topic_id=int(callback.data.rsplit("_", 1)[1]),
+    )
+
+
+async def _start_followup_campaign_add(
+    callback: CallbackQuery,
+    state: FSMContext,
+    topic_id: int | None = None,
+):
     await state.set_state(AutomationAdminStates.campaign_name)
+    await state.update_data(preset_topic_id=topic_id)
+    back_callback = f"topic_followup_campaigns_{topic_id}" if topic_id is not None else "followup_campaigns"
     await callback.message.edit_text(
         "Введите название цепочки. После создания она будет выключена, пока вы не добавите шаги.",
-        reply_markup=InlineKeyboardBuilder().row(_back("followup_campaigns")).as_markup(),
+        reply_markup=InlineKeyboardBuilder().row(_back(back_callback)).as_markup(),
     )
 
 
@@ -647,8 +854,21 @@ async def followup_campaign_name_received(message: Message, state: FSMContext):
     if not 2 <= len(name) <= 100:
         await message.answer("Название должно содержать от 2 до 100 символов.")
         return
+    data = await state.get_data()
+    preset_topic_id = data.get("preset_topic_id")
     async with async_session_maker() as session:
-        item = FollowupCampaign(name=name, include_main_dialogue=True, is_active=False)
+        item = FollowupCampaign(
+            name=name,
+            include_main_dialogue=preset_topic_id is None,
+            is_active=False,
+        )
+        if preset_topic_id is not None:
+            topic = await session.get(Topic, int(preset_topic_id))
+            if topic is None:
+                await message.answer("Тема больше не существует. Цепочка не создана.")
+                await state.clear()
+                return
+            item.topics.append(topic)
         session.add(item)
         await session.commit()
         await session.refresh(item)
