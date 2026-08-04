@@ -58,6 +58,25 @@ def _back(callback_data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_data)
 
 
+async def _navigation_topic_id(state: FSMContext | None, key: str) -> int | None:
+    if state is None:
+        return None
+    data = await state.get_data()
+    value = data.get(key)
+    return int(value) if value is not None else None
+
+
+async def _reset_navigation_context(
+    state: FSMContext | None,
+    key: str,
+    topic_id: int | None,
+) -> None:
+    if state is None:
+        return
+    await state.clear()
+    await state.update_data(**{key: topic_id})
+
+
 def _automation_menu_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="⚡ Обработчики событий", callback_data="automation_handlers")
@@ -119,6 +138,7 @@ async def topic_automation_stage_stats(callback: CallbackQuery):
 
 
 async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | None = None):
+    selected_topic_id = topic_id
     async with async_session_maker() as session:
         transition_stmt = select(
             AutomationStepTransition.topic_id,
@@ -131,9 +151,9 @@ async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | 
             AutomationConversationState.current_step,
             func.count(AutomationConversationState.id),
         ).where(AutomationConversationState.current_step.is_not(None))
-        if topic_id is not None:
-            transition_stmt = transition_stmt.where(AutomationStepTransition.topic_id == topic_id)
-            current_stmt = current_stmt.where(AutomationConversationState.topic_id == topic_id)
+        if selected_topic_id is not None:
+            transition_stmt = transition_stmt.where(AutomationStepTransition.topic_id == selected_topic_id)
+            current_stmt = current_stmt.where(AutomationConversationState.topic_id == selected_topic_id)
         transition_rows = (
             await session.execute(
                 transition_stmt
@@ -149,7 +169,7 @@ async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | 
         ).all()
         topic_ids = {row[0] for row in transition_rows if row[0]}
         topic_names = dict((await session.execute(select(Topic.id, Topic.name).where(Topic.id.in_(topic_ids)))).all()) if topic_ids else {}
-        selected_topic = await session.get(Topic, topic_id) if topic_id is not None else None
+        selected_topic = await session.get(Topic, selected_topic_id) if selected_topic_id is not None else None
 
     current_map = {(topic_id, step): count for topic_id, step, count in current_rows}
     if not transition_rows:
@@ -160,27 +180,43 @@ async def _show_automation_stage_stats(callback: CallbackQuery, topic_id: int | 
         )
     else:
         heading = f"Статистика этапов — {html.escape(selected_topic.name)}" if selected_topic else "Статистика этапов"
-        lines = [f"📊 <b>{heading}</b>", ""]
+        lines = [
+            f"📊 <b>{heading}</b>",
+            "",
+            "Считаются только реальные смены <code>current_step</code>.",
+        ]
         active_topic = object()
-        for topic_id, step, entries, users in transition_rows:
-            if topic_id != active_topic:
-                active_topic = topic_id
-                title = "Основной диалог" if topic_id == 0 else topic_names.get(topic_id, f"Тема #{topic_id}")
-                lines.extend([f"<b>{html.escape(title)}</b>"])
-            current = current_map.get((topic_id, step), 0)
-            lines.append(
-                f"• <code>{html.escape(step)}</code>: вошли {users} польз., "
-                f"переходов {entries}, сейчас {current}"
-            )
+        for row_topic_id, step, entries, users in transition_rows:
+            if row_topic_id != active_topic:
+                active_topic = row_topic_id
+                title = (
+                    "Основной диалог"
+                    if row_topic_id == 0
+                    else topic_names.get(row_topic_id, f"Тема #{row_topic_id}")
+                )
+                lines.extend(["", f"<b>{html.escape(title)}</b>"])
+            current = current_map.get((row_topic_id, step), 0)
+            lines.extend([
+                "",
+                f"<code>{html.escape(step)}</code>",
+                f"👥 Вошли: <b>{users}</b>   ·   🔁 Переходы: <b>{entries}</b>   ·   📍 Сейчас: <b>{current}</b>",
+            ])
             if len("\n".join(lines)) > 3600:
-                lines.append("…Показаны первые этапы. Для подробной выгрузки используйте экспорт данных клиентов.")
+                lines.extend([
+                    "",
+                    "…Показаны первые этапы. Полные данные доступны в экспорте клиентов.",
+                ])
                 break
-        lines.extend(["", "Повтор одного и того же шага подряд не создаёт новый переход."])
         text = "\n".join(lines)
+    back_callback = (
+        f"edit_topic_{selected_topic_id}"
+        if selected_topic_id is not None
+        else "automation_menu"
+    )
     await callback.message.edit_text(
         text,
         reply_markup=InlineKeyboardBuilder().row(
-            _back(f"edit_topic_{topic_id}" if topic_id is not None else "automation_menu")
+            _back(back_callback)
         ).as_markup(),
     )
 
@@ -239,8 +275,7 @@ async def _show_automation_handlers(
     state: FSMContext | None = None,
     topic_id: int | None = None,
 ):
-    if state is not None:
-        await state.clear()
+    await _reset_navigation_context(state, "automation_return_topic_id", topic_id)
     async with async_session_maker() as session:
         handlers = (
             await session.execute(
@@ -362,17 +397,30 @@ async def automation_handler_name_received(message: Message, state: FSMContext):
         await session.commit()
         await session.refresh(item)
         handler_id = item.id
-    await state.clear()
+    return_topic_id = int(preset_topic_id) if preset_topic_id is not None else None
+    await _reset_navigation_context(state, "automation_return_topic_id", return_topic_id)
     await message.answer("✅ Обработчик создан выключенным.")
-    await _show_handler(message, handler_id, edit=False)
+    await _show_handler(message, handler_id, edit=False, state=state)
 
 
-async def _show_handler(target, handler_id: int, *, edit: bool = True):
+async def _show_handler(
+    target,
+    handler_id: int,
+    *,
+    edit: bool = True,
+    state: FSMContext | None = None,
+):
+    return_topic_id = await _navigation_topic_id(state, "automation_return_topic_id")
+    back_callback = (
+        f"topic_automation_handlers_{return_topic_id}"
+        if return_topic_id is not None
+        else "automation_handlers"
+    )
     async with async_session_maker() as session:
         item = await _handler_with_relations(session, handler_id)
     if item is None:
         text = "Обработчик не найден."
-        markup = InlineKeyboardBuilder().row(_back("automation_handlers")).as_markup()
+        markup = InlineKeyboardBuilder().row(_back(back_callback)).as_markup()
     else:
         topic_names = [topic.name for topic in item.topics]
         if item.all_topics:
@@ -388,7 +436,7 @@ async def _show_handler(target, handler_id: int, *, edit: bool = True):
         builder.button(text=f"🔎 Условия ({len(item.conditions)})", callback_data=f"automation_conditions_{item.id}")
         builder.button(text=f"⚙️ Действия ({len(item.actions)})", callback_data=f"automation_actions_{item.id}")
         builder.button(text="🗑 Удалить", callback_data=f"automation_handler_delete_ask_{item.id}")
-        builder.row(_back("automation_handlers"))
+        builder.row(_back(back_callback))
         builder.adjust(1)
         markup = builder.as_markup()
         warning = "" if valid else "\n\n⚠️ Для включения выберите область, добавьте хотя бы одно условие и одно действие."
@@ -407,12 +455,12 @@ async def _show_handler(target, handler_id: int, *, edit: bool = True):
 
 
 @router.callback_query(F.data.regexp(r"^automation_handler_(\d+)$"))
-async def automation_handler_view(callback: CallbackQuery):
-    await _show_handler(callback.message, int(callback.data.rsplit("_", 1)[1]))
+async def automation_handler_view(callback: CallbackQuery, state: FSMContext | None = None):
+    await _show_handler(callback.message, int(callback.data.rsplit("_", 1)[1]), state=state)
 
 
 @router.callback_query(F.data.regexp(r"^automation_handler_toggle_(\d+)$"))
-async def automation_handler_toggle(callback: CallbackQuery):
+async def automation_handler_toggle(callback: CallbackQuery, state: FSMContext | None = None):
     handler_id = int(callback.data.rsplit("_", 1)[1])
     async with async_session_maker() as session:
         item = await _handler_with_relations(session, handler_id)
@@ -426,7 +474,7 @@ async def automation_handler_toggle(callback: CallbackQuery):
             return
         item.is_active = not item.is_active
         await session.commit()
-    await _show_handler(callback.message, handler_id)
+    await _show_handler(callback.message, handler_id, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^automation_handler_topics_(\d+)$"))
@@ -576,9 +624,10 @@ async def automation_condition_received(message: Message, state: FSMContext):
             sort_order=order,
         ))
         await session.commit()
-    await state.clear()
+    return_topic_id = data.get("automation_return_topic_id")
+    await _reset_navigation_context(state, "automation_return_topic_id", return_topic_id)
     await message.answer("✅ Условие добавлено. Оно объединено с остальными по AND.")
-    await _show_handler(message, data["handler_id"], edit=False)
+    await _show_handler(message, data["handler_id"], edit=False, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^automation_condition_delete_(\d+)_(\d+)$"))
@@ -680,9 +729,10 @@ async def automation_action_received(message: Message, state: FSMContext):
         ) or 0
         session.add(AutomationAction(sort_order=order, **values))
         await session.commit()
-    await state.clear()
+    return_topic_id = data.get("automation_return_topic_id")
+    await _reset_navigation_context(state, "automation_return_topic_id", return_topic_id)
     await message.answer("✅ Действие добавлено.")
-    await _show_handler(message, data["handler_id"], edit=False)
+    await _show_handler(message, data["handler_id"], edit=False, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^automation_action_delete_(\d+)_(\d+)$"))
@@ -710,14 +760,15 @@ async def automation_handler_delete_ask(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.regexp(r"^automation_handler_delete_yes_(\d+)$"))
-async def automation_handler_delete_yes(callback: CallbackQuery):
+async def automation_handler_delete_yes(callback: CallbackQuery, state: FSMContext | None = None):
     handler_id = int(callback.data.rsplit("_", 1)[1])
+    return_topic_id = await _navigation_topic_id(state, "automation_return_topic_id")
     async with async_session_maker() as session:
         item = await session.get(AutomationHandler, handler_id)
         if item:
             await session.delete(item)
             await session.commit()
-    await automation_handlers(callback)
+    await _show_automation_handlers(callback, state=state, topic_id=return_topic_id)
 
 
 async def _campaign_with_relations(session, campaign_id: int):
@@ -752,8 +803,7 @@ async def _show_followup_campaigns(
     state: FSMContext | None = None,
     topic_id: int | None = None,
 ):
-    if state is not None:
-        await state.clear()
+    await _reset_navigation_context(state, "followup_return_topic_id", topic_id)
     async with async_session_maker() as session:
         campaigns = (
             await session.execute(
@@ -873,12 +923,25 @@ async def followup_campaign_name_received(message: Message, state: FSMContext):
         await session.commit()
         await session.refresh(item)
         campaign_id = item.id
-    await state.clear()
+    return_topic_id = int(preset_topic_id) if preset_topic_id is not None else None
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Цепочка создана выключенной.")
-    await _show_campaign(message, campaign_id, edit=False)
+    await _show_campaign(message, campaign_id, edit=False, state=state)
 
 
-async def _show_campaign(target, campaign_id: int, *, edit: bool = True):
+async def _show_campaign(
+    target,
+    campaign_id: int,
+    *,
+    edit: bool = True,
+    state: FSMContext | None = None,
+):
+    return_topic_id = await _navigation_topic_id(state, "followup_return_topic_id")
+    back_callback = (
+        f"topic_followup_campaigns_{return_topic_id}"
+        if return_topic_id is not None
+        else "followup_campaigns"
+    )
     async with async_session_maker() as session:
         item = await _campaign_with_relations(session, campaign_id)
     if item is None:
@@ -897,7 +960,7 @@ async def _show_campaign(target, campaign_id: int, *, edit: bool = True):
     builder.button(text="🌙 Тихие часы", callback_data=f"followup_quiet_{item.id}")
     builder.button(text="🎲 Случайная задержка", callback_data=f"followup_jitter_{item.id}")
     builder.button(text="🗑 Удалить", callback_data=f"followup_delete_ask_{item.id}")
-    builder.row(_back("followup_campaigns"))
+    builder.row(_back(back_callback))
     builder.adjust(1)
     warning = "" if valid else "\n\n⚠️ Для включения выберите область и добавьте хотя бы один шаг."
     text = (
@@ -917,12 +980,12 @@ async def _show_campaign(target, campaign_id: int, *, edit: bool = True):
 
 
 @router.callback_query(F.data.regexp(r"^followup_campaign_(\d+)$"))
-async def followup_campaign_view(callback: CallbackQuery):
-    await _show_campaign(callback.message, int(callback.data.rsplit("_", 1)[1]))
+async def followup_campaign_view(callback: CallbackQuery, state: FSMContext | None = None):
+    await _show_campaign(callback.message, int(callback.data.rsplit("_", 1)[1]), state=state)
 
 
 @router.callback_query(F.data.regexp(r"^followup_toggle_(\d+)$"))
-async def followup_toggle(callback: CallbackQuery):
+async def followup_toggle(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
     async with async_session_maker() as session:
         item = await _campaign_with_relations(session, campaign_id)
@@ -933,7 +996,7 @@ async def followup_toggle(callback: CallbackQuery):
             return
         item.is_active = not item.is_active
         await session.commit()
-    await _show_campaign(callback.message, campaign_id)
+    await _show_campaign(callback.message, campaign_id, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^followup_topics_(\d+)$"))
@@ -1072,9 +1135,10 @@ async def followup_step_received(message: Message, state: FSMContext):
             values["message_text"] = body.strip()
         session.add(FollowupStep(**values))
         await session.commit()
-    await state.clear()
+    return_topic_id = data.get("followup_return_topic_id")
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Шаг добавлен.")
-    await _show_campaign(message, data["campaign_id"], edit=False)
+    await _show_campaign(message, data["campaign_id"], edit=False, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^followup_step_delete_(\d+)_(\d+)$"))
@@ -1136,9 +1200,10 @@ async def followup_quiet_received(message: Message, state: FSMContext):
         item.quiet_end_minute = eh * 60 + em
         item.timezone = match.group(5)
         await session.commit()
-    await state.clear()
+    return_topic_id = data.get("followup_return_topic_id")
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Тихие часы сохранены.")
-    await _show_campaign(message, data["campaign_id"], edit=False)
+    await _show_campaign(message, data["campaign_id"], edit=False, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^followup_jitter_(\d+)$"))
@@ -1170,9 +1235,10 @@ async def followup_jitter_received(message: Message, state: FSMContext):
         item.jitter_min_seconds = low
         item.jitter_max_seconds = high
         await session.commit()
-    await state.clear()
+    return_topic_id = data.get("followup_return_topic_id")
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Случайная задержка сохранена.")
-    await _show_campaign(message, data["campaign_id"], edit=False)
+    await _show_campaign(message, data["campaign_id"], edit=False, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^followup_delete_ask_(\d+)$"))
@@ -1188,11 +1254,12 @@ async def followup_delete_ask(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.regexp(r"^followup_delete_yes_(\d+)$"))
-async def followup_delete_yes(callback: CallbackQuery):
+async def followup_delete_yes(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
+    return_topic_id = await _navigation_topic_id(state, "followup_return_topic_id")
     async with async_session_maker() as session:
         item = await session.get(FollowupCampaign, campaign_id)
         if item:
             await session.delete(item)
             await session.commit()
-    await followup_campaigns(callback)
+    await _show_followup_campaigns(callback, state=state, topic_id=return_topic_id)

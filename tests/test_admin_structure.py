@@ -33,6 +33,20 @@ def callback_values(markup):
     }
 
 
+class MemoryState:
+    def __init__(self):
+        self.data = {}
+
+    async def clear(self):
+        self.data.clear()
+
+    async def update_data(self, **values):
+        self.data.update(values)
+
+    async def get_data(self):
+        return dict(self.data)
+
+
 class AdminStructureTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -116,6 +130,7 @@ class AdminStructureTests(unittest.IsolatedAsyncioTestCase):
         state = SimpleNamespace(
             get_data=AsyncMock(return_value={"preset_topic_id": 7}),
             clear=AsyncMock(),
+            update_data=AsyncMock(),
         )
         message = SimpleNamespace(text="Лид готов", answer=AsyncMock())
 
@@ -193,6 +208,7 @@ class AdminStructureTests(unittest.IsolatedAsyncioTestCase):
         state = SimpleNamespace(
             get_data=AsyncMock(return_value={"preset_topic_id": 8}),
             clear=AsyncMock(),
+            update_data=AsyncMock(),
         )
         message = SimpleNamespace(text="Вернуть к упражнению", answer=AsyncMock())
 
@@ -291,3 +307,80 @@ class AdminStructureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SELF_STEP", text)
         self.assertNotIn("ANXIETY_STEP", text)
         self.assertIn("edit_topic_1", callback_values(markup))
+
+    async def test_global_statistics_return_to_automations_after_rendering_topic_rows(self):
+        async with self.sessions() as session:
+            session.add_all([
+                User(id=42, first_name="Иван"),
+                Topic(id=1, name="Самооценка", is_active=True),
+                AutomationStepTransition(
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=1,
+                    current_step="SELF_STEP",
+                    state_json="{}",
+                ),
+                AutomationConversationState(
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=1,
+                    current_step="SELF_STEP",
+                    current_state_json="{}",
+                ),
+            ])
+            await session.commit()
+        message = SimpleNamespace(edit_text=AsyncMock())
+        callback = SimpleNamespace(message=message)
+
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin._show_automation_stage_stats(callback)
+
+        text = message.edit_text.await_args.args[0]
+        callbacks = callback_values(message.edit_text.await_args.kwargs["reply_markup"])
+        self.assertIn("👥 Вошли:", text)
+        self.assertIn("🔁 Переходы:", text)
+        self.assertIn("📍 Сейчас:", text)
+        self.assertIn("automation_menu", callbacks)
+        self.assertNotIn("edit_topic_1", callbacks)
+
+    async def test_handler_card_returns_to_topic_handler_list(self):
+        async with self.sessions() as session:
+            topic = Topic(id=1, name="Самооценка", is_active=True)
+            item = AutomationHandler(name="Только тема", topics=[topic])
+            session.add(item)
+            await session.commit()
+            handler_id = item.id
+        state = MemoryState()
+        list_message = SimpleNamespace(edit_text=AsyncMock())
+        card_message = SimpleNamespace(edit_text=AsyncMock())
+
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin._show_automation_handlers(
+                SimpleNamespace(message=list_message), state=state, topic_id=1
+            )
+            await automation_admin._show_handler(card_message, handler_id, state=state)
+
+        callbacks = callback_values(card_message.edit_text.await_args.kwargs["reply_markup"])
+        self.assertIn("topic_automation_handlers_1", callbacks)
+        self.assertNotIn("automation_handlers", callbacks)
+
+    async def test_followup_card_returns_to_topic_campaign_list(self):
+        async with self.sessions() as session:
+            topic = Topic(id=1, name="Самооценка", is_active=True)
+            item = FollowupCampaign(name="Только тема", topics=[topic])
+            session.add(item)
+            await session.commit()
+            campaign_id = item.id
+        state = MemoryState()
+        list_message = SimpleNamespace(edit_text=AsyncMock())
+        card_message = SimpleNamespace(edit_text=AsyncMock())
+
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin._show_followup_campaigns(
+                SimpleNamespace(message=list_message), state=state, topic_id=1
+            )
+            await automation_admin._show_campaign(card_message, campaign_id, state=state)
+
+        callbacks = callback_values(card_message.edit_text.await_args.kwargs["reply_markup"])
+        self.assertIn("topic_followup_campaigns_1", callbacks)
+        self.assertNotIn("followup_campaigns", callbacks)
