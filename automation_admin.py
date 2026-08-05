@@ -134,23 +134,49 @@ async def automation_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "automation_data_help")
 async def automation_data_help(callback: CallbackQuery):
     example = html.escape(
+        'Ответ 1 — бот спрашивает об увлечениях:\n'
         '<DATA>\n'
         '{\n'
         '  "current_state": {"current_step": "STAGE_1_HOBBY"},\n'
+        '  "events": [],\n'
+        '  "metadata": {}\n'
+        '}\n'
+        '</DATA>\n\n'
+        'Ответ 2 — увлечение получено, бот спрашивает о цели:\n'
+        '<DATA>\n'
+        '{\n'
+        '  "current_state": {"current_step": "STAGE_2_GOAL"},\n'
         '  "events": ["HOBBY_RECEIVED"],\n'
-        '  "save_mode": "merge",\n'
         '  "metadata": {"interests": ["играть в компьютер"]}\n'
+        '}\n'
+        '</DATA>\n\n'
+        'Ответ 3 — цель получена, бот готовит результат:\n'
+        '<DATA>\n'
+        '{\n'
+        '  "current_state": {"current_step": "STAGE_3_RESULT"},\n'
+        '  "events": ["GOAL_RECEIVED"],\n'
+        '  "metadata": {"goal": "найти новое увлечение"}\n'
+        '}\n'
+        '</DATA>\n\n'
+        'Ответ 4 — результат готов:\n'
+        '<DATA>\n'
+        '{\n'
+        '  "current_state": {"current_step": "STAGE_4_COMPLETED"},\n'
+        '  "events": ["RESULT_READY"],\n'
+        '  "metadata": {"result": "подобран план занятий"}\n'
         '}\n'
         '</DATA>'
     )
     await callback.message.edit_text(
         "📋 <b>Единый формат DATA</b>\n\n"
+        "Ниже четыре отдельных ответа модели. В каждом ответе должен быть только один блок <code>&lt;DATA&gt;</code>.\n\n"
         f"<pre>{example}</pre>\n\n"
         "Блок ставится один раз в конце ответа модели и пользователю не показывается.\n"
         "• <code>current_state.current_step</code> — текущий этап алгоритма; смена этапа попадает в статистику.\n"
         "• <code>events</code> — одноразовые сигналы для обработчиков.\n"
         "• <code>metadata</code> — данные текущего диалога и темы.\n"
-        "• <code>merge</code> дополняет текущие данные, <code>snapshot</code> сохраняет отдельный снимок.\n\n"
+        "• Метаданные по умолчанию дополняют уже сохранённые данные.\n"
+        "• <code>save_mode: snapshot</code> указывается только когда нужен отдельный снимок.\n\n"
         "Старый <code>[DATA]</code> читается для совместимости, но новые промпты следует писать только в этом формате.",
         reply_markup=InlineKeyboardBuilder().row(_back("automation_menu")).as_markup(),
     )
