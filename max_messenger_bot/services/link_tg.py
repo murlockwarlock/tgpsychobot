@@ -9,6 +9,7 @@ from ..legacy import User, UserSubscription, async_session_maker
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 from ..time_utils import utc_now
+from .subscription_access import is_active_subscription
 
 
 async def show_link_tg_prompt(client: MaxApiClient, chat_id: int, user_id: int) -> None:
@@ -97,46 +98,19 @@ async def process_tg_link(
         max_user.tg_user_id = tg_id
 
         now = utc_now()
-        tg_has_sub = (
-            tg_user.subscription
-            and tg_user.subscription.end_date
-            and tg_user.subscription.end_date > now
-        )
-        max_has_sub = (
-            max_user.subscription
-            and max_user.subscription.end_date
-            and max_user.subscription.end_date > now
-        )
+        tg_has_sub = is_active_subscription(tg_user.subscription, now)
+        max_has_sub = is_active_subscription(max_user.subscription, now)
 
         subscription_msg = ""
-        if tg_has_sub and not max_has_sub:
-            if max_user.subscription:
-                max_user.subscription.plan_id = tg_user.subscription.plan_id
-                max_user.subscription.start_date = now
-                max_user.subscription.end_date = tg_user.subscription.end_date
-                max_user.subscription.auto_renewal = False
-                max_user.subscription.payment_provider = "Telegram Link"
-                max_user.subscription.payment_method_id = None
-                max_user.subscription.pending_robokassa_invoice_id = None
-                max_user.subscription.last_payment_attempt = None
-                max_user.subscription.payment_attempt_count = 0
-            else:
-                session.add(
-                    UserSubscription(
-                        user_id=user_id,
-                        plan_id=tg_user.subscription.plan_id,
-                        start_date=now,
-                        end_date=tg_user.subscription.end_date,
-                        auto_renewal=False,
-                        payment_provider="Telegram Link",
-                        payment_attempt_count=0,
-                    )
-                )
+        if tg_has_sub:
             plan_name = tg_user.subscription.plan.name if tg_user.subscription.plan else "подписка"
-            subscription_msg = f"\n\n✅ Ваша подписка <b>{plan_name}</b> активирована в MAX!"
-        elif tg_has_sub and max_has_sub:
-            subscription_msg = "\n\nℹ️ У вас уже есть активная подписка в MAX."
-        elif not tg_has_sub:
+            subscription_msg = (
+                f"\n\n✅ Подписка <b>{plan_name}</b> из Telegram активна в MAX "
+                "и будет синхронизироваться автоматически."
+            )
+        elif max_has_sub:
+            subscription_msg = "\n\nℹ️ В MAX продолжает действовать собственная подписка."
+        else:
             subscription_msg = "\n\nℹ️ В Telegram боте нет активной подписки. Вы можете оформить её здесь."
 
         await session.commit()

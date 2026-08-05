@@ -30,6 +30,7 @@ from ..legacy import (
 )
 from ..storage import StateStore
 from ..time_utils import format_msk, utc_now
+from .subscription_access import load_active_subscription
 
 
 log = get_payments_logger("subscriptions")
@@ -79,6 +80,8 @@ async def show_subscription_info(client: MaxApiClient, chat_id: int, user_id: in
         return
 
     now = utc_now()
+    async with async_session_maker() as session:
+        active_subscription = await load_active_subscription(session, user_id, now)
     referral_enabled = bool(config and config.referral_enabled)
     referral_btn_name = config.referral_sub_btn_name if config else "🤝 Реферальная программа"
     tg_link_line = (
@@ -89,8 +92,9 @@ async def show_subscription_info(client: MaxApiClient, chat_id: int, user_id: in
 
     text = "У вас нет активной подписки.\n\nОформите её, чтобы получить доступ ко всем возможностям бота."
     sub_info = None
-    if user.subscription and user.subscription.end_date > now:
-        sub = user.subscription
+    if active_subscription:
+        sub = active_subscription.subscription
+        source_line = "\n<b>Источник:</b> привязанный Telegram" if active_subscription.source == "telegram" else ""
         if sub.plan_id and sub.plan:
             plan = sub.plan
             unit = "дн." if plan.duration_unit == "days" else "мес."
@@ -101,13 +105,18 @@ async def show_subscription_info(client: MaxApiClient, chat_id: int, user_id: in
                 "<b>⭐️ Ваша подписка активна</b>\n\n"
                 f"<b>Тариф:</b> {plan.name} ({plan.duration_value} {unit})\n"
                 f"<b>Действует до:</b> {format_msk(sub.end_date)} МСК"
+                f"{source_line}"
                 f"{renewal_line}"
             )
-            sub_info = {"auto_renewal": sub.auto_renewal, "allow_auto_renewal": getattr(plan, "allow_auto_renewal", True)}
+            sub_info = None if active_subscription.source == "telegram" else {
+                "auto_renewal": sub.auto_renewal,
+                "allow_auto_renewal": getattr(plan, "allow_auto_renewal", True),
+            }
         else:
             text = (
                 "<b>🎁 У вас активен бонусный доступ</b>\n\n"
                 f"Действует до: {format_msk(sub.end_date)} МСК"
+                f"{source_line}"
             )
     elif user.subscription and user.subscription.end_date <= now and user.subscription.auto_renewal and user.subscription.payment_method_id:
         text = (

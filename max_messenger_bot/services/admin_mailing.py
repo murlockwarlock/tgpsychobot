@@ -21,6 +21,7 @@ from ..legacy import Mailing, Message as DBMessage, User, UserSubscription, asyn
 from ..models import MAX_ID_OFFSET, REUSABLE_ATTACHMENT_TYPES, IncomingMessage, parse_message
 from ..storage import StateStore
 from ..time_utils import utc_now
+from .subscription_access import effective_subscription_filters
 
 
 PAGE_SIZE = 10
@@ -302,21 +303,13 @@ async def _get_recipient_ids(session, audience: str, user_id: int) -> list[int]:
         return list((await session.execute(stmt.where(not_(exists(subquery))))).scalars().all())
 
     now = utc_now()
+    access_filters = effective_subscription_filters(User, now)
 
     if audience == "active_subscription":
-        subquery = select(UserSubscription.id).where(UserSubscription.user_id == User.id, UserSubscription.end_date > now)
-        return list((await session.execute(stmt.where(exists(subquery)))).scalars().all())
+        return list((await session.execute(stmt.where(access_filters.active))).scalars().all())
 
     if audience == "inactive_subscription":
-        active_subquery = select(UserSubscription.id).where(UserSubscription.user_id == User.id, UserSubscription.end_date > now)
-        any_subquery = select(UserSubscription.id).where(UserSubscription.user_id == User.id)
-        return list(
-            (
-                await session.execute(
-                    stmt.where(or_(not_(exists(any_subquery)), not_(exists(active_subquery))))
-                )
-            ).scalars().all()
-        )
+        return list((await session.execute(stmt.where(not_(access_filters.active)))).scalars().all())
 
     return []
 

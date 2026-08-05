@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
@@ -21,6 +21,8 @@ from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 from ..time_utils import format_msk
 from result_history import TEST_RESULT_ROLE
+from client_search import normalize_client_search_query
+from .subscription_access import load_active_subscription
 
 
 PAGE_SIZE = 10
@@ -64,6 +66,7 @@ async def list_clients(client: MaxApiClient, chat_id: int, page: int = 0) -> Non
 async def show_client_profile(client: MaxApiClient, chat_id: int, target_user_id: int) -> None:
     async with async_session_maker() as session:
         user = await session.get(User, target_user_id, options=[selectinload(User.subscription).selectinload(UserSubscription.plan)])
+        active_subscription = await load_active_subscription(session, target_user_id) if user else None
     if user and user.id < MAX_ID_OFFSET:
         user = None
     if not user:
@@ -71,11 +74,13 @@ async def show_client_profile(client: MaxApiClient, chat_id: int, target_user_id
         return
 
     subscription_line = "нет"
-    if user.subscription:
-        if user.subscription.plan:
-            subscription_line = user.subscription.plan.name
-        elif user.subscription.end_date:
-            subscription_line = f"бонус до {user.subscription.end_date.strftime('%d.%m.%Y %H:%M')}"
+    if active_subscription:
+        sub = active_subscription.subscription
+        source = " (из Telegram)" if active_subscription.source == "telegram" else ""
+        if sub.plan:
+            subscription_line = f"{sub.plan.name}{source}, до {format_msk(sub.end_date)} МСК"
+        else:
+            subscription_line = f"бонус{source} до {format_msk(sub.end_date)} МСК"
 
     text = (
         "<b>Профиль клиента</b>\n\n"
@@ -146,26 +151,39 @@ async def start_search(client: MaxApiClient, states: StateStore, chat_id: int, u
 
 async def search_clients(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, query: str) -> None:
     await states.clear(user_id)
-    query = query.strip()
+    query = normalize_client_search_query(query)
     if not query:
         await list_clients(client, chat_id, 0)
         return
 
     query_lower = query.lower()
     async with async_session_maker() as session:
+        telegram_user = aliased(User)
         is_id_query = query.lstrip("-").isdigit()
         if is_id_query:
-            stmt = select(User).where(User.id >= MAX_ID_OFFSET, User.id == int(query)).limit(20)
+            numeric_query = int(query)
+            stmt = select(User).where(
+                User.id >= MAX_ID_OFFSET,
+                or_(
+                    User.id == numeric_query,
+                    User.id == numeric_query + MAX_ID_OFFSET,
+                    User.tg_user_id == numeric_query,
+                ),
+            ).limit(20)
         else:
             pattern = f"%{query_lower}%"
             stmt = (
                 select(User)
+                .outerjoin(telegram_user, User.tg_user_id == telegram_user.id)
                 .where(
                     User.id >= MAX_ID_OFFSET,
                     or_(
                         func.lower(User.first_name).like(pattern),
                         func.lower(User.name).like(pattern),
                         func.lower(User.username).like(pattern),
+                        func.lower(telegram_user.first_name).like(pattern),
+                        func.lower(telegram_user.name).like(pattern),
+                        func.lower(telegram_user.username).like(pattern),
                     )
                 )
                 .order_by(User.created_at.desc())
@@ -181,10 +199,23 @@ async def search_clients(client: MaxApiClient, states: StateStore, chat_id: int,
         )
         return
 
+    linked_tg_ids = [client.tg_user_id for client in clients if client.tg_user_id is not None]
+    linked_tg_usernames = {}
+    if linked_tg_ids:
+        async with async_session_maker() as session:
+            linked_tg_usernames = dict(
+                (
+                    await session.execute(
+                        select(User.id, User.username).where(User.id.in_(linked_tg_ids))
+                    )
+                ).all()
+            )
+
     rows = []
     for c in clients:
         name = c.name or c.first_name or str(c.id)
-        username = f"@{c.username}" if c.username else "без username"
+        username_value = c.username or linked_tg_usernames.get(c.tg_user_id)
+        username = f"@{username_value}" if username_value else "без username"
         rows.append([callback_button(f"{name} ({username})", f"view_client_{c.id}")])
     rows.append([callback_button("⬅️ К клиентам", "admin_clients")])
     text = f"🔍 Результаты поиска <b>{html.escape(query)}</b>: найдено {len(clients)} клиент(ов)"

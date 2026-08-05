@@ -28,6 +28,7 @@ from ..legacy import (
 )
 from ..storage import MaxContentMedia, StateStore
 from ..time_utils import utc_now
+from .subscription_access import load_active_subscription
 from memory_mode import normalize_memory_mode, start_new_dialogue
 from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
 from telegram_client import create_telegram_bot
@@ -373,7 +374,9 @@ async def ensure_access_before_chat(client: MaxApiClient, chat_id: int, user: Us
     if await is_admin(user.id):
         return True
     if config and config.subscriptions_enabled:
-        if not user.subscription or user.subscription.end_date < utc_now():
+        async with async_session_maker() as session:
+            active_subscription = await load_active_subscription(session, user.id)
+        if not active_subscription:
             await client.send_message(
                 chat_id=chat_id,
                 text="Чтобы продолжить диалог, активируйте подписку или бонусные дни.",

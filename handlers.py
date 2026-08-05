@@ -12,6 +12,7 @@ import zipfile
 from types import SimpleNamespace
 import ai_integration
 import keyboards
+from client_search import normalize_client_search_query
 from database import TestSession, TestAttempt, TestQuestion, TestConfig, BotGeneralConfig, SecretTestQuestion, CaseStudy
 from aiogram import Router, F, Bot
 from pydantic import ValidationError
@@ -2877,7 +2878,7 @@ async def start_client_search(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.search_client, F.text)
 async def process_client_search(message: Message, state: FSMContext, bot: Bot):
-    query = message.text.strip()
+    query = normalize_client_search_query(message.text)
     await state.update_data(client_search_query=query)
 
     data = await state.get_data()

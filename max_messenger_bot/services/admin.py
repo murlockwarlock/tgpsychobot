@@ -8,6 +8,7 @@ from ..api import MaxApiClient
 from ..keyboards import admin_panel_keyboard, admin_subscriptions_keyboard, callback_button, inline_keyboard
 from ..legacy import Message as DBMessage, PromoCode, ReferralPaymentLog, SubscriptionConfig, SubscriptionPlan, Topic, User, UserSubscription, async_session_maker
 from ..models import MAX_ID_OFFSET
+from .subscription_access import effective_subscription_filters
 
 
 async def show_admin_panel(client: MaxApiClient, chat_id: int) -> None:
@@ -63,25 +64,15 @@ async def show_stats(client: MaxApiClient, chat_id: int) -> None:
         total_messages = await session.scalar(
             select(func.count()).select_from(DBMessage).where(DBMessage.user_id >= MAX_ID_OFFSET)
         ) or 0
+        access_filters = effective_subscription_filters(User, now)
         active_subs = await session.scalar(
-            select(func.count()).select_from(UserSubscription).where(
-                UserSubscription.user_id >= MAX_ID_OFFSET,
-                UserSubscription.end_date > now,
-            )
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET, access_filters.active)
         ) or 0
         active_paid_subs = await session.scalar(
-            select(func.count()).select_from(UserSubscription).where(
-                UserSubscription.user_id >= MAX_ID_OFFSET,
-                UserSubscription.end_date > now,
-                UserSubscription.plan_id.is_not(None),
-            )
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET, access_filters.paid)
         ) or 0
         active_bonus_subs = await session.scalar(
-            select(func.count()).select_from(UserSubscription).where(
-                UserSubscription.user_id >= MAX_ID_OFFSET,
-                UserSubscription.end_date > now,
-                UserSubscription.plan_id.is_(None),
-            )
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET, access_filters.bonus)
         ) or 0
 
     text = _build_stats_text(
@@ -104,10 +95,9 @@ async def show_stats(client: MaxApiClient, chat_id: int) -> None:
 async def show_subscriptions_summary(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
+        access_filters = effective_subscription_filters(User, datetime.utcnow())
         active_subs = await session.scalar(
-            select(func.count()).select_from(UserSubscription).where(
-                UserSubscription.end_date > func.now(), UserSubscription.user_id >= MAX_ID_OFFSET
-            )
+            select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET, access_filters.active)
         ) or 0
         total_subs = await session.scalar(
             select(func.count()).select_from(UserSubscription).where(UserSubscription.user_id >= MAX_ID_OFFSET)
