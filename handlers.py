@@ -5368,7 +5368,9 @@ async def view_client_merged_metadata(callback: CallbackQuery):
         st = states[page]
         cur_step = st.current_step or "не задан"
         topic_info = f", Топик #{st.topic_id}" if st.topic_id else ""
-        diag_info = f"Диалог #{st.dialogue_id}{topic_info}"
+        dt_val = st.updated_at or st.created_at
+        dt_str = format_msk(dt_val, "%d-%m-%Y %H:%M МСК") if dt_val else "время неизвестно"
+        diag_info = f"Диалог #{st.dialogue_id} ({dt_str}){topic_info}"
 
         try:
             meta_obj = json.loads(st.metadata_json or "{}")
@@ -5448,7 +5450,9 @@ async def run_client_metadata_export(callback: CallbackQuery):
 
         if mode == "merged":
             res = await session.execute(
-                select(AutomationConversationState).where(AutomationConversationState.user_id == client_id)
+                select(AutomationConversationState)
+                .where(AutomationConversationState.user_id == client_id)
+                .order_by(AutomationConversationState.dialogue_id.desc())
             )
             states = res.scalars().all()
             merged_states = []
@@ -5462,10 +5466,12 @@ async def run_client_metadata_export(callback: CallbackQuery):
                 except Exception:
                     state_obj = st.current_state_json
 
+                dt_val = st.updated_at or st.created_at
                 merged_states.append({
                     "dialogue_id": st.dialogue_id,
                     "topic_id": st.topic_id,
                     "current_step": st.current_step,
+                    "updated_at": format_msk(dt_val, "%Y-%m-%dT%H:%M:%S+03:00") if dt_val else None,
                     "current_state": state_obj,
                     "merged_metadata": meta_obj,
                 })
