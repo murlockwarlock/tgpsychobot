@@ -14337,6 +14337,124 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
     )
 
 
+@router.callback_query(F.data == "admin_export_all_confirm")
+async def admin_export_all_confirm(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(export_all=True, export_date_from=None, export_date_to=None)
+    data = await state.get_data()
+    export_kind = data.get("export_kind", "history")
+    if export_kind == "metadata":
+        await callback.message.edit_text(
+            "🧩 Выберите формат выгрузки метаданных для ВСЕХ пользователей:",
+            reply_markup=kb.mass_export_options_keyboard(export_kind="metadata"),
+        )
+        return
+    await callback.message.edit_text(
+        "📅 Фильтр по датам для ВСЕХ пользователей:\n\nВыберите диапазон сообщений для экспорта:",
+        reply_markup=kb.export_date_filter_keyboard()
+    )
+
+
+@router.callback_query(F.data == "admin_export_confirm_options")
+async def admin_export_confirm_options(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected_ids = data.get("selected_export_ids", [])
+    if not selected_ids:
+        await callback.answer("Вы не выбрали ни одного клиента!", show_alert=True)
+        return
+    await state.update_data(export_all=False, export_date_from=None, export_date_to=None)
+    export_kind = data.get("export_kind", "history")
+    if export_kind == "metadata":
+        await callback.message.edit_text(
+            f"🧩 Выберите формат выгрузки метаданных для {len(selected_ids)} пользователей:",
+            reply_markup=kb.mass_export_options_keyboard(export_kind="metadata"),
+        )
+        return
+    await callback.message.edit_text(
+        f"📅 Фильтр по датам для {len(selected_ids)} пользователей:\n\nВыберите диапазон сообщений для экспорта:",
+        reply_markup=kb.export_date_filter_keyboard()
+    )
+
+
+@router.callback_query(F.data.startswith("export_date_preset_"))
+async def export_date_preset(callback: CallbackQuery, state: FSMContext):
+    days = int(callback.data.split("_")[-1])
+    if days == 0:
+        await state.update_data(export_date_from=None, export_date_to=None)
+        date_label = "без фильтра (все даты)"
+    else:
+        date_from = (datetime.now() - timedelta(days=days)).strftime("%d-%m-%Y")
+        await state.update_data(export_date_from=date_from, export_date_to=None)
+        date_label = f"за последние {days} дней (с {date_from})"
+
+    data = await state.get_data()
+    export_all = data.get("export_all", False)
+    selected_ids = data.get("selected_export_ids", [])
+    target = "ВСЕХ пользователей" if export_all else f"{len(selected_ids)} пользователей"
+
+    await callback.message.edit_text(
+        f"✅ Фильтр дат: {date_label}\n\nВыберите формат экспорта для {target}:",
+        reply_markup=kb.mass_export_options_keyboard(export_kind=data.get("export_kind", "history"))
+    )
+
+
+@router.callback_query(F.data == "export_date_manual")
+async def export_date_manual(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.export_date_from)
+    await callback.message.edit_text(
+        "✏️ Введите дату начала в формате <b>ДД-ММ-ГГГГ</b>\n"
+        "Пример: <code>01-09-2025</code>\n\n"
+        "Или отправьте <code>0</code> чтобы не ограничивать начало."
+    )
+
+
+@router.message(AdminStates.export_date_from)
+async def export_date_from_input(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if text == "0":
+        await state.update_data(export_date_from=None)
+    else:
+        try:
+            datetime.strptime(text, "%d-%m-%Y")
+            await state.update_data(export_date_from=text)
+        except ValueError:
+            await message.answer("❌ Неверный формат. Введите дату как <code>ДД-ММ-ГГГГ</code>, например <code>01-09-2025</code>")
+            return
+
+    await state.set_state(AdminStates.export_date_to)
+    await message.answer(
+        "✏️ Теперь введите дату окончания в формате <b>ДД-ММ-ГГГГ</b>\n"
+        "Пример: <code>31-12-2025</code>\n\n"
+        "Или отправьте <code>0</code> чтобы не ограничивать конец (до сегодня)."
+    )
+
+
+@router.message(AdminStates.export_date_to)
+async def export_date_to_input(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if text == "0":
+        await state.update_data(export_date_to=None)
+    else:
+        try:
+            datetime.strptime(text, "%d-%m-%Y")
+            await state.update_data(export_date_to=text)
+        except ValueError:
+            await message.answer("❌ Неверный формат. Введите дату как <code>31-12-2025</code>")
+            return
+
+    await state.set_state(AdminStates.selecting_for_export)
+    data = await state.get_data()
+    date_from = data.get("export_date_from", "начала")
+    date_to = data.get("export_date_to", "сегодня")
+    export_all = data.get("export_all", False)
+    selected_ids = data.get("selected_export_ids", [])
+    target = "ВСЕХ пользователей" if export_all else f"{len(selected_ids)} пользователей"
+
+    await message.answer(
+        f"✅ Фильтр дат: с <b>{date_from}</b> по <b>{date_to}</b>\n\nВыберите формат экспорта для {target}:",
+        reply_markup=kb.mass_export_options_keyboard(export_kind=data.get("export_kind", "history"))
+    )
+
+
 @router.callback_query(F.data == "reset_topic_to_main")
 async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear()
