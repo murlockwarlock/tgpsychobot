@@ -377,7 +377,7 @@ def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view
     builder.button(text="💳 Платежная инфо", callback_data=f"client_payment_info_{user_id}")
     builder.button(text="📜 История диалога", callback_data=f"client_history_{user_id}")
     builder.button(text="📥 Скачать историю", callback_data=f"download_history_{user_id}")
-    builder.button(text="✨ Итоговые метаданные (Merged)", callback_data=f"client_merged_metadata_{user_id}")
+    builder.button(text="✨ Итоговые метаданные (Merged)", callback_data=f"client_merged_metadata_{user_id}_0")
     builder.button(text="📜 История метаданных (Лог)", callback_data=f"client_metadata_{user_id}_0")
     builder.button(text="📥 Скачать метаданные", callback_data=f"download_metadata_{user_id}")
     builder.button(text="🧪 Результаты тестов", callback_data=f"client_test_attempts_{user_id}_0")

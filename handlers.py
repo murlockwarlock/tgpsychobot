@@ -5335,7 +5335,10 @@ async def view_client_merged_metadata(callback: CallbackQuery):
         await callback.answer("У вас нет прав на просмотр метаданных.", show_alert=True)
         return
 
-    client_id = int(callback.data.split("_")[-1])
+    parts = callback.data.split("_")
+    client_id = int(parts[3])
+    page = int(parts[4]) if len(parts) > 4 else 0
+
     async with async_session_maker() as session:
         user = await session.get(User, client_id)
         if not user:
@@ -5343,11 +5346,14 @@ async def view_client_merged_metadata(callback: CallbackQuery):
             return
 
         res = await session.execute(
-            select(AutomationConversationState).where(AutomationConversationState.user_id == client_id)
+            select(AutomationConversationState)
+            .where(AutomationConversationState.user_id == client_id)
+            .order_by(AutomationConversationState.dialogue_id.desc())
         )
         states = res.scalars().all()
 
     display_name = html.escape(user.name or user.first_name or str(user.id))
+    total_states = len(states)
 
     if not states:
         text = (
@@ -5355,33 +5361,47 @@ async def view_client_merged_metadata(callback: CallbackQuery):
             f"ID: <code>{client_id}</code>\n\n"
             f"<i>Текущих активных слитных метаданных в БД пока нет.</i>"
         )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")
     else:
-        text = f"✨ <b>Итоговые слитные метаданные:</b> {display_name} (ID: <code>{client_id}</code>)\n\n"
-        for st in states:
-            cur_step = st.current_step or "не задан"
-            topic_info = f", Топик #{st.topic_id}" if st.topic_id else ""
-            diag_info = f"Диалог #{st.dialogue_id}{topic_info}"
+        page = max(0, min(page, total_states - 1))
+        st = states[page]
+        cur_step = st.current_step or "не задан"
+        topic_info = f", Топик #{st.topic_id}" if st.topic_id else ""
+        diag_info = f"Диалог #{st.dialogue_id}{topic_info}"
 
-            try:
-                meta_obj = json.loads(st.metadata_json or "{}")
-                meta_rendered = json.dumps(meta_obj, ensure_ascii=False, indent=2)
-            except Exception:
-                meta_rendered = st.metadata_json or "{}"
+        try:
+            meta_obj = json.loads(st.metadata_json or "{}")
+            meta_rendered = json.dumps(meta_obj, ensure_ascii=False, indent=2)
+        except Exception:
+            meta_rendered = st.metadata_json or "{}"
 
-            if len(meta_rendered) > 2500:
-                meta_rendered = meta_rendered[:2500] + "\n... (полный текст доступен при скачивании .json)"
+        if len(meta_rendered) > 2800:
+            meta_rendered = meta_rendered[:2800] + "\n... (полный текст доступен при скачивании .json)"
 
-            text += (
-                f"📍 <b>{diag_info}</b>\n"
-                f"▫️ <b>Текущий шаг (step):</b> <code>{html.escape(str(cur_step))}</code>\n"
-                f"▫️ <b>Слитные метаданные (Merged):</b>\n"
-                f"<code>{html.escape(meta_rendered)}</code>\n\n"
-            )
+        page_hdr = f" (Диалог {page + 1} из {total_states})" if total_states > 1 else ""
+        text = (
+            f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
+            f"ID: <code>{client_id}</code>\n\n"
+            f"📍 <b>{diag_info}</b>\n"
+            f"▫️ <b>Текущий шаг (step):</b> <code>{html.escape(str(cur_step))}</code>\n"
+            f"▫️ <b>Слитные метаданные (Merged):</b>\n"
+            f"<code>{html.escape(meta_rendered)}</code>"
+        )
 
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📥 Скачать этот .json", callback_data=f"run_metadata_export_merged_{client_id}")
-    builder.button(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")
-    builder.adjust(1)
+        builder = InlineKeyboardBuilder()
+        if total_states > 1:
+            nav_buttons = []
+            if page > 0:
+                nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"client_merged_metadata_{client_id}_{page - 1}"))
+            nav_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_states}", callback_data="noop"))
+            if page < total_states - 1:
+                nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"client_merged_metadata_{client_id}_{page + 1}"))
+            builder.row(*nav_buttons)
+
+        builder.row(InlineKeyboardButton(text="📥 Скачать все диалоги (.json)", callback_data=f"run_metadata_export_merged_{client_id}"))
+        builder.row(InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}"))
+
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
     await callback.answer()
 
