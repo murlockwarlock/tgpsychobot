@@ -94,6 +94,7 @@ def admin_panel_keyboard():
     builder.button(text="🧩 Управление Тестом", callback_data="admin_test_menu")
     builder.button(text="⚙️ Автоматизации", callback_data="automation_menu")
     builder.button(text="🤖 Настройки ИИ", callback_data="admin_ai_settings")
+    builder.button(text="📜 Логи ИИ", callback_data="admin_ai_logs_0")
     builder.button(text="⭐️ Подписки", callback_data="admin_subscriptions")
     builder.button(text="📚 База знаний", callback_data="admin_kb_page_0")
     builder.button(text="🎨 Медиа-коллекции", callback_data="admin_collections_page_0")
@@ -376,7 +377,8 @@ def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view
     builder.button(text="💳 Платежная инфо", callback_data=f"client_payment_info_{user_id}")
     builder.button(text="📜 История диалога", callback_data=f"client_history_{user_id}")
     builder.button(text="📥 Скачать историю", callback_data=f"download_history_{user_id}")
-    builder.button(text="🧩 Метаданные", callback_data=f"client_metadata_{user_id}_0")
+    builder.button(text="✨ Итоговые метаданные (Merged)", callback_data=f"client_merged_metadata_{user_id}")
+    builder.button(text="📜 История метаданных (Лог)", callback_data=f"client_metadata_{user_id}_0")
     builder.button(text="📥 Скачать метаданные", callback_data=f"download_metadata_{user_id}")
     builder.button(text="🧪 Результаты тестов", callback_data=f"client_test_attempts_{user_id}_0")
     builder.button(text="📥 Скачать результаты тестов", callback_data=f"download_test_attempts_{user_id}")
@@ -1350,8 +1352,9 @@ def single_export_options_keyboard(user_id: int):
 
 def metadata_export_options_keyboard(user_id: int):
     builder = InlineKeyboardBuilder()
-    builder.button(text="JSON (Обычный)", callback_data=f"run_metadata_export_no_{user_id}")
-    builder.button(text="JSON (Обезличенный)", callback_data=f"run_metadata_export_yes_{user_id}")
+    builder.button(text="✨ JSON (Итоговые слитные метаданные)", callback_data=f"run_metadata_export_merged_{user_id}")
+    builder.button(text="📜 JSON (Полная история логов)", callback_data=f"run_metadata_export_no_{user_id}")
+    builder.button(text="🔒 JSON (Обезличенная история)", callback_data=f"run_metadata_export_yes_{user_id}")
     builder.button(text="⬅️ Назад в профиль", callback_data=f"view_client_{user_id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -1681,4 +1684,43 @@ def admin_referral_template_confirm_delete_keyboard(tpl_id: int):
 def admin_referral_template_input_cancel_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ Отмена", callback_data="admin_referral_templates")
+    return builder.as_markup()
+
+
+def admin_ai_logs_keyboard(logs, page: int, total_pages: int, filter_user_id: int | None = None):
+    builder = InlineKeyboardBuilder()
+    for log in logs:
+        lat_text = f" ({log.latency_ms / 1000:.1f}s)" if log.latency_ms else ""
+        btn_text = f"#{log.id} | {log.provider}: {log.model}{lat_text}"
+        cb = f"admin_ai_log_{log.id}_{page}"
+        if filter_user_id:
+            cb += f"_{filter_user_id}"
+        builder.button(text=btn_text[:60], callback_data=cb)
+
+    builder.adjust(1)
+    nav_row = []
+    if page > 0:
+        prev_cb = f"admin_user_ai_logs_{filter_user_id}_{page - 1}" if filter_user_id else f"admin_ai_logs_{page - 1}"
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=prev_cb))
+
+    nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{max(1, total_pages)}", callback_data="ignore"))
+
+    if page < total_pages - 1:
+        next_cb = f"admin_user_ai_logs_{filter_user_id}_{page + 1}" if filter_user_id else f"admin_ai_logs_{page + 1}"
+        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=next_cb))
+
+    if nav_row:
+        builder.row(*nav_row)
+
+    back_cb = f"admin_client_profile_{filter_user_id}" if filter_user_id else "admin_ai_settings"
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb))
+    return builder.as_markup()
+
+
+def admin_ai_log_detail_keyboard(log_id: int, page: int = 0, filter_user_id: int | None = None):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📄 Скачать .txt файл лога", callback_data=f"admin_ai_log_file_{log_id}")
+    back_cb = f"admin_user_ai_logs_{filter_user_id}_{page}" if filter_user_id else f"admin_ai_logs_{page}"
+    builder.button(text="⬅️ Назад к логам", callback_data=back_cb)
+    builder.adjust(1)
     return builder.as_markup()

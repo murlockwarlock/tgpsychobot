@@ -14,9 +14,11 @@ from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 
+import time
+
 from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestConfig, TestSession,
                      MediaLibrary, TopicMediaDeck, MediaCollection, media_collection_items, topic_collection_association,
-                     UserSubscription, KnowledgeBase, SubscriptionConfig)
+                     UserSubscription, KnowledgeBase, SubscriptionConfig, AILog)
 from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DATA_PROTOCOL_INSTRUCTION,
@@ -1306,6 +1308,10 @@ async def get_ai_response(
             else:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
 
+        start_time = time.monotonic()
+        actual_provider = provider
+        actual_model = model
+
         try:
             response_text = await _dispatch_call(provider_key, api_key, model)
         except (AIServiceError, Exception) as primary_err:
@@ -1331,6 +1337,8 @@ async def get_ai_response(
             )
             try:
                 response_text = await _dispatch_call(fb_key, fb_api_key, fb_model)
+                actual_provider = fb_provider
+                actual_model = fb_model
                 await _notify_ai_fallback_used(
                     bot,
                     user=user,
@@ -1346,9 +1354,22 @@ async def get_ai_response(
                     f"Основной провайдер ({provider}) и резервный ({fb_provider}) недоступны"
                 ) from fb_err
 
+        latency_ms = int((time.monotonic() - start_time) * 1000)
         visible_text, service_blocks, invalid_data_blocks = extract_service_data(response_text)
         if invalid_data_blocks:
             logging.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+
+        ai_log = AILog(
+            user_id=user_id,
+            provider=actual_provider,
+            model=actual_model,
+            prompt_summary=user_prompt[:500] if user_prompt else None,
+            raw_response=response_text,
+            clean_text=visible_text,
+            latency_ms=latency_ms,
+        )
+        session.add(ai_log)
+
         if service_blocks and persist_service_data:
             automation_result = await apply_service_data_blocks(
                 session,
@@ -1364,6 +1385,22 @@ async def get_ai_response(
                     await process_pending_events(bot, user_id=user.id)
                 except Exception:
                     logging.exception("Immediate automation event processing failed for user %s", user.id)
+        else:
+            await session.commit()
+
+        if bot is not None and getattr(user, "ai_debug_enabled", False):
+            try:
+                debug_msg = (
+                    f"🐛 <b>[AI DEBUG LOG]</b> #{ai_log.id}\n"
+                    f"🤖 <b>Провайдер:</b> {html.escape(actual_provider)} | <b>Модель:</b> {html.escape(actual_model)}\n"
+                    f"⏱ <b>Время ответа:</b> {latency_ms / 1000:.2f} сек\n"
+                    f"👤 <b>Пользователь:</b> ID {user_id}\n\n"
+                    f"📥 <b>Сырой ответ модели:</b>\n"
+                    f"<code>{html.escape(response_text[:3500])}</code>"
+                )
+                await bot.send_message(chat_id=user_id, text=debug_msg, parse_mode="HTML")
+            except Exception as exc:
+                logging.warning("Could not send live AI debug message to user %s: %s", user_id, exc)
 
         return visible_text
 

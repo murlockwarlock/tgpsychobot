@@ -89,6 +89,7 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
     can_view_history = Column(Boolean, default=False, nullable=False)
     accepted_disclaimer = Column(Boolean, default=False, nullable=False)
+    ai_debug_enabled = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     messages = relationship("Message", back_populates="user")
     current_dialogue_id = Column(Integer, default=1, nullable=False)
@@ -100,6 +101,21 @@ class User(Base):
     tg_user_id = Column(BigInteger, nullable=True)
     # JSON as text keeps the schema open for arbitrary prompt-defined fields.
     metadata_json = Column(Text, default="{}", nullable=False)
+
+
+class AILog(Base):
+    __tablename__ = 'ai_logs'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
+    provider = Column(String, nullable=False)
+    model = Column(String, nullable=False)
+    prompt_summary = Column(Text, nullable=True)
+    raw_response = Column(Text, nullable=False)
+    clean_text = Column(Text, nullable=True)
+    latency_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    user = relationship("User")
 
 
 class Message(Base):
@@ -587,6 +603,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN tg_user_id BIGINT"))
             if 'metadata_json' not in user_columns:
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN metadata_json TEXT DEFAULT '{}' NOT NULL"))
+            if 'ai_debug_enabled' not in user_columns:
+                sync_conn.execute(text("ALTER TABLE users ADD COLUMN ai_debug_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
 
             ai_columns = [c['name'] for c in insp.get_columns('ai_config')]
             if 'memory_mode' not in ai_columns:

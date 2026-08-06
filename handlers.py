@@ -36,7 +36,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
                      ReferralPaymentLog, MailingDeliveryLog, TopicMediaDeck,
                      MediaCollection, media_collection_items, topic_collection_association,
-                     ReferralTemplate, CardSpreadState)
+                     ReferralTemplate, CardSpreadState, AILog, AutomationConversationState)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
@@ -4396,6 +4396,182 @@ async def admin_history_paginator(callback: CallbackQuery):
     await view_user_history_page(client_id, page, callback, for_admin_view=True)
 
 
+@router.message(Command("ai_debug"))
+async def cmd_ai_debug_toggle(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+    async with async_session_maker() as session:
+        user = await session.get(User, message.from_user.id)
+        if user:
+            user.ai_debug_enabled = not user.ai_debug_enabled
+            status = "✅ ВКЛЮЧЁН" if user.ai_debug_enabled else "❌ ВЫКЛЮЧЁН"
+            await session.commit()
+            await message.answer(
+                f"🐛 <b>Live-режим отладки ИИ:</b> {status}\n\n"
+                f"При включенном режиме вы получаете сырой служебный лог вызова ИИ при каждом ответе модели."
+            )
+
+
+@router.message(Command("ai_log"))
+@router.message(Command("last_ai_log"))
+async def cmd_last_ai_log(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+    async with async_session_maker() as session:
+        res = await session.execute(
+            select(AILog).order_by(AILog.created_at.desc()).limit(1)
+        )
+        log_entry = res.scalar_one_or_none()
+        if not log_entry:
+            await message.answer("📜 Логи вызовов ИИ пока пусты.")
+            return
+
+    await show_ai_log_detail(message, log_entry.id)
+
+
+@router.callback_query(F.data.startswith("admin_ai_logs_"))
+async def callback_admin_ai_logs(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    page = int(callback.data.split("_")[-1])
+    await show_ai_logs_list(callback, page=page)
+
+
+@router.callback_query(F.data.startswith("admin_user_ai_logs_"))
+async def callback_admin_user_ai_logs(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    parts = callback.data.split("_")
+    user_id = int(parts[4])
+    page = int(parts[5])
+    await show_ai_logs_list(callback, page=page, filter_user_id=user_id)
+
+
+async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filter_user_id: int | None = None):
+    PER_PAGE = 8
+    async with async_session_maker() as session:
+        query = select(AILog)
+        if filter_user_id:
+            query = query.where(AILog.user_id == filter_user_id)
+
+        count_query = select(func.count()).select_from(query.subquery())
+        total_count = (await session.execute(count_query)).scalar() or 0
+        total_pages = math.ceil(total_count / PER_PAGE) if total_count > 0 else 1
+        page = max(0, min(page, total_pages - 1))
+
+        stmt = query.order_by(AILog.created_at.desc()).offset(page * PER_PAGE).limit(PER_PAGE)
+        logs = (await session.execute(stmt)).scalars().all()
+
+    if not logs:
+        text = "📜 <b>Логи вызовов ИИ пусты.</b>"
+        markup = kb.admin_ai_logs_keyboard([], page=0, total_pages=1, filter_user_id=filter_user_id)
+        if isinstance(event, CallbackQuery):
+            await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await event.answer(text, reply_markup=markup, parse_mode="HTML")
+        return
+
+    filter_text = f" пользователя <code>ID {filter_user_id}</code>" if filter_user_id else ""
+    header = f"📜 <b>Логи вызовов ИИ{filter_text}</b> (Стр. {page + 1}/{total_pages})\n\nВсего вызовов: <b>{total_count}</b>\nВыберите запись:"
+
+    markup = kb.admin_ai_logs_keyboard(logs, page=page, total_pages=total_pages, filter_user_id=filter_user_id)
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(header, reply_markup=markup, parse_mode="HTML")
+    else:
+        await event.answer(header, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("admin_ai_log_"))
+async def callback_admin_ai_log_detail(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    parts = callback.data.split("_")
+    if len(parts) > 3 and parts[3] == "file":
+        log_id = int(parts[4])
+        await send_ai_log_file(callback, log_id)
+        return
+    log_id = int(parts[3])
+    page = int(parts[4]) if len(parts) > 4 else 0
+    filter_user_id = int(parts[5]) if len(parts) > 5 else None
+    await show_ai_log_detail(callback, log_id, page=page, filter_user_id=filter_user_id)
+
+
+async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: int = 0, filter_user_id: int | None = None):
+    async with async_session_maker() as session:
+        log_entry = await session.get(AILog, log_id)
+        if not log_entry:
+            msg = "Запись лога не найдена."
+            if isinstance(event, CallbackQuery):
+                await event.answer(msg, show_alert=True)
+            else:
+                await event.answer(msg)
+            return
+
+        user_info = f"ID: {log_entry.user_id}"
+        if log_entry.user_id:
+            u = await session.get(User, log_entry.user_id)
+            if u:
+                uname = f"@{u.username}" if u.username else (u.first_name or u.name or "")
+                user_info = f"<b>{html.escape(uname)}</b> (ID: {log_entry.user_id})"
+
+    lat_text = f"{log_entry.latency_ms / 1000:.2f} сек" if log_entry.latency_ms else "не измерялось"
+    dt_str = format_msk(log_entry.created_at, "%d-%m-%Y %H:%M:%S МСК")
+    prompt_str = html.escape(log_entry.prompt_summary or "без текста")
+    if len(prompt_str) > 300:
+        prompt_str = prompt_str[:300] + "..."
+
+    raw_resp = log_entry.raw_response or ""
+    display_raw = html.escape(raw_resp)
+    if len(display_raw) > 2500:
+        display_raw = display_raw[:2500] + "\n\n[...] (Полный сырой файл скачайте по кнопке ниже)"
+
+    text = (
+        f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
+        f"👤 <b>Пользователь:</b> {user_info}\n"
+        f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider)}</b>\n"
+        f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model)}</code>\n"
+        f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
+        f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
+        f"💬 <b>Промпт/Вход (превью):</b>\n<i>{prompt_str}</i>\n\n"
+        f"📥 <b>Сырой ответ модели (Raw LLM Output):</b>\n"
+        f"<code>{display_raw}</code>"
+    )
+
+    markup = kb.admin_ai_log_detail_keyboard(log_id, page=page, filter_user_id=filter_user_id)
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def send_ai_log_file(callback: CallbackQuery, log_id: int):
+    async with async_session_maker() as session:
+        log_entry = await session.get(AILog, log_id)
+        if not log_entry:
+            await callback.answer("Запись не найдена.", show_alert=True)
+            return
+
+    content = (
+        f"AI LOG RECORD #{log_entry.id}\n"
+        f"Timestamp: {log_entry.created_at}\n"
+        f"User ID: {log_entry.user_id}\n"
+        f"Provider: {log_entry.provider}\n"
+        f"Model: {log_entry.model}\n"
+        f"Latency: {log_entry.latency_ms} ms\n"
+        f"----------------------------------------\n"
+        f"PROMPT SUMMARY:\n{log_entry.prompt_summary or ''}\n"
+        f"----------------------------------------\n"
+        f"RAW RESPONSE FROM LLM:\n{log_entry.raw_response or ''}\n"
+        f"----------------------------------------\n"
+        f"CLEAN TEXT SENT TO USER:\n{log_entry.clean_text or ''}\n"
+    )
+    file_bytes = content.encode("utf-8")
+    filename = f"ai_log_{log_id}_{log_entry.provider}_{log_entry.model}.txt"
+    input_file = BufferedInputFile(file_bytes, filename=filename)
+    await callback.message.answer_document(document=input_file, caption=f"📄 Полный сырой лог ИИ #{log_id}")
+    await callback.answer()
+
+
 async def view_user_history_page(user_id: int, page: int = 0, original_message: Message | CallbackQuery | None = None,
                                  for_admin_view: bool = False):
     async with async_session_maker() as session:
@@ -5153,6 +5329,63 @@ async def view_client_metadata(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("client_merged_metadata_"))
+async def view_client_merged_metadata(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на просмотр метаданных.", show_alert=True)
+        return
+
+    client_id = int(callback.data.split("_")[-1])
+    async with async_session_maker() as session:
+        user = await session.get(User, client_id)
+        if not user:
+            await callback.answer("Клиент не найден.", show_alert=True)
+            return
+
+        res = await session.execute(
+            select(AutomationConversationState).where(AutomationConversationState.user_id == client_id)
+        )
+        states = res.scalars().all()
+
+    display_name = html.escape(user.name or user.first_name or str(user.id))
+
+    if not states:
+        text = (
+            f"✨ <b>Итоговые метаданные (Merged):</b> {display_name}\n"
+            f"ID: <code>{client_id}</code>\n\n"
+            f"<i>Текущих активных слитных метаданных в БД пока нет.</i>"
+        )
+    else:
+        text = f"✨ <b>Итоговые слитные метаданные:</b> {display_name} (ID: <code>{client_id}</code>)\n\n"
+        for st in states:
+            cur_step = st.current_step or "не задан"
+            topic_info = f", Топик #{st.topic_id}" if st.topic_id else ""
+            diag_info = f"Диалог #{st.dialogue_id}{topic_info}"
+
+            try:
+                meta_obj = json.loads(st.metadata_json or "{}")
+                meta_rendered = json.dumps(meta_obj, ensure_ascii=False, indent=2)
+            except Exception:
+                meta_rendered = st.metadata_json or "{}"
+
+            if len(meta_rendered) > 2500:
+                meta_rendered = meta_rendered[:2500] + "\n... (полный текст доступен при скачивании .json)"
+
+            text += (
+                f"📍 <b>{diag_info}</b>\n"
+                f"▫️ <b>Текущий шаг (step):</b> <code>{html.escape(str(cur_step))}</code>\n"
+                f"▫️ <b>Слитные метаданные (Merged):</b>\n"
+                f"<code>{html.escape(meta_rendered)}</code>\n\n"
+            )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📥 Скачать этот .json", callback_data=f"run_metadata_export_merged_{client_id}")
+    builder.button(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")
+    builder.adjust(1)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("download_metadata_"))
 async def download_client_metadata(callback: CallbackQuery):
     if not await check_history_permission(callback.from_user.id):
@@ -5180,29 +5413,69 @@ async def run_client_metadata_export(callback: CallbackQuery):
         return
 
     try:
-        _, _, _, anonymize_value, client_id_value = callback.data.split("_")
-        client_id = int(client_id_value)
+        parts = callback.data.split("_")
+        mode = parts[3]
+        client_id = int(parts[4])
     except (ValueError, IndexError):
         await callback.answer("Некорректный запрос.", show_alert=True)
         return
-    anonymize = anonymize_value == "yes"
 
     async with async_session_maker() as session:
         user = await session.get(User, client_id)
-    if not user:
-        await callback.answer("Клиент не найден.", show_alert=True)
-        return
+        if not user:
+            await callback.answer("Клиент не найден.", show_alert=True)
+            return
 
-    export_data = metadata_export_entry(
-        user,
-        load_metadata_records(user.metadata_json),
-        anonymize=anonymize,
-    )
+        if mode == "merged":
+            res = await session.execute(
+                select(AutomationConversationState).where(AutomationConversationState.user_id == client_id)
+            )
+            states = res.scalars().all()
+            merged_states = []
+            for st in states:
+                try:
+                    meta_obj = json.loads(st.metadata_json or "{}")
+                except Exception:
+                    meta_obj = st.metadata_json
+                try:
+                    state_obj = json.loads(st.current_state_json or "{}")
+                except Exception:
+                    state_obj = st.current_state_json
+
+                merged_states.append({
+                    "dialogue_id": st.dialogue_id,
+                    "topic_id": st.topic_id,
+                    "current_step": st.current_step,
+                    "current_state": state_obj,
+                    "merged_metadata": meta_obj,
+                })
+
+            export_data = {
+                "user_info": {
+                    "id": user.id,
+                    "name": user.name or user.first_name,
+                    "username": user.username,
+                },
+                "export_type": "consolidated_merged_metadata",
+                "dialogue_states": merged_states,
+            }
+            filename = f"metadata_merged_{client_id}.json"
+            caption = f"✨ Итоговые слитные метаданные пользователя {client_id}"
+        else:
+            anonymize = mode == "yes"
+            export_data = metadata_export_entry(
+                user,
+                load_metadata_records(user.metadata_json),
+                anonymize=anonymize,
+            )
+            file_label = "user_1" if anonymize else str(client_id)
+            filename = f"metadata_history_{file_label}.json"
+            caption = f"📜 История метаданных пользователя {file_label}"
+
     data = json.dumps(export_data, ensure_ascii=False, indent=2).encode("utf-8")
-    file_label = "user_1" if anonymize else str(client_id)
     await callback.message.answer_document(
-        BufferedInputFile(data, filename=f"metadata_{file_label}.json"),
-        caption=f"🧩 Метаданные пользователя {file_label}",
+        BufferedInputFile(data, filename=filename),
+        caption=caption,
     )
     await callback.answer()
 
