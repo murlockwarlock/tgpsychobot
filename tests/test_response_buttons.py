@@ -88,12 +88,13 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertEqual(clean_text, "Можно начинать.")
 
     def test_extracts_buttons_wrapped_in_bold_or_code_markdown(self):
-        source = "Текст сообщения.\n\n**[Дальше](btn:after_photo)**\n`[Готов](btn:ready)`"
+        source = "Текст сообщения.\n\n**[Дальше](btn:after_photo)**\n`[Готов](btn:ready)`\n[**Дальше 2**](btn:after_photo_2)"
         text, rows = extract_response_buttons(source)
         self.assertEqual(text, "Текст сообщения.")
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual((rows[0][0].text, rows[0][0].value), ("Дальше", "after_photo"))
         self.assertEqual((rows[1][0].text, rows[1][0].value), ("Готов", "ready"))
+        self.assertEqual((rows[2][0].text, rows[2][0].value), ("Дальше 2", "after_photo_2"))
 
     def test_unescapes_literal_newlines_in_text(self):
         source = r"Первая строка.\n\nВторая строка.\n\n[Готов](btn:ready)"

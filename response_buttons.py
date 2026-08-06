@@ -60,7 +60,7 @@ def _parse_button_row(line: str) -> list[ResponseButton] | None:
         match = BUTTON_RE.fullmatch(cleaned_part)
         if not match:
             return None
-        text = match.group(1).strip()
+        text = _clean_part(match.group(1))
         target = match.group(2).strip()
         if not text:
             return None
