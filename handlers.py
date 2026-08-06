@@ -1042,7 +1042,8 @@ def _telegram_response_buttons_markup(rows: list[list[ResponseButton]]) -> Inlin
 
 
 async def _send_generated_response(bot: Bot, user_id: int, text: str) -> None:
-    clean_text, button_rows = extract_response_buttons(text)
+    visible_text, _, _ = extract_service_data(text)
+    clean_text, button_rows = extract_response_buttons(visible_text)
     markup = _telegram_response_buttons_markup(button_rows)
     if not clean_text and markup:
         await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=markup)

@@ -36,14 +36,28 @@ def _is_valid_action(action: str) -> bool:
     return len(f"{ACTION_CALLBACK_PREFIX}{action}".encode("utf-8")) <= MAX_CALLBACK_DATA_BYTES
 
 
+def _clean_part(part: str) -> str:
+    p = part.strip()
+    while len(p) >= 2:
+        if (p.startswith("**") and p.endswith("**")) or (p.startswith("__") and p.endswith("__")):
+            p = p[2:-2].strip()
+        elif (p.startswith("*") and p.endswith("*")) or (p.startswith("_") and p.endswith("_")) or (p.startswith("`") and p.endswith("`")) or (p.startswith("~") and p.endswith("~")):
+            p = p[1:-1].strip()
+        else:
+            break
+    return p
+
+
 def _parse_button_row(line: str) -> list[ResponseButton] | None:
-    parts = line.split("|")
+    cleaned_line = _clean_part(line)
+    parts = cleaned_line.split("|")
     if not parts or len(parts) > MAX_BUTTONS_PER_ROW:
         return None
 
     row: list[ResponseButton] = []
     for part in parts:
-        match = BUTTON_RE.fullmatch(part.strip())
+        cleaned_part = _clean_part(part)
+        match = BUTTON_RE.fullmatch(cleaned_part)
         if not match:
             return None
         text = match.group(1).strip()
@@ -66,6 +80,8 @@ def _parse_button_row(line: str) -> list[ResponseButton] | None:
 def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseButton]]]:
     """Remove standalone button rows and return their platform-neutral description."""
     source = text or ""
+    if r"\n" in source:
+        source = source.replace(r"\r\n", "\n").replace(r"\n", "\n")
     clean_lines: list[str] = []
     rows: list[list[ResponseButton]] = []
     for line in source.splitlines():

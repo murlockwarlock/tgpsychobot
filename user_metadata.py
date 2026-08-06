@@ -97,6 +97,7 @@ def extract_service_data(text: str | None) -> tuple[str, list[ServiceDataBlock],
         )
 
     visible_text = DATA_BLOCK_RE.sub("", raw_text)
+    visible_text = re.sub(r"</?DATA(?:\s[^>]*)?>|\[/?DATA\]", "", visible_text, flags=re.IGNORECASE)
     visible_text = re.sub(r"[ \t]+\n", "\n", visible_text)
     visible_text = re.sub(r"\n{3,}", "\n\n", visible_text).strip()
     return visible_text, blocks, invalid_count

@@ -87,6 +87,21 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertTrue(should_start_test)
         self.assertEqual(clean_text, "Можно начинать.")
 
+    def test_extracts_buttons_wrapped_in_bold_or_code_markdown(self):
+        source = "Текст сообщения.\n\n**[Дальше](btn:after_photo)**\n`[Готов](btn:ready)`"
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, "Текст сообщения.")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0][0].text, rows[0][0].value), ("Дальше", "after_photo"))
+        self.assertEqual((rows[1][0].text, rows[1][0].value), ("Готов", "ready"))
+
+    def test_unescapes_literal_newlines_in_text(self):
+        source = r"Первая строка.\n\nВторая строка.\n\n[Готов](btn:ready)"
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, "Первая строка.\n\nВторая строка.")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0][0].text, rows[0][0].value), ("Готов", "ready"))
+
 
 class ApiKeyDisplayTests(unittest.TestCase):
     def test_masks_api_keys_in_telegram_admin_keyboard(self):
