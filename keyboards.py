@@ -1328,14 +1328,22 @@ def export_date_filter_keyboard():
     return builder.as_markup()
 
 
-def mass_export_options_keyboard():
+def mass_export_options_keyboard(export_kind: str = "history"):
     builder = InlineKeyboardBuilder()
-    builder.button(text="TXT (Обычный)", callback_data="run_export_txt_no")
-    builder.button(text="TXT (Анонимно)", callback_data="run_export_txt_yes")
-    builder.button(text="JSON (Обычный)", callback_data="run_export_json_no")
-    builder.button(text="JSON (Анонимно)", callback_data="run_export_json_yes")
-    builder.button(text="⬅️ Назад к выбору", callback_data="admin_export_page_0")
-    builder.adjust(2, 2, 1)
+    if export_kind == "metadata":
+        builder.button(text="✨ JSON (Итоговые слитные)", callback_data="run_export_json_merged_no")
+        builder.button(text="✨ JSON (Слитные - Анонимно)", callback_data="run_export_json_merged_yes")
+        builder.button(text="📜 JSON (История логов)", callback_data="run_export_json_no")
+        builder.button(text="🔒 JSON (История логов - Анонимно)", callback_data="run_export_json_yes")
+        builder.button(text="⬅️ Назад к выбору", callback_data="admin_export_page_0")
+        builder.adjust(2, 2, 1)
+    else:
+        builder.button(text="TXT (Обычный)", callback_data="run_export_txt_no")
+        builder.button(text="TXT (Анонимно)", callback_data="run_export_txt_yes")
+        builder.button(text="JSON (Обычный)", callback_data="run_export_json_no")
+        builder.button(text="JSON (Анонимно)", callback_data="run_export_json_yes")
+        builder.button(text="⬅️ Назад к выбору", callback_data="admin_export_page_0")
+        builder.adjust(2, 2, 1)
     return builder.as_markup()
 
 
