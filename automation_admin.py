@@ -819,22 +819,20 @@ async def automation_conditions(callback: CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     for condition in item.conditions:
-        builder.row(
-            InlineKeyboardButton(text=f"🔍 {_condition_label(condition)}", callback_data=f"automation_condition_view_{handler_id}_{condition.id}"),
-            InlineKeyboardButton(text="✏️", callback_data=f"automation_condition_edit_{handler_id}_{condition.id}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"automation_condition_delete_{handler_id}_{condition.id}"),
+        builder.button(
+            text=f"🔍 {_condition_label(condition)}",
+            callback_data=f"automation_condition_view_{handler_id}_{condition.id}",
         )
-    builder.row(InlineKeyboardButton(text="➕ Событие", callback_data=f"automation_condition_add_{handler_id}_event"))
-    builder.row(InlineKeyboardButton(text="➕ Текущий этап", callback_data=f"automation_condition_add_{handler_id}_current_step"))
-    builder.row(InlineKeyboardButton(text="➕ Метаданные", callback_data=f"automation_condition_add_{handler_id}_metadata"))
+    builder.button(text="➕ Событие", callback_data=f"automation_condition_add_{handler_id}_event")
+    builder.button(text="➕ Текущий этап", callback_data=f"automation_condition_add_{handler_id}_current_step")
+    builder.button(text="➕ Метаданные", callback_data=f"automation_condition_add_{handler_id}_metadata")
     builder.row(_back(f"automation_handler_{handler_id}"))
+    builder.adjust(1)
     text = (
         f"🔎 <b>Условия ({len(item.conditions)})</b>\n\n"
         "Все добавленные условия должны выполниться одновременно (AND).\n"
         "Для обычного события достаточно условия «Событие = EVENT_NAME».\n\n"
-        "• Нажмите на условие 🔍, чтобы просмотреть подробности.\n"
-        "• Нажмите ✏️, чтобы отредактировать условие.\n"
-        "• Нажмите 🗑, чтобы удалить условие."
+        "• Нажмите на условие 🔍, чтобы просмотреть подробности, отредактировать или удалить его."
     )
     await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
 
@@ -1011,21 +1009,19 @@ async def automation_actions(callback: CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     for action in item.actions:
-        builder.row(
-            InlineKeyboardButton(text=f"⚙️ {_action_label(action)}", callback_data=f"automation_action_view_{handler_id}_{action.id}"),
-            InlineKeyboardButton(text="✏️", callback_data=f"automation_action_edit_{handler_id}_{action.id}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"automation_action_delete_{handler_id}_{action.id}"),
+        builder.button(
+            text=f"⚙️ {_action_label(action)}",
+            callback_data=f"automation_action_view_{handler_id}_{action.id}",
         )
-    builder.row(InlineKeyboardButton(text="➕ Сообщение всем админам", callback_data=f"automation_action_add_{handler_id}_admins"))
-    builder.row(InlineKeyboardButton(text="➕ Сообщение выбранному ID", callback_data=f"automation_action_add_{handler_id}_user"))
-    builder.row(InlineKeyboardButton(text="➕ Сохранить метаданные", callback_data=f"automation_action_add_{handler_id}_metadata"))
+    builder.button(text="➕ Сообщение всем админам", callback_data=f"automation_action_add_{handler_id}_admins")
+    builder.button(text="➕ Сообщение выбранному ID", callback_data=f"automation_action_add_{handler_id}_user")
+    builder.button(text="➕ Сохранить метаданные", callback_data=f"automation_action_add_{handler_id}_metadata")
     builder.row(_back(f"automation_handler_{handler_id}"))
+    builder.adjust(1)
     text = (
         f"⚙️ <b>Действия ({len(item.actions)})</b>\n\n"
         "Действия выполняются сверху вниз. Для одного события каждое действие выполняется не более одного раза.\n\n"
-        "• Нажмите на действие ⚙️, чтобы просмотреть подробности.\n"
-        "• Нажмите ✏️, чтобы отредактировать действие.\n"
-        "• Нажмите 🗑, чтобы удалить действие."
+        "• Нажмите на действие ⚙️, чтобы просмотреть подробности, отредактировать или удалить его."
     )
     await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
 
