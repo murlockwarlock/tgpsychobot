@@ -48,6 +48,11 @@ def _clean_part(part: str) -> str:
     return p
 
 
+COMMON_PLAIN_BUTTON_WORDS = frozenset({
+    "дальше", "далее", "продолжить", "начать", "погнали", "вперед", "вперёд", "готово", "понятно", "ок", "хорошо"
+})
+
+
 def _parse_button_row(line: str) -> list[ResponseButton] | None:
     cleaned_line = _clean_part(line)
     parts = cleaned_line.split("|")
@@ -58,22 +63,35 @@ def _parse_button_row(line: str) -> list[ResponseButton] | None:
     for part in parts:
         cleaned_part = _clean_part(part)
         match = BUTTON_RE.fullmatch(cleaned_part)
-        if not match:
-            return None
-        text = _clean_part(match.group(1))
-        target = match.group(2).strip()
-        if not text:
-            return None
-        if target.lower().startswith("btn:"):
-            action = target[4:]
-            if not _is_valid_action(action):
+        if match:
+            text = _clean_part(match.group(1))
+            target = match.group(2).strip()
+            if not text:
                 return None
-            row.append(ResponseButton(text=text, kind="action", value=action))
+            if target.lower().startswith("btn:"):
+                action = target[4:]
+                if not _is_valid_action(action):
+                    return None
+                row.append(ResponseButton(text=text, kind="action", value=action))
+            else:
+                parsed_url = urlsplit(target)
+                if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.netloc or any(char.isspace() for char in target):
+                    return None
+                row.append(ResponseButton(text=text, kind="url", value=target))
         else:
-            parsed_url = urlsplit(target)
-            if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.netloc or any(char.isspace() for char in target):
-                return None
-            row.append(ResponseButton(text=text, kind="url", value=target))
+            bracket_match = re.fullmatch(r"\[([^\]\n]{1,64})\]", cleaned_part)
+            if bracket_match:
+                b_text = _clean_part(bracket_match.group(1))
+                if b_text and _is_valid_action(b_text):
+                    row.append(ResponseButton(text=b_text, kind="action", value=b_text))
+                    continue
+
+            word = cleaned_part.strip()
+            if word.lower() in COMMON_PLAIN_BUTTON_WORDS and _is_valid_action(word):
+                row.append(ResponseButton(text=word, kind="action", value=word))
+                continue
+
+            return None
     return row
 
 

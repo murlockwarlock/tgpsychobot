@@ -34,6 +34,8 @@ from database import (
 from time_helpers import format_msk
 
 
+import logging
+
 router = Router(name="automation_admin")
 _answered_callback_ids: set[str] = set()
 
@@ -43,6 +45,26 @@ async def _answer_callback(callback: CallbackQuery, *args, **kwargs) -> None:
     callback_id = getattr(callback, "id", None)
     if callback_id:
         _answered_callback_ids.add(callback_id)
+
+
+async def _safe_edit_text_or_markup(target, text: str, reply_markup=None, disable_web_page_preview: bool = False):
+    msg = target.message if hasattr(target, "message") and getattr(target, "message", None) is not None else target
+    try:
+        await msg.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except Exception as exc:
+        err_str = str(exc)
+        if "message is not modified" in err_str or "is not modified" in err_str:
+            try:
+                await msg.edit_reply_markup(reply_markup=reply_markup)
+            except Exception:
+                pass
+        else:
+            logging.exception("Failed to edit admin menu message: %s", exc)
 
 
 class EnsureCallbackAnsweredMiddleware(BaseMiddleware):
@@ -543,8 +565,9 @@ async def _show_automation_handlers(
     back_callback = f"edit_topic_{topic_id}" if topic_id is not None else "automation_menu"
     builder.row(InlineKeyboardButton(text="➕ Новый обработчик", callback_data=add_callback))
     builder.row(_back(back_callback))
-    await callback.message.edit_text(
-        f"⚡ <b>Обработчики событий{f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
+    await _safe_edit_text_or_markup(
+        callback,
+        f"⚡ <b>Обработчики событий ({len(handlers)}){f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
         "Обработчик срабатывает только когда совпали тема и все его условия. "
         "Действия выполняются по порядку и не повторяются для одного события."
         + ("\n\nЗдесь показаны обработчики этой темы. Созданный здесь обработчик привяжется к ней автоматически." if topic else ""),
@@ -806,17 +829,14 @@ async def automation_conditions(callback: CallbackQuery):
     builder.row(InlineKeyboardButton(text="➕ Метаданные", callback_data=f"automation_condition_add_{handler_id}_metadata"))
     builder.row(_back(f"automation_handler_{handler_id}"))
     text = (
-        "🔎 <b>Условия</b>\n\n"
+        f"🔎 <b>Условия ({len(item.conditions)})</b>\n\n"
         "Все добавленные условия должны выполниться одновременно (AND).\n"
         "Для обычного события достаточно условия «Событие = EVENT_NAME».\n\n"
         "• Нажмите на условие 🔍, чтобы просмотреть подробности.\n"
         "• Нажмите ✏️, чтобы отредактировать условие.\n"
         "• Нажмите 🗑, чтобы удалить условие."
     )
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    except Exception:
-        pass
+    await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.regexp(r"^automation_condition_view_(\d+)_(\d+)$"))
@@ -1001,16 +1021,13 @@ async def automation_actions(callback: CallbackQuery):
     builder.row(InlineKeyboardButton(text="➕ Сохранить метаданные", callback_data=f"automation_action_add_{handler_id}_metadata"))
     builder.row(_back(f"automation_handler_{handler_id}"))
     text = (
-        "⚙️ <b>Действия</b>\n\n"
+        f"⚙️ <b>Действия ({len(item.actions)})</b>\n\n"
         "Действия выполняются сверху вниз. Для одного события каждое действие выполняется не более одного раза.\n\n"
         "• Нажмите на действие ⚙️, чтобы просмотреть подробности.\n"
         "• Нажмите ✏️, чтобы отредактировать действие.\n"
         "• Нажмите 🗑, чтобы удалить действие."
     )
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    except Exception:
-        pass
+    await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.regexp(r"^automation_action_view_(\d+)_(\d+)$"))
@@ -1323,8 +1340,9 @@ async def _show_followup_campaigns(
     back_callback = f"edit_topic_{topic_id}" if topic_id is not None else "automation_menu"
     builder.row(InlineKeyboardButton(text="➕ Новая цепочка", callback_data=add_callback))
     builder.row(_back(back_callback))
-    await callback.message.edit_text(
-        f"💬 <b>Догоняющие сообщения{f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
+    await _safe_edit_text_or_markup(
+        callback,
+        f"💬 <b>Догоняющие сообщения ({len(campaigns)}){f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
         "Таймер начинается заново после каждого сообщения или нажатия пользователя. "
         "При смене темы либо создании нового диалога старая цепочка отменяется. "
         "Шаги отправляются только вне тихих часов."
@@ -1574,13 +1592,13 @@ async def followup_steps(callback: CallbackQuery):
     builder.button(text="➕ Сгенерировать через AI", callback_data=f"followup_step_add_{campaign_id}_ai")
     builder.row(_back(f"followup_campaign_{campaign_id}"))
     builder.adjust(1)
-    await callback.message.edit_text(
-        "🪜 <b>Шаги цепочки</b>\n\n"
+    text = (
+        f"🪜 <b>Шаги цепочки ({len(item.steps)})</b>\n\n"
         "Задержка первого шага считается от последнего действия пользователя. "
         "Задержки следующих шагов — от предыдущей отправки. Новая активность начинает цепочку заново.\n\n"
-        "Нажатие на существующий шаг удаляет его.",
-        reply_markup=builder.as_markup(),
+        "Нажатие на существующий шаг удаляет его."
     )
+    await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.regexp(r"^followup_step_add_(\d+)_(static|ai)$"))
