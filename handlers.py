@@ -4552,18 +4552,26 @@ async def send_ai_log_file(callback: CallbackQuery, log_id: int):
             return
 
     content = (
+        f"========================================\n"
         f"AI LOG RECORD #{log_entry.id}\n"
+        f"========================================\n"
         f"Timestamp: {log_entry.created_at}\n"
         f"User ID: {log_entry.user_id}\n"
         f"Provider: {log_entry.provider}\n"
         f"Model: {log_entry.model}\n"
         f"Latency: {log_entry.latency_ms} ms\n"
+        f"========================================\n\n"
+        f"📥 [1] PROMPT / INPUT REQUEST:\n"
         f"----------------------------------------\n"
-        f"PROMPT SUMMARY:\n{log_entry.prompt_summary or ''}\n"
+        f"{log_entry.prompt_summary or ''}\n\n"
+        f"========================================\n"
+        f"🤖 [2] RAW RESPONSE FROM LLM:\n"
         f"----------------------------------------\n"
-        f"RAW RESPONSE FROM LLM:\n{log_entry.raw_response or ''}\n"
+        f"{log_entry.raw_response or ''}\n\n"
+        f"========================================\n"
+        f"💬 [3] CLEAN TEXT SENT TO USER:\n"
         f"----------------------------------------\n"
-        f"CLEAN TEXT SENT TO USER:\n{log_entry.clean_text or ''}\n"
+        f"{log_entry.clean_text or ''}\n"
     )
     file_bytes = content.encode("utf-8")
     filename = f"ai_log_{log_id}_{log_entry.provider}_{log_entry.model}.txt"

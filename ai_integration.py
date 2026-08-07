@@ -1363,7 +1363,7 @@ async def get_ai_response(
             user_id=user_id,
             provider=actual_provider,
             model=actual_model,
-            prompt_summary=user_prompt[:500] if user_prompt else None,
+            prompt_summary=user_prompt if user_prompt else None,
             raw_response=response_text,
             clean_text=visible_text,
             latency_ms=latency_ms,
