@@ -918,9 +918,26 @@ async def automation_action_add(callback: CallbackQuery, state: FSMContext):
             "<code>{\"lead_status\":\"ready\"}</code>. Отправьте <code>{}</code>, чтобы сохранить metadata события как есть."
         )
     elif kind == "user":
-        hint = "Первая строка — Telegram ID получателя, со второй строки — шаблон сообщения."
+        hint = (
+            "Первая строка — Telegram ID получателя, со второй строки — шаблон сообщения.\n\n"
+            "<b>Пример:</b>\n"
+            "<code>123456789\n"
+            "Новая заявка от {name} (@{username})!\n"
+            "Телефон: {metadata.contact}\n"
+            "Событие: {event}\n"
+            "Шаг: {current_step}</code>\n\n"
+            "<i>Доступные переменные: {name}, {username}, {user_id}, {event}, {current_step}, {metadata.ключ}</i>"
+        )
     else:
-        hint = "Введите шаблон сообщения для всех администраторов."
+        hint = (
+            "Введите шаблон сообщения для всех администраторов.\n\n"
+            "<b>Пример:</b>\n"
+            "<code>🚀 Событие: {event}\n"
+            "Пользователь: {name} (@{username}, ID: {user_id})\n"
+            "Телефон: {metadata.contact}\n"
+            "Шаг: {current_step}</code>\n\n"
+            "<i>Доступные переменные: {name}, {username}, {user_id}, {event}, {current_step}, {metadata.ключ}</i>"
+        )
     await callback.message.edit_text(
         f"<b>Новое действие</b>\n\n{hint}",
         reply_markup=InlineKeyboardBuilder().row(_back(f"automation_actions_{handler_id}")).as_markup(),
