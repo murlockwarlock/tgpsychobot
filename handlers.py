@@ -36,7 +36,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
                      ReferralPaymentLog, MailingDeliveryLog, TopicMediaDeck,
                      MediaCollection, media_collection_items, topic_collection_association,
-                     ReferralTemplate, CardSpreadState, AILog, AutomationConversationState)
+                     ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationEvent)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
@@ -5372,6 +5372,17 @@ async def view_client_merged_metadata(callback: CallbackQuery):
         dt_str = format_msk(dt_val, "%d-%m-%Y %H:%M МСК") if dt_val else "время неизвестно"
         diag_info = f"Диалог #{st.dialogue_id} ({dt_str}){topic_info}"
 
+        event_res = await session.execute(
+            select(AutomationEvent.name)
+            .where(
+                AutomationEvent.user_id == client_id,
+                AutomationEvent.dialogue_id == st.dialogue_id,
+            )
+            .order_by(AutomationEvent.id.desc())
+            .limit(1)
+        )
+        last_event_name = event_res.scalar() or "не зафиксировано"
+
         try:
             meta_obj = json.loads(st.metadata_json or "{}")
             meta_rendered = json.dumps(meta_obj, ensure_ascii=False, indent=2)
@@ -5386,8 +5397,9 @@ async def view_client_merged_metadata(callback: CallbackQuery):
             f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
             f"ID: <code>{client_id}</code>\n\n"
             f"📍 <b>{diag_info}</b>\n"
-            f"▫️ <b>Текущий шаг (step):</b> <code>{html.escape(str(cur_step))}</code>\n"
-            f"▫️ <b>Слитные метаданные (Merged):</b>\n"
+            f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{html.escape(str(last_event_name))}</code>\n"
+            f"▫️ <b>Текущий шаг ({html.escape('{current_step}')}):</b> <code>{html.escape(str(cur_step))}</code>\n"
+            f"▫️ <b>Слитные метаданные ({html.escape('{metadata}')}):</b>\n"
             f"<code>{html.escape(meta_rendered)}</code>"
         )
 
