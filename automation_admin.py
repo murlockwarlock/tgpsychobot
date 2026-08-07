@@ -77,7 +77,9 @@ STAGE_USERS_PAGE_SIZE = 10
 class AutomationAdminStates(StatesGroup):
     handler_name = State()
     condition_value = State()
+    condition_edit_value = State()
     action_value = State()
+    action_edit_value = State()
     campaign_name = State()
     followup_step = State()
     quiet_hours = State()
@@ -794,22 +796,123 @@ async def automation_conditions(callback: CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     for condition in item.conditions:
-        builder.button(
-            text=f"🗑 {_condition_label(condition)}",
-            callback_data=f"automation_condition_delete_{handler_id}_{condition.id}",
+        builder.row(
+            InlineKeyboardButton(text=f"🔍 {_condition_label(condition)}", callback_data=f"automation_condition_view_{handler_id}_{condition.id}"),
+            InlineKeyboardButton(text="✏️", callback_data=f"automation_condition_edit_{handler_id}_{condition.id}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"automation_condition_delete_{handler_id}_{condition.id}"),
         )
-    builder.button(text="➕ Событие", callback_data=f"automation_condition_add_{handler_id}_event")
-    builder.button(text="➕ Текущий этап", callback_data=f"automation_condition_add_{handler_id}_current_step")
-    builder.button(text="➕ Метаданные", callback_data=f"automation_condition_add_{handler_id}_metadata")
+    builder.row(InlineKeyboardButton(text="➕ Событие", callback_data=f"automation_condition_add_{handler_id}_event"))
+    builder.row(InlineKeyboardButton(text="➕ Текущий этап", callback_data=f"automation_condition_add_{handler_id}_current_step"))
+    builder.row(InlineKeyboardButton(text="➕ Метаданные", callback_data=f"automation_condition_add_{handler_id}_metadata"))
     builder.row(_back(f"automation_handler_{handler_id}"))
-    builder.adjust(1)
-    await callback.message.edit_text(
+    text = (
         "🔎 <b>Условия</b>\n\n"
-        "Все добавленные условия должны выполниться одновременно (AND). "
+        "Все добавленные условия должны выполниться одновременно (AND).\n"
         "Для обычного события достаточно условия «Событие = EVENT_NAME».\n\n"
-        "Нажатие на существующее условие удаляет его.",
-        reply_markup=builder.as_markup(),
+        "• Нажмите на условие 🔍, чтобы просмотреть подробности.\n"
+        "• Нажмите ✏️, чтобы отредактировать условие.\n"
+        "• Нажмите 🗑, чтобы удалить условие."
     )
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.regexp(r"^automation_condition_view_(\d+)_(\d+)$"))
+async def automation_condition_view(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    handler_id = int(parts[3])
+    condition_id = int(parts[4])
+
+    async with async_session_maker() as session:
+        condition = await session.get(AutomationCondition, condition_id)
+        if not condition or condition.handler_id != handler_id:
+            await callback.answer("Условие не найдено.", show_alert=True)
+            return
+
+        cond_type = condition.condition_type
+        field_path = condition.field_path
+        exp_val = condition.expected_value
+        operator = condition.operator or "equals"
+
+    type_label = "Событие" if cond_type == "event" else ("Текущий этап" if cond_type == "current_step" else "Метаданные")
+    field_info = f"▫️ <b>Поле (path):</b> <code>{html.escape(field_path or '')}</code>\n" if field_path else ""
+
+    text = (
+        f"🔎 <b>Условие #{condition_id}</b>\n\n"
+        f"▫️ <b>Тип:</b> {type_label}\n"
+        f"{field_info}"
+        f"▫️ <b>Оператор:</b> {operator}\n"
+        f"▫️ <b>Ожидаемое значение:</b> <code>{html.escape(exp_val or '')}</code>"
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить значение", callback_data=f"automation_condition_edit_{handler_id}_{condition_id}")
+    builder.button(text="🗑 Удалить условие", callback_data=f"automation_condition_delete_{handler_id}_{condition_id}")
+    builder.row(_back(f"automation_conditions_{handler_id}"))
+    builder.adjust(1)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.regexp(r"^automation_condition_edit_(\d+)_(\d+)$"))
+async def automation_condition_edit(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    handler_id = int(parts[3])
+    condition_id = int(parts[4])
+
+    async with async_session_maker() as session:
+        condition = await session.get(AutomationCondition, condition_id)
+        if not condition or condition.handler_id != handler_id:
+            await callback.answer("Условие не найдено.", show_alert=True)
+            return
+        cond_type = condition.condition_type
+        field_path = condition.field_path
+        exp_val = condition.expected_value
+
+    await state.set_state(AutomationAdminStates.condition_edit_value)
+    await state.update_data(handler_id=handler_id, condition_id=condition_id, condition_type=cond_type)
+
+    if cond_type == "metadata":
+        hint = f"Текущее значение: <code>{html.escape(field_path or '')} = {html.escape(exp_val or '')}</code>.\n\nВведите новое значение в формате: <code>путь = значение</code>"
+    else:
+        hint = f"Текущее значение: <code>{html.escape(exp_val or '')}</code>.\n\nВведите новое значение:"
+
+    await callback.message.edit_text(
+        f"✏️ <b>Редактирование условия #{condition_id}</b>\n\n{hint}",
+        reply_markup=InlineKeyboardBuilder().row(_back(f"automation_condition_view_{handler_id}_{condition_id}")).as_markup(),
+    )
+
+
+@router.message(AutomationAdminStates.condition_edit_value)
+async def automation_condition_edit_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    value = (message.text or "").strip()
+    field_path = None
+    if data["condition_type"] == "metadata":
+        if "=" not in value:
+            await message.answer("Нужен формат: <code>путь = значение</code>.")
+            return
+        field_path, value = (part.strip() for part in value.split("=", 1))
+        if not field_path or not value:
+            await message.answer("Путь и значение не должны быть пустыми.")
+            return
+    elif not value:
+        await message.answer("Значение не должно быть пустым.")
+        return
+
+    async with async_session_maker() as session:
+        condition = await session.get(AutomationCondition, data["condition_id"])
+        if condition:
+            condition.expected_value = value
+            if field_path is not None:
+                condition.field_path = field_path
+            await session.commit()
+
+    await state.clear()
+    await message.answer("✅ Условие успешно обновлено!")
+    await _show_handler(message, data["handler_id"], edit=False, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^automation_condition_add_(\d+)_(event|current_step|metadata)$"))
@@ -867,7 +970,8 @@ async def automation_condition_received(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.regexp(r"^automation_condition_delete_(\d+)_(\d+)$"))
 async def automation_condition_delete(callback: CallbackQuery):
-    _, _, _, handler_id_raw, condition_id_raw = callback.data.split("_")
+    parts = callback.data.split("_")
+    handler_id_raw, condition_id_raw = parts[3], parts[4]
     await _answer_callback(callback)
     async with async_session_maker() as session:
         condition = await session.get(AutomationCondition, int(condition_id_raw))
@@ -887,23 +991,152 @@ async def automation_actions(callback: CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     for action in item.actions:
-        builder.button(
-            text=f"🗑 {_action_label(action)}",
-            callback_data=f"automation_action_delete_{handler_id}_{action.id}",
+        builder.row(
+            InlineKeyboardButton(text=f"⚙️ {_action_label(action)}", callback_data=f"automation_action_view_{handler_id}_{action.id}"),
+            InlineKeyboardButton(text="✏️", callback_data=f"automation_action_edit_{handler_id}_{action.id}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"automation_action_delete_{handler_id}_{action.id}"),
         )
-    builder.button(text="➕ Сообщение всем админам", callback_data=f"automation_action_add_{handler_id}_admins")
-    builder.button(text="➕ Сообщение выбранному ID", callback_data=f"automation_action_add_{handler_id}_user")
-    builder.button(text="➕ Сохранить метаданные", callback_data=f"automation_action_add_{handler_id}_metadata")
+    builder.row(InlineKeyboardButton(text="➕ Сообщение всем админам", callback_data=f"automation_action_add_{handler_id}_admins"))
+    builder.row(InlineKeyboardButton(text="➕ Сообщение выбранному ID", callback_data=f"automation_action_add_{handler_id}_user"))
+    builder.row(InlineKeyboardButton(text="➕ Сохранить метаданные", callback_data=f"automation_action_add_{handler_id}_metadata"))
     builder.row(_back(f"automation_handler_{handler_id}"))
-    builder.adjust(1)
-    await callback.message.edit_text(
+    text = (
         "⚙️ <b>Действия</b>\n\n"
         "Действия выполняются сверху вниз. Для одного события каждое действие выполняется не более одного раза.\n\n"
-        "В шаблонах доступны: <code>{name}</code>, <code>{username}</code>, <code>{user_id}</code>, "
-        "<code>{event}</code>, <code>{current_step}</code>, <code>{metadata.profile.city}</code>.\n\n"
-        "Нажатие на существующее действие удаляет его.",
-        reply_markup=builder.as_markup(),
+        "• Нажмите на действие ⚙️, чтобы просмотреть подробности.\n"
+        "• Нажмите ✏️, чтобы отредактировать действие.\n"
+        "• Нажмите 🗑, чтобы удалить действие."
     )
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.regexp(r"^automation_action_view_(\d+)_(\d+)$"))
+async def automation_action_view(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    handler_id = int(parts[3])
+    action_id = int(parts[4])
+
+    async with async_session_maker() as session:
+        action = await session.get(AutomationAction, action_id)
+        if not action or action.handler_id != handler_id:
+            await callback.answer("Действие не найдено.", show_alert=True)
+            return
+
+        act_type = action.action_type
+        rec_type = action.recipient_type
+        rec_id = action.recipient_user_id
+        tpl = action.message_template
+        meta = action.metadata_json
+
+    if act_type == "save_metadata":
+        type_str = "Сохранение метаданных"
+        content_str = f"<code>{html.escape(meta or '{}')}</code>"
+    else:
+        rec_str = "Всем администраторам" if rec_type == "all_admins" else f"ID: {rec_id}"
+        type_str = f"Сообщение ({rec_str})"
+        content_str = f"<code>{html.escape(tpl or '')}</code>"
+
+    text = (
+        f"⚙️ <b>Действие #{action_id}</b>\n\n"
+        f"▫️ <b>Тип:</b> {type_str}\n"
+        f"▫️ <b>Содержимое:</b>\n{content_str}"
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить значение/шаблон", callback_data=f"automation_action_edit_{handler_id}_{action_id}")
+    builder.button(text="🗑 Удалить действие", callback_data=f"automation_action_delete_{handler_id}_{action_id}")
+    builder.row(_back(f"automation_actions_{handler_id}"))
+    builder.adjust(1)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.regexp(r"^automation_action_edit_(\d+)_(\d+)$"))
+async def automation_action_edit(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    handler_id = int(parts[3])
+    action_id = int(parts[4])
+
+    async with async_session_maker() as session:
+        action = await session.get(AutomationAction, action_id)
+        if not action or action.handler_id != handler_id:
+            await callback.answer("Действие не найдено.", show_alert=True)
+            return
+        act_type = action.action_type
+        rec_type = action.recipient_type
+        rec_id = action.recipient_user_id
+        tpl = action.message_template
+        meta = action.metadata_json
+
+    await state.set_state(AutomationAdminStates.action_edit_value)
+    await state.update_data(
+        handler_id=handler_id,
+        action_id=action_id,
+        action_type=act_type,
+        recipient_type=rec_type,
+        recipient_user_id=rec_id,
+    )
+
+    if act_type == "save_metadata":
+        hint = f"Текущий JSON: <code>{html.escape(meta or '{}')}</code>\n\nВведите новый JSON:"
+    elif rec_type == "selected_user":
+        hint = (
+            f"Текущее значение:\n<code>{rec_id}\n{html.escape(tpl or '')}</code>\n\n"
+            "Первая строка — Telegram ID получателя, со второй строки — новый шаблон сообщения."
+        )
+    else:
+        hint = f"Текущий шаблон:\n<code>{html.escape(tpl or '')}</code>\n\nВведите новый шаблон сообщения для всех администраторов:"
+
+    await callback.message.edit_text(
+        f"✏️ <b>Редактирование действия #{action_id}</b>\n\n{hint}",
+        reply_markup=InlineKeyboardBuilder().row(_back(f"automation_action_view_{handler_id}_{action_id}")).as_markup(),
+    )
+
+
+@router.message(AutomationAdminStates.action_edit_value)
+async def automation_action_edit_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    raw = (message.text or "").strip()
+    act_type = data["action_type"]
+    rec_type = data.get("recipient_type")
+
+    updates = {}
+    if act_type == "save_metadata":
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            await message.answer(f"Невалидный JSON: {html.escape(str(exc))}")
+            return
+        if not isinstance(payload, dict):
+            await message.answer("В корне JSON должен быть объект.")
+            return
+        updates["metadata_json"] = json.dumps(payload, ensure_ascii=False)
+    elif rec_type == "selected_user":
+        first, separator, template = raw.partition("\n")
+        if not separator or not first.strip().isdigit() or not template.strip():
+            await message.answer("Нужны Telegram ID в первой строке и текст сообщения ниже.")
+            return
+        updates["recipient_user_id"] = int(first.strip())
+        updates["message_template"] = template.strip()
+    else:
+        if not raw:
+            await message.answer("Шаблон сообщения не должен быть пустым.")
+            return
+        updates["message_template"] = raw
+
+    async with async_session_maker() as session:
+        action = await session.get(AutomationAction, data["action_id"])
+        if action:
+            for key, val in updates.items():
+                setattr(action, key, val)
+            await session.commit()
+
+    await state.clear()
+    await message.answer("✅ Действие успешно обновлено!")
+    await _show_handler(message, data["handler_id"], edit=False, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^automation_action_add_(\d+)_(admins|user|metadata)$"))
@@ -990,7 +1223,8 @@ async def automation_action_received(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.regexp(r"^automation_action_delete_(\d+)_(\d+)$"))
 async def automation_action_delete(callback: CallbackQuery):
-    _, _, _, handler_id_raw, action_id_raw = callback.data.split("_")
+    parts = callback.data.split("_")
+    handler_id_raw, action_id_raw = parts[3], parts[4]
     await _answer_callback(callback)
     async with async_session_maker() as session:
         action = await session.get(AutomationAction, int(action_id_raw))
