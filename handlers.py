@@ -14724,11 +14724,45 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
 
             analysis_result = await ai_integration.analyze_image_content(image_bytes, system_prompt, history=history)
 
+            visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
+            if service_blocks:
+                await apply_service_data_blocks(
+                    session,
+                    user=user,
+                    dialogue_id=user.current_dialogue_id,
+                    topic_id=current_topic_id,
+                    blocks=service_blocks,
+                )
+                await session.commit()
+                from automation_events import process_pending_events
+                try:
+                    await process_pending_events(bot, user_id=user.id)
+                except Exception:
+                    logging.exception("Immediate automation event processing failed in photo handler for user %s", user.id)
+
+            try:
+                ai_log = AILog(
+                    user_id=user_id,
+                    provider=getattr(ai_config, "vision_provider", "Vision") or "Vision",
+                    model=getattr(ai_config, "vision_model", "Vision") or "Vision",
+                    prompt_summary="[Анализ изображения]",
+                    raw_response=analysis_result,
+                    clean_text=visible_text,
+                    latency_ms=0,
+                )
+                session.add(ai_log)
+                await session.commit()
+            except Exception:
+                logging.exception("Could not save vision AILog entry for user %s", user_id)
+
             if typing_task:
                 typing_task.cancel()
 
-            edit_prompt, clean_text = _extract_ai_directive_payload(analysis_result, "EDIT_IMG")
+            edit_prompt, clean_text = _extract_ai_directive_payload(visible_text, "EDIT_IMG")
             gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
+
+            clean_text, button_rows = extract_response_buttons(clean_text)
+            response_markup = _telegram_response_buttons_markup(button_rows)
 
             formatted_html = markdown_to_html(clean_text)
 
@@ -14740,9 +14774,10 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
 
             if formatted_html:
                 parts = split_html_text(formatted_html)
-                for part in parts:
+                for index, part in enumerate(parts):
+                    part_markup = response_markup if index == len(parts) - 1 else None
                     await _safe_send_html(
-                        lambda text, pm: message.answer(text, parse_mode=pm),
+                        lambda text, pm, reply_markup=part_markup: message.answer(text, parse_mode=pm, reply_markup=reply_markup),
                         part,
                     )
 
