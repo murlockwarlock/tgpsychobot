@@ -5473,7 +5473,7 @@ async def run_client_metadata_export(callback: CallbackQuery):
                     "current_step": st.current_step,
                     "updated_at": format_msk(dt_val, "%Y-%m-%dT%H:%M:%S+03:00") if dt_val else None,
                     "current_state": state_obj,
-                    "merged_metadata": meta_obj,
+                    "metadata": meta_obj,
                 })
 
             export_data = {
