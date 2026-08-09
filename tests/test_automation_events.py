@@ -14,6 +14,7 @@ from automation_events import condition_matches, handler_matches, process_pendin
 from database import (
     AutomationAction,
     AutomationActionExecution,
+    AutomationMessageDelivery,
     AutomationCondition,
     AutomationEvent,
     AutomationHandler,
@@ -30,6 +31,18 @@ class FakeBot:
     async def send_message(self, chat_id, text):
         self.sent.append((chat_id, text))
         return SimpleNamespace(message_id=len(self.sent))
+
+
+class PartiallyFailingBot(FakeBot):
+    def __init__(self, failing_recipient):
+        super().__init__()
+        self.failing_recipient = failing_recipient
+        self.fail = True
+
+    async def send_message(self, chat_id, text):
+        if self.fail and chat_id == self.failing_recipient:
+            raise TimeoutError("temporary timeout")
+        return await super().send_message(chat_id, text)
 
 
 class AutomationEventTests(unittest.IsolatedAsyncioTestCase):
@@ -121,4 +134,47 @@ class AutomationEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second, 0)
         self.assertEqual(bot.sent, [(9001, "Лид 42: LEAD_READY")])
         self.assertEqual(executions, 1)
+        self.assertIsNotNone(stored_event.processed_at)
+
+    async def test_partial_admin_delivery_retries_only_failed_recipient(self):
+        async with self.sessions() as session:
+            user = User(id=43, first_name="Иван", current_dialogue_id=1)
+            handler = AutomationHandler(name="Новый лид", is_active=True, include_main_dialogue=True)
+            handler.conditions.append(AutomationCondition(
+                condition_type="event", expected_value="LEAD_READY", operator="equals",
+            ))
+            handler.actions.append(AutomationAction(
+                action_type="send_message",
+                recipient_type="all_admins",
+                message_template="Лид {user_id}",
+            ))
+            session.add_all([
+                user,
+                handler,
+                AutomationEvent(
+                    user_id=43,
+                    dialogue_id=1,
+                    topic_id=0,
+                    name="LEAD_READY",
+                    state_json="{}",
+                    metadata_json="{}",
+                ),
+            ])
+            await session.commit()
+
+        bot = PartiallyFailingBot(failing_recipient=9002)
+        with (
+            patch.object(automation_events, "async_session_maker", self.sessions),
+            patch.object(automation_events, "get_all_admin_ids", AsyncMock(return_value={9001, 9002})),
+        ):
+            self.assertEqual(await process_pending_events(bot), 0)
+            bot.fail = False
+            self.assertEqual(await process_pending_events(bot), 1)
+
+        async with self.sessions() as session:
+            deliveries = await session.scalar(select(func.count(AutomationMessageDelivery.id)))
+            stored_event = await session.scalar(select(AutomationEvent))
+
+        self.assertEqual(bot.sent, [(9001, "Лид 43"), (9002, "Лид 43")])
+        self.assertEqual(deliveries, 2)
         self.assertIsNotNone(stored_event.processed_at)

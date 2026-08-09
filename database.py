@@ -1002,6 +1002,27 @@ class AutomationActionExecution(Base):
     executed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class AutomationMessageDelivery(Base):
+    """Per-recipient delivery receipt for idempotent admin notifications."""
+
+    __tablename__ = 'automation_message_deliveries'
+    __table_args__ = (
+        UniqueConstraint(
+            'event_id',
+            'action_id',
+            'recipient_id',
+            name='uq_automation_message_recipient',
+        ),
+        Index('idx_automation_message_delivery_event', 'event_id'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(Integer, ForeignKey('automation_events.id', ondelete='CASCADE'), nullable=False)
+    handler_id = Column(Integer, ForeignKey('automation_handlers.id', ondelete='CASCADE'), nullable=False)
+    action_id = Column(Integer, ForeignKey('automation_actions.id', ondelete='CASCADE'), nullable=False)
+    recipient_id = Column(BigInteger, nullable=False)
+    delivered_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class FollowupCampaign(Base):
     __tablename__ = 'followup_campaigns'
     id = Column(Integer, primary_key=True, autoincrement=True)

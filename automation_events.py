@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 from database import (
     AutomationAction,
     AutomationActionExecution,
+    AutomationMessageDelivery,
     AutomationCondition,
     AutomationConversationState,
     AutomationEvent,
@@ -141,6 +142,9 @@ def _render_metadata_value(value: Any, *, event: AutomationEvent, user: User) ->
 async def _execute_action(session, bot, event, handler, action, user) -> None:
     if action.action_type == "send_message":
         text = render_message_template(action.message_template or "", event=event, user=user)
+        event_id = event.id
+        handler_id = handler.id
+        action_id = action.id
         if not text:
             raise ValueError("Пустой шаблон сообщения")
         if action.recipient_type == "all_admins":
@@ -151,9 +155,28 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
             raise ValueError("Не выбран получатель сообщения")
         errors = []
         for recipient_id in recipients:
+            delivered = await session.scalar(
+                select(AutomationMessageDelivery.id).where(
+                    AutomationMessageDelivery.event_id == event_id,
+                    AutomationMessageDelivery.action_id == action_id,
+                    AutomationMessageDelivery.recipient_id == recipient_id,
+                )
+            )
+            if delivered:
+                continue
             try:
                 await bot.send_message(recipient_id, text)
+                session.add(AutomationMessageDelivery(
+                    event_id=event_id,
+                    handler_id=handler_id,
+                    action_id=action_id,
+                    recipient_id=recipient_id,
+                ))
+                # Persist each successful recipient before trying the next one.
+                # A timeout for one admin must not duplicate earlier deliveries.
+                await session.commit()
             except Exception as exc:
+                await session.rollback()
                 errors.append(f"{recipient_id}: {exc}")
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -213,30 +236,28 @@ async def process_pending_events(bot, *, limit: int = 100, user_id: int | None =
         if not claimed_ids:
             return 0
 
-        events = (
-            await session.execute(
-                select(AutomationEvent)
-                .where(AutomationEvent.id.in_(claimed_ids))
-                .order_by(AutomationEvent.created_at.asc(), AutomationEvent.id.asc())
-            )
-        ).scalars().all()
-        handlers = (
-            await session.execute(
-                select(AutomationHandler)
-                .where(AutomationHandler.is_active.is_(True))
-                .options(
-                    selectinload(AutomationHandler.topics),
-                    selectinload(AutomationHandler.conditions),
-                    selectinload(AutomationHandler.actions),
+    for event_id in claimed_ids:
+        # A failed action rolls its session back. Keeping one session per event
+        # prevents that rollback from expiring ORM objects of later events.
+        async with async_session_maker() as session:
+            event = await session.get(AutomationEvent, event_id)
+            if event is None:
+                continue
+            handlers = (
+                await session.execute(
+                    select(AutomationHandler)
+                    .where(AutomationHandler.is_active.is_(True))
+                    .options(
+                        selectinload(AutomationHandler.topics),
+                        selectinload(AutomationHandler.conditions),
+                        selectinload(AutomationHandler.actions),
+                    )
                 )
-            )
-        ).scalars().all()
-
-        for event in events:
-            event_id = event.id
+            ).scalars().all()
             user = await session.get(User, event.user_id)
             if user is None:
                 event.processed_at = datetime.utcnow()
+                await session.commit()
                 continue
             failed = False
             for handler in handlers:
@@ -274,7 +295,8 @@ async def process_pending_events(bot, *, limit: int = 100, user_id: int | None =
                 if failed:
                     break
             if not failed:
-                event.processed_at = datetime.utcnow()
+                completed_event = await session.get(AutomationEvent, event_id)
+                completed_event.processed_at = datetime.utcnow()
                 await session.commit()
                 processed_count += 1
             else:
