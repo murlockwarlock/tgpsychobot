@@ -47,19 +47,18 @@ class AIRequestContextTests(unittest.IsolatedAsyncioTestCase):
             patch.object(ai_integration, "build_runtime_automation_context", AsyncMock(return_value=automation_context)),
             patch.object(ai_integration, "active_subscription_flag", return_value=""),
         ):
-            result = await ai_integration.build_runtime_user_message(
+            result = await ai_integration.build_runtime_context(
                 session,
                 user=user,
                 dialogue_id=7,
                 topic_id=3,
-                user_message="[Фото для анализа]",
             )
 
         self.assertIn("ИМЯ: Ясна", result)
         self.assertIn("ПОЛ: female", result)
         self.assertIn('"current_step":"photo"', result)
         self.assertIn('"guide":"yoda"', result)
-        self.assertTrue(result.endswith("СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n[Фото для анализа]"))
+        self.assertNotIn("СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ", result)
 
     async def test_kie_multimodal_keeps_history_as_messages_and_captures_full_payload(self):
         history = [
@@ -87,3 +86,24 @@ class AIRequestContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[2](btn:b)", payload["messages"][2]["content"])
         self.assertEqual(payload["messages"][-1]["content"][1]["image_url"]["url"], "https://image")
         self.assertNotIn("secret", capture["endpoint"])
+
+    async def test_kie_vision_keeps_runtime_context_out_of_user_message(self):
+        multimodal = AsyncMock(return_value="Готово")
+        with (
+            patch.object(ai_integration, "_upload_file_to_kie", AsyncMock(return_value="https://image")),
+            patch.object(ai_integration, "_call_kie_multimodal", multimodal),
+        ):
+            await ai_integration._call_kie_vision(
+                "secret",
+                "https://api.example",
+                "https://upload.example",
+                "gemini-2.5-flash",
+                b"image",
+                "SYSTEM PROMPT",
+                history=[],
+                request_context="RUNTIME METADATA",
+            )
+
+        args = multimodal.await_args.args
+        self.assertIn("RUNTIME METADATA", args[3])
+        self.assertNotIn("RUNTIME METADATA", args[4][0]["text"])

@@ -10,7 +10,7 @@ os.environ.setdefault("BOT_TOKEN", "test")
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from automation_engine import apply_service_data_blocks, get_conversation_automation_state
+from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_conversation_automation_state
 from database import (
     AIConfig,
     AutomationConversationState,
@@ -118,6 +118,30 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
             {(row.dialogue_id, row.topic_id, row.current_step) for row in rows},
             {(1, 0, "MAIN_1"), (1, 8, "TOPIC_8"), (2, 0, "MAIN_2")},
         )
+
+    async def test_runtime_context_exposes_state_without_navigation_command(self):
+        async with self.sessions() as session:
+            user = await session.get(User, 42)
+            await apply_service_data_blocks(
+                session,
+                user=user,
+                dialogue_id=1,
+                topic_id=7,
+                blocks=self._blocks(
+                    '{"current_state":{"current_step":"STEP_2"},"metadata":{"guide":"yoda"}}'
+                ),
+            )
+            await session.commit()
+            context = await build_runtime_automation_context(
+                session,
+                user_id=42,
+                dialogue_id=1,
+                topic_id=7,
+            )
+
+        self.assertIn('"current_step":"STEP_2"', context)
+        self.assertIn('"guide":"yoda"', context)
+        self.assertNotIn("Продолжай алгоритм", context)
 
     async def test_snapshot_is_a_record_but_does_not_mutate_merged_context(self):
         async with self.sessions() as session:

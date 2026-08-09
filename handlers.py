@@ -13193,9 +13193,9 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         )
         fake_history = [DBMessage(
             role='user',
-            content=f"{runtime_context}\n\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{user_prompt}",
+            content=user_prompt,
         )]
-        full_system_prompt = f"{system_prompt}\n\n{DATA_PROTOCOL_INSTRUCTION}"
+        full_system_prompt = f"{system_prompt}\n\n{DATA_PROTOCOL_INSTRUCTION}\n\n{runtime_context}"
 
         if provider_key == 'gemini':
             response_text = await _call_gemini_api(api_key, model, fake_history, "", full_system_prompt)
@@ -14823,12 +14823,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 user.current_topic.name if user.current_topic else None,
                 memory_mode,
             )
-            request_context = await ai_integration.build_runtime_user_message(
+            request_context = await ai_integration.build_runtime_context(
                 session,
                 user=user,
                 dialogue_id=user.current_dialogue_id,
                 topic_id=current_topic_id,
-                user_message="[Фото для анализа]",
                 subscription_config=sub_config,
                 global_memory_context=global_memory_context,
             )

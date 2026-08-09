@@ -449,13 +449,12 @@ def _build_memory_aware_history(
     return current_topic_history, global_memory_context
 
 
-async def build_runtime_user_message(
+async def build_runtime_context(
     session,
     *,
     user: User,
     dialogue_id: int,
     topic_id: int | None,
-    user_message: str,
     subscription_config: SubscriptionConfig | None = None,
     test_context: str = "",
     available_media_text: str = "",
@@ -493,11 +492,10 @@ async def build_runtime_user_message(
     if global_memory_context:
         runtime_parts.append(global_memory_context)
 
-    runtime_context = (
+    return (
         "Это служебный контекст приложения, а не сообщение пользователя. "
         "Не цитируй и не раскрывай его:\n\n" + "\n\n".join(part for part in runtime_parts if part)
     )
-    return f"{runtime_context}\n\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{user_message}"
 
 
 async def generate_response(user_id: int, user_prompt: str, bot=None) -> str:
@@ -868,13 +866,12 @@ async def _call_claude_vision(
             if getattr(msg, "content", None)
         ]
         user_instruction = "Проанализируй это изображение согласно системной инструкции."
-        if request_context:
-            user_instruction = f"{request_context}\n\n{user_instruction}"
+        full_system_prompt = f"{prompt}\n\n{request_context}" if request_context else prompt
         payload = {
             "model": model,
             "max_tokens": 4096,
             "temperature": temperature,
-            "system": prompt,
+            "system": full_system_prompt,
             "messages": [*claude_history,
                 {
                     "role": "user",
@@ -1356,12 +1353,11 @@ async def get_ai_response(
             active_topic.name if active_topic else None,
             memory_mode,
         )
-        runtime_user_message = await build_runtime_user_message(
+        runtime_context = await build_runtime_context(
             session,
             user=user,
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
-            user_message=user_prompt,
             subscription_config=subscription_config,
             test_context=test_context_injection,
             available_media_text=available_media_text,
@@ -1369,12 +1365,13 @@ async def get_ai_response(
             knowledge_context=context,
             global_memory_context=global_memory_context,
         )
+        request_system_prompt = f"{system_prompt}\n\n{runtime_context}"
 
         if final_history and final_history[-1].role == "user" and final_history[-1].content == user_prompt:
             final_history.pop()
         final_history.append(DBMessage(
             role='user',
-            content=runtime_user_message,
+            content=user_prompt,
         ))
 
         request_capture: dict = {}
@@ -1383,17 +1380,17 @@ async def get_ai_response(
             use_proxy = getattr(ai_config, 'use_proxy', True)
             timeout = float(getattr(ai_config, "fallback_timeout", 60))
             if p_key == 'openai':
-                return await _call_openai_api(p_api_key, p_model, final_history, "", system_prompt, temperature, timeout=timeout, request_capture=request_capture)
+                return await _call_openai_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
             elif p_key in ['anthropic', 'claude']:
-                return await _call_claude_api(p_api_key, p_model, final_history, "", system_prompt, temperature, timeout=timeout, request_capture=request_capture)
+                return await _call_claude_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
             elif p_key == 'gemini':
-                return await _call_gemini_api(p_api_key, p_model, final_history, "", system_prompt, temperature, timeout=timeout, request_capture=request_capture)
+                return await _call_gemini_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
             elif p_key == 'kie':
-                return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, "", system_prompt, temperature, request_capture=request_capture)
+                return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, "", request_system_prompt, temperature, request_capture=request_capture)
             elif p_key == 'deepseek':
-                return await _call_deepseek_api(p_api_key, p_model, final_history, "", system_prompt, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture)
+                return await _call_deepseek_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture)
             elif p_key == 'xai':
-                return await _call_openai_api(p_api_key, p_model, final_history, "", system_prompt, temperature, timeout=timeout, request_capture=request_capture)
+                return await _call_openai_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
             else:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
 
@@ -2051,21 +2048,19 @@ async def analyze_image_content(
             "You are a professional expert analyst. Analyze the provided image thoroughly. "
             "If visualization is needed, add at the very end: "
             "GEN_IMG: [Detailed English prompt].\n\n"
-            f"Role and Context: {prompt}{formatting_rules}"
+            f"{formatting_rules}"
         )
 
-        messages = []
+        full_system_prompt = f"{prompt}\n\n{request_context}" if request_context else prompt
+        messages = [{"role": "system", "content": full_system_prompt}]
         if history:
             for msg in history:
                 messages.append({"role": msg.role, "content": msg.content})
 
-        user_instruction = vision_instructions
-        if request_context:
-            user_instruction = f"{request_context}\n\n{vision_instructions}"
         messages.append({
             "role": "user",
             "content": [
-                {"type": "text", "text": user_instruction},
+                {"type": "text", "text": vision_instructions},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}", "detail": "high"}}
             ]
         })
@@ -2116,8 +2111,7 @@ async def _call_gemini_vision(api_key: str, model: str, image_bytes: bytes, prom
                     contents.append({'role': role, 'parts': [{'text': msg.content}]})
 
             user_instruction = "Проанализируй это изображение согласно системной инструкции выше."
-            if request_context:
-                user_instruction = f"{request_context}\n\n{user_instruction}"
+            full_system_prompt = f"{prompt}\n\n{request_context}" if request_context else prompt
             contents.append({
                 "role": "user",
                 "parts": [
@@ -2128,7 +2122,7 @@ async def _call_gemini_vision(api_key: str, model: str, image_bytes: bytes, prom
 
             payload = {
                 "contents": contents,
-                "systemInstruction": {"parts": [{"text": prompt}]},
+                "systemInstruction": {"parts": [{"text": full_system_prompt}]},
                 "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096}
             }
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
@@ -2190,13 +2184,12 @@ async def _call_kie_vision(
         )
 
         user_instruction = "Проанализируй это изображение согласно системной инструкции."
-        if request_context:
-            user_instruction = f"{request_context}\n\n{user_instruction}"
+        full_system_prompt = f"{prompt}\n\n{request_context}" if request_context else prompt
         return await _call_kie_multimodal(
             api_key,
             base_url,
             model,
-            prompt,
+            full_system_prompt,
             [
                 {"type": "text", "text": user_instruction},
                 {"type": "image_url", "image_url": {"url": file_url}},

@@ -104,8 +104,7 @@ async def build_runtime_automation_context(
             "metadata": _load_object(row.metadata_json),
         }
     return (
-        "СЛУЖЕБНЫЕ ДАННЫЕ ТЕКУЩЕГО ДИАЛОГА. Не показывай их пользователю. "
-        "Продолжай алгоритм с указанного состояния:\n"
+        "СЛУЖЕБНЫЕ ДАННЫЕ ТЕКУЩЕГО ДИАЛОГА. Не показывай их пользователю:\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
