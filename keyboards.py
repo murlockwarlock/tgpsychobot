@@ -516,6 +516,28 @@ def user_history_keyboard(page: int, total_pages: int, for_admin_user_id: int | 
 
     return builder.as_markup()
 
+
+def fixed_pagination_rows(page: int, total_pages: int, callback_for_page) -> list[list[InlineKeyboardButton]]:
+    """Return the stable two-row navigation used by dialogue history screens."""
+    total_pages = max(1, total_pages)
+    page = max(0, min(page, total_pages - 1))
+    if total_pages == 1:
+        return [[InlineKeyboardButton(text="1/1", callback_data="noop")]]
+
+    previous_page = page - 1 if page > 0 else total_pages - 1
+    next_page = page + 1 if page < total_pages - 1 else 0
+    return [
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_for_page(previous_page)),
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"),
+            InlineKeyboardButton(text="Вперёд ➡️", callback_data=callback_for_page(next_page)),
+        ],
+        [
+            InlineKeyboardButton(text="⏮ В начало", callback_data=callback_for_page(0)),
+            InlineKeyboardButton(text="В конец ⏭", callback_data=callback_for_page(total_pages - 1)),
+        ],
+    ]
+
 def confirm_delete_history_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🗑️ Да, удалить", callback_data="delete_history_confirm")
@@ -1710,19 +1732,8 @@ def admin_ai_logs_keyboard(logs, page: int, total_pages: int, filter_user_id: in
         builder.button(text=btn_text[:60], callback_data=cb)
 
     builder.adjust(1)
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⏮ В начало", callback_data=list_callback(0)))
-        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=list_callback(page - 1)))
-
-    nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{max(1, total_pages)}", callback_data="ignore"))
-
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=list_callback(page + 1)))
-        nav_row.append(InlineKeyboardButton(text="В конец ⏭", callback_data=list_callback(total_pages - 1)))
-
-    if nav_row:
-        builder.row(*nav_row)
+    for navigation_row in fixed_pagination_rows(page, total_pages, list_callback):
+        builder.row(*navigation_row)
 
     period_labels = (("Сегодня", "today"), ("7 дней", "7d"), ("30 дней", "30d"), ("Все", "all"))
     builder.row(*[

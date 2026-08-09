@@ -5411,16 +5411,11 @@ async def view_client_metadata(callback: CallbackQuery):
         f"<code>{html.escape(rendered_chunk)}</code>\n\n"
         f"Запись {record_index + 1}/{max(len(records), 1)}{part_label}"
     )
-    buttons = []
-    navigation = []
-    if page > 0:
-        navigation.append(InlineKeyboardButton(text="⏮ В начало", callback_data=f"client_metadata_{client_id}_0"))
-        navigation.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"client_metadata_{client_id}_{page - 1}"))
-    if page < len(pages) - 1:
-        navigation.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"client_metadata_{client_id}_{page + 1}"))
-        navigation.append(InlineKeyboardButton(text="В конец ⏭", callback_data=f"client_metadata_{client_id}_{len(pages) - 1}"))
-    if navigation:
-        buttons.append(navigation)
+    buttons = kb.fixed_pagination_rows(
+        page,
+        len(pages),
+        lambda target_page: f"client_metadata_{client_id}_{target_page}",
+    )
     buttons.append([InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")])
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
@@ -5501,16 +5496,12 @@ async def view_client_merged_metadata(callback: CallbackQuery):
         )
 
         builder = InlineKeyboardBuilder()
-        if total_states > 1:
-            nav_buttons = []
-            if page > 0:
-                nav_buttons.append(InlineKeyboardButton(text="⏮ В начало", callback_data=f"client_merged_metadata_{client_id}_0"))
-                nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"client_merged_metadata_{client_id}_{page - 1}"))
-            nav_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_states}", callback_data="noop"))
-            if page < total_states - 1:
-                nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"client_merged_metadata_{client_id}_{page + 1}"))
-                nav_buttons.append(InlineKeyboardButton(text="В конец ⏭", callback_data=f"client_merged_metadata_{client_id}_{total_states - 1}"))
-            builder.row(*nav_buttons)
+        for navigation_row in kb.fixed_pagination_rows(
+            page,
+            total_states,
+            lambda target_page: f"client_merged_metadata_{client_id}_{target_page}",
+        ):
+            builder.row(*navigation_row)
 
         builder.row(InlineKeyboardButton(text="📥 Скачать все диалоги (.json)", callback_data=f"run_metadata_export_merged_{client_id}"))
         builder.row(InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}"))

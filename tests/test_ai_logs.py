@@ -6,7 +6,13 @@ os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from database import AILog, User, async_session_maker, engine, init_db
-from keyboards import admin_ai_log_detail_keyboard, admin_ai_logs_keyboard, admin_panel_keyboard, ai_settings_keyboard
+from keyboards import (
+    admin_ai_log_detail_keyboard,
+    admin_ai_logs_keyboard,
+    admin_panel_keyboard,
+    ai_settings_keyboard,
+    fixed_pagination_rows,
+)
 
 
 class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
@@ -60,3 +66,16 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
         admin_panel_buttons = [button.text for row in admin_panel_keyboard().inline_keyboard for button in row]
         self.assertIn("📜 Логи запросов ИИ", ai_settings_buttons)
         self.assertNotIn("📜 Логи ИИ", admin_panel_buttons)
+
+    def test_fixed_navigation_has_same_two_rows_on_every_page(self):
+        callback = lambda page: f"page_{page}"
+        first_page = fixed_pagination_rows(0, 5, callback)
+        middle_page = fixed_pagination_rows(2, 5, callback)
+        last_page = fixed_pagination_rows(4, 5, callback)
+
+        for rows in (first_page, middle_page, last_page):
+            self.assertEqual([len(row) for row in rows], [3, 2])
+            self.assertEqual([button.text for button in rows[0]][::2], ["⬅️ Назад", "Вперёд ➡️"])
+            self.assertEqual([button.text for button in rows[1]], ["⏮ В начало", "В конец ⏭"])
+        self.assertEqual(first_page[0][0].callback_data, "page_4")
+        self.assertEqual(last_page[0][2].callback_data, "page_0")
