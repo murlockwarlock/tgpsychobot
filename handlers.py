@@ -83,7 +83,7 @@ from mailing_utils import (
     render_mailing_text,
     send_mailing_content,
 )
-from prompt_blocks import DATA_PROTOCOL_INSTRUCTION, DEFAULT_SERVICE_PROMPT_TEMPLATE, render_prompt_block
+from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE, render_prompt_block
 from provider_models import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MODELS
 from user_metadata import append_metadata_records, extract_data_blocks, extract_service_data, load_metadata_records
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary
@@ -13186,7 +13186,7 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
             role='user',
             content=user_prompt,
         )]
-        full_system_prompt = f"{system_prompt}\n\n{DATA_PROTOCOL_INSTRUCTION}\n\n{runtime_context}"
+        full_system_prompt = f"{system_prompt}\n\n{runtime_context}"
 
         if provider_key == 'gemini':
             response_text = await _call_gemini_api(api_key, model, fake_history, "", full_system_prompt)
@@ -14777,7 +14777,6 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     system_prompt_text.strip(),
                     shared_prompt_block,
                     service_prompt_block,
-                    DATA_PROTOCOL_INSTRUCTION,
                 ] if part
             ]
             base_prompt_text = "\n\n".join(base_prompt_parts)

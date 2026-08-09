@@ -210,7 +210,7 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(visible, "Результат теста готов.")
         sent_system_prompt = call.await_args.args[4]
-        self.assertIn("<DATA>", sent_system_prompt)
+        self.assertNotIn("<DATA>", sent_system_prompt)
         async with self.sessions() as session:
             state = await get_conversation_automation_state(
                 session, user_id=42, dialogue_id=1, topic_id=None

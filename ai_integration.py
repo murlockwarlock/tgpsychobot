@@ -21,7 +21,6 @@ from database import (async_session_maker, AIConfig, Message as DBMessage, User,
                      UserSubscription, KnowledgeBase, SubscriptionConfig, AILog)
 from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
-    DATA_PROTOCOL_INSTRUCTION,
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
     DEFAULT_SHORT_RESPONSE_INSTRUCTION,
     build_test_context_injection,
@@ -1344,7 +1343,6 @@ async def get_ai_response(
             prompt_parts.append(shared_prompt_block)
         if service_prompt_block:
             prompt_parts.append(service_prompt_block)
-        prompt_parts.append(DATA_PROTOCOL_INSTRUCTION)
         system_prompt = "\n\n".join(part for part in prompt_parts if part)
 
         final_history, global_memory_context = _build_memory_aware_history(
