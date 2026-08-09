@@ -497,7 +497,13 @@ async def build_runtime_context(
     )
 
 
-async def generate_response(user_id: int, user_prompt: str, bot=None) -> str:
+async def generate_response(
+    user_id: int,
+    user_prompt: str,
+    bot=None,
+    *,
+    response_capture: dict | None = None,
+) -> str:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
@@ -512,7 +518,14 @@ async def generate_response(user_id: int, user_prompt: str, bot=None) -> str:
         user_name = user.name if user.name else "Незнакомец"
         user_gender = user.gender if user.gender else "unknown"
 
-    return await get_ai_response(user_id, user_prompt, user_name, user_gender, bot=bot)
+    return await get_ai_response(
+        user_id,
+        user_prompt,
+        user_name,
+        user_gender,
+        bot=bot,
+        response_capture=response_capture,
+    )
 
 
 async def _call_gemini_api(api_key: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, timeout: float = 60.0, request_capture: dict | None = None) -> str:
@@ -1122,6 +1135,7 @@ async def get_ai_response(
     dialogue_id_override: int | None = None,
     include_test_context: bool = True,
     persist_service_data: bool = True,
+    response_capture: dict | None = None,
 ) -> str:
     async with async_session_maker() as session:
         user_result = await session.execute(
@@ -1440,6 +1454,12 @@ async def get_ai_response(
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
         visible_text, service_blocks, invalid_data_blocks = extract_service_data(response_text)
+        if response_capture is not None:
+            response_capture.clear()
+            response_capture.update({
+                "raw_response": response_text,
+                "visible_text": visible_text,
+            })
         if invalid_data_blocks:
             logging.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
 

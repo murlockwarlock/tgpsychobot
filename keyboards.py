@@ -1750,7 +1750,7 @@ def admin_ai_logs_keyboard(logs, page: int, total_pages: int, filter_user_id: in
         text="📦 Скачать пакет логов",
         callback_data=f"export_ai_logs_{filter_user_id or 0}_{period}",
     ))
-    back_cb = f"admin_client_profile_{filter_user_id}" if filter_user_id else "admin_ai_settings"
+    back_cb = f"view_client_{filter_user_id}" if filter_user_id else "admin_ai_settings"
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb))
     return builder.as_markup()
 

@@ -1141,7 +1141,14 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
     try:
-        response_text = await ai_integration.generate_response(user_id, full_text, bot=bot)
+        response_capture = {}
+        response_text = await ai_integration.generate_response(
+            user_id,
+            full_text,
+            bot=bot,
+            response_capture=response_capture,
+        )
+        ai_context_content = response_capture.get("raw_response") or response_text
         typing_task.cancel()
 
         should_start_test, directive_clean_text = extract_test_start_directive(response_text)
@@ -1158,7 +1165,14 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 user = await session.get(User, user_id)
                 if user:
                     session.add(DBMessage(user_id=user.id, role='user', content=full_text, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
-                    session.add(DBMessage(user_id=user.id, role='assistant', content=directive_clean_text, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                    session.add(DBMessage(
+                        user_id=user.id,
+                        role='assistant',
+                        content=directive_clean_text,
+                        ai_context_content=ai_context_content,
+                        dialogue_id=user.current_dialogue_id,
+                        topic_id=user.current_topic_id,
+                    ))
                     await session.commit()
 
             await _start_test_from_ai_directive(bot, user_id, state)
@@ -1356,7 +1370,14 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
 
             if user:
                 session.add(DBMessage(user_id=user.id, role='user', content=full_text, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
-                session.add(DBMessage(user_id=user.id, role='assistant', content=response_text, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                session.add(DBMessage(
+                    user_id=user.id,
+                    role='assistant',
+                    content=response_text,
+                    ai_context_content=ai_context_content,
+                    dialogue_id=user.current_dialogue_id,
+                    topic_id=user.current_topic_id,
+                ))
                 if drawn_cards_info:
                     cards_text = "; ".join(drawn_cards_info)
                     card_system_msg = f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]"
@@ -14927,7 +14948,14 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     pass
 
             session.add(DBMessage(user_id=user_id, role='user', content="[Фото для анализа]", dialogue_id=user.current_dialogue_id, topic_id=current_topic_id))
-            session.add(DBMessage(user_id=user_id, role='assistant', content=visible_text, dialogue_id=user.current_dialogue_id, topic_id=current_topic_id))
+            session.add(DBMessage(
+                user_id=user_id,
+                role='assistant',
+                content=visible_text,
+                ai_context_content=analysis_result,
+                dialogue_id=user.current_dialogue_id,
+                topic_id=current_topic_id,
+            ))
             await session.commit()
 
     except AIServiceError as e:

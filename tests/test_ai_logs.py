@@ -60,6 +60,7 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("⏮ В начало", "admin_user_ai_logs_777_0_7d"), pairs)
         self.assertIn(("В конец ⏭", "admin_user_ai_logs_777_4_7d"), pairs)
         self.assertIn(("📦 Скачать пакет логов", "export_ai_logs_777_7d"), pairs)
+        self.assertIn(("⬅️ Назад", "view_client_777"), pairs)
         self.assertTrue(any(text == "✅ 7 дней" for text, _ in pairs))
 
         ai_settings_buttons = [button.text for row in ai_settings_keyboard("KIE").inline_keyboard for button in row]

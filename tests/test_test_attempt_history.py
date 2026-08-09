@@ -274,6 +274,20 @@ class TestAttemptHistoryTests(unittest.IsolatedAsyncioTestCase):
         result = next(message for message in selected if "Итог теста" in message.content)
         self.assertEqual(result.role, "user")
 
+    def test_assistant_raw_context_is_used_without_changing_visible_history(self):
+        message = SimpleNamespace(
+            role="assistant",
+            content="Видимый ответ",
+            ai_context_content='Видимый ответ\n<DATA>{"current_step":"wish"}</DATA>',
+            topic_id=None,
+            topic=None,
+        )
+
+        selected = select_ai_history_messages([message], limit_first=5, limit_recent=15)
+
+        self.assertEqual(selected[0].content, message.ai_context_content)
+        self.assertEqual(message.content, "Видимый ответ")
+
     async def test_backfills_existing_attempt_into_history_once(self):
         async with self.sessions() as session:
             session.add(DBTestAttempt(

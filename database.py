@@ -131,6 +131,9 @@ class Message(Base):
     dialogue_id = Column(Integer, default=1, nullable=False)
     role = Column(String)
     content = Column(Text)
+    # Exact assistant output for the next AI request. ``content`` remains the
+    # user-visible history, while this field may retain hidden service blocks.
+    ai_context_content = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     user = relationship("User", back_populates="messages")
     topic_id = Column(Integer, ForeignKey('topics.id'), nullable=True)
@@ -697,6 +700,8 @@ async def init_db():
             """))
 
             message_columns = [c['name'] for c in insp.get_columns('messages')]
+            if 'ai_context_content' not in message_columns:
+                sync_conn.execute(text("ALTER TABLE messages ADD COLUMN ai_context_content TEXT"))
             if 'test_attempt_id' not in message_columns:
                 sync_conn.execute(text(
                     "ALTER TABLE messages ADD COLUMN test_attempt_id INTEGER "
