@@ -109,12 +109,14 @@ def render_message_template(
         return html.escape(raw) if escape_values else raw
 
     rendered = _METADATA_PLACEHOLDER_RE.sub(replace_metadata, template or "")
+    display_name = clean(user.name or user.first_name)
     replacements = {
         "{event}": clean(event.name),
         "{current_step}": clean(state.get("current_step")),
         "{user_id}": str(user.id),
         "{username}": clean(f"@{user.username}") if user.username else "",
-        "{name}": clean(user.name or user.first_name),
+        "{name}": display_name,
+        "{user}": display_name,
         "{dialogue_id}": str(event.dialogue_id),
         "{topic_id}": str(event.topic_id),
     }

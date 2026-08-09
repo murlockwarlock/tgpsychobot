@@ -69,11 +69,11 @@ class AutomationEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handler_matches(handler, event))
         self.assertEqual(
             render_message_template(
-                "{name} {event} {current_step} {metadata.profile.city}",
+                "{name} {user} {event} {current_step} {metadata.profile.city}",
                 event=event,
                 user=user,
             ),
-            "Иван LEAD_READY CONSULTATION Москва",
+            "Иван Иван LEAD_READY CONSULTATION Москва",
         )
 
     async def test_successful_action_is_idempotent(self):

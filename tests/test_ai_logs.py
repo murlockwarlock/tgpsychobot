@@ -6,7 +6,7 @@ os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from database import AILog, User, async_session_maker, engine, init_db
-from keyboards import admin_ai_log_detail_keyboard, admin_ai_logs_keyboard
+from keyboards import admin_ai_log_detail_keyboard, admin_ai_logs_keyboard, admin_panel_keyboard, ai_settings_keyboard
 
 
 class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
@@ -22,6 +22,7 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
                 provider="KIE",
                 model="gemini-3-flash",
                 prompt_summary="Какой типаж?",
+                request_payload='{"payload":{"temperature":0.1,"messages":[]}}',
                 raw_response="[Дальше](btn:after_photo)\n<DATA>{}</DATA>",
                 clean_text="Дальше",
                 latency_ms=1200,
@@ -34,6 +35,7 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fetched.provider, "KIE")
             self.assertEqual(fetched.model, "gemini-3-flash")
             self.assertEqual(fetched.latency_ms, 1200)
+            self.assertIn('"temperature":0.1', fetched.request_payload)
 
     def test_ai_log_keyboards_structure(self):
         fake_log = AILog(id=1, provider="Deepseek", model="deepseek-chat", latency_ms=850)
@@ -44,3 +46,17 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
         detail_markup = admin_ai_log_detail_keyboard(1, page=0)
         detail_buttons = [b.text for row in detail_markup.inline_keyboard for b in row]
         self.assertIn("📄 Скачать .txt файл лога", detail_buttons)
+
+    def test_log_navigation_filters_export_and_settings_location(self):
+        fake_log = AILog(id=9, provider="KIE", model="gemini", latency_ms=100)
+        markup = admin_ai_logs_keyboard([fake_log], page=2, total_pages=5, filter_user_id=777, period="7d")
+        pairs = [(button.text, button.callback_data) for row in markup.inline_keyboard for button in row]
+        self.assertIn(("⏮ В начало", "admin_user_ai_logs_777_0_7d"), pairs)
+        self.assertIn(("В конец ⏭", "admin_user_ai_logs_777_4_7d"), pairs)
+        self.assertIn(("📦 Скачать пакет логов", "export_ai_logs_777_7d"), pairs)
+        self.assertTrue(any(text == "✅ 7 дней" for text, _ in pairs))
+
+        ai_settings_buttons = [button.text for row in ai_settings_keyboard("KIE").inline_keyboard for button in row]
+        admin_panel_buttons = [button.text for row in admin_panel_keyboard().inline_keyboard for button in row]
+        self.assertIn("📜 Логи запросов ИИ", ai_settings_buttons)
+        self.assertNotIn("📜 Логи ИИ", admin_panel_buttons)

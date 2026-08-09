@@ -9,6 +9,7 @@ import traceback
 import textwrap
 import json
 import zipfile
+import time
 from types import SimpleNamespace
 import ai_integration
 import keyboards
@@ -82,7 +83,7 @@ from mailing_utils import (
     render_mailing_text,
     send_mailing_content,
 )
-from prompt_blocks import DATA_PROTOCOL_INSTRUCTION, DEFAULT_SERVICE_PROMPT_TEMPLATE
+from prompt_blocks import DATA_PROTOCOL_INSTRUCTION, DEFAULT_SERVICE_PROMPT_TEMPLATE, render_prompt_block
 from provider_models import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MODELS
 from user_metadata import append_metadata_records, extract_data_blocks, extract_service_data, load_metadata_records
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary
@@ -4433,8 +4434,10 @@ async def cmd_last_ai_log(message: Message):
 async def callback_admin_ai_logs(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id):
         return
-    page = int(callback.data.split("_")[-1])
-    await show_ai_logs_list(callback, page=page)
+    parts = callback.data.split("_")
+    page = int(parts[3])
+    period = parts[4] if len(parts) > 4 else "all"
+    await show_ai_logs_list(callback, page=page, period=period)
 
 
 @router.callback_query(F.data.startswith("admin_user_ai_logs_"))
@@ -4444,15 +4447,44 @@ async def callback_admin_user_ai_logs(callback: CallbackQuery):
     parts = callback.data.split("_")
     user_id = int(parts[4])
     page = int(parts[5])
-    await show_ai_logs_list(callback, page=page, filter_user_id=user_id)
+    period = parts[6] if len(parts) > 6 else "all"
+    await show_ai_logs_list(callback, page=page, filter_user_id=user_id, period=period)
 
 
-async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filter_user_id: int | None = None):
+AI_LOG_PERIOD_LABELS = {
+    "all": "всё время",
+    "today": "сегодня",
+    "7d": "7 дней",
+    "30d": "30 дней",
+}
+
+
+def _ai_log_period_start(period: str) -> datetime | None:
+    now_utc = datetime.utcnow()
+    if period == "today":
+        now_msk = now_utc + timedelta(hours=3)
+        return now_msk.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=3)
+    if period == "7d":
+        return now_utc - timedelta(days=7)
+    if period == "30d":
+        return now_utc - timedelta(days=30)
+    return None
+
+
+def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str):
+    if filter_user_id:
+        query = query.where(AILog.user_id == filter_user_id)
+    period_start = _ai_log_period_start(period)
+    if period_start is not None:
+        query = query.where(AILog.created_at >= period_start)
+    return query
+
+
+async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filter_user_id: int | None = None, period: str = "all"):
     PER_PAGE = 8
+    period = period if period in AI_LOG_PERIOD_LABELS else "all"
     async with async_session_maker() as session:
-        query = select(AILog)
-        if filter_user_id:
-            query = query.where(AILog.user_id == filter_user_id)
+        query = _apply_ai_log_filters(select(AILog), filter_user_id=filter_user_id, period=period)
 
         count_query = select(func.count()).select_from(query.subquery())
         total_count = (await session.execute(count_query)).scalar() or 0
@@ -4464,7 +4496,7 @@ async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filte
 
     if not logs:
         text = "📜 <b>Логи вызовов ИИ пусты.</b>"
-        markup = kb.admin_ai_logs_keyboard([], page=0, total_pages=1, filter_user_id=filter_user_id)
+        markup = kb.admin_ai_logs_keyboard([], page=0, total_pages=1, filter_user_id=filter_user_id, period=period)
         if isinstance(event, CallbackQuery):
             await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         else:
@@ -4472,9 +4504,13 @@ async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filte
         return
 
     filter_text = f" пользователя <code>ID {filter_user_id}</code>" if filter_user_id else ""
-    header = f"📜 <b>Логи вызовов ИИ{filter_text}</b> (Стр. {page + 1}/{total_pages})\n\nВсего вызовов: <b>{total_count}</b>\nВыберите запись:"
+    header = (
+        f"📜 <b>Логи вызовов ИИ{filter_text}</b> (Стр. {page + 1}/{total_pages})\n\n"
+        f"Период: <b>{AI_LOG_PERIOD_LABELS[period]}</b>\n"
+        f"Всего вызовов: <b>{total_count}</b>\nВыберите запись:"
+    )
 
-    markup = kb.admin_ai_logs_keyboard(logs, page=page, total_pages=total_pages, filter_user_id=filter_user_id)
+    markup = kb.admin_ai_logs_keyboard(logs, page=page, total_pages=total_pages, filter_user_id=filter_user_id, period=period)
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(header, reply_markup=markup, parse_mode="HTML")
     else:
@@ -4492,11 +4528,12 @@ async def callback_admin_ai_log_detail(callback: CallbackQuery):
         return
     log_id = int(parts[3])
     page = int(parts[4]) if len(parts) > 4 else 0
-    filter_user_id = int(parts[5]) if len(parts) > 5 else None
-    await show_ai_log_detail(callback, log_id, page=page, filter_user_id=filter_user_id)
+    filter_user_id = int(parts[5]) if len(parts) > 5 and int(parts[5]) else None
+    period = parts[6] if len(parts) > 6 else "all"
+    await show_ai_log_detail(callback, log_id, page=page, filter_user_id=filter_user_id, period=period)
 
 
-async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: int = 0, filter_user_id: int | None = None):
+async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: int = 0, filter_user_id: int | None = None, period: str = "all"):
     async with async_session_maker() as session:
         log_entry = await session.get(AILog, log_id)
         if not log_entry:
@@ -4516,9 +4553,10 @@ async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: 
 
     lat_text = f"{log_entry.latency_ms / 1000:.2f} сек" if log_entry.latency_ms else "не измерялось"
     dt_str = format_msk(log_entry.created_at, "%d-%m-%Y %H:%M:%S МСК")
-    prompt_str = html.escape(log_entry.prompt_summary or "без текста")
-    if len(prompt_str) > 300:
-        prompt_str = prompt_str[:300] + "..."
+    request_preview = log_entry.request_payload or log_entry.prompt_summary or "без текста"
+    prompt_str = html.escape(request_preview)
+    if len(prompt_str) > 1200:
+        prompt_str = prompt_str[:1200] + "..."
 
     raw_resp = log_entry.raw_response or ""
     display_raw = html.escape(raw_resp)
@@ -4532,26 +4570,20 @@ async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: 
         f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model)}</code>\n"
         f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
         f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
-        f"💬 <b>Промпт/Вход (превью):</b>\n<i>{prompt_str}</i>\n\n"
+        f"📤 <b>Полный payload запроса (превью):</b>\n<code>{prompt_str}</code>\n\n"
         f"📥 <b>Сырой ответ модели (Raw LLM Output):</b>\n"
         f"<code>{display_raw}</code>"
     )
 
-    markup = kb.admin_ai_log_detail_keyboard(log_id, page=page, filter_user_id=filter_user_id)
+    markup = kb.admin_ai_log_detail_keyboard(log_id, page=page, filter_user_id=filter_user_id, period=period)
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     else:
         await event.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
-async def send_ai_log_file(callback: CallbackQuery, log_id: int):
-    async with async_session_maker() as session:
-        log_entry = await session.get(AILog, log_id)
-        if not log_entry:
-            await callback.answer("Запись не найдена.", show_alert=True)
-            return
-
-    content = (
+def _build_ai_log_file_content(log_entry: AILog) -> str:
+    return (
         f"========================================\n"
         f"AI LOG RECORD #{log_entry.id}\n"
         f"========================================\n"
@@ -4561,9 +4593,9 @@ async def send_ai_log_file(callback: CallbackQuery, log_id: int):
         f"Model: {log_entry.model}\n"
         f"Latency: {log_entry.latency_ms} ms\n"
         f"========================================\n\n"
-        f"📥 [1] PROMPT / INPUT REQUEST:\n"
+        f"📤 [1] FULL REQUEST PAYLOAD:\n"
         f"----------------------------------------\n"
-        f"{log_entry.prompt_summary or ''}\n\n"
+        f"{log_entry.request_payload or log_entry.prompt_summary or ''}\n\n"
         f"========================================\n"
         f"🤖 [2] RAW RESPONSE FROM LLM:\n"
         f"----------------------------------------\n"
@@ -4573,10 +4605,65 @@ async def send_ai_log_file(callback: CallbackQuery, log_id: int):
         f"----------------------------------------\n"
         f"{log_entry.clean_text or ''}\n"
     )
+
+
+async def send_ai_log_file(callback: CallbackQuery, log_id: int):
+    async with async_session_maker() as session:
+        log_entry = await session.get(AILog, log_id)
+        if not log_entry:
+            await callback.answer("Запись не найдена.", show_alert=True)
+            return
+
+    content = _build_ai_log_file_content(log_entry)
     file_bytes = content.encode("utf-8")
     filename = f"ai_log_{log_id}_{log_entry.provider}_{log_entry.model}.txt"
     input_file = BufferedInputFile(file_bytes, filename=filename)
     await callback.message.answer_document(document=input_file, caption=f"📄 Полный сырой лог ИИ #{log_id}")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("export_ai_logs_"))
+async def export_ai_logs_package(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    parts = callback.data.split("_")
+    filter_user_id = int(parts[3]) or None
+    period = parts[4] if len(parts) > 4 and parts[4] in AI_LOG_PERIOD_LABELS else "all"
+    async with async_session_maker() as session:
+        stmt = _apply_ai_log_filters(
+            select(AILog).order_by(AILog.created_at.desc()),
+            filter_user_id=filter_user_id,
+            period=period,
+        )
+        logs = (await session.execute(stmt)).scalars().all()
+    if not logs:
+        await callback.answer("По выбранному фильтру логов нет.", show_alert=True)
+        return
+
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        manifest = []
+        for log_entry in logs:
+            safe_provider = re.sub(r"[^A-Za-z0-9_.-]+", "_", log_entry.provider or "provider")
+            filename = f"ai_log_{log_entry.id}_{safe_provider}.txt"
+            archive.writestr(filename, _build_ai_log_file_content(log_entry))
+            manifest.append({
+                "id": log_entry.id,
+                "created_at": log_entry.created_at.isoformat() if log_entry.created_at else None,
+                "user_id": log_entry.user_id,
+                "provider": log_entry.provider,
+                "model": log_entry.model,
+                "latency_ms": log_entry.latency_ms,
+                "file": filename,
+            })
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    archive_buffer.seek(0)
+    user_suffix = f"_user_{filter_user_id}" if filter_user_id else ""
+    filename = f"ai_logs_{period}{user_suffix}_{datetime.utcnow():%Y%m%d_%H%M%S}.zip"
+    await callback.message.answer_document(
+        BufferedInputFile(archive_buffer.getvalue(), filename=filename),
+        caption=f"📦 Логи ИИ: {len(logs)} шт., период — {AI_LOG_PERIOD_LABELS[period]}",
+    )
     await callback.answer()
 
 
@@ -5327,9 +5414,11 @@ async def view_client_metadata(callback: CallbackQuery):
     buttons = []
     navigation = []
     if page > 0:
+        navigation.append(InlineKeyboardButton(text="⏮ В начало", callback_data=f"client_metadata_{client_id}_0"))
         navigation.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"client_metadata_{client_id}_{page - 1}"))
     if page < len(pages) - 1:
         navigation.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"client_metadata_{client_id}_{page + 1}"))
+        navigation.append(InlineKeyboardButton(text="В конец ⏭", callback_data=f"client_metadata_{client_id}_{len(pages) - 1}"))
     if navigation:
         buttons.append(navigation)
     buttons.append([InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")])
@@ -5415,10 +5504,12 @@ async def view_client_merged_metadata(callback: CallbackQuery):
         if total_states > 1:
             nav_buttons = []
             if page > 0:
+                nav_buttons.append(InlineKeyboardButton(text="⏮ В начало", callback_data=f"client_merged_metadata_{client_id}_0"))
                 nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"client_merged_metadata_{client_id}_{page - 1}"))
             nav_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_states}", callback_data="noop"))
             if page < total_states - 1:
                 nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"client_merged_metadata_{client_id}_{page + 1}"))
+                nav_buttons.append(InlineKeyboardButton(text="В конец ⏭", callback_data=f"client_merged_metadata_{client_id}_{total_states - 1}"))
             builder.row(*nav_buttons)
 
         builder.row(InlineKeyboardButton(text="📥 Скачать все диалоги (.json)", callback_data=f"run_metadata_export_merged_{client_id}"))
@@ -14683,22 +14774,28 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 user.current_topic.system_prompt if user.current_topic else None
             )
             shared_prompt_block = (getattr(ai_config, 'shared_prompt_block', "") or "").strip()
-            base_prompt_parts = [part for part in [system_prompt_text.strip(), shared_prompt_block] if part]
+            service_prompt_template = getattr(ai_config, 'service_prompt_block', None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
+            service_prompt_block = render_prompt_block(
+                service_prompt_template,
+                available_media_text="[список передан в служебном контексте]",
+                test_context_injection="[контекст теста передан в служебном контексте]",
+                short_response_instruction="[режим длины передан в служебном контексте]",
+            )
+            base_prompt_parts = [
+                part for part in [
+                    system_prompt_text.strip(),
+                    shared_prompt_block,
+                    service_prompt_block,
+                    DATA_PROTOCOL_INSTRUCTION,
+                ] if part
+            ]
             base_prompt_text = "\n\n".join(base_prompt_parts)
 
             if not base_prompt_text:
                 base_prompt_text = "Ты — профессиональный эксперт. Проанализируй это изображение максимально подробно."
 
-            subscription_context = ""
-            subscription_flag = active_subscription_flag(sub_config, user.subscription)
-            if subscription_flag:
-                subscription_context = (
-                    f"ДАННЫЕ КЛИЕНТА:\n"
-                    f"{subscription_flag}\n\n"
-                )
-
             system_prompt = (
-                f"{subscription_context}{base_prompt_text}\n\n"
+                f"{base_prompt_text}\n\n"
                 "ИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"
                 "1. Если пользователь просит ИЗМЕНИТЬ это фото или 'сделать так же', добавь в конце: EDIT_IMG: <prompt on english>.\n"
                 "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"
@@ -14715,22 +14812,42 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 stmt = stmt.where(DBMessage.topic_id == current_topic_id)
             stmt = stmt.options(selectinload(DBMessage.topic)).order_by(DBMessage.timestamp.asc())
             result = await session.execute(stmt)
-            history = result.scalars().all()
+            history = ai_integration.select_ai_history_messages(
+                result.scalars().all(),
+                getattr(ai_config, "context_limit_first", 2) or 2,
+                getattr(ai_config, "context_limit_recent", 10) or 10,
+            )
             history, global_memory_context = ai_integration._build_memory_aware_history(
                 history,
                 current_topic_id,
                 user.current_topic.name if user.current_topic else None,
                 memory_mode,
             )
-            if global_memory_context:
-                system_prompt = f"{system_prompt}\n\n{global_memory_context}"
+            request_context = await ai_integration.build_runtime_user_message(
+                session,
+                user=user,
+                dialogue_id=user.current_dialogue_id,
+                topic_id=current_topic_id,
+                user_message="[Фото для анализа]",
+                subscription_config=sub_config,
+                global_memory_context=global_memory_context,
+            )
 
             photo = message.photo[-1]
             file_info = await bot.get_file(photo.file_id)
             file_content = await bot.download_file(file_info.file_path)
             image_bytes = file_content.read()
 
-            analysis_result = await ai_integration.analyze_image_content(image_bytes, system_prompt, history=history)
+            request_capture = {}
+            started_at = time.monotonic()
+            analysis_result = await ai_integration.analyze_image_content(
+                image_bytes,
+                system_prompt,
+                history=history,
+                request_context=request_context,
+                request_capture=request_capture,
+            )
+            latency_ms = int((time.monotonic() - started_at) * 1000)
 
             visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
             if service_blocks:
@@ -14754,9 +14871,10 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     provider=getattr(ai_config, "vision_provider", "Vision") or "Vision",
                     model=getattr(ai_config, "vision_model", "Vision") or "Vision",
                     prompt_summary="[Анализ изображения]",
+                    request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2),
                     raw_response=analysis_result,
                     clean_text=visible_text,
-                    latency_ms=0,
+                    latency_ms=latency_ms,
                 )
                 session.add(ai_log)
                 await session.commit()
@@ -14820,7 +14938,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     pass
 
             session.add(DBMessage(user_id=user_id, role='user', content="[Фото для анализа]", dialogue_id=user.current_dialogue_id, topic_id=current_topic_id))
-            session.add(DBMessage(user_id=user_id, role='assistant', content=clean_text, dialogue_id=user.current_dialogue_id, topic_id=current_topic_id))
+            session.add(DBMessage(user_id=user_id, role='assistant', content=visible_text, dialogue_id=user.current_dialogue_id, topic_id=current_topic_id))
             await session.commit()
 
     except AIServiceError as e:

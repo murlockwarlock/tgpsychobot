@@ -110,6 +110,7 @@ class AILog(Base):
     provider = Column(String, nullable=False)
     model = Column(String, nullable=False)
     prompt_summary = Column(Text, nullable=True)
+    request_payload = Column(Text, nullable=True)
     raw_response = Column(Text, nullable=False)
     clean_text = Column(Text, nullable=True)
     latency_ms = Column(Integer, nullable=True)
@@ -605,6 +606,10 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN metadata_json TEXT DEFAULT '{}' NOT NULL"))
             if 'ai_debug_enabled' not in user_columns:
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN ai_debug_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
+
+            ai_log_columns = [c['name'] for c in insp.get_columns('ai_logs')]
+            if 'request_payload' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN request_payload TEXT"))
 
             ai_columns = [c['name'] for c in insp.get_columns('ai_config')]
             if 'memory_mode' not in ai_columns:
