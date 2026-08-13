@@ -1135,6 +1135,7 @@ async def get_ai_response(
     dialogue_id_override: int | None = None,
     include_test_context: bool = True,
     persist_service_data: bool = True,
+    request_type: str = "chat",
     response_capture: dict | None = None,
 ) -> str:
     async with async_session_maker() as session:
@@ -1465,6 +1466,7 @@ async def get_ai_response(
 
         ai_log = AILog(
             user_id=user_id,
+            request_type=(request_type or "chat").strip().lower(),
             provider=actual_provider,
             model=actual_model,
             prompt_summary=user_prompt if user_prompt else None,

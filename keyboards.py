@@ -1718,17 +1718,29 @@ def admin_referral_template_input_cancel_keyboard():
     return builder.as_markup()
 
 
-def admin_ai_logs_keyboard(logs, page: int, total_pages: int, filter_user_id: int | None = None, period: str = "all"):
+def admin_ai_logs_keyboard(
+    logs,
+    page: int,
+    total_pages: int,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+):
+    request_type = request_type if request_type in {"all", "chat", "followup"} else "all"
+
     def list_callback(target_page: int) -> str:
+        suffix = f"_{request_type}" if request_type != "all" else ""
         if filter_user_id:
-            return f"admin_user_ai_logs_{filter_user_id}_{target_page}_{period}"
-        return f"admin_ai_logs_{target_page}_{period}"
+            return f"admin_user_ai_logs_{filter_user_id}_{target_page}_{period}{suffix}"
+        return f"admin_ai_logs_{target_page}_{period}{suffix}"
 
     builder = InlineKeyboardBuilder()
     for log in logs:
         lat_text = f" ({log.latency_ms / 1000:.1f}s)" if log.latency_ms else ""
         btn_text = f"#{log.id} | {log.provider}: {log.model}{lat_text}"
         cb = f"admin_ai_log_{log.id}_{page}_{filter_user_id or 0}_{period}"
+        if request_type != "all":
+            cb += f"_{request_type}"
         builder.button(text=btn_text[:60], callback_data=cb)
 
     builder.adjust(1)
@@ -1736,29 +1748,57 @@ def admin_ai_logs_keyboard(logs, page: int, total_pages: int, filter_user_id: in
         builder.row(*navigation_row)
 
     period_labels = (("Сегодня", "today"), ("7 дней", "7d"), ("30 дней", "30d"), ("Все", "all"))
+    type_suffix = f"_{request_type}" if request_type != "all" else ""
     builder.row(*[
         InlineKeyboardButton(
             text=("✅ " if value == period else "") + label,
             callback_data=(
-                f"admin_user_ai_logs_{filter_user_id}_0_{value}"
-                if filter_user_id else f"admin_ai_logs_0_{value}"
+                f"admin_user_ai_logs_{filter_user_id}_0_{value}{type_suffix}"
+                if filter_user_id else f"admin_ai_logs_0_{value}{type_suffix}"
             ),
         )
         for label, value in period_labels
     ])
+    type_labels = (("Все типы", "all"), ("Обычные", "chat"), ("Догоняющие", "followup"))
+    builder.row(*[
+        InlineKeyboardButton(
+            text=("✅ " if value == request_type else "") + label,
+            callback_data=(
+                f"admin_user_ai_logs_{filter_user_id}_0_{period}"
+                if filter_user_id and value == "all"
+                else f"admin_ai_logs_0_{period}"
+                if not filter_user_id and value == "all"
+                else f"admin_user_ai_logs_{filter_user_id}_0_{period}_{value}"
+                if filter_user_id
+                else f"admin_ai_logs_0_{period}_{value}"
+            ),
+        )
+        for label, value in type_labels
+    ])
     builder.row(InlineKeyboardButton(
         text="📦 Скачать пакет логов",
-        callback_data=f"export_ai_logs_{filter_user_id or 0}_{period}",
+        callback_data=f"export_ai_logs_{filter_user_id or 0}_{period}{type_suffix}",
     ))
     back_cb = f"view_client_{filter_user_id}" if filter_user_id else "admin_ai_settings"
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb))
     return builder.as_markup()
 
 
-def admin_ai_log_detail_keyboard(log_id: int, page: int = 0, filter_user_id: int | None = None, period: str = "all"):
+def admin_ai_log_detail_keyboard(
+    log_id: int,
+    page: int = 0,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+):
     builder = InlineKeyboardBuilder()
     builder.button(text="📄 Скачать .txt файл лога", callback_data=f"admin_ai_log_file_{log_id}")
-    back_cb = f"admin_user_ai_logs_{filter_user_id}_{page}_{period}" if filter_user_id else f"admin_ai_logs_{page}_{period}"
+    suffix = f"_{request_type}" if request_type != "all" else ""
+    back_cb = (
+        f"admin_user_ai_logs_{filter_user_id}_{page}_{period}{suffix}"
+        if filter_user_id
+        else f"admin_ai_logs_{page}_{period}{suffix}"
+    )
     builder.button(text="⬅️ Назад к логам", callback_data=back_cb)
     builder.adjust(1)
     return builder.as_markup()

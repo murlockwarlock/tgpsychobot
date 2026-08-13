@@ -16,9 +16,12 @@ from database import (
     FollowupCampaign,
     FollowupDelivery,
     FollowupRun,
+    Message as DBMessage,
     User,
     async_session_maker,
 )
+from response_buttons import extract_response_buttons
+from user_metadata import extract_service_data
 
 
 log = logging.getLogger(__name__)
@@ -220,6 +223,7 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
                     from ai_integration import get_ai_response
 
                     instruction = (
+                        "[Служебная команда системы]: Пользователь замолчал.\n"
                         "Сформируй одно догоняющее сообщение после паузы пользователя. "
                         "Не упоминай автоматизацию и не добавляй блок DATA.\n\n"
                         + (step.ai_instruction or "Мягко верни пользователя к текущему диалогу.")
@@ -233,11 +237,22 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
                         topic_id_override=None if run.topic_id == 0 else run.topic_id,
                         dialogue_id_override=run.dialogue_id,
                         persist_service_data=False,
+                        request_type="followup",
                     )
                     if not text:
                         raise ValueError("AI вернул пустое догоняющее сообщение")
                     from handlers import _send_generated_response
+                    visible_text, _, _ = extract_service_data(text)
+                    history_text, _ = extract_response_buttons(visible_text)
                     await _send_generated_response(bot, run.user_id, text)
+                    session.add(DBMessage(
+                        user_id=run.user_id,
+                        role="assistant",
+                        content=history_text or "Выберите действие:",
+                        ai_context_content=text,
+                        dialogue_id=run.dialogue_id,
+                        topic_id=None if run.topic_id == 0 else run.topic_id,
+                    ))
                     telegram_message_id = None
                 else:
                     text = (step.message_text or "").strip()
@@ -245,6 +260,13 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
                         raise ValueError("Пустой текст догоняющего сообщения")
                     sent = await bot.send_message(run.user_id, text)
                     telegram_message_id = getattr(sent, "message_id", None)
+                    session.add(DBMessage(
+                        user_id=run.user_id,
+                        role="assistant",
+                        content=text,
+                        dialogue_id=run.dialogue_id,
+                        topic_id=None if run.topic_id == 0 else run.topic_id,
+                    ))
                 session.add(FollowupDelivery(
                     run_id=run.id,
                     step_id=step.id,

@@ -4458,7 +4458,8 @@ async def callback_admin_ai_logs(callback: CallbackQuery):
     parts = callback.data.split("_")
     page = int(parts[3])
     period = parts[4] if len(parts) > 4 else "all"
-    await show_ai_logs_list(callback, page=page, period=period)
+    request_type = parts[5] if len(parts) > 5 else "all"
+    await show_ai_logs_list(callback, page=page, period=period, request_type=request_type)
 
 
 @router.callback_query(F.data.startswith("admin_user_ai_logs_"))
@@ -4469,7 +4470,14 @@ async def callback_admin_user_ai_logs(callback: CallbackQuery):
     user_id = int(parts[4])
     page = int(parts[5])
     period = parts[6] if len(parts) > 6 else "all"
-    await show_ai_logs_list(callback, page=page, filter_user_id=user_id, period=period)
+    request_type = parts[7] if len(parts) > 7 else "all"
+    await show_ai_logs_list(
+        callback,
+        page=page,
+        filter_user_id=user_id,
+        period=period,
+        request_type=request_type,
+    )
 
 
 AI_LOG_PERIOD_LABELS = {
@@ -4477,6 +4485,12 @@ AI_LOG_PERIOD_LABELS = {
     "today": "сегодня",
     "7d": "7 дней",
     "30d": "30 дней",
+}
+
+AI_LOG_TYPE_LABELS = {
+    "all": "все типы",
+    "chat": "обычные запросы",
+    "followup": "догоняющие",
 }
 
 
@@ -4492,20 +4506,34 @@ def _ai_log_period_start(period: str) -> datetime | None:
     return None
 
 
-def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str):
+def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str, request_type: str = "all"):
     if filter_user_id:
         query = query.where(AILog.user_id == filter_user_id)
     period_start = _ai_log_period_start(period)
     if period_start is not None:
         query = query.where(AILog.created_at >= period_start)
+    if request_type in AI_LOG_TYPE_LABELS and request_type != "all":
+        query = query.where(AILog.request_type == request_type)
     return query
 
 
-async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filter_user_id: int | None = None, period: str = "all"):
+async def show_ai_logs_list(
+    event: Message | CallbackQuery,
+    page: int = 0,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+):
     PER_PAGE = 8
     period = period if period in AI_LOG_PERIOD_LABELS else "all"
+    request_type = request_type if request_type in AI_LOG_TYPE_LABELS else "all"
     async with async_session_maker() as session:
-        query = _apply_ai_log_filters(select(AILog), filter_user_id=filter_user_id, period=period)
+        query = _apply_ai_log_filters(
+            select(AILog),
+            filter_user_id=filter_user_id,
+            period=period,
+            request_type=request_type,
+        )
 
         count_query = select(func.count()).select_from(query.subquery())
         total_count = (await session.execute(count_query)).scalar() or 0
@@ -4517,7 +4545,14 @@ async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filte
 
     if not logs:
         text = "📜 <b>Логи вызовов ИИ пусты.</b>"
-        markup = kb.admin_ai_logs_keyboard([], page=0, total_pages=1, filter_user_id=filter_user_id, period=period)
+        markup = kb.admin_ai_logs_keyboard(
+            [],
+            page=0,
+            total_pages=1,
+            filter_user_id=filter_user_id,
+            period=period,
+            request_type=request_type,
+        )
         if isinstance(event, CallbackQuery):
             await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         else:
@@ -4528,10 +4563,18 @@ async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filte
     header = (
         f"📜 <b>Логи вызовов ИИ{filter_text}</b> (Стр. {page + 1}/{total_pages})\n\n"
         f"Период: <b>{AI_LOG_PERIOD_LABELS[period]}</b>\n"
+        f"Тип: <b>{AI_LOG_TYPE_LABELS[request_type]}</b>\n"
         f"Всего вызовов: <b>{total_count}</b>\nВыберите запись:"
     )
 
-    markup = kb.admin_ai_logs_keyboard(logs, page=page, total_pages=total_pages, filter_user_id=filter_user_id, period=period)
+    markup = kb.admin_ai_logs_keyboard(
+        logs,
+        page=page,
+        total_pages=total_pages,
+        filter_user_id=filter_user_id,
+        period=period,
+        request_type=request_type,
+    )
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(header, reply_markup=markup, parse_mode="HTML")
     else:
@@ -4551,10 +4594,25 @@ async def callback_admin_ai_log_detail(callback: CallbackQuery):
     page = int(parts[4]) if len(parts) > 4 else 0
     filter_user_id = int(parts[5]) if len(parts) > 5 and int(parts[5]) else None
     period = parts[6] if len(parts) > 6 else "all"
-    await show_ai_log_detail(callback, log_id, page=page, filter_user_id=filter_user_id, period=period)
+    request_type = parts[7] if len(parts) > 7 else "all"
+    await show_ai_log_detail(
+        callback,
+        log_id,
+        page=page,
+        filter_user_id=filter_user_id,
+        period=period,
+        request_type=request_type,
+    )
 
 
-async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: int = 0, filter_user_id: int | None = None, period: str = "all"):
+async def show_ai_log_detail(
+    event: Message | CallbackQuery,
+    log_id: int,
+    page: int = 0,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+):
     async with async_session_maker() as session:
         log_entry = await session.get(AILog, log_id)
         if not log_entry:
@@ -4574,6 +4632,7 @@ async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: 
 
     lat_text = f"{log_entry.latency_ms / 1000:.2f} сек" if log_entry.latency_ms else "не измерялось"
     dt_str = format_msk(log_entry.created_at, "%d-%m-%Y %H:%M:%S МСК")
+    log_type = getattr(log_entry, "request_type", "chat") or "chat"
     request_preview = log_entry.request_payload or log_entry.prompt_summary or "без текста"
     prompt_str = html.escape(request_preview)
     if len(prompt_str) > 1200:
@@ -4587,6 +4646,7 @@ async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: 
     text = (
         f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
         f"👤 <b>Пользователь:</b> {user_info}\n"
+        f"🧾 <b>Тип запроса:</b> {html.escape(AI_LOG_TYPE_LABELS.get(log_type, log_type))}\n"
         f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider)}</b>\n"
         f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model)}</code>\n"
         f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
@@ -4596,7 +4656,13 @@ async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: 
         f"<code>{display_raw}</code>"
     )
 
-    markup = kb.admin_ai_log_detail_keyboard(log_id, page=page, filter_user_id=filter_user_id, period=period)
+    markup = kb.admin_ai_log_detail_keyboard(
+        log_id,
+        page=page,
+        filter_user_id=filter_user_id,
+        period=period,
+        request_type=request_type,
+    )
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     else:
@@ -4610,6 +4676,7 @@ def _build_ai_log_file_content(log_entry: AILog) -> str:
         f"========================================\n"
         f"Timestamp: {log_entry.created_at}\n"
         f"User ID: {log_entry.user_id}\n"
+        f"Request type: {getattr(log_entry, 'request_type', 'chat')}\n"
         f"Provider: {log_entry.provider}\n"
         f"Model: {log_entry.model}\n"
         f"Latency: {log_entry.latency_ms} ms\n"
@@ -4655,6 +4722,7 @@ async def export_ai_logs_package(callback: CallbackQuery):
             select(AILog).order_by(AILog.created_at.desc()),
             filter_user_id=filter_user_id,
             period=period,
+            request_type=parts[5] if len(parts) > 5 else "all",
         )
         logs = (await session.execute(stmt)).scalars().all()
     if not logs:

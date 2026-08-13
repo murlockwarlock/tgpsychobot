@@ -68,6 +68,20 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("📜 Логи запросов ИИ", ai_settings_buttons)
         self.assertNotIn("📜 Логи ИИ", admin_panel_buttons)
 
+    def test_followup_log_filter_is_available(self):
+        markup = admin_ai_logs_keyboard(
+            [AILog(id=10, request_type="followup", provider="Gemini", model="flash", latency_ms=100)],
+            page=0,
+            total_pages=1,
+            period="7d",
+            request_type="followup",
+        )
+        pairs = [(button.text, button.callback_data) for row in markup.inline_keyboard for button in row]
+        self.assertIn(("#10 | Gemini: flash (0.1s)", "admin_ai_log_10_0_0_7d_followup"), pairs)
+        self.assertIn(("✅ Догоняющие", "admin_ai_logs_0_7d_followup"), pairs)
+        self.assertIn(("Сегодня", "admin_ai_logs_0_today_followup"), pairs)
+        self.assertIn(("📦 Скачать пакет логов", "export_ai_logs_0_7d_followup"), pairs)
+
     def test_fixed_navigation_has_same_two_rows_on_every_page(self):
         callback = lambda page: f"page_{page}"
         first_page = fixed_pagination_rows(0, 5, callback)

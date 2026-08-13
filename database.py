@@ -107,6 +107,7 @@ class AILog(Base):
     __tablename__ = 'ai_logs'
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
+    request_type = Column(String, default='chat', nullable=False, index=True)
     provider = Column(String, nullable=False)
     model = Column(String, nullable=False)
     prompt_summary = Column(Text, nullable=True)
@@ -613,6 +614,8 @@ async def init_db():
             ai_log_columns = [c['name'] for c in insp.get_columns('ai_logs')]
             if 'request_payload' not in ai_log_columns:
                 sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN request_payload TEXT"))
+            if 'request_type' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN request_type VARCHAR DEFAULT 'chat' NOT NULL"))
 
             ai_columns = [c['name'] for c in insp.get_columns('ai_config')]
             if 'memory_mode' not in ai_columns:
