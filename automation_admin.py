@@ -147,10 +147,12 @@ async def automation_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         "⚙️ <b>Автоматизации</b>\n\n"
-        "<b>Обработчики событий</b> реагируют на события из блока DATA и выполняют несколько действий. "
-        "Все условия одного обработчика проверяются вместе по правилу И (AND).\n\n"
-        "<b>Догоняющие сообщения</b> запускаются после бездействия пользователя. Они привязываются к темам отдельно.\n\n"
-        "<b>Статистика этапов</b> строится по фактическим сменам current_step, а не по числу ответов модели.",
+        "Здесь можно настроить действия, которые бот выполняет сам:\n\n"
+        "<b>Обработчики событий</b> — например, отправить администратору заявку, "
+        "когда пользователь оставил контакт.\n\n"
+        "<b>Догоняющие сообщения</b> — напомнить пользователю о диалоге после паузы.\n\n"
+        "<b>Статистика этапов</b> — посмотреть, до какого места доходят пользователи.\n\n"
+        "<b>Формат DATA</b> — краткая справка для настройки сценария.",
         reply_markup=_automation_menu_keyboard(),
     )
 
@@ -158,50 +160,27 @@ async def automation_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "automation_data_help")
 async def automation_data_help(callback: CallbackQuery):
     example = html.escape(
-        'Ответ 1 — бот спрашивает об увлечениях:\n'
+        'Ответ бота:\n'
+        'Спасибо! Мы получили ваши контакты.\n\n'
         '<DATA>\n'
         '{\n'
-        '  "current_state": {"current_step": "STAGE_1_HOBBY"},\n'
-        '  "events": [],\n'
-        '  "metadata": {}\n'
-        '}\n'
-        '</DATA>\n\n'
-        'Ответ 2 — увлечение получено, бот спрашивает о цели:\n'
-        '<DATA>\n'
-        '{\n'
-        '  "current_state": {"current_step": "STAGE_2_GOAL"},\n'
-        '  "events": ["HOBBY_RECEIVED"],\n'
-        '  "metadata": {"interests": ["играть в компьютер"]}\n'
-        '}\n'
-        '</DATA>\n\n'
-        'Ответ 3 — цель получена, бот готовит результат:\n'
-        '<DATA>\n'
-        '{\n'
-        '  "current_state": {"current_step": "STAGE_3_RESULT"},\n'
-        '  "events": ["GOAL_RECEIVED"],\n'
-        '  "metadata": {"goal": "найти новое увлечение"}\n'
-        '}\n'
-        '</DATA>\n\n'
-        'Ответ 4 — результат готов:\n'
-        '<DATA>\n'
-        '{\n'
-        '  "current_state": {"current_step": "STAGE_4_COMPLETED"},\n'
-        '  "events": ["RESULT_READY"],\n'
-        '  "metadata": {"result": "подобран план занятий"}\n'
+        '  "current_state": {"current_step": "completed"},\n'
+        '  "events": ["CONTACTS_RECEIVED"],\n'
+        '  "metadata": {"contact": "+79000000000"}\n'
         '}\n'
         '</DATA>'
     )
     await callback.message.edit_text(
         "📋 <b>Единый формат DATA</b>\n\n"
-        "Ниже четыре отдельных ответа модели. В каждом ответе должен быть только один блок <code>&lt;DATA&gt;</code>.\n\n"
+        "Обычно администратору не нужно менять этот блок. Попросите промпт-инженера передать точные названия событий, этапов и полей.\n\n"
         f"<pre>{example}</pre>\n\n"
-        "Блок ставится один раз в конце ответа модели и пользователю не показывается.\n"
-        "• <code>current_state.current_step</code> — текущий этап алгоритма; смена этапа попадает в статистику.\n"
-        "• <code>events</code> — одноразовые сигналы для обработчиков.\n"
-        "• <code>metadata</code> — данные текущего диалога и темы.\n"
-        "• Метаданные по умолчанию дополняют уже сохранённые данные.\n"
-        "• <code>save_mode: snapshot</code> указывается только когда нужен отдельный снимок.\n\n"
-        "Старый <code>[DATA]</code> читается для совместимости, но новые промпты следует писать только в этом формате.",
+        "Блок ставится один раз в конце ответа и пользователю не показывается.\n"
+        "• <code>current_step</code> — этап, на котором продолжится сценарий.\n"
+        "• <code>events</code> — что произошло сейчас; событий может быть несколько.\n"
+        "• <code>metadata</code> — сведения о пользователе; они сохраняются автоматически.\n"
+        "• <code>save_mode</code> можно не указывать: по умолчанию новые данные объединяются со старыми.\n"
+        "• <code>snapshot</code> — отдельная запись в истории, а не новый диалог.\n\n"
+        "Названия чувствительны к регистру: <code>completed</code> и <code>COMPLETED</code> — разные значения.",
         reply_markup=InlineKeyboardBuilder().row(_back("automation_menu")).as_markup(),
     )
 
@@ -491,14 +470,13 @@ async def _handler_with_relations(session, handler_id: int):
 
 
 def _condition_label(condition: AutomationCondition) -> str:
-    operators = {"equals": "=", "not_equals": "≠", "contains": "содержит", "exists": "существует"}
     if condition.condition_type == "event":
         source = "Событие"
     elif condition.condition_type == "current_step":
         source = "Этап"
     else:
-        source = f"metadata.{condition.field_path}"
-    return f"{source} {operators.get(condition.operator, condition.operator)} {condition.expected_value}"[:55]
+        source = f"Данные пользователя: {condition.field_path}"
+    return f"{source} = {condition.expected_value}"[:55]
 
 
 def _action_label(action: AutomationAction) -> str:
@@ -568,8 +546,9 @@ async def _show_automation_handlers(
     await _safe_edit_text_or_markup(
         callback,
         f"⚡ <b>Обработчики событий ({len(handlers)}){f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
-        "Обработчик срабатывает только когда совпали тема и все его условия. "
-        "Действия выполняются по порядку и не повторяются для одного события."
+        "Обработчик — это правило «если произошло событие, сделать действие». "
+        "Он сработает, только если подходит выбранная область и выполнены все условия. "
+        "После создания добавьте условие, действие и включите обработчик."
         + ("\n\nЗдесь показаны обработчики этой темы. Созданный здесь обработчик привяжется к ней автоматически." if topic else ""),
         reply_markup=builder.as_markup(),
     )
@@ -702,7 +681,7 @@ async def _show_handler(
             f"⚡ <b>{html.escape(item.name)}</b>\n\n"
             f"Статус: {status}\n"
             f"Область: {html.escape(topic_text)}\n"
-            f"Условий: {len(item.conditions)} (логика И / AND)\n"
+            f"Условий: {len(item.conditions)} (все должны совпасть)\n"
             f"Действий: {len(item.actions)}"
             f"{warning}"
         )
@@ -763,8 +742,9 @@ async def automation_handler_topics(callback: CallbackQuery):
     builder.adjust(1)
     await callback.message.edit_text(
         "💬 <b>Темы обработчика</b>\n\n"
-        "«Все темы» включает основной диалог и любые текущие/будущие темы. "
-        "Иначе отметьте основной диалог и нужные темы отдельно.",
+        "Отметьте, где должно работать правило.\n"
+        "«Все темы» включает основной диалог и будущие темы. "
+        "Если правило нужно только в одном месте, отметьте основной диалог или конкретную тему.",
         reply_markup=builder.as_markup(),
     )
 
@@ -830,8 +810,10 @@ async def automation_conditions(callback: CallbackQuery):
     builder.adjust(1)
     text = (
         f"🔎 <b>Условия ({len(item.conditions)})</b>\n\n"
-        "Все добавленные условия должны выполниться одновременно (AND).\n"
-        "Для обычного события достаточно условия «Событие = EVENT_NAME».\n\n"
+        "Все добавленные условия должны совпасть одновременно.\n"
+        "Обычно достаточно одного условия «Событие» — точного названия события из сценария.\n"
+        "Для проверки данных используйте «Метаданные»: например, <code>profile.city = Москва</code>.\n"
+        "Проверка всегда означает точное совпадение.\n\n"
         "• Нажмите на условие 🔍, чтобы просмотреть подробности, отредактировать или удалить его."
     )
     await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
@@ -852,16 +834,13 @@ async def automation_condition_view(callback: CallbackQuery):
         cond_type = condition.condition_type
         field_path = condition.field_path
         exp_val = condition.expected_value
-        operator = condition.operator or "equals"
-
     type_label = "Событие" if cond_type == "event" else ("Текущий этап" if cond_type == "current_step" else "Метаданные")
-    field_info = f"▫️ <b>Поле (path):</b> <code>{html.escape(field_path or '')}</code>\n" if field_path else ""
-
+    field_info = f"▫️ <b>Поле:</b> <code>{html.escape(field_path or '')}</code>\n" if field_path else ""
     text = (
         f"🔎 <b>Условие #{condition_id}</b>\n\n"
         f"▫️ <b>Тип:</b> {type_label}\n"
         f"{field_info}"
-        f"▫️ <b>Оператор:</b> {operator}\n"
+        "▫️ <b>Проверка:</b> точное совпадение\n"
         f"▫️ <b>Ожидаемое значение:</b> <code>{html.escape(exp_val or '')}</code>"
     )
 
@@ -893,7 +872,11 @@ async def automation_condition_edit(callback: CallbackQuery, state: FSMContext):
     await state.update_data(handler_id=handler_id, condition_id=condition_id, condition_type=cond_type)
 
     if cond_type == "metadata":
-        hint = f"Текущее значение: <code>{html.escape(field_path or '')} = {html.escape(exp_val or '')}</code>.\n\nВведите новое значение в формате: <code>путь = значение</code>"
+        hint = (
+            f"Текущее значение: <code>{html.escape(field_path or '')} = {html.escape(exp_val or '')}</code>.\n\n"
+            "Введите новое значение в формате: <code>поле = значение</code>. "
+            "Проверка означает точное совпадение."
+        )
     else:
         hint = f"Текущее значение: <code>{html.escape(exp_val or '')}</code>.\n\nВведите новое значение:"
 
@@ -940,11 +923,16 @@ async def automation_condition_add(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AutomationAdminStates.condition_value)
     await state.update_data(handler_id=handler_id, condition_type=condition_type)
     if condition_type == "metadata":
-        hint = "Введите путь и значение: <code>profile.city = Москва</code>. Вложенные поля разделяются точкой."
+        hint = (
+            "Введите поле и значение: <code>profile.city = Москва</code>.\n"
+            "Вложенные поля разделяются точкой. Проверка означает точное совпадение.\n"
+            "Если значение хранится списком, например <code>[\"portfolio\"]</code>, "
+            "попросите промпт-инженера сохранить отдельное поле-строку."
+        )
     elif condition_type == "current_step":
-        hint = "Введите точный ID этапа, например <code>STAGE_2_RESULT</code>."
+        hint = "Введите точное название этапа из сценария, например <code>completed</code>."
     else:
-        hint = "Введите точное имя события из массива events, например <code>LEAD_READY</code>."
+        hint = "Введите точное название события из сценария, например <code>CONTACTS_RECEIVED</code>."
     await callback.message.edit_text(
         f"<b>Новое условие</b>\n\n{hint}",
         reply_markup=InlineKeyboardBuilder().row(_back(f"automation_conditions_{handler_id}")).as_markup(),
@@ -982,7 +970,7 @@ async def automation_condition_received(message: Message, state: FSMContext):
         await session.commit()
     return_topic_id = data.get("automation_return_topic_id")
     await _reset_navigation_context(state, "automation_return_topic_id", return_topic_id)
-    await message.answer("✅ Условие добавлено. Оно объединено с остальными по AND.")
+    await message.answer("✅ Условие добавлено. Оно будет проверяться вместе с остальными.")
     await _show_handler(message, data["handler_id"], edit=False, state=state)
 
 
@@ -1020,7 +1008,8 @@ async def automation_actions(callback: CallbackQuery):
     builder.adjust(1)
     text = (
         f"⚙️ <b>Действия ({len(item.actions)})</b>\n\n"
-        "Действия выполняются сверху вниз. Для одного события каждое действие выполняется не более одного раза.\n\n"
+        "Действия выполняются сверху вниз. Например: сначала отправить уведомление, затем сохранить метку.\n"
+        "Для одного события каждое действие выполняется только один раз.\n\n"
         "• Нажмите на действие ⚙️, чтобы просмотреть подробности, отредактировать или удалить его."
     )
     await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
@@ -1094,7 +1083,11 @@ async def automation_action_edit(callback: CallbackQuery, state: FSMContext):
     )
 
     if act_type == "save_metadata":
-        hint = f"Текущий JSON: <code>{html.escape(meta or '{}')}</code>\n\nВведите новый JSON:"
+        hint = (
+            f"Текущие данные: <code>{html.escape(meta or '{}')}</code>\n\n"
+            "Введите JSON-объект с данными, которые нужно добавить или изменить. "
+            "Старые данные не стираются; массивы заменяются целиком."
+        )
     elif rec_type == "selected_user":
         hint = (
             f"Текущее значение:\n<code>{rec_id}\n{html.escape(tpl or '')}</code>\n\n"
@@ -1160,29 +1153,33 @@ async def automation_action_add(callback: CallbackQuery, state: FSMContext):
     await state.update_data(handler_id=handler_id, action_kind=kind)
     if kind == "metadata":
         hint = (
-            "Отправьте JSON с дополнительными полями, например "
-            "<code>{\"lead_status\":\"ready\"}</code>. Отправьте <code>{}</code>, чтобы сохранить metadata события как есть."
+            "Введите дополнительные данные в формате JSON, например "
+            "<code>{\"lead_status\":\"ready\"}</code>.\n"
+            "Они добавятся к данным пользователя. <code>{}</code> сохранит данные, "
+            "которые пришли вместе с событием."
         )
     elif kind == "user":
         hint = (
             "Первая строка — Telegram ID получателя, со второй строки — шаблон сообщения.\n\n"
             "<b>Пример:</b>\n"
             "<code>123456789\n"
-            "Новая заявка от {name} (@{username})!\n"
+            "Новая заявка от {name} ({username})!\n"
             "Телефон: {metadata.contact}\n"
             "Событие: {event}\n"
             "Шаг: {current_step}</code>\n\n"
-            "<i>Доступные переменные: {name}, {username}, {user_id}, {event}, {current_step}, {metadata.ключ}</i>"
+            "<i>Можно использовать: {name}, {user}, {username}, {user_id}, {event}, "
+            "{current_step}, например {metadata.contact}</i>"
         )
     else:
         hint = (
             "Введите шаблон сообщения для всех администраторов.\n\n"
             "<b>Пример:</b>\n"
             "<code>🚀 Событие: {event}\n"
-            "Пользователь: {name} (@{username}, ID: {user_id})\n"
+            "Пользователь: {name} ({username}, ID: {user_id})\n"
             "Телефон: {metadata.contact}\n"
             "Шаг: {current_step}</code>\n\n"
-            "<i>Доступные переменные: {name}, {username}, {user_id}, {event}, {current_step}, {metadata.ключ}</i>"
+            "<i>Можно использовать: {name}, {user}, {username}, {user_id}, {event}, "
+            "{current_step}, например {metadata.contact}</i>"
         )
     await callback.message.edit_text(
         f"<b>Новое действие</b>\n\n{hint}",
@@ -1339,9 +1336,9 @@ async def _show_followup_campaigns(
     await _safe_edit_text_or_markup(
         callback,
         f"💬 <b>Догоняющие сообщения ({len(campaigns)}){f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
-        "Таймер начинается заново после каждого сообщения или нажатия пользователя. "
-        "При смене темы либо создании нового диалога старая цепочка отменяется. "
-        "Шаги отправляются только вне тихих часов."
+        "Цепочка начинается после действия пользователя и запускается заново после его нового сообщения или нажатия кнопки. "
+        "При смене темы или создании нового диалога старая цепочка отменяется. "
+        "Сообщения не отправляются в тихие часы."
         + ("\n\nЗдесь показаны цепочки этой темы. Новая цепочка привяжется к ней автоматически." if topic else ""),
         reply_markup=builder.as_markup(),
     )
@@ -1467,6 +1464,7 @@ async def _show_campaign(
     warning = "" if valid else "\n\n⚠️ Для включения выберите область и добавьте хотя бы один шаг."
     text = (
         f"💬 <b>{html.escape(item.name)}</b>\n\n"
+        "Цепочка отправляет несколько напоминаний, пока пользователь молчит.\n"
         f"Статус: {'✅ включена' if item.is_active else '⏸ выключена'}\n"
         f"Область: {html.escape(scopes)}\n"
         f"Шагов: {len(item.steps)}\n"
@@ -1590,8 +1588,10 @@ async def followup_steps(callback: CallbackQuery):
     builder.adjust(1)
     text = (
         f"🪜 <b>Шаги цепочки ({len(item.steps)})</b>\n\n"
-        "Задержка первого шага считается от последнего действия пользователя. "
-        "Задержки следующих шагов — от предыдущей отправки. Новая активность начинает цепочку заново.\n\n"
+        "Первое время считается от последнего действия пользователя, следующие — от предыдущего сообщения. "
+        "Новое действие пользователя начинает цепочку заново.\n\n"
+        "Шаг «Обычный текст» отправляет ваш текст. Шаг «Сгенерировать через AI» передаёт AI вашу инструкцию "
+        "и текущий диалог.\n\n"
         "Нажатие на существующий шаг удаляет его."
     )
     await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
@@ -1607,7 +1607,8 @@ async def followup_step_add(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "<b>Новый шаг</b>\n\n"
         f"В первой строке укажите задержку в минутах, ниже — {label}.\n\n"
-        "Пример:\n<code>60\nМягко напомни пользователю о незавершённом упражнении.</code>",
+        "Пример:\n<code>60\nМягко напомни пользователю о незавершённом упражнении.</code>\n\n"
+        + ("AI сам видит текущий диалог. Напишите только, что нужно сказать; DATA добавлять не нужно." if kind == "ai" else ""),
         reply_markup=InlineKeyboardBuilder().row(_back(f"followup_steps_{campaign_id}")).as_markup(),
     )
 
