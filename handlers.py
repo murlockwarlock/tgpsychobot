@@ -5844,12 +5844,64 @@ async def run_client_test_attempts_export(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("export_pick_topic_"))
+async def export_pick_topic_menu(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на скачивание истории.", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    user_id = int(parts[3])
+    current_topic_val = parts[4]
+    current_topic_id = None if current_topic_val == "all" else int(current_topic_val)
+
+    async with async_session_maker() as session:
+        topics = (await session.execute(select(Topic).order_by(Topic.id.asc()))).scalars().all()
+
+    await callback.message.edit_text(
+        f"Выберите тему для выгрузки истории пользователя <code>{user_id}</code>:",
+        reply_markup=kb.export_topic_selection_keyboard(user_id, topics, current_topic_id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("export_set_topic_"))
+async def export_set_topic(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на скачивание истории.", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    user_id = int(parts[3])
+    topic_val = parts[4]
+    topic_id = None if topic_val == "all" else int(topic_val)
+
+    topic_name = "Все темы"
+    if topic_id == 0:
+        topic_name = "Основной диалог"
+    elif topic_id is not None:
+        async with async_session_maker() as session:
+            t = await session.get(Topic, topic_id)
+            if t:
+                topic_name = t.name
+
+    await callback.message.edit_text(
+        f"Выберите формат и параметры экспорта для пользователя <code>{user_id}</code>:\n\n"
+        f"📁 <b>Выбранная тема:</b> {html.escape(topic_name)}",
+        parse_mode="HTML",
+        reply_markup=kb.single_export_options_keyboard(user_id, topic_id=topic_id, topic_name=topic_name)
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("run_single_"))
 async def process_single_export(callback: CallbackQuery, bot: Bot):
     parts = callback.data.split("_")
     fmt = parts[2]
     anonymize = parts[3] == "yes"
     user_id = int(parts[4])
+    topic_val = parts[5] if len(parts) > 5 else "all"
+    selected_topic_id = None if topic_val == "all" else int(topic_val)
 
     thinking_msg = await callback.message.answer("⏳ Формирую файл...")
 
@@ -5862,7 +5914,12 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
         topics_res = await session.execute(select(Topic))
         topic_map = {t.id: t.name for t in topics_res.scalars().all()}
 
-        msg_stmt = select(DBMessage).where(DBMessage.user_id == user.id).order_by(DBMessage.timestamp)
+        msg_stmt = select(DBMessage).where(DBMessage.user_id == user.id)
+        if selected_topic_id == 0:
+            msg_stmt = msg_stmt.where(DBMessage.topic_id.is_(None))
+        elif selected_topic_id is not None:
+            msg_stmt = msg_stmt.where(DBMessage.topic_id == selected_topic_id)
+        msg_stmt = msg_stmt.order_by(DBMessage.timestamp)
         messages = (await session.execute(msg_stmt)).scalars().all()
 
         if not messages:
@@ -5870,9 +5927,15 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
             return
 
         user_label = "user_1" if anonymize else str(user.id)
+        selected_topic_label = ""
+        if selected_topic_id == 0:
+            selected_topic_label = " (Основной диалог)"
+        elif selected_topic_id is not None:
+            t_name = topic_map.get(selected_topic_id, f"Topic {selected_topic_id}")
+            selected_topic_label = f" (Тема: {t_name})"
 
         if fmt == "txt":
-            header = f"History: {user_label}\n" if anonymize else f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username})\n"
+            header = f"History: {user_label}{selected_topic_label}\n" if anonymize else f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username}){selected_topic_label}\n"
             content_str = header + "=" * 50 + "\n"
             for m in messages:
                 t_name = topic_map.get(m.topic_id, "General")
@@ -5901,7 +5964,7 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
             caption = "📦 Файл превысил 50МБ и был заархивирован."
         else:
             file_to_send = BufferedInputFile(file_bytes, filename=f"{user_label}.{fmt}")
-            caption = f"📋 История пользователя {user_label}"
+            caption = f"📋 История пользователя {user_label}{selected_topic_label}"
 
         await callback.message.answer_document(file_to_send, caption=caption)
         await bot.delete_message(callback.message.chat.id, thinking_msg.message_id)
@@ -15798,10 +15861,53 @@ async def export_date_to_input(message: Message, state: FSMContext):
     selected_ids = data.get("selected_export_ids", [])
     target = "ВСЕХ пользователей" if export_all else f"{len(selected_ids)} пользователей"
 
-    await message.answer(
-        f"✅ Фильтр дат: с <b>{date_from}</b> по <b>{date_to}</b>\n\nВыберите формат экспорта для {target}:",
-        reply_markup=kb.mass_export_options_keyboard()
+@router.callback_query(F.data == "mass_export_pick_topic")
+async def mass_export_pick_topic_menu(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    current_topic_id = data.get("export_topic_id")
+
+    async with async_session_maker() as session:
+        topics = (await session.execute(select(Topic).order_by(Topic.id.asc()))).scalars().all()
+
+    await callback.message.edit_text(
+        "Выберите тему для массовой выгрузки истории:",
+        reply_markup=kb.mass_export_topic_selection_keyboard(topics, current_topic_id)
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mass_export_set_topic_"))
+async def mass_export_set_topic(callback: CallbackQuery, state: FSMContext):
+    topic_val = callback.data.replace("mass_export_set_topic_", "")
+    topic_id = None if topic_val == "all" else int(topic_val)
+
+    topic_name = "Все темы"
+    if topic_id == 0:
+        topic_name = "Основной диалог"
+    elif topic_id is not None:
+        async with async_session_maker() as session:
+            t = await session.get(Topic, topic_id)
+            if t:
+                topic_name = t.name
+
+    await state.update_data(export_topic_id=topic_id, export_topic_name=topic_name)
+    data = await state.get_data()
+    export_all = data.get("export_all", False)
+    selected_ids = data.get("selected_export_ids", [])
+    target = "ВСЕХ пользователей" if export_all else f"{len(selected_ids)} пользователей"
+    date_from = data.get("export_date_from", "начала")
+    date_to = data.get("export_date_to", "сегодня")
+
+    date_label = ""
+    if data.get("export_date_from") or data.get("export_date_to"):
+        date_label = f"✅ Фильтр дат: с {date_from} по {date_to}\n"
+
+    await callback.message.edit_text(
+        f"{date_label}📁 Тема: <b>{html.escape(topic_name)}</b>\n\nВыберите формат экспорта для {target}:",
+        parse_mode="HTML",
+        reply_markup=kb.mass_export_options_keyboard(topic_id=topic_id, topic_name=topic_name)
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("run_export_"))
@@ -15813,15 +15919,20 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
     data = await state.get_data()
     export_all = data.get("export_all", False)
     export_kind = data.get("export_kind", "history")
+    export_topic_id = data.get("export_topic_id")
+    export_topic_name = data.get("export_topic_name")
 
     date_from_str = data.get("export_date_from") if export_kind == "history" else None
     date_to_str = data.get("export_date_to") if export_kind == "history" else None
     date_from_dt = datetime.strptime(date_from_str, "%d-%m-%Y") if date_from_str else None
     date_to_dt = datetime.strptime(date_to_str, "%d-%m-%Y").replace(hour=23, minute=59, second=59) if date_to_str else None
 
-    date_label = ""
+    filters = []
     if date_from_dt or date_to_dt:
-        date_label = f" | фильтр: {date_from_str or 'начало'} → {date_to_str or 'сегодня'}"
+        filters.append(f"даты: {date_from_str or 'начало'} → {date_to_str or 'сегодня'}")
+    if export_topic_name and export_topic_name != "Все темы":
+        filters.append(f"тема: {export_topic_name}")
+    date_label = f" | {' | '.join(filters)}" if filters else ""
 
     export_title = "метаданных" if export_kind == "metadata" else "данных"
     await callback.message.edit_text(f"⏳ Начинаю сбор {export_title} и формирование файла{date_label}. Это может занять время...")
@@ -15871,6 +15982,10 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
 
             def build_msg_stmt(user_id):
                 stmt = select(DBMessage).where(DBMessage.user_id == user_id)
+                if export_topic_id == 0:
+                    stmt = stmt.where(DBMessage.topic_id.is_(None))
+                elif export_topic_id is not None:
+                    stmt = stmt.where(DBMessage.topic_id == export_topic_id)
                 if date_from_dt:
                     stmt = stmt.where(DBMessage.timestamp >= date_from_dt)
                 if date_to_dt:

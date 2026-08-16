@@ -72,6 +72,88 @@ def _normalize_service_payload(
     )
 
 
+def _repair_json_payload(raw_json: str) -> dict[str, Any] | None:
+    text = (raw_json or "").strip()
+    if not text:
+        return None
+    try:
+        val = json.loads(text)
+        if isinstance(val, dict):
+            return val
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        val = json.loads(cleaned)
+        if isinstance(val, dict):
+            return val
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    replaced = re.sub(r"\bTrue\b", "true", cleaned)
+    replaced = re.sub(r"\bFalse\b", "false", replaced)
+    replaced = re.sub(r"\bNone\b", "null", replaced)
+    replaced = re.sub(r",\s*([\}\]])", r"\1", replaced)
+    try:
+        val = json.loads(replaced)
+        if isinstance(val, dict):
+            return val
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    start_idx = replaced.find("{")
+    if start_idx != -1:
+        candidate = replaced[start_idx:]
+        open_count = 0
+        close_count = 0
+        in_string = False
+        escape = False
+        repaired_chars: list[str] = []
+        for ch in candidate:
+            if escape:
+                repaired_chars.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                repaired_chars.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                repaired_chars.append(ch)
+                continue
+            if not in_string:
+                if ch == "{":
+                    open_count += 1
+                    repaired_chars.append(ch)
+                elif ch == "}":
+                    if open_count > close_count:
+                        close_count += 1
+                        repaired_chars.append(ch)
+                    else:
+                        continue
+                else:
+                    repaired_chars.append(ch)
+            else:
+                repaired_chars.append(ch)
+
+        if open_count > close_count:
+            repaired_chars.append("}" * (open_count - close_count))
+
+        repaired_text = "".join(repaired_chars)
+        repaired_text = re.sub(r",\s*([\}\]])", r"\1", repaired_text)
+        try:
+            val = json.loads(repaired_text)
+            if isinstance(val, dict):
+                return val
+        except (TypeError, json.JSONDecodeError):
+            pass
+
+    return None
+
+
 def extract_service_data(text: str | None) -> tuple[str, list[ServiceDataBlock], int]:
     """Extract legacy ``[DATA]`` and the unified ``<DATA>`` JSON envelope."""
     raw_text = text or ""
@@ -80,12 +162,8 @@ def extract_service_data(text: str | None) -> tuple[str, list[ServiceDataBlock],
 
     for match in DATA_BLOCK_RE.finditer(raw_text):
         raw_json = (match.group("xml") or match.group("square") or "").strip()
-        try:
-            payload = json.loads(raw_json)
-        except json.JSONDecodeError:
-            invalid_count += 1
-            continue
-        if not isinstance(payload, dict):
+        payload = _repair_json_payload(raw_json)
+        if payload is None or not isinstance(payload, dict):
             invalid_count += 1
             continue
         blocks.append(

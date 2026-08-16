@@ -1351,7 +1351,7 @@ def export_date_filter_keyboard():
     return builder.as_markup()
 
 
-def mass_export_options_keyboard(export_kind: str = "history"):
+def mass_export_options_keyboard(export_kind: str = "history", topic_id: int | None = None, topic_name: str | None = None):
     builder = InlineKeyboardBuilder()
     if export_kind == "metadata":
         builder.button(text="✨ JSON (Итоговые слитные)", callback_data="run_export_json_merged_no")
@@ -1361,23 +1361,62 @@ def mass_export_options_keyboard(export_kind: str = "history"):
         builder.button(text="⬅️ Назад к выбору", callback_data="admin_export_page_0")
         builder.adjust(2, 2, 1)
     else:
+        topic_label = topic_name or "Все темы"
+        builder.button(text=f"📁 Тема: {topic_label}", callback_data="mass_export_pick_topic")
         builder.button(text="TXT (Обычный)", callback_data="run_export_txt_no")
         builder.button(text="TXT (Анонимно)", callback_data="run_export_txt_yes")
         builder.button(text="JSON (Обычный)", callback_data="run_export_json_no")
         builder.button(text="JSON (Анонимно)", callback_data="run_export_json_yes")
         builder.button(text="⬅️ Назад к выбору", callback_data="admin_export_page_0")
-        builder.adjust(2, 2, 1)
+        builder.adjust(1, 2, 2, 1)
     return builder.as_markup()
 
 
-def single_export_options_keyboard(user_id: int):
+def mass_export_topic_selection_keyboard(topics: list, current_topic_id: int | None = None):
     builder = InlineKeyboardBuilder()
-    builder.button(text="TXT (Обычный)", callback_data=f"run_single_txt_no_{user_id}")
-    builder.button(text="TXT (Анонимно)", callback_data=f"run_single_txt_yes_{user_id}")
-    builder.button(text="JSON (Обычный)", callback_data=f"run_single_json_no_{user_id}")
-    builder.button(text="JSON (Анонимно)", callback_data=f"run_single_json_yes_{user_id}")
+    all_check = "✅ " if current_topic_id is None else ""
+    builder.button(text=f"{all_check}🌐 Все темы", callback_data="mass_export_set_topic_all")
+
+    gen_check = "✅ " if current_topic_id == 0 else ""
+    builder.button(text=f"{gen_check}💬 Основной диалог", callback_data="mass_export_set_topic_0")
+
+    for t in topics:
+        check = "✅ " if current_topic_id == t.id else ""
+        builder.button(text=f"{check}{t.name}", callback_data=f"mass_export_set_topic_{t.id}")
+
+    builder.button(text="⬅️ Назад", callback_data="admin_export_date_preset_0")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def single_export_options_keyboard(user_id: int, topic_id: int | None = None, topic_name: str | None = None):
+    builder = InlineKeyboardBuilder()
+    topic_label = topic_name or "Все темы"
+    topic_val = "all" if topic_id is None else str(topic_id)
+    builder.button(text=f"📁 Тема: {topic_label}", callback_data=f"export_pick_topic_{user_id}_{topic_val}")
+    builder.button(text="TXT (Обычный)", callback_data=f"run_single_txt_no_{user_id}_{topic_val}")
+    builder.button(text="TXT (Анонимно)", callback_data=f"run_single_txt_yes_{user_id}_{topic_val}")
+    builder.button(text="JSON (Обычный)", callback_data=f"run_single_json_no_{user_id}_{topic_val}")
+    builder.button(text="JSON (Анонимно)", callback_data=f"run_single_json_yes_{user_id}_{topic_val}")
     builder.button(text="⬅️ Назад в профиль", callback_data=f"view_client_{user_id}")
-    builder.adjust(2, 2, 1)
+    builder.adjust(1, 2, 2, 1)
+    return builder.as_markup()
+
+
+def export_topic_selection_keyboard(user_id: int, topics: list, current_topic_id: int | None = None):
+    builder = InlineKeyboardBuilder()
+    all_check = "✅ " if current_topic_id is None else ""
+    builder.button(text=f"{all_check}🌐 Все темы", callback_data=f"export_set_topic_{user_id}_all")
+
+    gen_check = "✅ " if current_topic_id == 0 else ""
+    builder.button(text=f"{gen_check}💬 Основной диалог", callback_data=f"export_set_topic_{user_id}_0")
+
+    for t in topics:
+        check = "✅ " if current_topic_id == t.id else ""
+        builder.button(text=f"{check}{t.name}", callback_data=f"export_set_topic_{user_id}_{t.id}")
+
+    builder.button(text="⬅️ Назад", callback_data=f"download_history_{user_id}")
+    builder.adjust(1)
     return builder.as_markup()
 
 
