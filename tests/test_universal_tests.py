@@ -535,7 +535,7 @@ class UniversalFormulaAndPromptTests(unittest.TestCase):
         self.assertIn("Предварительный вывод", prompt)
         self.assertIn("текущего системного промпта", prompt)
         self.assertIn("Не придумывай максимальные баллы", prompt)
-        self.assertIn("Имя пользователя из профиля: Анна", prompt)
+        self.assertNotIn("Имя пользователя из профиля", prompt)
         self.assertIn("total_score", prompt)
 
     def test_internal_report_is_detected_for_client_side_hiding(self):

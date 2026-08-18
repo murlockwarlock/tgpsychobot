@@ -104,13 +104,19 @@ from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
 from time_helpers import format_msk, to_msk
 from vector_store import delete_document_vectors, update_case_study_index, search_relevant_case, delete_case_study_vectors
-from yookassa import Configuration, Payment
 from uuid import uuid4
+try:
+    from yookassa import Configuration, Payment
+except ModuleNotFoundError:
+    Configuration = Payment = None
 import decimal
 import hashlib
 from urllib import parse
 from urllib.parse import urlparse
-from dateutil.relativedelta import relativedelta
+try:
+    from dateutil.relativedelta import relativedelta
+except ModuleNotFoundError:
+    relativedelta = None
 from payment_failure_reasons import format_yookassa_admin_reason_line
 from scheduler import (
     process_recurring_payment,
@@ -1997,12 +2003,17 @@ def markdown_to_html(text: str) -> str:
 
 
 def remove_markdown(text: str) -> str:
-    text = re.sub(r'#+\s+', '', text)
-    text = re.sub(r'\*\*(.*?)\*\*|__(.*?)__', r'\1', text)
-    text = re.sub(r'\*(.*?)\*|_(.*?)_', r'\1', text)
-    text = re.sub(r'~~(.*?)~~', r'\1', text)
-    text = re.sub(r'`(.*?)`', r'\1', text)
-    text = re.sub(r'\[(.*?)\]\((.*?)\)', r'\1', text)
+    if not text:
+        return ""
+    text = re.sub(r'\[([^\]\n]+)\]\([^\)\n]+\)', r'\1', text)
+    text = re.sub(r'```(?:[a-zA-Z0-9_-]+)?\n?(.*?)\n?```', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'`([^`\n]+)`', r'\1', text)
+    text = re.sub(r'^\s*#+\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'~~(.+?)~~', r'\1', text)
+    text = re.sub(r'(?<!\w)\*(?!\s)([^\*\n]+?)(?<!\s)\*(?!\w)', r'\1', text)
+    text = re.sub(r'(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)', r'\1', text)
     return text
 
 
@@ -3072,7 +3083,7 @@ def _build_prompt_block_editor_text(config_key: str, current_value: str) -> str:
     ]
     if meta["placeholders"]:
         parts.extend(["", meta["placeholders"]])
-    parts.extend(["", "Отправьте новый текст или загрузите <b>.txt файл</b>."])
+    parts.extend(["", "Отправьте новый текст или загрузите <b>.txt/.md файл</b>."])
     return "\n".join(parts)
 
 
@@ -3714,7 +3725,7 @@ async def edit_system_prompt(callback: CallbackQuery, state: FSMContext):
     if config.prompt_mode == 'file':
         prompt_too_long = True
         prompt_info = f"Текущий промпт загружен из файла: `{config.prompt_filename}`{time_str}"
-        message_text_content = "Отправьте новый текст или .txt файл, чтобы его заменить."
+        message_text_content = "Отправьте новый текст или .txt/.md файл, чтобы его заменить."
         message_text = f"{prompt_info}\n\n{message_text_content}"
     else:
         prompt_info = f"Текущий промпт сохранен как текст.{time_str}"
@@ -3723,7 +3734,7 @@ async def edit_system_prompt(callback: CallbackQuery, state: FSMContext):
         if len(prompt_text) > 3500:
             prompt_too_long = True
             display_text = prompt_text[:3500] + "\n\n[...] (Промпт слишком длинный для полного отображения)"
-        message_text = f"{prompt_info}\n\n`{display_text}`\n\nОтправьте новый текст или .txt файл, чтобы его заменить."
+        message_text = f"{prompt_info}\n\n`{display_text}`\n\nОтправьте новый текст или .txt/.md файл, чтобы его заменить."
 
     await callback.message.edit_text(
         message_text,
@@ -3788,8 +3799,8 @@ async def process_system_prompt(message: Message, state: FSMContext, bot: Bot):
 
             document = message.document
 
-            if not document.file_name.lower().endswith('.txt'):
-                await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt")
+            if not document.file_name.lower().endswith(('.txt', '.md')):
+                await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt или .md")
 
                 return
 
@@ -3837,8 +3848,8 @@ async def process_prompt_block(message: Message, state: FSMContext, bot: Bot):
     if message.text is not None:
         new_value = message.text.strip()
     elif message.document:
-        if not message.document.file_name.lower().endswith('.txt'):
-            temp = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt")
+        if not message.document.file_name.lower().endswith(('.txt', '.md')):
+            temp = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt или .md")
             await asyncio.sleep(4)
             await temp.delete()
             return
@@ -4262,9 +4273,9 @@ async def process_content_update(message: Message, state: FSMContext, bot: Bot):
 
     elif message.document:
         document = message.document
-        if not document.file_name.lower().endswith('.txt'):
+        if not document.file_name.lower().endswith(('.txt', '.md')):
             await send_temp_notification(message.from_user.id, bot,
-                                         "❌ Ошибка: Для текста принимаются только .txt файлы.", delay=5)
+                                         "❌ Ошибка: Для текста принимаются только .txt и .md файлы.", delay=5)
         else:
             try:
                 file_info = await bot.get_file(document.file_id)
@@ -6723,7 +6734,7 @@ async def topic_editor_router(callback: CallbackQuery, state: FSMContext):
 
         await callback.message.edit_text(
             f"<b>Текущий промпт:</b>\n{safe_prompt_text}\n\n"
-            f"Отправьте новый текст или .txt файл.",
+            f"Отправьте новый текст или .txt/.md файл.",
             reply_markup=kb.topic_prompt_keyboard(topic_id)
         )
 
@@ -6836,9 +6847,9 @@ async def admin_edit_topic_prompt_process(message: Message, state: FSMContext, b
         notification_text = "✅ Промпт для темы обновлен текстом."
 
     elif message.document:
-        if not message.document.file_name.lower().endswith('.txt'):
+        if not message.document.file_name.lower().endswith(('.txt', '.md')):
             await message.delete()
-            temp_msg = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt")
+            temp_msg = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt или .md")
             await delete_message_after_delay(temp_msg, 5)
             return
         try:
@@ -11120,12 +11131,12 @@ async def admin_topic_random_phrases_menu(callback: CallbackQuery, state: FSMCon
     text = (
         f"🎲 <b>Случайные фразы для темы: «{html.escape(topic.name)}»</b>\n\n"
         f"Загружено фраз: <b>{count}</b>\n\n"
-        "Вы можете загрузить файл .txt (каждая фраза с новой строки). "
+        "Вы можете загрузить файл .txt или .md (каждая фраза с новой строки). "
         "Бот будет выбирать одну случайную фразу из этого списка и добавлять её в контекст к каждому сообщению пользователя в этой теме."
     )
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="📥 Загрузить файл фраз (.txt)", callback_data=f"upload_topic_phrases_{topic_id}")
+    builder.button(text="📥 Загрузить файл фраз (.txt/.md)", callback_data=f"upload_topic_phrases_{topic_id}")
     builder.button(text="🗑️ Очистить все фразы", callback_data=f"clear_topic_phrases_{topic_id}")
     builder.button(text="⬅️ Назад к теме", callback_data=f"edit_topic_{topic_id}")
     builder.adjust(1)
@@ -11144,7 +11155,7 @@ async def admin_upload_topic_phrases_start(callback: CallbackQuery, state: FSMCo
     builder.button(text="⬅️ Отмена", callback_data=f"topic_random_phrases_{topic_id}")
 
     await callback.message.edit_text(
-        "Отправьте файл <b>.txt</b> со списком фраз (каждая с новой строки).\n\n"
+        "Отправьте файл <b>.txt/.md</b> со списком фраз (каждая с новой строки).\n\n"
         "Эти фразы будут привязаны ТОЛЬКО к текущей теме.",
         reply_markup=builder.as_markup()
     )
@@ -11156,8 +11167,8 @@ async def process_topic_phrases_file(message: Message, state: FSMContext, bot: B
     topic_id = data.get('topic_id')
     document = message.document
 
-    if not document.file_name.lower().endswith('.txt'):
-        await message.answer("❌ Пожалуйста, отправьте файл .txt")
+    if not document.file_name.lower().endswith(('.txt', '.md')):
+        await message.answer("❌ Пожалуйста, отправьте файл .txt или .md")
         return
 
     try:
@@ -12773,6 +12784,8 @@ async def finish_test_generation(
                 user_id,
                 result_system_prompt,
                 interpretation_prompt,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
             )
         if preliminary_interpretation and result_prompt_is_final:
             interpretation_text = preliminary_interpretation
@@ -13310,7 +13323,14 @@ async def admin_process_formulas_file(message: Message, state: FSMContext, bot: 
         await message.answer(f"❌ Формулы не изменены: {html.escape(str(exc))}")
 
 
-async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: str) -> str:
+async def get_ai_response_direct(
+    user_id: int,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    dialogue_id: int | None = None,
+    topic_id: int | None = None,
+) -> str:
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
         provider = ai_config.provider
@@ -13328,11 +13348,13 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         user = await session.get(User, user_id)
         if not user:
             return "Ошибка: Пользователь не найден."
+        active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
+        active_topic_id = topic_id if topic_id is not None else user.current_topic_id
         runtime_context = await build_runtime_automation_context(
             session,
             user_id=user.id,
-            dialogue_id=user.current_dialogue_id,
-            topic_id=user.current_topic_id,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
         )
         fake_history = [DBMessage(
             role='user',
@@ -13370,12 +13392,12 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
                 await apply_service_data_blocks(
                     session,
                     user=user,
-                    dialogue_id=user.current_dialogue_id,
-                    topic_id=user.current_topic_id,
+                    dialogue_id=active_dialogue_id,
+                    topic_id=active_topic_id,
                     blocks=service_blocks,
                 )
                 await session.commit()
-    return visible_text
+    return visible_text or response_text
 
 
 @router.message(Command("test"))
@@ -13919,7 +13941,7 @@ async def _show_test_prompt_editor(callback: CallbackQuery, state: FSMContext, p
     text = (
         f"<b>{title}:</b>\n\n"
         f"<code>{html.escape(display_prompt)}</code>\n\n"
-        f"Отправьте новый текст промпта или загрузите <b>.txt файл</b> с промптом."
+        f"Отправьте новый текст промпта или загрузите <b>.txt/.md файл</b> с промптом."
     )
 
     keyboard = kb.test_prompt_keyboard("download_result_prompt" if prompt_target == "result" else "download_test_prompt")
@@ -13978,8 +14000,8 @@ async def admin_process_test_prompt(message: Message, state: FSMContext, bot: Bo
         new_prompt = message.text.strip()
         notification_text = f"✅ Промпт {prompt_label} обновлен текстом."
     elif message.document:
-        if not message.document.file_name.lower().endswith('.txt'):
-            temp = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt")
+        if not message.document.file_name.lower().endswith(('.txt', '.md')):
+            temp = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt или .md")
             await asyncio.sleep(4)
             await temp.delete()
             return
@@ -14819,8 +14841,8 @@ async def cmd_upload_random_messages(message: Message, bot: Bot):
         return
 
     document = message.document
-    if not document.file_name.endswith('.txt'):
-        await message.answer("❌ Пожалуйста, отправьте файл .txt")
+    if not document.file_name.lower().endswith(('.txt', '.md')):
+        await message.answer("❌ Пожалуйста, отправьте файл .txt или .md")
         return
 
     file_in_io = io.BytesIO()

@@ -331,6 +331,8 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
                 f"Интерпретируй результаты теста.\n\n{prompt_payload}\n\n"
                 "Не показывай технические имена переменных и формул. Не придумывай максимальные баллы, "
                 "знаменатели или нормы, которых нет во входных данных.",
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
             )
         profile_name = getattr(user, "name", None) or getattr(user, "first_name", None) or None
         final_prompt = build_result_handoff_prompt(prompt_payload, preliminary, profile_name)

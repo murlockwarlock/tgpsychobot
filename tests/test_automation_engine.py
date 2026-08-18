@@ -220,3 +220,65 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.current_step, "TEST_RESULT_READY")
         self.assertEqual(load_metadata(state.metadata_json), {"test": {"score": 17}})
         self.assertEqual(event_count, 1)
+
+    async def test_get_ai_response_direct_passes_scoped_dialogue_and_topic(self):
+        import handlers
+
+        provider_response = (
+            "Промежуточный результат.\n"
+            '<DATA>{"current_state":{"current_step":"CALCULATED"},'
+            '"metadata":{"calc":{"result_val":42}}}</DATA>'
+        )
+        call = AsyncMock(return_value=provider_response)
+
+        with (
+            patch.object(handlers, "async_session_maker", self.sessions),
+            patch.object(handlers, "_call_gemini_api", call),
+        ):
+            visible = await handlers.get_ai_response_direct(
+                42,
+                "Системный промпт",
+                "Ответы",
+                dialogue_id=3,
+                topic_id=15,
+            )
+
+        self.assertEqual(visible, "Промежуточный результат.")
+        async with self.sessions() as session:
+            state = await get_conversation_automation_state(
+                session, user_id=42, dialogue_id=3, topic_id=15
+            )
+        self.assertIsNotNone(state)
+        self.assertEqual(state.current_step, "CALCULATED")
+        self.assertEqual(load_metadata(state.metadata_json), {"calc": {"result_val": 42}})
+
+    async def test_max_get_ai_response_direct_merges_data_blocks(self):
+        from max_messenger_bot import ai as max_ai
+
+        provider_response = (
+            "MAX результат.\n"
+            '<DATA>{"current_state":{"current_step":"MAX_STEP"},'
+            '"metadata":{"max_key":"max_val"}}</DATA>'
+        )
+
+        with (
+            patch.object(max_ai, "async_session_maker", self.sessions),
+            patch.object(max_ai, "_dispatch_provider", AsyncMock(return_value=provider_response)),
+        ):
+            visible = await max_ai.get_ai_response_direct(
+                42,
+                "Системный промпт",
+                "Ответы",
+                dialogue_id=2,
+                topic_id=8,
+            )
+
+        self.assertEqual(visible, "MAX результат.")
+        async with self.sessions() as session:
+            state = await get_conversation_automation_state(
+                session, user_id=42, dialogue_id=2, topic_id=8
+            )
+        self.assertIsNotNone(state)
+        self.assertEqual(state.current_step, "MAX_STEP")
+        self.assertEqual(load_metadata(state.metadata_json), {"max_key": "max_val"})
+

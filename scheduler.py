@@ -8,10 +8,17 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database import (async_session_maker, UserSubscription, SubscriptionPlan, SubscriptionConfig, User,
                       RobokassaPayment, PromoCode, YookassaPayment, AIConfig, get_all_admin_ids)
 from ai_integration import get_kie_remaining_credits, AIServiceError
-from dateutil.relativedelta import relativedelta
-from yookassa import Configuration, Payment
-from yookassa.domain.exceptions import (BadRequestError, ForbiddenError, InternalServerError,
-                                        TooManyRequestsError, UnauthorizedError)
+try:
+    from dateutil.relativedelta import relativedelta
+except ModuleNotFoundError:
+    relativedelta = None
+try:
+    from yookassa import Configuration, Payment
+    from yookassa.domain.exceptions import (BadRequestError, ForbiddenError, InternalServerError,
+                                            TooManyRequestsError, UnauthorizedError)
+except ModuleNotFoundError:
+    Configuration = Payment = None
+    BadRequestError = ForbiddenError = InternalServerError = TooManyRequestsError = UnauthorizedError = Exception
 from uuid import uuid4
 import html
 import os

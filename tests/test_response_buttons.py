@@ -125,3 +125,46 @@ class ApiKeyDisplayTests(unittest.TestCase):
         labels = [button.text for row in markup.inline_keyboard for button in row]
         self.assertIn("🔑 Deepseek: abcd...wxyz", labels)
         self.assertNotIn(secret, "\n".join(labels))
+
+
+class RemoveMarkdownTests(unittest.TestCase):
+    def test_remove_markdown_preserves_all_buttons_in_row(self):
+        from handlers import remove_markdown
+        from max_messenger_bot.services.admin_clients import _remove_markdown
+
+        source = (
+            "Чем любишь заниматься?\n\n"
+            "[1](btn:interest_1) | [2](btn:interest_2) | [3](btn:interest_3) | "
+            "[4](btn:interest_4) | [5](btn:interest_5) | [6](btn:interest_6)\n"
+            "[7](btn:interest_7) | [8](btn:interest_8) | [9](btn:interest_9) | "
+            "[10](btn:interest_10) | [11](btn:interest_11) | [12](btn:interest_12)"
+        )
+        expected = (
+            "Чем любишь заниматься?\n\n"
+            "1 | 2 | 3 | 4 | 5 | 6\n"
+            "7 | 8 | 9 | 10 | 11 | 12"
+        )
+        self.assertEqual(remove_markdown(source), expected)
+        self.assertEqual(_remove_markdown(source), expected)
+
+    def test_remove_markdown_handles_duels_and_levels(self):
+        from handlers import remove_markdown
+        from max_messenger_bot.services.admin_clients import _remove_markdown
+
+        duels = "[1](btn:duel_1) | [2](btn:duel_2)"
+        levels = "[1](btn:level_1) | [2](btn:level_2) | [3](btn:level_3) | [4](btn:level_4)"
+
+        self.assertEqual(remove_markdown(duels), "1 | 2")
+        self.assertEqual(_remove_markdown(duels), "1 | 2")
+        self.assertEqual(remove_markdown(levels), "1 | 2 | 3 | 4")
+        self.assertEqual(_remove_markdown(levels), "1 | 2 | 3 | 4")
+
+    def test_remove_markdown_preserves_formatting_and_links(self):
+        from handlers import remove_markdown
+        from max_messenger_bot.services.admin_clients import _remove_markdown
+
+        text = "**Жирный** и _курсив_, а также `код` и [Ссылка](https://example.com)"
+        expected = "Жирный и курсив, а также код и Ссылка"
+        self.assertEqual(remove_markdown(text), expected)
+        self.assertEqual(_remove_markdown(text), expected)
+
