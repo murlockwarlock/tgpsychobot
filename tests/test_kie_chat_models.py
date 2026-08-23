@@ -247,7 +247,7 @@ def _canonical_kie_layout():
 
 
 def _assert_kie_layout_payload(payload, protocol):
-    stable = "STABLE CONFIGURED TOPIC PROMPT"
+    stable = "STABLE CONFIGURED TOPIC PROMPT\n\nSHARED TOPIC INSTRUCTIONS"
     if protocol == "openai_chat":
         blocks = [item["content"] for item in payload["messages"] if item["role"] == "system"]
         history = payload["messages"][-3:-1]
@@ -274,6 +274,7 @@ def _assert_kie_layout_payload(payload, protocol):
         assert "Ясна" not in payload["instructions"]
         assert "photo" not in payload["instructions"]
         assert "kie-meta" not in payload["instructions"]
+        assert payload["instructions"] == stable
     else:
         assert blocks[0] == stable
         assert "Ясна" not in blocks[0]
@@ -282,12 +283,11 @@ def _assert_kie_layout_payload(payload, protocol):
     dynamic_index = next(i for i, block in enumerate(blocks) if "Ясна" in block)
     assert "photo" in blocks[dynamic_index]
     assert "kie-meta" in blocks[dynamic_index]
-    shared_index = next(i for i, block in enumerate(blocks) if "SHARED TOPIC INSTRUCTIONS" in block)
+    assert "SHARED TOPIC INSTRUCTIONS" in (payload["instructions"] if protocol == "responses" else blocks[0])
     if protocol == "responses":
-        assert shared_index < dynamic_index
+        assert dynamic_index == 0
     else:
-        assert blocks[0] == stable
-        assert 0 < shared_index < dynamic_index
+        assert dynamic_index == 1
     request_indices = [
         i for i, block in enumerate(blocks)
         if any(value in block for value in ("TEST RESULTS", "KB RAG RESULTS", "GLOBAL MEMORY"))

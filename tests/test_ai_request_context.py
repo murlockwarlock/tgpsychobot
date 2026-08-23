@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -50,6 +51,58 @@ class _CompletionClient:
 
     async def close(self):
         return None
+
+
+class _GetResponseResult:
+    def __init__(self, *, scalar=None, rows=()):
+        self._scalar = scalar
+        self._rows = list(rows)
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+
+class _GetResponseSession:
+    def __init__(self, module, user, ai_config):
+        self.module = module
+        self.user = user
+        self.ai_config = ai_config
+        self.execute_calls = 0
+        self.added = []
+
+    async def execute(self, statement):
+        self.execute_calls += 1
+        if self.execute_calls == 1:
+            return _GetResponseResult(scalar=self.user)
+        return _GetResponseResult(rows=[])
+
+    async def get(self, model, key):
+        if model is self.module.AIConfig:
+            return self.ai_config
+        return None
+
+    def add(self, value):
+        self.added.append(value)
+
+    async def commit(self):
+        return None
+
+
+class _GetResponseSessionContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, *args):
+        return False
 
 
 class _ClaudeClient:
@@ -130,16 +183,15 @@ def _assert_direct_payload_layout(provider, payload, client_name="Ясна"):
         history = payload["contents"][-3:-1]
         current = payload["contents"][-1]
 
-    assert system_blocks[0] == stable
+    assert system_blocks[0] == f"{stable}\n\nSHARED TOPIC INSTRUCTIONS"
     assert client_name not in system_blocks[0]
     assert state not in system_blocks[0]
     assert metadata not in system_blocks[0]
     dynamic_index = next(i for i, block in enumerate(system_blocks) if client_name in block)
     assert state in system_blocks[dynamic_index]
     assert metadata in system_blocks[dynamic_index]
-    assert dynamic_index > 0
-    shared_index = next(i for i, block in enumerate(system_blocks) if "SHARED TOPIC INSTRUCTIONS" in block)
-    assert 0 < shared_index < dynamic_index
+    assert dynamic_index == 1
+    assert "SHARED TOPIC INSTRUCTIONS" in system_blocks[0]
     request_indices = [
         i for i, block in enumerate(system_blocks)
         if any(value in block for value in ("TEST RESULTS", "KB RAG RESULTS", "GLOBAL MEMORY"))
@@ -245,12 +297,11 @@ async def test_deepseek_stable_placeholders_are_neutralized(monkeypatch):
 
     messages = capture["payload"]["messages"]
     stable_content = messages[0]["content"]
-    shared_content = messages[1]["content"]
     assert "{user_name}" not in stable_content
     assert "{user_gender}" not in stable_content
     assert "Alice" not in stable_content
-    assert "{test_results}" not in shared_content
-    assert "Alice" in messages[2]["content"]
+    assert "{test_results}" not in stable_content
+    assert "Alice" in messages[1]["content"]
 
 
 @pytest.mark.asyncio
@@ -278,6 +329,110 @@ async def test_cache_regression_stable_block_is_identical_across_users(monkeypat
     assert "Alice" in first[1]["content"] and "STATE one" in first[1]["content"]
     assert "Boris" in second[1]["content"] and "STATE two" in second[1]["content"]
     assert "Alice" not in first[0]["content"] and "Boris" not in second[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_real_get_ai_response_preserves_deepseek_golden_prefix(monkeypatch):
+    _CompletionClient.calls.clear()
+    monkeypatch.setattr(ai_integration, "AsyncOpenAI", _CompletionClient)
+    monkeypatch.setattr(
+        ai_integration,
+        "build_runtime_automation_context",
+        AsyncMock(return_value="CURRENT_STATE STATE_X METADATA META_X"),
+    )
+    monkeypatch.setattr(ai_integration, "active_subscription_flag", lambda *args: "")
+
+    ai_config = SimpleNamespace(
+        provider="Deepseek",
+        deepseek_api_key="not-a-real-key",
+        deepseek_model="deepseek-chat",
+        system_prompt="STABLE CONFIGURED TOPIC PROMPT",
+        prompt_mode="text",
+        prompt_filename=None,
+        shared_prompt_block="SHARED BLOCK",
+        service_prompt_block="SERVICE BLOCK",
+        temperature=0.7,
+        context_limit_first=2,
+        context_limit_recent=10,
+        memory_mode="reset",
+        preserve_topic_context=False,
+        use_proxy=False,
+        fallback_timeout=60,
+        allow_fallback=False,
+    )
+    users = [
+        SimpleNamespace(
+            id=101,
+            name="Alice",
+            first_name="Alice",
+            gender="female",
+            age="31",
+            response_length="normal",
+            current_dialogue_id=7,
+            current_topic_id=None,
+            current_topic=None,
+            subscription=None,
+            ai_debug_enabled=False,
+        ),
+        SimpleNamespace(
+            id=202,
+            name="Boris",
+            first_name="Boris",
+            gender="male",
+            age="44",
+            response_length="normal",
+            current_dialogue_id=8,
+            current_topic_id=None,
+            current_topic=None,
+            subscription=None,
+            ai_debug_enabled=False,
+        ),
+    ]
+    sessions = []
+    current_user = {"value": users[0]}
+
+    def session_factory():
+        session = _GetResponseSession(ai_integration, current_user["value"], ai_config)
+        sessions.append(session)
+        return _GetResponseSessionContext(session)
+
+    monkeypatch.setattr(ai_integration, "async_session_maker", session_factory)
+
+    for user in users:
+        current_user["value"] = user
+        await ai_integration.get_ai_response(
+            user.id,
+            "CURRENT USER",
+            user.name,
+            user.gender,
+            include_test_context=False,
+        )
+
+    assert len(_CompletionClient.calls) == 2
+    payloads = _CompletionClient.calls
+    expected_stable = "STABLE CONFIGURED TOPIC PROMPT\n\nSHARED BLOCK\n\nSERVICE BLOCK"
+    for user, session, payload in zip(users, sessions, payloads):
+        messages = payload["messages"]
+        expected_dynamic = (
+            f"ДАННЫЕ КЛИЕНТА:\nИМЯ: {user.name}\nПОЛ: {user.gender}\nВОЗРАСТ: {user.age}"
+            "\n\nCURRENT_STATE STATE_X METADATA META_X"
+        )
+        assert messages[:2] == [
+            {"role": "system", "content": expected_stable},
+            {"role": "system", "content": expected_dynamic},
+        ]
+        assert messages[-1] == {"role": "user", "content": "CURRENT USER"}
+        assert sum(message == messages[-1] for message in messages) == 1
+        assert all(
+            forbidden not in messages[0]["content"]
+            for forbidden in ("Alice", "Boris", "CURRENT_STATE", "METADATA", "TEST", "RAG", "GLOBAL")
+        )
+
+        captured = json.loads(session.added[-1].request_payload)
+        assert captured["payload"] == payload
+        assert "not-a-real-key" not in session.added[-1].request_payload
+
+    assert payloads[0]["messages"][0] == payloads[1]["messages"][0]
 
 
 class AIRequestContextTests(unittest.IsolatedAsyncioTestCase):

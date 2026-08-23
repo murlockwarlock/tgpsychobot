@@ -131,15 +131,18 @@ class AIRequestLayout:
     def provider_instruction_blocks(self) -> tuple[str, ...]:
         """Return the provider-facing blocks without changing logical order.
 
-        The runtime and scenario fields are one dynamic semantic region.  They
-        are grouped for providers such as Chat Completions so their stable
-        prefix is followed by the same single dynamic block as the reference
-        DeepSeek request.  Request-specific blocks remain after that region.
+        Configured and shared instructions are one stable provider prefix,
+        matching the production Chat Completions shape.  The runtime and
+        scenario fields are one dynamic semantic region, followed by
+        request-specific blocks.
         """
         blocks: list[str] = []
-        if self.stable_system_prompt:
-            blocks.append(self.stable_system_prompt)
-        blocks.extend(self.shared_instructions)
+        stable_parts = (
+            ((self.stable_system_prompt,) if self.stable_system_prompt else ())
+            + self.shared_instructions
+        )
+        if stable_parts:
+            blocks.append("\n\n".join(stable_parts))
         dynamic_parts = self.runtime_context + self.scenario_context
         if dynamic_parts:
             blocks.append("\n\n".join(dynamic_parts))
@@ -147,10 +150,16 @@ class AIRequestLayout:
         return tuple(blocks)
 
     @property
+    def provider_stable_prefix(self) -> str:
+        """Return the single stable block used by provider protocols with one prefix."""
+        blocks = self.provider_instruction_blocks
+        return blocks[0] if blocks else ""
+
+    @property
     def provider_dynamic_instruction_blocks(self) -> tuple[str, ...]:
         """Return provider-facing dynamic blocks after the stable prefix."""
         blocks = self.provider_instruction_blocks
-        if self.stable_system_prompt and blocks:
+        if self.provider_stable_prefix and blocks:
             return blocks[1:]
         return blocks
 

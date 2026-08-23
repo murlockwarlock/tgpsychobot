@@ -145,7 +145,7 @@ def build_kie_chat_request(
     elif spec.protocol == KIE_CHAT_PROTOCOL_RESPONSES:
         payload = {
             "model": model,
-            "instructions": request_layout.stable_system_prompt,
+            "instructions": request_layout.provider_stable_prefix,
             "input": build_responses_input(request_layout),
             "stream": spec.stream,
         }
