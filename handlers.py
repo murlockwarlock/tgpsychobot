@@ -10,6 +10,7 @@ import textwrap
 import json
 import zipfile
 import time
+from collections import OrderedDict
 from types import SimpleNamespace
 import ai_integration
 import keyboards
@@ -37,7 +38,8 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
                      ReferralPaymentLog, MailingDeliveryLog, TopicMediaDeck,
                      MediaCollection, media_collection_items, topic_collection_association,
-                     ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationEvent)
+                     ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationEvent,
+                     DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_MAX_LENGTH)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
@@ -165,6 +167,124 @@ user_locks = {}
 user_message_buffers = {}
 user_processing_tasks = {}
 NAVIGATION_MENU_HINT = "Нажмите на кнопку или воспользуйтесь меню для навигации"
+
+_AI_BUTTON_CLAIMS_MAX = 2048
+_ai_button_claims: OrderedDict[tuple[int, int], None] = OrderedDict()
+
+
+def _ai_button_message_identity(callback: CallbackQuery) -> tuple[int, int] | None:
+    message = getattr(callback, "message", None)
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return None
+    try:
+        return int(chat_id), int(message_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _claim_ai_button_message(callback: CallbackQuery) -> bool:
+    identity = _ai_button_message_identity(callback)
+    if identity is None:
+        return True
+    if identity in _ai_button_claims:
+        return False
+    _ai_button_claims[identity] = None
+    _ai_button_claims.move_to_end(identity)
+    while len(_ai_button_claims) > _AI_BUTTON_CLAIMS_MAX:
+        _ai_button_claims.popitem(last=False)
+    return True
+
+
+def _resolve_ai_button_label(callback: CallbackQuery, callback_data: str) -> str | None:
+    message = getattr(callback, "message", None)
+    markup = getattr(message, "reply_markup", None)
+    rows = getattr(markup, "inline_keyboard", None) or []
+    for row in rows:
+        for button in row or []:
+            if getattr(button, "callback_data", None) == callback_data:
+                text = getattr(button, "text", None)
+                return text if isinstance(text, str) else None
+    return None
+
+
+def _sanitize_ai_button_fragment(value: str | None) -> str:
+    value = value if isinstance(value, str) else ""
+    value = value.replace("\\", "\\\\")
+    value = re.sub(r"[\r\n\t]+", " ", value)
+    for character in ('"', "[", "]", "(", ")"):
+        value = value.replace(character, f"\\{character}")
+    return value
+
+
+def build_ai_button_system_message(button_text: str | None, action: str) -> str:
+    return (
+        '[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку '
+        f'"{_sanitize_ai_button_fragment(button_text)}" '
+        f'({_sanitize_ai_button_fragment(action)})]'
+    )
+
+
+def normalize_ai_processing_message_text(value: str | None) -> str:
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        raise ValueError("Текст не может быть пустым.")
+    if len(text) > AI_PROCESSING_MESSAGE_MAX_LENGTH:
+        raise ValueError(
+            f"Текст слишком длинный. Максимум — {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов."
+        )
+    return text
+
+
+async def _disable_ai_button_keyboard(callback: CallbackQuery) -> None:
+    message = getattr(callback, "message", None)
+    edit_reply_markup = getattr(message, "edit_reply_markup", None)
+    if not callable(edit_reply_markup):
+        return
+    try:
+        await edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest as exc:
+        logging.info("AI button keyboard was already unavailable: %s", exc)
+    except Exception as exc:
+        logging.warning("Failed to remove AI button keyboard: %s", exc)
+
+
+async def _echo_ai_button_label(callback: CallbackQuery, bot: Bot, button_text: str | None) -> None:
+    if not isinstance(button_text, str) or not button_text:
+        return
+    message = getattr(callback, "message", None)
+    answer = getattr(message, "answer", None)
+    try:
+        if callable(answer):
+            await answer(button_text, parse_mode=None)
+            return
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            await bot.send_message(chat_id=chat_id, text=button_text, parse_mode=None)
+    except Exception as exc:
+        logging.warning("Failed to echo AI button label: %s", exc)
+
+
+async def _prepare_ai_button_submission(
+    callback: CallbackQuery,
+    bot: Bot,
+    callback_data: str,
+    *,
+    acknowledge: bool = True,
+) -> tuple[bool, str | None]:
+    if not _claim_ai_button_message(callback):
+        await callback.answer()
+        return False, None
+
+    if acknowledge:
+        await callback.answer()
+    button_text = _resolve_ai_button_label(callback, callback_data)
+    await _disable_ai_button_keyboard(callback)
+    await _echo_ai_button_label(callback, bot, button_text)
+    return True, button_text
 
 user_spread_state = {}  # Runtime cache; the source of truth is card_spread_states in the database.
 PAGE_SIZE = 5
@@ -541,6 +661,7 @@ class AdminStates(StatesGroup):
     set_context_recent_limit = State()
     set_temperature = State()
     set_kie_credit_threshold = State()
+    set_ai_processing_message_text = State()
     upload_test_questions_file = State()
     upload_test_formulas_file = State()
     set_test_system_prompt = State()
@@ -747,6 +868,43 @@ def _start_chat_action_loop(bot: Bot, chat_id: int, action: str, interval: float
             pass
 
     return asyncio.create_task(_loop())
+
+
+async def _send_ai_processing_message(bot: Bot, user_id: int, config: BotGeneralConfig | None):
+    if not config or not bool(getattr(config, "ai_processing_message_enabled", False)):
+        return None
+    text = getattr(config, "ai_processing_message_text", None)
+    text = text.strip() if isinstance(text, str) else ""
+    if not text:
+        logging.warning("AI processing message is enabled without usable text")
+        return None
+    try:
+        return await bot.send_message(chat_id=user_id, text=text, parse_mode=None)
+    except Exception as exc:
+        logging.warning("Failed to send AI processing message: %s", exc)
+        return None
+
+
+async def _delete_ai_processing_message(processing_message) -> None:
+    if processing_message is None:
+        return
+    delete = getattr(processing_message, "delete", None)
+    if not callable(delete):
+        return
+    try:
+        await delete()
+    except Exception as exc:
+        logging.warning("Failed to delete AI processing message: %s", exc)
+
+
+async def _cancel_task(task: asyncio.Task | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def handle_ai_media_content(bot: Bot, user_id: int, response_text: str):
@@ -1154,13 +1312,21 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
     await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
 
 
-async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | None = None):
+async def process_buffered_messages(
+    user_id: int,
+    bot: Bot,
+    state: FSMContext | None = None,
+    *,
+    visible_user_text: str | None = None,
+):
     if user_id not in user_message_buffers:
         return
     messages = user_message_buffers.pop(user_id)
     if await _resend_active_spread_choice(bot, user_id):
         return
     full_text = "\n".join(messages)
+    history_user_text = visible_user_text if visible_user_text is not None else full_text
+    user_ai_context_content = full_text if visible_user_text is not None else None
 
     async def keep_typing_loop():
         try:
@@ -1171,9 +1337,14 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
             pass
 
     typing_task = asyncio.create_task(keep_typing_loop())
-    async with async_session_maker() as session:
-        ai_config = await session.get(AIConfig, 1)
+    processing_message = None
+    ai_config = None
     try:
+        async with async_session_maker() as session:
+            ai_config = await session.get(AIConfig, 1)
+            general_config = await session.get(BotGeneralConfig, 1)
+        processing_message = await _send_ai_processing_message(bot, user_id, general_config)
+
         response_capture = {}
         response_text = await ai_integration.generate_response(
             user_id,
@@ -1182,7 +1353,6 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
             response_capture=response_capture,
         )
         ai_context_content = response_capture.get("raw_response") or response_text
-        typing_task.cancel()
 
         should_start_test, directive_clean_text = extract_test_start_directive(response_text)
         if should_start_test:
@@ -1197,7 +1367,14 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
             async with async_session_maker() as session:
                 user = await session.get(User, user_id)
                 if user:
-                    session.add(DBMessage(user_id=user.id, role='user', content=full_text, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                    session.add(DBMessage(
+                        user_id=user.id,
+                        role='user',
+                        content=history_user_text,
+                        ai_context_content=user_ai_context_content,
+                        dialogue_id=user.current_dialogue_id,
+                        topic_id=user.current_topic_id,
+                    ))
                     session.add(DBMessage(
                         user_id=user.id,
                         role='assistant',
@@ -1402,7 +1579,14 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                     await bot.send_message(chat_id=user_id, text="Выбери карту, которая тебе откликается:", reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]))
 
             if user:
-                session.add(DBMessage(user_id=user.id, role='user', content=full_text, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                session.add(DBMessage(
+                    user_id=user.id,
+                    role='user',
+                    content=history_user_text,
+                    ai_context_content=user_ai_context_content,
+                    dialogue_id=user.current_dialogue_id,
+                    topic_id=user.current_topic_id,
+                ))
                 session.add(DBMessage(
                     user_id=user.id,
                     role='assistant',
@@ -1448,7 +1632,6 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
                 )
 
     except AIServiceError as e:
-        if typing_task: typing_task.cancel()
         provider, model = _resolve_ai_provider_model(ai_config, "chat")
         await _report_ai_failure(
             bot,
@@ -1480,15 +1663,25 @@ async def process_buffered_messages(user_id: int, bot: Bot, state: FSMContext | 
             exception=e,
         )
         await bot.send_message(chat_id=user_id, text="Произошла ошибка при обработке сообщения.")
+    finally:
+        await _cancel_task(typing_task)
+        await _delete_ai_processing_message(processing_message)
 
 
 @router.callback_query(F.data.startswith("ai_btn:"))
 async def process_response_button(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    action = callback.data.split(":", 1)[1]
+    callback_data = callback.data or ""
+    action = callback_data.split(":", 1)[1]
     user_id = callback.from_user.id
     delegates_topic_callback = action.startswith("topic_") and action[6:].isdigit()
-    if not delegates_topic_callback:
-        await callback.answer()
+    accepted, button_text = await _prepare_ai_button_submission(
+        callback,
+        bot,
+        callback_data,
+        acknowledge=not delegates_topic_callback,
+    )
+    if not accepted:
+        return
 
     if action == "start_test":
         await _start_test_from_ai_directive(bot, user_id, state)
@@ -1531,8 +1724,14 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         await show_referral_info(message_proxy, bot)
         return
 
-    user_message_buffers[user_id] = [action]
-    await process_buffered_messages(user_id, bot, state)
+    ai_button_text = button_text or "Кнопка"
+    user_message_buffers[user_id] = [build_ai_button_system_message(ai_button_text, action)]
+    await process_buffered_messages(
+        user_id,
+        bot,
+        state,
+        visible_user_text=ai_button_text,
+    )
 
 
 @router.callback_query(F.data.startswith("card_select_"))
@@ -6122,6 +6321,8 @@ async def cancel_handler(callback: CallbackQuery, state: FSMContext):
         await admin_case_studies_list(callback_mock)
     elif target_menu_callback_data == "admin_test_menu":
         await admin_test_menu(callback)
+    elif target_menu_callback_data == "admin_general_settings":
+        await admin_general_settings(callback_mock)
     elif target_menu_callback_data == "admin_secret_questions":
         await admin_secret_questions_menu(callback_mock)
     elif target_menu_callback_data == "admin_test_links":
@@ -13536,18 +13737,116 @@ async def admin_general_settings(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(BotGeneralConfig, 1)
         if not config:
-            config = BotGeneralConfig(id=1)
+            config = BotGeneralConfig(
+                id=1,
+                ai_processing_message_enabled=False,
+                ai_processing_message_text=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
+            )
             session.add(config)
             await session.commit()
+
+    processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
+    processing_text = getattr(config, "ai_processing_message_text", None) or DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+    processing_text_display = html.escape(processing_text)
 
     await callback.message.edit_text(
         "⚙️ <b>Общие настройки</b>\n\n"
         "Выберите, какие данные бот должен запросить у нового пользователя при входе. "
         "Настройки действуют на весь бот, а не только на тест.\n\n"
         "Если поле уже заполнено в профиле, бот повторно его не спрашивает. "
-        "Отключённое поле можно заполнить позже через настройки пользователя.",
+        "Отключённое поле можно заполнить позже через настройки пользователя.\n\n"
+        f"Сообщение ожидания ИИ: {'включено' if processing_enabled else 'выключено'}\n"
+        f"Текущий текст: {processing_text_display}",
         reply_markup=kb.admin_general_settings_keyboard(config),
     )
+
+
+@router.callback_query(F.data == "admin_general_toggle_ai_processing_message")
+async def admin_toggle_ai_processing_message(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        if not config:
+            config = BotGeneralConfig(
+                id=1,
+                ai_processing_message_enabled=False,
+                ai_processing_message_text=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
+            )
+            session.add(config)
+            current_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+        else:
+            current_text = getattr(config, "ai_processing_message_text", None)
+        new_value = not bool(getattr(config, "ai_processing_message_enabled", False))
+        if new_value and (not isinstance(current_text, str) or not current_text.strip()):
+            await callback.answer("Сначала задайте текст сообщения ожидания.", show_alert=True)
+            return
+        config.ai_processing_message_enabled = new_value
+        await session.commit()
+
+    await admin_general_settings(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_general_edit_ai_processing_message_text")
+async def admin_edit_ai_processing_message_text(callback: CallbackQuery, state: FSMContext):
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        current_text = getattr(config, "ai_processing_message_text", None) if config else None
+    current_text = current_text or DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+    current_text_display = html.escape(current_text)
+    await state.set_state(AdminStates.set_ai_processing_message_text)
+    await state.update_data(message_id=callback.message.message_id)
+    await callback.message.edit_text(
+        "Введите текст временного сообщения во время ответа ИИ.\n"
+        f"Текущее значение: {current_text_display}\n\n"
+        f"После очистки текст должен содержать от 1 до {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов.",
+        reply_markup=kb.back_to_previous_menu("admin_general_settings"),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.set_ai_processing_message_text, F.text)
+async def admin_save_ai_processing_message_text(message: Message, state: FSMContext, bot: Bot):
+    try:
+        value = normalize_ai_processing_message_text(message.text)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+
+    state_data = await state.get_data()
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        if not config:
+            config = BotGeneralConfig(
+                id=1,
+                ai_processing_message_enabled=False,
+                ai_processing_message_text=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
+            )
+            session.add(config)
+        config.ai_processing_message_text = value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    message_id = state_data.get("message_id")
+    if message_id is not None:
+        async def edit_menu(text, **kwargs):
+            return await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                text=text,
+                **kwargs,
+            )
+
+        callback_mock = SimpleNamespace(
+            data="admin_general_settings_refresh",
+            message=SimpleNamespace(edit_text=edit_menu),
+        )
+        await admin_general_settings(callback_mock)
+    await message.answer("✅ Текст сообщения ожидания сохранён.")
 
 
 @router.callback_query(F.data.startswith("admin_general_toggle_profile_"))

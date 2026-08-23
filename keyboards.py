@@ -1,7 +1,13 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
-from database import async_session_maker, Content, SubscriptionConfig, TestConfig, Topic
+from database import (
+    async_session_maker,
+    Content,
+    SubscriptionConfig,
+    TestConfig,
+    Topic,
+)
 from config import OWNER_IDS
 from datetime import timezone, timedelta, date
 from mailing_utils import MAILING_AUDIENCE_LABELS, get_mailing_status_label, is_birthday_mailing
@@ -166,6 +172,16 @@ def admin_general_settings_keyboard(config):
             text=f"{title}: {status}",
             callback_data=f"admin_general_toggle_profile_{field}",
         )
+    processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
+    processing_status = "✅ включено" if processing_enabled else "❌ выключено"
+    builder.button(
+        text=f"Показывать сообщение во время ответа ИИ: {processing_status}",
+        callback_data="admin_general_toggle_ai_processing_message",
+    )
+    builder.button(
+        text="✏️ Текст сообщения ожидания",
+        callback_data="admin_general_edit_ai_processing_message_text",
+    )
     builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
     builder.adjust(1)
     return builder.as_markup()

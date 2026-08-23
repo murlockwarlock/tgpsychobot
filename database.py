@@ -132,8 +132,6 @@ class Message(Base):
     dialogue_id = Column(Integer, default=1, nullable=False)
     role = Column(String)
     content = Column(Text)
-    # Exact assistant output for the next AI request. ``content`` remains the
-    # user-visible history, while this field may retain hidden service blocks.
     ai_context_content = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     user = relationship("User", back_populates="messages")
@@ -523,6 +521,12 @@ class BotGeneralConfig(Base):
     profile_collect_name = Column(Boolean, default=True, nullable=False)
     profile_collect_gender = Column(Boolean, default=True, nullable=False)
     profile_collect_age = Column(Boolean, default=False, nullable=False)
+    ai_processing_message_enabled = Column(Boolean, default=False, nullable=False)
+    ai_processing_message_text = Column(String(200), default="Думаю...", nullable=False)
+
+
+DEFAULT_AI_PROCESSING_MESSAGE_TEXT = "Думаю..."
+AI_PROCESSING_MESSAGE_MAX_LENGTH = 200
 
 
 class SecretTestQuestion(Base):
@@ -610,6 +614,18 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN metadata_json TEXT DEFAULT '{}' NOT NULL"))
             if 'ai_debug_enabled' not in user_columns:
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN ai_debug_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
+
+            general_columns = [c['name'] for c in insp.get_columns('bot_general_config')]
+            if 'ai_processing_message_enabled' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN ai_processing_message_enabled BOOLEAN DEFAULT FALSE NOT NULL"
+                ))
+            if 'ai_processing_message_text' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN ai_processing_message_text VARCHAR(200) DEFAULT 'Думаю...' NOT NULL"
+                ))
 
             ai_log_columns = [c['name'] for c in insp.get_columns('ai_logs')]
             if 'request_payload' not in ai_log_columns:
@@ -844,8 +860,15 @@ async def init_db():
                 profile_collect_name=bool(getattr(test_conf, 'profile_collect_name', True)),
                 profile_collect_gender=bool(getattr(test_conf, 'profile_collect_gender', True)),
                 profile_collect_age=bool(getattr(test_conf, 'profile_collect_age', False)),
+                ai_processing_message_enabled=False,
+                ai_processing_message_text=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
             )
             session.add(general_conf)
+        else:
+            if getattr(general_conf, 'ai_processing_message_enabled', None) is None:
+                general_conf.ai_processing_message_enabled = False
+            if getattr(general_conf, 'ai_processing_message_text', None) is None:
+                general_conf.ai_processing_message_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
 
         # Seed default content sections for new bots (won't overwrite existing)
         default_content = [

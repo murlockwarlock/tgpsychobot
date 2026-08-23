@@ -63,6 +63,14 @@ def select_ai_history_messages(
                 topic=getattr(message, "topic", None),
                 source_role="assistant",
             ))
+        elif message.role == "user" and getattr(message, "ai_context_content", None):
+            normalized.append(AIHistoryMessage(
+                role="user",
+                content=message.ai_context_content,
+                topic_id=getattr(message, "topic_id", None),
+                topic=getattr(message, "topic", None),
+                source_role="user",
+            ))
         else:
             normalized.append(message)
 
