@@ -96,7 +96,13 @@ from user_metadata import append_metadata_records, extract_data_blocks, extract_
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
-from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
+from response_buttons import (
+    ResponseButton,
+    build_action_callback_data,
+    extract_response_buttons,
+    extract_test_start_directive,
+    split_action_callback_data,
+)
 from result_history import (
     TEST_RESULT_ROLE,
     attach_secret_answers,
@@ -206,7 +212,7 @@ def _resolve_ai_button_label(callback: CallbackQuery, callback_data: str) -> str
         for button in row or []:
             if getattr(button, "callback_data", None) == callback_data:
                 text = getattr(button, "text", None)
-                return text if isinstance(text, str) else None
+                return text if isinstance(text, str) and text else None
     return None
 
 
@@ -282,6 +288,16 @@ async def _prepare_ai_button_submission(
     if acknowledge:
         await callback.answer()
     button_text = _resolve_ai_button_label(callback, callback_data)
+    if not button_text:
+        if not acknowledge:
+            await callback.answer()
+        log.warning(
+            "Could not resolve AI button label; rejecting callback_data=%r message=%s",
+            callback_data,
+            _ai_button_message_identity(callback),
+        )
+        await _disable_ai_button_keyboard(callback)
+        return False, None
     await _disable_ai_button_keyboard(callback)
     await _echo_ai_button_label(callback, bot, button_text)
     return True, button_text
@@ -1220,14 +1236,28 @@ def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None
 def _telegram_response_buttons_markup(rows: list[list[ResponseButton]]) -> InlineKeyboardMarkup | None:
     if not rows:
         return None
+    action_counts: dict[str, int] = {}
+    for row in rows:
+        for button in row:
+            if button.kind == "action":
+                action_counts[button.value] = action_counts.get(button.value, 0) + 1
+
     keyboard_rows: list[list[InlineKeyboardButton]] = []
+    action_button_index = 0
     for row in rows:
         keyboard_row = []
         for button in row:
             if button.kind == "url":
                 keyboard_row.append(InlineKeyboardButton(text=button.text, url=button.value))
             else:
-                keyboard_row.append(InlineKeyboardButton(text=button.text, callback_data=f"ai_btn:{button.value}"))
+                callback_data = build_action_callback_data(
+                    button.value,
+                    action_button_index if action_counts[button.value] > 1 else None,
+                )
+                keyboard_row.append(
+                    InlineKeyboardButton(text=button.text, callback_data=callback_data)
+                )
+                action_button_index += 1
         if keyboard_row:
             keyboard_rows.append(keyboard_row)
     return InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
@@ -1602,6 +1632,7 @@ async def process_buffered_messages(
                 await session.commit()
 
         if drawn_cards_info:
+            typing_task_interp = None
             try:
                 cards_text = "; ".join(drawn_cards_info)
                 typing_task_interp = asyncio.create_task(keep_typing_loop())
@@ -1610,7 +1641,7 @@ async def process_buffered_messages(
                     f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]",
                     bot=bot,
                 )
-                typing_task_interp.cancel()
+                await _cancel_task(typing_task_interp)
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
                 if clean_interpretation:
                     await _send_generated_response(bot, user_id, clean_interpretation)
@@ -1619,6 +1650,7 @@ async def process_buffered_messages(
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation, dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
                         await s2.commit()
             except Exception as e:
+                await _cancel_task(typing_task_interp)
                 provider, model = _resolve_ai_provider_model(ai_config, "chat")
                 await _report_ai_failure(
                     bot,
@@ -1671,7 +1703,7 @@ async def process_buffered_messages(
 @router.callback_query(F.data.startswith("ai_btn:"))
 async def process_response_button(callback: CallbackQuery, state: FSMContext, bot: Bot):
     callback_data = callback.data or ""
-    action = callback_data.split(":", 1)[1]
+    action, _button_index = split_action_callback_data(callback_data)
     user_id = callback.from_user.id
     delegates_topic_callback = action.startswith("topic_") and action[6:].isdigit()
     accepted, button_text = await _prepare_ai_button_submission(
@@ -1724,13 +1756,14 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         await show_referral_info(message_proxy, bot)
         return
 
-    ai_button_text = button_text or "Кнопка"
-    user_message_buffers[user_id] = [build_ai_button_system_message(ai_button_text, action)]
+    if not isinstance(button_text, str) or not button_text:
+        return
+    user_message_buffers[user_id] = [build_ai_button_system_message(button_text, action)]
     await process_buffered_messages(
         user_id,
         bot,
         state,
-        visible_user_text=ai_button_text,
+        visible_user_text=button_text,
     )
 
 

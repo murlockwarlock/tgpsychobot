@@ -12,10 +12,19 @@ MAX_BUTTON_ROWS = 20
 MAX_ACTION_CHARS = 30
 MAX_CALLBACK_DATA_BYTES = 64
 ACTION_CALLBACK_PREFIX = "ai_btn:"
+ACTION_CALLBACK_ID_SEPARATOR = "|"
+ACTION_CALLBACK_ID_WIDTH = 2
+ACTION_CALLBACK_ID_SUFFIX = (
+    f"{ACTION_CALLBACK_ID_SEPARATOR}{'0' * ACTION_CALLBACK_ID_WIDTH}"
+)
 BUTTON_RE = re.compile(r"\[([^\]\n]{1,64})\]\((.+)\)")
 TEST_START_DIRECTIVE_RE = re.compile(
     r"(?<![:\w])\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)",
     re.IGNORECASE,
+)
+_ACTION_CALLBACK_ID_RE = re.compile(
+    rf"{re.escape(ACTION_CALLBACK_ID_SEPARATOR)}"
+    rf"([0-9a-f]{{{ACTION_CALLBACK_ID_WIDTH}}})$"
 )
 
 
@@ -26,6 +35,35 @@ class ResponseButton:
     value: str
 
 
+def build_action_callback_data(action: str, button_index: int | None = None) -> str:
+    """Build a legacy or collision-safe Telegram callback payload."""
+    callback_data = f"{ACTION_CALLBACK_PREFIX}{action}"
+    if button_index is None:
+        if len(callback_data.encode("utf-8")) > MAX_CALLBACK_DATA_BYTES:
+            raise ValueError("action callback data exceeds Telegram's 64-byte limit")
+        return callback_data
+    if not isinstance(button_index, int) or not 0 <= button_index <= 0xFF:
+        raise ValueError("button_index must fit into the two-digit callback identity")
+    callback_data = (
+        f"{callback_data}{ACTION_CALLBACK_ID_SEPARATOR}"
+        f"{button_index:0{ACTION_CALLBACK_ID_WIDTH}x}"
+    )
+    if len(callback_data.encode("utf-8")) > MAX_CALLBACK_DATA_BYTES:
+        raise ValueError("action callback data exceeds Telegram's 64-byte limit")
+    return callback_data
+
+
+def split_action_callback_data(callback_data: str) -> tuple[str, int | None]:
+    """Return the action and optional generated per-button identity."""
+    if not isinstance(callback_data, str) or not callback_data.startswith(ACTION_CALLBACK_PREFIX):
+        return callback_data, None
+    payload = callback_data[len(ACTION_CALLBACK_PREFIX):]
+    match = _ACTION_CALLBACK_ID_RE.search(payload)
+    if not match:
+        return payload, None
+    return payload[:match.start()], int(match.group(1), 16)
+
+
 def _is_valid_action(action: str) -> bool:
     if not 1 <= len(action) <= MAX_ACTION_CHARS:
         return False
@@ -33,7 +71,10 @@ def _is_valid_action(action: str) -> bool:
         return False
     if any(char in "[]()|" for char in action):
         return False
-    return len(f"{ACTION_CALLBACK_PREFIX}{action}".encode("utf-8")) <= MAX_CALLBACK_DATA_BYTES
+    return len(
+        f"{ACTION_CALLBACK_PREFIX}{action}{ACTION_CALLBACK_ID_SUFFIX}"
+        .encode("utf-8")
+    ) <= MAX_CALLBACK_DATA_BYTES
 
 
 def _clean_part(part: str) -> str:
