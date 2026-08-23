@@ -117,7 +117,9 @@ def _failure(module, kind):
     raise AssertionError(f"unknown failure kind: {kind}")
 
 
-def _config(*, fallback_enabled):
+def _config(*, fallback_enabled, fallback_configured=None):
+    if fallback_configured is None:
+        fallback_configured = fallback_enabled
     return SimpleNamespace(
         provider="gemini",
         system_prompt="SYSTEM",
@@ -127,8 +129,8 @@ def _config(*, fallback_enabled):
         gemini_model="primary-model",
         openai_api_key="fallback-key",
         openai_model="fallback-model",
-        fallback_provider="openai" if fallback_enabled else None,
-        fallback_model="fallback-model" if fallback_enabled else None,
+        fallback_provider="openai" if fallback_configured else None,
+        fallback_model="fallback-model" if fallback_configured else None,
         allow_fallback=fallback_enabled,
         temperature=0.7,
         context_limit_first=2,
@@ -158,17 +160,27 @@ def _user():
     )
 
 
-async def _run_telegram(monkeypatch, primary_outcome, *, fallback_enabled):
+async def _run_telegram(
+    monkeypatch,
+    primary_outcome,
+    *,
+    fallback_enabled,
+    fallback_configured=None,
+    fallback_call=None,
+):
     import ai_integration
 
-    config = _config(fallback_enabled=fallback_enabled)
+    config = _config(
+        fallback_enabled=fallback_enabled,
+        fallback_configured=fallback_configured,
+    )
     session = _Session(ai_integration, _user(), config, telegram=True)
     primary = (
         AsyncMock(side_effect=primary_outcome)
         if isinstance(primary_outcome, BaseException)
         else AsyncMock(return_value=primary_outcome)
     )
-    fallback = AsyncMock(return_value="fallback answer")
+    fallback = fallback_call if fallback_call is not None else AsyncMock(return_value="fallback answer")
     monkeypatch.setattr(ai_integration, "async_session_maker", lambda: _SessionContext(session))
     monkeypatch.setattr(ai_integration, "build_runtime_context", AsyncMock(return_value="runtime"))
     monkeypatch.setattr(ai_integration, "_call_gemini_api", primary)
@@ -183,17 +195,27 @@ async def _run_telegram(monkeypatch, primary_outcome, *, fallback_enabled):
     return result, primary, fallback
 
 
-async def _run_max(monkeypatch, primary_outcome, *, fallback_enabled):
+async def _run_max(
+    monkeypatch,
+    primary_outcome,
+    *,
+    fallback_enabled,
+    fallback_configured=None,
+    fallback_call=None,
+):
     from max_messenger_bot import ai
 
-    config = _config(fallback_enabled=fallback_enabled)
+    config = _config(
+        fallback_enabled=fallback_enabled,
+        fallback_configured=fallback_configured,
+    )
     session = _Session(ai, _user(), config, telegram=False)
     primary = (
         AsyncMock(side_effect=primary_outcome)
         if isinstance(primary_outcome, BaseException)
         else AsyncMock(return_value=primary_outcome)
     )
-    fallback = AsyncMock(return_value="fallback answer")
+    fallback = fallback_call if fallback_call is not None else AsyncMock(return_value="fallback answer")
     monkeypatch.setattr(ai, "async_session_maker", lambda: _SessionContext(session))
     monkeypatch.setattr(ai, "_dispatch_provider", primary)
     monkeypatch.setattr(ai, "_call_openai", fallback)
@@ -288,6 +310,38 @@ async def test_primary_success_does_not_invoke_fallback(monkeypatch, surface):
     assert result == "primary answer"
     primary.assert_awaited_once()
     fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+async def test_fallback_toggle_controls_configured_fallback(monkeypatch, surface):
+    module = _module(surface)
+    runner = _run_telegram if surface == "telegram" else _run_max
+    primary_error = module.AIServiceError("primary provider failed")
+    disabled_fallback = AsyncMock(return_value="should not be used")
+
+    with pytest.raises(module.AIServiceError, match="primary provider failed"):
+        await runner(
+            monkeypatch,
+            primary_error,
+            fallback_enabled=False,
+            fallback_configured=True,
+            fallback_call=disabled_fallback,
+        )
+    disabled_fallback.assert_not_awaited()
+
+    enabled_fallback = AsyncMock(return_value="fallback answer")
+    result, _, fallback = await runner(
+        monkeypatch,
+        primary_error,
+        fallback_enabled=True,
+        fallback_configured=True,
+        fallback_call=enabled_fallback,
+    )
+
+    assert result == "fallback answer"
+    assert fallback is enabled_fallback
+    enabled_fallback.assert_awaited_once()
 
 
 @pytest.mark.asyncio

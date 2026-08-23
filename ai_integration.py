@@ -1447,9 +1447,10 @@ async def get_ai_response(
         try:
             response_text = await _dispatch_call(provider_key, api_key, model)
         except (AIServiceError, Exception) as primary_err:
+            allow_fallback = getattr(ai_config, 'allow_fallback', False)
             fb_provider = getattr(ai_config, 'fallback_provider', None)
             fb_model = getattr(ai_config, 'fallback_model', None)
-            if not fb_provider or not fb_model:
+            if not allow_fallback or not fb_provider or not fb_model:
                 raise
 
             fb_key = fb_provider.strip().lower()
