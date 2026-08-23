@@ -84,7 +84,12 @@ from mailing_utils import (
     send_mailing_content,
 )
 from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE, render_prompt_block
-from provider_models import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MODELS
+from provider_models import (
+    DEEPSEEK_DEFAULT_MODEL,
+    DEEPSEEK_MODELS,
+    KIE_CHAT_MODELS,
+    KIE_DEFAULT_CHAT_MODEL,
+)
 from user_metadata import append_metadata_records, extract_data_blocks, extract_service_data, load_metadata_records
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary
 from metadata_export import metadata_export_entry
@@ -369,6 +374,22 @@ MODELS_INFO = {
             'name': 'KIE Gemini 2.5 Flash',
             'desc': 'Быстрая KIE-модель для более дешёвых сценариев и fallback.'
         },
+        'claude-haiku-4-5': {
+            'name': 'KIE Claude Haiku 4.5',
+            'desc': 'KIE Claude-модель для текстового чата через Messages API.'
+        },
+        'grok-4-3': {
+            'name': 'KIE Grok 4.3',
+            'desc': 'KIE Grok-модель для текстового чата через Responses API.'
+        },
+        'gemini-3-7-flash': {
+            'name': 'KIE Gemini 3.7 Flash',
+            'desc': 'KIE Gemini-модель для текстового чата через native Gemini API.'
+        },
+        'gpt-5-6-luna': {
+            'name': 'KIE GPT 5.6 Luna',
+            'desc': 'KIE GPT-модель для текстового чата через Responses API.'
+        },
         'pricing': '<b>Зависит от выбранной модели в KIE.</b>\nДля чата используйте Gemini 3 Flash.'
     },
     "Claude": {
@@ -417,6 +438,12 @@ MODELS_INFO = {
         'pricing': '<b>GPT-4o:</b> $5 / $15\n<b>GPT-4T:</b> $10 / $30\n<b>GPT-3.5T:</b> $0.50 / $1.50\n(Вход / Выход за 1M токенов)'
     }
 }
+
+# Keep the Telegram primary selector driven by the shared KIE chat catalog.
+MODELS_INFO["KIE"] = {
+    model: MODELS_INFO["KIE"][model]
+    for model in KIE_CHAT_MODELS
+} | {"pricing": MODELS_INFO["KIE"]["pricing"]}
 
 
 CATEGORY_NAMES = {
@@ -3556,7 +3583,7 @@ _FALLBACK_DEFAULT_MODELS = {
     "Deepseek": DEEPSEEK_DEFAULT_MODEL,
     "Claude": "claude-sonnet-4-5-20250929",
     "Gemini": "gemini-2.0-flash",
-    "KIE": "gemini-3-flash",
+    "KIE": KIE_DEFAULT_CHAT_MODEL,
     "OpenAI": "gpt-4o",
 }
 
@@ -3618,7 +3645,7 @@ async def admin_change_fallback_model_list(callback: CallbackQuery):
         "Deepseek": list(DEEPSEEK_MODELS),
         "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
         "Gemini": ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-2.5-pro-preview-05-06"],
-        "KIE": ["gemini-3-flash", "gemini-2.5-flash"],
+        "KIE": list(KIE_CHAT_MODELS),
         "OpenAI": ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
     }
     models = model_map.get(provider, [])

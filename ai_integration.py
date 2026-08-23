@@ -36,6 +36,11 @@ from error_reporting import exception_summary, notify_admins_about_error
 from vector_store import search_relevant_chunks
 from user_metadata import extract_service_data
 from provider_models import normalize_deepseek_model
+from kie_chat import (
+    build_kie_chat_request,
+    extract_kie_chat_response_text,
+    extract_kie_chat_text,
+)
 from subscription_context import active_subscription_flag
 
 class InsufficientBalanceError(Exception):
@@ -573,37 +578,50 @@ async def _call_gemini_api(api_key: str, model: str, history: list, context: str
 
 async def _call_kie_chat(api_key: str, base_url: str, model: str, history: list, context: str, system_prompt: str, temperature: float = 0.7, request_capture: dict | None = None) -> str:
     try:
-        kie_history = []
-        for msg in history:
-            if msg.content:
-                kie_history.append({"role": msg.role, "content": msg.content})
-
         full_system_prompt = f"{system_prompt}\n\nИспользуй следующие данные из базы знаний для ответа:\n{context}"
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": full_system_prompt},
-                *kie_history,
-            ],
-            "max_tokens": 4096,
-            "temperature": temperature,
-            "stream": False,
-        }
-        endpoint = f"{_kie_model_base_url(base_url, model)}/chat/completions"
-        _capture_ai_request(request_capture, provider="KIE", endpoint=endpoint, payload=payload)
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        request = build_kie_chat_request(
+            api_key,
+            base_url,
+            model,
+            history,
+            full_system_prompt,
+            temperature,
+        )
+        _capture_ai_request(
+            request_capture,
+            provider="KIE",
+            endpoint=request.endpoint,
+            payload=request.payload,
+        )
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(
-                endpoint,
-                headers=headers,
-                json=payload,
+                request.endpoint,
+                headers=request.headers,
+                json=request.payload,
             )
-        response_payload = _validate_kie_json_response(
-            response.status_code,
-            response.json(),
-            context="Ошибка при обращении к KIE Chat API",
-        )
-        text = _extract_kie_chat_text(response_payload)
+        if response.status_code != 200:
+            try:
+                error_payload = response.json()
+            except (TypeError, ValueError):
+                error_payload = {"message": getattr(response, "text", "")}
+            _validate_kie_json_response(
+                response.status_code,
+                error_payload,
+                context="Ошибка при обращении к KIE Chat API",
+            )
+
+        if request.stream:
+            text = extract_kie_chat_response_text(response, request.protocol, stream=True)
+        else:
+            try:
+                response_payload = _validate_kie_json_response(
+                    response.status_code,
+                    response.json(),
+                    context="Ошибка при обращении к KIE Chat API",
+                )
+                text = extract_kie_chat_text(response_payload, request.protocol)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                text = extract_kie_chat_response_text(response, request.protocol, stream=True)
         if not text:
             raise AIResponseError("KIE chat returned empty content")
         return text
