@@ -58,9 +58,12 @@ def _provider_model(provider: str | None, model: str | None) -> str:
 
 
 def _fallback_model_for_provider(config: AIConfig, provider: str | None) -> str:
-    field = MODEL_FIELDS.get(provider or "")
-    configured = getattr(config, field, None) if field else None
-    return configured or get_default_model(provider or "", channel="fallback")
+    selectable = get_selectable_models(provider or "", channel="fallback")
+    current_fb_provider = getattr(config, "fallback_provider", None)
+    current_fb_model = getattr(config, "fallback_model", None)
+    if current_fb_provider == provider and current_fb_model in selectable:
+        return current_fb_model
+    return get_default_model(provider or "", channel="fallback")
 
 
 def _prompt_input_keyboard(cancel_payload: str) -> list[dict]:
@@ -506,8 +509,6 @@ async def set_fallback_provider(client: MaxApiClient, chat_id: int, provider: st
         current_model = config.fallback_model
     models = list(get_selectable_models(provider, channel="fallback"))
     rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
-    if current_model and current_model not in models:
-        rows.insert(0, [callback_button(f"✅ {current_model}", f"admin_ai_save_fallback_{provider}_{current_model}")])
     rows.append([callback_button("◀️ Назад", "admin_ai_fallback_models")])
     await client.send_message(
         chat_id=chat_id,

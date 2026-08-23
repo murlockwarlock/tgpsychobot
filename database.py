@@ -157,24 +157,24 @@ class AIConfig(Base):
     kie_api_key = Column(String, nullable=True)
     yandex_api_key = Column(String, nullable=True)
     yandex_folder_id = Column(String, nullable=True)
-    gemini_model = Column(String, default='gemini-2.0-flash')
+    gemini_model = Column(String, default='gemini-3.7-flash')
     kie_model = Column(String, default='gemini-3-flash')
     kie_base_url = Column(String, default='https://api.kie.ai')
     kie_upload_base_url = Column(String, default='https://kieai.redpandaai.co')
     kie_transcription_model = Column(String, default='elevenlabs/speech-to-text')
     kie_credit_alert_threshold = Column(Float, default=0, nullable=False)
     kie_credit_alert_sent = Column(Boolean, default=False, nullable=False)
-    claude_model = Column(String, default='claude-sonnet-4-5-20250929')
+    claude_model = Column(String, default='claude-sonnet-5')
     deepseek_model = Column(String, default=DEEPSEEK_DEFAULT_MODEL)
-    openai_model = Column(String, default='gpt-4o')
+    openai_model = Column(String, default='gpt-5.6-terra')
     max_voice_duration_sec = Column(Integer, default=180, nullable=False)
     transcription_provider = Column(String, default='OpenAI', nullable=False)
     vision_provider = Column(String, default='Gemini', nullable=False)
-    vision_model = Column(String, default='gemini-3-flash-preview', nullable=False)
-    image_generation_provider = Column(String, default='Gemini', nullable=False)
-    image_generation_model = Column(String, default='imagen-4.0-generate-001', nullable=False)
-    image_edit_provider = Column(String, default='Gemini', nullable=False)
-    image_edit_model = Column(String, default='gemini-3-pro-image-preview', nullable=False)
+    vision_model = Column(String, default='gemini-3.7-flash', nullable=False)
+    image_generation_provider = Column(String, default='OpenAI', nullable=False)
+    image_generation_model = Column(String, default='gpt-image-2', nullable=False)
+    image_edit_provider = Column(String, default='KIE', nullable=False)
+    image_edit_model = Column(String, default='seedream/4.5-edit', nullable=False)
     context_limit_first = Column(Integer, default=2, nullable=False)
     context_limit_recent = Column(Integer, default=10, nullable=False)
     temperature = Column(Float, default=0.7, nullable=False)
@@ -583,6 +583,72 @@ def _migrate_deepseek_models(sync_conn) -> None:
     """))
 
 
+def _migrate_ai_config_models(sync_conn) -> None:
+    """Safely and idempotently migrate retired/legacy models in ai_config to approved active models."""
+    from sqlalchemy import text
+
+    _migrate_deepseek_models(sync_conn)
+
+    # 1. Migrate OpenAI chat and fallback models
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET openai_model = 'gpt-5.6-terra'
+        WHERE openai_model IN ('gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'gpt-4.1')
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET fallback_model = 'gpt-5.6-terra'
+        WHERE fallback_provider = 'OpenAI'
+          AND fallback_model IN ('gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'gpt-4.1')
+    """))
+
+    # 2. Migrate Claude chat and fallback models
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET claude_model = 'claude-sonnet-5'
+        WHERE claude_model IN ('claude-opus-4-1-20250805', 'claude-3-haiku-20240307', 'claude-sonnet-4-5-20250929')
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET fallback_model = 'claude-sonnet-5'
+        WHERE fallback_provider = 'Claude'
+          AND fallback_model IN ('claude-opus-4-1-20250805', 'claude-3-haiku-20240307', 'claude-sonnet-4-5-20250929')
+    """))
+
+    # 3. Migrate Gemini chat and fallback models
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET gemini_model = 'gemini-3.7-flash'
+        WHERE gemini_model IN ('gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.5-flash-preview-05-20', 'gemini-2.5-pro-preview-05-06')
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET fallback_model = 'gemini-3.7-flash'
+        WHERE fallback_provider = 'Gemini'
+          AND fallback_model IN ('gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.5-flash-preview-05-20', 'gemini-2.5-pro-preview-05-06')
+    """))
+
+    # 4. Migrate Vision models for active vision providers
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET vision_model = 'gemini-3.7-flash'
+        WHERE vision_provider = 'Gemini'
+          AND vision_model IN ('gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash', 'gemini-3-flash-preview')
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET vision_model = 'claude-sonnet-5'
+        WHERE vision_provider = 'Claude'
+          AND vision_model IN ('claude-opus-4-1-20250805', 'claude-3-haiku-20240307', 'claude-sonnet-4-5-20250929')
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET vision_model = 'gpt-5.6-terra'
+        WHERE vision_provider = 'OpenAI'
+          AND vision_model IN ('gpt-4o', 'gpt-4o-mini')
+    """))
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -655,13 +721,13 @@ async def init_db():
             if 'kie_credit_alert_sent' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_credit_alert_sent BOOLEAN DEFAULT FALSE NOT NULL"))
             if 'image_generation_provider' not in ai_columns:
-                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_generation_provider VARCHAR DEFAULT 'Gemini' NOT NULL"))
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_generation_provider VARCHAR DEFAULT 'OpenAI' NOT NULL"))
             if 'image_generation_model' not in ai_columns:
-                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_generation_model VARCHAR DEFAULT 'imagen-4.0-generate-001' NOT NULL"))
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_generation_model VARCHAR DEFAULT 'gpt-image-2' NOT NULL"))
             if 'image_edit_provider' not in ai_columns:
-                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_provider VARCHAR DEFAULT 'Gemini' NOT NULL"))
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_provider VARCHAR DEFAULT 'KIE' NOT NULL"))
             if 'image_edit_model' not in ai_columns:
-                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_model VARCHAR DEFAULT 'gemini-3-pro-image-preview' NOT NULL"))
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN image_edit_model VARCHAR DEFAULT 'seedream/4.5-edit' NOT NULL"))
             if 'use_proxy' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN use_proxy BOOLEAN DEFAULT TRUE NOT NULL"))
             if 'fallback_timeout' not in ai_columns:
@@ -677,7 +743,7 @@ async def init_db():
             if 'allow_image_edit' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_image_edit BOOLEAN DEFAULT FALSE NOT NULL"))
 
-            _migrate_deepseek_models(sync_conn)
+            _migrate_ai_config_models(sync_conn)
 
             test_session_columns = [c['name'] for c in insp.get_columns('test_sessions')]
             if 'formula_results' not in test_session_columns:
@@ -787,7 +853,7 @@ async def init_db():
             if not hasattr(ai_conf, 'vision_provider') or ai_conf.vision_provider is None:
                 ai_conf.vision_provider = 'Gemini'
             if not hasattr(ai_conf, 'vision_model') or ai_conf.vision_model is None:
-                ai_conf.vision_model = 'gemini-3-flash-preview'
+                ai_conf.vision_model = 'gemini-3.7-flash'
             if getattr(ai_conf, 'kie_model', None) is None:
                 ai_conf.kie_model = 'gemini-3-flash'
             if getattr(ai_conf, 'kie_base_url', None) is None:
@@ -801,13 +867,13 @@ async def init_db():
             if getattr(ai_conf, 'kie_credit_alert_sent', None) is None:
                 ai_conf.kie_credit_alert_sent = False
             if getattr(ai_conf, 'image_generation_provider', None) is None:
-                ai_conf.image_generation_provider = 'Gemini'
+                ai_conf.image_generation_provider = 'OpenAI'
             if getattr(ai_conf, 'image_generation_model', None) is None:
-                ai_conf.image_generation_model = 'imagen-4.0-generate-001'
+                ai_conf.image_generation_model = 'gpt-image-2'
             if getattr(ai_conf, 'image_edit_provider', None) is None:
-                ai_conf.image_edit_provider = 'Gemini'
+                ai_conf.image_edit_provider = 'KIE'
             if getattr(ai_conf, 'image_edit_model', None) is None:
-                ai_conf.image_edit_model = 'gemini-3-pro-image-preview'
+                ai_conf.image_edit_model = 'seedream/4.5-edit'
             if getattr(ai_conf, 'memory_mode', None) is None:
                 ai_conf.memory_mode = get_memory_mode(ai_conf)
             ai_conf.preserve_topic_context = ai_conf.memory_mode == MEMORY_MODE_TOPIC

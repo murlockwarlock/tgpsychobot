@@ -140,7 +140,7 @@ class MaxTranscriptionFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "готовый текст")
         gemini.assert_awaited_once_with(
             "gemini-key",
-            "gemini-model",
+            "gemini-3.7-flash",
             b"audio",
             "voice.ogg",
         )

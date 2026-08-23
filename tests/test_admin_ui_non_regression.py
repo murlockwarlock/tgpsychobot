@@ -122,7 +122,7 @@ def test_vision_toggle_valid_model(provider):
     assert model not in RETIRED_UPSTREAM_MODELS
     assert model not in APP_DISABLED_OR_MIGRATED_MODELS
     vision_models = get_selectable_models(provider, channel="vision")
-    assert model in vision_models or model == pm.DEFAULT_VISION_MODEL, (
+    assert model in vision_models, (
         f"Vision toggle for {provider!r} writes '{model}' not in {vision_models}"
     )
 
@@ -307,3 +307,232 @@ def test_kie_chat_models_consistent():
         "KIE_CHAT_MODELS and SELECTABLE_CHAT_MODELS['KIE'] diverged. "
         "handlers.py uses KIE_CHAT_MODELS to filter MODELS_INFO."
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. Fresh AIConfig defaults do not contain retired / disabled models
+# ---------------------------------------------------------------------------
+
+def test_fresh_aiconfig_defaults_are_current_and_active():
+    from database import AIConfig
+    config = AIConfig()
+
+    runtime_models = {
+        "gemini_model": config.gemini_model,
+        "claude_model": config.claude_model,
+        "openai_model": config.openai_model,
+        "deepseek_model": config.deepseek_model,
+        "kie_model": config.kie_model,
+        "vision_model": config.vision_model,
+        "image_generation_model": config.image_generation_model,
+        "image_edit_model": config.image_edit_model,
+    }
+    for field_name, model_val in runtime_models.items():
+        assert model_val not in RETIRED_UPSTREAM_MODELS, (
+            f"AIConfig.{field_name} defaults to retired model {model_val!r}"
+        )
+        assert model_val not in APP_DISABLED_OR_MIGRATED_MODELS, (
+            f"AIConfig.{field_name} defaults to app-disabled model {model_val!r}"
+        )
+
+    # Provider defaults must not point to retired Google image capabilities
+    assert config.image_generation_provider != "Gemini", (
+        "AIConfig.image_generation_provider must not default to retired Gemini"
+    )
+    assert config.image_edit_provider != "Gemini", (
+        "AIConfig.image_edit_provider must not default to retired Gemini"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 15. Database migration _migrate_ai_config_models replaces legacy models
+# ---------------------------------------------------------------------------
+
+def test_database_migration_replaces_all_legacy_and_retired_models():
+    from sqlalchemy import create_engine, text
+    from database import _migrate_ai_config_models
+
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE ai_config (
+                id INTEGER PRIMARY KEY,
+                openai_model VARCHAR,
+                claude_model VARCHAR,
+                gemini_model VARCHAR,
+                deepseek_model VARCHAR,
+                vision_provider VARCHAR,
+                vision_model VARCHAR,
+                fallback_provider VARCHAR,
+                fallback_model VARCHAR
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO ai_config (
+                id, openai_model, claude_model, gemini_model, deepseek_model,
+                vision_provider, vision_model, fallback_provider, fallback_model
+            )
+            VALUES
+                (1, 'gpt-4o', 'claude-sonnet-4-5-20250929', 'gemini-2.0-flash', 'deepseek-chat',
+                 'Gemini', 'gemini-2.0-flash', 'OpenAI', 'gpt-4o'),
+                (2, 'gpt-4.1', 'claude-opus-4-1-20250805', 'gemini-1.5-pro', 'deepseek-v4-pro',
+                 'Claude', 'claude-opus-4-1-20250805', 'Claude', 'claude-opus-4-1-20250805'),
+                (3, 'gpt-4-turbo', 'claude-3-haiku-20240307', 'gemini-2.5-flash-preview-05-20', 'deepseek-coder',
+                 'OpenAI', 'gpt-4o', 'Gemini', 'gemini-2.0-flash')
+        """))
+
+        _migrate_ai_config_models(conn)
+
+        rows = conn.execute(text("""
+            SELECT id, openai_model, claude_model, gemini_model, deepseek_model,
+                   vision_provider, vision_model, fallback_provider, fallback_model
+            FROM ai_config ORDER BY id
+        """)).all()
+
+    # Row 1
+    assert rows[0][1] == "gpt-5.6-terra"
+    assert rows[0][2] == "claude-sonnet-5"
+    assert rows[0][3] == "gemini-3.7-flash"
+    assert rows[0][4] == "deepseek-v4-flash"
+    assert rows[0][6] == "gemini-3.7-flash"
+    assert rows[0][8] == "gpt-5.6-terra"
+
+    # Row 2
+    assert rows[1][1] == "gpt-5.6-terra"
+    assert rows[1][2] == "claude-sonnet-5"
+    assert rows[1][3] == "gemini-3.7-flash"
+    assert rows[1][4] == "deepseek-v4-pro"
+    assert rows[1][6] == "claude-sonnet-5"
+    assert rows[1][8] == "claude-sonnet-5"
+
+    # Row 3
+    assert rows[2][1] == "gpt-5.6-terra"
+    assert rows[2][2] == "claude-sonnet-5"
+    assert rows[2][3] == "gemini-3.7-flash"
+    assert rows[2][4] == "deepseek-v4-flash"
+    assert rows[2][6] == "gpt-5.6-terra"
+    assert rows[2][8] == "gemini-3.7-flash"
+
+
+# ---------------------------------------------------------------------------
+# 16. MAX fallback selection with stale primary models
+# ---------------------------------------------------------------------------
+
+def test_max_fallback_selection_does_not_resurrect_stale_primary_models():
+    from database import AIConfig
+    from max_messenger_bot.services.admin_ai import _fallback_model_for_provider
+
+    # Simulate AIConfig with stale primary models
+    config = AIConfig(
+        openai_model="gpt-4o",
+        claude_model="claude-sonnet-4-5-20250929",
+        gemini_model="gemini-2.0-flash",
+        fallback_provider=None,
+        fallback_model=None,
+    )
+
+    # Selecting OpenAI as fallback must write current default, NOT 'gpt-4o'
+    fb_openai = _fallback_model_for_provider(config, "OpenAI")
+    assert fb_openai == "gpt-5.6-terra"
+    assert fb_openai in get_selectable_models("OpenAI", channel="fallback")
+
+    # Selecting Claude as fallback must write current default, NOT 'claude-sonnet-4-5-20250929'
+    fb_claude = _fallback_model_for_provider(config, "Claude")
+    assert fb_claude == "claude-sonnet-5"
+    assert fb_claude in get_selectable_models("Claude", channel="fallback")
+
+    # Selecting Gemini as fallback must write current default, NOT 'gemini-2.0-flash'
+    fb_gemini = _fallback_model_for_provider(config, "Gemini")
+    assert fb_gemini == "gemini-3.7-flash"
+    assert fb_gemini in get_selectable_models("Gemini", channel="fallback")
+
+
+# ---------------------------------------------------------------------------
+# 17. OpenAI BadRequestError handling
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_openai_bad_request_error_raises_ai_service_error_not_none():
+    from unittest.mock import AsyncMock, patch
+    from openai import BadRequestError
+    import httpx
+    from ai_integration import _call_openai_api, AIServiceError, InsufficientBalanceError
+
+    mock_request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    mock_response = httpx.Response(400, request=mock_request)
+    bad_req_err = BadRequestError("Invalid parameter: temperature not allowed", response=mock_response, body=None)
+
+    with patch("ai_integration.AsyncOpenAI") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create.side_effect = bad_req_err
+        mock_client_cls.return_value = mock_client
+
+        with pytest.raises(AIServiceError) as exc_info:
+            await _call_openai_api(
+                api_key="sk-test",
+                model="gpt-5.6-terra",
+                history=[],
+                context="",
+                system_prompt="Test system prompt",
+            )
+
+        assert "Ошибка при обращении к OpenAI API" in str(exc_info.value)
+        assert "Invalid parameter" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_openai_billing_bad_request_raises_insufficient_balance():
+    from unittest.mock import AsyncMock, patch
+    from openai import BadRequestError
+    import httpx
+    from ai_integration import _call_openai_api, InsufficientBalanceError
+
+    mock_request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    mock_response = httpx.Response(400, request=mock_request)
+    billing_err = BadRequestError("You exceeded your current quota, please check your plan and billing details.", response=mock_response, body=None)
+
+    with patch("ai_integration.AsyncOpenAI") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create.side_effect = billing_err
+        mock_client_cls.return_value = mock_client
+
+        with pytest.raises(InsufficientBalanceError):
+            await _call_openai_api(
+                api_key="sk-test",
+                model="gpt-5.6-terra",
+                history=[],
+                context="",
+                system_prompt="Test system prompt",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 18. Gemini transcription resolution with old configured gemini_model
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_gemini_transcription_ignores_stale_chat_model_in_db():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from types import SimpleNamespace
+    from ai_integration import transcribe_voice_message
+
+    config = SimpleNamespace(
+        transcription_provider="Gemini",
+        gemini_api_key="test-gemini-key",
+        gemini_model="gemini-2.0-flash",  # Stale retired chat model in DB
+    )
+    session = AsyncMock()
+    session.get.return_value = config
+    session_context = MagicMock()
+    session_context.__aenter__.return_value = session
+    session_context.__aexit__.return_value = False
+
+    with patch("ai_integration.async_session_maker", return_value=session_context), \
+         patch("ai_integration._call_gemini_transcribe", AsyncMock(return_value="тестовый текст")) as mock_call:
+        result = await transcribe_voice_message(b"audio-data", "voice.ogg")
+
+    assert result == "тестовый текст"
+    # Proves transcription was called with 'gemini-3.7-flash', NOT the retired 'gemini-2.0-flash' from chat config
+    called_model = mock_call.await_args.args[1]
+    assert called_model == "gemini-3.7-flash"
+    assert called_model not in RETIRED_UPSTREAM_MODELS

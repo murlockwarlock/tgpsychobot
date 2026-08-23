@@ -32,6 +32,7 @@ from provider_models import (
     PROVIDER_KIE,
     PROVIDER_OPENAI,
     ensure_model_available,
+    get_default_model,
     is_retired_model,
     normalize_deepseek_model,
 )
@@ -1072,7 +1073,8 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для транскрибации не задан")
-        return await _transcribe_gemini(api_key, config.gemini_model or "gemini-3.7-flash", file_bytes, filename)
+        gemini_stt_model = get_default_model(PROVIDER_GEMINI, channel="transcription")
+        return await _transcribe_gemini(api_key, gemini_stt_model, file_bytes, filename)
     if provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
@@ -1091,9 +1093,10 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
             if not config.gemini_api_key:
                 raise
             log.warning("KIE transcription failed (%s), falling back to Gemini", exc)
+            gemini_stt_model = get_default_model(PROVIDER_GEMINI, channel="transcription")
             return await _transcribe_gemini(
                 config.gemini_api_key,
-                config.gemini_model or "gemini-3.7-flash",
+                gemini_stt_model,
                 file_bytes,
                 filename,
             )

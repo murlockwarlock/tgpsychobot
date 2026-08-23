@@ -117,7 +117,10 @@ async def notify_admins_about_error(
     level: int = logging.ERROR,
 ) -> None:
     log = logger or logging.getLogger(__name__)
-    raw_trace = traceback.format_exc() if exception is not None and include_traceback else ""
+    if exception is not None and include_traceback:
+        raw_trace = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+    else:
+        raw_trace = ""
     trace = sanitize_secret_values(raw_trace)
     
     effective_details = details.strip() if details and details.strip() else None

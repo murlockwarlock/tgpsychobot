@@ -46,6 +46,7 @@ from provider_models import (
     PROVIDER_KIE,
     PROVIDER_OPENAI,
     ensure_model_available,
+    get_default_model,
     is_retired_model,
     normalize_deepseek_model,
 )
@@ -1345,7 +1346,7 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
 
         elif provider == "Gemini":
             api_key = ai_config.gemini_api_key
-            model = ai_config.gemini_model or "gemini-3.7-flash"
+            model = get_default_model(PROVIDER_GEMINI, channel="transcription")
             if not api_key:
                 raise AIServiceError(f"API ключ для {provider} (для транскрибации) не установлен администратором.")
             response_text = await _call_gemini_transcribe(api_key, model, file_bytes, filename)
@@ -1440,13 +1441,6 @@ async def _call_openai_api(
             **payload,
         )
         return _extract_openai_chat_text(chat_completion, provider="OpenAI")
-    except AuthenticationError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {e}")
-    except RateLimitError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Rate limit or quota exceeded. {e}")
-    except BadRequestError as e:
-        if "billing" in str(e) or "quota" in str(e).lower():
-            raise InsufficientBalanceError(f"OpenAI API Error: Billing issue or insufficient quota. {e}")
     except AuthenticationError as e:
         raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {e}")
     except RateLimitError as e:
@@ -1852,7 +1846,8 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
             mime_type = 'audio/ogg'
 
         b64_data = base64.b64encode(file_bytes).decode('utf-8')
-        target_model = model if model else "gemini-2.5-flash"
+        target_model = model if model else get_default_model(PROVIDER_GEMINI, channel="transcription")
+        ensure_model_available(PROVIDER_GEMINI, target_model, channel="transcription")
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
 

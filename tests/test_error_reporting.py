@@ -21,11 +21,71 @@ class ErrorReportingTests(unittest.IsolatedAsyncioTestCase):
     def test_empty_exception_message_uses_exception_class(self):
         self.assertEqual(error_reporting.exception_summary(EmptyMessageError()), "EmptyMessageError")
 
+    def test_classify_ai_error_401_auth(self):
+        code, msg = error_reporting.classify_ai_error(Exception("AuthenticationError: Invalid API Key provided"))
+        self.assertEqual(code, "auth_invalid_key")
+        self.assertIn("401", msg)
+
+    def test_classify_ai_error_402_credits(self):
+        code, msg = error_reporting.classify_ai_error(Exception("Insufficient credits: purchase credits to continue (code: 402)"))
+        self.assertEqual(code, "insufficient_balance")
+        self.assertIn("402", msg)
+
+    def test_classify_ai_error_429_rate_limit(self):
+        code, msg = error_reporting.classify_ai_error(Exception("RateLimitError: 429 Too Many Requests"))
+        self.assertEqual(code, "rate_limited")
+        self.assertIn("429", msg)
+
+    def test_classify_ai_error_timeout(self):
+        code, msg = error_reporting.classify_ai_error(Exception("APITimeoutError: Request timed out after 60 seconds"))
+        self.assertEqual(code, "timeout")
+        self.assertIn("Timeout", msg)
+
+    def test_classify_ai_error_5xx(self):
+        code, msg = error_reporting.classify_ai_error(Exception("InternalServerError: 503 Service Unavailable / server overloaded"))
+        self.assertEqual(code, "provider_5xx")
+        self.assertIn("5xx", msg)
+
+    def test_classify_ai_error_network(self):
+        code, msg = error_reporting.classify_ai_error(Exception("ConnectError: Connection error while contacting upstream"))
+        self.assertEqual(code, "network_error")
+        self.assertIn("сетевого", msg)
+
+    def test_classify_ai_error_empty_response(self):
+        code, msg = error_reporting.classify_ai_error(Exception("Провайдер вернул пустой ответ (no response data)"))
+        self.assertEqual(code, "empty_response")
+        self.assertIn("пустой ответ", msg)
+
+    def test_classify_ai_error_retired_model(self):
+        code, msg = error_reporting.classify_ai_error(Exception("Модель 'gemini-2.0-flash' отключена провайдером"))
+        self.assertEqual(code, "retired_model_unsupported")
+        self.assertIn("отключена провайдером", msg)
+
+    def test_classify_ai_error_geo_blocked(self):
+        code, msg = error_reporting.classify_ai_error(Exception("User location is not supported in this region / 403"))
+        self.assertEqual(code, "geo_blocked")
+        self.assertIn("Geo-Block", msg)
+
+    def test_classify_ai_error_missing_config(self):
+        code, msg = error_reporting.classify_ai_error(Exception("Не указан API ключ OpenAI"))
+        self.assertEqual(code, "missing_config")
+
+    def test_sanitize_secret_values_redacts_keys_and_tokens(self):
+        sample = (
+            "Error on url https://api.openai.com/v1?key=AIzaSySecretKey1234567890 "
+            "with Authorization: Bearer sk-proj-superSecretToken12345678 and api_key='sk-abcdef1234567890'"
+        )
+        cleaned = error_reporting.sanitize_secret_values(sample)
+        self.assertNotIn("AIzaSySecretKey1234567890", cleaned)
+        self.assertNotIn("sk-proj-superSecretToken12345678", cleaned)
+        self.assertNotIn("sk-abcdef1234567890", cleaned)
+        self.assertIn("[REDACTED]", cleaned)
+
     async def test_provider_attempts_are_rendered_in_order_without_traceback(self):
         bot = SimpleNamespace(send_message=AsyncMock())
         attempts = (
-            {"provider": "KIE", "model": "elevenlabs/speech-to-text", "error": "ReadError"},
-            {"provider": "OpenAI", "model": "whisper-1", "error": "credit_balance_exhausted"},
+            {"provider": "KIE", "model": "elevenlabs/speech-to-text", "error": "ReadError: connection dropped"},
+            {"provider": "OpenAI", "model": "whisper-1", "error": "credit_balance_exhausted on sk-secret12345678"},
         )
 
         with patch.object(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[123])):
@@ -41,7 +101,27 @@ class ErrorReportingTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(text.index("KIE"), text.index("OpenAI"))
         self.assertIn("ReadError", text)
         self.assertIn("credit_balance_exhausted", text)
+        self.assertNotIn("sk-secret12345678", text)  # Secret redacted in attempts
         self.assertNotIn("Traceback:", text)
+
+    async def test_non_ai_error_includes_traceback_when_requested(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        try:
+            raise ValueError("Test unexpected runtime error")
+        except ValueError as e:
+            test_exc = e
+
+        with patch.object(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[123])):
+            await error_reporting.notify_admins_about_error(
+                bot,
+                title="Системная ошибка",
+                exception=test_exc,
+                include_traceback=True,
+            )
+
+        text = bot.send_message.await_args.args[1]
+        self.assertIn("Traceback:", text)
+        self.assertIn("Test unexpected runtime error", text)
 
 
 class TranscriptionProviderChainTests(unittest.IsolatedAsyncioTestCase):

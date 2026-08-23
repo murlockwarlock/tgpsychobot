@@ -329,6 +329,9 @@ def get_default_model(provider: str | None, channel: str = "chat") -> str:
     """Return the active default model for a provider and channel."""
     p_name = _canonical_provider_name(provider)
     if channel == "vision":
+        vision_models = SELECTABLE_VISION_MODELS.get(p_name)
+        if vision_models:
+            return vision_models[0]
         return DEFAULT_VISION_MODEL
     if channel in ("image_gen", "image_generation"):
         if p_name == PROVIDER_OPENAI:
