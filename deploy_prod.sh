@@ -19,6 +19,7 @@ REMOTE_PY="${PROD_REMOTE_PY:-/root/telegram_bots/venv/bin/python}"
 REMOTE_RUNTIME_ENV="${PROD_RUNTIME_ENV:-/root/telegram_bots/runtime.env}"
 PM2_NAMES="${PROD_PM2_NAMES:-psy5d_new,veraveda_new,someone01_new,someone02_new,veraveda_legacy,someone02_legacy,someone01_legacy,psy5d_legacy,test01_legacy,test02_legacy,someone03_new,someone04_new,someone05_new,someone06_new,someone07_new,yourself_way_bot,max_veraveda_legacy,max_yourself_way}"
 PM2_CONFIG="${PROD_PM2_CONFIG:-ecosystem.config.js}"
+REMOTE_LOG_BASELINE="/tmp/tgpsychobot-deploy-log-baseline.json"
 
 for arg in "$@"; do
     case "$arg" in
@@ -116,7 +117,6 @@ if [[ "${#TRACKED_FILES[@]}" -eq 0 ]]; then
 fi
 
 REVISION="$(git rev-parse --short HEAD)"
-DEPLOY_STARTED_AT="$(date +%s)"
 echo "Deploying revision $REVISION to ${USER_NAME}@${HOST}:${REMOTE_DIR}"
 
 SSH_CMD=(ssh -o StrictHostKeyChecking=no)
@@ -147,6 +147,9 @@ tar czf - -- "${TRACKED_FILES[@]}" | \
              fi; \
          done; \
      done && \
+     '${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \
+         --snapshot-log-baseline '${REMOTE_LOG_BASELINE}' \
+         --pm2-names '${PM2_NAMES}' && \
      pm2 startOrReload '${PM2_CONFIG}' --only ${PM2_NAMES} --update-env && \
      sleep 10 && \
      pm2 status && \
@@ -154,6 +157,6 @@ tar czf - -- "${TRACKED_FILES[@]}" | \
          --revision '${REVISION}' \
          --pm2-names '${PM2_NAMES}' \
          --root '${REMOTE_DIR}' \
-         --started-at '${DEPLOY_STARTED_AT}'"
+         --log-baseline '${REMOTE_LOG_BASELINE}'"
 
 echo "Deploy complete."

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -152,21 +151,61 @@ def process_database_url(process: dict[str, Any]) -> str | None:
     return None
 
 
-def recent_startup_error(process: dict[str, Any], started_at: float | None) -> bool:
-    if started_at is None:
+def write_log_baseline(
+    path: str,
+    snapshot: dict[str, dict[str, Any]],
+    expected_names: list[str],
+) -> None:
+    baseline: dict[str, dict[str, Any]] = {}
+    for name in expected_names:
+        process = snapshot.get(name)
+        if process is None:
+            continue
+        log_path = pm2_env(process).get("pm_err_log_path")
+        if not isinstance(log_path, str) or not log_path:
+            continue
+        try:
+            size = Path(log_path).stat().st_size
+        except OSError:
+            size = 0
+        baseline[name] = {"path": log_path, "size": size}
+    Path(path).write_text(json.dumps(baseline, ensure_ascii=True), encoding="utf-8")
+
+
+def load_log_baseline(path: str) -> dict[str, dict[str, Any]]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unable to read PM2 log baseline") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("PM2 log baseline has an unexpected shape")
+    return {
+        str(name): entry
+        for name, entry in value.items()
+        if isinstance(name, str) and isinstance(entry, dict)
+    }
+
+
+def recent_startup_error(
+    process: dict[str, Any],
+    baseline: dict[str, Any] | None,
+) -> bool:
+    if not baseline:
         return False
-    path_value = pm2_env(process).get("pm_err_log_path")
+    path_value = baseline.get("path")
     if not isinstance(path_value, str) or not path_value:
         return False
     path = Path(path_value)
     try:
-        stat = path.stat()
-        if stat.st_mtime < started_at - 120:
-            return False
-        content = path.read_bytes()[-131072:].decode(errors="ignore")
+        current_size = path.stat().st_size
+        baseline_size = int(baseline.get("size", 0))
+        if current_size >= baseline_size:
+            content = path.read_bytes()[baseline_size:]
+        else:
+            content = path.read_bytes()
     except OSError:
         return False
-    return STARTUP_ERROR_RE.search(content) is not None
+    return STARTUP_ERROR_RE.search(content.decode(errors="ignore")) is not None
 
 
 async def verify_general_config(database_url: str) -> bool:
@@ -214,17 +253,33 @@ async def verify_migrations(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--revision", required=True)
+    parser.add_argument("--revision")
     parser.add_argument("--pm2-names", required=True)
     parser.add_argument("--root", default=".")
     parser.add_argument("--settle-seconds", type=float, default=3.0)
-    parser.add_argument("--started-at", type=float)
+    parser.add_argument("--snapshot-log-baseline")
+    parser.add_argument("--log-baseline")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     expected_names = parse_names(args.pm2_names)
+
+    if args.snapshot_log_baseline:
+        try:
+            snapshot = load_pm2_snapshot()
+            write_log_baseline(args.snapshot_log_baseline, snapshot, expected_names)
+        except (RuntimeError, OSError):
+            print("log_baseline=failed")
+            return 1
+        print("log_baseline=ok")
+        return 0
+
+    if not args.revision:
+        print("verification=failed")
+        return 1
+
     errors: list[str] = []
 
     revision_path = Path(args.root) / "REVISION"
@@ -252,11 +307,22 @@ def main() -> int:
     errors.extend(validate_pm2_snapshot(second_snapshot, expected_names))
     errors.extend(validate_pm2_stability(first_snapshot, second_snapshot, expected_names))
 
+    log_baseline: dict[str, dict[str, Any]] = {}
+    if args.log_baseline:
+        try:
+            log_baseline = load_log_baseline(args.log_baseline)
+        except RuntimeError:
+            errors.append("log_baseline_unavailable")
+        try:
+            Path(args.log_baseline).unlink()
+        except OSError:
+            pass
+
     log_error_names = [
         name
         for name in expected_names
         if name in second_snapshot
-        and recent_startup_error(second_snapshot[name], args.started_at)
+        and recent_startup_error(second_snapshot[name], log_baseline.get(name))
     ]
     if log_error_names:
         errors.append("startup_log_errors:" + ",".join(log_error_names))

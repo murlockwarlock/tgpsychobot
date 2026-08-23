@@ -1,6 +1,9 @@
+from pathlib import Path
+
 from scripts.verify_prod_runtime import (
     parse_names,
     process_database_url,
+    recent_startup_error,
     validate_pm2_snapshot,
     validate_pm2_stability,
 )
@@ -43,3 +46,20 @@ def test_pm2_stability_detects_restart_or_pid_change():
 def test_database_url_is_read_from_process_environment_without_reformatting():
     process = _process(database_url="postgresql+asyncpg://user:password@host/db")
     assert process_database_url(process) == "postgresql+asyncpg://user:password@host/db"
+
+
+def test_startup_error_check_reads_only_log_bytes_added_after_baseline(tmp_path):
+    log_path = Path(tmp_path) / "bot-error.log"
+    old_content = "old Traceback (most recent call last)\n"
+    log_path.write_text(old_content, encoding="utf-8")
+    process = _process()
+    process["pm2_env"]["pm_err_log_path"] = str(log_path)
+
+    baseline = {"path": str(log_path), "size": len(old_content.encode())}
+    assert not recent_startup_error(process, baseline)
+
+    log_path.write_text(
+        old_content + "new ModuleNotFoundError: missing\n",
+        encoding="utf-8",
+    )
+    assert recent_startup_error(process, baseline)
