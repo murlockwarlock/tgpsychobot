@@ -280,13 +280,24 @@ def recent_startup_error(
         open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         file_descriptor = os.open(path_value, open_flags)
         initial_stat = os.fstat(file_descriptor)
+        if not stat.S_ISREG(initial_stat.st_mode):
+            return LogCheckResult(LOG_INDETERMINATE, "fd_not_regular")
+        initial_path_stat = os.stat(path_value, follow_symlinks=False)
+        if not stat.S_ISREG(initial_path_stat.st_mode):
+            return LogCheckResult(LOG_INDETERMINATE, "path_not_regular")
+        baseline_identity = (baseline_device, baseline_inode)
+        initial_fd_identity = (initial_stat.st_dev, initial_stat.st_ino)
+        initial_path_identity = (initial_path_stat.st_dev, initial_path_stat.st_ino)
         if (
-            initial_stat.st_dev != baseline_device
-            or initial_stat.st_ino != baseline_inode
+            initial_fd_identity != baseline_identity
+            or initial_path_identity != baseline_identity
+            or initial_path_identity != initial_fd_identity
         ):
             return LogCheckResult(LOG_INDETERMINATE, "identity_changed")
         if initial_stat.st_size < baseline_offset:
             return LogCheckResult(LOG_INDETERMINATE, "truncated")
+        if initial_path_stat.st_size != initial_stat.st_size:
+            return LogCheckResult(LOG_INDETERMINATE, "changed_before_read")
         scan_size = initial_stat.st_size - baseline_offset
         if scan_size > MAX_LOG_SCAN_BYTES:
             return LogCheckResult(LOG_INDETERMINATE, "range_too_large")
@@ -296,11 +307,29 @@ def recent_startup_error(
             handle.seek(baseline_offset)
             content = handle.read(scan_size)
             final_stat = os.fstat(handle.fileno())
+        final_path_stat = os.stat(path_value, follow_symlinks=False)
+        if not stat.S_ISREG(final_path_stat.st_mode):
+            return LogCheckResult(LOG_INDETERMINATE, "path_not_regular_during_read")
+        final_fd_identity = (final_stat.st_dev, final_stat.st_ino)
+        final_path_identity = (final_path_stat.st_dev, final_path_stat.st_ino)
+        if (
+            final_fd_identity != baseline_identity
+            or final_path_identity != baseline_identity
+            or final_path_identity != final_fd_identity
+        ):
+            return LogCheckResult(LOG_INDETERMINATE, "identity_changed_during_read")
         if len(content) != scan_size:
             return LogCheckResult(LOG_INDETERMINATE, "short_read")
-        if final_stat.st_size < baseline_offset:
+        if (
+            final_stat.st_size < baseline_offset
+            or final_path_stat.st_size < baseline_offset
+        ):
             return LogCheckResult(LOG_INDETERMINATE, "truncated_during_read")
-        if final_stat.st_size != initial_stat.st_size:
+        if (
+            final_stat.st_size != initial_stat.st_size
+            or final_path_stat.st_size != initial_path_stat.st_size
+            or final_path_stat.st_size != final_stat.st_size
+        ):
             return LogCheckResult(LOG_INDETERMINATE, "changed_during_read")
     except (OSError, ValueError):
         return LogCheckResult(LOG_INDETERMINATE, "unreadable")

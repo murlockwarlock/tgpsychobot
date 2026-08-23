@@ -169,6 +169,36 @@ def test_log_identity_change_is_indeterminate_not_historical_error(tmp_path):
         _remove_baseline(baseline_path)
 
 
+def test_log_rotation_after_open_is_indeterminate(monkeypatch, tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    original_stat = verifier.os.stat
+    stat_calls = 0
+
+    def rotate_on_final_path_stat(path, *args, **kwargs):
+        nonlocal stat_calls
+        stat_calls += 1
+        if stat_calls == 2:
+            log_path.rename(tmp_path / "bot-error.log.1")
+            log_path.write_text(
+                "Traceback (most recent call last)\n",
+                encoding="utf-8",
+            )
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(verifier.os, "stat", rotate_on_final_path_stat)
+    try:
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert stat_calls == 2
+    assert result.status == LOG_INDETERMINATE
+    assert result.reason == "identity_changed_during_read"
+
+
 def test_log_truncation_is_indeterminate_not_historical_error(tmp_path):
     log_path = tmp_path / "bot-error.log"
     log_path.write_text(
