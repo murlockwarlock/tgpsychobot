@@ -506,7 +506,7 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
                     Path(tmp_path).unlink(missing_ok=True)
             except Exception as img_exc:
                 log.exception("Image generation failed user_id=%s: %s", user_id, img_exc)
-                await client.send_message(chat_id=chat_id, text=f"⚠️ Не удалось создать изображение: {img_exc}")
+                await client.send_message(chat_id=chat_id, text="⚠️ Не удалось создать изображение. Попробуйте позже.")
             if response_buttons and not buttons_sent:
                 await client.send_message(
                     chat_id=chat_id,
@@ -658,7 +658,7 @@ async def run_ai_dialogue_with_voice(client: MaxApiClient, chat_id: int, user_id
             await client.send_message(chat_id=chat_id, text=f"🎙 <i>{html.escape(transcription)}</i>")
     except AIServiceError as exc:
         log.exception("Transcription failed: %s", exc)
-        msg = f"Не удалось распознать аудио: {exc}"
+        msg = "Не удалось распознать аудио. Сервис временно недоступен."
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text=msg)
         else:

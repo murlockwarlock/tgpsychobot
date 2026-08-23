@@ -22,8 +22,19 @@ from automation_engine import apply_service_data_blocks, build_runtime_automatio
 from user_metadata import extract_service_data
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
 from result_history import ai_history_role_filter, select_ai_history_messages
-from vector_store import search_relevant_chunks
-from provider_models import normalize_deepseek_model
+from error_reporting import classify_ai_error
+from provider_models import (
+    DEFAULT_OPENAI_IMAGE_MODEL,
+    DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+    PROVIDER_CLAUDE,
+    PROVIDER_DEEPSEEK,
+    PROVIDER_GEMINI,
+    PROVIDER_KIE,
+    PROVIDER_OPENAI,
+    ensure_model_available,
+    is_retired_model,
+    normalize_deepseek_model,
+)
 from ai_request_context import (
     AIRequestLayout,
     build_anthropic_system,
@@ -131,13 +142,17 @@ async def _call_openai(
     *,
     request_layout: AIRequestLayout | None = None,
 ) -> str:
+    target_model = model or "gpt-5.6-terra"
+    ensure_model_available(PROVIDER_OPENAI, target_model)
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
-    response = await client.chat.completions.create(
-        model=model,
-        messages=build_openai_chat_messages(request_layout or _legacy_layout(messages)),
-        max_tokens=4096,
-        temperature=temperature,
-    )
+    payload: dict = {
+        "model": target_model,
+        "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
+        "max_completion_tokens": 4096,
+    }
+    if not target_model.startswith("gpt-5.6"):
+        payload["temperature"] = temperature
+    response = await client.chat.completions.create(**payload)
     return response.choices[0].message.content or ""
 
 
@@ -149,9 +164,11 @@ async def _call_deepseek(
     *,
     request_layout: AIRequestLayout | None = None,
 ) -> str:
+    normalized_model = normalize_deepseek_model(model)
+    ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
     response = await client.chat.completions.create(
-        model=normalize_deepseek_model(model),
+        model=normalized_model,
         messages=build_openai_chat_messages(request_layout or _legacy_layout(messages)),
         max_tokens=4096,
         temperature=temperature,
@@ -168,6 +185,8 @@ async def _call_claude(
     *,
     request_layout: AIRequestLayout | None = None,
 ) -> str:
+    target_model = model or "claude-sonnet-5"
+    ensure_model_available(PROVIDER_CLAUDE, target_model)
     layout = request_layout or _legacy_layout(messages, system_prompt)
     anthropic_messages = [
         {"role": message.role, "content": message.content}
@@ -176,13 +195,15 @@ async def _call_claude(
     if layout.current_user_content is not None:
         anthropic_messages.append({"role": "user", "content": layout.current_user_content})
     client = anthropic.AsyncAnthropic(api_key=api_key)
-    response = await client.messages.create(
-        model=model,
-        max_tokens=4096,
-        temperature=temperature,
-        system=build_anthropic_system(layout),
-        messages=anthropic_messages,
-    )
+    payload: dict = {
+        "model": target_model,
+        "max_tokens": 4096,
+        "system": build_anthropic_system(layout),
+        "messages": anthropic_messages,
+    }
+    if target_model != "claude-sonnet-5":
+        payload["temperature"] = temperature
+    response = await client.messages.create(**payload)
     return response.content[0].text
 
 
@@ -208,15 +229,20 @@ async def _call_gemini(
 ) -> str:
     import httpx
 
+    target_model = model or "gemini-3.7-flash"
+    ensure_model_available(PROVIDER_GEMINI, target_model)
     layout = request_layout or _legacy_layout(messages, system_prompt)
+    generation_config: dict = {"maxOutputTokens": 4096}
+    if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
+        generation_config["temperature"] = temperature
+
     payload = {
         "contents": build_gemini_contents(layout),
         "systemInstruction": {
             "parts": build_gemini_system_parts(layout) or [{"text": ""}],
         },
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096},
+        "generationConfig": generation_config,
     }
-    target_model = model or "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
     transport = _build_gemini_proxy_transport()
     async with httpx.AsyncClient(timeout=60.0, transport=transport) as client:
@@ -998,6 +1024,7 @@ async def get_ai_response_direct(
 # ---------------------------------------------------------------------------
 
 async def _transcribe_openai(api_key: str, file_bytes: bytes, filename: str) -> str:
+    ensure_model_available(PROVIDER_OPENAI, "whisper-1", channel="transcription")
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
     transcription = await client.audio.transcriptions.create(model="whisper-1", file=(filename, file_bytes))
     return transcription.text
@@ -1010,7 +1037,8 @@ async def _transcribe_gemini(api_key: str, model: str, file_bytes: bytes, filena
     if not mime_type or not mime_type.startswith("audio/"):
         mime_type = "audio/ogg"
     b64_data = base64.b64encode(file_bytes).decode()
-    target_model = model or "gemini-2.5-flash"
+    target_model = model or "gemini-3.7-flash"
+    ensure_model_available(PROVIDER_GEMINI, target_model, channel="transcription")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
     payload = {
         "contents": [{
@@ -1044,7 +1072,7 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для транскрибации не задан")
-        return await _transcribe_gemini(api_key, config.gemini_model or "gemini-2.5-flash", file_bytes, filename)
+        return await _transcribe_gemini(api_key, config.gemini_model or "gemini-3.7-flash", file_bytes, filename)
     if provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
@@ -1065,7 +1093,7 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
             log.warning("KIE transcription failed (%s), falling back to Gemini", exc)
             return await _transcribe_gemini(
                 config.gemini_api_key,
-                config.gemini_model or "gemini-2.5-flash",
+                config.gemini_model or "gemini-3.7-flash",
                 file_bytes,
                 filename,
             )
@@ -1084,7 +1112,8 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
     import httpx
 
     b64_data = base64.b64encode(image_bytes).decode()
-    target_model = model or "gemini-2.0-flash"
+    target_model = model or "gemini-3.7-flash"
+    ensure_model_available(PROVIDER_GEMINI, target_model, channel="vision")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
     
     layout = request_layout or AIRequestLayout(
@@ -1097,12 +1126,16 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
             {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
         ])
     contents = build_gemini_contents(layout)
+    generation_config: dict = {"maxOutputTokens": 4096}
+    if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
+        generation_config["temperature"] = temperature
+
     payload = {
         "contents": contents,
         "systemInstruction": {
             "parts": build_gemini_system_parts(layout) or [{"text": ""}],
         },
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096},
+        "generationConfig": generation_config,
     }
     async with httpx.AsyncClient(timeout=60.0, transport=_build_gemini_proxy_transport()) as http:
         resp = await http.post(url, json=payload, headers={"Content-Type": "application/json"})
@@ -1115,6 +1148,8 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
 
 
 async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+    target_model = model or "gpt-5.6-terra"
+    ensure_model_available(PROVIDER_OPENAI, target_model, channel="vision")
     b64_data = base64.b64encode(image_bytes).decode()
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
     layout = request_layout or AIRequestLayout(
@@ -1126,16 +1161,20 @@ async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_p
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
         ])
-    response = await client.chat.completions.create(
-        model=model or "gpt-4o",
-        messages=build_openai_chat_messages(layout),
-        max_tokens=4096,
-        temperature=temperature,
-    )
+    payload: dict = {
+        "model": target_model,
+        "messages": build_openai_chat_messages(layout),
+        "max_completion_tokens": 4096,
+    }
+    if not target_model.startswith("gpt-5.6"):
+        payload["temperature"] = temperature
+    response = await client.chat.completions.create(**payload)
     return response.choices[0].message.content or ""
 
 
 async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+    target_model = model or "claude-sonnet-5"
+    ensure_model_available(PROVIDER_CLAUDE, target_model, channel="vision")
     b64_data = base64.b64encode(image_bytes).decode()
     client = anthropic.AsyncAnthropic(api_key=api_key)
     layout = request_layout or AIRequestLayout(
@@ -1152,13 +1191,15 @@ async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_p
         for message in layout.history
     ]
     claude_messages.append({"role": "user", "content": layout.current_user_content})
-    response = await client.messages.create(
-        model=model or "claude-sonnet-4-5-20250929",
-        max_tokens=4096,
-        temperature=temperature,
-        system=build_anthropic_system(layout),
-        messages=claude_messages,
-    )
+    payload: dict = {
+        "model": target_model,
+        "max_tokens": 4096,
+        "system": build_anthropic_system(layout),
+        "messages": claude_messages,
+    }
+    if target_model != "claude-sonnet-5":
+        payload["temperature"] = temperature
+    response = await client.messages.create(**payload)
     return response.content[0].text
 
 
@@ -1239,23 +1280,23 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для vision не задан")
-        return await _analyze_gemini(api_key, config.vision_model or "gemini-2.0-flash", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        return await _analyze_gemini(api_key, config.vision_model or "gemini-3.7-flash", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
     if provider in {"Claude", "Anthropic"}:
         api_key = config.claude_api_key
         if not api_key:
             raise AIServiceError("API ключ Claude для vision не задан")
-        return await _analyze_claude(api_key, config.vision_model or "claude-sonnet-4-5-20250929", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        return await _analyze_claude(api_key, config.vision_model or "claude-sonnet-5", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
     if provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
-        model = config.vision_model or "google/gemini-2.5-pro"
+        model = config.vision_model or "gemini-3-flash"
         return await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
     # Default: OpenAI
     api_key = config.openai_api_key
     if not api_key:
         raise AIServiceError("API ключ OpenAI для vision не задан")
-    return await _analyze_openai(api_key, config.vision_model or "gpt-4o", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+    return await _analyze_openai(api_key, config.vision_model or "gpt-5.6-terra", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
 
 
 # ---------------------------------------------------------------------------
@@ -1266,6 +1307,7 @@ async def _generate_gemini(api_key: str, model: str, prompt: str) -> bytes:
     import httpx
 
     target_model = model or "imagen-4.0-generate-001"
+    ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_gen")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:predict?key={api_key}"
     payload = {
         "instances": [{"prompt": prompt}],
@@ -1287,8 +1329,10 @@ async def _generate_gemini(api_key: str, model: str, prompt: str) -> bytes:
 async def _generate_openai(api_key: str, prompt: str) -> bytes:
     import httpx
 
+    model = DEFAULT_OPENAI_IMAGE_MODEL
+    ensure_model_available(PROVIDER_OPENAI, model, channel="image_gen")
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
-    response = await client.images.generate(model="gpt-image-1.5", prompt=prompt, n=1, size="1024x1024")
+    response = await client.images.generate(model=model, prompt=prompt, n=1, size="1024x1024")
     if not response.data:
         raise AIServiceError("OpenAI image generation returned no data")
     img_data = response.data[0]
@@ -1309,7 +1353,7 @@ async def generate_image(prompt: str) -> bytes:
     if not config:
         raise AIServiceError("AIConfig не найден")
 
-    provider = getattr(config, "image_generation_provider", None) or config.vision_provider or "Gemini"
+    provider = getattr(config, "image_generation_provider", None) or config.vision_provider or "OpenAI"
     provider = provider.strip()
 
     if provider == "Gemini":
@@ -1338,8 +1382,9 @@ async def generate_image(prompt: str) -> bytes:
 async def _edit_gemini(api_key: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
     import httpx
 
-    b64_data = base64.b64encode(image_bytes).decode()
     target_model = model or "gemini-3-pro-image-preview"
+    ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_edit")
+    b64_data = base64.b64encode(image_bytes).decode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
     payload = {
         "contents": [{
@@ -1371,7 +1416,7 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
     if not config:
         raise AIServiceError("AIConfig не найден")
 
-    provider = getattr(config, "image_edit_provider", None) or config.vision_provider or "Gemini"
+    provider = getattr(config, "image_edit_provider", None) or config.vision_provider or "KIE"
     provider = provider.strip()
 
     if provider == "Gemini":

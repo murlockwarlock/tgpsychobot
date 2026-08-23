@@ -8,42 +8,15 @@ from ..keyboards import admin_ai_model_selection_keyboard, admin_ai_settings_key
 from ..legacy import AIConfig, async_session_maker
 from ..storage import StateStore
 from memory_mode import MEMORY_MODE_RESET, memory_mode_label, next_memory_mode, normalize_memory_mode
-from provider_models import DEEPSEEK_MODELS, KIE_CHAT_MODELS
-
-
-PROVIDER_MODELS = {
-    "Deepseek": list(DEEPSEEK_MODELS),
-    "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001", "claude-3-haiku-20240307"],
-    "Gemini": ["gemini-2.5-pro", "gemini-2.5-flash"],
-    "OpenAI": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-    "KIE": list(KIE_CHAT_MODELS),
-}
-
-FALLBACK_MODELS = {
-    "Deepseek": list(DEEPSEEK_MODELS),
-    "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
-    "Gemini": ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-2.5-pro-preview-05-06"],
-    "KIE": list(KIE_CHAT_MODELS),
-    "OpenAI": ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
-}
-
-VISION_MODELS = {
-    "Gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-3-flash-preview"],
-    "KIE": ["gemini-2.5-flash", "gemini-3-flash"],
-    "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
-    "OpenAI": ["gpt-4o", "gpt-4o-mini"],
-}
-
-IMAGE_GEN_MODELS = {
-    "Gemini": ["imagen-4.0-generate-001"],
-    "KIE": ["seedream/4.5-text-to-image", "bytedance/seedream-v4-text-to-image", "google/imagen4-fast", "google/imagen4-ultra"],
-    "OpenAI": ["gpt-image-1.5"],
-}
-
-IMAGE_EDIT_MODELS = {
-    "Gemini": ["gemini-3-pro-image-preview"],
-    "KIE": ["seedream/4.5-edit", "bytedance/seedream-v4-edit", "google/nano-banana-edit"],
-}
+from provider_models import (
+    PROVIDER_CLAUDE,
+    PROVIDER_DEEPSEEK,
+    PROVIDER_GEMINI,
+    PROVIDER_KIE,
+    PROVIDER_OPENAI,
+    get_default_model,
+    get_selectable_models,
+)
 
 FALLBACK_PROVIDERS = ["OpenAI", "Gemini", "Claude", "Deepseek", "KIE"]
 
@@ -87,7 +60,7 @@ def _provider_model(provider: str | None, model: str | None) -> str:
 def _fallback_model_for_provider(config: AIConfig, provider: str | None) -> str:
     field = MODEL_FIELDS.get(provider or "")
     configured = getattr(config, field, None) if field else None
-    return configured or (FALLBACK_MODELS.get(provider or "", ["нет"])[0] if provider else "нет")
+    return configured or get_default_model(provider or "", channel="fallback")
 
 
 def _prompt_input_keyboard(cancel_payload: str) -> list[dict]:
@@ -231,7 +204,7 @@ async def save_key(client: MaxApiClient, states: StateStore, chat_id: int, user_
 async def show_models(client: MaxApiClient, chat_id: int, provider: str) -> None:
     config = await _get_config()
     field = MODEL_FIELDS.get(provider)
-    models = PROVIDER_MODELS.get(provider, [])
+    models = list(get_selectable_models(provider, channel="chat"))
     current_model = getattr(config, field) if field else ""
     await client.send_message(
         chat_id=chat_id,
@@ -273,23 +246,23 @@ async def toggle_vision(client: MaxApiClient, chat_id: int) -> None:
         config = await _ensure_session_config(session)
         if config.vision_provider == "OpenAI":
             config.vision_provider = "Gemini"
-            config.vision_model = "gemini-3-flash-preview"
+            config.vision_model = get_default_model(PROVIDER_GEMINI, channel="vision")
         elif config.vision_provider == "Gemini":
             config.vision_provider = "KIE"
-            config.vision_model = "gemini-2.5-flash"
+            config.vision_model = get_default_model(PROVIDER_KIE, channel="vision")
         elif config.vision_provider == "KIE":
             config.vision_provider = "Claude"
-            config.vision_model = config.claude_model or "claude-sonnet-4-5-20250929"
+            config.vision_model = get_default_model(PROVIDER_CLAUDE, channel="vision")
         else:
             config.vision_provider = "OpenAI"
-            config.vision_model = "gpt-4o"
+            config.vision_model = get_default_model(PROVIDER_OPENAI, channel="vision")
         await session.commit()
     await show_keys(client, chat_id)
 
 
 async def show_vision_models(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
-    models = VISION_MODELS.get(config.vision_provider, [])
+    models = list(get_selectable_models(config.vision_provider, channel="vision"))
     await client.send_message(
         chat_id=chat_id,
         text=f"Выберите vision-модель для {config.vision_provider}.",
@@ -439,14 +412,11 @@ async def toggle_image_generation(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
         if config.image_generation_provider == "OpenAI":
-            config.image_generation_provider = "Gemini"
-            config.image_generation_model = "imagen-4.0-generate-001"
-        elif config.image_generation_provider == "Gemini":
             config.image_generation_provider = "KIE"
-            config.image_generation_model = "seedream/4.5-text-to-image"
+            config.image_generation_model = get_default_model(PROVIDER_KIE, channel="image_gen")
         else:
             config.image_generation_provider = "OpenAI"
-            config.image_generation_model = "gpt-image-1.5"
+            config.image_generation_model = get_default_model(PROVIDER_OPENAI, channel="image_gen")
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -454,12 +424,8 @@ async def toggle_image_generation(client: MaxApiClient, chat_id: int) -> None:
 async def toggle_image_edit(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        if config.image_edit_provider == "Gemini":
-            config.image_edit_provider = "KIE"
-            config.image_edit_model = "seedream/4.5-edit"
-        else:
-            config.image_edit_provider = "Gemini"
-            config.image_edit_model = "gemini-3-pro-image-preview"
+        config.image_edit_provider = "KIE"
+        config.image_edit_model = get_default_model(PROVIDER_KIE, channel="image_edit")
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -467,8 +433,8 @@ async def toggle_image_edit(client: MaxApiClient, chat_id: int) -> None:
 async def show_image_generation_models(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
     current_model = config.image_generation_model or ""
-    provider = config.image_generation_provider or "Gemini"
-    models = IMAGE_GEN_MODELS.get(provider, [])
+    provider = config.image_generation_provider or "OpenAI"
+    models = list(get_selectable_models(provider, channel="image_gen"))
     rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_gen_model_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
     await client.send_message(
@@ -489,8 +455,8 @@ async def set_image_generation_model(client: MaxApiClient, chat_id: int, model_n
 async def show_image_edit_models(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
     current_model = config.image_edit_model or ""
-    provider = config.image_edit_provider or "Gemini"
-    models = IMAGE_EDIT_MODELS.get(provider, [])
+    provider = config.image_edit_provider or "KIE"
+    models = list(get_selectable_models(provider, channel="image_edit"))
     rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_edit_model_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
     await client.send_message(
@@ -538,7 +504,7 @@ async def set_fallback_provider(client: MaxApiClient, chat_id: int, provider: st
         config.fallback_model = _fallback_model_for_provider(config, provider)
         await session.commit()
         current_model = config.fallback_model
-    models = FALLBACK_MODELS.get(provider, [])
+    models = list(get_selectable_models(provider, channel="fallback"))
     rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
     if current_model and current_model not in models:
         rows.insert(0, [callback_button(f"✅ {current_model}", f"admin_ai_save_fallback_{provider}_{current_model}")])

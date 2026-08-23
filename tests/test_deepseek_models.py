@@ -11,9 +11,13 @@ from provider_models import (
 
 
 def test_current_deepseek_models_are_used_in_telegram_and_max_admins():
-    from max_messenger_bot.services import admin_ai
+    """Both Telegram and MAX now call get_selectable_models('Deepseek', channel=...)
+    instead of reading a hardcoded PROVIDER_MODELS dict.  Verify the SSOT catalog
+    returns the same list as DEEPSEEK_MODELS for both chat and fallback channels."""
+    from provider_models import get_selectable_models
 
     expected = list(DEEPSEEK_MODELS)
+    # Telegram MODELS_INFO still lists the models for primary picker
     module = ast.parse(Path("handlers.py").read_text(encoding="utf-8"))
     models_assignment = next(
         node for node in module.body
@@ -24,8 +28,9 @@ def test_current_deepseek_models_are_used_in_telegram_and_max_admins():
     telegram_models = [name for name in models_info["Deepseek"] if name != "pricing"]
 
     assert telegram_models == expected
-    assert admin_ai.PROVIDER_MODELS["Deepseek"] == expected
-    assert admin_ai.FALLBACK_MODELS["Deepseek"] == expected
+    # Both Telegram and MAX now delegate model lists to get_selectable_models()
+    assert list(get_selectable_models("Deepseek", channel="chat")) == expected
+    assert list(get_selectable_models("Deepseek", channel="fallback")) == expected
 
 
 def test_legacy_deepseek_names_are_normalized_before_request():

@@ -58,7 +58,17 @@ from ai_integration import (
     _call_kie_chat,
     _get_kie_base_url,
 )
-from error_reporting import exception_summary, notify_admins_about_error
+from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error
+from provider_models import (
+    PROVIDER_CLAUDE,
+    PROVIDER_DEEPSEEK,
+    PROVIDER_GEMINI,
+    PROVIDER_KIE,
+    PROVIDER_OPENAI,
+    SELECTABLE_CHAT_MODELS,
+    get_default_model,
+    get_selectable_models,
+)
 from knowledge_base_admin import (
     delete_knowledge_base_record,
     find_original_kb_file_id,
@@ -498,15 +508,19 @@ async def _sync_user_birthdate_from_telegram(bot: Bot, user: User) -> bool:
 
 MODELS_INFO = {
     "Gemini": {
+        'gemini-3.7-flash': {
+            'name': 'Gemini 3.7 Flash (Default)',
+            'desc': 'Флагманская быстрая модель Google с адаптивным мышлением и максимальной скоростью.'
+        },
         'gemini-2.5-pro': {
             'name': 'Gemini 2.5 Pro',
-            'desc': 'Самая мощная и продвинутая модель с адаптивным мышлением для решения наиболее сложных задач.'
+            'desc': 'Самая мощная и продвинутая модель для решения сложных аналитических задач.'
         },
         'gemini-2.5-flash': {
             'name': 'Gemini 2.5 Flash',
-            'desc': 'Оптимальная модель по соотношению цены и производительности для большинства повседневных задач.'
+            'desc': 'Оптимальная модель по соотношению цены и производительности.'
         },
-        'pricing': '<b>Вход (Pro):</b> $1.25 / 1M токенов\n<b>Выход (Pro):</b> $10.00 / 1M токенов\n(Flash значительно дешевле)'
+        'pricing': '<b>Gemini 3.7 Flash:</b> Рекомендуемая модель по умолчанию.'
     },
     "KIE": {
         'gemini-3-flash': {
@@ -536,23 +550,19 @@ MODELS_INFO = {
         'pricing': '<b>Зависит от выбранной модели в KIE.</b>\nДля чата используйте Gemini 3 Flash.'
     },
     "Claude": {
-        'claude-sonnet-4-5-20250929': {
-            'name': 'Claude 4.5 Sonnet',
-            'desc': 'Наша самая умная модель для сложных агентов и кодирования (Рекомендуется).'
+        'claude-sonnet-5': {
+            'name': 'Claude Sonnet 5 (Default)',
+            'desc': 'Флагманская модель Anthropic нового поколения для сложных диалогов и логики (Рекомендуется).'
         },
-        'claude-opus-4-1-20250805': {
-            'name': 'Claude 4.1 Opus',
-            'desc': 'Исключительная модель для специализированных задач.'
+        'claude-opus-5': {
+            'name': 'Claude Opus 5',
+            'desc': 'Исключительная модель с наивысшим уровнем интеллекта.'
         },
         'claude-haiku-4-5-20251001': {
             'name': 'Claude 4.5 Haiku',
-            'desc': 'Наша самая быстрая модель с почти передовым интеллектом.'
+            'desc': 'Наша самая быстрая модель с отличной точностью.'
         },
-        'claude-3-haiku-20240307': {
-            'name': 'Claude 3 Haiku (Legacy)',
-            'desc': 'Самая быстрая и компактная модель 3-го поколения для простых задач.'
-        },
-        'pricing': '<b>Sonnet 4.5:</b> $3 / $15\n<b>Opus 4.1:</b> $15 / $75\n<b>Haiku 4.5:</b> $1 / $5\n<b>Haiku 3:</b> $0.25 / $1.25\n(Вход / Выход за 1M токенов)'
+        'pricing': '<b>Sonnet 5:</b> Рекомендуемая модель Anthropic.'
     },
     "Deepseek": {
         'deepseek-v4-flash': {
@@ -566,19 +576,19 @@ MODELS_INFO = {
         'pricing': '<b>V4 Flash:</b> $0.14 / $0.28\n<b>V4 Pro:</b> $0.435 / $0.87\n(Вход / выход за 1M токенов, без учёта кеша)'
     },
     "OpenAI": {
-        'gpt-4o': {
-            'name': 'GPT-4o',
-            'desc': 'Новейшая, самая быстрая и мощная модель от OpenAI.'
+        'gpt-5.6-terra': {
+            'name': 'GPT 5.6 Terra (Default)',
+            'desc': 'Флагманская сбалансированная модель OpenAI нового поколения (Рекомендуется).'
         },
-        'gpt-4-turbo': {
-            'name': 'GPT-4 Turbo',
-            'desc': 'Модель с большим окном контекста (128K) и актуальными знаниями.'
+        'gpt-5.6-sol': {
+            'name': 'GPT 5.6 Sol',
+            'desc': 'Высокопроизводительная модель OpenAI с быстрым откликом.'
         },
-        'gpt-3.5-turbo': {
-            'name': 'GPT-3.5 Turbo',
-            'desc': 'Быстрая и недорогая модель для простых задач и быстрого ответа.'
+        'gpt-5.6-luna': {
+            'name': 'GPT 5.6 Luna',
+            'desc': 'Компактная быстрая модель OpenAI для простых сценариев.'
         },
-        'pricing': '<b>GPT-4o:</b> $5 / $15\n<b>GPT-4T:</b> $10 / $30\n<b>GPT-3.5T:</b> $0.50 / $1.50\n(Вход / Выход за 1M токенов)'
+        'pricing': '<b>GPT 5.6:</b> Новое поколение OpenAI.'
     }
 }
 
@@ -586,6 +596,7 @@ MODELS_INFO = {
 MODELS_INFO["KIE"] = {
     model: MODELS_INFO["KIE"][model]
     for model in KIE_CHAT_MODELS
+    if model in MODELS_INFO["KIE"]
 } | {"pricing": MODELS_INFO["KIE"]["pricing"]}
 
 
@@ -854,9 +865,12 @@ async def _report_ai_failure(
     details: str | None = None,
     extra: dict | None = None,
     exception: Exception | None = None,
-    include_traceback: bool = True,
+    include_traceback: bool = False,
 ) -> None:
     provider_attempts = getattr(exception, "provider_attempts", None) if exception else None
+    if not details and exception:
+        _, classified_desc = classify_ai_error(exception, provider=provider)
+        details = classified_desc
     await notify_admins_about_error(
         bot,
         title=title,
@@ -866,7 +880,7 @@ async def _report_ai_failure(
         provider=None if provider_attempts else provider,
         model=None if provider_attempts else model,
         stage=stage,
-        details=None if provider_attempts else (details or (exception_summary(exception) if exception else None)),
+        details=None if provider_attempts else details,
         extra=extra,
         provider_attempts=provider_attempts,
         exception=exception,
@@ -3407,10 +3421,10 @@ async def admin_ai_settings(message: Message | CallbackQuery):
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
         vis_provider = config.vision_provider
         vis_model = config.vision_model
-        image_gen_provider = getattr(config, 'image_generation_provider', 'Gemini')
-        image_gen_model = getattr(config, 'image_generation_model', 'imagen-4.0-generate-001')
-        image_edit_provider = getattr(config, 'image_edit_provider', 'Gemini')
-        image_edit_model = getattr(config, 'image_edit_model', 'gemini-3-pro-image-preview')
+        image_gen_provider = getattr(config, 'image_generation_provider', PROVIDER_OPENAI)
+        image_gen_model = getattr(config, 'image_generation_model', None) or get_default_model(image_gen_provider, channel="image_gen")
+        image_edit_provider = getattr(config, 'image_edit_provider', PROVIDER_KIE)
+        image_edit_model = getattr(config, 'image_edit_model', None) or get_default_model(image_edit_provider, channel="image_edit")
         kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0)
         fb_provider = getattr(config, 'fallback_provider', None)
         fb_model = getattr(config, 'fallback_model', None)
@@ -3478,12 +3492,16 @@ async def admin_ai_keys_models(callback: CallbackQuery):
         config = await session.get(AIConfig, 1)
 
     trans_provider = config.transcription_provider if config else 'OpenAI'
-    vis_provider = config.vision_provider if config else 'Gemini'
-    vis_model = config.vision_model if config else 'gemini-3-flash-preview'
-    image_gen_provider = getattr(config, 'image_generation_provider', 'Gemini') if config else 'Gemini'
-    image_gen_model = getattr(config, 'image_generation_model', 'imagen-4.0-generate-001') if config else 'imagen-4.0-generate-001'
-    image_edit_provider = getattr(config, 'image_edit_provider', 'Gemini') if config else 'Gemini'
-    image_edit_model = getattr(config, 'image_edit_model', 'gemini-3-pro-image-preview') if config else 'gemini-3-pro-image-preview'
+    vis_provider = config.vision_provider if config else PROVIDER_GEMINI
+    vis_model = config.vision_model if config else get_default_model(PROVIDER_GEMINI, channel="vision")
+    image_gen_provider = getattr(config, 'image_generation_provider', PROVIDER_OPENAI) if config else PROVIDER_OPENAI
+    image_gen_model = getattr(config, 'image_generation_model', None) if config else None
+    if not image_gen_model:
+        image_gen_model = get_default_model(image_gen_provider, channel="image_gen")
+    image_edit_provider = getattr(config, 'image_edit_provider', PROVIDER_KIE) if config else PROVIDER_KIE
+    image_edit_model = getattr(config, 'image_edit_model', None) if config else None
+    if not image_edit_model:
+        image_edit_model = get_default_model(image_edit_provider, channel="image_edit")
     kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0) if config else 0
     c_first = config.context_limit_first if config else 2
     c_recent = config.context_limit_recent if config else 10
@@ -3530,24 +3548,21 @@ async def admin_ai_keys_models(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_toggle_vision")
 async def admin_toggle_vision(callback: CallbackQuery):
+    _VISION_CYCLE = [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_CLAUDE]
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
             await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
             return
 
-        if config.vision_provider == "OpenAI":
-            config.vision_provider = "Gemini"
-            config.vision_model = "gemini-3-flash-preview"
-        elif config.vision_provider == "Gemini":
-            config.vision_provider = "KIE"
-            config.vision_model = "gemini-2.5-flash"
-        elif config.vision_provider == "KIE":
-            config.vision_provider = "Claude"
-            config.vision_model = getattr(config, "claude_model", "claude-sonnet-4-5-20250929")
-        else:
-            config.vision_provider = "OpenAI"
-            config.vision_model = "gpt-4o"
+        current_vp = config.vision_provider or PROVIDER_GEMINI
+        try:
+            idx = _VISION_CYCLE.index(current_vp)
+        except ValueError:
+            idx = 0
+        next_vp = _VISION_CYCLE[(idx + 1) % len(_VISION_CYCLE)]
+        config.vision_provider = next_vp
+        config.vision_model = get_default_model(next_vp, channel="vision")
 
         new_provider = config.vision_provider
         new_model = config.vision_model
@@ -3781,21 +3796,24 @@ async def admin_toggle_transcription(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_toggle_image_generation")
 async def admin_toggle_image_generation(callback: CallbackQuery):
+    # Gemini image-gen is retired until protocol migration; cycle is OpenAI <-> KIE only
+    _IMG_GEN_CYCLE = [PROVIDER_OPENAI, PROVIDER_KIE]
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
             await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
             return
 
-        if config.image_generation_provider == "OpenAI":
-            config.image_generation_provider = "Gemini"
-            config.image_generation_model = "imagen-4.0-generate-001"
-        elif config.image_generation_provider == "Gemini":
-            config.image_generation_provider = "KIE"
-            config.image_generation_model = "seedream/4.5-text-to-image"
-        else:
-            config.image_generation_provider = "OpenAI"
-            config.image_generation_model = "gpt-image-1.5"
+        current_igp = config.image_generation_provider or PROVIDER_OPENAI
+        if current_igp == PROVIDER_GEMINI:
+            current_igp = PROVIDER_OPENAI  # migrate stale Gemini to next valid provider
+        try:
+            idx = _IMG_GEN_CYCLE.index(current_igp)
+        except ValueError:
+            idx = 0
+        next_igp = _IMG_GEN_CYCLE[(idx + 1) % len(_IMG_GEN_CYCLE)]
+        config.image_generation_provider = next_igp
+        config.image_generation_model = get_default_model(next_igp, channel="image_gen")
         await session.commit()
 
     await callback.answer(f"✅ Генерация изображений: {config.image_generation_provider}")
@@ -3804,32 +3822,23 @@ async def admin_toggle_image_generation(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_toggle_image_edit")
 async def admin_toggle_image_edit(callback: CallbackQuery):
+    # Gemini image-edit is retired until protocol migration; only KIE is valid
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
             await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
             return
 
-        if config.image_edit_provider == "Gemini":
-            config.image_edit_provider = "KIE"
-            config.image_edit_model = "seedream/4.5-edit"
-        else:
-            config.image_edit_provider = "Gemini"
-            config.image_edit_model = "gemini-3-pro-image-preview"
+        # Force KIE regardless of previous provider since Gemini image-edit is retired
+        config.image_edit_provider = PROVIDER_KIE
+        config.image_edit_model = get_default_model(PROVIDER_KIE, channel="image_edit")
         await session.commit()
 
     await callback.answer(f"✅ Редактирование изображений: {config.image_edit_provider}")
     await admin_ai_keys_models(callback)
 
 
-_FALLBACK_CYCLE = [None, "Deepseek", "Claude", "Gemini", "KIE", "OpenAI"]
-_FALLBACK_DEFAULT_MODELS = {
-    "Deepseek": DEEPSEEK_DEFAULT_MODEL,
-    "Claude": "claude-sonnet-4-5-20250929",
-    "Gemini": "gemini-2.0-flash",
-    "KIE": KIE_DEFAULT_CHAT_MODEL,
-    "OpenAI": "gpt-4o",
-}
+_FALLBACK_CYCLE = [None, PROVIDER_DEEPSEEK, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENAI]
 
 
 @router.callback_query(F.data == "admin_toggle_proxy")
@@ -3864,7 +3873,7 @@ async def admin_toggle_fallback(callback: CallbackQuery):
         next_val = _FALLBACK_CYCLE[(idx + 1) % len(_FALLBACK_CYCLE)]
         config.fallback_provider = next_val
         if next_val:
-            config.fallback_model = _FALLBACK_DEFAULT_MODELS.get(next_val, "")
+            config.fallback_model = get_default_model(next_val, channel="fallback")
         else:
             config.fallback_model = None
         await session.commit()
@@ -3884,15 +3893,8 @@ async def admin_change_fallback_model_list(callback: CallbackQuery):
         await callback.answer("Сначала выберите резервный провайдер.", show_alert=True)
         return
 
+    models = list(get_selectable_models(provider, channel="fallback"))
     builder = InlineKeyboardBuilder()
-    model_map = {
-        "Deepseek": list(DEEPSEEK_MODELS),
-        "Claude": ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-haiku-4-5-20251001"],
-        "Gemini": ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-2.5-pro-preview-05-06"],
-        "KIE": list(KIE_CHAT_MODELS),
-        "OpenAI": ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
-    }
-    models = model_map.get(provider, [])
     for m in models:
         builder.button(text=m, callback_data=f"save_fallback_model_{m}")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
@@ -16487,22 +16489,10 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
 async def admin_change_vision_model_list(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-        provider = config.vision_provider
+        provider = config.vision_provider or PROVIDER_GEMINI
 
+    models = list(get_selectable_models(provider, channel="vision"))
     builder = InlineKeyboardBuilder()
-    if provider == "Gemini":
-        models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-3-flash-preview"]
-    elif provider == "KIE":
-        models = ["gemini-2.5-flash", "gemini-3-flash"]
-    elif provider == "Claude":
-        models = [
-            "claude-sonnet-4-5-20250929",
-            "claude-opus-4-1-20250805",
-            "claude-haiku-4-5-20251001",
-        ]
-    else:
-        models = ["gpt-4o", "gpt-4o-mini"]
-
     for m in models:
         builder.button(text=m, callback_data=f"save_vision_model_{m}")
 
@@ -16527,21 +16517,13 @@ async def save_vision_model(callback: CallbackQuery):
 async def admin_change_image_generation_model_list(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-        provider = getattr(config, "image_generation_provider", "Gemini")
+        provider = getattr(config, "image_generation_provider", None) or PROVIDER_OPENAI
+        # Gemini image-gen retired; migrate stale provider to display valid models
+        if provider == PROVIDER_GEMINI:
+            provider = PROVIDER_OPENAI
 
+    models = list(get_selectable_models(provider, channel="image_gen"))
     builder = InlineKeyboardBuilder()
-    if provider == "Gemini":
-        models = ["imagen-4.0-generate-001"]
-    elif provider == "KIE":
-        models = [
-            "seedream/4.5-text-to-image",
-            "bytedance/seedream-v4-text-to-image",
-            "google/imagen4-fast",
-            "google/imagen4-ultra",
-        ]
-    else:
-        models = ["gpt-image-1.5"]
-
     for m in models:
         builder.button(text=m, callback_data=f"save_image_generation_model_{m}")
 
@@ -16564,18 +16546,13 @@ async def save_image_generation_model(callback: CallbackQuery):
 async def admin_change_image_edit_model_list(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-        provider = getattr(config, "image_edit_provider", "Gemini")
+        provider = getattr(config, "image_edit_provider", None) or PROVIDER_KIE
+        # Gemini image-edit retired; migrate stale provider to KIE
+        if provider == PROVIDER_GEMINI:
+            provider = PROVIDER_KIE
 
+    models = list(get_selectable_models(provider, channel="image_edit"))
     builder = InlineKeyboardBuilder()
-    if provider == "Gemini":
-        models = ["gemini-3-pro-image-preview"]
-    else:
-        models = [
-            "seedream/4.5-edit",
-            "bytedance/seedream-v4-edit",
-            "google/nano-banana-edit",
-        ]
-
     for m in models:
         builder.button(text=m, callback_data=f"save_image_edit_model_{m}")
 

@@ -34,10 +34,21 @@ from result_history import (
     ai_history_role_filter,
     select_ai_history_messages,
 )
-from error_reporting import exception_summary, notify_admins_about_error
+from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error
 from vector_store import search_relevant_chunks
 from user_metadata import extract_service_data
-from provider_models import normalize_deepseek_model
+from provider_models import (
+    DEFAULT_OPENAI_IMAGE_MODEL,
+    DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+    PROVIDER_CLAUDE,
+    PROVIDER_DEEPSEEK,
+    PROVIDER_GEMINI,
+    PROVIDER_KIE,
+    PROVIDER_OPENAI,
+    ensure_model_available,
+    is_retired_model,
+    normalize_deepseek_model,
+)
 from kie_chat import (
     build_kie_chat_request,
     extract_kie_chat_response_text,
@@ -192,6 +203,18 @@ def _normalize_config_value(value: str | None) -> str | None:
     return value
 
 
+def _resolve_temperature(config: Any, default: float = 0.7) -> float:
+    if config is None:
+        return default
+    val = getattr(config, "temperature", None)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 async def _notify_ai_fallback_used(
     bot,
     *,
@@ -206,6 +229,7 @@ async def _notify_ai_fallback_used(
         return
 
     try:
+        _, classified_error = classify_ai_error(error, provider=primary_provider)
         await notify_admins_about_error(
             bot,
             title="Основной AI-провайдер недоступен, включен резервный",
@@ -215,12 +239,13 @@ async def _notify_ai_fallback_used(
             provider=primary_provider,
             model=primary_model,
             stage="ai_provider_fallback",
-            details=str(error),
+            details=classified_error,
             extra={
                 "fallback_provider": fallback_provider,
                 "fallback_model": fallback_model,
             },
             exception=error,
+            include_traceback=False,
             level=logging.WARNING,
         )
     except Exception as notify_error:
@@ -727,6 +752,9 @@ async def _call_gemini_api(
 ) -> str:
     import httpx
     try:
+        target_model = model if model else "gemini-3.7-flash"
+        ensure_model_available(PROVIDER_GEMINI, target_model)
+
         transport = _build_async_transport_from_env("GEMINI_PROXY")
         layout = _coerce_request_layout(
             request_layout,
@@ -739,17 +767,19 @@ async def _call_gemini_api(
         if not contents or contents[-1]['role'] != 'user':
             raise AIResponseError("Gemini request history must end with a user message")
 
+        generation_config: dict[str, Any] = {
+            "maxOutputTokens": 4096,
+        }
+        if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
+            generation_config["temperature"] = temperature
+
         payload = {
             "contents": contents,
             "systemInstruction": {
                 "parts": build_gemini_system_parts(layout) or [{"text": ""}],
             },
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": 4096,
-            }
+            "generationConfig": generation_config,
         }
-        target_model = model if model else "gemini-2.5-flash"
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
         url = f"{endpoint}?key={api_key}"
         _capture_ai_request(request_capture, provider="Gemini", endpoint=endpoint, payload=payload)
@@ -1090,6 +1120,8 @@ async def _call_claude_api(
     request_layout: AIRequestLayout | None = None,
 ):
     try:
+        target_model = model if model else "claude-sonnet-5"
+        ensure_model_available(PROVIDER_CLAUDE, target_model)
         client = anthropic.AsyncAnthropic(api_key=api_key)
 
         layout = _coerce_request_layout(
@@ -1106,13 +1138,15 @@ async def _call_claude_api(
         if layout.current_user_content is not None:
             claude_history.append({"role": "user", "content": layout.current_user_content})
 
-        payload = {
-            "model": model,
+        payload: dict[str, Any] = {
+            "model": target_model,
             "max_tokens": 4096,
-            "temperature": temperature,
             "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
+        if target_model != "claude-sonnet-5":
+            payload["temperature"] = temperature
+
         _capture_ai_request(
             request_capture,
             provider="Claude",
@@ -1146,6 +1180,8 @@ async def _call_claude_vision(
     request_layout: AIRequestLayout | None = None,
 ) -> str:
     try:
+        target_model = model if model else "claude-sonnet-5"
+        ensure_model_available(PROVIDER_CLAUDE, target_model, channel="vision")
         client = anthropic.AsyncAnthropic(api_key=api_key)
         user_instruction = "Проанализируй это изображение согласно системной инструкции."
         layout = _coerce_request_layout(
@@ -1172,13 +1208,15 @@ async def _call_claude_vision(
             for message in layout.history
         ]
         claude_history.append({"role": "user", "content": vision_content})
-        payload = {
-            "model": model,
+        payload: dict[str, Any] = {
+            "model": target_model,
             "max_tokens": 4096,
-            "temperature": temperature,
             "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
+        if target_model != "claude-sonnet-5":
+            payload["temperature"] = temperature
+
         _capture_ai_request(request_capture, provider="Claude", endpoint="https://api.anthropic.com/v1/messages", payload=payload)
         message = await client.messages.create(**payload)
 
@@ -1216,6 +1254,9 @@ async def _call_deepseek_api(
 ):
     client = None
     try:
+        normalized_model = normalize_deepseek_model(model)
+        ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
+
         if use_proxy:
             base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
             transport = _build_async_transport_from_env("DEEPSEEK_PROXY", use_proxy=True)
@@ -1237,7 +1278,7 @@ async def _call_deepseek_api(
         )
 
         payload = {
-            "model": normalize_deepseek_model(model),
+            "model": normalized_model,
             "messages": build_openai_chat_messages(layout),
             "max_tokens": 4096,
             "temperature": temperature,
@@ -1266,6 +1307,7 @@ async def _call_deepseek_api(
 
 async def _call_openai_transcribe(api_key: str, file_bytes: bytes, filename: str) -> str:
     try:
+        ensure_model_available(PROVIDER_OPENAI, "whisper-1", channel="transcription")
         client = AsyncOpenAI(api_key=api_key)
 
         transcription = await client.audio.transcriptions.create(
@@ -1291,31 +1333,27 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
         if not ai_config:
-            return "❌ Ошибка: Конфигурация ИИ не найдена."
+            raise AIServiceError("Конфигурация ИИ не найдена.")
 
         provider = ai_config.transcription_provider
 
         if provider == "OpenAI":
             api_key = ai_config.openai_api_key
             if not api_key:
-                return f"❌ Ошибка: API ключ для {provider} (для транскрибации) не установлен администратором."
+                raise AIServiceError(f"API ключ для {provider} (для транскрибации) не установлен администратором.")
             response_text = await _call_openai_transcribe(api_key, file_bytes, filename)
 
         elif provider == "Gemini":
             api_key = ai_config.gemini_api_key
-            model = ai_config.gemini_model
+            model = ai_config.gemini_model or "gemini-3.7-flash"
             if not api_key:
-                return f"❌ Ошибка: API ключ для {provider} (для транскрибации) не установлен администратором."
-            if not model:
-                return f"❌ Ошибка: Модель для {provider} (для транскрибации) не выбрана администратором."
+                raise AIServiceError(f"API ключ для {provider} (для транскрибации) не установлен администратором.")
             response_text = await _call_gemini_transcribe(api_key, model, file_bytes, filename)
         elif provider == "KIE":
             api_key = ai_config.kie_api_key
-            model = getattr(ai_config, "kie_transcription_model", None) or getattr(ai_config, "kie_model", None)
+            model = getattr(ai_config, "kie_transcription_model", None) or getattr(ai_config, "kie_model", None) or DEFAULT_KIE_TRANSCRIPTION_MODEL
             if not api_key:
-                return f"❌ Ошибка: API ключ для {provider} (для транскрибации) не установлен администратором."
-            if not model:
-                return f"❌ Ошибка: Модель для {provider} (для транскрибации) не выбрана администратором."
+                raise AIServiceError(f"API ключ для {provider} (для транскрибации) не установлен администратором.")
             try:
                 response_text = await _call_kie_transcribe(
                     api_key,
@@ -1353,7 +1391,7 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                     raise fallback_exc from kie_exc
 
         else:
-            return f"❌ Ошибка: Неизвестный провайдер транскрибации: {provider}"
+            raise AIServiceError(f"Неизвестный провайдер транскрибации: {provider}")
 
         return response_text
 
@@ -1372,6 +1410,8 @@ async def _call_openai_api(
     request_layout: AIRequestLayout | None = None,
 ):
     try:
+        target_model = model if model else "gpt-5.6-terra"
+        ensure_model_available(PROVIDER_OPENAI, target_model)
         client = AsyncOpenAI(api_key=api_key, timeout=timeout)
 
         layout = _coerce_request_layout(
@@ -1382,12 +1422,14 @@ async def _call_openai_api(
             runtime_context=runtime_context,
         )
 
-        payload = {
-            "model": model,
+        payload: dict[str, Any] = {
+            "model": target_model,
             "messages": build_openai_chat_messages(layout),
-            "max_tokens": 4096,
-            "temperature": temperature,
+            "max_completion_tokens": 4096,
         }
+        if not target_model.startswith("gpt-5.6"):
+            payload["temperature"] = temperature
+
         _capture_ai_request(
             request_capture,
             provider="OpenAI",
@@ -1398,6 +1440,13 @@ async def _call_openai_api(
             **payload,
         )
         return _extract_openai_chat_text(chat_completion, provider="OpenAI")
+    except AuthenticationError as e:
+        raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {e}")
+    except RateLimitError as e:
+        raise InsufficientBalanceError(f"OpenAI API Error: Rate limit or quota exceeded. {e}")
+    except BadRequestError as e:
+        if "billing" in str(e) or "quota" in str(e).lower():
+            raise InsufficientBalanceError(f"OpenAI API Error: Billing issue or insufficient quota. {e}")
     except AuthenticationError as e:
         raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {e}")
     except RateLimitError as e:
@@ -1460,7 +1509,7 @@ async def get_ai_response(
         if not ai_config:
             return "❌ Ошибка: Конфигурация ИИ не найдена."
 
-        temperature = getattr(ai_config, 'temperature', 0.7) or 0.7
+        temperature = _resolve_temperature(ai_config)
 
         available_media_text = ""
         media_instruction_block = ""
@@ -1720,9 +1769,17 @@ async def get_ai_response(
                 )
             except Exception as fb_err:
                 logging.error(f"Fallback provider '{fb_provider}' also failed: {fb_err}")
-                raise AIServiceError(
+                _, primary_desc = classify_ai_error(primary_err, provider=provider)
+                _, fb_desc = classify_ai_error(fb_err, provider=fb_provider)
+                attempts = (
+                    {"provider": provider, "model": model, "error": primary_desc},
+                    {"provider": fb_provider, "model": fb_model, "error": fb_desc},
+                )
+                service_err = AIServiceError(
                     f"Основной провайдер ({provider}) и резервный ({fb_provider}) недоступны"
-                ) from fb_err
+                )
+                service_err.provider_attempts = attempts
+                raise service_err from fb_err
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
         visible_text, service_blocks, invalid_data_blocks = extract_service_data(response_text)
@@ -2128,23 +2185,26 @@ async def generate_image(prompt: str) -> any:
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
-            raise Exception("Конфигурация ИИ не найдена.")
+            raise AIServiceError("Конфигурация ИИ не найдена.")
 
         provider = getattr(config, "image_generation_provider", None) or config.vision_provider
         provider_key = _normalize_provider_name(provider)
         model = getattr(config, "image_generation_model", None) or "imagen-4.0-generate-001"
 
     if provider_key == 'gemini':
+        ensure_model_available(PROVIDER_GEMINI, model, channel="image_gen")
         api_key = config.gemini_api_key
         if not api_key:
-            raise Exception("API ключ Gemini для генерации не установлен.")
+            raise AIServiceError("API ключ Gemini для генерации не установлен.")
         return await _call_gemini_image_generation(api_key, model, prompt)
     if provider_key == 'kie':
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
-            raise Exception("API ключ KIE для генерации не установлен.")
+            raise AIServiceError("API ключ KIE для генерации не установлен.")
+        target_model = model or "google/imagen4-fast"
+        ensure_model_available(PROVIDER_KIE, target_model, channel="image_gen")
         try:
-            return await _call_kie_image_generation(api_key, _get_kie_base_url(config), model or "google/imagen4-fast", prompt)
+            return await _call_kie_image_generation(api_key, _get_kie_base_url(config), target_model, prompt)
         except AIServiceError as exc:
             if _is_kie_transient_failure(exc):
                 logging.warning("KIE image generation transient failure, falling back to OpenAI: %s", exc)
@@ -2158,26 +2218,29 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
-            raise Exception("Конфигурация ИИ не найдена.")
+            raise AIServiceError("Конфигурация ИИ не найдена.")
 
         provider = getattr(config, "image_edit_provider", None) or config.vision_provider
         provider_key = _normalize_provider_name(provider)
         model = getattr(config, "image_edit_model", None) or "gemini-3-pro-image-preview"
 
     if provider_key == "gemini":
+        ensure_model_available(PROVIDER_GEMINI, model, channel="image_edit")
         api_key = config.gemini_api_key
         if not api_key:
-            raise Exception("API ключ Gemini для редактирования не установлен.")
+            raise AIServiceError("API ключ Gemini для редактирования не установлен.")
         return await edit_image_gemini_v3(api_key, model, prompt, image_bytes)
     if provider_key == "kie":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
-            raise Exception("API ключ KIE для редактирования не установлен.")
+            raise AIServiceError("API ключ KIE для редактирования не установлен.")
+        target_model = model or "google/nano-banana-edit"
+        ensure_model_available(PROVIDER_KIE, target_model, channel="image_edit")
         return await _call_kie_image_edit(
             api_key,
             _get_kie_base_url(config),
             _get_kie_upload_base_url(config),
-            model or "google/nano-banana-edit",
+            target_model,
             prompt,
             image_bytes,
         )
@@ -2193,13 +2256,15 @@ async def generate_openai_image(prompt: str) -> str:
         api_key = os.getenv('OPENAI_API_KEY')
 
     if not api_key:
-        raise Exception("API ключ OpenAI не установлен.")
+        raise AIServiceError("API ключ OpenAI не установлен.")
 
     base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
+    timeout = 60.0
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
     try:
-        model = "gpt-image-1.5"
+        model = DEFAULT_OPENAI_IMAGE_MODEL
+        ensure_model_available(PROVIDER_OPENAI, model, channel="image_gen")
         _, preferred_size = _select_image_generation_shape(prompt)
 
         logging.info(f"Generating image via {model} with prompt: {prompt}")
@@ -2224,10 +2289,10 @@ async def generate_openai_image(prompt: str) -> str:
                 logging.warning("OpenAI image generation failed with size=%s: %s", size, exc)
 
         if response is None:
-            raise last_error or Exception("OpenAI image generation failed without response")
+            raise last_error or AIServiceError("OpenAI image generation failed without response")
 
         if not response.data:
-            raise Exception("API не вернул данных (empty data).")
+            raise AIServiceError("API не вернул данных (empty data).")
 
         img_data = response.data[0]
 
@@ -2236,11 +2301,11 @@ async def generate_openai_image(prompt: str) -> str:
         elif img_data.b64_json:
             return base64.b64decode(img_data.b64_json)
         else:
-            raise Exception("API не вернул ни URL, ни B64.")
+            raise AIServiceError("API не вернул ни URL, ни B64.")
 
     except Exception as e:
         logging.error(f"OpenAI Image Error ({model}): {e}")
-        raise Exception(f"Ошибка генерации изображения: {e}")
+        raise AIServiceError(f"Ошибка генерации изображения: {e}")
 
 
 async def analyze_image_content(
@@ -2255,29 +2320,33 @@ async def analyze_image_content(
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
-            raise Exception("Конфигурация ИИ не найдена.")
+            raise AIServiceError("Конфигурация ИИ не найдена.")
 
         provider = config.vision_provider
         v_model = config.vision_model
-        temperature = getattr(config, 'temperature', 0.7) or 0.7
+        temperature = _resolve_temperature(config)
         api_key = None
 
         if provider == "Gemini":
+            target_v_model = v_model or "gemini-3.7-flash"
+            ensure_model_available(PROVIDER_GEMINI, target_v_model, channel="vision")
             api_key = config.gemini_api_key
             if not api_key:
-                return "❌ Ошибка: API ключ для Gemini (Vision) не установлен."
+                raise AIServiceError("API ключ для Gemini (Vision) не установлен.")
             return await _call_gemini_vision(
-                api_key, v_model, image_bytes, prompt, history=history, temperature=temperature,
+                api_key, target_v_model, image_bytes, prompt, history=history, temperature=temperature,
                 request_context=request_context, request_capture=request_capture,
                 request_layout=request_layout,
             )
         if provider == "Claude":
+            target_v_model = v_model or "claude-sonnet-5"
+            ensure_model_available(PROVIDER_CLAUDE, target_v_model, channel="vision")
             api_key = config.claude_api_key
             if not api_key:
-                return "❌ Ошибка: API ключ для Claude (Vision) не установлен."
+                raise AIServiceError("API ключ для Claude (Vision) не установлен.")
             return await _call_claude_vision(
                 api_key,
-                v_model or getattr(config, "claude_model", "claude-sonnet-4-5-20250929"),
+                target_v_model,
                 image_bytes,
                 prompt,
                 history=history,
@@ -2289,7 +2358,7 @@ async def analyze_image_content(
         if provider == "KIE":
             api_key = getattr(config, "kie_api_key", None)
             if not api_key:
-                return "❌ Ошибка: API ключ для KIE (Vision) не установлен."
+                raise AIServiceError("API ключ для KIE (Vision) не установлен.")
             preferred_model = v_model or "gemini-3-flash"
             fallback_models = [preferred_model]
             if preferred_model != "gemini-2.5-flash":
@@ -2300,6 +2369,7 @@ async def analyze_image_content(
             last_exc = None
             for model_name in fallback_models:
                 try:
+                    ensure_model_available(PROVIDER_KIE, model_name, channel="vision")
                     if model_name != preferred_model:
                         logging.warning("Retrying KIE vision with alternate model=%s after failure: %s", model_name, last_exc)
                     return await _call_kie_vision(
@@ -2328,7 +2398,7 @@ async def analyze_image_content(
         if not api_key:
             api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
-            return "❌ Ошибка: API ключ для OpenAI (Vision) не установлен."
+            raise AIServiceError("API ключ для OpenAI (Vision) не установлен.")
 
         b64_img = base64.b64encode(image_bytes).decode('utf-8')
         formatting_rules = (
@@ -2361,12 +2431,16 @@ async def analyze_image_content(
         client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
 
         try:
+            target_v_model = v_model or "gpt-5.6-terra"
+            ensure_model_available(PROVIDER_OPENAI, target_v_model, channel="vision")
             payload = {
-                "model": v_model,
+                "model": target_v_model,
                 "messages": build_openai_chat_messages(layout),
-                "max_tokens": 4096,
-                "temperature": temperature,
+                "max_completion_tokens": 4096,
             }
+            if not target_v_model.startswith("gpt-5.6"):
+                payload["temperature"] = temperature
+
             _capture_ai_request(request_capture, provider="OpenAI", endpoint=f"{base_url.rstrip('/')}/chat/completions", payload=payload)
             response = await client.chat.completions.create(**payload)
             return _extract_openai_chat_text(response, provider="OpenAI Vision")
@@ -2403,7 +2477,8 @@ async def _call_gemini_vision(
                 transport = httpx.AsyncHTTPTransport(proxy=gemini_proxy)
 
             b64_data = base64.b64encode(image_bytes).decode('utf-8')
-            target_model = model if model else "gemini-1.5-flash"
+            target_model = model if model else "gemini-3.7-flash"
+            ensure_model_available(PROVIDER_GEMINI, target_model, channel="vision")
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
 
             user_instruction = "Проанализируй это изображение согласно системной инструкции выше."
@@ -2418,12 +2493,18 @@ async def _call_gemini_vision(
                 {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
             ])
 
+            generation_config: dict[str, Any] = {
+                "maxOutputTokens": 4096,
+            }
+            if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
+                generation_config["temperature"] = temperature
+
             payload = {
                 "contents": build_gemini_contents(layout),
                 "systemInstruction": {
                     "parts": build_gemini_system_parts(layout) or [{"text": ""}],
                 },
-                "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096}
+                "generationConfig": generation_config,
             }
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
             _capture_ai_request(request_capture, provider="Gemini", endpoint=endpoint, payload=payload)

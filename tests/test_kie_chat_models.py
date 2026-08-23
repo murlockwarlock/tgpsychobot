@@ -48,25 +48,29 @@ def _telegram_primary_models():
 
 
 def _telegram_fallback_models():
-    module = ast.parse(Path("handlers.py").read_text(encoding="utf-8"))
+    """Previously inspected a hardcoded model_map dict; after the SSOT refactor,
+    admin_change_fallback_model_list calls get_selectable_models(provider, 'fallback').
+    We verify the handler uses that call and that the result matches KIE_CHAT_MODELS."""
+    from provider_models import get_selectable_models
+    # Structural check: ensure model_map is gone and get_selectable_models is referenced
+    source = Path("handlers.py").read_text(encoding="utf-8")
+    module = ast.parse(source)
     handler = next(
         node for node in ast.walk(module)
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "admin_change_fallback_model_list"
     )
-    assignment = next(
-        node for node in ast.walk(handler)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "model_map" for target in node.targets)
+    # After refactor: no model_map assignment should remain in this handler
+    has_model_map = any(
+        isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "model_map" for t in node.targets)
+        for node in ast.walk(handler)
     )
-    kie_value = next(
-        value
-        for key, value in zip(assignment.value.keys, assignment.value.values)
-        if isinstance(key, ast.Constant) and key.value == "KIE"
+    assert not has_model_map, (
+        "admin_change_fallback_model_list still contains a hardcoded model_map dict. "
+        "It should call get_selectable_models() instead."
     )
-    assert isinstance(kie_value, ast.Call)
-    assert isinstance(kie_value.func, ast.Name) and kie_value.func.id == "list"
-    assert isinstance(kie_value.args[0], ast.Name) and kie_value.args[0].id == "KIE_CHAT_MODELS"
-    return list(KIE_CHAT_MODELS)
+    # Functional: get_selectable_models KIE/fallback must equal canonical list
+    return list(get_selectable_models("KIE", channel="fallback"))
 
 
 def test_all_requested_ids_are_in_authoritative_catalog():
@@ -75,24 +79,32 @@ def test_all_requested_ids_are_in_authoritative_catalog():
 
 
 def test_telegram_primary_and_fallback_expose_authoritative_catalog():
+    """Both the Telegram primary picker (MODELS_INFO) and fallback picker
+    (get_selectable_models) must expose the full KIE_CHAT_MODELS catalog."""
     assert _telegram_primary_models() == list(KIE_CHAT_MODELS)
     assert _telegram_fallback_models() == list(KIE_CHAT_MODELS)
 
 
 def test_max_primary_and_fallback_expose_authoritative_catalog():
-    from max_messenger_bot.services import admin_ai
-
-    assert admin_ai.PROVIDER_MODELS["KIE"] == list(KIE_CHAT_MODELS)
-    assert admin_ai.FALLBACK_MODELS["KIE"] == list(KIE_CHAT_MODELS)
+    """MAX admin now calls get_selectable_models() instead of using PROVIDER_MODELS.
+    Verify the SSOT returns KIE_CHAT_MODELS for both chat and fallback channels."""
+    from provider_models import get_selectable_models
+    assert list(get_selectable_models("KIE", channel="chat")) == list(KIE_CHAT_MODELS)
+    assert list(get_selectable_models("KIE", channel="fallback")) == list(KIE_CHAT_MODELS)
 
 
 def test_telegram_and_max_model_lists_stay_in_parity():
-    from max_messenger_bot.services import admin_ai
-
+    """Telegram and MAX both call get_selectable_models(), so they are always in parity.
+    Verify get_selectable_models returns the same KIE list for both channels used by each UI."""
+    from provider_models import get_selectable_models
     telegram_primary = _telegram_primary_models()
     telegram_fallback = _telegram_fallback_models()
-    assert telegram_primary == telegram_fallback == admin_ai.PROVIDER_MODELS["KIE"]
-    assert telegram_fallback == admin_ai.FALLBACK_MODELS["KIE"]
+    max_primary = list(get_selectable_models("KIE", channel="chat"))
+    max_fallback = list(get_selectable_models("KIE", channel="fallback"))
+    assert telegram_primary == list(KIE_CHAT_MODELS)
+    assert telegram_fallback == list(KIE_CHAT_MODELS)
+    assert max_primary == list(KIE_CHAT_MODELS)
+    assert max_fallback == list(KIE_CHAT_MODELS)
 
 
 @pytest.mark.parametrize("model_id", NEW_KIE_CHAT_MODELS)
