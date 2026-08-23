@@ -40,6 +40,8 @@ from kie_chat import (
     build_kie_chat_request,
     extract_kie_chat_response_text,
     extract_kie_chat_text,
+    is_kie_error_payload,
+    is_kie_insufficient_balance,
 )
 from subscription_context import active_subscription_flag
 
@@ -295,15 +297,19 @@ async def _retry_kie_transcription_step(step: str, operation, attempts: int = 3)
 
 
 def _validate_kie_json_response(status_code: int, payload: dict, *, context: str) -> dict:
+    detail = (
+        payload.get("msg") or payload.get("message") or str(payload)
+        if isinstance(payload, dict)
+        else str(payload)
+    )
     if status_code != 200:
-        detail = payload.get("msg") or payload.get("message") or str(payload)
+        if is_kie_insufficient_balance(status_code, payload):
+            raise InsufficientBalanceError(f"KIE API Error: {detail}")
         raise AIServiceError(f"{context}: status={status_code} message={detail}")
 
     code = payload.get("code")
     if code not in (None, 200, "200"):
-        detail = payload.get("msg") or payload.get("message") or str(payload)
-        lowered = str(detail).lower()
-        if any(word in lowered for word in ["billing", "quota", "balance", "credit"]):
+        if is_kie_insufficient_balance(status_code, payload):
             raise InsufficientBalanceError(f"KIE API Error: {detail}")
         raise AIServiceError(f"{context}: {detail}")
 
@@ -611,6 +617,16 @@ async def _call_kie_chat(api_key: str, base_url: str, model: str, history: list,
             )
 
         if request.stream:
+            try:
+                response_payload = response.json()
+            except (TypeError, ValueError):
+                response_payload = None
+            if is_kie_error_payload(response_payload):
+                _validate_kie_json_response(
+                    response.status_code,
+                    response_payload,
+                    context="Ошибка при обращении к KIE Chat API",
+                )
             text = extract_kie_chat_response_text(response, request.protocol, stream=True)
         else:
             try:
@@ -1431,9 +1447,6 @@ async def get_ai_response(
         try:
             response_text = await _dispatch_call(provider_key, api_key, model)
         except (AIServiceError, Exception) as primary_err:
-            if isinstance(primary_err, InsufficientBalanceError):
-                raise
-
             fb_provider = getattr(ai_config, 'fallback_provider', None)
             fb_model = getattr(ai_config, 'fallback_model', None)
             if not fb_provider or not fb_model:

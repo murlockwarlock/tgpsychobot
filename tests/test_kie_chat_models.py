@@ -171,9 +171,8 @@ def test_gemini_native_request_shape():
 
 
 class _Response:
-    status_code = 200
-
-    def __init__(self, payload=None, text=""):
+    def __init__(self, payload=None, text="", status_code=200):
+        self.status_code = status_code
         self._payload = payload
         self.text = text
 
@@ -314,3 +313,58 @@ async def test_existing_kie_chat_models_keep_openai_compatible_route(model_id):
     assert client.calls[0]["endpoint"] == f"https://api.example/{model_id}/v1/chat/completions"
     assert client.calls[0]["kwargs"]["json"]["model"] == model_id
     assert KIE_API_KEY not in json.dumps(capture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+async def test_kie_http_402_is_classified_as_insufficient_balance(surface):
+    if surface == "telegram":
+        import ai_integration as module
+
+        call = module._call_kie_chat
+        args = (KIE_API_KEY, "https://api.example", "claude-haiku-4-5", HISTORY, "", "SYSTEM")
+    else:
+        from max_messenger_bot import ai as module
+
+        call = module._call_kie_text_chat
+        args = (
+            KIE_API_KEY,
+            "https://api.example",
+            "claude-haiku-4-5",
+            [{"role": "user", "content": "текущий вопрос"}],
+            "SYSTEM",
+            0.25,
+        )
+
+    client = _HttpClient(_Response({"code": 402, "msg": "Insufficient credits"}, status_code=402))
+    with patch.object(module.httpx, "AsyncClient", return_value=client):
+        with pytest.raises(module.InsufficientBalanceError, match="Insufficient credits"):
+            await call(*args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+async def test_kie_http_200_credit_error_envelope_is_rejected_before_stream_parsing(surface):
+    if surface == "telegram":
+        import ai_integration as module
+
+        call = module._call_kie_chat
+        args = (KIE_API_KEY, "https://api.example", "grok-4-3", HISTORY, "", "SYSTEM")
+    else:
+        from max_messenger_bot import ai as module
+
+        call = module._call_kie_text_chat
+        args = (
+            KIE_API_KEY,
+            "https://api.example",
+            "grok-4-3",
+            [{"role": "user", "content": "текущий вопрос"}],
+            "SYSTEM",
+            0.25,
+        )
+
+    error_payload = {"code": 402, "msg": "Insufficient credits"}
+    client = _HttpClient(_Response(error_payload, text=json.dumps(error_payload)))
+    with patch.object(module.httpx, "AsyncClient", return_value=client):
+        with pytest.raises(module.InsufficientBalanceError, match="Insufficient credits"):
+            await call(*args)
