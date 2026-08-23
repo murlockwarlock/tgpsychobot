@@ -20,16 +20,11 @@ REMOTE_RUNTIME_ENV="${PROD_RUNTIME_ENV:-/root/telegram_bots/runtime.env}"
 PM2_NAMES="${PROD_PM2_NAMES:-psy5d_new,veraveda_new,someone01_new,someone02_new,veraveda_legacy,someone02_legacy,someone01_legacy,psy5d_legacy,test01_legacy,test02_legacy,someone03_new,someone04_new,someone05_new,someone06_new,someone07_new,yourself_way_bot,max_veraveda_legacy,max_yourself_way}"
 PM2_CONFIG="${PROD_PM2_CONFIG:-ecosystem.config.js}"
 
-ALLOW_DIRTY=0
-
 for arg in "$@"; do
     case "$arg" in
-        --allow-dirty)
-            ALLOW_DIRTY=1
-            ;;
         -h|--help)
             cat <<'EOF'
-Usage: ./deploy_prod.sh [--allow-dirty]
+Usage: ./deploy_prod.sh
 
 Environment variables:
   PROD_PASSWORD    Optional. SSH password; without it an SSH key is used.
@@ -57,6 +52,50 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     exit 1
 fi
 
+CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    if [[ -z "$CURRENT_BRANCH" ]]; then
+        echo "Refusing to deploy: detached HEAD; production deploys require branch 'main'." >&2
+    else
+        echo "Refusing to deploy from branch '$CURRENT_BRANCH'; production deploys require 'main'." >&2
+    fi
+    exit 1
+fi
+
+if ! git fetch origin main; then
+    echo "Refusing to deploy: git fetch origin main failed." >&2
+    exit 1
+fi
+
+if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+    echo "Refusing to deploy a dirty worktree." >&2
+    exit 1
+fi
+
+if ! LOCAL_HEAD="$(git rev-parse --verify HEAD)"; then
+    echo "Refusing to deploy: unable to resolve local HEAD." >&2
+    exit 1
+fi
+if ! REMOTE_MAIN="$(git rev-parse --verify refs/remotes/origin/main^{commit})"; then
+    echo "Refusing to deploy: unable to resolve origin/main after fetch." >&2
+    exit 1
+fi
+
+DIVERGENCE="$(git rev-list --left-right --count HEAD...refs/remotes/origin/main)"
+read -r LOCAL_ONLY BEHIND <<<"$DIVERGENCE"
+if [[ "$LOCAL_ONLY" != "0" ]]; then
+    echo "Refusing to deploy: local main has $LOCAL_ONLY local-only commit(s)." >&2
+    exit 1
+fi
+if [[ "$BEHIND" != "0" ]]; then
+    echo "Refusing to deploy: local main is behind origin/main by $BEHIND commit(s)." >&2
+    exit 1
+fi
+if [[ "$LOCAL_HEAD" != "$REMOTE_MAIN" ]]; then
+    echo "Refusing to deploy: local HEAD $LOCAL_HEAD does not equal origin/main $REMOTE_MAIN." >&2
+    exit 1
+fi
+
 if [[ -z "$HOST" ]]; then
     echo "Set PROD_HOST in .env.deploy or the environment." >&2
     exit 1
@@ -65,14 +104,6 @@ fi
 if [[ ",${PROD_BLOCKED_HOSTS:-}," == *",${HOST},"* && "${PROD_ALLOW_BLOCKED_HOST:-0}" != "1" ]]; then
     echo "Refusing to deploy to blocked host $HOST." >&2
     exit 1
-fi
-
-if [[ "$ALLOW_DIRTY" -ne 1 ]]; then
-    if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
-        echo "Refusing to deploy a dirty worktree." >&2
-        echo "Commit your changes first or rerun with --allow-dirty." >&2
-        exit 1
-    fi
 fi
 
 TRACKED_FILES=()
