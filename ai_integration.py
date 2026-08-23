@@ -38,7 +38,6 @@ from error_reporting import classify_ai_error, exception_summary, notify_admins_
 from vector_store import search_relevant_chunks
 from user_metadata import extract_service_data
 from provider_models import (
-    DEFAULT_OPENAI_IMAGE_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
@@ -1959,6 +1958,8 @@ async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str
 async def _call_gemini_image_generation(api_key: str, model: str, prompt: str) -> bytes:
     import httpx
     import base64
+    target_model = (model or "").strip()
+    ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_gen")
     try:
         raw_proxy = os.getenv("GEMINI_PROXY")
         transport = None
@@ -1966,7 +1967,6 @@ async def _call_gemini_image_generation(api_key: str, model: str, prompt: str) -
             gemini_proxy = raw_proxy.strip().strip('"').strip("'")
             transport = httpx.AsyncHTTPTransport(proxy=gemini_proxy)
 
-        target_model = model if model else "imagen-4.0-generate-001"
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:predict?key={api_key}"
 
         payload = {
@@ -1998,6 +1998,8 @@ async def _call_gemini_image_generation(api_key: str, model: str, prompt: str) -
 async def edit_image_gemini_v3(api_key: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
     import httpx
     import base64
+    target_model = (model or "").strip()
+    ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_edit")
     try:
         raw_proxy = os.getenv("GEMINI_PROXY")
         transport = None
@@ -2005,7 +2007,6 @@ async def edit_image_gemini_v3(api_key: str, model: str, prompt: str, image_byte
             gemini_proxy = raw_proxy.strip().strip('"').strip("'")
             transport = httpx.AsyncHTTPTransport(proxy=gemini_proxy)
         b64_data = base64.b64encode(image_bytes).decode('utf-8')
-        target_model = model if model else "gemini-3-pro-image-preview"
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
         payload = {
             "contents": [{
@@ -2129,6 +2130,7 @@ def _build_kie_image_edit_input(model: str, prompt: str, source_url: str) -> dic
 
 
 async def _call_kie_image_generation(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
+    ensure_model_available(PROVIDER_KIE, model, channel="image_gen")
     attempts = 2
     last_exc = None
     for _ in range(attempts):
@@ -2155,6 +2157,7 @@ async def _call_kie_image_generation(api_key: str, base_url: str, model: str, pr
 
 
 async def _call_kie_image_edit(api_key: str, base_url: str, upload_base_url: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
+    ensure_model_available(PROVIDER_KIE, model, channel="image_edit")
     source_url = await _upload_file_to_kie(
         api_key,
         upload_base_url,
@@ -2197,7 +2200,7 @@ async def generate_image(prompt: str) -> any:
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для генерации не установлен.")
-        target_model = model or "google/imagen4-fast"
+        target_model = model or get_default_model(PROVIDER_KIE, channel="image_gen")
         ensure_model_available(PROVIDER_KIE, target_model, channel="image_gen")
         try:
             return await _call_kie_image_generation(api_key, _get_kie_base_url(config), target_model, prompt)
@@ -2230,7 +2233,7 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для редактирования не установлен.")
-        target_model = model or "google/nano-banana-edit"
+        target_model = model or get_default_model(PROVIDER_KIE, channel="image_edit")
         ensure_model_available(PROVIDER_KIE, target_model, channel="image_edit")
         return await _call_kie_image_edit(
             api_key,
@@ -2259,7 +2262,7 @@ async def generate_openai_image(prompt: str) -> str:
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
     try:
-        model = DEFAULT_OPENAI_IMAGE_MODEL
+        model = get_default_model(PROVIDER_OPENAI, channel="image_gen")
         ensure_model_available(PROVIDER_OPENAI, model, channel="image_gen")
         _, preferred_size = _select_image_generation_shape(prompt)
 

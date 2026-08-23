@@ -284,20 +284,59 @@ def is_retired_model(model: str | None) -> bool:
 
 
 class ModelUnavailableError(Exception):
-    """Raised when an attempt is made to execute a retired model."""
+    """Raised when a model is retired or unsupported for its capability."""
     pass
 
 
+_SELECTABLE_MODEL_CATALOGS = {
+    "chat": SELECTABLE_CHAT_MODELS,
+    "fallback": SELECTABLE_FALLBACK_MODELS,
+    "vision": SELECTABLE_VISION_MODELS,
+    "image_gen": SELECTABLE_IMAGE_GEN_MODELS,
+    "image_generation": SELECTABLE_IMAGE_GEN_MODELS,
+    "image_edit": SELECTABLE_IMAGE_EDIT_MODELS,
+    "transcription": SELECTABLE_TRANSCRIPTION_MODELS,
+}
+
+_CAPABILITY_CHANNELS = frozenset({
+    "vision",
+    "image_gen",
+    "image_generation",
+    "image_edit",
+    "transcription",
+})
+
+
 def ensure_model_available(provider: str | None, model: str | None, channel: str = "chat") -> None:
-    """Validate that the model is not retired before initiating network requests."""
+    """Validate retired IDs and capability/model compatibility before HTTP."""
     normalized = (model or "").strip()
-    if not normalized:
-        return
-    if is_retired_model(normalized):
-        p_name = _canonical_provider_name(provider) or provider or "AI"
+    p_name = _canonical_provider_name(provider) or provider or "AI"
+    channel_name = (channel or "chat").strip().lower()
+
+    if normalized and is_retired_model(normalized):
         raise ModelUnavailableError(
             f"Модель '{normalized}' ({p_name}) отключена провайдером. "
             f"Пожалуйста, выберите актуальную модель в настройках."
+        )
+
+    if channel_name not in _CAPABILITY_CHANNELS:
+        return
+
+    selectable = get_selectable_models(p_name, channel=channel_name)
+    if not selectable:
+        raise ModelUnavailableError(
+            f"Для провайдера '{p_name}' нет доступной модели для канала '{channel_name}'. "
+            "Выберите провайдера с поддержкой этой возможности."
+        )
+    if not normalized:
+        raise ModelUnavailableError(
+            f"Для провайдера '{p_name}' не задана модель для канала '{channel_name}'. "
+            "Выберите актуальную модель в настройках."
+        )
+    if normalized not in selectable:
+        raise ModelUnavailableError(
+            f"Модель '{normalized}' не поддерживается провайдером '{p_name}' "
+            f"для канала '{channel_name}'. Выберите актуальную модель в настройках."
         )
 
 
@@ -325,40 +364,21 @@ def normalize_deepseek_model(model: str | None) -> str:
 def get_selectable_models(provider: str | None, channel: str = "chat") -> tuple[str, ...]:
     """Return the tuple of active selectable models for a provider and channel."""
     p_name = _canonical_provider_name(provider)
-    catalogs = {
-        "chat": SELECTABLE_CHAT_MODELS,
-        "fallback": SELECTABLE_FALLBACK_MODELS,
-        "vision": SELECTABLE_VISION_MODELS,
-        "image_gen": SELECTABLE_IMAGE_GEN_MODELS,
-        "image_generation": SELECTABLE_IMAGE_GEN_MODELS,
-        "image_edit": SELECTABLE_IMAGE_EDIT_MODELS,
-        "transcription": SELECTABLE_TRANSCRIPTION_MODELS,
-    }
-    catalog = catalogs.get(channel, SELECTABLE_CHAT_MODELS)
+    channel_name = (channel or "chat").strip().lower()
+    catalog = _SELECTABLE_MODEL_CATALOGS.get(channel_name, SELECTABLE_CHAT_MODELS)
     return catalog.get(p_name, ())
 
 
 def get_default_model(provider: str | None, channel: str = "chat") -> str:
     """Return the active default model for a provider and channel."""
     p_name = _canonical_provider_name(provider)
-    if channel == "vision":
-        vision_models = SELECTABLE_VISION_MODELS.get(p_name)
-        if vision_models:
-            return vision_models[0]
-        return DEFAULT_VISION_MODEL
-    if channel in ("image_gen", "image_generation"):
-        if p_name == PROVIDER_OPENAI:
-            return DEFAULT_OPENAI_IMAGE_MODEL
-        if p_name == PROVIDER_KIE:
-            return "seedream/4.5-text-to-image"
-    if channel == "image_edit":
-        if p_name == PROVIDER_KIE:
-            return "seedream/4.5-edit"
-    if channel == "transcription":
-        if p_name == PROVIDER_OPENAI:
-            return DEFAULT_OPENAI_TRANSCRIPTION_MODEL
-        if p_name == PROVIDER_GEMINI:
-            return "gemini-3.7-flash"
-        if p_name == PROVIDER_KIE:
-            return DEFAULT_KIE_TRANSCRIPTION_MODEL
+    channel_name = (channel or "chat").strip().lower()
+    if channel_name in _CAPABILITY_CHANNELS:
+        selectable = get_selectable_models(p_name, channel=channel_name)
+        if not selectable:
+            raise ModelUnavailableError(
+                f"Для провайдера '{p_name or provider or 'AI'}' нет доступной модели "
+                f"для канала '{channel_name}'. Выберите провайдера с поддержкой этой возможности."
+            )
+        return selectable[0]
     return PROVIDER_DEFAULT_MODELS.get(p_name, "gemini-3.7-flash")

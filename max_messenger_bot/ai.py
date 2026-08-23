@@ -24,7 +24,6 @@ from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory
 from result_history import ai_history_role_filter, select_ai_history_messages
 from error_reporting import classify_ai_error
 from provider_models import (
-    DEFAULT_OPENAI_IMAGE_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
@@ -585,6 +584,7 @@ async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model:
 
 
 async def _generate_kie(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
+    ensure_model_available(PROVIDER_KIE, model, channel="image_gen")
     attempts = 2
     last_exc: Exception = AIServiceError("KIE image generation failed without detailed error")
     for _ in range(attempts):
@@ -606,6 +606,7 @@ async def _generate_kie(api_key: str, base_url: str, model: str, prompt: str) ->
 
 
 async def _edit_kie(api_key: str, base_url: str, upload_base_url: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
+    ensure_model_available(PROVIDER_KIE, model, channel="image_edit")
     source_url = await _upload_file_to_kie(
         api_key, upload_base_url, image_bytes,
         _guess_filename(image_bytes, "image_edit_source", "jpg"), "images",
@@ -1310,7 +1311,7 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
 async def _generate_gemini(api_key: str, model: str, prompt: str) -> bytes:
     import httpx
 
-    target_model = model or "imagen-4.0-generate-001"
+    target_model = (model or "").strip()
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_gen")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:predict?key={api_key}"
     payload = {
@@ -1333,7 +1334,7 @@ async def _generate_gemini(api_key: str, model: str, prompt: str) -> bytes:
 async def _generate_openai(api_key: str, prompt: str) -> bytes:
     import httpx
 
-    model = DEFAULT_OPENAI_IMAGE_MODEL
+    model = get_default_model(PROVIDER_OPENAI, channel="image_gen")
     ensure_model_available(PROVIDER_OPENAI, model, channel="image_gen")
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
     response = await client.images.generate(model=model, prompt=prompt, n=1, size="1024x1024")
@@ -1358,19 +1359,20 @@ async def generate_image(prompt: str) -> bytes:
         raise AIServiceError("AIConfig не найден")
 
     provider = getattr(config, "image_generation_provider", None) or config.vision_provider or "OpenAI"
-    provider = provider.strip()
+    provider_key = provider.strip().lower()
 
-    if provider == "Gemini":
+    if provider_key == "gemini":
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для генерации не задан")
         model = getattr(config, "image_generation_model", None) or get_default_model(PROVIDER_GEMINI, channel="image_gen")
         return await _generate_gemini(api_key, model, prompt)
-    if provider == "KIE":
+    if provider_key == "kie":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для генерации не задан")
         model = getattr(config, "image_generation_model", None) or get_default_model(PROVIDER_KIE, channel="image_gen")
+        ensure_model_available(PROVIDER_KIE, model, channel="image_gen")
         return await _generate_kie(api_key, _get_kie_base_url(config), model, prompt)
     # Default: OpenAI
     api_key = config.openai_api_key
@@ -1386,7 +1388,7 @@ async def generate_image(prompt: str) -> bytes:
 async def _edit_gemini(api_key: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
     import httpx
 
-    target_model = model or get_default_model(PROVIDER_GEMINI, channel="image_edit")
+    target_model = (model or "").strip()
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_edit")
     b64_data = base64.b64encode(image_bytes).decode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
@@ -1421,18 +1423,19 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
         raise AIServiceError("AIConfig не найден")
 
     provider = getattr(config, "image_edit_provider", None) or config.vision_provider or "KIE"
-    provider = provider.strip()
+    provider_key = provider.strip().lower()
 
-    if provider == "Gemini":
+    if provider_key == "gemini":
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для редактирования не задан")
         model = getattr(config, "image_edit_model", None) or get_default_model(PROVIDER_GEMINI, channel="image_edit")
         return await _edit_gemini(api_key, model, prompt, image_bytes)
-    if provider == "KIE":
+    if provider_key == "kie":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для редактирования не задан")
         model = getattr(config, "image_edit_model", None) or get_default_model(PROVIDER_KIE, channel="image_edit")
+        ensure_model_available(PROVIDER_KIE, model, channel="image_edit")
         return await _edit_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, prompt, image_bytes)
     raise AIServiceError(f"Редактирование изображений не поддерживается для провайдера: {provider}")

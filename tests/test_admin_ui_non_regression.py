@@ -31,6 +31,7 @@ from provider_models import (
     PROVIDER_GEMINI,
     PROVIDER_KIE,
     PROVIDER_OPENAI,
+    ModelUnavailableError,
     RETIRED_UPSTREAM_MODELS,
     APP_DISABLED_OR_MIGRATED_MODELS,
     SELECTABLE_CHAT_MODELS,
@@ -105,6 +106,10 @@ def test_selectable_models_deterministic(channel, provider):
 @pytest.mark.parametrize("channel", ALL_CHANNELS)
 @pytest.mark.parametrize("provider", ALL_PROVIDERS)
 def test_default_model_not_retired(channel, provider):
+    if not get_selectable_models(provider, channel=channel):
+        with pytest.raises(ModelUnavailableError):
+            get_default_model(provider, channel=channel)
+        return
     d = get_default_model(provider, channel=channel)
     assert d not in RETIRED_UPSTREAM_MODELS, (
         f"get_default_model({provider!r}, {channel!r}) returned retired '{d}'"

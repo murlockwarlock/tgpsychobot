@@ -65,6 +65,7 @@ from provider_models import (
     PROVIDER_GEMINI,
     PROVIDER_KIE,
     PROVIDER_OPENAI,
+    ModelUnavailableError,
     SELECTABLE_CHAT_MODELS,
     get_default_model,
     get_selectable_models,
@@ -75,6 +76,18 @@ from knowledge_base_admin import (
     kb_text_export_filename,
 )
 from bot_restart import get_current_pm2_identity, schedule_pm2_restart, write_restart_marker
+
+
+def _display_capability_model(provider: str | None, model: str | None, channel: str) -> str:
+    """Render a configured capability model without inventing a stale fallback."""
+    if model:
+        return model
+    try:
+        return get_default_model(provider, channel=channel)
+    except ModelUnavailableError:
+        return "не задана"
+
+
 from memory_mode import (
     MEMORY_MODE_GLOBAL,
     MEMORY_MODE_RESET,
@@ -3420,11 +3433,19 @@ async def admin_ai_settings(message: Message | CallbackQuery):
 
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
         vis_provider = config.vision_provider
-        vis_model = config.vision_model
+        vis_model = _display_capability_model(vis_provider, config.vision_model, "vision")
         image_gen_provider = getattr(config, 'image_generation_provider', PROVIDER_OPENAI)
-        image_gen_model = getattr(config, 'image_generation_model', None) or get_default_model(image_gen_provider, channel="image_gen")
+        image_gen_model = _display_capability_model(
+            image_gen_provider,
+            getattr(config, 'image_generation_model', None),
+            "image_gen",
+        )
         image_edit_provider = getattr(config, 'image_edit_provider', PROVIDER_KIE)
-        image_edit_model = getattr(config, 'image_edit_model', None) or get_default_model(image_edit_provider, channel="image_edit")
+        image_edit_model = _display_capability_model(
+            image_edit_provider,
+            getattr(config, 'image_edit_model', None),
+            "image_edit",
+        )
         kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0)
         fb_provider = getattr(config, 'fallback_provider', None)
         fb_model = getattr(config, 'fallback_model', None)
@@ -3493,15 +3514,17 @@ async def admin_ai_keys_models(callback: CallbackQuery):
 
     trans_provider = config.transcription_provider if config else 'OpenAI'
     vis_provider = config.vision_provider if config else PROVIDER_GEMINI
-    vis_model = config.vision_model if config else get_default_model(PROVIDER_GEMINI, channel="vision")
+    vis_model = _display_capability_model(
+        vis_provider,
+        config.vision_model if config else None,
+        "vision",
+    )
     image_gen_provider = getattr(config, 'image_generation_provider', PROVIDER_OPENAI) if config else PROVIDER_OPENAI
     image_gen_model = getattr(config, 'image_generation_model', None) if config else None
-    if not image_gen_model:
-        image_gen_model = get_default_model(image_gen_provider, channel="image_gen")
+    image_gen_model = _display_capability_model(image_gen_provider, image_gen_model, "image_gen")
     image_edit_provider = getattr(config, 'image_edit_provider', PROVIDER_KIE) if config else PROVIDER_KIE
     image_edit_model = getattr(config, 'image_edit_model', None) if config else None
-    if not image_edit_model:
-        image_edit_model = get_default_model(image_edit_provider, channel="image_edit")
+    image_edit_model = _display_capability_model(image_edit_provider, image_edit_model, "image_edit")
     kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0) if config else 0
     c_first = config.context_limit_first if config else 2
     c_recent = config.context_limit_recent if config else 10
