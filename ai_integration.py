@@ -59,6 +59,12 @@ class AIResponseError(AIServiceError):
     pass
 
 
+def _validate_text_response(response_text: object, *, provider: str) -> str:
+    if not isinstance(response_text, str) or not response_text.strip():
+        raise AIResponseError(f"{provider} returned an empty or invalid text response")
+    return response_text
+
+
 _CURRENT_AI_CONTEXT = object()
 
 
@@ -549,7 +555,7 @@ async def _call_gemini_api(api_key: str, model: str, history: list, context: str
             role = 'user' if msg.role == 'user' else 'model'
             contents.append({'role': role, 'parts': [{'text': msg.content}]})
         if not contents or contents[-1]['role'] != 'user':
-            return "Ошибка: История диалога должна заканчиваться сообщением пользователя."
+            raise AIResponseError("Gemini request history must end with a user message")
         full_system_prompt = f"{system_prompt}\n\nCONTEXT:\n{context}"
         payload = {
             "contents": contents,
@@ -574,7 +580,7 @@ async def _call_gemini_api(api_key: str, model: str, history: list, context: str
             data = response.json()
             candidates = data.get('candidates', [])
             if not candidates:
-                return "Ошибка: Gemini вернул пустой ответ или контент заблокирован."
+                raise AIResponseError("Gemini returned an empty response or blocked content")
             return candidates[0]['content']['parts'][0]['text']
     except Exception as e:
         if any(word in str(e).lower() for word in ["billing", "quota", "location", "geo-block"]):
@@ -1426,19 +1432,20 @@ async def get_ai_response(
             use_proxy = getattr(ai_config, 'use_proxy', True)
             timeout = float(getattr(ai_config, "fallback_timeout", 60))
             if p_key == 'openai':
-                return await _call_openai_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
+                response_text = await _call_openai_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
             elif p_key in ['anthropic', 'claude']:
-                return await _call_claude_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
+                response_text = await _call_claude_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
             elif p_key == 'gemini':
-                return await _call_gemini_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
+                response_text = await _call_gemini_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
             elif p_key == 'kie':
-                return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, "", request_system_prompt, temperature, request_capture=request_capture)
+                response_text = await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, "", request_system_prompt, temperature, request_capture=request_capture)
             elif p_key == 'deepseek':
-                return await _call_deepseek_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture)
+                response_text = await _call_deepseek_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture)
             elif p_key == 'xai':
-                return await _call_openai_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
+                response_text = await _call_openai_api(p_api_key, p_model, final_history, "", request_system_prompt, temperature, timeout=timeout, request_capture=request_capture)
             else:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
+            return _validate_text_response(response_text, provider=p_key)
 
         start_time = time.monotonic()
         actual_provider = provider

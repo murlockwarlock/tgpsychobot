@@ -217,7 +217,7 @@ async def _run_max(
     )
     fallback = fallback_call if fallback_call is not None else AsyncMock(return_value="fallback answer")
     monkeypatch.setattr(ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(ai, "_dispatch_provider", primary)
+    monkeypatch.setattr(ai, "_call_gemini", primary)
     monkeypatch.setattr(ai, "_call_openai", fallback)
     result = await ai.get_ai_response(123, "question")
     return result, primary, fallback
@@ -298,18 +298,91 @@ async def test_kie_credit_failure_is_classified_and_still_uses_fallback(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ("telegram", "max"))
-async def test_primary_success_does_not_invoke_fallback(monkeypatch, surface):
+@pytest.mark.parametrize("primary_text", ("primary answer", "Ошибка в вычислении пользователя..."))
+async def test_primary_success_does_not_invoke_fallback(monkeypatch, surface, primary_text):
     runner = _run_telegram if surface == "telegram" else _run_max
 
     result, primary, fallback = await runner(
         monkeypatch,
-        "primary answer",
+        primary_text,
         fallback_enabled=True,
     )
 
-    assert result == "primary answer"
+    assert result == primary_text
     primary.assert_awaited_once()
     fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+@pytest.mark.parametrize("primary_text", (None, "", " \t\n"))
+async def test_empty_primary_response_attempts_fallback(monkeypatch, surface, primary_text):
+    runner = _run_telegram if surface == "telegram" else _run_max
+
+    result, primary, fallback = await runner(
+        monkeypatch,
+        primary_text,
+        fallback_enabled=True,
+    )
+
+    assert result == "fallback answer"
+    primary.assert_awaited_once()
+    fallback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+@pytest.mark.parametrize("fallback_text", (None, "", " \t\n"))
+async def test_empty_fallback_response_is_a_final_failure(monkeypatch, surface, fallback_text):
+    module = _module(surface)
+    runner = _run_telegram if surface == "telegram" else _run_max
+    fallback = AsyncMock(return_value=fallback_text)
+
+    with pytest.raises(module.AIServiceError, match="недоступны"):
+        await runner(
+            monkeypatch,
+            module.AIServiceError("primary provider failed"),
+            fallback_enabled=True,
+            fallback_call=fallback,
+        )
+
+    fallback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+async def test_empty_primary_response_respects_disabled_fallback(monkeypatch, surface):
+    module = _module(surface)
+    runner = _run_telegram if surface == "telegram" else _run_max
+    fallback = AsyncMock(return_value="should not be used")
+
+    with pytest.raises(module.AIServiceError):
+        await runner(
+            monkeypatch,
+            " \t\n",
+            fallback_enabled=False,
+            fallback_configured=True,
+            fallback_call=fallback,
+        )
+
+    fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_gemini_empty_or_blocked_response_raises(monkeypatch):
+    import ai_integration
+
+    client = _KieClient(_KieResponse({"candidates": []}, 200))
+    monkeypatch.setattr(ai_integration.httpx, "AsyncClient", lambda *args, **kwargs: client)
+
+    with pytest.raises(ai_integration.AIServiceError):
+        await ai_integration._call_gemini_api(
+            "gemini-key",
+            "gemini-model",
+            [SimpleNamespace(role="user", content="question")],
+            "",
+            "SYSTEM",
+        )
 
 
 @pytest.mark.asyncio

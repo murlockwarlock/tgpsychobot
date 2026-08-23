@@ -39,8 +39,19 @@ class AIServiceError(RuntimeError):
     pass
 
 
+class AIResponseError(AIServiceError):
+    """Provider returned an invalid or empty text response."""
+    pass
+
+
 class InsufficientBalanceError(AIServiceError):
     pass
+
+
+def _validate_text_response(response_text: object, *, provider: str) -> str:
+    if not isinstance(response_text, str) or not response_text.strip():
+        raise AIResponseError(f"{provider} returned an empty or invalid text response")
+    return response_text
 
 
 _CURRENT_AI_CONTEXT = object()
@@ -589,25 +600,27 @@ async def _dispatch_provider(ai_config: AIConfig, system_prompt: str, messages: 
     if provider == "openai":
         if not ai_config.openai_api_key:
             raise AIServiceError("OpenAI API key не задан")
-        return await _call_openai(ai_config.openai_api_key, ai_config.openai_model, [{"role": "system", "content": system_prompt}, *messages], temperature)
-    if provider in {"claude", "anthropic"}:
+        result = await _call_openai(ai_config.openai_api_key, ai_config.openai_model, [{"role": "system", "content": system_prompt}, *messages], temperature)
+    elif provider in {"claude", "anthropic"}:
         if not ai_config.claude_api_key:
             raise AIServiceError("Claude API key не задан")
-        return await _call_claude(ai_config.claude_api_key, ai_config.claude_model, messages, system_prompt, temperature)
-    if provider == "gemini":
+        result = await _call_claude(ai_config.claude_api_key, ai_config.claude_model, messages, system_prompt, temperature)
+    elif provider == "gemini":
         if not ai_config.gemini_api_key:
             raise AIServiceError("Gemini API key не задан")
-        return await _call_gemini(ai_config.gemini_api_key, ai_config.gemini_model, messages, system_prompt, temperature)
-    if provider == "deepseek":
+        result = await _call_gemini(ai_config.gemini_api_key, ai_config.gemini_model, messages, system_prompt, temperature)
+    elif provider == "deepseek":
         if not ai_config.deepseek_api_key:
             raise AIServiceError("DeepSeek API key не задан")
-        return await _call_deepseek(ai_config.deepseek_api_key, ai_config.deepseek_model, [{"role": "system", "content": system_prompt}, *messages], temperature)
-    if provider == "kie":
+        result = await _call_deepseek(ai_config.deepseek_api_key, ai_config.deepseek_model, [{"role": "system", "content": system_prompt}, *messages], temperature)
+    elif provider == "kie":
         if not ai_config.kie_api_key:
             raise AIServiceError("KIE API key не задан")
         base_url = _get_kie_base_url(ai_config)
-        return await _call_kie_text_chat(ai_config.kie_api_key, base_url, ai_config.kie_model or "gemini-3-flash", messages, system_prompt, temperature)
-    raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
+        result = await _call_kie_text_chat(ai_config.kie_api_key, base_url, ai_config.kie_model or "gemini-3-flash", messages, system_prompt, temperature)
+    else:
+        raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
+    return _validate_text_response(result, provider=provider)
 
 
 def _looks_like_prompt_kb_entry(filename: str | None, indexed_content: str | None) -> bool:
@@ -745,6 +758,7 @@ async def get_ai_response(
                             result = await _call_kie_text_chat(fb_api_key, _get_kie_base_url(ai_config), fb_model, stripped, system_prompt, temperature)
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
+                        result = _validate_text_response(result, provider=fb_key)
                         log.info("Fallback response generated user_id=%s provider=%s", user_id, fb_provider)
                         return result
                     except Exception as fb_err:
