@@ -139,7 +139,6 @@ SELECTABLE_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
 SELECTABLE_VISION_MODELS: dict[str, tuple[str, ...]] = {
     PROVIDER_GEMINI: (
         "gemini-3.7-flash",
-        "gemini-3-flash-preview",
         "gemini-2.5-pro",
         "gemini-2.5-flash",
     ),
@@ -283,6 +282,11 @@ def is_retired_model(model: str | None) -> bool:
     return normalized in RETIRED_UPSTREAM_MODELS
 
 
+def canonical_provider_name(provider: str | None) -> str:
+    """Return the canonical provider identifier used by the catalogs."""
+    return _canonical_provider_name(provider)
+
+
 class ModelUnavailableError(Exception):
     """Raised when a model is retired or unsupported for its capability."""
     pass
@@ -308,30 +312,45 @@ _CAPABILITY_CHANNELS = frozenset({
 
 
 def ensure_model_available(provider: str | None, model: str | None, channel: str = "chat") -> None:
-    """Validate retired IDs and capability/model compatibility before HTTP."""
-    normalized = (model or "").strip()
-    p_name = _canonical_provider_name(provider) or provider or "AI"
+    """Validate a provider/model/channel tuple before persistence or HTTP."""
+    p_name = canonical_provider_name(provider)
     channel_name = (channel or "chat").strip().lower()
+    normalized = normalize_model_for_provider(p_name, model)
 
-    if normalized and is_retired_model(normalized):
+    if p_name not in ALL_PROVIDERS:
+        raise ModelUnavailableError(
+            f"Провайдер '{provider or 'AI'}' не поддерживается. "
+            "Выберите провайдера из доступных настроек."
+        )
+
+    if channel_name not in _SELECTABLE_MODEL_CATALOGS:
+        raise ModelUnavailableError(
+            f"Канал '{channel_name}' не поддерживается для выбора модели."
+        )
+
+    if not normalized:
+        raise ModelUnavailableError(
+            f"Для провайдера '{p_name}' не задана модель для канала '{channel_name}'. "
+            "Выберите актуальную модель в настройках."
+        )
+
+    if is_retired_model(normalized):
         raise ModelUnavailableError(
             f"Модель '{normalized}' ({p_name}) отключена провайдером. "
             f"Пожалуйста, выберите актуальную модель в настройках."
         )
 
-    if channel_name not in _CAPABILITY_CHANNELS:
-        return
+    if normalized in APP_DISABLED_OR_MIGRATED_MODELS:
+        raise ModelUnavailableError(
+            f"Модель '{normalized}' ({p_name}) отключена в приложении. "
+            "Пожалуйста, выберите актуальную модель в настройках."
+        )
 
     selectable = get_selectable_models(p_name, channel=channel_name)
     if not selectable:
         raise ModelUnavailableError(
             f"Для провайдера '{p_name}' нет доступной модели для канала '{channel_name}'. "
             "Выберите провайдера с поддержкой этой возможности."
-        )
-    if not normalized:
-        raise ModelUnavailableError(
-            f"Для провайдера '{p_name}' не задана модель для канала '{channel_name}'. "
-            "Выберите актуальную модель в настройках."
         )
     if normalized not in selectable:
         raise ModelUnavailableError(
@@ -358,6 +377,21 @@ def normalize_deepseek_model(model: str | None) -> str:
     normalized = (model or "").strip()
     if not normalized or normalized in DEEPSEEK_LEGACY_MODELS:
         return DEEPSEEK_DEFAULT_MODEL
+    return normalized
+
+
+def normalize_model_for_provider(provider: str | None, model: str | None) -> str:
+    """Normalize local compatibility aliases before catalog validation."""
+    normalized = (model or "").strip()
+    if canonical_provider_name(provider) == PROVIDER_DEEPSEEK:
+        return normalize_deepseek_model(normalized)
+    return normalized
+
+
+def validate_model_selection(provider: str | None, model: str | None, channel: str = "chat") -> str:
+    """Validate and return the canonical model for an admin/runtime selection."""
+    normalized = normalize_model_for_provider(provider, model)
+    ensure_model_available(provider, normalized, channel=channel)
     return normalized
 
 

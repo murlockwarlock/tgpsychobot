@@ -162,6 +162,14 @@ def _canonical_layout(client_name="Ясна", state="photo"):
     )
 
 
+_ACTIVE_CHAT_MODELS = {
+    "OpenAI": "gpt-5.6-terra",
+    "Deepseek": "deepseek-v4-flash",
+    "Claude": "claude-haiku-4-5-20251001",
+    "Gemini": "gemini-3.7-flash",
+}
+
+
 def _assert_direct_payload_layout(provider, payload, client_name="Ясна"):
     stable = "STABLE CONFIGURED TOPIC PROMPT"
     state = "photo"
@@ -211,6 +219,7 @@ def _assert_direct_payload_layout(provider, payload, client_name="Ясна"):
 async def test_direct_final_payload_preserves_canonical_layout(monkeypatch, provider):
     capture = {}
     layout = _canonical_layout()
+    model = _ACTIVE_CHAT_MODELS[provider]
     _CompletionClient.calls.clear()
     _ClaudeClient.calls.clear()
     _GeminiClient.calls.clear()
@@ -218,25 +227,25 @@ async def test_direct_final_payload_preserves_canonical_layout(monkeypatch, prov
     if provider == "OpenAI":
         monkeypatch.setattr(ai_integration, "AsyncOpenAI", _CompletionClient)
         await ai_integration._call_openai_api(
-            "secret", "model", [], "", "STABLE", request_capture=capture,
+            "secret", model, [], "", "STABLE", request_capture=capture,
             request_layout=layout,
         )
     elif provider == "Deepseek":
         monkeypatch.setattr(ai_integration, "AsyncOpenAI", _CompletionClient)
         await ai_integration._call_deepseek_api(
-            "secret", "model", [], "", "STABLE", use_proxy=False,
+            "secret", model, [], "", "STABLE", use_proxy=False,
             request_capture=capture, request_layout=layout,
         )
     elif provider == "Claude":
         monkeypatch.setattr(ai_integration.anthropic, "AsyncAnthropic", _ClaudeClient)
         await ai_integration._call_claude_api(
-            "secret", "model", [], "", "STABLE", request_capture=capture,
+            "secret", model, [], "", "STABLE", request_capture=capture,
             request_layout=layout,
         )
     else:
         monkeypatch.setattr(ai_integration.httpx, "AsyncClient", _GeminiClient)
         await ai_integration._call_gemini_api(
-            "secret", "model", [], "", "STABLE", request_capture=capture,
+            "secret", model, [], "", "STABLE", request_capture=capture,
             request_layout=layout,
         )
 
@@ -312,7 +321,7 @@ async def test_cache_regression_stable_block_is_identical_across_users(monkeypat
     for client_name, state in (("Alice", "one"), ("Boris", "two")):
         capture = {}
         await ai_integration._call_deepseek_api(
-            "secret", "model", [], "", "STABLE", use_proxy=False,
+            "secret", _ACTIVE_CHAT_MODELS["Deepseek"], [], "", "STABLE", use_proxy=False,
             request_capture=capture,
             request_layout=AIRequestLayout(
                 stable_system_prompt="STABLE",

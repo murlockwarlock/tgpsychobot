@@ -926,8 +926,11 @@ def admin_ai_model_selection_keyboard(provider: str, current_model: str, models:
     return inline_keyboard(rows)
 
 
-def admin_ai_vision_models_keyboard(current_model: str, models: list[str]) -> list[dict]:
-    rows = [[callback_button(f"✅ {model}" if model == current_model else model, f"admin_ai_set_vision_model_{model}")] for model in models]
+def admin_ai_vision_models_keyboard(provider: str, current_model: str, models: list[str]) -> list[dict]:
+    rows = [[callback_button(
+        f"✅ {model}" if model == current_model else model,
+        f"admin_ai_set_vision_model_{provider}_{model}",
+    )] for model in models]
     rows.append([callback_button("⬅️ Назад", "admin_ai_keys")])
     return inline_keyboard(rows)
 

@@ -67,8 +67,10 @@ from provider_models import (
     PROVIDER_OPENAI,
     ModelUnavailableError,
     SELECTABLE_CHAT_MODELS,
+    canonical_provider_name,
     get_default_model,
     get_selectable_models,
+    validate_model_selection,
 )
 from knowledge_base_admin import (
     delete_knowledge_base_record,
@@ -86,6 +88,25 @@ def _display_capability_model(provider: str | None, model: str | None, channel: 
         return get_default_model(provider, channel=channel)
     except ModelUnavailableError:
         return "не задана"
+
+
+def _split_model_callback_payload(payload: str) -> tuple[str | None, str]:
+    """Parse provider-bound callbacks while retaining validated legacy support."""
+    provider, separator, model = (payload or "").partition("_")
+    known_providers = {
+        PROVIDER_CLAUDE,
+        PROVIDER_DEEPSEEK,
+        PROVIDER_GEMINI,
+        PROVIDER_KIE,
+        PROVIDER_OPENAI,
+    }
+    if separator and provider in known_providers:
+        return provider, model
+    return None, payload or ""
+
+
+async def _reject_model_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Недопустимая модель. Настройки не изменены.", show_alert=True)
 
 
 from memory_mode import (
@@ -3498,7 +3519,16 @@ async def admin_ai_settings(message: Message | CallbackQuery):
 
 @router.callback_query(F.data.startswith("ai_provider_"))
 async def set_ai_provider(callback: CallbackQuery, bot: Bot):
-    provider = callback.data.split("_")[-1]
+    provider = canonical_provider_name(callback.data.replace("ai_provider_", "", 1))
+    if provider not in {
+        PROVIDER_CLAUDE,
+        PROVIDER_DEEPSEEK,
+        PROVIDER_GEMINI,
+        PROVIDER_KIE,
+        PROVIDER_OPENAI,
+    }:
+        await _reject_model_callback(callback)
+        return
     async with async_session_maker() as session:
         stmt = update(AIConfig).where(AIConfig.id == 1).values(provider=provider)
         await session.execute(stmt)
@@ -3584,8 +3614,13 @@ async def admin_toggle_vision(callback: CallbackQuery):
         except ValueError:
             idx = 0
         next_vp = _VISION_CYCLE[(idx + 1) % len(_VISION_CYCLE)]
+        next_model = validate_model_selection(
+            next_vp,
+            get_default_model(next_vp, channel="vision"),
+            channel="vision",
+        )
         config.vision_provider = next_vp
-        config.vision_model = get_default_model(next_vp, channel="vision")
+        config.vision_model = next_model
 
         new_provider = config.vision_provider
         new_model = config.vision_model
@@ -3802,7 +3837,11 @@ async def admin_toggle_transcription(callback: CallbackQuery):
             config.transcription_provider = "Gemini"
         elif config.transcription_provider == "Gemini":
             config.transcription_provider = "KIE"
-            config.kie_transcription_model = get_default_model(PROVIDER_KIE, channel="transcription")
+            config.kie_transcription_model = validate_model_selection(
+                PROVIDER_KIE,
+                get_default_model(PROVIDER_KIE, channel="transcription"),
+                channel="transcription",
+            )
         elif config.transcription_provider == "KIE":
             config.transcription_provider = "None"
         else:
@@ -3835,8 +3874,13 @@ async def admin_toggle_image_generation(callback: CallbackQuery):
         except ValueError:
             idx = 0
         next_igp = _IMG_GEN_CYCLE[(idx + 1) % len(_IMG_GEN_CYCLE)]
+        next_model = validate_model_selection(
+            next_igp,
+            get_default_model(next_igp, channel="image_gen"),
+            channel="image_gen",
+        )
         config.image_generation_provider = next_igp
-        config.image_generation_model = get_default_model(next_igp, channel="image_gen")
+        config.image_generation_model = next_model
         await session.commit()
 
     await callback.answer(f"✅ Генерация изображений: {config.image_generation_provider}")
@@ -3854,7 +3898,11 @@ async def admin_toggle_image_edit(callback: CallbackQuery):
 
         # Force KIE regardless of previous provider since Gemini image-edit is retired
         config.image_edit_provider = PROVIDER_KIE
-        config.image_edit_model = get_default_model(PROVIDER_KIE, channel="image_edit")
+        config.image_edit_model = validate_model_selection(
+            PROVIDER_KIE,
+            get_default_model(PROVIDER_KIE, channel="image_edit"),
+            channel="image_edit",
+        )
         await session.commit()
 
     await callback.answer(f"✅ Редактирование изображений: {config.image_edit_provider}")
@@ -3896,7 +3944,11 @@ async def admin_toggle_fallback(callback: CallbackQuery):
         next_val = _FALLBACK_CYCLE[(idx + 1) % len(_FALLBACK_CYCLE)]
         config.fallback_provider = next_val
         if next_val:
-            config.fallback_model = get_default_model(next_val, channel="fallback")
+            config.fallback_model = validate_model_selection(
+                next_val,
+                get_default_model(next_val, channel="fallback"),
+                channel="fallback",
+            )
         else:
             config.fallback_model = None
         await session.commit()
@@ -3919,7 +3971,7 @@ async def admin_change_fallback_model_list(callback: CallbackQuery):
     models = list(get_selectable_models(provider, channel="fallback"))
     builder = InlineKeyboardBuilder()
     for m in models:
-        builder.button(text=m, callback_data=f"save_fallback_model_{m}")
+        builder.button(text=m, callback_data=f"save_fallback_model_{provider}_{m}")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
 
@@ -3928,13 +3980,28 @@ async def admin_change_fallback_model_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("save_fallback_model_"))
 async def save_fallback_model(callback: CallbackQuery):
-    model_name = callback.data.replace("save_fallback_model_", "")
+    payload = callback.data.replace("save_fallback_model_", "", 1)
+    callback_provider, model_name = _split_model_callback_payload(payload)
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-        config.fallback_model = model_name
+        if not config:
+            await _reject_model_callback(callback)
+            return
+        intended_provider = canonical_provider_name(callback_provider or getattr(config, "fallback_provider", None))
+        try:
+            normalized_model = validate_model_selection(
+                intended_provider,
+                model_name,
+                channel="fallback",
+            )
+        except ModelUnavailableError:
+            await _reject_model_callback(callback)
+            return
+        config.fallback_provider = intended_provider
+        config.fallback_model = normalized_model
         await session.commit()
 
-    await callback.answer(f"✅ Резервная модель: {model_name}")
+    await callback.answer(f"✅ Резервная модель: {normalized_model}")
     await admin_ai_keys_models(callback)
 
 
@@ -3942,11 +4009,19 @@ async def save_fallback_model(callback: CallbackQuery):
 @router.message(AdminStates.set_model)
 async def process_api_input(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    provider = data['provider']
+    provider = canonical_provider_name(data['provider'])
     current_state = await state.get_state()
     is_key = current_state == AdminStates.set_api_key.state
-    column_name = f"{provider.lower()}_api_key" if is_key else f"{provider.lower()}_model"
     value = message.text.strip() if message.text else None
+
+    if not is_key:
+        try:
+            value = validate_model_selection(provider, value, channel="chat")
+        except ModelUnavailableError:
+            await message.answer("Недопустимая модель. Настройки не изменены.")
+            return
+
+    column_name = f"{provider.lower()}_api_key" if is_key else f"{provider.lower()}_model"
 
     async with async_session_maker() as session:
         stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
@@ -4381,22 +4456,35 @@ async def handle_info_buttons(message: Message):
 
 @router.callback_query(F.data.startswith("view_models_"))
 async def view_models_by_provider(callback: CallbackQuery):
-    provider = callback.data.split("_")[-1]
+    provider = canonical_provider_name(callback.data.replace("view_models_", "", 1))
+    selectable_models = get_selectable_models(provider, channel="chat")
     provider_models = MODELS_INFO.get(provider)
 
-    if not provider_models:
+    if not provider_models or not selectable_models:
         await callback.answer("Модели для этого провайдера не найдены.", show_alert=True)
         return
 
     text = f"Выберите модель для <b>{provider}</b>:\n\n"
-    for model in provider_models.values():
-        if isinstance(model, dict):
-            text += f"▪️ <b>{model['name']}</b>: {model['desc']}\n"
+    for model_id in selectable_models:
+        model = provider_models.get(model_id, {
+            "name": model_id,
+            "desc": "Доступная модель из активного каталога.",
+        })
+        text += f"▪️ <b>{model['name']}</b>: {model['desc']}\n"
     text += f"\n<b>Прайсинг (официальный):</b>\n{provider_models['pricing']}\n\n<i>Цены в рублях являются примерными.</i>"
 
     await callback.message.edit_text(
         text,
-        reply_markup=kb.model_selection_keyboard(provider, {k: v for k, v in provider_models.items() if k != 'pricing'})
+        reply_markup=kb.model_selection_keyboard(
+            provider,
+            {
+                model_id: provider_models.get(model_id, {
+                    "name": model_id,
+                    "desc": "Доступная модель из активного каталога.",
+                })
+                for model_id in selectable_models
+            },
+        )
     )
 
 
@@ -4415,12 +4503,19 @@ async def process_selection(callback: CallbackQuery, state: FSMContext, bot: Bot
 
     if action_type == "set" and parts[1] == "model":
         model_key = "_".join(parts[3:])
+        provider = canonical_provider_name(provider)
+        try:
+            model_key = validate_model_selection(provider, model_key, channel="chat")
+        except ModelUnavailableError:
+            await _reject_model_callback(callback)
+            return
         column_name = f"{provider.lower()}_model"
         async with async_session_maker() as session:
             stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: model_key})
             await session.execute(stmt)
             await session.commit()
-        await callback.answer(f"✅ Модель для {provider} установлена на {MODELS_INFO[provider][model_key]['name']}", show_alert=True)
+        model_info = MODELS_INFO.get(provider, {}).get(model_key, {"name": model_key})
+        await callback.answer(f"✅ Модель для {provider} установлена на {model_info['name']}", show_alert=True)
         await admin_ai_keys_models(callback)
 
 
@@ -16517,7 +16612,7 @@ async def admin_change_vision_model_list(callback: CallbackQuery):
     models = list(get_selectable_models(provider, channel="vision"))
     builder = InlineKeyboardBuilder()
     for m in models:
-        builder.button(text=m, callback_data=f"save_vision_model_{m}")
+        builder.button(text=m, callback_data=f"save_vision_model_{provider}_{m}")
 
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
@@ -16527,13 +16622,28 @@ async def admin_change_vision_model_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("save_vision_model_"))
 async def save_vision_model(callback: CallbackQuery):
-    model_name = callback.data.replace("save_vision_model_", "")
+    payload = callback.data.replace("save_vision_model_", "", 1)
+    callback_provider, model_name = _split_model_callback_payload(payload)
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-        config.vision_model = model_name
+        if not config:
+            await _reject_model_callback(callback)
+            return
+        intended_provider = canonical_provider_name(callback_provider or getattr(config, "vision_provider", None))
+        try:
+            normalized_model = validate_model_selection(
+                intended_provider,
+                model_name,
+                channel="vision",
+            )
+        except ModelUnavailableError:
+            await _reject_model_callback(callback)
+            return
+        config.vision_provider = intended_provider
+        config.vision_model = normalized_model
         await session.commit()
 
-    await callback.answer(f"✅ Модель для фото изменена на {model_name}")
+    await callback.answer(f"✅ Модель для фото изменена на {normalized_model}")
 
 
 @router.callback_query(F.data == "admin_change_image_generation_model")
@@ -16548,7 +16658,7 @@ async def admin_change_image_generation_model_list(callback: CallbackQuery):
     models = list(get_selectable_models(provider, channel="image_gen"))
     builder = InlineKeyboardBuilder()
     for m in models:
-        builder.button(text=m, callback_data=f"save_image_generation_model_{m}")
+        builder.button(text=m, callback_data=f"save_image_generation_model_{provider}_{m}")
 
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
@@ -16557,12 +16667,29 @@ async def admin_change_image_generation_model_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("save_image_generation_model_"))
 async def save_image_generation_model(callback: CallbackQuery):
-    model_name = callback.data.replace("save_image_generation_model_", "")
+    payload = callback.data.replace("save_image_generation_model_", "", 1)
+    callback_provider, model_name = _split_model_callback_payload(payload)
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-        config.image_generation_model = model_name
+        if not config:
+            await _reject_model_callback(callback)
+            return
+        intended_provider = canonical_provider_name(
+            callback_provider or getattr(config, "image_generation_provider", None)
+        )
+        try:
+            normalized_model = validate_model_selection(
+                intended_provider,
+                model_name,
+                channel="image_gen",
+            )
+        except ModelUnavailableError:
+            await _reject_model_callback(callback)
+            return
+        config.image_generation_provider = intended_provider
+        config.image_generation_model = normalized_model
         await session.commit()
-    await callback.answer(f"✅ Модель генерации изменена на {model_name}")
+    await callback.answer(f"✅ Модель генерации изменена на {normalized_model}")
 
 
 @router.callback_query(F.data == "admin_change_image_edit_model")
@@ -16577,7 +16704,7 @@ async def admin_change_image_edit_model_list(callback: CallbackQuery):
     models = list(get_selectable_models(provider, channel="image_edit"))
     builder = InlineKeyboardBuilder()
     for m in models:
-        builder.button(text=m, callback_data=f"save_image_edit_model_{m}")
+        builder.button(text=m, callback_data=f"save_image_edit_model_{provider}_{m}")
 
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
@@ -16586,12 +16713,29 @@ async def admin_change_image_edit_model_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("save_image_edit_model_"))
 async def save_image_edit_model(callback: CallbackQuery):
-    model_name = callback.data.replace("save_image_edit_model_", "")
+    payload = callback.data.replace("save_image_edit_model_", "", 1)
+    callback_provider, model_name = _split_model_callback_payload(payload)
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-        config.image_edit_model = model_name
+        if not config:
+            await _reject_model_callback(callback)
+            return
+        intended_provider = canonical_provider_name(
+            callback_provider or getattr(config, "image_edit_provider", None)
+        )
+        try:
+            normalized_model = validate_model_selection(
+                intended_provider,
+                model_name,
+                channel="image_edit",
+            )
+        except ModelUnavailableError:
+            await _reject_model_callback(callback)
+            return
+        config.image_edit_provider = intended_provider
+        config.image_edit_model = normalized_model
         await session.commit()
-    await callback.answer(f"✅ Модель редактирования изменена на {model_name}")
+    await callback.answer(f"✅ Модель редактирования изменена на {normalized_model}")
 
 
 # ══════════════════════════════════════════════════════════════

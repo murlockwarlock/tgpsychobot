@@ -76,6 +76,16 @@ def _validate_text_response(response_text: object, *, provider: str) -> str:
     return response_text
 
 
+def _resolve_temperature(config, default: float = 0.7) -> float:
+    value = getattr(config, "temperature", None) if config is not None else None
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 _CURRENT_AI_CONTEXT = object()
 
 
@@ -448,9 +458,12 @@ async def _call_kie_multimodal(
     system_prompt: str,
     user_content: list,
     temperature: float = 0.7,
+    channel: str = "chat",
     *,
     request_layout: AIRequestLayout | None = None,
 ) -> str:
+    target_model = (model or "").strip()
+    ensure_model_available(PROVIDER_KIE, target_model, channel=channel)
     try:
         layout = request_layout or AIRequestLayout(
             stable_system_prompt=neutralize_stable_prompt(system_prompt),
@@ -459,7 +472,7 @@ async def _call_kie_multimodal(
         )
         layout = layout.with_current_user_content(user_content)
         payload = {
-            "model": model,
+            "model": target_model,
             "messages": build_openai_chat_messages(layout),
             "max_tokens": 4096,
             "temperature": temperature,
@@ -468,7 +481,7 @@ async def _call_kie_multimodal(
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(
-                f"{_kie_model_base_url(base_url, model)}/chat/completions",
+                f"{_kie_model_base_url(base_url, target_model)}/chat/completions",
                 headers=headers,
                 json=payload,
             )
@@ -523,6 +536,7 @@ def _build_kie_image_edit_input(model: str, prompt: str, source_url: str) -> dic
 
 
 async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, model: str, file_bytes: bytes, filename: str) -> str:
+    ensure_model_available(PROVIDER_KIE, model, channel="transcription")
     try:
         file_url = await _upload_file_to_kie(api_key, upload_base_url, file_bytes, filename, "audio")
         if model == "elevenlabs/speech-to-text":
@@ -546,6 +560,7 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
                 {"type": "image_url", "image_url": {"url": file_url}},
             ],
             temperature=0.0,
+            channel="transcription",
         )
     except (InsufficientBalanceError, AIServiceError):
         raise
@@ -555,6 +570,7 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
 
 
 async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+    ensure_model_available(PROVIDER_KIE, model, channel="vision")
     try:
         file_url = await _upload_file_to_kie(
             api_key, upload_base_url, image_bytes,
@@ -574,6 +590,7 @@ async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model:
             system_prompt,
             layout.current_user_content,
             temperature=temperature,
+            channel="vision",
             request_layout=layout,
         )
     except (InsufficientBalanceError, AIServiceError):
@@ -632,6 +649,7 @@ async def _call_kie_text_chat(
     request_layout: AIRequestLayout | None = None,
 ) -> str:
     """Call KIE text chat using the model's documented protocol."""
+    ensure_model_available(PROVIDER_KIE, model, channel="chat")
     layout = request_layout or _legacy_layout(messages, system_prompt)
     request = build_kie_chat_request(
         api_key,
@@ -692,7 +710,7 @@ async def _call_kie_text_chat(
 
 def _resolve_provider(ai_config: AIConfig) -> tuple[str, float]:
     provider = (ai_config.provider or "").strip().lower()
-    temperature = getattr(ai_config, "temperature", 0.7) or 0.7
+    temperature = _resolve_temperature(ai_config)
     return provider, temperature
 
 
@@ -891,7 +909,7 @@ async def get_ai_response(
             history=normalize_request_messages(history_messages),
             current_user_content=user_prompt,
         )
-        temperature = getattr(ai_config, "temperature", 0.7) or 0.7
+        temperature = _resolve_temperature(ai_config)
         try:
             result = await _dispatch_provider(ai_config, request_layout)
             log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, active_topic_id)
@@ -1226,7 +1244,7 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
             raise AIServiceError("Обработка изображений отключена администратором")
 
         provider = (config.vision_provider or "Gemini").strip()
-        temperature = getattr(config, "temperature", 0.7) or 0.7
+        temperature = _resolve_temperature(config)
         
         photo_instructions = (
             "\n\nИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"

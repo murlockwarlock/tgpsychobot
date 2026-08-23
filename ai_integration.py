@@ -817,8 +817,11 @@ async def _call_kie_chat(
     request_capture: dict | None = None,
     runtime_context: str = "",
     *,
+    timeout: float = 120.0,
     request_layout: AIRequestLayout | None = None,
 ) -> str:
+    target_model = (model or "").strip()
+    ensure_model_available(PROVIDER_KIE, target_model, channel="chat")
     try:
         layout = _coerce_request_layout(
             request_layout,
@@ -831,7 +834,7 @@ async def _call_kie_chat(
         request = build_kie_chat_request(
             api_key,
             base_url,
-            model,
+            target_model,
             request_layout=layout,
             temperature=temperature,
         )
@@ -841,7 +844,7 @@ async def _call_kie_chat(
             endpoint=request.endpoint,
             payload=request.payload,
         )
-        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(
                 request.endpoint,
                 headers=request.headers,
@@ -925,9 +928,12 @@ async def _call_kie_multimodal(
     temperature: float = 0.7,
     history: list | None = None,
     request_capture: dict | None = None,
+    channel: str = "chat",
     *,
     request_layout: AIRequestLayout | None = None,
 ) -> str:
+    target_model = (model or "").strip()
+    ensure_model_available(PROVIDER_KIE, target_model, channel=channel)
     try:
         layout = _coerce_request_layout(
             request_layout,
@@ -936,13 +942,13 @@ async def _call_kie_multimodal(
             current_user_content=user_content,
         ).with_current_user_content(user_content)
         payload = {
-            "model": model,
+            "model": target_model,
             "messages": build_openai_chat_messages(layout),
             "max_tokens": 4096,
             "temperature": temperature,
             "stream": False,
         }
-        endpoint = f"{_kie_model_base_url(base_url, model)}/chat/completions"
+        endpoint = f"{_kie_model_base_url(base_url, target_model)}/chat/completions"
         _capture_ai_request(request_capture, provider="KIE", endpoint=endpoint, payload=payload)
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
@@ -1123,7 +1129,7 @@ async def _call_claude_api(
     try:
         target_model = model if model else "claude-sonnet-5"
         ensure_model_available(PROVIDER_CLAUDE, target_model)
-        client = anthropic.AsyncAnthropic(api_key=api_key)
+        client = anthropic.AsyncAnthropic(api_key=api_key, timeout=timeout)
 
         layout = _coerce_request_layout(
             request_layout,
@@ -1714,7 +1720,7 @@ async def get_ai_response(
             elif p_key == 'gemini':
                 response_text = await _call_gemini_api(p_api_key, p_model, final_history, "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
             elif p_key == 'kie':
-                response_text = await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, "", formatted_body, temperature, request_capture=request_capture, request_layout=request_layout)
+                response_text = await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
             elif p_key == 'deepseek':
                 response_text = await _call_deepseek_api(p_api_key, p_model, final_history, "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
             elif p_key == 'xai':
@@ -1899,6 +1905,7 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
 
 
 async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str, model: str, file_bytes: bytes, filename: str) -> str:
+    ensure_model_available(PROVIDER_KIE, model, channel="transcription")
     try:
         upload_bytes, upload_filename = await _prepare_kie_transcription_audio(file_bytes, filename)
         file_url = await _retry_kie_transcription_step(
@@ -1947,6 +1954,7 @@ async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str
                 {"type": "image_url", "image_url": {"url": file_url}},
             ],
             temperature=0.0,
+            channel="transcription",
         )
     except (InsufficientBalanceError, AIServiceError):
         raise
@@ -2556,6 +2564,7 @@ async def _call_kie_vision(
     *,
     request_layout: AIRequestLayout | None = None,
 ) -> str:
+    ensure_model_available(PROVIDER_KIE, model, channel="vision")
     try:
         file_url = await _upload_file_to_kie(
             api_key,
@@ -2585,6 +2594,7 @@ async def _call_kie_vision(
             temperature=temperature,
             history=history,
             request_capture=request_capture,
+            channel="vision",
             request_layout=layout,
         )
     except (InsufficientBalanceError, AIServiceError):

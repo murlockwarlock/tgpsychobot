@@ -14,8 +14,11 @@ from provider_models import (
     PROVIDER_GEMINI,
     PROVIDER_KIE,
     PROVIDER_OPENAI,
+    ModelUnavailableError,
+    canonical_provider_name,
     get_default_model,
     get_selectable_models,
+    validate_model_selection,
 )
 
 FALLBACK_PROVIDERS = ["OpenAI", "Gemini", "Claude", "Deepseek", "KIE"]
@@ -55,6 +58,18 @@ def _provider_model(provider: str | None, model: str | None) -> str:
     provider_label = provider or "нет"
     model_label = model or "нет"
     return f"{provider_label}/{model_label}"
+
+
+def _split_provider_model_payload(payload: str) -> tuple[str | None, str]:
+    """Parse provider-bound callbacks while retaining validated legacy support."""
+    provider, separator, model = (payload or "").partition("_")
+    if separator and provider in MODEL_FIELDS:
+        return provider, model
+    return None, payload or ""
+
+
+async def _reject_model_selection(client: MaxApiClient, chat_id: int) -> None:
+    await client.send_message(chat_id=chat_id, text="Недопустимая модель. Настройки не изменены.")
 
 
 def _fallback_model_for_provider(config: AIConfig, provider: str | None) -> str:
@@ -217,13 +232,19 @@ async def show_models(client: MaxApiClient, chat_id: int, provider: str) -> None
 
 
 async def set_model(client: MaxApiClient, chat_id: int, provider: str, model_name: str) -> None:
+    provider = canonical_provider_name(provider)
     field = MODEL_FIELDS.get(provider)
     if not field:
-        await client.send_message(chat_id=chat_id, text="Неизвестный провайдер.")
+        await _reject_model_selection(client, chat_id)
+        return
+    try:
+        normalized_model = validate_model_selection(provider, model_name, channel="chat")
+    except ModelUnavailableError:
+        await _reject_model_selection(client, chat_id)
         return
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        setattr(config, field, model_name)
+        setattr(config, field, normalized_model)
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -249,34 +270,67 @@ async def toggle_vision(client: MaxApiClient, chat_id: int) -> None:
         config = await _ensure_session_config(session)
         if config.vision_provider == "OpenAI":
             config.vision_provider = "Gemini"
-            config.vision_model = get_default_model(PROVIDER_GEMINI, channel="vision")
+            config.vision_model = validate_model_selection(
+                PROVIDER_GEMINI,
+                get_default_model(PROVIDER_GEMINI, channel="vision"),
+                channel="vision",
+            )
         elif config.vision_provider == "Gemini":
             config.vision_provider = "KIE"
-            config.vision_model = get_default_model(PROVIDER_KIE, channel="vision")
+            config.vision_model = validate_model_selection(
+                PROVIDER_KIE,
+                get_default_model(PROVIDER_KIE, channel="vision"),
+                channel="vision",
+            )
         elif config.vision_provider == "KIE":
             config.vision_provider = "Claude"
-            config.vision_model = get_default_model(PROVIDER_CLAUDE, channel="vision")
+            config.vision_model = validate_model_selection(
+                PROVIDER_CLAUDE,
+                get_default_model(PROVIDER_CLAUDE, channel="vision"),
+                channel="vision",
+            )
         else:
             config.vision_provider = "OpenAI"
-            config.vision_model = get_default_model(PROVIDER_OPENAI, channel="vision")
+            config.vision_model = validate_model_selection(
+                PROVIDER_OPENAI,
+                get_default_model(PROVIDER_OPENAI, channel="vision"),
+                channel="vision",
+            )
         await session.commit()
     await show_keys(client, chat_id)
 
 
 async def show_vision_models(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
-    models = list(get_selectable_models(config.vision_provider, channel="vision"))
+    provider = canonical_provider_name(config.vision_provider)
+    models = list(get_selectable_models(provider, channel="vision"))
     await client.send_message(
         chat_id=chat_id,
-        text=f"Выберите vision-модель для {config.vision_provider}.",
-        attachments=admin_ai_vision_models_keyboard(config.vision_model, models),
+        text=f"Выберите vision-модель для {provider}.",
+        attachments=admin_ai_vision_models_keyboard(provider, config.vision_model, models),
     )
 
 
-async def set_vision_model(client: MaxApiClient, chat_id: int, model_name: str) -> None:
+async def set_vision_model(
+    client: MaxApiClient,
+    chat_id: int,
+    model_name: str,
+    provider: str | None = None,
+) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        config.vision_model = model_name
+        intended_provider = canonical_provider_name(provider or config.vision_provider)
+        try:
+            normalized_model = validate_model_selection(
+                intended_provider,
+                model_name,
+                channel="vision",
+            )
+        except ModelUnavailableError:
+            await _reject_model_selection(client, chat_id)
+            return
+        config.vision_provider = intended_provider
+        config.vision_model = normalized_model
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -416,10 +470,18 @@ async def toggle_image_generation(client: MaxApiClient, chat_id: int) -> None:
         config = await _ensure_session_config(session)
         if config.image_generation_provider == "OpenAI":
             config.image_generation_provider = "KIE"
-            config.image_generation_model = get_default_model(PROVIDER_KIE, channel="image_gen")
+            config.image_generation_model = validate_model_selection(
+                PROVIDER_KIE,
+                get_default_model(PROVIDER_KIE, channel="image_gen"),
+                channel="image_gen",
+            )
         else:
             config.image_generation_provider = "OpenAI"
-            config.image_generation_model = get_default_model(PROVIDER_OPENAI, channel="image_gen")
+            config.image_generation_model = validate_model_selection(
+                PROVIDER_OPENAI,
+                get_default_model(PROVIDER_OPENAI, channel="image_gen"),
+                channel="image_gen",
+            )
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -428,7 +490,11 @@ async def toggle_image_edit(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
         config.image_edit_provider = "KIE"
-        config.image_edit_model = get_default_model(PROVIDER_KIE, channel="image_edit")
+        config.image_edit_model = validate_model_selection(
+            PROVIDER_KIE,
+            get_default_model(PROVIDER_KIE, channel="image_edit"),
+            channel="image_edit",
+        )
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -436,9 +502,9 @@ async def toggle_image_edit(client: MaxApiClient, chat_id: int) -> None:
 async def show_image_generation_models(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
     current_model = config.image_generation_model or ""
-    provider = config.image_generation_provider or "OpenAI"
+    provider = canonical_provider_name(config.image_generation_provider or "OpenAI")
     models = list(get_selectable_models(provider, channel="image_gen"))
-    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_gen_model_{m}")] for m in models]
+    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_gen_model_{provider}_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
     await client.send_message(
         chat_id=chat_id,
@@ -447,10 +513,28 @@ async def show_image_generation_models(client: MaxApiClient, chat_id: int) -> No
     )
 
 
-async def set_image_generation_model(client: MaxApiClient, chat_id: int, model_name: str) -> None:
+async def set_image_generation_model(
+    client: MaxApiClient,
+    chat_id: int,
+    model_name: str,
+    provider: str | None = None,
+) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        config.image_generation_model = model_name
+        intended_provider = canonical_provider_name(
+            provider or getattr(config, "image_generation_provider", None) or "OpenAI"
+        )
+        try:
+            normalized_model = validate_model_selection(
+                intended_provider,
+                model_name,
+                channel="image_gen",
+            )
+        except ModelUnavailableError:
+            await _reject_model_selection(client, chat_id)
+            return
+        config.image_generation_provider = intended_provider
+        config.image_generation_model = normalized_model
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -458,9 +542,9 @@ async def set_image_generation_model(client: MaxApiClient, chat_id: int, model_n
 async def show_image_edit_models(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
     current_model = config.image_edit_model or ""
-    provider = config.image_edit_provider or "KIE"
+    provider = canonical_provider_name(config.image_edit_provider or "KIE")
     models = list(get_selectable_models(provider, channel="image_edit"))
-    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_edit_model_{m}")] for m in models]
+    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_set_image_edit_model_{provider}_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
     await client.send_message(
         chat_id=chat_id,
@@ -469,10 +553,28 @@ async def show_image_edit_models(client: MaxApiClient, chat_id: int) -> None:
     )
 
 
-async def set_image_edit_model(client: MaxApiClient, chat_id: int, model_name: str) -> None:
+async def set_image_edit_model(
+    client: MaxApiClient,
+    chat_id: int,
+    model_name: str,
+    provider: str | None = None,
+) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        config.image_edit_model = model_name
+        intended_provider = canonical_provider_name(
+            provider or getattr(config, "image_edit_provider", None) or "KIE"
+        )
+        try:
+            normalized_model = validate_model_selection(
+                intended_provider,
+                model_name,
+                channel="image_edit",
+            )
+        except ModelUnavailableError:
+            await _reject_model_selection(client, chat_id)
+            return
+        config.image_edit_provider = intended_provider
+        config.image_edit_model = normalized_model
         await session.commit()
     await show_keys(client, chat_id)
 
@@ -501,10 +603,17 @@ async def show_fallback_models(client: MaxApiClient, chat_id: int) -> None:
 
 
 async def set_fallback_provider(client: MaxApiClient, chat_id: int, provider: str) -> None:
+    provider = canonical_provider_name(provider)
+    try:
+        default_model = get_default_model(provider, channel="fallback")
+        normalized_model = validate_model_selection(provider, default_model, channel="fallback")
+    except ModelUnavailableError:
+        await _reject_model_selection(client, chat_id)
+        return
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
         config.fallback_provider = provider
-        config.fallback_model = _fallback_model_for_provider(config, provider)
+        config.fallback_model = normalized_model
         await session.commit()
         current_model = config.fallback_model
     models = list(get_selectable_models(provider, channel="fallback"))
@@ -518,10 +627,16 @@ async def set_fallback_provider(client: MaxApiClient, chat_id: int, provider: st
 
 
 async def save_fallback_model(client: MaxApiClient, chat_id: int, provider: str, model_name: str) -> None:
+    provider = canonical_provider_name(provider)
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
+        try:
+            normalized_model = validate_model_selection(provider, model_name, channel="fallback")
+        except ModelUnavailableError:
+            await _reject_model_selection(client, chat_id)
+            return
         config.fallback_provider = provider
-        config.fallback_model = model_name
+        config.fallback_model = normalized_model
         await session.commit()
     await show_keys(client, chat_id)
 

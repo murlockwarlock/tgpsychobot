@@ -859,7 +859,10 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ai_set_model_"):
                 payload = data.replace("admin_ai_set_model_", "", 1)
-                provider, model_name = payload.split("_", 1)
+                provider, separator, model_name = payload.partition("_")
+                if not separator:
+                    await self.client.send_message(chat_id=chat_id, text="Недопустимая модель. Настройки не изменены.")
+                    return
                 await admin_ai_service.set_model(self.client, chat_id, provider, model_name)
                 return
             if data == "admin_ai_toggle_transcription":
@@ -872,7 +875,9 @@ class MaxBotApplication:
                 await admin_ai_service.show_vision_models(self.client, chat_id)
                 return
             if data.startswith("admin_ai_set_vision_model_"):
-                await admin_ai_service.set_vision_model(self.client, chat_id, data.replace("admin_ai_set_vision_model_", "", 1))
+                payload = data.replace("admin_ai_set_vision_model_", "", 1)
+                provider, model_name = admin_ai_service._split_provider_model_payload(payload)
+                await admin_ai_service.set_vision_model(self.client, chat_id, model_name, provider=provider)
                 return
             if data == "admin_ai_set_context_first":
                 await admin_ai_service.start_set_int(self.client, self.states, chat_id, user_id, "admin_ai_set_context_first", "context_limit_first", "Введите количество первых сообщений контекста.")
@@ -1639,13 +1644,17 @@ class MaxBotApplication:
                 await admin_ai_service.show_image_generation_models(self.client, chat_id)
                 return
             if data.startswith("admin_ai_set_image_gen_model_"):
-                await admin_ai_service.set_image_generation_model(self.client, chat_id, data.replace("admin_ai_set_image_gen_model_", "", 1))
+                payload = data.replace("admin_ai_set_image_gen_model_", "", 1)
+                provider, model_name = admin_ai_service._split_provider_model_payload(payload)
+                await admin_ai_service.set_image_generation_model(self.client, chat_id, model_name, provider=provider)
                 return
             if data == "admin_ai_image_edit_models":
                 await admin_ai_service.show_image_edit_models(self.client, chat_id)
                 return
             if data.startswith("admin_ai_set_image_edit_model_"):
-                await admin_ai_service.set_image_edit_model(self.client, chat_id, data.replace("admin_ai_set_image_edit_model_", "", 1))
+                payload = data.replace("admin_ai_set_image_edit_model_", "", 1)
+                provider, model_name = admin_ai_service._split_provider_model_payload(payload)
+                await admin_ai_service.set_image_edit_model(self.client, chat_id, model_name, provider=provider)
                 return
             if data == "admin_ai_toggle_fallback":
                 await admin_ai_service.toggle_fallback(self.client, chat_id)
@@ -1658,7 +1667,10 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ai_save_fallback_"):
                 payload = data.replace("admin_ai_save_fallback_", "", 1)
-                provider, model_name = payload.split("_", 1)
+                provider, separator, model_name = payload.partition("_")
+                if not separator:
+                    await self.client.send_message(chat_id=chat_id, text="Недопустимая модель. Настройки не изменены.")
+                    return
                 await admin_ai_service.save_fallback_model(self.client, chat_id, provider, model_name)
                 return
             if data == "admin_ai_set_kie_threshold":
