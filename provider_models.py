@@ -1,4 +1,7 @@
 from dataclasses import dataclass
+from hashlib import sha256
+from hmac import compare_digest
+import re
 
 
 # ==========================================
@@ -309,6 +312,72 @@ _CAPABILITY_CHANNELS = frozenset({
     "image_edit",
     "transcription",
 })
+
+TELEGRAM_MODEL_CALLBACK_PREFIX = "ai_m_"
+TELEGRAM_CALLBACK_DATA_LIMIT = 64
+
+_TELEGRAM_MODEL_CALLBACK_CHANNEL_CODES = {
+    "chat": "c",
+    "fallback": "f",
+    "vision": "v",
+    "image_gen": "g",
+    "image_edit": "e",
+    "transcription": "t",
+}
+_TELEGRAM_MODEL_CALLBACK_CHANNELS = {
+    code: channel for channel, code in _TELEGRAM_MODEL_CALLBACK_CHANNEL_CODES.items()
+}
+_TELEGRAM_MODEL_CALLBACK_TOKEN_RE = re.compile(r"^ai_m_[a-z]_([0-9a-f]{32})$")
+
+
+def _normalize_model_channel(channel: str | None) -> str:
+    channel_name = (channel or "chat").strip().lower()
+    if channel_name == "image_generation":
+        channel_name = "image_gen"
+    return channel_name
+
+
+def _telegram_model_callback_digest(channel: str, provider: str, model: str) -> str:
+    value = f"{channel}\0{provider}\0{model}".encode("utf-8")
+    return sha256(value).hexdigest()[:32]
+
+
+def build_telegram_model_callback_data(provider: str, channel: str, model: str) -> str:
+    """Build a compact callback resolved against the current model catalog."""
+    channel_name = _normalize_model_channel(channel)
+    channel_code = _TELEGRAM_MODEL_CALLBACK_CHANNEL_CODES.get(channel_name)
+    if channel_code is None:
+        raise ModelUnavailableError(f"Канал '{channel}' не поддерживается для callback модели.")
+
+    normalized_model = validate_model_selection(provider, model, channel=channel_name)
+    canonical_provider = canonical_provider_name(provider)
+    callback_data = (
+        f"{TELEGRAM_MODEL_CALLBACK_PREFIX}{channel_code}_"
+        f"{_telegram_model_callback_digest(channel_name, canonical_provider, normalized_model)}"
+    )
+    if len(callback_data.encode("utf-8")) > TELEGRAM_CALLBACK_DATA_LIMIT:
+        raise ModelUnavailableError("Сформирован слишком длинный callback модели.")
+    return callback_data
+
+
+def resolve_telegram_model_callback(callback_data: str | None) -> tuple[str, str, str] | None:
+    """Resolve a compact callback only if its tuple is active in the current catalog."""
+    match = _TELEGRAM_MODEL_CALLBACK_TOKEN_RE.fullmatch(callback_data or "")
+    if not match:
+        return None
+
+    channel_code = (callback_data or "").split("_")[2]
+    channel = _TELEGRAM_MODEL_CALLBACK_CHANNELS.get(channel_code)
+    if channel is None:
+        return None
+    digest = match.group(1)
+
+    for provider in ALL_PROVIDERS:
+        for model in get_selectable_models(provider, channel=channel):
+            expected = _telegram_model_callback_digest(channel, provider, model)
+            if compare_digest(digest, expected):
+                return provider, channel, model
+    return None
 
 
 def ensure_model_available(provider: str | None, model: str | None, channel: str = "chat") -> None:

@@ -13,6 +13,7 @@ from datetime import timezone, timedelta, date
 from mailing_utils import MAILING_AUDIENCE_LABELS, get_mailing_status_label, is_birthday_mailing
 from memory_mode import memory_mode_label
 from time_helpers import to_msk
+from provider_models import build_telegram_model_callback_data
 
 
 def should_show_test_button(test_config) -> bool:
@@ -337,7 +338,10 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
 def model_selection_keyboard(provider: str, models: dict):
     builder = InlineKeyboardBuilder()
     for model_key, model_info in models.items():
-        builder.button(text=model_info['name'], callback_data=f"set_model_{provider}_{model_key}")
+        builder.button(
+            text=model_info['name'],
+            callback_data=build_telegram_model_callback_data(provider, "chat", model_key),
+        )
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
     return builder.as_markup()

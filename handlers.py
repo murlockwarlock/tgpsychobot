@@ -67,9 +67,12 @@ from provider_models import (
     PROVIDER_OPENAI,
     ModelUnavailableError,
     SELECTABLE_CHAT_MODELS,
+    TELEGRAM_MODEL_CALLBACK_PREFIX,
+    build_telegram_model_callback_data,
     canonical_provider_name,
     get_default_model,
     get_selectable_models,
+    resolve_telegram_model_callback,
     validate_model_selection,
 )
 from knowledge_base_admin import (
@@ -217,6 +220,50 @@ user_locks = {}
 user_message_buffers = {}
 user_processing_tasks = {}
 NAVIGATION_MENU_HINT = "Нажмите на кнопку или воспользуйтесь меню для навигации"
+
+
+@router.callback_query(F.data.startswith(TELEGRAM_MODEL_CALLBACK_PREFIX))
+async def handle_compact_model_callback(callback: CallbackQuery):
+    resolved = resolve_telegram_model_callback(callback.data)
+    if not resolved:
+        await _reject_model_callback(callback)
+        return
+
+    provider, channel, model_name = resolved
+    try:
+        normalized_model = validate_model_selection(provider, model_name, channel=channel)
+    except ModelUnavailableError:
+        await _reject_model_callback(callback)
+        return
+
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await _reject_model_callback(callback)
+            return
+
+        if channel == "chat":
+            setattr(config, f"{provider.lower()}_model", normalized_model)
+        elif channel == "fallback":
+            config.fallback_provider = provider
+            config.fallback_model = normalized_model
+        elif channel == "vision":
+            config.vision_provider = provider
+            config.vision_model = normalized_model
+        elif channel == "image_gen":
+            config.image_generation_provider = provider
+            config.image_generation_model = normalized_model
+        elif channel == "image_edit":
+            config.image_edit_provider = provider
+            config.image_edit_model = normalized_model
+        else:
+            await _reject_model_callback(callback)
+            return
+        await session.commit()
+
+    await callback.answer(f"✅ Модель изменена на {normalized_model}")
+    if channel in {"chat", "fallback"}:
+        await admin_ai_keys_models(callback)
 
 _AI_BUTTON_CLAIMS_MAX = 2048
 _ai_button_claims: OrderedDict[tuple[int, int], None] = OrderedDict()
@@ -3971,7 +4018,10 @@ async def admin_change_fallback_model_list(callback: CallbackQuery):
     models = list(get_selectable_models(provider, channel="fallback"))
     builder = InlineKeyboardBuilder()
     for m in models:
-        builder.button(text=m, callback_data=f"save_fallback_model_{provider}_{m}")
+        builder.button(
+            text=m,
+            callback_data=build_telegram_model_callback_data(provider, "fallback", m),
+        )
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
 
@@ -16612,7 +16662,10 @@ async def admin_change_vision_model_list(callback: CallbackQuery):
     models = list(get_selectable_models(provider, channel="vision"))
     builder = InlineKeyboardBuilder()
     for m in models:
-        builder.button(text=m, callback_data=f"save_vision_model_{provider}_{m}")
+        builder.button(
+            text=m,
+            callback_data=build_telegram_model_callback_data(provider, "vision", m),
+        )
 
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
@@ -16658,7 +16711,10 @@ async def admin_change_image_generation_model_list(callback: CallbackQuery):
     models = list(get_selectable_models(provider, channel="image_gen"))
     builder = InlineKeyboardBuilder()
     for m in models:
-        builder.button(text=m, callback_data=f"save_image_generation_model_{provider}_{m}")
+        builder.button(
+            text=m,
+            callback_data=build_telegram_model_callback_data(provider, "image_gen", m),
+        )
 
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
@@ -16704,7 +16760,10 @@ async def admin_change_image_edit_model_list(callback: CallbackQuery):
     models = list(get_selectable_models(provider, channel="image_edit"))
     builder = InlineKeyboardBuilder()
     for m in models:
-        builder.button(text=m, callback_data=f"save_image_edit_model_{provider}_{m}")
+        builder.button(
+            text=m,
+            callback_data=build_telegram_model_callback_data(provider, "image_edit", m),
+        )
 
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)

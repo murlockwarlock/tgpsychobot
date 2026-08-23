@@ -17,10 +17,16 @@ from provider_models import (
     PROVIDER_KIE,
     PROVIDER_OPENAI,
     RETIRED_UPSTREAM_MODELS,
+    SELECTABLE_CHAT_MODELS,
+    SELECTABLE_FALLBACK_MODELS,
+    SELECTABLE_IMAGE_EDIT_MODELS,
+    SELECTABLE_IMAGE_GEN_MODELS,
     SELECTABLE_VISION_MODELS,
     ModelUnavailableError,
+    build_telegram_model_callback_data,
     ensure_model_available,
     get_selectable_models,
+    resolve_telegram_model_callback,
     validate_model_selection,
 )
 
@@ -159,6 +165,33 @@ def test_gemini_preview_cannot_return_to_the_vision_picker_after_migration():
     assert migrated in get_selectable_models(PROVIDER_GEMINI, channel="vision")
 
 
+@pytest.mark.parametrize(
+    ("channel", "catalog"),
+    (
+        ("chat", SELECTABLE_CHAT_MODELS),
+        ("fallback", SELECTABLE_FALLBACK_MODELS),
+        ("vision", SELECTABLE_VISION_MODELS),
+        ("image_gen", SELECTABLE_IMAGE_GEN_MODELS),
+        ("image_edit", SELECTABLE_IMAGE_EDIT_MODELS),
+    ),
+)
+def test_all_telegram_ai_model_callbacks_are_bounded_and_catalog_bound(channel, catalog):
+    for provider, models in catalog.items():
+        for model in models:
+            callback_data = build_telegram_model_callback_data(provider, channel, model)
+            assert len(callback_data.encode("utf-8")) <= 64
+            assert resolve_telegram_model_callback(callback_data) == (provider, channel, model)
+
+
+def test_longest_kie_image_generation_callback_resolves_exact_model():
+    model = "bytedance/seedream-v4-text-to-image"
+    callback_data = build_telegram_model_callback_data(PROVIDER_KIE, "image_gen", model)
+
+    assert len(callback_data.encode("utf-8")) <= 64
+    assert resolve_telegram_model_callback(callback_data) == (PROVIDER_KIE, "image_gen", model)
+    assert validate_model_selection(PROVIDER_KIE, model, channel="image_gen") == model
+
+
 @pytest.mark.asyncio
 async def test_telegram_legacy_callback_fails_closed_against_current_provider(monkeypatch):
     import handlers
@@ -176,6 +209,47 @@ async def test_telegram_legacy_callback_fails_closed_against_current_provider(mo
     assert not session.committed
     assert config.fallback_provider == PROVIDER_OPENAI
     assert config.fallback_model == "gpt-5.6-terra"
+    assert callback.answers[0][1]["show_alert"] is True
+
+
+@pytest.mark.asyncio
+async def test_telegram_compact_callback_persists_exact_kie_image_generation_pair(monkeypatch):
+    import handlers
+
+    model = "bytedance/seedream-v4-text-to-image"
+    config = SimpleNamespace(
+        image_generation_provider=PROVIDER_OPENAI,
+        image_generation_model="gpt-image-2",
+    )
+    session = _SessionContext(config=config)
+    monkeypatch.setattr(handlers, "async_session_maker", lambda: session)
+
+    callback = _TelegramCallback(build_telegram_model_callback_data(PROVIDER_KIE, "image_gen", model))
+    await handlers.handle_compact_model_callback(callback)
+
+    assert session.committed
+    assert config.image_generation_provider == PROVIDER_KIE
+    assert config.image_generation_model == model
+    assert callback.answers[0][1].get("show_alert") is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_stale_compact_callback_does_not_write(monkeypatch):
+    import handlers
+
+    config = SimpleNamespace(
+        image_generation_provider=PROVIDER_OPENAI,
+        image_generation_model="gpt-image-2",
+    )
+    session = _SessionContext(config=config)
+    monkeypatch.setattr(handlers, "async_session_maker", lambda: session)
+
+    callback = _TelegramCallback("ai_m_g_" + ("0" * 32))
+    await handlers.handle_compact_model_callback(callback)
+
+    assert not session.committed
+    assert config.image_generation_provider == PROVIDER_OPENAI
+    assert config.image_generation_model == "gpt-image-2"
     assert callback.answers[0][1]["show_alert"] is True
 
 
