@@ -6355,7 +6355,7 @@ async def cancel_handler(callback: CallbackQuery, state: FSMContext):
     elif target_menu_callback_data == "admin_test_menu":
         await admin_test_menu(callback)
     elif target_menu_callback_data == "admin_general_settings":
-        await admin_general_settings(callback_mock)
+        await admin_general_settings(callback)
     elif target_menu_callback_data == "admin_secret_questions":
         await admin_secret_questions_menu(callback_mock)
     elif target_menu_callback_data == "admin_test_links":

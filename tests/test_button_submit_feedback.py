@@ -336,6 +336,26 @@ async def test_admin_processing_toggle_persists(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_admin_processing_text_back_returns_to_general_settings(monkeypatch):
+    callback = SimpleNamespace(
+        data="cancel_state_admin_general_settings",
+        message=SimpleNamespace(),
+        from_user=SimpleNamespace(id=42),
+        bot=SimpleNamespace(),
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace(clear=AsyncMock())
+    general_settings = AsyncMock()
+    monkeypatch.setattr(handlers, "admin_general_settings", general_settings)
+
+    await handlers.cancel_handler(callback, state)
+
+    state.clear.assert_awaited_once_with()
+    general_settings.assert_awaited_once_with(callback)
+    callback.answer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_admin_processing_text_persists_and_rejects_empty(monkeypatch):
     config = SimpleNamespace(
         ai_processing_message_enabled=True,

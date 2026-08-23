@@ -116,6 +116,7 @@ if [[ "${#TRACKED_FILES[@]}" -eq 0 ]]; then
 fi
 
 REVISION="$(git rev-parse --short HEAD)"
+DEPLOY_STARTED_AT="$(date +%s)"
 echo "Deploying revision $REVISION to ${USER_NAME}@${HOST}:${REMOTE_DIR}"
 
 SSH_CMD=(ssh -o StrictHostKeyChecking=no)
@@ -148,6 +149,11 @@ tar czf - -- "${TRACKED_FILES[@]}" | \
      done && \
      pm2 startOrReload '${PM2_CONFIG}' --only ${PM2_NAMES} --update-env && \
      sleep 10 && \
-     pm2 status"
+     pm2 status && \
+     '${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \
+         --revision '${REVISION}' \
+         --pm2-names '${PM2_NAMES}' \
+         --root '${REMOTE_DIR}' \
+         --started-at '${DEPLOY_STARTED_AT}'"
 
 echo "Deploy complete."
