@@ -49,6 +49,7 @@ from provider_models import (
     get_default_model,
     is_retired_model,
     normalize_deepseek_model,
+    should_omit_claude_sampling,
 )
 from kie_chat import (
     build_kie_chat_request,
@@ -1145,7 +1146,7 @@ async def _call_claude_api(
             "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
-        if target_model != "claude-sonnet-5":
+        if not should_omit_claude_sampling(target_model):
             payload["temperature"] = temperature
 
         _capture_ai_request(
@@ -1215,7 +1216,7 @@ async def _call_claude_vision(
             "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
-        if target_model != "claude-sonnet-5":
+        if not should_omit_claude_sampling(target_model):
             payload["temperature"] = temperature
 
         _capture_ai_request(request_capture, provider="Claude", endpoint="https://api.anthropic.com/v1/messages", payload=payload)
@@ -2182,9 +2183,9 @@ async def generate_image(prompt: str) -> any:
         if not config:
             raise AIServiceError("Конфигурация ИИ не найдена.")
 
-        provider = getattr(config, "image_generation_provider", None) or config.vision_provider
+        provider = getattr(config, "image_generation_provider", None) or config.vision_provider or PROVIDER_OPENAI
         provider_key = _normalize_provider_name(provider)
-        model = getattr(config, "image_generation_model", None) or "imagen-4.0-generate-001"
+        model = getattr(config, "image_generation_model", None) or get_default_model(provider, channel="image_gen")
 
     if provider_key == 'gemini':
         ensure_model_available(PROVIDER_GEMINI, model, channel="image_gen")
@@ -2215,9 +2216,9 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
         if not config:
             raise AIServiceError("Конфигурация ИИ не найдена.")
 
-        provider = getattr(config, "image_edit_provider", None) or config.vision_provider
+        provider = getattr(config, "image_edit_provider", None) or config.vision_provider or PROVIDER_KIE
         provider_key = _normalize_provider_name(provider)
-        model = getattr(config, "image_edit_model", None) or "gemini-3-pro-image-preview"
+        model = getattr(config, "image_edit_model", None) or get_default_model(provider, channel="image_edit")
 
     if provider_key == "gemini":
         ensure_model_available(PROVIDER_GEMINI, model, channel="image_edit")

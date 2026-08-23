@@ -3779,7 +3779,7 @@ async def admin_toggle_transcription(callback: CallbackQuery):
             config.transcription_provider = "Gemini"
         elif config.transcription_provider == "Gemini":
             config.transcription_provider = "KIE"
-            config.kie_transcription_model = "elevenlabs/speech-to-text"
+            config.kie_transcription_model = get_default_model(PROVIDER_KIE, channel="transcription")
         elif config.transcription_provider == "KIE":
             config.transcription_provider = "None"
         else:
@@ -12120,12 +12120,12 @@ async def process_audio_limit(message: Message, state: FSMContext, bot: Bot):
                     current_transcription_provider=transcription_provider,
                     context_first=config.context_limit_first if config else 2,
                     context_recent=config.context_limit_recent if config else 10,
-                    current_vision_provider=config.vision_provider if config else 'Gemini',
-                    current_vision_model=config.vision_model if config else 'gemini-3-flash-preview',
-                    image_generation_provider=getattr(config, 'image_generation_provider', 'Gemini') if config else 'Gemini',
-                    image_generation_model=getattr(config, 'image_generation_model', 'imagen-4.0-generate-001') if config else 'imagen-4.0-generate-001',
-                    image_edit_provider=getattr(config, 'image_edit_provider', 'Gemini') if config else 'Gemini',
-                    image_edit_model=getattr(config, 'image_edit_model', 'gemini-3-pro-image-preview') if config else 'gemini-3-pro-image-preview',
+                    current_vision_provider=config.vision_provider if config else PROVIDER_GEMINI,
+                    current_vision_model=config.vision_model if config else get_default_model(PROVIDER_GEMINI, channel="vision"),
+                    image_generation_provider=getattr(config, 'image_generation_provider', PROVIDER_OPENAI) if config else PROVIDER_OPENAI,
+                    image_generation_model=getattr(config, 'image_generation_model', get_default_model(PROVIDER_OPENAI, channel="image_gen")) if config else get_default_model(PROVIDER_OPENAI, channel="image_gen"),
+                    image_edit_provider=getattr(config, 'image_edit_provider', PROVIDER_KIE) if config else PROVIDER_KIE,
+                    image_edit_model=getattr(config, 'image_edit_model', get_default_model(PROVIDER_KIE, channel="image_edit")) if config else get_default_model(PROVIDER_KIE, channel="image_edit"),
                     kie_credit_alert_threshold=getattr(config, 'kie_credit_alert_threshold', 0) if config else 0,
                     temperature=getattr(config, 'temperature', 0.7) if config else 0.7,
                     memory_mode=get_memory_mode(config) if config else MEMORY_MODE_RESET,
@@ -17281,12 +17281,12 @@ async def save_ai_timeout(message: Message, state: FSMContext):
                 current_transcription_provider=conf2.transcription_provider if conf2 else 'OpenAI',
                 context_first=conf2.context_limit_first if conf2 else 2,
                 context_recent=conf2.context_limit_recent if conf2 else 10,
-                current_vision_provider=conf2.vision_provider if conf2 else 'Gemini',
-                current_vision_model=conf2.vision_model if conf2 else 'gemini-3-flash-preview',
-                image_generation_provider=getattr(conf2, 'image_generation_provider', 'Gemini') if conf2 else 'Gemini',
-                image_generation_model=getattr(conf2, 'image_generation_model', 'imagen-4.0-generate-001') if conf2 else 'imagen-4.0-generate-001',
-                image_edit_provider=getattr(conf2, 'image_edit_provider', 'Gemini') if conf2 else 'Gemini',
-                image_edit_model=getattr(conf2, 'image_edit_model', 'gemini-3-pro-image-preview') if conf2 else 'gemini-3-pro-image-preview',
+                current_vision_provider=conf2.vision_provider if conf2 else PROVIDER_GEMINI,
+                current_vision_model=conf2.vision_model if conf2 else get_default_model(PROVIDER_GEMINI, channel="vision"),
+                image_generation_provider=getattr(conf2, 'image_generation_provider', PROVIDER_OPENAI) if conf2 else PROVIDER_OPENAI,
+                image_generation_model=getattr(conf2, 'image_generation_model', get_default_model(PROVIDER_OPENAI, channel="image_gen")) if conf2 else get_default_model(PROVIDER_OPENAI, channel="image_gen"),
+                image_edit_provider=getattr(conf2, 'image_edit_provider', PROVIDER_KIE) if conf2 else PROVIDER_KIE,
+                image_edit_model=getattr(conf2, 'image_edit_model', get_default_model(PROVIDER_KIE, channel="image_edit")) if conf2 else get_default_model(PROVIDER_KIE, channel="image_edit"),
                 kie_credit_alert_threshold=getattr(conf2, 'kie_credit_alert_threshold', 0) if conf2 else 0,
                 temperature=getattr(conf2, 'temperature', 0.7) if conf2 else 0.7,
                 memory_mode=get_memory_mode(conf2) if conf2 else "reset",

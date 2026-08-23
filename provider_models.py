@@ -301,6 +301,19 @@ def ensure_model_available(provider: str | None, model: str | None, channel: str
         )
 
 
+# Models that omit sampling parameters (temperature, top_p, top_k)
+CLAUDE_OMIT_SAMPLING_MODELS = frozenset({
+    "claude-sonnet-5",
+    "claude-opus-5",
+})
+
+
+def should_omit_claude_sampling(model: str | None) -> bool:
+    """Return True if the Claude model does not accept non-default temperature/sampling parameters."""
+    normalized = (model or "").strip()
+    return normalized in CLAUDE_OMIT_SAMPLING_MODELS
+
+
 def normalize_deepseek_model(model: str | None) -> str:
     """Normalize local legacy DeepSeek aliases to the default active model."""
     normalized = (model or "").strip()

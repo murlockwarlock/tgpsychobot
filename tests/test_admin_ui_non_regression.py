@@ -17,6 +17,11 @@ Covers:
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("BOT_TOKEN", "test")
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
 import pytest
 
 import provider_models as pm
@@ -389,7 +394,7 @@ def test_database_migration_replaces_all_legacy_and_retired_models():
             FROM ai_config ORDER BY id
         """)).all()
 
-    # Row 1
+    # Row 1 (Sonnet family preserved)
     assert rows[0][1] == "gpt-5.6-terra"
     assert rows[0][2] == "claude-sonnet-5"
     assert rows[0][3] == "gemini-3.7-flash"
@@ -397,17 +402,17 @@ def test_database_migration_replaces_all_legacy_and_retired_models():
     assert rows[0][6] == "gemini-3.7-flash"
     assert rows[0][8] == "gpt-5.6-terra"
 
-    # Row 2
+    # Row 2 (Opus family preserved)
     assert rows[1][1] == "gpt-5.6-terra"
-    assert rows[1][2] == "claude-sonnet-5"
+    assert rows[1][2] == "claude-opus-5"
     assert rows[1][3] == "gemini-3.7-flash"
     assert rows[1][4] == "deepseek-v4-pro"
-    assert rows[1][6] == "claude-sonnet-5"
-    assert rows[1][8] == "claude-sonnet-5"
+    assert rows[1][6] == "claude-opus-5"
+    assert rows[1][8] == "claude-opus-5"
 
-    # Row 3
+    # Row 3 (Haiku family preserved)
     assert rows[2][1] == "gpt-5.6-terra"
-    assert rows[2][2] == "claude-sonnet-5"
+    assert rows[2][2] == "claude-haiku-4-5-20251001"
     assert rows[2][3] == "gemini-3.7-flash"
     assert rows[2][4] == "deepseek-v4-flash"
     assert rows[2][6] == "gpt-5.6-terra"
@@ -536,3 +541,273 @@ async def test_gemini_transcription_ignores_stale_chat_model_in_db():
     called_model = mock_call.await_args.args[1]
     assert called_model == "gemini-3.7-flash"
     assert called_model not in RETIRED_UPSTREAM_MODELS
+
+
+# ---------------------------------------------------------------------------
+# 19. Provider Serialization Tests (Telegram & MAX)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["claude-sonnet-5", "claude-opus-5"])
+async def test_claude_sampling_omitted_for_sonnet_and_opus_telegram(model_name):
+    from unittest.mock import AsyncMock, patch
+    import ai_integration
+
+    capture = {}
+    mock_client = AsyncMock()
+    mock_resp = AsyncMock()
+    mock_resp.content = [AsyncMock(text="Claude test answer")]
+    mock_client.messages.create.return_value = mock_resp
+
+    with patch("ai_integration.anthropic.AsyncAnthropic", return_value=mock_client):
+        await ai_integration._call_claude_api(
+            api_key="test-key",
+            model=model_name,
+            history=[],
+            context="",
+            system_prompt="System Prompt",
+            temperature=0.7,
+            runtime_context="",
+            request_capture=capture,
+        )
+
+    # Telegram payload check
+    payload = capture.get("payload", {})
+    assert "temperature" not in payload, f"temperature must be omitted for {model_name}"
+    assert "top_p" not in payload, f"top_p must be omitted for {model_name}"
+    assert "top_k" not in payload, f"top_k must be omitted for {model_name}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["claude-sonnet-5", "claude-opus-5"])
+async def test_claude_sampling_omitted_for_sonnet_and_opus_max(model_name):
+    from unittest.mock import AsyncMock, patch
+    from max_messenger_bot import ai as max_ai
+
+    mock_client = AsyncMock()
+    mock_resp = AsyncMock()
+    mock_resp.content = [AsyncMock(text="Max Claude answer")]
+    mock_client.messages.create.return_value = mock_resp
+
+    with patch("max_messenger_bot.ai.anthropic.AsyncAnthropic", return_value=mock_client):
+        await max_ai._call_claude(
+            api_key="test-key",
+            model=model_name,
+            messages=[{"role": "user", "content": "Hello"}],
+            system_prompt="System Prompt",
+            temperature=0.7,
+        )
+
+    call_kwargs = mock_client.messages.create.call_args.kwargs
+    assert "temperature" not in call_kwargs, f"MAX temperature must be omitted for {model_name}"
+    assert "top_p" not in call_kwargs
+    assert "top_k" not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_claude_sampling_preserved_for_haiku_4_5_telegram_and_max():
+    from unittest.mock import AsyncMock, patch
+    import ai_integration
+    from max_messenger_bot import ai as max_ai
+
+    # 1. Telegram
+    capture = {}
+    mock_tg_client = AsyncMock()
+    mock_tg_resp = AsyncMock()
+    mock_tg_resp.content = [AsyncMock(text="Haiku answer")]
+    mock_tg_client.messages.create.return_value = mock_tg_resp
+
+    with patch("ai_integration.anthropic.AsyncAnthropic", return_value=mock_tg_client):
+        await ai_integration._call_claude_api(
+            api_key="test-key",
+            model="claude-haiku-4-5-20251001",
+            history=[],
+            context="",
+            system_prompt="System Prompt",
+            temperature=0.0,
+            runtime_context="",
+            request_capture=capture,
+        )
+
+    payload = capture.get("payload", {})
+    assert "temperature" in payload
+    assert payload["temperature"] == 0.0, "temperature=0.0 must be preserved exactly for Haiku 4.5"
+
+    # 2. MAX
+    mock_max_client = AsyncMock()
+    mock_max_resp = AsyncMock()
+    mock_max_resp.content = [AsyncMock(text="Max Haiku answer")]
+    mock_max_client.messages.create.return_value = mock_max_resp
+
+    with patch("max_messenger_bot.ai.anthropic.AsyncAnthropic", return_value=mock_max_client):
+        await max_ai._call_claude(
+            api_key="test-key",
+            model="claude-haiku-4-5-20251001",
+            messages=[{"role": "user", "content": "Hello"}],
+            system_prompt="System Prompt",
+            temperature=0.0,
+        )
+
+    max_kwargs = mock_max_client.messages.create.call_args.kwargs
+    assert "temperature" in max_kwargs
+    assert max_kwargs["temperature"] == 0.0, "MAX temperature=0.0 must be preserved exactly for Haiku 4.5"
+
+
+@pytest.mark.asyncio
+async def test_openai_gpt56_payload_shape_telegram_and_max():
+    from unittest.mock import AsyncMock, patch
+    import ai_integration
+    from max_messenger_bot import ai as max_ai
+    from ai_request_context import AIRequestLayout, AIRequestMessage
+
+    layout = AIRequestLayout(
+        stable_system_prompt="System instructions",
+        history=(
+            AIRequestMessage(role="user", content="Past question"),
+            AIRequestMessage(role="assistant", content="Past answer"),
+        ),
+        current_user_content="Current question",
+    )
+
+    # 1. Telegram
+    capture = {}
+    mock_tg_client = AsyncMock()
+    mock_tg_client.chat.completions.create.return_value = AsyncMock(
+        choices=[AsyncMock(message=AsyncMock(content="GPT answer"))]
+    )
+
+    with patch("ai_integration.AsyncOpenAI", return_value=mock_tg_client):
+        await ai_integration._call_openai_api(
+            api_key="test-key",
+            model="gpt-5.6-terra",
+            history=[],
+            context="",
+            system_prompt="",
+            temperature=0.7,
+            request_capture=capture,
+            request_layout=layout,
+        )
+
+    tg_payload = capture.get("payload", {})
+    assert tg_payload["model"] == "gpt-5.6-terra"
+    assert "max_completion_tokens" in tg_payload
+    assert "temperature" not in tg_payload, "temperature must be omitted for gpt-5.6 models"
+    # Current user remains final message
+    assert tg_payload["messages"][-1]["role"] == "user"
+    assert tg_payload["messages"][-1]["content"] == "Current question"
+
+    # 2. MAX
+    mock_max_client = AsyncMock()
+    mock_max_client.chat.completions.create.return_value = AsyncMock(
+        choices=[AsyncMock(message=AsyncMock(content="Max GPT answer"))]
+    )
+
+    with patch("max_messenger_bot.ai.AsyncOpenAI", return_value=mock_max_client):
+        await max_ai._call_openai(
+            api_key="test-key",
+            model="gpt-5.6-terra",
+            messages=None,
+            temperature=0.7,
+            request_layout=layout,
+        )
+
+    max_kwargs = mock_max_client.chat.completions.create.call_args.kwargs
+    assert max_kwargs["model"] == "gpt-5.6-terra"
+    assert "max_completion_tokens" in max_kwargs
+    assert "temperature" not in max_kwargs, "MAX temperature must be omitted for gpt-5.6 models"
+    assert max_kwargs["messages"][-1]["role"] == "user"
+    assert max_kwargs["messages"][-1]["content"] == "Current question"
+
+
+@pytest.mark.asyncio
+async def test_gemini_37_payload_shape_telegram_and_max():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import ai_integration
+    from max_messenger_bot import ai as max_ai
+    from ai_request_context import AIRequestLayout, AIRequestMessage
+
+    layout = AIRequestLayout(
+        stable_system_prompt="System instructions",
+        history=(
+            AIRequestMessage(role="user", content="Past question"),
+            AIRequestMessage(role="assistant", content="Past answer"),
+        ),
+        current_user_content="Current question",
+    )
+
+    # 1. Telegram
+    capture = {}
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.json = lambda: {
+        "candidates": [{
+            "content": {
+                "parts": [{"text": "Gemini answer"}],
+                "role": "model",
+            }
+        }]
+    }
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client_cm = MagicMock()
+    mock_client_cm.__aenter__.return_value = mock_client
+    mock_client_cm.__aexit__.return_value = False
+
+    with patch("httpx.AsyncClient", return_value=mock_client_cm):
+        await ai_integration._call_gemini_api(
+            api_key="test-key",
+            model="gemini-3.7-flash",
+            history=[],
+            context="",
+            system_prompt="",
+            temperature=0.7,
+            request_capture=capture,
+            request_layout=layout,
+        )
+
+    tg_payload = capture.get("payload", {})
+    gen_config = tg_payload.get("generationConfig", {})
+    assert "temperature" not in gen_config, "temperature must be omitted for Gemini 3.7"
+    assert "top_p" not in gen_config, "top_p must be omitted for Gemini 3.7"
+    assert "top_k" not in gen_config, "top_k must be omitted for Gemini 3.7"
+    # Final turn must be current user
+    assert tg_payload["contents"][-1]["role"] == "user"
+    assert tg_payload["contents"][-1]["parts"][0]["text"] == "Current question"
+
+    # 2. MAX
+    max_mock_resp = AsyncMock()
+    max_mock_resp.status_code = 200
+    max_mock_resp.raise_for_status = MagicMock()
+    max_mock_resp.json = lambda: {
+        "candidates": [{
+            "content": {
+                "parts": [{"text": "Max Gemini answer"}],
+                "role": "model",
+            }
+        }]
+    }
+    max_mock_client = AsyncMock()
+    max_mock_client.post.return_value = max_mock_resp
+    max_mock_client_cm = MagicMock()
+    max_mock_client_cm.__aenter__.return_value = max_mock_client
+    max_mock_client_cm.__aexit__.return_value = False
+
+    with patch("httpx.AsyncClient", return_value=max_mock_client_cm):
+        await max_ai._call_gemini(
+            api_key="test-key",
+            model="gemini-3.7-flash",
+            messages=None,
+            system_prompt="",
+            temperature=0.7,
+            request_layout=layout,
+        )
+
+    max_call_kwargs = max_mock_client.post.call_args.kwargs
+    max_payload = max_call_kwargs.get("json", {})
+    max_gen_config = max_payload.get("generationConfig", {})
+    assert "temperature" not in max_gen_config, "MAX temperature must be omitted for Gemini 3.7"
+    assert "top_p" not in max_gen_config, "MAX top_p must be omitted for Gemini 3.7"
+    assert "top_k" not in max_gen_config, "MAX top_k must be omitted for Gemini 3.7"
+    contents = max_payload["contents"]
+    assert contents[-1]["role"] == "user"
+    assert contents[-1]["parts"][0]["text"] == "Current question"

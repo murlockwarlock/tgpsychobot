@@ -35,6 +35,7 @@ from provider_models import (
     get_default_model,
     is_retired_model,
     normalize_deepseek_model,
+    should_omit_claude_sampling,
 )
 from ai_request_context import (
     AIRequestLayout,
@@ -202,7 +203,7 @@ async def _call_claude(
         "system": build_anthropic_system(layout),
         "messages": anthropic_messages,
     }
-    if target_model != "claude-sonnet-5":
+    if not should_omit_claude_sampling(target_model):
         payload["temperature"] = temperature
     response = await client.messages.create(**payload)
     return response.content[0].text
@@ -1200,7 +1201,7 @@ async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_p
         "system": build_anthropic_system(layout),
         "messages": claude_messages,
     }
-    if target_model != "claude-sonnet-5":
+    if not should_omit_claude_sampling(target_model):
         payload["temperature"] = temperature
     response = await client.messages.create(**payload)
     return response.content[0].text
@@ -1363,13 +1364,13 @@ async def generate_image(prompt: str) -> bytes:
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для генерации не задан")
-        model = getattr(config, "image_generation_model", None) or "imagen-4.0-generate-001"
+        model = getattr(config, "image_generation_model", None) or get_default_model(PROVIDER_GEMINI, channel="image_gen")
         return await _generate_gemini(api_key, model, prompt)
     if provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для генерации не задан")
-        model = getattr(config, "image_generation_model", None) or "google/imagen4-fast"
+        model = getattr(config, "image_generation_model", None) or get_default_model(PROVIDER_KIE, channel="image_gen")
         return await _generate_kie(api_key, _get_kie_base_url(config), model, prompt)
     # Default: OpenAI
     api_key = config.openai_api_key
@@ -1385,7 +1386,7 @@ async def generate_image(prompt: str) -> bytes:
 async def _edit_gemini(api_key: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
     import httpx
 
-    target_model = model or "gemini-3-pro-image-preview"
+    target_model = model or get_default_model(PROVIDER_GEMINI, channel="image_edit")
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_edit")
     b64_data = base64.b64encode(image_bytes).decode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
@@ -1426,12 +1427,12 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для редактирования не задан")
-        model = getattr(config, "image_edit_model", None) or "gemini-3-pro-image-preview"
+        model = getattr(config, "image_edit_model", None) or get_default_model(PROVIDER_GEMINI, channel="image_edit")
         return await _edit_gemini(api_key, model, prompt, image_bytes)
     if provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для редактирования не задан")
-        model = getattr(config, "image_edit_model", None) or "google/nano-banana-edit"
+        model = getattr(config, "image_edit_model", None) or get_default_model(PROVIDER_KIE, channel="image_edit")
         return await _edit_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, prompt, image_bytes)
     raise AIServiceError(f"Редактирование изображений не поддерживается для провайдера: {provider}")

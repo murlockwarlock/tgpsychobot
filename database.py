@@ -602,17 +602,40 @@ def _migrate_ai_config_models(sync_conn) -> None:
           AND fallback_model IN ('gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'gpt-4.1')
     """))
 
-    # 2. Migrate Claude chat and fallback models
+    # 2. Migrate Claude chat and fallback models (preserving model families)
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET claude_model = 'claude-opus-5'
+        WHERE claude_model = 'claude-opus-4-1-20250805'
+    """))
     sync_conn.execute(text("""
         UPDATE ai_config
         SET claude_model = 'claude-sonnet-5'
-        WHERE claude_model IN ('claude-opus-4-1-20250805', 'claude-3-haiku-20240307', 'claude-sonnet-4-5-20250929')
+        WHERE claude_model = 'claude-sonnet-4-5-20250929'
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET claude_model = 'claude-haiku-4-5-20251001'
+        WHERE claude_model = 'claude-3-haiku-20240307'
+    """))
+
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET fallback_model = 'claude-opus-5'
+        WHERE fallback_provider = 'Claude'
+          AND fallback_model = 'claude-opus-4-1-20250805'
     """))
     sync_conn.execute(text("""
         UPDATE ai_config
         SET fallback_model = 'claude-sonnet-5'
         WHERE fallback_provider = 'Claude'
-          AND fallback_model IN ('claude-opus-4-1-20250805', 'claude-3-haiku-20240307', 'claude-sonnet-4-5-20250929')
+          AND fallback_model = 'claude-sonnet-4-5-20250929'
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET fallback_model = 'claude-haiku-4-5-20251001'
+        WHERE fallback_provider = 'Claude'
+          AND fallback_model = 'claude-3-haiku-20240307'
     """))
 
     # 3. Migrate Gemini chat and fallback models
@@ -637,9 +660,21 @@ def _migrate_ai_config_models(sync_conn) -> None:
     """))
     sync_conn.execute(text("""
         UPDATE ai_config
+        SET vision_model = 'claude-opus-5'
+        WHERE vision_provider = 'Claude'
+          AND vision_model = 'claude-opus-4-1-20250805'
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
         SET vision_model = 'claude-sonnet-5'
         WHERE vision_provider = 'Claude'
-          AND vision_model IN ('claude-opus-4-1-20250805', 'claude-3-haiku-20240307', 'claude-sonnet-4-5-20250929')
+          AND vision_model = 'claude-sonnet-4-5-20250929'
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET vision_model = 'claude-haiku-4-5-20251001'
+        WHERE vision_provider = 'Claude'
+          AND vision_model = 'claude-3-haiku-20240307'
     """))
     sync_conn.execute(text("""
         UPDATE ai_config
