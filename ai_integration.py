@@ -10,6 +10,7 @@ import json
 import uuid
 import httpx
 import re
+from typing import Any, Iterable
 from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
@@ -45,6 +46,16 @@ from kie_chat import (
     is_kie_insufficient_balance,
 )
 from subscription_context import active_subscription_flag
+from ai_request_context import (
+    AIRequestLayout,
+    AIRequestMessage,
+    build_anthropic_system,
+    build_gemini_contents,
+    build_gemini_system_parts,
+    build_openai_chat_messages,
+    neutralize_stable_prompt,
+    normalize_request_messages,
+)
 
 class InsufficientBalanceError(Exception):
     pass
@@ -79,6 +90,79 @@ def _capture_ai_request(capture: dict | None, *, provider: str, endpoint: str, p
         "endpoint": endpoint,
         "payload": payload,
     })
+
+
+_MISSING_CURRENT_CONTENT = object()
+
+
+def _clean_request_history(history: Iterable[Any] | None) -> tuple[AIRequestMessage, ...]:
+    """Normalize history while preserving the existing service-data cleanup."""
+    cleaned: list[AIRequestMessage] = []
+    for message in normalize_request_messages(history):
+        content = message.content
+        if message.role == "assistant" and isinstance(content, str) and content:
+            content, _, _ = extract_service_data(content)
+        if content not in (None, "", []):
+            cleaned.append(AIRequestMessage(role=message.role, content=content))
+    return tuple(cleaned)
+
+
+def _legacy_request_layout(
+    *,
+    history: Iterable[Any] | None,
+    system_prompt: str | None,
+    context: str | None = "",
+    runtime_context: str | None = "",
+    current_user_content: Any = _MISSING_CURRENT_CONTENT,
+) -> AIRequestLayout:
+    """Adapt the pre-layout call signature without joining semantic blocks."""
+    cleaned_history = _clean_request_history(history)
+    current_content = current_user_content
+    if current_content is _MISSING_CURRENT_CONTENT:
+        if cleaned_history and cleaned_history[-1].role == "user":
+            current_content = cleaned_history[-1].content
+            cleaned_history = cleaned_history[:-1]
+        else:
+            current_content = None
+
+    request_blocks = ()
+    if context and context.strip():
+        request_blocks = (f"РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n{context.strip()}",)
+    return AIRequestLayout(
+        stable_system_prompt=neutralize_stable_prompt(system_prompt),
+        runtime_context=(runtime_context,) if runtime_context and runtime_context.strip() else (),
+        request_context=request_blocks,
+        history=cleaned_history,
+        current_user_content=current_content,
+    )
+
+
+def _coerce_request_layout(
+    request_layout: AIRequestLayout | None,
+    *,
+    history: Iterable[Any] | None,
+    system_prompt: str | None,
+    context: str | None = "",
+    runtime_context: str | None = "",
+    current_user_content: Any = _MISSING_CURRENT_CONTENT,
+) -> AIRequestLayout:
+    if request_layout is None:
+        return _legacy_request_layout(
+            history=history,
+            system_prompt=system_prompt,
+            context=context,
+            runtime_context=runtime_context,
+            current_user_content=current_user_content,
+        )
+    return AIRequestLayout(
+        stable_system_prompt=request_layout.stable_system_prompt,
+        shared_instructions=request_layout.shared_instructions,
+        runtime_context=request_layout.runtime_context,
+        scenario_context=request_layout.scenario_context,
+        request_context=request_layout.request_context,
+        history=_clean_request_history(request_layout.history),
+        current_user_content=request_layout.current_user_content,
+    )
 
 
 def _build_async_transport_from_env(env_var_name: str, use_proxy: bool = True):
@@ -466,6 +550,105 @@ def _build_memory_aware_history(
     return current_topic_history, global_memory_context
 
 
+async def _build_request_context_blocks(
+    session,
+    *,
+    user: User,
+    dialogue_id: int,
+    topic_id: int | None,
+    subscription_config: SubscriptionConfig | None = None,
+    load_subscription_config: bool = True,
+    include_subscription_status: bool = True,
+    test_context: str = "",
+    short_response_instruction: str = "",
+    knowledge_context: str = "",
+    global_memory_context: str = "",
+    scenario_context: str | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Build the dynamic, scenario, and request-specific semantic blocks."""
+    user_name = user.name or user.first_name or "Не указано"
+    user_gender = user.gender or "Не указан"
+    client_lines = ["ДАННЫЕ КЛИЕНТА:", f"ИМЯ: {user_name}", f"ПОЛ: {user_gender}"]
+    if user.age:
+        client_lines.append(f"ВОЗРАСТ: {user.age}")
+    if subscription_config is None and load_subscription_config:
+        subscription_config = await session.get(SubscriptionConfig, 1)
+    if include_subscription_status:
+        subscription_flag = active_subscription_flag(subscription_config, user.subscription)
+        if subscription_flag:
+            client_lines.append(subscription_flag)
+
+    if scenario_context is None:
+        scenario_context = await build_runtime_automation_context(
+            session,
+            user_id=user.id,
+            dialogue_id=dialogue_id,
+            topic_id=topic_id,
+        )
+
+    runtime_parts = ["\n".join(client_lines)]
+    if short_response_instruction and short_response_instruction.strip():
+        runtime_parts.append(short_response_instruction.strip())
+
+    request_parts = []
+    if test_context and test_context.strip():
+        request_parts.append(test_context.strip())
+    if knowledge_context and knowledge_context.strip():
+        request_parts.append("РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n" + knowledge_context.strip())
+    if global_memory_context and global_memory_context.strip():
+        request_parts.append(global_memory_context.strip())
+
+    scenario_parts = ()
+    if scenario_context and scenario_context.strip():
+        scenario_parts = (scenario_context.strip(),)
+    return tuple(runtime_parts), scenario_parts, tuple(request_parts)
+
+
+async def build_ai_request_layout(
+    session,
+    *,
+    user: User,
+    dialogue_id: int,
+    topic_id: int | None,
+    stable_system_prompt: str,
+    shared_instructions: Iterable[str] = (),
+    history: Iterable[Any] | None = None,
+    current_user_content: Any = None,
+    subscription_config: SubscriptionConfig | None = None,
+    load_subscription_config: bool = True,
+    include_subscription_status: bool = True,
+    test_context: str = "",
+    short_response_instruction: str = "",
+    knowledge_context: str = "",
+    global_memory_context: str = "",
+    scenario_context: str | None = None,
+) -> AIRequestLayout:
+    """Build the canonical request layout for a conversational request."""
+    runtime_parts, scenario_parts, request_parts = await _build_request_context_blocks(
+        session,
+        user=user,
+        dialogue_id=dialogue_id,
+        topic_id=topic_id,
+        subscription_config=subscription_config,
+        load_subscription_config=load_subscription_config,
+        include_subscription_status=include_subscription_status,
+        test_context=test_context,
+        short_response_instruction=short_response_instruction,
+        knowledge_context=knowledge_context,
+        global_memory_context=global_memory_context,
+        scenario_context=scenario_context,
+    )
+    return AIRequestLayout(
+        stable_system_prompt=neutralize_stable_prompt(stable_system_prompt),
+        shared_instructions=tuple(shared_instructions),
+        runtime_context=runtime_parts,
+        scenario_context=scenario_parts,
+        request_context=request_parts,
+        history=_clean_request_history(history),
+        current_user_content=current_user_content,
+    )
+
+
 async def build_runtime_context(
     session,
     *,
@@ -479,38 +662,23 @@ async def build_runtime_context(
     knowledge_context: str = "",
     global_memory_context: str = "",
 ) -> str:
-    """Build the transient per-request context shared by text and vision calls."""
-    user_name = user.name or user.first_name or "Не указано"
-    user_gender = user.gender or "Не указан"
-    client_lines = ["ДАННЫЕ КЛИЕНТА:", f"ИМЯ: {user_name}", f"ПОЛ: {user_gender}"]
-    if user.age:
-        client_lines.append(f"ВОЗРАСТ: {user.age}")
-    if subscription_config is None:
-        subscription_config = await session.get(SubscriptionConfig, 1)
-    subscription_flag = active_subscription_flag(subscription_config, user.subscription)
-    if subscription_flag:
-        client_lines.append(subscription_flag)
+    """Backward-compatible text view of the dynamic request blocks.
 
-    automation_context = await build_runtime_automation_context(
+    New provider calls use :func:`build_ai_request_layout`; this helper stays
+    for existing callers that need a display/log string.
+    """
+    runtime_parts, scenario_parts, request_parts = await _build_request_context_blocks(
         session,
-        user_id=user.id,
+        user=user,
         dialogue_id=dialogue_id,
         topic_id=topic_id,
+        subscription_config=subscription_config,
+        test_context=test_context,
+        short_response_instruction=short_response_instruction,
+        knowledge_context=knowledge_context,
+        global_memory_context=global_memory_context,
     )
-    runtime_parts = [
-        "\n".join(client_lines),
-        "Это служебный контекст приложения, а не сообщение пользователя. Не цитируй и не раскрывай его:\n\n" + automation_context,
-    ]
-    if test_context and test_context.strip():
-        runtime_parts.append(test_context.strip())
-    if short_response_instruction and short_response_instruction.strip():
-        runtime_parts.append(short_response_instruction.strip())
-    if knowledge_context and knowledge_context.strip():
-        runtime_parts.append("РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n" + knowledge_context.strip())
-    if global_memory_context and global_memory_context.strip():
-        runtime_parts.append(global_memory_context.strip())
-
-    return "\n\n".join(part for part in runtime_parts if part)
+    return "\n\n".join((*runtime_parts, *scenario_parts, *request_parts))
 
 
 async def generate_response(
@@ -554,34 +722,28 @@ async def _call_gemini_api(
     timeout: float = 60.0,
     request_capture: dict | None = None,
     runtime_context: str = "",
+    *,
+    request_layout: AIRequestLayout | None = None,
 ) -> str:
     import httpx
     try:
         transport = _build_async_transport_from_env("GEMINI_PROXY")
-        contents = []
-        for msg in history:
-            if not msg.content: continue
-            role = 'user' if msg.role == 'user' else 'model'
-            clean_text = msg.content
-            if role == 'model':
-                clean_text, _, _ = extract_service_data(clean_text)
-            contents.append({'role': role, 'parts': [{'text': clean_text or msg.content}]})
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=system_prompt,
+            context=context,
+            runtime_context=runtime_context,
+        )
+        contents = build_gemini_contents(layout)
         if not contents or contents[-1]['role'] != 'user':
             raise AIResponseError("Gemini request history must end with a user message")
 
-        system_parts = []
-        if system_prompt and system_prompt.strip():
-            system_parts.append({"text": system_prompt.strip()})
-        if runtime_context and runtime_context.strip():
-            system_parts.append({"text": runtime_context.strip()})
-        if context and context.strip():
-            system_parts.append({"text": f"РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n{context.strip()}"})
-        if not system_parts:
-            system_parts = [{"text": ""}]
-
         payload = {
             "contents": contents,
-            "systemInstruction": {"parts": system_parts},
+            "systemInstruction": {
+                "parts": build_gemini_system_parts(layout) or [{"text": ""}],
+            },
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": 4096,
@@ -623,32 +785,24 @@ async def _call_kie_chat(
     temperature: float = 0.7,
     request_capture: dict | None = None,
     runtime_context: str = "",
+    *,
+    request_layout: AIRequestLayout | None = None,
 ) -> str:
     try:
-        kie_history = []
-        for msg in history:
-            if msg.content:
-                clean_content = msg.content
-                if msg.role == "assistant":
-                    clean_content, _, _ = extract_service_data(clean_content)
-                kie_history.append({"role": msg.role, "content": clean_content or msg.content})
-
-        system_parts = []
-        if system_prompt and system_prompt.strip():
-            system_parts.append(system_prompt.strip())
-        if runtime_context and runtime_context.strip():
-            system_parts.append(runtime_context.strip())
-        if context and context.strip():
-            system_parts.append(f"РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n{context.strip()}")
-        full_system_prompt = "\n\n".join(system_parts)
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=system_prompt,
+            context=context,
+            runtime_context=runtime_context,
+        )
 
         request = build_kie_chat_request(
             api_key,
             base_url,
             model,
-            kie_history,
-            full_system_prompt,
-            temperature,
+            request_layout=layout,
+            temperature=temperature,
         )
         _capture_ai_request(
             request_capture,
@@ -731,20 +885,28 @@ async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: by
         raise AIServiceError(f"Ошибка загрузки файла в KIE: {exception_summary(e)}")
 
 
-async def _call_kie_multimodal(api_key: str, base_url: str, model: str, system_prompt: str, user_content: list, temperature: float = 0.7, history: list | None = None, request_capture: dict | None = None) -> str:
+async def _call_kie_multimodal(
+    api_key: str,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    user_content: list,
+    temperature: float = 0.7,
+    history: list | None = None,
+    request_capture: dict | None = None,
+    *,
+    request_layout: AIRequestLayout | None = None,
+) -> str:
     try:
-        history_messages = [
-            {"role": msg.role, "content": msg.content}
-            for msg in (history or [])
-            if getattr(msg, "content", None)
-        ]
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=system_prompt,
+            current_user_content=user_content,
+        ).with_current_user_content(user_content)
         payload = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                *history_messages,
-                {"role": "user", "content": user_content},
-            ],
+            "messages": build_openai_chat_messages(layout),
             "max_tokens": 4096,
             "temperature": temperature,
             "stream": False,
@@ -924,31 +1086,31 @@ async def _call_claude_api(
     timeout: float = 60.0,
     request_capture: dict | None = None,
     runtime_context: str = "",
+    *,
+    request_layout: AIRequestLayout | None = None,
 ):
     try:
         client = anthropic.AsyncAnthropic(api_key=api_key)
 
-        claude_history = []
-        for msg in history:
-            clean_content = msg.content
-            if getattr(msg, 'role', None) == 'assistant' and clean_content:
-                clean_content, _, _ = extract_service_data(clean_content)
-            claude_history.append({'role': msg.role, 'content': clean_content or msg.content})
-
-        system_parts = []
-        if system_prompt and system_prompt.strip():
-            system_parts.append(system_prompt.strip())
-        if runtime_context and runtime_context.strip():
-            system_parts.append(runtime_context.strip())
-        if context and context.strip():
-            system_parts.append(f"РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n{context.strip()}")
-        full_system_prompt = "\n\n".join(system_parts)
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=system_prompt,
+            context=context,
+            runtime_context=runtime_context,
+        )
+        claude_history = [
+            {"role": message.role, "content": message.content}
+            for message in layout.history
+        ]
+        if layout.current_user_content is not None:
+            claude_history.append({"role": "user", "content": layout.current_user_content})
 
         payload = {
             "model": model,
             "max_tokens": 4096,
             "temperature": temperature,
-            "system": full_system_prompt,
+            "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
         _capture_ai_request(
@@ -980,37 +1142,42 @@ async def _call_claude_vision(
     temperature: float = 0.7,
     request_context: str = "",
     request_capture: dict | None = None,
+    *,
+    request_layout: AIRequestLayout | None = None,
 ) -> str:
     try:
         client = anthropic.AsyncAnthropic(api_key=api_key)
-        claude_history = [
-            {"role": msg.role, "content": msg.content}
-            for msg in (history or [])
-            if getattr(msg, "content", None)
-        ]
         user_instruction = "Проанализируй это изображение согласно системной инструкции."
-        full_system_prompt = f"{prompt}\n\n{request_context}" if request_context else prompt
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=prompt,
+            runtime_context=request_context,
+            current_user_content=None,
+        )
+        vision_content = [
+            {"type": "text", "text": user_instruction},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": _guess_image_media_type(image_bytes),
+                    "data": base64.b64encode(image_bytes).decode("utf-8"),
+                },
+            },
+        ]
+        layout = layout.with_current_user_content(vision_content)
+        claude_history = [
+            {"role": message.role, "content": message.content}
+            for message in layout.history
+        ]
+        claude_history.append({"role": "user", "content": vision_content})
         payload = {
             "model": model,
             "max_tokens": 4096,
             "temperature": temperature,
-            "system": full_system_prompt,
-            "messages": [*claude_history,
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_instruction},
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": _guess_image_media_type(image_bytes),
-                                "data": base64.b64encode(image_bytes).decode("utf-8"),
-                            },
-                        },
-                    ],
-                }
-            ],
+            "system": build_anthropic_system(layout),
+            "messages": claude_history,
         }
         _capture_ai_request(request_capture, provider="Claude", endpoint="https://api.anthropic.com/v1/messages", payload=payload)
         message = await client.messages.create(**payload)
@@ -1044,6 +1211,8 @@ async def _call_deepseek_api(
     timeout: float = 60.0,
     request_capture: dict | None = None,
     runtime_context: str = "",
+    *,
+    request_layout: AIRequestLayout | None = None,
 ):
     client = None
     try:
@@ -1059,25 +1228,17 @@ async def _call_deepseek_api(
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
 
-        deepseek_history = []
-        for msg in history:
-            clean_content = msg.content
-            if getattr(msg, 'role', None) == 'assistant' and clean_content:
-                clean_content, _, _ = extract_service_data(clean_content)
-            deepseek_history.append({'role': msg.role, 'content': clean_content or msg.content})
-
-        messages_with_system = []
-        if system_prompt and system_prompt.strip():
-            messages_with_system.append({"role": "system", "content": system_prompt.strip()})
-        if runtime_context and runtime_context.strip():
-            messages_with_system.append({"role": "system", "content": runtime_context.strip()})
-        if context and context.strip():
-            messages_with_system.append({"role": "system", "content": f"РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n{context.strip()}"})
-        messages_with_system.extend(deepseek_history)
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=system_prompt,
+            context=context,
+            runtime_context=runtime_context,
+        )
 
         payload = {
             "model": normalize_deepseek_model(model),
-            "messages": messages_with_system,
+            "messages": build_openai_chat_messages(layout),
             "max_tokens": 4096,
             "temperature": temperature,
         }
@@ -1207,29 +1368,23 @@ async def _call_openai_api(
     timeout: float = 60.0,
     request_capture: dict | None = None,
     runtime_context: str = "",
+    *,
+    request_layout: AIRequestLayout | None = None,
 ):
     try:
         client = AsyncOpenAI(api_key=api_key, timeout=timeout)
 
-        openai_history = []
-        for msg in history:
-            clean_content = msg.content
-            if getattr(msg, 'role', None) == 'assistant' and clean_content:
-                clean_content, _, _ = extract_service_data(clean_content)
-            openai_history.append({'role': msg.role, 'content': clean_content or msg.content})
-
-        messages_with_system = []
-        if system_prompt and system_prompt.strip():
-            messages_with_system.append({"role": "system", "content": system_prompt.strip()})
-        if runtime_context and runtime_context.strip():
-            messages_with_system.append({"role": "system", "content": runtime_context.strip()})
-        if context and context.strip():
-            messages_with_system.append({"role": "system", "content": f"РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n{context.strip()}"})
-        messages_with_system.extend(openai_history)
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=system_prompt,
+            context=context,
+            runtime_context=runtime_context,
+        )
 
         payload = {
             "model": model,
-            "messages": messages_with_system,
+            "messages": build_openai_chat_messages(layout),
             "max_tokens": 4096,
             "temperature": temperature,
         }
@@ -1414,16 +1569,8 @@ async def get_ai_response(
 
         subscription_config = await session.get(SubscriptionConfig, 1)
 
-        # Keep the system-prefix stable for provider prompt caches. Per-user values are
-        # passed in a separate transient runtime message below.
-        formatted_body = system_prompt_text
-        for placeholder, replacement in {
-            "{user_name}": "[имя передано в служебном контексте]",
-            "{user_gender}": "[пол передан в служебном контексте]",
-            "{test_results}": "[результаты теста переданы в служебном контексте]",
-            "{secret_answers}": "[ответы секретного теста переданы в служебном контексте]",
-        }.items():
-            formatted_body = formatted_body.replace(placeholder, replacement)
+        # Only configured/topic prompt text belongs in the stable cache prefix.
+        formatted_body = neutralize_stable_prompt(system_prompt_text)
 
         shared_prompt_block = (getattr(ai_config, 'shared_prompt_block', "") or "").strip()
         short_response_instruction = ""
@@ -1483,12 +1630,9 @@ async def get_ai_response(
             test_context_injection="",
             short_response_instruction="",
         )
-        prompt_parts = [formatted_body.strip()]
-        if shared_prompt_block:
-            prompt_parts.append(shared_prompt_block)
-        if service_prompt_block:
-            prompt_parts.append(service_prompt_block)
-        system_prompt = "\n\n".join(part for part in prompt_parts if part)
+        shared_instructions = tuple(
+            part for part in (shared_prompt_block, service_prompt_block) if part
+        )
 
         final_history, global_memory_context = _build_memory_aware_history(
             selected_messages,
@@ -1496,25 +1640,24 @@ async def get_ai_response(
             active_topic.name if active_topic else None,
             memory_mode,
         )
-        runtime_context = await build_runtime_context(
+        if final_history and final_history[-1].role == "user" and final_history[-1].content == user_prompt:
+            final_history.pop()
+
+        request_layout = await build_ai_request_layout(
             session,
             user=user,
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
+            stable_system_prompt=formatted_body,
+            shared_instructions=shared_instructions,
+            history=final_history,
+            current_user_content=user_prompt,
             subscription_config=subscription_config,
             test_context=test_context_injection,
-            available_media_text="",
             short_response_instruction=short_response_instruction,
             knowledge_context=context,
             global_memory_context=global_memory_context,
         )
-
-        if final_history and final_history[-1].role == "user" and final_history[-1].content == user_prompt:
-            final_history.pop()
-        final_history.append(DBMessage(
-            role='user',
-            content=user_prompt,
-        ))
 
         request_capture: dict = {}
 
@@ -1522,17 +1665,17 @@ async def get_ai_response(
             use_proxy = getattr(ai_config, 'use_proxy', True)
             timeout = float(getattr(ai_config, "fallback_timeout", 60))
             if p_key == 'openai':
-                response_text = await _call_openai_api(p_api_key, p_model, final_history, "", system_prompt, temperature, timeout=timeout, request_capture=request_capture, runtime_context=runtime_context)
+                response_text = await _call_openai_api(p_api_key, p_model, final_history, "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
             elif p_key in ['anthropic', 'claude']:
-                response_text = await _call_claude_api(p_api_key, p_model, final_history, "", system_prompt, temperature, timeout=timeout, request_capture=request_capture, runtime_context=runtime_context)
+                response_text = await _call_claude_api(p_api_key, p_model, final_history, "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
             elif p_key == 'gemini':
-                response_text = await _call_gemini_api(p_api_key, p_model, final_history, "", system_prompt, temperature, timeout=timeout, request_capture=request_capture, runtime_context=runtime_context)
+                response_text = await _call_gemini_api(p_api_key, p_model, final_history, "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
             elif p_key == 'kie':
-                response_text = await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, "", system_prompt, temperature, request_capture=request_capture, runtime_context=runtime_context)
+                response_text = await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, final_history, "", formatted_body, temperature, request_capture=request_capture, request_layout=request_layout)
             elif p_key == 'deepseek':
-                response_text = await _call_deepseek_api(p_api_key, p_model, final_history, "", system_prompt, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture, runtime_context=runtime_context)
+                response_text = await _call_deepseek_api(p_api_key, p_model, final_history, "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
             elif p_key == 'xai':
-                response_text = await _call_openai_api(p_api_key, p_model, final_history, "", system_prompt, temperature, timeout=timeout, request_capture=request_capture, runtime_context=runtime_context)
+                response_text = await _call_openai_api(p_api_key, p_model, final_history, "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
             else:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
             return _validate_text_response(response_text, provider=p_key)
@@ -2107,6 +2250,7 @@ async def analyze_image_content(
     *,
     request_context: str = "",
     request_capture: dict | None = None,
+    request_layout: AIRequestLayout | None = None,
 ) -> str:
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
@@ -2125,6 +2269,7 @@ async def analyze_image_content(
             return await _call_gemini_vision(
                 api_key, v_model, image_bytes, prompt, history=history, temperature=temperature,
                 request_context=request_context, request_capture=request_capture,
+                request_layout=request_layout,
             )
         if provider == "Claude":
             api_key = config.claude_api_key
@@ -2139,6 +2284,7 @@ async def analyze_image_content(
                 temperature=temperature,
                 request_context=request_context,
                 request_capture=request_capture,
+                request_layout=request_layout,
             )
         if provider == "KIE":
             api_key = getattr(config, "kie_api_key", None)
@@ -2167,6 +2313,7 @@ async def analyze_image_content(
                         temperature=temperature,
                         request_context=request_context,
                         request_capture=request_capture,
+                        request_layout=request_layout,
                     )
                 except AIServiceError as exc:
                     last_exc = exc
@@ -2199,27 +2346,24 @@ async def analyze_image_content(
             f"{formatting_rules}"
         )
 
-        full_system_prompt = f"{prompt}\n\n{request_context}" if request_context else prompt
-        messages = [{"role": "system", "content": full_system_prompt}]
-        if history:
-            for msg in history:
-                messages.append({"role": msg.role, "content": msg.content})
-
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": vision_instructions},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}", "detail": "high"}}
-            ]
-        })
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=prompt,
+            runtime_context=request_context,
+            current_user_content=None,
+        ).with_current_user_content([
+            {"type": "text", "text": vision_instructions},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}", "detail": "high"}},
+        ])
 
         base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
 
         try:
             payload = {
                 "model": v_model,
-                "messages": messages,
+                "messages": build_openai_chat_messages(layout),
                 "max_tokens": 4096,
                 "temperature": temperature,
             }
@@ -2231,7 +2375,18 @@ async def analyze_image_content(
             raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {e}")
 
 
-async def _call_gemini_vision(api_key: str, model: str, image_bytes: bytes, prompt: str, history: list = None, temperature: float = 0.7, request_context: str = "", request_capture: dict | None = None) -> str:
+async def _call_gemini_vision(
+    api_key: str,
+    model: str,
+    image_bytes: bytes,
+    prompt: str,
+    history: list = None,
+    temperature: float = 0.7,
+    request_context: str = "",
+    request_capture: dict | None = None,
+    *,
+    request_layout: AIRequestLayout | None = None,
+) -> str:
     import httpx
     import base64
     import asyncio
@@ -2251,26 +2406,23 @@ async def _call_gemini_vision(api_key: str, model: str, image_bytes: bytes, prom
             target_model = model if model else "gemini-1.5-flash"
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
 
-            contents = []
-            if history:
-                for msg in history:
-                    if not msg.content: continue
-                    role = 'user' if msg.role == 'user' else 'model'
-                    contents.append({'role': role, 'parts': [{'text': msg.content}]})
-
             user_instruction = "Проанализируй это изображение согласно системной инструкции выше."
-            full_system_prompt = f"{prompt}\n\n{request_context}" if request_context else prompt
-            contents.append({
-                "role": "user",
-                "parts": [
-                    {"text": user_instruction},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}
-                ]
-            })
+            layout = _coerce_request_layout(
+                request_layout,
+                history=history,
+                system_prompt=prompt,
+                runtime_context=request_context,
+                current_user_content=None,
+            ).with_current_user_content([
+                {"text": user_instruction},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
+            ])
 
             payload = {
-                "contents": contents,
-                "systemInstruction": {"parts": [{"text": full_system_prompt}]},
+                "contents": build_gemini_contents(layout),
+                "systemInstruction": {
+                    "parts": build_gemini_system_parts(layout) or [{"text": ""}],
+                },
                 "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096}
             }
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
@@ -2321,6 +2473,8 @@ async def _call_kie_vision(
     temperature: float = 0.7,
     request_context: str = "",
     request_capture: dict | None = None,
+    *,
+    request_layout: AIRequestLayout | None = None,
 ) -> str:
     try:
         file_url = await _upload_file_to_kie(
@@ -2332,12 +2486,18 @@ async def _call_kie_vision(
         )
 
         user_instruction = "Проанализируй это изображение согласно системной инструкции."
-        full_system_prompt = f"{prompt}\n\n{request_context}" if request_context else prompt
+        layout = _coerce_request_layout(
+            request_layout,
+            history=history,
+            system_prompt=prompt,
+            runtime_context=request_context,
+            current_user_content=None,
+        )
         return await _call_kie_multimodal(
             api_key,
             base_url,
             model,
-            full_system_prompt,
+            prompt,
             [
                 {"type": "text", "text": user_instruction},
                 {"type": "image_url", "image_url": {"url": file_url}},
@@ -2345,6 +2505,7 @@ async def _call_kie_vision(
             temperature=temperature,
             history=history,
             request_capture=request_capture,
+            request_layout=layout,
         )
     except (InsufficientBalanceError, AIServiceError):
         raise

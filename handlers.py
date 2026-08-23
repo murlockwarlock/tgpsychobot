@@ -13628,16 +13628,39 @@ async def get_ai_response_direct(
             role='user',
             content=user_prompt,
         )]
-        full_system_prompt = f"{system_prompt}\n\n{runtime_context}"
+        request_layout = await ai_integration.build_ai_request_layout(
+            session,
+            user=user,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
+            stable_system_prompt=system_prompt,
+            history=(),
+            current_user_content=user_prompt,
+            scenario_context=runtime_context,
+            load_subscription_config=False,
+            include_subscription_status=False,
+        )
 
         if provider_key == 'gemini':
-            response_text = await _call_gemini_api(api_key, model, fake_history, "", full_system_prompt)
+            response_text = await _call_gemini_api(
+                api_key, model, fake_history, "", system_prompt,
+                request_layout=request_layout,
+            )
         elif provider_key == 'openai':
-            response_text = await _call_openai_api(api_key, model, fake_history, "", full_system_prompt)
+            response_text = await _call_openai_api(
+                api_key, model, fake_history, "", system_prompt,
+                request_layout=request_layout,
+            )
         elif provider_key in ['anthropic', 'claude']:
-            response_text = await _call_claude_api(api_key, model, fake_history, "", full_system_prompt)
+            response_text = await _call_claude_api(
+                api_key, model, fake_history, "", system_prompt,
+                request_layout=request_layout,
+            )
         elif provider_key == 'deepseek':
-            response_text = await _call_deepseek_api(api_key, model, fake_history, "", full_system_prompt)
+            response_text = await _call_deepseek_api(
+                api_key, model, fake_history, "", system_prompt,
+                request_layout=request_layout,
+            )
         elif provider_key == 'kie':
             response_text = await _call_kie_chat(
                 api_key,
@@ -13645,7 +13668,8 @@ async def get_ai_response_direct(
                 model,
                 fake_history,
                 "",
-                full_system_prompt,
+                system_prompt,
+                request_layout=request_layout,
             )
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
@@ -15312,24 +15336,18 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 test_context_injection="[контекст теста передан в служебном контексте]",
                 short_response_instruction="[режим длины передан в служебном контексте]",
             )
-            base_prompt_parts = [
-                part for part in [
-                    system_prompt_text.strip(),
-                    shared_prompt_block,
-                    service_prompt_block,
-                ] if part
-            ]
-            base_prompt_text = "\n\n".join(base_prompt_parts)
+            stable_vision_prompt = ai_integration.neutralize_stable_prompt(system_prompt_text)
+            if not stable_vision_prompt:
+                stable_vision_prompt = "Ты — профессиональный эксперт. Проанализируй это изображение максимально подробно."
 
-            if not base_prompt_text:
-                base_prompt_text = "Ты — профессиональный эксперт. Проанализируй это изображение максимально подробно."
-
-            system_prompt = (
-                f"{base_prompt_text}\n\n"
+            photo_instructions = (
                 "ИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"
                 "1. Если пользователь просит ИЗМЕНИТЬ это фото или 'сделать так же', добавь в конце: EDIT_IMG: <prompt on english>.\n"
                 "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"
                 "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
+            )
+            vision_shared_instructions = tuple(
+                part for part in (shared_prompt_block, service_prompt_block, photo_instructions) if part
             )
 
             memory_mode = get_memory_mode(ai_config)
@@ -15353,11 +15371,15 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 user.current_topic.name if user.current_topic else None,
                 memory_mode,
             )
-            request_context = await ai_integration.build_runtime_context(
+            request_layout = await ai_integration.build_ai_request_layout(
                 session,
                 user=user,
                 dialogue_id=user.current_dialogue_id,
                 topic_id=current_topic_id,
+                stable_system_prompt=stable_vision_prompt,
+                shared_instructions=vision_shared_instructions,
+                history=history,
+                current_user_content=None,
                 subscription_config=sub_config,
                 global_memory_context=global_memory_context,
             )
@@ -15371,10 +15393,10 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             started_at = time.monotonic()
             analysis_result = await ai_integration.analyze_image_content(
                 image_bytes,
-                system_prompt,
+                stable_vision_prompt,
                 history=history,
-                request_context=request_context,
                 request_capture=request_capture,
+                request_layout=request_layout,
             )
             latency_ms = int((time.monotonic() - started_at) * 1000)
 

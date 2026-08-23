@@ -11,6 +11,7 @@ os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from kie_chat import build_kie_chat_request
+from ai_request_context import AIRequestLayout, AIRequestMessage
 from provider_models import (
     KIE_CHAT_MODELS,
     KIE_CHAT_PROTOCOL_ANTHROPIC,
@@ -27,6 +28,7 @@ NEW_KIE_CHAT_MODELS = (
     "gemini-3-7-flash",
     "gpt-5-6-luna",
 )
+KIE_CANONICAL_LAYOUT_MODELS = NEW_KIE_CHAT_MODELS + ("gemini-3-flash",)
 KIE_API_KEY = "kie-test-secret"
 HISTORY = [
     SimpleNamespace(role="user", content="предыдущий вопрос"),
@@ -119,7 +121,7 @@ def test_claude_messages_request_shape_and_headers():
     assert request.endpoint == "https://api.example/claude/v1/messages"
     assert request.payload == {
         "model": "claude-haiku-4-5",
-        "system": "SYSTEM",
+        "system": [{"type": "text", "text": "SYSTEM"}],
         "messages": [
             {"role": "user", "content": "предыдущий вопрос"},
             {"role": "assistant", "content": "предыдущий ответ"},
@@ -199,6 +201,8 @@ class _HttpClient:
 
 
 def _provider_response(model_id):
+    if model_id == "gemini-3-flash":
+        return _Response({"choices": [{"message": {"content": "OpenAI-compatible answer"}}]})
     if model_id == "claude-haiku-4-5":
         return _Response({"content": [{"type": "text", "text": "Claude answer"}]})
     if model_id == "grok-4-3":
@@ -225,6 +229,102 @@ def _provider_response(model_id):
             "content": [{"type": "output_text", "text": "Luna answer"}],
         }],
     })
+
+
+def _canonical_kie_layout():
+    return AIRequestLayout(
+        stable_system_prompt="STABLE CONFIGURED TOPIC PROMPT",
+        shared_instructions=("SHARED TOPIC INSTRUCTIONS",),
+        runtime_context=("ДАННЫЕ КЛИЕНТА: ИМЯ: Ясна",),
+        scenario_context=('current_state=photo metadata=kie-meta',),
+        request_context=("TEST RESULTS", "KB RAG RESULTS", "GLOBAL MEMORY"),
+        history=(
+            AIRequestMessage("user", "предыдущий вопрос"),
+            AIRequestMessage("assistant", "предыдущий ответ"),
+        ),
+        current_user_content="текущий вопрос",
+    )
+
+
+def _assert_kie_layout_payload(payload, protocol):
+    stable = "STABLE CONFIGURED TOPIC PROMPT"
+    if protocol == "openai_chat":
+        blocks = [item["content"] for item in payload["messages"] if item["role"] == "system"]
+        history = payload["messages"][-3:-1]
+        current = payload["messages"][-1]
+    elif protocol == "anthropic_messages":
+        blocks = [item["text"] for item in payload["system"]]
+        history = payload["messages"][-3:-1]
+        current = payload["messages"][-1]
+    elif protocol == "responses":
+        assert payload["instructions"] == stable
+        blocks = [
+            item["content"][0]["text"]
+            for item in payload["input"]
+            if item.get("role") == "developer"
+        ]
+        history = payload["input"][-3:-1]
+        current = payload["input"][-1]
+    else:
+        blocks = [item["text"] for item in payload["systemInstruction"]["parts"]]
+        history = payload["contents"][-3:-1]
+        current = payload["contents"][-1]
+
+    if protocol == "responses":
+        assert "Ясна" not in payload["instructions"]
+        assert "photo" not in payload["instructions"]
+        assert "kie-meta" not in payload["instructions"]
+    else:
+        assert blocks[0] == stable
+        assert "Ясна" not in blocks[0]
+        assert "photo" not in blocks[0]
+        assert "kie-meta" not in blocks[0]
+    dynamic_index = next(i for i, block in enumerate(blocks) if "Ясна" in block)
+    assert "photo" in blocks[dynamic_index]
+    assert "kie-meta" in blocks[dynamic_index]
+    shared_index = next(i for i, block in enumerate(blocks) if "SHARED TOPIC INSTRUCTIONS" in block)
+    if protocol == "responses":
+        assert shared_index < dynamic_index
+    else:
+        assert blocks[0] == stable
+        assert 0 < shared_index < dynamic_index
+    request_indices = [
+        i for i, block in enumerate(blocks)
+        if any(value in block for value in ("TEST RESULTS", "KB RAG RESULTS", "GLOBAL MEMORY"))
+    ]
+    assert request_indices
+    assert min(request_indices) > dynamic_index
+    assert all(value in "\n".join(blocks) for value in ("TEST RESULTS", "KB RAG RESULTS", "GLOBAL MEMORY"))
+    assert "предыдущий вопрос" in json.dumps(history[0], ensure_ascii=False)
+    assert "предыдущий ответ" in json.dumps(history[1], ensure_ascii=False)
+    assert "текущий вопрос" in json.dumps(current, ensure_ascii=False)
+    assert current["role"] == "user"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", KIE_CANONICAL_LAYOUT_MODELS)
+async def test_kie_final_payload_preserves_canonical_layout(monkeypatch, model_id):
+    import ai_integration
+
+    client = _HttpClient(_provider_response(model_id))
+    capture = {}
+    layout = _canonical_kie_layout()
+    with patch.object(ai_integration.httpx, "AsyncClient", return_value=client):
+        result = await ai_integration._call_kie_chat(
+            KIE_API_KEY,
+            "https://api.example",
+            model_id,
+            [],
+            "",
+            "LEGACY SYSTEM MUST NOT BE USED",
+            temperature=0.25,
+            request_capture=capture,
+            request_layout=layout,
+        )
+
+    assert result
+    assert client.calls[0]["kwargs"]["json"] == capture["payload"]
+    _assert_kie_layout_payload(capture["payload"], get_kie_chat_model_spec(model_id).protocol)
 
 
 @pytest.mark.asyncio

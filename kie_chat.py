@@ -4,6 +4,15 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterator
 
+from ai_request_context import (
+    AIRequestLayout,
+    build_anthropic_system,
+    build_gemini_contents,
+    build_gemini_system_parts,
+    build_openai_chat_messages,
+    build_responses_input,
+    normalize_request_messages,
+)
 from provider_models import (
     KIE_CHAT_PROTOCOL_ANTHROPIC,
     KIE_CHAT_PROTOCOL_GEMINI,
@@ -67,46 +76,46 @@ def _text_messages(history: list[Any]) -> list[dict[str, str]]:
     return messages
 
 
-def _responses_input(history: list[Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "role": message["role"],
-            "content": [{"type": "input_text", "text": message["content"]}],
-        }
-        for message in _text_messages(history)
-    ]
-
-
-def _gemini_contents(history: list[Any]) -> list[dict[str, Any]]:
-    contents = []
-    for message in _text_messages(history):
-        contents.append({
-            "role": "model" if message["role"] == "assistant" else "user",
-            "parts": [{"text": message["content"]}],
-        })
-    return contents
-
-
 def build_kie_chat_request(
     api_key: str,
     base_url: str,
     model: str,
-    history: list[Any],
-    system_prompt: str,
+    history: list[Any] | AIRequestLayout | None = None,
+    system_prompt: str | AIRequestLayout | None = None,
     temperature: float = 0.7,
+    *,
+    request_layout: AIRequestLayout | None = None,
 ) -> BuiltKIEChatRequest:
+    """Build a KIE request from the canonical semantic layout.
+
+    ``history``/``system_prompt`` remain accepted for compatibility with
+    older callers, but new code should pass ``request_layout``.  In
+    particular, the adapter never needs a pre-concatenated full system
+    prompt.
+    """
+    if request_layout is None:
+        if isinstance(history, AIRequestLayout):
+            request_layout = history
+        elif isinstance(system_prompt, AIRequestLayout):
+            request_layout = system_prompt
+        else:
+            request_layout = AIRequestLayout(
+                stable_system_prompt=system_prompt or "",
+                history=normalize_request_messages(history),
+            )
+    if not isinstance(request_layout, AIRequestLayout):  # pragma: no cover - defensive API guard
+        raise TypeError("request_layout must be an AIRequestLayout")
+
     spec = get_kie_chat_model_spec(model)
     endpoint = f"{base_url.rstrip('/')}{spec.endpoint_path.format(model=model)}"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    messages = _text_messages(history)
-
     if spec.protocol == KIE_CHAT_PROTOCOL_OPENAI:
         payload = {
             "model": model,
-            "messages": [{"role": "system", "content": system_prompt}, *messages],
+            "messages": build_openai_chat_messages(request_layout),
             "max_tokens": 4096,
             "temperature": temperature,
             "stream": False,
@@ -116,10 +125,19 @@ def build_kie_chat_request(
             "X-Api-Key": api_key,
             "anthropic-version": "2023-06-01",
         })
+        anthropic_messages = [
+            {"role": message.role, "content": message.content}
+            for message in request_layout.history
+        ]
+        if request_layout.current_user_content is not None:
+            anthropic_messages.append({
+                "role": "user",
+                "content": request_layout.current_user_content,
+            })
         payload = {
             "model": model,
-            "system": system_prompt,
-            "messages": messages,
+            "system": build_anthropic_system(request_layout),
+            "messages": anthropic_messages,
             "max_tokens": 4096,
             "temperature": temperature,
             "stream": False,
@@ -127,16 +145,18 @@ def build_kie_chat_request(
     elif spec.protocol == KIE_CHAT_PROTOCOL_RESPONSES:
         payload = {
             "model": model,
-            "instructions": system_prompt,
-            "input": _responses_input(history),
+            "instructions": request_layout.stable_system_prompt,
+            "input": build_responses_input(request_layout),
             "stream": spec.stream,
         }
     elif spec.protocol == KIE_CHAT_PROTOCOL_GEMINI:
         headers["X-Goog-Api-Key"] = api_key
         payload = {
             "stream": True,
-            "contents": _gemini_contents(history),
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": build_gemini_contents(request_layout),
+            "systemInstruction": {
+                "parts": build_gemini_system_parts(request_layout) or [{"text": ""}],
+            },
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": 4096,

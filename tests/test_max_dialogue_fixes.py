@@ -659,6 +659,11 @@ class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
         
         with (
             patch.object(ai, "async_session_maker", return_value=session_context),
+            patch.object(
+                ai,
+                "build_runtime_automation_context",
+                AsyncMock(return_value="current_state=photo metadata=vision-meta"),
+            ),
             patch.object(ai, "_analyze_gemini", AsyncMock(return_value="analyzed result")) as gemini,
         ):
             res = await ai.analyze_image(123, b"image_data", "test caption")
@@ -670,6 +675,9 @@ class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(history_passed), 2)
         self.assertEqual(history_passed[0]["content"], "Hello")
         self.assertEqual(history_passed[1]["content"], "Hi there")
+        request_layout = gemini.call_args.kwargs["request_layout"]
+        self.assertTrue(any("ДАННЫЕ КЛИЕНТА" in block for block in request_layout.runtime_context))
+        self.assertIn("current_state=photo", request_layout.scenario_context[0])
 
 
 class MaxFormattingTests(unittest.TestCase):
