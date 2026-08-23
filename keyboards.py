@@ -1351,7 +1351,7 @@ def export_date_filter_keyboard():
     return builder.as_markup()
 
 
-def mass_export_options_keyboard(export_kind: str = "history"):
+def mass_export_options_keyboard(export_kind: str = "history", topic_id: int | None = None, topic_name: str | None = None):
     builder = InlineKeyboardBuilder()
     if export_kind == "metadata":
         builder.button(text="✨ JSON (Итоговые слитные)", callback_data="run_export_json_merged_no")
@@ -1361,23 +1361,62 @@ def mass_export_options_keyboard(export_kind: str = "history"):
         builder.button(text="⬅️ Назад к выбору", callback_data="admin_export_page_0")
         builder.adjust(2, 2, 1)
     else:
+        topic_label = topic_name or "Все темы"
+        builder.button(text=f"📁 Тема: {topic_label}", callback_data="mass_export_pick_topic")
         builder.button(text="TXT (Обычный)", callback_data="run_export_txt_no")
         builder.button(text="TXT (Анонимно)", callback_data="run_export_txt_yes")
         builder.button(text="JSON (Обычный)", callback_data="run_export_json_no")
         builder.button(text="JSON (Анонимно)", callback_data="run_export_json_yes")
         builder.button(text="⬅️ Назад к выбору", callback_data="admin_export_page_0")
-        builder.adjust(2, 2, 1)
+        builder.adjust(1, 2, 2, 1)
     return builder.as_markup()
 
 
-def single_export_options_keyboard(user_id: int):
+def mass_export_topic_selection_keyboard(topics: list, current_topic_id: int | None = None):
     builder = InlineKeyboardBuilder()
-    builder.button(text="TXT (Обычный)", callback_data=f"run_single_txt_no_{user_id}")
-    builder.button(text="TXT (Анонимно)", callback_data=f"run_single_txt_yes_{user_id}")
-    builder.button(text="JSON (Обычный)", callback_data=f"run_single_json_no_{user_id}")
-    builder.button(text="JSON (Анонимно)", callback_data=f"run_single_json_yes_{user_id}")
+    all_check = "✅ " if current_topic_id is None else ""
+    builder.button(text=f"{all_check}🌐 Все темы", callback_data="mass_export_set_topic_all")
+
+    gen_check = "✅ " if current_topic_id == 0 else ""
+    builder.button(text=f"{gen_check}💬 Основной диалог", callback_data="mass_export_set_topic_0")
+
+    for t in topics:
+        check = "✅ " if current_topic_id == t.id else ""
+        builder.button(text=f"{check}{t.name}", callback_data=f"mass_export_set_topic_{t.id}")
+
+    builder.button(text="⬅️ Назад", callback_data="admin_export_date_preset_0")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def single_export_options_keyboard(user_id: int, topic_id: int | None = None, topic_name: str | None = None):
+    builder = InlineKeyboardBuilder()
+    topic_label = topic_name or "Все темы"
+    topic_val = "all" if topic_id is None else str(topic_id)
+    builder.button(text=f"📁 Тема: {topic_label}", callback_data=f"export_pick_topic_{user_id}_{topic_val}")
+    builder.button(text="TXT (Обычный)", callback_data=f"run_single_txt_no_{user_id}_{topic_val}")
+    builder.button(text="TXT (Анонимно)", callback_data=f"run_single_txt_yes_{user_id}_{topic_val}")
+    builder.button(text="JSON (Обычный)", callback_data=f"run_single_json_no_{user_id}_{topic_val}")
+    builder.button(text="JSON (Анонимно)", callback_data=f"run_single_json_yes_{user_id}_{topic_val}")
     builder.button(text="⬅️ Назад в профиль", callback_data=f"view_client_{user_id}")
-    builder.adjust(2, 2, 1)
+    builder.adjust(1, 2, 2, 1)
+    return builder.as_markup()
+
+
+def export_topic_selection_keyboard(user_id: int, topics: list, current_topic_id: int | None = None):
+    builder = InlineKeyboardBuilder()
+    all_check = "✅ " if current_topic_id is None else ""
+    builder.button(text=f"{all_check}🌐 Все темы", callback_data=f"export_set_topic_{user_id}_all")
+
+    gen_check = "✅ " if current_topic_id == 0 else ""
+    builder.button(text=f"{gen_check}💬 Основной диалог", callback_data=f"export_set_topic_{user_id}_0")
+
+    for t in topics:
+        check = "✅ " if current_topic_id == t.id else ""
+        builder.button(text=f"{check}{t.name}", callback_data=f"export_set_topic_{user_id}_{t.id}")
+
+    builder.button(text="⬅️ Назад", callback_data=f"download_history_{user_id}")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -1718,17 +1757,29 @@ def admin_referral_template_input_cancel_keyboard():
     return builder.as_markup()
 
 
-def admin_ai_logs_keyboard(logs, page: int, total_pages: int, filter_user_id: int | None = None, period: str = "all"):
+def admin_ai_logs_keyboard(
+    logs,
+    page: int,
+    total_pages: int,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+):
+    request_type = request_type if request_type in {"all", "chat", "followup"} else "all"
+
     def list_callback(target_page: int) -> str:
+        suffix = f"_{request_type}" if request_type != "all" else ""
         if filter_user_id:
-            return f"admin_user_ai_logs_{filter_user_id}_{target_page}_{period}"
-        return f"admin_ai_logs_{target_page}_{period}"
+            return f"admin_user_ai_logs_{filter_user_id}_{target_page}_{period}{suffix}"
+        return f"admin_ai_logs_{target_page}_{period}{suffix}"
 
     builder = InlineKeyboardBuilder()
     for log in logs:
         lat_text = f" ({log.latency_ms / 1000:.1f}s)" if log.latency_ms else ""
         btn_text = f"#{log.id} | {log.provider}: {log.model}{lat_text}"
         cb = f"admin_ai_log_{log.id}_{page}_{filter_user_id or 0}_{period}"
+        if request_type != "all":
+            cb += f"_{request_type}"
         builder.button(text=btn_text[:60], callback_data=cb)
 
     builder.adjust(1)
@@ -1736,29 +1787,57 @@ def admin_ai_logs_keyboard(logs, page: int, total_pages: int, filter_user_id: in
         builder.row(*navigation_row)
 
     period_labels = (("Сегодня", "today"), ("7 дней", "7d"), ("30 дней", "30d"), ("Все", "all"))
+    type_suffix = f"_{request_type}" if request_type != "all" else ""
     builder.row(*[
         InlineKeyboardButton(
             text=("✅ " if value == period else "") + label,
             callback_data=(
-                f"admin_user_ai_logs_{filter_user_id}_0_{value}"
-                if filter_user_id else f"admin_ai_logs_0_{value}"
+                f"admin_user_ai_logs_{filter_user_id}_0_{value}{type_suffix}"
+                if filter_user_id else f"admin_ai_logs_0_{value}{type_suffix}"
             ),
         )
         for label, value in period_labels
     ])
+    type_labels = (("Все типы", "all"), ("Обычные", "chat"), ("Догоняющие", "followup"))
+    builder.row(*[
+        InlineKeyboardButton(
+            text=("✅ " if value == request_type else "") + label,
+            callback_data=(
+                f"admin_user_ai_logs_{filter_user_id}_0_{period}"
+                if filter_user_id and value == "all"
+                else f"admin_ai_logs_0_{period}"
+                if not filter_user_id and value == "all"
+                else f"admin_user_ai_logs_{filter_user_id}_0_{period}_{value}"
+                if filter_user_id
+                else f"admin_ai_logs_0_{period}_{value}"
+            ),
+        )
+        for label, value in type_labels
+    ])
     builder.row(InlineKeyboardButton(
         text="📦 Скачать пакет логов",
-        callback_data=f"export_ai_logs_{filter_user_id or 0}_{period}",
+        callback_data=f"export_ai_logs_{filter_user_id or 0}_{period}{type_suffix}",
     ))
     back_cb = f"view_client_{filter_user_id}" if filter_user_id else "admin_ai_settings"
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb))
     return builder.as_markup()
 
 
-def admin_ai_log_detail_keyboard(log_id: int, page: int = 0, filter_user_id: int | None = None, period: str = "all"):
+def admin_ai_log_detail_keyboard(
+    log_id: int,
+    page: int = 0,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+):
     builder = InlineKeyboardBuilder()
     builder.button(text="📄 Скачать .txt файл лога", callback_data=f"admin_ai_log_file_{log_id}")
-    back_cb = f"admin_user_ai_logs_{filter_user_id}_{page}_{period}" if filter_user_id else f"admin_ai_logs_{page}_{period}"
+    suffix = f"_{request_type}" if request_type != "all" else ""
+    back_cb = (
+        f"admin_user_ai_logs_{filter_user_id}_{page}_{period}{suffix}"
+        if filter_user_id
+        else f"admin_ai_logs_{page}_{period}{suffix}"
+    )
     builder.button(text="⬅️ Назад к логам", callback_data=back_cb)
     builder.adjust(1)
     return builder.as_markup()

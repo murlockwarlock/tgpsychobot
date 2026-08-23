@@ -1,3 +1,4 @@
+import html
 import os
 import unittest
 from types import SimpleNamespace
@@ -103,17 +104,19 @@ class AdminStructureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("topic_followup_campaigns_17", callbacks)
         self.assertIn("topic_automation_stats_17", callbacks)
 
-    async def test_data_help_shows_several_sequential_steps(self):
+    async def test_data_help_shows_short_current_format(self):
         message = SimpleNamespace(edit_text=AsyncMock())
 
         await automation_admin.automation_data_help(SimpleNamespace(message=message))
 
         text = message.edit_text.await_args.args[0]
+        shown_text = html.unescape(text)
         callbacks = callback_values(message.edit_text.await_args.kwargs["reply_markup"])
-        for step in ("STAGE_1_HOBBY", "STAGE_2_GOAL", "STAGE_3_RESULT", "STAGE_4_COMPLETED"):
-            self.assertIn(step, text)
-        self.assertIn("четыре отдельных ответа модели", text)
-        self.assertNotIn('"save_mode": "merge"', text)
+        self.assertIn('"current_step": "completed"', shown_text)
+        self.assertIn('"events": ["CONTACTS_RECEIVED"]', shown_text)
+        self.assertIn("событий может быть несколько", shown_text)
+        self.assertIn("save_mode", shown_text)
+        self.assertNotIn('"save_mode": "merge"', shown_text)
         self.assertLess(len(text), 4096)
         self.assertIn("automation_menu", callbacks)
 

@@ -18,6 +18,8 @@ from sqlalchemy.orm import selectinload
 
 from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, async_session_maker
 from .logging_utils import configure_logging, get_ai_logger
+from automation_engine import apply_service_data_blocks, build_runtime_automation_context
+from user_metadata import extract_service_data
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
 from prompt_context import apply_global_prompt_appendix
 from result_history import ai_history_role_filter, select_ai_history_messages
@@ -773,7 +775,14 @@ async def get_ai_response(
             raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}") from primary_err
 
 
-async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: str) -> str:
+async def get_ai_response_direct(
+    user_id: int,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    dialogue_id: int | None = None,
+    topic_id: int | None = None,
+) -> str:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
@@ -781,21 +790,48 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         ai_config = await session.get(AIConfig, 1)
         if not ai_config:
             raise AIServiceError("AIConfig не найден")
+        active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
+        active_topic_id = topic_id if topic_id is not None else user.current_topic_id
+        runtime_context = await build_runtime_automation_context(
+            session,
+            user_id=user.id,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
+        )
 
-    prompt = apply_global_prompt_appendix(system_prompt or ai_config.system_prompt or "Ты полезный ИИ-помощник.", getattr(ai_config, 'shared_prompt_block', None))
+    base_system = system_prompt or ai_config.system_prompt or "Ты полезный ИИ-помощник."
+    prompt = apply_global_prompt_appendix(base_system, getattr(ai_config, 'shared_prompt_block', None))
+    if runtime_context and runtime_context.strip():
+        prompt = f"{prompt}\n\n{runtime_context.strip()}"
     if getattr(user, "response_length", "normal") == "short":
         prompt += "\n\nОтвечай кратко, по делу, без длинных вступлений."
     messages = [{"role": "user", "content": user_prompt}]
     try:
         result = await _dispatch_provider(ai_config, prompt, messages)
         log.info("AI direct response generated user_id=%s provider=%s", user_id, ai_config.provider)
-        return result
     except AIServiceError:
         log.exception("AI direct request failed user_id=%s provider=%s", user_id, ai_config.provider)
         raise
     except Exception as exc:
         log.exception("Unexpected AI direct request failure user_id=%s provider=%s", user_id, ai_config.provider)
         raise AIServiceError(f"Ошибка при прямом обращении к AI-провайдеру: {exc}") from exc
+
+    visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+    if invalid_data_blocks:
+        log.warning("Direct AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+    if service_blocks:
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if user:
+                await apply_service_data_blocks(
+                    session,
+                    user=user,
+                    dialogue_id=active_dialogue_id,
+                    topic_id=active_topic_id,
+                    blocks=service_blocks,
+                )
+                await session.commit()
+    return visible_text or result
 
 
 # ---------------------------------------------------------------------------

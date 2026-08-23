@@ -31,12 +31,17 @@ MAX_DIRECT_FILE_SIZE = 50 * 1024 * 1024
 
 
 def _remove_markdown(text: str) -> str:
-    text = re.sub(r"#+\s+", "", text or "")
-    text = re.sub(r"\*\*(.*?)\*\*|__(.*?)__", r"\1", text)
-    text = re.sub(r"\*(.*?)\*|_(.*?)_", r"\1", text)
-    text = re.sub(r"~~(.*?)~~", r"\1", text)
-    text = re.sub(r"`(.*?)`", r"\1", text)
-    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
+    if not text:
+        return ""
+    text = re.sub(r"\[([^\]\n]+)\]\([^\)\n]+\)", r"\1", text)
+    text = re.sub(r"```(?:[a-zA-Z0-9_-]+)?\n?(.*?)\n?```", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    text = re.sub(r"^\s*#+\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"~~(.+?)~~", r"\1", text)
+    text = re.sub(r"(?<!\w)\*(?!\s)([^\*\n]+?)(?<!\s)\*(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)", r"\1", text)
     return text
 
 

@@ -1,8 +1,10 @@
 import os
+import sys
+import types
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -11,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import followups
-from database import Base, FollowupCampaign, FollowupDelivery, FollowupRun, FollowupStep, User
+from database import Base, FollowupCampaign, FollowupDelivery, FollowupRun, FollowupStep, Message, User
 from followups import _outside_quiet_hours, process_due_followups, record_user_activity
 
 
@@ -19,7 +21,7 @@ class FakeBot:
     def __init__(self):
         self.sent = []
 
-    async def send_message(self, chat_id, text):
+    async def send_message(self, chat_id, text, **kwargs):
         self.sent.append((chat_id, text))
         return SimpleNamespace(message_id=len(self.sent))
 
@@ -112,3 +114,42 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent, 0)
         self.assertEqual(run.status, "cancelled")
         self.assertEqual(bot.sent, [])
+
+    async def test_ai_followup_uses_service_instruction_and_saves_sent_message(self):
+        async with self.sessions() as session:
+            step = await session.scalar(select(FollowupStep))
+            step.message_type = "ai"
+            step.ai_instruction = "Напомни, какой ответ мы ждём."
+            await session.commit()
+
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=AsyncMock(return_value="Вернись к нам\n[Дальше](btn:continue)"),
+        ) as get_ai_response:
+            await record_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=datetime.utcnow() - timedelta(minutes=2),
+            )
+            bot = FakeBot()
+            fake_handlers = types.ModuleType("handlers")
+            fake_send = AsyncMock()
+            fake_handlers._send_generated_response = fake_send
+            with patch.dict(sys.modules, {"handlers": fake_handlers}):
+                sent = await process_due_followups(bot)
+
+        self.assertEqual(sent, 1)
+        get_ai_response.assert_awaited_once()
+        call_kwargs = get_ai_response.await_args.kwargs
+        self.assertEqual(call_kwargs["request_type"], "followup")
+        self.assertFalse(call_kwargs["persist_service_data"])
+        self.assertIn("[Служебная команда системы]: Пользователь замолчал.", get_ai_response.await_args.args[1])
+        self.assertIn("Напомни, какой ответ мы ждём.", get_ai_response.await_args.args[1])
+        fake_send.assert_awaited_once_with(bot, 42, "Вернись к нам\n[Дальше](btn:continue)")
+
+        async with self.sessions() as session:
+            message = await session.scalar(select(Message).where(Message.role == "assistant"))
+
+        self.assertIsNotNone(message)
+        self.assertEqual(message.content, "Вернись к нам")

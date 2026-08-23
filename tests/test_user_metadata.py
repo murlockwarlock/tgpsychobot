@@ -155,3 +155,32 @@ class UserMetadataTests(unittest.TestCase):
         self.assertEqual(visible, 'Пример:\n```python\nprint("ok")\n```')
         self.assertEqual(blocks[0].events, ["CODE_SHOWN"])
         self.assertEqual(invalid, 0)
+
+    def test_repair_malformed_json_with_extra_closing_braces(self):
+        # The exact bug reported by user: 4 closing braces at the end
+        raw_response = (
+            "Привет!\n"
+            "<DATA>\n"
+            '{\n'
+            '  "current_state": {"current_step": "2"},\n'
+            '  "metadata": {"a": {"b": {"d": "4"}}}}\n'
+            '}\n'
+            "</DATA>"
+        )
+        visible, blocks, invalid = extract_service_data(raw_response)
+        self.assertEqual(visible, "Привет!")
+        self.assertEqual(invalid, 0)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].current_state, {"current_step": "2"})
+        self.assertEqual(blocks[0].metadata, {"a": {"b": {"d": "4"}}})
+
+    def test_recursive_merge_deep_nested_metadata(self):
+        from user_metadata import merge_metadata
+        base = {"a": {"b": {"c": 1}}}
+        incoming = {"a": {"b": {"d": 2}}}
+        merged = merge_metadata(base, incoming)
+        self.assertEqual(merged, {"a": {"b": {"c": 1, "d": 2}}})
+        # 3 levels deep
+        incoming2 = {"a": {"b": {"e": {"f": 3}}}}
+        merged2 = merge_metadata(merged, incoming2)
+        self.assertEqual(merged2, {"a": {"b": {"c": 1, "d": 2, "e": {"f": 3}}}})

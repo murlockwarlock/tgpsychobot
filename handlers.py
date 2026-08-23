@@ -109,13 +109,19 @@ from datetime import datetime, timedelta, timezone
 from telegram_birthdate import extract_birthdate_parts, format_birthdate, has_birthdate
 from time_helpers import format_msk, to_msk
 from vector_store import delete_document_vectors, update_case_study_index, search_relevant_case, delete_case_study_vectors
-from yookassa import Configuration, Payment
 from uuid import uuid4
+try:
+    from yookassa import Configuration, Payment
+except ModuleNotFoundError:
+    Configuration = Payment = None
 import decimal
 import hashlib
 from urllib import parse
 from urllib.parse import urlparse
-from dateutil.relativedelta import relativedelta
+try:
+    from dateutil.relativedelta import relativedelta
+except ModuleNotFoundError:
+    relativedelta = None
 from payment_failure_reasons import format_yookassa_admin_reason_line
 from scheduler import (
     process_recurring_payment,
@@ -2024,12 +2030,17 @@ def markdown_to_html(text: str) -> str:
 
 
 def remove_markdown(text: str) -> str:
-    text = re.sub(r'#+\s+', '', text)
-    text = re.sub(r'\*\*(.*?)\*\*|__(.*?)__', r'\1', text)
-    text = re.sub(r'\*(.*?)\*|_(.*?)_', r'\1', text)
-    text = re.sub(r'~~(.*?)~~', r'\1', text)
-    text = re.sub(r'`(.*?)`', r'\1', text)
-    text = re.sub(r'\[(.*?)\]\((.*?)\)', r'\1', text)
+    if not text:
+        return ""
+    text = re.sub(r'\[([^\]\n]+)\]\([^\)\n]+\)', r'\1', text)
+    text = re.sub(r'```(?:[a-zA-Z0-9_-]+)?\n?(.*?)\n?```', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'`([^`\n]+)`', r'\1', text)
+    text = re.sub(r'^\s*#+\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'~~(.+?)~~', r'\1', text)
+    text = re.sub(r'(?<!\w)\*(?!\s)([^\*\n]+?)(?<!\s)\*(?!\w)', r'\1', text)
+    text = re.sub(r'(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)', r'\1', text)
     return text
 
 
@@ -3099,7 +3110,7 @@ def _build_prompt_block_editor_text(config_key: str, current_value: str) -> str:
     ]
     if meta["placeholders"]:
         parts.extend(["", meta["placeholders"]])
-    parts.extend(["", "Отправьте новый текст или загрузите <b>.txt файл</b>."])
+    parts.extend(["", "Отправьте новый текст или загрузите <b>.txt/.md файл</b>."])
     return "\n".join(parts)
 
 
@@ -3741,7 +3752,7 @@ async def edit_system_prompt(callback: CallbackQuery, state: FSMContext):
     if config.prompt_mode == 'file':
         prompt_too_long = True
         prompt_info = f"Текущий промпт загружен из файла: `{config.prompt_filename}`{time_str}"
-        message_text_content = "Отправьте новый текст или .txt файл, чтобы его заменить."
+        message_text_content = "Отправьте новый текст или .txt/.md файл, чтобы его заменить."
         message_text = f"{prompt_info}\n\n{message_text_content}"
     else:
         prompt_info = f"Текущий промпт сохранен как текст.{time_str}"
@@ -3750,7 +3761,7 @@ async def edit_system_prompt(callback: CallbackQuery, state: FSMContext):
         if len(prompt_text) > 3500:
             prompt_too_long = True
             display_text = prompt_text[:3500] + "\n\n[...] (Промпт слишком длинный для полного отображения)"
-        message_text = f"{prompt_info}\n\n`{display_text}`\n\nОтправьте новый текст или .txt файл, чтобы его заменить."
+        message_text = f"{prompt_info}\n\n`{display_text}`\n\nОтправьте новый текст или .txt/.md файл, чтобы его заменить."
 
     await callback.message.edit_text(
         message_text,
@@ -3815,8 +3826,8 @@ async def process_system_prompt(message: Message, state: FSMContext, bot: Bot):
 
             document = message.document
 
-            if not document.file_name.lower().endswith('.txt'):
-                await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt")
+            if not document.file_name.lower().endswith(('.txt', '.md')):
+                await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt или .md")
 
                 return
 
@@ -3864,8 +3875,8 @@ async def process_prompt_block(message: Message, state: FSMContext, bot: Bot):
     if message.text is not None:
         new_value = message.text.strip()
     elif message.document:
-        if not message.document.file_name.lower().endswith('.txt'):
-            temp = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt")
+        if not message.document.file_name.lower().endswith(('.txt', '.md')):
+            temp = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt или .md")
             await asyncio.sleep(4)
             await temp.delete()
             return
@@ -4289,9 +4300,9 @@ async def process_content_update(message: Message, state: FSMContext, bot: Bot):
 
     elif message.document:
         document = message.document
-        if not document.file_name.lower().endswith('.txt'):
+        if not document.file_name.lower().endswith(('.txt', '.md')):
             await send_temp_notification(message.from_user.id, bot,
-                                         "❌ Ошибка: Для текста принимаются только .txt файлы.", delay=5)
+                                         "❌ Ошибка: Для текста принимаются только .txt и .md файлы.", delay=5)
         else:
             try:
                 file_info = await bot.get_file(document.file_id)
@@ -4485,7 +4496,8 @@ async def callback_admin_ai_logs(callback: CallbackQuery):
     parts = callback.data.split("_")
     page = int(parts[3])
     period = parts[4] if len(parts) > 4 else "all"
-    await show_ai_logs_list(callback, page=page, period=period)
+    request_type = parts[5] if len(parts) > 5 else "all"
+    await show_ai_logs_list(callback, page=page, period=period, request_type=request_type)
 
 
 @router.callback_query(F.data.startswith("admin_user_ai_logs_"))
@@ -4496,7 +4508,14 @@ async def callback_admin_user_ai_logs(callback: CallbackQuery):
     user_id = int(parts[4])
     page = int(parts[5])
     period = parts[6] if len(parts) > 6 else "all"
-    await show_ai_logs_list(callback, page=page, filter_user_id=user_id, period=period)
+    request_type = parts[7] if len(parts) > 7 else "all"
+    await show_ai_logs_list(
+        callback,
+        page=page,
+        filter_user_id=user_id,
+        period=period,
+        request_type=request_type,
+    )
 
 
 AI_LOG_PERIOD_LABELS = {
@@ -4504,6 +4523,12 @@ AI_LOG_PERIOD_LABELS = {
     "today": "сегодня",
     "7d": "7 дней",
     "30d": "30 дней",
+}
+
+AI_LOG_TYPE_LABELS = {
+    "all": "все типы",
+    "chat": "обычные запросы",
+    "followup": "догоняющие",
 }
 
 
@@ -4519,20 +4544,34 @@ def _ai_log_period_start(period: str) -> datetime | None:
     return None
 
 
-def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str):
+def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str, request_type: str = "all"):
     if filter_user_id:
         query = query.where(AILog.user_id == filter_user_id)
     period_start = _ai_log_period_start(period)
     if period_start is not None:
         query = query.where(AILog.created_at >= period_start)
+    if request_type in AI_LOG_TYPE_LABELS and request_type != "all":
+        query = query.where(AILog.request_type == request_type)
     return query
 
 
-async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filter_user_id: int | None = None, period: str = "all"):
+async def show_ai_logs_list(
+    event: Message | CallbackQuery,
+    page: int = 0,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+):
     PER_PAGE = 8
     period = period if period in AI_LOG_PERIOD_LABELS else "all"
+    request_type = request_type if request_type in AI_LOG_TYPE_LABELS else "all"
     async with async_session_maker() as session:
-        query = _apply_ai_log_filters(select(AILog), filter_user_id=filter_user_id, period=period)
+        query = _apply_ai_log_filters(
+            select(AILog),
+            filter_user_id=filter_user_id,
+            period=period,
+            request_type=request_type,
+        )
 
         count_query = select(func.count()).select_from(query.subquery())
         total_count = (await session.execute(count_query)).scalar() or 0
@@ -4544,7 +4583,14 @@ async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filte
 
     if not logs:
         text = "📜 <b>Логи вызовов ИИ пусты.</b>"
-        markup = kb.admin_ai_logs_keyboard([], page=0, total_pages=1, filter_user_id=filter_user_id, period=period)
+        markup = kb.admin_ai_logs_keyboard(
+            [],
+            page=0,
+            total_pages=1,
+            filter_user_id=filter_user_id,
+            period=period,
+            request_type=request_type,
+        )
         if isinstance(event, CallbackQuery):
             await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         else:
@@ -4555,10 +4601,18 @@ async def show_ai_logs_list(event: Message | CallbackQuery, page: int = 0, filte
     header = (
         f"📜 <b>Логи вызовов ИИ{filter_text}</b> (Стр. {page + 1}/{total_pages})\n\n"
         f"Период: <b>{AI_LOG_PERIOD_LABELS[period]}</b>\n"
+        f"Тип: <b>{AI_LOG_TYPE_LABELS[request_type]}</b>\n"
         f"Всего вызовов: <b>{total_count}</b>\nВыберите запись:"
     )
 
-    markup = kb.admin_ai_logs_keyboard(logs, page=page, total_pages=total_pages, filter_user_id=filter_user_id, period=period)
+    markup = kb.admin_ai_logs_keyboard(
+        logs,
+        page=page,
+        total_pages=total_pages,
+        filter_user_id=filter_user_id,
+        period=period,
+        request_type=request_type,
+    )
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(header, reply_markup=markup, parse_mode="HTML")
     else:
@@ -4578,10 +4632,25 @@ async def callback_admin_ai_log_detail(callback: CallbackQuery):
     page = int(parts[4]) if len(parts) > 4 else 0
     filter_user_id = int(parts[5]) if len(parts) > 5 and int(parts[5]) else None
     period = parts[6] if len(parts) > 6 else "all"
-    await show_ai_log_detail(callback, log_id, page=page, filter_user_id=filter_user_id, period=period)
+    request_type = parts[7] if len(parts) > 7 else "all"
+    await show_ai_log_detail(
+        callback,
+        log_id,
+        page=page,
+        filter_user_id=filter_user_id,
+        period=period,
+        request_type=request_type,
+    )
 
 
-async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: int = 0, filter_user_id: int | None = None, period: str = "all"):
+async def show_ai_log_detail(
+    event: Message | CallbackQuery,
+    log_id: int,
+    page: int = 0,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+):
     async with async_session_maker() as session:
         log_entry = await session.get(AILog, log_id)
         if not log_entry:
@@ -4601,6 +4670,7 @@ async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: 
 
     lat_text = f"{log_entry.latency_ms / 1000:.2f} сек" if log_entry.latency_ms else "не измерялось"
     dt_str = format_msk(log_entry.created_at, "%d-%m-%Y %H:%M:%S МСК")
+    log_type = getattr(log_entry, "request_type", "chat") or "chat"
     request_preview = log_entry.request_payload or log_entry.prompt_summary or "без текста"
     prompt_str = html.escape(request_preview)
     if len(prompt_str) > 1200:
@@ -4614,6 +4684,7 @@ async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: 
     text = (
         f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
         f"👤 <b>Пользователь:</b> {user_info}\n"
+        f"🧾 <b>Тип запроса:</b> {html.escape(AI_LOG_TYPE_LABELS.get(log_type, log_type))}\n"
         f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider)}</b>\n"
         f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model)}</code>\n"
         f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
@@ -4623,7 +4694,13 @@ async def show_ai_log_detail(event: Message | CallbackQuery, log_id: int, page: 
         f"<code>{display_raw}</code>"
     )
 
-    markup = kb.admin_ai_log_detail_keyboard(log_id, page=page, filter_user_id=filter_user_id, period=period)
+    markup = kb.admin_ai_log_detail_keyboard(
+        log_id,
+        page=page,
+        filter_user_id=filter_user_id,
+        period=period,
+        request_type=request_type,
+    )
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     else:
@@ -4637,6 +4714,7 @@ def _build_ai_log_file_content(log_entry: AILog) -> str:
         f"========================================\n"
         f"Timestamp: {log_entry.created_at}\n"
         f"User ID: {log_entry.user_id}\n"
+        f"Request type: {getattr(log_entry, 'request_type', 'chat')}\n"
         f"Provider: {log_entry.provider}\n"
         f"Model: {log_entry.model}\n"
         f"Latency: {log_entry.latency_ms} ms\n"
@@ -4682,6 +4760,7 @@ async def export_ai_logs_package(callback: CallbackQuery):
             select(AILog).order_by(AILog.created_at.desc()),
             filter_user_id=filter_user_id,
             period=period,
+            request_type=parts[5] if len(parts) > 5 else "all",
         )
         logs = (await session.execute(stmt)).scalars().all()
     if not logs:
@@ -5803,12 +5882,64 @@ async def run_client_test_attempts_export(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("export_pick_topic_"))
+async def export_pick_topic_menu(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на скачивание истории.", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    user_id = int(parts[3])
+    current_topic_val = parts[4]
+    current_topic_id = None if current_topic_val == "all" else int(current_topic_val)
+
+    async with async_session_maker() as session:
+        topics = (await session.execute(select(Topic).order_by(Topic.id.asc()))).scalars().all()
+
+    await callback.message.edit_text(
+        f"Выберите тему для выгрузки истории пользователя <code>{user_id}</code>:",
+        reply_markup=kb.export_topic_selection_keyboard(user_id, topics, current_topic_id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("export_set_topic_"))
+async def export_set_topic(callback: CallbackQuery):
+    if not await check_history_permission(callback.from_user.id):
+        await callback.answer("У вас нет прав на скачивание истории.", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    user_id = int(parts[3])
+    topic_val = parts[4]
+    topic_id = None if topic_val == "all" else int(topic_val)
+
+    topic_name = "Все темы"
+    if topic_id == 0:
+        topic_name = "Основной диалог"
+    elif topic_id is not None:
+        async with async_session_maker() as session:
+            t = await session.get(Topic, topic_id)
+            if t:
+                topic_name = t.name
+
+    await callback.message.edit_text(
+        f"Выберите формат и параметры экспорта для пользователя <code>{user_id}</code>:\n\n"
+        f"📁 <b>Выбранная тема:</b> {html.escape(topic_name)}",
+        parse_mode="HTML",
+        reply_markup=kb.single_export_options_keyboard(user_id, topic_id=topic_id, topic_name=topic_name)
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("run_single_"))
 async def process_single_export(callback: CallbackQuery, bot: Bot):
     parts = callback.data.split("_")
     fmt = parts[2]
     anonymize = parts[3] == "yes"
     user_id = int(parts[4])
+    topic_val = parts[5] if len(parts) > 5 else "all"
+    selected_topic_id = None if topic_val == "all" else int(topic_val)
 
     thinking_msg = await callback.message.answer("⏳ Формирую файл...")
 
@@ -5821,7 +5952,12 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
         topics_res = await session.execute(select(Topic))
         topic_map = {t.id: t.name for t in topics_res.scalars().all()}
 
-        msg_stmt = select(DBMessage).where(DBMessage.user_id == user.id).order_by(DBMessage.timestamp)
+        msg_stmt = select(DBMessage).where(DBMessage.user_id == user.id)
+        if selected_topic_id == 0:
+            msg_stmt = msg_stmt.where(DBMessage.topic_id.is_(None))
+        elif selected_topic_id is not None:
+            msg_stmt = msg_stmt.where(DBMessage.topic_id == selected_topic_id)
+        msg_stmt = msg_stmt.order_by(DBMessage.timestamp)
         messages = (await session.execute(msg_stmt)).scalars().all()
 
         if not messages:
@@ -5829,9 +5965,15 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
             return
 
         user_label = "user_1" if anonymize else str(user.id)
+        selected_topic_label = ""
+        if selected_topic_id == 0:
+            selected_topic_label = " (Основной диалог)"
+        elif selected_topic_id is not None:
+            t_name = topic_map.get(selected_topic_id, f"Topic {selected_topic_id}")
+            selected_topic_label = f" (Тема: {t_name})"
 
         if fmt == "txt":
-            header = f"History: {user_label}\n" if anonymize else f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username})\n"
+            header = f"History: {user_label}{selected_topic_label}\n" if anonymize else f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username}){selected_topic_label}\n"
             content_str = header + "=" * 50 + "\n"
             for m in messages:
                 t_name = topic_map.get(m.topic_id, "General")
@@ -5860,7 +6002,7 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
             caption = "📦 Файл превысил 50МБ и был заархивирован."
         else:
             file_to_send = BufferedInputFile(file_bytes, filename=f"{user_label}.{fmt}")
-            caption = f"📋 История пользователя {user_label}"
+            caption = f"📋 История пользователя {user_label}{selected_topic_label}"
 
         await callback.message.answer_document(file_to_send, caption=caption)
         await bot.delete_message(callback.message.chat.id, thinking_msg.message_id)
@@ -6619,7 +6761,7 @@ async def topic_editor_router(callback: CallbackQuery, state: FSMContext):
 
         await callback.message.edit_text(
             f"<b>Текущий промпт:</b>\n{safe_prompt_text}\n\n"
-            f"Отправьте новый текст или .txt файл.",
+            f"Отправьте новый текст или .txt/.md файл.",
             reply_markup=kb.topic_prompt_keyboard(topic_id)
         )
 
@@ -6732,9 +6874,9 @@ async def admin_edit_topic_prompt_process(message: Message, state: FSMContext, b
         notification_text = "✅ Промпт для темы обновлен текстом."
 
     elif message.document:
-        if not message.document.file_name.lower().endswith('.txt'):
+        if not message.document.file_name.lower().endswith(('.txt', '.md')):
             await message.delete()
-            temp_msg = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt")
+            temp_msg = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt или .md")
             await delete_message_after_delay(temp_msg, 5)
             return
         try:
@@ -11016,12 +11158,12 @@ async def admin_topic_random_phrases_menu(callback: CallbackQuery, state: FSMCon
     text = (
         f"🎲 <b>Случайные фразы для темы: «{html.escape(topic.name)}»</b>\n\n"
         f"Загружено фраз: <b>{count}</b>\n\n"
-        "Вы можете загрузить файл .txt (каждая фраза с новой строки). "
+        "Вы можете загрузить файл .txt или .md (каждая фраза с новой строки). "
         "Бот будет выбирать одну случайную фразу из этого списка и добавлять её в контекст к каждому сообщению пользователя в этой теме."
     )
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="📥 Загрузить файл фраз (.txt)", callback_data=f"upload_topic_phrases_{topic_id}")
+    builder.button(text="📥 Загрузить файл фраз (.txt/.md)", callback_data=f"upload_topic_phrases_{topic_id}")
     builder.button(text="🗑️ Очистить все фразы", callback_data=f"clear_topic_phrases_{topic_id}")
     builder.button(text="⬅️ Назад к теме", callback_data=f"edit_topic_{topic_id}")
     builder.adjust(1)
@@ -11040,7 +11182,7 @@ async def admin_upload_topic_phrases_start(callback: CallbackQuery, state: FSMCo
     builder.button(text="⬅️ Отмена", callback_data=f"topic_random_phrases_{topic_id}")
 
     await callback.message.edit_text(
-        "Отправьте файл <b>.txt</b> со списком фраз (каждая с новой строки).\n\n"
+        "Отправьте файл <b>.txt/.md</b> со списком фраз (каждая с новой строки).\n\n"
         "Эти фразы будут привязаны ТОЛЬКО к текущей теме.",
         reply_markup=builder.as_markup()
     )
@@ -11052,8 +11194,8 @@ async def process_topic_phrases_file(message: Message, state: FSMContext, bot: B
     topic_id = data.get('topic_id')
     document = message.document
 
-    if not document.file_name.lower().endswith('.txt'):
-        await message.answer("❌ Пожалуйста, отправьте файл .txt")
+    if not document.file_name.lower().endswith(('.txt', '.md')):
+        await message.answer("❌ Пожалуйста, отправьте файл .txt или .md")
         return
 
     try:
@@ -12669,6 +12811,8 @@ async def finish_test_generation(
                 user_id,
                 result_system_prompt,
                 interpretation_prompt,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
             )
         if preliminary_interpretation and result_prompt_is_final:
             interpretation_text = preliminary_interpretation
@@ -13206,7 +13350,14 @@ async def admin_process_formulas_file(message: Message, state: FSMContext, bot: 
         await message.answer(f"❌ Формулы не изменены: {html.escape(str(exc))}")
 
 
-async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: str) -> str:
+async def get_ai_response_direct(
+    user_id: int,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    dialogue_id: int | None = None,
+    topic_id: int | None = None,
+) -> str:
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
         provider = ai_config.provider
@@ -13224,11 +13375,13 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
         user = await session.get(User, user_id)
         if not user:
             return "Ошибка: Пользователь не найден."
+        active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
+        active_topic_id = topic_id if topic_id is not None else user.current_topic_id
         runtime_context = await build_runtime_automation_context(
             session,
             user_id=user.id,
-            dialogue_id=user.current_dialogue_id,
-            topic_id=user.current_topic_id,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
         )
         fake_history = [DBMessage(
             role='user',
@@ -13266,12 +13419,12 @@ async def get_ai_response_direct(user_id: int, system_prompt: str, user_prompt: 
                 await apply_service_data_blocks(
                     session,
                     user=user,
-                    dialogue_id=user.current_dialogue_id,
-                    topic_id=user.current_topic_id,
+                    dialogue_id=active_dialogue_id,
+                    topic_id=active_topic_id,
                     blocks=service_blocks,
                 )
                 await session.commit()
-    return visible_text
+    return visible_text or response_text
 
 
 @router.message(Command("test"))
@@ -13815,7 +13968,7 @@ async def _show_test_prompt_editor(callback: CallbackQuery, state: FSMContext, p
     text = (
         f"<b>{title}:</b>\n\n"
         f"<code>{html.escape(display_prompt)}</code>\n\n"
-        f"Отправьте новый текст промпта или загрузите <b>.txt файл</b> с промптом."
+        f"Отправьте новый текст промпта или загрузите <b>.txt/.md файл</b> с промптом."
     )
 
     keyboard = kb.test_prompt_keyboard("download_result_prompt" if prompt_target == "result" else "download_test_prompt")
@@ -13874,8 +14027,8 @@ async def admin_process_test_prompt(message: Message, state: FSMContext, bot: Bo
         new_prompt = message.text.strip()
         notification_text = f"✅ Промпт {prompt_label} обновлен текстом."
     elif message.document:
-        if not message.document.file_name.lower().endswith('.txt'):
-            temp = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt")
+        if not message.document.file_name.lower().endswith(('.txt', '.md')):
+            temp = await message.answer("❌ Ошибка: Пожалуйста, загрузите файл в формате .txt или .md")
             await asyncio.sleep(4)
             await temp.delete()
             return
@@ -14715,8 +14868,8 @@ async def cmd_upload_random_messages(message: Message, bot: Bot):
         return
 
     document = message.document
-    if not document.file_name.endswith('.txt'):
-        await message.answer("❌ Пожалуйста, отправьте файл .txt")
+    if not document.file_name.lower().endswith(('.txt', '.md')):
+        await message.answer("❌ Пожалуйста, отправьте файл .txt или .md")
         return
 
     file_in_io = io.BytesIO()
@@ -15757,10 +15910,53 @@ async def export_date_to_input(message: Message, state: FSMContext):
     selected_ids = data.get("selected_export_ids", [])
     target = "ВСЕХ пользователей" if export_all else f"{len(selected_ids)} пользователей"
 
-    await message.answer(
-        f"✅ Фильтр дат: с <b>{date_from}</b> по <b>{date_to}</b>\n\nВыберите формат экспорта для {target}:",
-        reply_markup=kb.mass_export_options_keyboard()
+@router.callback_query(F.data == "mass_export_pick_topic")
+async def mass_export_pick_topic_menu(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    current_topic_id = data.get("export_topic_id")
+
+    async with async_session_maker() as session:
+        topics = (await session.execute(select(Topic).order_by(Topic.id.asc()))).scalars().all()
+
+    await callback.message.edit_text(
+        "Выберите тему для массовой выгрузки истории:",
+        reply_markup=kb.mass_export_topic_selection_keyboard(topics, current_topic_id)
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mass_export_set_topic_"))
+async def mass_export_set_topic(callback: CallbackQuery, state: FSMContext):
+    topic_val = callback.data.replace("mass_export_set_topic_", "")
+    topic_id = None if topic_val == "all" else int(topic_val)
+
+    topic_name = "Все темы"
+    if topic_id == 0:
+        topic_name = "Основной диалог"
+    elif topic_id is not None:
+        async with async_session_maker() as session:
+            t = await session.get(Topic, topic_id)
+            if t:
+                topic_name = t.name
+
+    await state.update_data(export_topic_id=topic_id, export_topic_name=topic_name)
+    data = await state.get_data()
+    export_all = data.get("export_all", False)
+    selected_ids = data.get("selected_export_ids", [])
+    target = "ВСЕХ пользователей" if export_all else f"{len(selected_ids)} пользователей"
+    date_from = data.get("export_date_from", "начала")
+    date_to = data.get("export_date_to", "сегодня")
+
+    date_label = ""
+    if data.get("export_date_from") or data.get("export_date_to"):
+        date_label = f"✅ Фильтр дат: с {date_from} по {date_to}\n"
+
+    await callback.message.edit_text(
+        f"{date_label}📁 Тема: <b>{html.escape(topic_name)}</b>\n\nВыберите формат экспорта для {target}:",
+        parse_mode="HTML",
+        reply_markup=kb.mass_export_options_keyboard(topic_id=topic_id, topic_name=topic_name)
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("run_export_"))
@@ -15772,15 +15968,20 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
     data = await state.get_data()
     export_all = data.get("export_all", False)
     export_kind = data.get("export_kind", "history")
+    export_topic_id = data.get("export_topic_id")
+    export_topic_name = data.get("export_topic_name")
 
     date_from_str = data.get("export_date_from") if export_kind == "history" else None
     date_to_str = data.get("export_date_to") if export_kind == "history" else None
     date_from_dt = datetime.strptime(date_from_str, "%d-%m-%Y") if date_from_str else None
     date_to_dt = datetime.strptime(date_to_str, "%d-%m-%Y").replace(hour=23, minute=59, second=59) if date_to_str else None
 
-    date_label = ""
+    filters = []
     if date_from_dt or date_to_dt:
-        date_label = f" | фильтр: {date_from_str or 'начало'} → {date_to_str or 'сегодня'}"
+        filters.append(f"даты: {date_from_str or 'начало'} → {date_to_str or 'сегодня'}")
+    if export_topic_name and export_topic_name != "Все темы":
+        filters.append(f"тема: {export_topic_name}")
+    date_label = f" | {' | '.join(filters)}" if filters else ""
 
     export_title = "метаданных" if export_kind == "metadata" else "данных"
     await callback.message.edit_text(f"⏳ Начинаю сбор {export_title} и формирование файла{date_label}. Это может занять время...")
@@ -15830,6 +16031,10 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
 
             def build_msg_stmt(user_id):
                 stmt = select(DBMessage).where(DBMessage.user_id == user_id)
+                if export_topic_id == 0:
+                    stmt = stmt.where(DBMessage.topic_id.is_(None))
+                elif export_topic_id is not None:
+                    stmt = stmt.where(DBMessage.topic_id == export_topic_id)
                 if date_from_dt:
                     stmt = stmt.where(DBMessage.timestamp >= date_from_dt)
                 if date_to_dt:

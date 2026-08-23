@@ -13,7 +13,7 @@ DEFAULT_SHORT_RESPONSE_INSTRUCTION = textwrap.dedent("""
 """).strip()
 
 
-DEFAULT_SERVICE_PROMPT_TEMPLATE = textwrap.dedent("""
+DEFAULT_BASE_SERVICE_PROMPT_TEMPLATE = textwrap.dedent("""
 ТЕХНИЧЕСКИЕ ПРАВИЛА ОФОРМЛЕНИЯ (СТРОГО):
 1. Формат: Используй Markdown. HTML запрещен.
 2. ЗАГОЛОВКИ: Используй жирный шрифт (**Заголовок**).
@@ -26,7 +26,10 @@ DEFAULT_SERVICE_PROMPT_TEMPLATE = textwrap.dedent("""
 📷 ВИЗУАЛИЗАЦИЯ (ГЕНЕРАЦИЯ):
 Если пользователь просит 'показать', 'визуализировать' что-то новое — используй формат:
 GEN_IMG: [подробный промпт на АНГЛИЙСКОМ языке]
+""").strip()
 
+
+DEFAULT_MEDIA_RULES_TEMPLATE = textwrap.dedent("""
 🎵 ДОСТУПНЫЙ МЕДИА-КОНТЕНТ В ЭТОЙ ТЕМЕ:
 {available_media_text}
 
@@ -42,10 +45,33 @@ GEN_IMG: [подробный промпт на АНГЛИЙСКОМ языке]
 3. [SHOW_IMG: имя_файла] — показать конкретную карту по имени файла из списка выше.
 4. ВАЖНО: После RANDOM_IMG, CHOICE_IMG, CHOICE_IMG_HIDDEN НЕ пиши интерпретацию — ты ещё не знаешь какая выпадет. Вводный текст, интерпретация после.
 5. Теги с новой строки. Не выдумывай категории и имена файлов.
-
-{test_context_injection}
-{short_response_instruction}
 """).strip()
+
+
+DEFAULT_SERVICE_PROMPT_TEMPLATE = textwrap.dedent("""
+ТЕХНИЧЕСКИЕ ПРАВИЛА ОФОРМЛЕНИЯ (СТРОГО):
+1. Формат: Используй Markdown. HTML запрещен.
+2. ЗАГОЛОВКИ: Используй жирный шрифт (**Заголовок**).
+3. ОТСТУПЫ: Перед каждым заголовком и списком — ДВА переноса строки.
+4. ЗАПРЕТЫ:
+   - НЕ используй вложенное форматирование (**_текст_**).
+   - НЕ используй '*' или '***' как разделительную линию (используй '———').
+5. СПИСКИ: Используй дефис '-' для списков. Каждый пункт с новой строки.
+
+📷 ВИЗУАЛИЗАЦИЯ (ГЕНЕРАЦИЯ):
+Если пользователь просит 'показать', 'визуализировать' что-то новое — используй формат:
+GEN_IMG: [подробный промпт на АНГЛИЙСКОМ языке]
+{media_instruction_block}
+""").strip()
+
+
+def build_media_instruction_block(available_media_text: str | None) -> str:
+    if not available_media_text or not available_media_text.strip():
+        return ""
+    text = available_media_text.strip()
+    if "НЕ загружены" in text or "не загружены" in text:
+        return ""
+    return "\n\n" + render_prompt_block(DEFAULT_MEDIA_RULES_TEMPLATE, available_media_text=text)
 
 
 def render_prompt_block(template: str, **values: str) -> str:

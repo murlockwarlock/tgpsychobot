@@ -13,7 +13,7 @@ from sqlalchemy import select, text
 from database import Message, TestAttempt
 from response_buttons import extract_response_buttons
 from time_helpers import format_msk
-from user_metadata import extract_data_blocks
+from user_metadata import extract_data_blocks, extract_service_data
 
 
 TEST_RESULT_ROLE = "test_result"
@@ -53,10 +53,12 @@ def select_ai_history_messages(
                 topic=getattr(message, "topic", None),
                 source_role=TEST_RESULT_ROLE,
             ))
-        elif message.role == "assistant" and getattr(message, "ai_context_content", None):
+        elif message.role == "assistant":
+            raw = getattr(message, "content", None) or getattr(message, "ai_context_content", None) or ""
+            clean_content, _, _ = extract_service_data(raw)
             normalized.append(AIHistoryMessage(
                 role="assistant",
-                content=message.ai_context_content,
+                content=clean_content if clean_content else raw,
                 topic_id=getattr(message, "topic_id", None),
                 topic=getattr(message, "topic", None),
                 source_role="assistant",
