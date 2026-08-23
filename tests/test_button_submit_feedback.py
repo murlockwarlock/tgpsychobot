@@ -113,8 +113,8 @@ async def test_duplicate_action_buttons_echo_clicked_label_and_share_action():
         )
         second_payload = handlers.user_message_buffers[42][0]
 
-    assert first_message.answer.await_args.args == ("Да",)
-    assert second_message.answer.await_args.args == ("Продолжить",)
+    assert first_message.answer.await_args.args == ("Ответ принят: Да",)
+    assert second_message.answer.await_args.args == ("Ответ принят: Продолжить",)
     assert '"Да" (continue)' in first_payload
     assert '"Продолжить" (continue)' in second_payload
     assert [call.kwargs["visible_user_text"] for call in process.await_args_list] == [
@@ -221,7 +221,7 @@ async def test_ai_button_is_claimed_once_echoes_label_and_removes_keyboard():
     )
     assert callback.answer.await_count == 2
     assert message.edit_calls == [None]
-    message.answer.assert_awaited_once_with("Пропустить", parse_mode=None)
+    message.answer.assert_awaited_once_with("Ответ принят: Пропустить", parse_mode=None)
     assert handlers.user_message_buffers[42] == [
         '[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку "Пропустить" (hero_skip)]'
     ]
@@ -352,6 +352,34 @@ async def test_admin_processing_text_back_returns_to_general_settings(monkeypatc
 
     state.clear.assert_awaited_once_with()
     general_settings.assert_awaited_once_with(callback)
+    callback.answer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_topic_prompt_back_returns_to_topic_editor_menu(monkeypatch):
+    callback = SimpleNamespace(
+        data="cancel_state_edit_topic_17",
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=42),
+            message_id=314,
+        ),
+        from_user=SimpleNamespace(id=42),
+        bot=SimpleNamespace(),
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace(clear=AsyncMock())
+    show_topic_menu = AsyncMock()
+    monkeypatch.setattr(handlers, "_show_edit_topic_menu", show_topic_menu)
+
+    await handlers.cancel_handler(callback, state)
+
+    state.clear.assert_awaited_once_with()
+    show_topic_menu.assert_awaited_once_with(
+        bot=callback.bot,
+        chat_id=42,
+        message_id=314,
+        topic_id=17,
+    )
     callback.answer.assert_awaited_once_with()
 
 

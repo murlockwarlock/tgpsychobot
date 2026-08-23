@@ -260,16 +260,17 @@ async def _disable_ai_button_keyboard(callback: CallbackQuery) -> None:
 async def _echo_ai_button_label(callback: CallbackQuery, bot: Bot, button_text: str | None) -> None:
     if not isinstance(button_text, str) or not button_text:
         return
+    acknowledgement = f"Ответ принят: {button_text}"
     message = getattr(callback, "message", None)
     answer = getattr(message, "answer", None)
     try:
         if callable(answer):
-            await answer(button_text, parse_mode=None)
+            await answer(acknowledgement, parse_mode=None)
             return
         chat = getattr(message, "chat", None)
         chat_id = getattr(chat, "id", None)
         if chat_id is not None:
-            await bot.send_message(chat_id=chat_id, text=button_text, parse_mode=None)
+            await bot.send_message(chat_id=chat_id, text=acknowledgement, parse_mode=None)
     except Exception as exc:
         logging.warning("Failed to echo AI button label: %s", exc)
 
@@ -6345,7 +6346,13 @@ async def cancel_handler(callback: CallbackQuery, state: FSMContext):
     elif target_menu_callback_data.startswith("admin_topics_page_"):
         await admin_topics_paginated(callback_mock)
     elif target_menu_callback_data.startswith("edit_topic_"):
-        await topic_editor_router(callback_mock, state)
+        topic_id = int(target_menu_callback_data.rsplit("_", 1)[-1])
+        await _show_edit_topic_menu(
+            bot=callback.bot,
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            topic_id=topic_id,
+        )
     elif target_menu_callback_data == "admin_manage_admins":
         await admin_manage_admins_menu(callback_mock)
     elif target_menu_callback_data == "admin_manage_buttons":

@@ -19,7 +19,6 @@ REMOTE_PY="${PROD_REMOTE_PY:-/root/telegram_bots/venv/bin/python}"
 REMOTE_RUNTIME_ENV="${PROD_RUNTIME_ENV:-/root/telegram_bots/runtime.env}"
 PM2_NAMES="${PROD_PM2_NAMES:-psy5d_new,veraveda_new,someone01_new,someone02_new,veraveda_legacy,someone02_legacy,someone01_legacy,psy5d_legacy,test01_legacy,test02_legacy,someone03_new,someone04_new,someone05_new,someone06_new,someone07_new,yourself_way_bot,max_veraveda_legacy,max_yourself_way}"
 PM2_CONFIG="${PROD_PM2_CONFIG:-ecosystem.config.js}"
-REMOTE_LOG_BASELINE="/tmp/tgpsychobot-deploy-log-baseline.json"
 
 for arg in "$@"; do
     case "$arg" in
@@ -47,6 +46,11 @@ EOF
             ;;
     esac
 done
+
+if [[ ! "$PM2_NAMES" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+    echo "Refusing to deploy: PROD_PM2_NAMES contains invalid process names." >&2
+    exit 1
+fi
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "Git is not initialized in $ROOT_DIR" >&2
@@ -147,16 +151,19 @@ tar czf - -- "${TRACKED_FILES[@]}" | \
              fi; \
          done; \
      done && \
-     '${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \
-         --snapshot-log-baseline '${REMOTE_LOG_BASELINE}' \
-         --pm2-names '${PM2_NAMES}' && \
-     pm2 startOrReload '${PM2_CONFIG}' --only ${PM2_NAMES} --update-env && \
+     baseline_path= && \
+     trap 'status=\$?; if [[ -n "\$baseline_path" ]]; then rm -f -- "\$baseline_path" 2>/dev/null || true; fi; trap - EXIT; exit "\$status"' EXIT && \
+     baseline_path=\$('${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \
+         --create-log-baseline \
+         --pm2-names '${PM2_NAMES}') && \
+     [[ -n "\$baseline_path" ]] && \
+     pm2 startOrReload '${PM2_CONFIG}' --only '${PM2_NAMES}' --update-env && \
      sleep 10 && \
      pm2 status && \
      '${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \
          --revision '${REVISION}' \
          --pm2-names '${PM2_NAMES}' \
          --root '${REMOTE_DIR}' \
-         --log-baseline '${REMOTE_LOG_BASELINE}'"
+         --log-baseline "\$baseline_path""
 
 echo "Deploy complete."
