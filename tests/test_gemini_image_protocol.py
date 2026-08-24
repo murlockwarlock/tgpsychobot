@@ -291,6 +291,80 @@ async def test_existing_image_provider_routing_remains_authoritative(monkeypatch
     assert not gemini_call.await_args_list
 
 
+@pytest.mark.asyncio
+async def test_telegram_kie_generation_passes_exact_configured_model(monkeypatch):
+    import ai_integration as module
+
+    model = "bytedance/seedream-v4-text-to-image"
+    config = _image_config(gen_provider=PROVIDER_KIE, gen_model=model)
+    kie_call = AsyncMock(return_value=RESULT_BYTES)
+    monkeypatch.setattr(module, "async_session_maker", lambda: _Session(config))
+    monkeypatch.setattr(module, "_call_kie_image_generation", kie_call)
+
+    assert await module.generate_image("prompt") == RESULT_BYTES
+    assert kie_call.await_args.args == ("kie-test-key", "https://kie.example", model, "prompt")
+
+
+@pytest.mark.asyncio
+async def test_telegram_kie_transient_failure_does_not_switch_image_provider(monkeypatch):
+    import ai_integration as module
+
+    config = _image_config(
+        gen_provider=PROVIDER_KIE,
+        gen_model="bytedance/seedream-v4-text-to-image",
+    )
+    kie_call = AsyncMock(side_effect=module.AIServiceError("KIE timeout"))
+    openai_call = AsyncMock(side_effect=AssertionError("OpenAI must not be called"))
+    gemini_call = AsyncMock(side_effect=AssertionError("Gemini must not be called"))
+    monkeypatch.setattr(module, "async_session_maker", lambda: _Session(config))
+    monkeypatch.setattr(module, "_call_kie_image_generation", kie_call)
+    monkeypatch.setattr(module, "generate_openai_image", openai_call)
+    monkeypatch.setattr(gemini_image, "generate_image", gemini_call)
+
+    with pytest.raises(module.AIServiceError, match="KIE timeout"):
+        await module.generate_image("prompt")
+
+    assert kie_call.await_count == 1
+    assert not openai_call.await_args_list
+    assert not gemini_call.await_args_list
+
+
+@pytest.mark.asyncio
+async def test_max_kie_generation_passes_exact_configured_model(monkeypatch):
+    from max_messenger_bot import ai as module
+
+    model = "bytedance/seedream-v4-text-to-image"
+    config = _image_config(gen_provider=PROVIDER_KIE, gen_model=model)
+    kie_call = AsyncMock(return_value=RESULT_BYTES)
+    monkeypatch.setattr(module, "async_session_maker", lambda: _Session(config))
+    monkeypatch.setattr(module, "_generate_kie", kie_call)
+
+    assert await module.generate_image("prompt") == RESULT_BYTES
+    assert kie_call.await_args.args == ("kie-test-key", "https://kie.example", model, "prompt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("UnsupportedProvider", ""))
+async def test_telegram_unsupported_image_generation_provider_fails_closed(monkeypatch, provider):
+    import ai_integration as module
+
+    config = _image_config(gen_provider=provider, gen_model="gpt-image-2")
+    openai_call = AsyncMock(side_effect=AssertionError("OpenAI must not be called"))
+    kie_call = AsyncMock(side_effect=AssertionError("KIE must not be called"))
+    gemini_call = AsyncMock(side_effect=AssertionError("Gemini must not be called"))
+    monkeypatch.setattr(module, "async_session_maker", lambda: _Session(config))
+    monkeypatch.setattr(module, "generate_openai_image", openai_call)
+    monkeypatch.setattr(module, "_call_kie_image_generation", kie_call)
+    monkeypatch.setattr(gemini_image, "generate_image", gemini_call)
+
+    with pytest.raises(module.AIServiceError):
+        await module.generate_image("prompt")
+
+    assert not openai_call.await_args_list
+    assert not kie_call.await_args_list
+    assert not gemini_call.await_args_list
+
+
 class _TelegramMessage:
     def __init__(self):
         self.text = None

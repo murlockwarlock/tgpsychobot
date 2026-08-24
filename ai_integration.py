@@ -2140,8 +2140,16 @@ async def generate_image(prompt: str) -> any:
         if not config:
             raise AIServiceError("Конфигурация ИИ не найдена.")
 
-        provider = getattr(config, "image_generation_provider", None) or config.vision_provider or PROVIDER_OPENAI
+        configured_provider = getattr(config, "image_generation_provider", None)
+        if configured_provider is None:
+            provider = config.vision_provider or PROVIDER_OPENAI
+        elif not isinstance(configured_provider, str) or not configured_provider.strip():
+            raise AIServiceError("Некорректно задан провайдер генерации изображений.")
+        else:
+            provider = configured_provider
         provider_key = _normalize_provider_name(provider)
+        if provider_key not in {"gemini", "kie", "openai"}:
+            raise AIServiceError(f"Генерация изображений не поддерживается для провайдера: {provider}")
         model = getattr(config, "image_generation_model", None) or get_default_model(provider, channel="image_gen")
 
     if provider_key == 'gemini':
@@ -2156,15 +2164,10 @@ async def generate_image(prompt: str) -> any:
             raise AIServiceError("API ключ KIE для генерации не установлен.")
         target_model = model or get_default_model(PROVIDER_KIE, channel="image_gen")
         ensure_model_available(PROVIDER_KIE, target_model, channel="image_gen")
-        try:
-            return await _call_kie_image_generation(api_key, _get_kie_base_url(config), target_model, prompt)
-        except AIServiceError as exc:
-            if _is_kie_transient_failure(exc):
-                logging.warning("KIE image generation transient failure, falling back to OpenAI: %s", exc)
-                return await generate_openai_image(prompt)
-            raise
-    else:
+        return await _call_kie_image_generation(api_key, _get_kie_base_url(config), target_model, prompt)
+    if provider_key == 'openai':
         return await generate_openai_image(prompt)
+    raise AIServiceError(f"Генерация изображений не поддерживается для провайдера: {provider}")
 
 
 async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
