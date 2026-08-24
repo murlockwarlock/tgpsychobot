@@ -49,15 +49,6 @@ def _button_callback(message, data="ai_btn:hero_skip"):
     )
 
 
-@pytest.fixture(autouse=True)
-def _disable_durable_reply_cleanup_for_legacy_button_tests(monkeypatch):
-    monkeypatch.setattr(
-        handlers,
-        "_invalidate_telegram_pending_reply",
-        AsyncMock(return_value=False),
-    )
-
-
 def _button_callback_with_model_copy(message, data):
     callback = _button_callback(message, data)
 

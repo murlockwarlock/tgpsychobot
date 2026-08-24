@@ -20,8 +20,7 @@ from database import TestSession, TestAttempt, TestQuestion, TestConfig, BotGene
 from aiogram import Router, F, Bot
 from pydantic import ValidationError
 from aiogram.types import (Message, CallbackQuery, FSInputFile, Document,
-                           InlineKeyboardMarkup, InlineKeyboardButton,
-                           KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove)
+                           InlineKeyboardMarkup, InlineKeyboardButton)
 from aiogram.filters import CommandStart, Command, StateFilter, Filter, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -41,7 +40,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      ReferralPaymentLog, MailingDeliveryLog, TopicMediaDeck,
                      MediaCollection, media_collection_items, topic_collection_association,
                      ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationEvent,
-                     TelegramPendingAIReply, DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_MAX_LENGTH)
+                     DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_MAX_LENGTH)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
@@ -224,177 +223,6 @@ user_processing_tasks = {}
 NAVIGATION_MENU_HINT = "Нажмите на кнопку или воспользуйтесь меню для навигации"
 
 
-@dataclass(frozen=True)
-class TelegramPendingReplyResult:
-    accepted: bool = False
-    duplicate: bool = False
-    stale_cleared: bool = False
-    label: str | None = None
-    action: str | None = None
-
-
-def _decode_telegram_pending_reply_mapping(pending: TelegramPendingAIReply | None) -> dict[str, str]:
-    if pending is None:
-        return {}
-    try:
-        payload = json.loads(getattr(pending, "mapping_json", "{}") or "{}")
-    except (TypeError, ValueError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    return {
-        str(label): str(action)
-        for label, action in payload.items()
-        if isinstance(label, str) and label and isinstance(action, str) and action
-    }
-
-
-async def _get_telegram_pending_reply(session, user_id: int, *, for_update: bool = False):
-    try:
-        return await session.get(
-            TelegramPendingAIReply,
-            user_id,
-            with_for_update=for_update,
-        )
-    except TypeError:
-        # Small test doubles and older SQLAlchemy-compatible adapters may not
-        # expose the optional row-lock argument.
-        return await session.get(TelegramPendingAIReply, user_id)
-
-
-async def _has_pending_telegram_reply_label(user_id: int, label: str | None) -> bool:
-    if not isinstance(label, str) or not label:
-        return False
-    async with async_session_maker() as session:
-        pending = await _get_telegram_pending_reply(session, user_id)
-    return label in _decode_telegram_pending_reply_mapping(pending)
-
-
-async def _replace_telegram_pending_replies(user_id: int, mapping: dict[str, str]) -> bool:
-    """Replace the durable one-shot mapping and return whether one was active."""
-    normalized_mapping = {
-        str(label): str(action)
-        for label, action in mapping.items()
-        if isinstance(label, str) and label and isinstance(action, str) and action
-    }
-    async with async_session_maker() as session:
-        pending = await _get_telegram_pending_reply(session, user_id, for_update=True)
-        previous_mapping = _decode_telegram_pending_reply_mapping(pending)
-        if pending is None:
-            if not normalized_mapping:
-                return False
-            session.add(TelegramPendingAIReply(
-                user_id=user_id,
-                mapping_json=json.dumps(normalized_mapping, ensure_ascii=False, separators=(",", ":")),
-                consumed_message_id=None,
-            ))
-        else:
-            consumed_message_id = getattr(pending, "consumed_message_id", None)
-            pending.mapping_json = json.dumps(
-                normalized_mapping,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            # Keep the last consumed Telegram message identity while an AI
-            # response has no new answer buttons.  This prevents the same
-            # one-shot update from being replayed after the response cleanup;
-            # a new mapping starts a fresh one-shot generation.
-            if normalized_mapping:
-                pending.consumed_message_id = None
-            else:
-                pending.consumed_message_id = consumed_message_id
-            pending.updated_at = datetime.utcnow()
-        await session.commit()
-    return bool(previous_mapping)
-
-
-async def _invalidate_telegram_pending_reply(user_id: int) -> bool:
-    """Invalidate the current answer keyboard and report whether it was visible."""
-    return await _replace_telegram_pending_replies(user_id, {})
-
-
-async def _consume_telegram_pending_reply(
-    user_id: int,
-    label: str | None,
-    message_id: int | None,
-) -> TelegramPendingReplyResult:
-    try:
-        safe_message_id = int(message_id) if message_id is not None else None
-    except (TypeError, ValueError):
-        safe_message_id = None
-
-    async with async_session_maker() as session:
-        pending = await _get_telegram_pending_reply(session, user_id, for_update=True)
-        if pending is None:
-            return TelegramPendingReplyResult()
-
-        mapping = _decode_telegram_pending_reply_mapping(pending)
-        consumed_message_id = getattr(pending, "consumed_message_id", None)
-        if safe_message_id is not None and consumed_message_id == safe_message_id:
-            return TelegramPendingReplyResult(duplicate=True)
-        if not mapping:
-            return TelegramPendingReplyResult()
-
-        action = mapping.get(label) if isinstance(label, str) else None
-        pending.mapping_json = "{}"
-        pending.consumed_message_id = safe_message_id
-        pending.updated_at = datetime.utcnow()
-        await session.commit()
-
-        if action is None:
-            return TelegramPendingReplyResult(stale_cleared=True)
-        return TelegramPendingReplyResult(
-            accepted=True,
-            label=label,
-            action=action,
-        )
-
-
-class PendingTelegramReplyFilter(Filter):
-    async def __call__(self, message: Message) -> bool:
-        user = getattr(message, "from_user", None)
-        return await _has_pending_telegram_reply_label(
-            getattr(user, "id", None),
-            getattr(message, "text", None),
-        )
-
-
-async def _handle_pending_telegram_reply(
-    message: Message,
-    state: FSMContext | None,
-    bot: Bot,
-    result: TelegramPendingReplyResult,
-) -> bool:
-    if not result.accepted or not result.label or not result.action:
-        return False
-    user_id = message.from_user.id
-    await message.answer(
-        f"Ответ принят: {result.label}",
-        parse_mode=None,
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    user_message_buffers[user_id] = [build_ai_button_system_message(result.label, result.action)]
-    await process_buffered_messages(
-        user_id,
-        bot,
-        state,
-        visible_user_text=result.label,
-    )
-    return True
-
-
-@router.message(PendingTelegramReplyFilter(), StateFilter(None))
-async def handle_pending_telegram_reply(message: Message, state: FSMContext, bot: Bot):
-    result = await _consume_telegram_pending_reply(
-        message.from_user.id,
-        message.text,
-        getattr(message, "message_id", None),
-    )
-    if result.duplicate:
-        return
-    await _handle_pending_telegram_reply(message, state, bot, result)
-
-
 @router.callback_query(F.data.startswith(TELEGRAM_MODEL_CALLBACK_PREFIX))
 async def handle_compact_model_callback(callback: CallbackQuery):
     resolved = resolve_telegram_model_callback(callback.data)
@@ -564,27 +392,21 @@ async def _prepare_ai_button_submission(
         await callback.answer()
         return False, None
 
-    if acknowledge:
-        await callback.answer()
     button_text = _resolve_ai_button_label(callback, callback_data)
     if not button_text:
-        if not acknowledge:
-            await callback.answer()
         log.warning(
             "Could not resolve AI button label; rejecting callback_data=%r message=%s",
             callback_data,
             _ai_button_message_identity(callback),
         )
         await _disable_ai_button_keyboard(callback)
+        await callback.answer()
         return False, None
+
     await _disable_ai_button_keyboard(callback)
-    pending_reply_was_active = await _invalidate_telegram_pending_reply(callback.from_user.id)
-    await _echo_ai_button_label(
-        callback,
-        bot,
-        button_text,
-        reply_markup=ReplyKeyboardRemove() if pending_reply_was_active else None,
-    )
+    if acknowledge:
+        await callback.answer()
+    await _echo_ai_button_label(callback, bot, button_text)
     return True, button_text
 
 user_spread_state = {}  # Runtime cache; the source of truth is card_spread_states in the database.
@@ -1575,143 +1397,25 @@ def _merge_telegram_inline_markups(
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
-TELEGRAM_INLINE_AI_ACTIONS = frozenset({
-    "start_test",
-    "topics",
-    "new_dialogue",
-    "main_menu",
-    "subscription",
-    "referral",
-})
-
-
 @dataclass(frozen=True)
 class TelegramResponseButtonPresentation:
-    reply_markup: ReplyKeyboardMarkup | None
     inline_markup: InlineKeyboardMarkup | None
-    pending_mapping: dict[str, str]
-    replaced_pending: bool
-
-
-def _is_telegram_inline_ai_action(action: str) -> bool:
-    return (
-        action in TELEGRAM_INLINE_AI_ACTIONS
-        or action.startswith("topic_")
-        or action.startswith("admin_")
-        or action.startswith("control_")
-        or action.startswith("menu_")
-    )
-
-
-def _partition_telegram_response_buttons(
-    rows: list[list[ResponseButton]],
-) -> tuple[list[list[ResponseButton]], list[list[ResponseButton]], dict[str, str]]:
-    """Split answer buttons from URLs/navigation without changing the syntax."""
-    destinations_by_label: dict[str, set[tuple[str, str]]] = {}
-    for row in rows:
-        for button in row:
-            destinations_by_label.setdefault(button.text, set()).add(
-                (button.kind, button.value)
-            )
-    ambiguous_labels = {
-        label
-        for label, destinations in destinations_by_label.items()
-        if len(destinations) > 1
-    }
-
-    reply_rows: list[list[ResponseButton]] = []
-    inline_rows: list[list[ResponseButton]] = []
-    pending_mapping: dict[str, str] = {}
-    seen_reply_labels: set[str] = set()
-    for row in rows:
-        reply_row: list[ResponseButton] = []
-        inline_row: list[ResponseButton] = []
-        for button in row:
-            if button.kind == "url":
-                inline_row.append(button)
-                continue
-            if (
-                button.text in ambiguous_labels
-                or _is_telegram_inline_ai_action(button.value)
-            ):
-                inline_row.append(button)
-                continue
-            pending_mapping[button.text] = button.value
-            if button.text not in seen_reply_labels:
-                seen_reply_labels.add(button.text)
-                reply_row.append(button)
-        if reply_row:
-            reply_rows.append(reply_row)
-        if inline_row:
-            inline_rows.append(inline_row)
-    return reply_rows, inline_rows, pending_mapping
-
-
-def _telegram_reply_keyboard_markup(
-    rows: list[list[ResponseButton]],
-) -> ReplyKeyboardMarkup | None:
-    if not rows:
-        return None
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=button.text) for button in row]
-            for row in rows
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
 
 
 async def _prepare_telegram_response_buttons(
     user_id: int,
     rows: list[list[ResponseButton]],
 ) -> TelegramResponseButtonPresentation:
-    reply_rows, inline_rows, pending_mapping = _partition_telegram_response_buttons(rows)
-    replaced_pending = await _replace_telegram_pending_replies(user_id, pending_mapping)
+    del user_id
     return TelegramResponseButtonPresentation(
-        reply_markup=_telegram_reply_keyboard_markup(reply_rows),
-        inline_markup=_telegram_response_buttons_markup(inline_rows),
-        pending_mapping=pending_mapping,
-        replaced_pending=replaced_pending,
+        inline_markup=_telegram_response_buttons_markup(rows),
     )
 
 
 def _telegram_response_text_markup(
     presentation: TelegramResponseButtonPresentation,
-    *,
-    remove_reply_keyboard: bool = False,
 ):
-    if presentation.reply_markup is not None:
-        return presentation.reply_markup
-    if remove_reply_keyboard or presentation.replaced_pending:
-        return ReplyKeyboardRemove()
     return presentation.inline_markup
-
-
-def _telegram_inline_controls_are_separate(
-    presentation: TelegramResponseButtonPresentation,
-    text_markup,
-) -> bool:
-    return bool(
-        presentation.inline_markup
-        and (
-            presentation.reply_markup is not None
-            or isinstance(text_markup, ReplyKeyboardRemove)
-        )
-    )
-
-
-async def _send_telegram_inline_controls(
-    bot: Bot,
-    user_id: int,
-    markup: InlineKeyboardMarkup | None,
-) -> None:
-    if markup is not None:
-        await bot.send_message(
-            chat_id=user_id,
-            text="Дополнительные действия:",
-            reply_markup=markup,
-        )
 
 
 async def _send_generated_response(bot: Bot, user_id: int, text: str) -> None:
@@ -1723,10 +1427,8 @@ async def _send_generated_response(bot: Bot, user_id: int, text: str) -> None:
         await bot.send_message(
             chat_id=user_id,
             text="Выберите действие:",
-            reply_markup=text_markup or presentation.inline_markup,
+            reply_markup=text_markup,
         )
-        if _telegram_inline_controls_are_separate(presentation, text_markup):
-            await _send_telegram_inline_controls(bot, user_id, presentation.inline_markup)
         return
     html_text = markdown_to_html(clean_text)
     chunks = split_html_text(html_text)
@@ -1741,8 +1443,6 @@ async def _send_generated_response(bot: Bot, user_id: int, text: str) -> None:
             ),
             chunk,
         )
-    if _telegram_inline_controls_are_separate(presentation, text_markup):
-        await _send_telegram_inline_controls(bot, user_id, presentation.inline_markup)
 
 
 async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContext | None):
@@ -1808,7 +1508,6 @@ async def process_buffered_messages(
     state: FSMContext | None = None,
     *,
     visible_user_text: str | None = None,
-    remove_reply_keyboard: bool = False,
 ):
     if user_id not in user_message_buffers:
         return
@@ -1838,7 +1537,6 @@ async def process_buffered_messages(
             bot,
             user_id,
             general_config,
-            reply_markup=ReplyKeyboardRemove() if remove_reply_keyboard else None,
         )
 
         response_capture = {}
@@ -1852,7 +1550,6 @@ async def process_buffered_messages(
 
         should_start_test, directive_clean_text = extract_test_start_directive(response_text)
         if should_start_test:
-            await _replace_telegram_pending_replies(user_id, {})
             if directive_clean_text:
                 html_response = markdown_to_html(directive_clean_text)
                 for chunk in split_html_text(html_response):
@@ -1888,10 +1585,7 @@ async def process_buffered_messages(
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_text)
         clean_text, response_button_rows = extract_response_buttons(clean_text)
         presentation = await _prepare_telegram_response_buttons(user_id, response_button_rows)
-        response_text_markup = _telegram_response_text_markup(
-            presentation,
-            remove_reply_keyboard=remove_reply_keyboard,
-        )
+        response_text_markup = _telegram_response_text_markup(presentation)
 
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
@@ -1961,9 +1655,6 @@ async def process_buffered_messages(
                         text="Выберите действие:",
                         reply_markup=response_text_markup,
                     )
-
-            if _telegram_inline_controls_are_separate(presentation, response_text_markup):
-                await _send_telegram_inline_controls(bot, user_id, presentation.inline_markup)
 
             # --- 2. Медиа (карты, аудио) после текста ---
 
@@ -2161,7 +1852,6 @@ async def process_buffered_messages(
         await bot.send_message(
             chat_id=user_id,
             text="Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут.",
-            reply_markup=ReplyKeyboardRemove() if remove_reply_keyboard else None,
         )
     except Exception as e:
         if typing_task: typing_task.cancel()
@@ -2180,7 +1870,6 @@ async def process_buffered_messages(
         await bot.send_message(
             chat_id=user_id,
             text="Произошла ошибка при обработке сообщения.",
-            reply_markup=ReplyKeyboardRemove() if remove_reply_keyboard else None,
         )
     finally:
         await _cancel_task(typing_task)
@@ -5935,7 +5624,6 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         response_text_markup = _telegram_response_text_markup(presentation)
 
         if should_start_test:
-            await _replace_telegram_pending_replies(user_id, {})
             if clean_text:
                 await thinking_msg.edit_text(markdown_to_html(clean_text), parse_mode="HTML")
             else:
@@ -5956,112 +5644,98 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         if image_prompt:
             if text_part:
                 html_text = markdown_to_html(text_part)
-                if isinstance(response_text_markup, (ReplyKeyboardMarkup, ReplyKeyboardRemove)):
-                    await thinking_msg.delete()
-                    chunks = split_html_text(html_text)
-                    for index, chunk in enumerate(chunks):
-                        chunk_markup = response_text_markup if index == len(chunks) - 1 else None
-                        await _safe_send_html(
-                            lambda text, pm, markup=chunk_markup: message.answer(
-                                text, parse_mode=pm, reply_markup=markup
-                            ),
-                            chunk,
-                        )
-                        await asyncio.sleep(0.3)
-                else:
+                try:
+                    await thinking_msg.edit_text(
+                        html_text,
+                        parse_mode="HTML",
+                        reply_markup=response_text_markup,
+                    )
+                except Exception:
+                    fixed_html = _fix_unclosed_html_tags(html_text)
                     try:
-                        await thinking_msg.edit_text(html_text, parse_mode="HTML", reply_markup=response_text_markup)
+                        await thinking_msg.edit_text(
+                            fixed_html,
+                            parse_mode="HTML",
+                            reply_markup=response_text_markup,
+                        )
                     except Exception:
-                        fixed_html = _fix_unclosed_html_tags(html_text)
-                        try:
-                            await thinking_msg.edit_text(fixed_html, parse_mode="HTML", reply_markup=response_text_markup)
-                        except Exception:
-                            await thinking_msg.delete()
-                            chunks = split_html_text(html_text)
-                            for index, chunk in enumerate(chunks):
-                                chunk_markup = response_text_markup if index == len(chunks) - 1 else None
-                                await _safe_send_html(
-                                    lambda text, pm, markup=chunk_markup: message.answer(
-                                        text, parse_mode=pm, reply_markup=markup
-                                    ),
-                                    chunk,
-                                )
-                                await asyncio.sleep(0.3)
+                        await thinking_msg.delete()
+                        chunks = split_html_text(html_text)
+                        for index, chunk in enumerate(chunks):
+                            chunk_markup = response_text_markup if index == len(chunks) - 1 else None
+                            await _safe_send_html(
+                                lambda text, pm, markup=chunk_markup: message.answer(
+                                    text,
+                                    parse_mode=pm,
+                                    reply_markup=markup,
+                                ),
+                                chunk,
+                            )
+                            await asyncio.sleep(0.3)
             elif response_text_markup:
-                if isinstance(response_text_markup, (ReplyKeyboardMarkup, ReplyKeyboardRemove)):
-                    await thinking_msg.delete()
-                    await message.answer("Выберите действие:", reply_markup=response_text_markup)
-                else:
-                    await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
+                await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
             else:
                 await thinking_msg.delete()
 
-            if image_prompt:
-                upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
-                try:
-                    image_data = await ai_integration.generate_image(image_prompt)
-                    await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(image_data, filename="gen.png"), caption="✨ Готово!")
-                except Exception as e:
-                    gen_provider, gen_model = _resolve_ai_provider_model(ai_config, "image_generation")
-                    await _report_ai_failure(
-                        bot,
-                        title="Сбой генерации изображения",
-                        user=message.from_user,
-                        provider=gen_provider,
-                        model=gen_model,
-                        stage="generate_image",
-                        details=str(e),
-                        extra={"prompt_len": len(image_prompt)},
-                        exception=e,
-                    )
-                    await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
-                finally:
-                    upload_task.cancel()
+            upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
+            try:
+                image_data = await ai_integration.generate_image(image_prompt)
+                await bot.send_photo(
+                    chat_id=user_id,
+                    photo=BufferedInputFile(image_data, filename="gen.png"),
+                    caption="✨ Готово!",
+                )
+            except Exception as e:
+                gen_provider, gen_model = _resolve_ai_provider_model(ai_config, "image_generation")
+                await _report_ai_failure(
+                    bot,
+                    title="Сбой генерации изображения",
+                    user=message.from_user,
+                    provider=gen_provider,
+                    model=gen_model,
+                    stage="generate_image",
+                    details=str(e),
+                    extra={"prompt_len": len(image_prompt)},
+                    exception=e,
+                )
+                await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
+            finally:
+                upload_task.cancel()
         else:
             if clean_text:
                 html_response = markdown_to_html(clean_text)
-                if isinstance(response_text_markup, (ReplyKeyboardMarkup, ReplyKeyboardRemove)):
-                    await thinking_msg.delete()
-                    chunks = split_html_text(html_response, 4000)
-                    for index, chunk in enumerate(chunks):
-                        chunk_markup = response_text_markup if index == len(chunks) - 1 else None
-                        await _safe_send_html(
-                            lambda text, pm, markup=chunk_markup: message.answer(
-                                text, parse_mode=pm, reply_markup=markup
-                            ),
-                            chunk,
-                        )
-                        await asyncio.sleep(0.3)
-                else:
+                try:
+                    await thinking_msg.edit_text(
+                        html_response,
+                        parse_mode="HTML",
+                        reply_markup=response_text_markup,
+                    )
+                except Exception:
+                    fixed_html = _fix_unclosed_html_tags(html_response)
                     try:
-                        await thinking_msg.edit_text(html_response, parse_mode="HTML", reply_markup=response_text_markup)
+                        await thinking_msg.edit_text(
+                            fixed_html,
+                            parse_mode="HTML",
+                            reply_markup=response_text_markup,
+                        )
                     except Exception:
-                        fixed_html = _fix_unclosed_html_tags(html_response)
-                        try:
-                            await thinking_msg.edit_text(fixed_html, parse_mode="HTML", reply_markup=response_text_markup)
-                        except Exception:
-                            await thinking_msg.delete()
-                            chunks = split_html_text(html_response, 4000)
-                            for index, chunk in enumerate(chunks):
-                                chunk_markup = response_text_markup if index == len(chunks) - 1 else None
-                                await _safe_send_html(
-                                    lambda text, pm, markup=chunk_markup: message.answer(
-                                        text, parse_mode=pm, reply_markup=markup
-                                    ),
-                                    chunk,
-                                )
-                                await asyncio.sleep(0.3)
+                        await thinking_msg.delete()
+                        chunks = split_html_text(html_response, 4000)
+                        for index, chunk in enumerate(chunks):
+                            chunk_markup = response_text_markup if index == len(chunks) - 1 else None
+                            await _safe_send_html(
+                                lambda text, pm, markup=chunk_markup: message.answer(
+                                    text,
+                                    parse_mode=pm,
+                                    reply_markup=markup,
+                                ),
+                                chunk,
+                            )
+                            await asyncio.sleep(0.3)
             elif response_text_markup:
-                if isinstance(response_text_markup, (ReplyKeyboardMarkup, ReplyKeyboardRemove)):
-                    await thinking_msg.delete()
-                    await message.answer("Выберите действие:", reply_markup=response_text_markup)
-                else:
-                    await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
+                await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
             else:
                 await thinking_msg.delete()
-
-        if _telegram_inline_controls_are_separate(presentation, response_text_markup):
-            await _send_telegram_inline_controls(bot, user_id, presentation.inline_markup)
 
         # --- 2. Медиа (карты, аудио) после текста ---
 
@@ -13733,13 +13407,7 @@ async def finish_test_generation(
         case_markup = kb.case_study_confirmation_keyboard()
         reply_markup = _merge_telegram_inline_markups(reply_markup, case_markup)
 
-    if presentation.reply_markup is not None:
-        await message.edit_text(html_story, reply_markup=None)
-        await message.answer("Выберите действие:", reply_markup=presentation.reply_markup)
-        if reply_markup is not None:
-            await message.answer("Дополнительные действия:", reply_markup=reply_markup)
-    else:
-        await message.edit_text(html_story, reply_markup=reply_markup)
+    await message.edit_text(html_story, reply_markup=reply_markup)
 
 
 @router.callback_query(F.data == "test_confirm_case")
@@ -13883,7 +13551,6 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
     interpretation_response = interpretation_response.replace("{user_name}", user_name)
     visible_interpretation, interpretation_buttons = extract_response_buttons(interpretation_response)
     presentation = await _prepare_telegram_response_buttons(user_id, interpretation_buttons)
-    interpretation_markup = presentation.inline_markup
     interpretation_text_markup = _telegram_response_text_markup(presentation)
 
     html_response = markdown_to_html(
@@ -13912,12 +13579,6 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
             chunk,
         )
         await asyncio.sleep(0.3)
-
-    if _telegram_inline_controls_are_separate(presentation, interpretation_text_markup):
-        await callback.message.answer(
-            "Дополнительные действия:",
-            reply_markup=interpretation_markup,
-        )
 
     if secret_test_enabled:
         secret_test_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -16070,7 +15731,6 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
 
             clean_text, button_rows = extract_response_buttons(clean_text)
             presentation = await _prepare_telegram_response_buttons(user_id, button_rows)
-            response_markup = presentation.inline_markup
             response_text_markup = _telegram_response_text_markup(presentation)
 
             formatted_html = markdown_to_html(clean_text)
@@ -16086,17 +15746,15 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 for index, part in enumerate(parts):
                     part_markup = response_text_markup if index == len(parts) - 1 else None
                     await _safe_send_html(
-                        lambda text, pm, reply_markup=part_markup: message.answer(text, parse_mode=pm, reply_markup=reply_markup),
+                        lambda text, pm, reply_markup=part_markup: message.answer(
+                            text,
+                            parse_mode=pm,
+                            reply_markup=reply_markup,
+                        ),
                         part,
                     )
             elif response_text_markup:
                 await message.answer("Выберите действие:", reply_markup=response_text_markup)
-
-            if _telegram_inline_controls_are_separate(presentation, response_text_markup):
-                await message.answer(
-                    "Дополнительные действия:",
-                    reply_markup=response_markup,
-                )
 
             if edit_prompt:
                 m_gen_status = await message.answer("🎨 Редактирую ваше фото...")
@@ -16652,17 +16310,6 @@ async def show_referral_from_sub(callback: CallbackQuery, bot: Bot):
 @router.message(F.text, StateFilter(None))
 async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    pending_result = await _consume_telegram_pending_reply(
-        user_id,
-        message.text,
-        getattr(message, "message_id", None),
-    )
-    if pending_result.duplicate:
-        return
-    if pending_result.accepted:
-        await _handle_pending_telegram_reply(message, state, bot, pending_result)
-        return
-    remove_reply_keyboard = pending_result.stale_cleared
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.subscription)])
@@ -16725,7 +16372,6 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
             user_id,
             bot,
             state,
-            remove_reply_keyboard=remove_reply_keyboard,
         )
 
     user_processing_tasks[user_id] = asyncio.create_task(debounced_process())

@@ -3,19 +3,18 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 import pytest_asyncio
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from sqlalchemy import select
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import handlers
-from database import Base, Message as DBMessage, TelegramPendingAIReply, User
+from database import Base, TelegramPendingAIReply, User
 from response_buttons import extract_response_buttons
 
 
@@ -39,22 +38,30 @@ async def pending_store(tmp_path, monkeypatch):
 
     monkeypatch.setattr(handlers, "async_session_maker", sessions)
     handlers.user_message_buffers.clear()
+    handlers.user_processing_tasks.clear()
+    handlers._ai_button_claims.clear()
     try:
         yield engine, sessions
     finally:
         handlers.user_message_buffers.clear()
+        handlers.user_processing_tasks.clear()
+        handlers._ai_button_claims.clear()
         await engine.dispose()
 
 
 class _ReplyMessage:
-    def __init__(self, text: str, message_id: int = 101):
+    def __init__(self, text: str = "ответ", message_id: int = 101, reply_markup=None):
         self.text = text
         self.message_id = message_id
-        self.from_user = SimpleNamespace(id=42)
+        self.from_user = SimpleNamespace(id=42, username="tester", full_name="Тест")
         self.chat = SimpleNamespace(id=42)
         self.answer = AsyncMock()
-        self.reply_markup = None
-        self.edit_reply_markup = AsyncMock()
+        self.reply_markup = reply_markup
+        self.edit_calls = []
+
+    async def edit_reply_markup(self, *, reply_markup=None):
+        self.edit_calls.append(reply_markup)
+        self.reply_markup = reply_markup
 
 
 class _ReplyBot:
@@ -69,296 +76,205 @@ class _ReplyBot:
         return SimpleNamespace(delete=AsyncMock())
 
 
-def test_conversational_actions_render_as_reply_keyboard_and_navigation_stays_inline():
+def _button_callback(message, data="ai_btn:some_new_action"):
+    return SimpleNamespace(
+        data=data,
+        from_user=SimpleNamespace(id=42),
+        message=message,
+        answer=AsyncMock(),
+    )
+
+
+def test_all_ai_response_buttons_are_inline_and_keep_rows_and_urls():
     _, rows = extract_response_buttons(
-        "[Синтетический ответ](btn:some_new_action) | [Другой ответ](btn:another_new_action)\n"
-        "[Документация](https://example.com) | [Навигация](btn:topics)"
+        "[Новый ответ](btn:some_new_action) | [Сайт](https://example.com) | [Темы](btn:topics)\n"
+        "[Тест](btn:start_test) | [Тема](btn:topic_42) | [Меню](btn:main_menu)"
     )
 
-    reply_rows, inline_rows, pending_mapping = handlers._partition_telegram_response_buttons(rows)
-    reply_markup = handlers._telegram_reply_keyboard_markup(reply_rows)
-    inline_markup = handlers._telegram_response_buttons_markup(inline_rows)
+    markup = handlers._telegram_response_buttons_markup(rows)
 
-    assert isinstance(reply_markup, ReplyKeyboardMarkup)
-    assert reply_markup.resize_keyboard is True
-    assert reply_markup.one_time_keyboard is True
-    assert [button.text for button in reply_markup.keyboard[0]] == ["Синтетический ответ", "Другой ответ"]
-    assert pending_mapping == {
-        "Синтетический ответ": "some_new_action",
-        "Другой ответ": "another_new_action",
-    }
-    assert inline_markup is not None
-    assert inline_markup.inline_keyboard[0][0].url == "https://example.com"
-    assert inline_markup.inline_keyboard[0][1].callback_data.startswith("ai_btn:topics")
-
-
-def test_ambiguous_visible_label_stays_inline_but_same_action_with_different_labels_is_reply_keyboard():
-    _, ambiguous_rows = extract_response_buttons(
-        "[Неоднозначный ответ](btn:first) | [Неоднозначный ответ](btn:second)"
-    )
-    reply_rows, inline_rows, pending_mapping = handlers._partition_telegram_response_buttons(ambiguous_rows)
-    assert reply_rows == []
-    assert pending_mapping == {}
-    assert len(inline_rows[0]) == 2
-
-    _, valid_rows = extract_response_buttons(
-        "[Ответ A](btn:continue) | [Ответ B](btn:continue)"
-    )
-    reply_rows, inline_rows, pending_mapping = handlers._partition_telegram_response_buttons(valid_rows)
-    assert len(reply_rows[0]) == 2
-    assert inline_rows == []
-    assert pending_mapping == {"Ответ A": "continue", "Ответ B": "continue"}
-
-    _, url_collision_rows = extract_response_buttons(
-        "[Одинаковый текст](btn:some_new_action) | "
-        "[Одинаковый текст](https://example.com)"
-    )
-    reply_rows, inline_rows, pending_mapping = handlers._partition_telegram_response_buttons(url_collision_rows)
-    assert reply_rows == []
-    assert pending_mapping == {}
-    assert len(inline_rows[0]) == 2
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert len(markup.inline_keyboard) == 2
+    buttons = [button for row in markup.inline_keyboard for button in row]
+    assert [button.text for button in buttons] == [
+        "Новый ответ",
+        "Сайт",
+        "Темы",
+        "Тест",
+        "Тема",
+        "Меню",
+    ]
+    assert buttons[0].callback_data == "ai_btn:some_new_action"
+    assert buttons[1].url == "https://example.com"
+    assert buttons[2].callback_data == "ai_btn:topics"
+    assert buttons[3].callback_data == "ai_btn:start_test"
+    assert buttons[4].callback_data == "ai_btn:topic_42"
+    assert buttons[5].callback_data == "ai_btn:main_menu"
 
 
 @pytest.mark.asyncio
-async def test_generated_response_persists_arbitrary_new_reply_button_and_sends_reply_keyboard(pending_store):
-    bot = _ReplyBot()
+async def test_generated_response_uses_one_inline_markup_and_does_not_touch_legacy_rows(pending_store):
+    _, sessions = pending_store
+    async with sessions() as session:
+        session.add(TelegramPendingAIReply(
+            user_id=42,
+            mapping_json=json.dumps({"Старая кнопка": "old_action"}, ensure_ascii=False),
+            consumed_message_id=None,
+        ))
+        await session.commit()
 
+    bot = _ReplyBot()
     await handlers._send_generated_response(
         bot,
         42,
-        "[Совершенно новый ответ](btn:some_new_action)",
+        "Текст ответа\n[Новый ответ](btn:some_new_action) | [Документация](https://example.com)",
     )
 
     assert len(bot.sent) == 1
-    assert bot.sent[0]["text"] == "Выберите действие:"
-    assert isinstance(bot.sent[0]["reply_markup"], ReplyKeyboardMarkup)
-    assert bot.sent[0]["reply_markup"].keyboard[0][0].text == "Совершенно новый ответ"
+    assert bot.sent[0]["text"] == "Текст ответа"
+    markup = bot.sent[0]["reply_markup"]
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert [button.text for row in markup.inline_keyboard for button in row] == [
+        "Новый ответ",
+        "Документация",
+    ]
+    assert not hasattr(markup, "keyboard")
 
-    async with pending_store[1]() as session:
+    async with sessions() as session:
         pending = await session.get(TelegramPendingAIReply, 42)
-    assert json.loads(pending.mapping_json) == {"Совершенно новый ответ": "some_new_action"}
+    assert json.loads(pending.mapping_json) == {"Старая кнопка": "old_action"}
 
 
 @pytest.mark.asyncio
-async def test_mixed_response_keeps_reply_and_inline_controls(pending_store):
+async def test_mixed_answer_url_and_navigation_buttons_stay_under_the_same_message():
     bot = _ReplyBot()
 
     await handlers._send_generated_response(
         bot,
         42,
         "Текст ответа\n"
-        "[Синтетический ответ](btn:some_new_action) | "
-        "[Документация](https://example.com)",
+        "[Да](btn:yes) | [Документация](https://example.com) | [Подписка](btn:subscription)",
     )
 
-    assert len(bot.sent) == 2
-    assert isinstance(bot.sent[0]["reply_markup"], ReplyKeyboardMarkup)
-    assert bot.sent[0]["reply_markup"].keyboard[0][0].text == "Синтетический ответ"
-    assert bot.sent[1]["text"] == "Дополнительные действия:"
-    assert bot.sent[1]["reply_markup"].inline_keyboard[0][0].url == "https://example.com"
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["text"] == "Текст ответа"
+    markup = bot.sent[0]["reply_markup"]
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert [button.callback_data for button in markup.inline_keyboard[0]] == [
+        "ai_btn:yes",
+        None,
+        "ai_btn:subscription",
+    ]
+    assert markup.inline_keyboard[0][1].url == "https://example.com"
 
 
 @pytest.mark.asyncio
-async def test_accepted_inline_control_invalidates_mixed_reply_keyboard(pending_store, monkeypatch):
-    handlers._ai_button_claims.clear()
-    handlers.user_message_buffers.clear()
-    await handlers._replace_telegram_pending_replies(
-        42,
-        {"Старая синтетическая кнопка": "old_answer_action"},
+async def test_inline_click_disables_first_echoes_once_and_runs_one_continuation(pending_store):
+    message = _ReplyMessage(
+        message_id=601,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Да", callback_data="ai_btn:yes"),
+        ]]),
     )
-    markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Панель действий", callback_data="ai_btn:control_action"),
-    ]])
-    message = _ReplyMessage("mixed", message_id=601)
-    message.reply_markup = markup
-    callback = SimpleNamespace(
-        data="ai_btn:control_action",
-        from_user=SimpleNamespace(id=42),
-        message=message,
-        answer=AsyncMock(),
-    )
-    process = AsyncMock()
-    monkeypatch.setattr(handlers, "process_buffered_messages", process)
+    events = []
 
-    await handlers.process_response_button(callback, None, _ReplyBot())
+    async def echo(*args, **kwargs):
+        events.append("echo")
 
-    async with pending_store[1]() as session:
-        pending = await session.get(TelegramPendingAIReply, 42)
-    assert json.loads(pending.mapping_json) == {}
-    assert isinstance(
-        message.answer.await_args.kwargs["reply_markup"],
-        ReplyKeyboardRemove,
-    )
-    assert process.await_count == 1
+    message.answer = AsyncMock(side_effect=echo)
+    callback = _button_callback(message, "ai_btn:yes")
 
-    stale_reply = await handlers._consume_telegram_pending_reply(
-        42,
-        "Старая синтетическая кнопка",
-        602,
-    )
-    assert stale_reply.accepted is False
-    assert stale_reply.stale_cleared is False
-    assert process.await_count == 1
+    async def acknowledge(*args, **kwargs):
+        events.append("callback_ack")
 
+    callback.answer = AsyncMock(side_effect=acknowledge)
+    process = AsyncMock(side_effect=lambda *args, **kwargs: events.append("continue"))
+    original_edit = message.edit_reply_markup
 
-@pytest.mark.asyncio
-async def test_special_inline_control_invalidates_pending_reply_keyboard(pending_store, monkeypatch):
-    handlers._ai_button_claims.clear()
-    await handlers._replace_telegram_pending_replies(
-        42,
-        {"Ещё один синтетический ответ": "another_answer_action"},
-    )
-    markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Открыть раздел", callback_data="ai_btn:topics"),
-    ]])
-    message = _ReplyMessage("mixed", message_id=603)
-    message.reply_markup = markup
-    callback = SimpleNamespace(
-        data="ai_btn:topics",
-        from_user=SimpleNamespace(id=42),
-        message=message,
-        answer=AsyncMock(),
-    )
-    topics = AsyncMock()
-    monkeypatch.setattr(handlers, "select_topic_menu", topics)
+    async def disable(*args, **kwargs):
+        events.append("disable")
+        await original_edit(*args, **kwargs)
 
-    await handlers.process_response_button(callback, None, _ReplyBot())
+    message.edit_reply_markup = disable
+    original_process = handlers.process_buffered_messages
+    handlers.process_buffered_messages = process
+    try:
+        await handlers.process_response_button(callback, None, _ReplyBot())
+        await handlers.process_response_button(callback, None, _ReplyBot())
+    finally:
+        handlers.process_buffered_messages = original_process
 
-    async with pending_store[1]() as session:
-        pending = await session.get(TelegramPendingAIReply, 42)
-    assert json.loads(pending.mapping_json) == {}
-    assert isinstance(message.answer.await_args.kwargs["reply_markup"], ReplyKeyboardRemove)
-    topics.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_unresolved_inline_control_does_not_invalidate_pending_reply_keyboard(pending_store):
-    handlers._ai_button_claims.clear()
-    await handlers._replace_telegram_pending_replies(
-        42,
-        {"Сохрани этот ответ": "preserve_answer_action"},
-    )
-    message = _ReplyMessage("mixed", message_id=604)
-    message.reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Действие", callback_data="ai_btn:known_action"),
-    ]])
-    callback = SimpleNamespace(
-        data="ai_btn:missing_action",
-        from_user=SimpleNamespace(id=42),
-        message=message,
-        answer=AsyncMock(),
-    )
-
-    await handlers.process_response_button(callback, None, _ReplyBot())
-
-    async with pending_store[1]() as session:
-        pending = await session.get(TelegramPendingAIReply, 42)
-    assert json.loads(pending.mapping_json) == {"Сохрани этот ответ": "preserve_answer_action"}
-    assert message.answer.await_count == 0
-
-
-@pytest.mark.asyncio
-async def test_reply_mapping_persists_across_session_reload_and_replaces_previous(pending_store):
-    engine, sessions = pending_store
-    assert await handlers._replace_telegram_pending_replies(42, {"Архивный вариант": "old"}) is False
-    assert await handlers._replace_telegram_pending_replies(42, {"Свежий вариант": "new"}) is True
-
-    async with sessions() as session:
-        pending = await session.get(TelegramPendingAIReply, 42)
-        assert json.loads(pending.mapping_json) == {"Свежий вариант": "new"}
-
-    reloaded_sessions = async_sessionmaker(engine, expire_on_commit=False)
-    handlers.async_session_maker = reloaded_sessions
-    result = await handlers._consume_telegram_pending_reply(42, "Свежий вариант", 201)
-    assert result.accepted is True
-    assert result.label == "Свежий вариант"
-    assert result.action == "new"
-
-
-@pytest.mark.asyncio
-async def test_pending_reply_is_consumed_once_with_exact_context_and_no_duplicate_user_message(pending_store, monkeypatch):
-    await handlers._replace_telegram_pending_replies(42, {"Синтетический ответ": "some_new_action"})
-    message = _ReplyMessage("Синтетический ответ", message_id=301)
-    bot = _ReplyBot()
-    generated = AsyncMock(return_value="Принято")
-
-    monkeypatch.setattr(handlers, "_resend_active_spread_choice", AsyncMock(return_value=False))
-    monkeypatch.setattr(
-        handlers,
-        "handle_ai_media_content",
-        AsyncMock(return_value=("Принято", [], [], [], [], [])),
-    )
-    monkeypatch.setattr(handlers.ai_integration, "generate_response", generated)
-
-    result = await handlers._consume_telegram_pending_reply(42, message.text, message.message_id)
-    assert result.accepted is True
-    await handlers._handle_pending_telegram_reply(message, None, bot, result)
-
-    replay = await handlers._consume_telegram_pending_reply(42, message.text, message.message_id)
-    assert replay.duplicate is True
-    assert generated.await_count == 1
-    assert handlers.user_message_buffers.get(42) is None
-
+    assert events.index("disable") < events.index("echo") < events.index("continue")
+    assert message.edit_calls == [None]
     assert message.answer.await_count == 1
-    acknowledgement = message.answer.await_args
-    assert acknowledgement.args == ("Ответ принят: Синтетический ответ",)
-    assert isinstance(acknowledgement.kwargs["reply_markup"], ReplyKeyboardRemove)
-
-    async with pending_store[1]() as session:
-        user_messages = (
-            await session.execute(
-                select(DBMessage).where(DBMessage.user_id == 42, DBMessage.role == "user")
-            )
-        ).scalars().all()
-    assert len(user_messages) == 1
-    assert user_messages[0].content == "Синтетический ответ"
-    assert user_messages[0].ai_context_content == (
-        '[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку "Синтетический ответ" (some_new_action)]'
+    assert message.answer.await_args.args == ("Ответ принят: Да",)
+    assert message.answer.await_args.kwargs == {"parse_mode": None}
+    assert process.await_count == 1
+    process.assert_awaited_once_with(
+        42,
+        ANY,
+        None,
+        visible_user_text="Да",
     )
+    assert handlers.user_message_buffers[42] == [
+        '[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку "Да" (yes)]'
+    ]
 
 
 @pytest.mark.asyncio
-async def test_arbitrary_typed_text_clears_stale_mapping(pending_store):
-    await handlers._replace_telegram_pending_replies(42, {"Синтетический ответ": "some_new_action"})
+async def test_stale_legacy_rows_do_not_intercept_ordinary_typed_text(pending_store, monkeypatch):
+    _, sessions = pending_store
+    async with sessions() as session:
+        session.add(TelegramPendingAIReply(
+            user_id=42,
+            mapping_json=json.dumps({"Старая кнопка": "old_action"}, ensure_ascii=False),
+            consumed_message_id=None,
+        ))
+        await session.commit()
 
-    stale = await handlers._consume_telegram_pending_reply(42, "обычный текст", 401)
-    assert stale.stale_cleared is True
-
-    old_button = await handlers._consume_telegram_pending_reply(42, "Синтетический ответ", 402)
-    assert old_button.accepted is False
-    assert old_button.stale_cleared is False
-
-
-@pytest.mark.asyncio
-async def test_arbitrary_typed_text_remains_normal_input_and_removes_stale_keyboard(
-    pending_store,
-    monkeypatch,
-):
-    await handlers._replace_telegram_pending_replies(42, {"Синтетический ответ": "some_new_action"})
-    message = _ReplyMessage("обычный пользовательский текст", message_id=501)
-    message.from_user.username = "tester"
-    message.from_user.full_name = "Тест"
+    message = _ReplyMessage("обычный пользовательский текст", message_id=701)
     state = SimpleNamespace()
     bot = SimpleNamespace()
     process = AsyncMock()
-
     monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
     monkeypatch.setattr(handlers, "_sync_user_birthdate_from_telegram", AsyncMock())
     monkeypatch.setattr(handlers, "_request_profile_onboarding_if_needed", AsyncMock(return_value=False))
     monkeypatch.setattr(handlers, "process_buffered_messages", process)
-    handlers.user_processing_tasks.clear()
 
     await handlers.handle_ai_chat(message, state, bot)
     await handlers.user_processing_tasks[42]
 
-    process.assert_awaited_once_with(
-        42,
-        bot,
-        state,
-        remove_reply_keyboard=True,
-    )
+    process.assert_awaited_once_with(42, bot, state)
     assert handlers.user_message_buffers[42] == ["обычный пользовательский текст"]
-    handlers.user_processing_tasks.clear()
+    async with sessions() as session:
+        pending = await session.get(TelegramPendingAIReply, 42)
+    assert json.loads(pending.mapping_json) == {"Старая кнопка": "old_action"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_ai_button_callback_still_uses_inline_label_and_action():
+    handlers._ai_button_claims.clear()
+    handlers.user_message_buffers.clear()
+    message = _ReplyMessage(
+        message_id=702,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Продолжить", callback_data="ai_btn:legacy_action"),
+        ]]),
+    )
+    callback = _button_callback(message, "ai_btn:legacy_action")
+    process = AsyncMock()
+    original_process = handlers.process_buffered_messages
+    handlers.process_buffered_messages = process
+    try:
+        await handlers.process_response_button(callback, None, _ReplyBot())
+    finally:
+        handlers.process_buffered_messages = original_process
+
+    assert message.answer.await_args.args == ("Ответ принят: Продолжить",)
+    process.assert_awaited_once()
+    assert handlers.user_message_buffers[42] == [
+        '[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку "Продолжить" (legacy_action)]'
+    ]
 
 
 @pytest.mark.asyncio
