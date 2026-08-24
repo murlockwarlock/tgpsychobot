@@ -58,9 +58,9 @@ def _surface_module(surface: str):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ("telegram", "max"))
-async def test_gemini_image_generation_missing_model_fails_before_http(monkeypatch, surface):
+async def test_gemini_image_generation_invalid_model_fails_before_http(monkeypatch, surface):
     module = _surface_module(surface)
-    config = _image_config(provider=PROVIDER_GEMINI, model=None)
+    config = _image_config(provider=PROVIDER_GEMINI, model="gemini-3.7-flash")
     http_client_factory = Mock(side_effect=AssertionError("HTTP client must not be created"))
 
     monkeypatch.setattr(module, "async_session_maker", lambda: _SessionContext(config))
@@ -74,9 +74,9 @@ async def test_gemini_image_generation_missing_model_fails_before_http(monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ("telegram", "max"))
-async def test_gemini_image_edit_missing_model_fails_before_http(monkeypatch, surface):
+async def test_gemini_image_edit_invalid_model_fails_before_http(monkeypatch, surface):
     module = _surface_module(surface)
-    config = _image_config(provider=PROVIDER_GEMINI, model=None)
+    config = _image_config(provider=PROVIDER_GEMINI, model="gemini-3.7-flash")
     http_client_factory = Mock(side_effect=AssertionError("HTTP client must not be created"))
 
     monkeypatch.setattr(module, "async_session_maker", lambda: _SessionContext(config))
@@ -117,9 +117,8 @@ async def test_retired_stored_google_image_model_fails_before_http(
 
 
 @pytest.mark.parametrize("channel", ("image_gen", "image_edit"))
-def test_gemini_image_defaults_fail_closed_instead_of_using_chat_model(channel):
-    with pytest.raises(ModelUnavailableError):
-        get_default_model(PROVIDER_GEMINI, channel=channel)
+def test_gemini_image_defaults_use_direct_image_model(channel):
+    assert get_default_model(PROVIDER_GEMINI, channel=channel) == "gemini-3.1-flash-image"
 
 
 def test_supported_image_defaults_are_catalog_defaults():

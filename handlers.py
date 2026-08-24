@@ -4296,8 +4296,7 @@ async def admin_toggle_transcription(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_toggle_image_generation")
 async def admin_toggle_image_generation(callback: CallbackQuery):
-    # Gemini image-gen is retired until protocol migration; cycle is OpenAI <-> KIE only
-    _IMG_GEN_CYCLE = [PROVIDER_OPENAI, PROVIDER_KIE]
+    _IMG_GEN_CYCLE = [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_KIE]
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
@@ -4305,8 +4304,6 @@ async def admin_toggle_image_generation(callback: CallbackQuery):
             return
 
         current_igp = config.image_generation_provider or PROVIDER_OPENAI
-        if current_igp == PROVIDER_GEMINI:
-            current_igp = PROVIDER_OPENAI  # migrate stale Gemini to next valid provider
         try:
             idx = _IMG_GEN_CYCLE.index(current_igp)
         except ValueError:
@@ -4327,18 +4324,23 @@ async def admin_toggle_image_generation(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_toggle_image_edit")
 async def admin_toggle_image_edit(callback: CallbackQuery):
-    # Gemini image-edit is retired until protocol migration; only KIE is valid
+    _IMG_EDIT_CYCLE = [PROVIDER_KIE, PROVIDER_GEMINI]
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
             await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
             return
 
-        # Force KIE regardless of previous provider since Gemini image-edit is retired
-        config.image_edit_provider = PROVIDER_KIE
+        current_iep = config.image_edit_provider or PROVIDER_KIE
+        try:
+            idx = _IMG_EDIT_CYCLE.index(current_iep)
+        except ValueError:
+            idx = 0
+        next_iep = _IMG_EDIT_CYCLE[(idx + 1) % len(_IMG_EDIT_CYCLE)]
+        config.image_edit_provider = next_iep
         config.image_edit_model = validate_model_selection(
-            PROVIDER_KIE,
-            get_default_model(PROVIDER_KIE, channel="image_edit"),
+            next_iep,
+            get_default_model(next_iep, channel="image_edit"),
             channel="image_edit",
         )
         await session.commit()
@@ -17188,9 +17190,6 @@ async def admin_change_image_generation_model_list(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         provider = getattr(config, "image_generation_provider", None) or PROVIDER_OPENAI
-        # Gemini image-gen retired; migrate stale provider to display valid models
-        if provider == PROVIDER_GEMINI:
-            provider = PROVIDER_OPENAI
 
     models = list(get_selectable_models(provider, channel="image_gen"))
     builder = InlineKeyboardBuilder()
@@ -17237,9 +17236,6 @@ async def admin_change_image_edit_model_list(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         provider = getattr(config, "image_edit_provider", None) or PROVIDER_KIE
-        # Gemini image-edit retired; migrate stale provider to KIE
-        if provider == PROVIDER_GEMINI:
-            provider = PROVIDER_KIE
 
     models = list(get_selectable_models(provider, channel="image_edit"))
     builder = InlineKeyboardBuilder()

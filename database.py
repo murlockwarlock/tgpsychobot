@@ -696,6 +696,21 @@ def _migrate_ai_config_models(sync_conn) -> None:
           AND vision_model IN ('gpt-4o', 'gpt-4o-mini')
     """))
 
+    # 5. Migrate only retired direct Gemini image IDs. KIE image model IDs
+    # remain untouched even when their model name contains a Google prefix.
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET image_generation_model = 'gemini-3.1-flash-image'
+        WHERE LOWER(COALESCE(image_generation_provider, '')) = 'gemini'
+          AND image_generation_model IN ('imagen-4.0-generate-001', 'gemini-3-pro-image-preview')
+    """))
+    sync_conn.execute(text("""
+        UPDATE ai_config
+        SET image_edit_model = 'gemini-3.1-flash-image'
+        WHERE LOWER(COALESCE(image_edit_provider, '')) = 'gemini'
+          AND image_edit_model IN ('imagen-4.0-generate-001', 'gemini-3-pro-image-preview')
+    """))
+
 
 async def _acquire_database_init_lock(conn):
     if getattr(getattr(conn, 'dialect', None), 'name', None) != 'postgresql':

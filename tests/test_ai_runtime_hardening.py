@@ -146,7 +146,11 @@ def test_gemini_preview_cannot_return_to_the_vision_picker_after_migration():
                 vision_provider VARCHAR,
                 vision_model VARCHAR,
                 fallback_provider VARCHAR,
-                fallback_model VARCHAR
+                fallback_model VARCHAR,
+                image_generation_provider VARCHAR,
+                image_generation_model VARCHAR,
+                image_edit_provider VARCHAR,
+                image_edit_model VARCHAR
             )
         """))
         conn.execute(text("""

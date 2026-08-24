@@ -466,33 +466,39 @@ async def save_global_prompt_appendix(client: MaxApiClient, states: StateStore, 
 
 
 async def toggle_image_generation(client: MaxApiClient, chat_id: int) -> None:
+    cycle = [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_KIE]
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        if config.image_generation_provider == "OpenAI":
-            config.image_generation_provider = "KIE"
-            config.image_generation_model = validate_model_selection(
-                PROVIDER_KIE,
-                get_default_model(PROVIDER_KIE, channel="image_gen"),
-                channel="image_gen",
-            )
-        else:
-            config.image_generation_provider = "OpenAI"
-            config.image_generation_model = validate_model_selection(
-                PROVIDER_OPENAI,
-                get_default_model(PROVIDER_OPENAI, channel="image_gen"),
-                channel="image_gen",
-            )
+        current_provider = config.image_generation_provider or PROVIDER_OPENAI
+        try:
+            current_index = cycle.index(current_provider)
+        except ValueError:
+            current_index = 0
+        next_provider = cycle[(current_index + 1) % len(cycle)]
+        config.image_generation_provider = next_provider
+        config.image_generation_model = validate_model_selection(
+            next_provider,
+            get_default_model(next_provider, channel="image_gen"),
+            channel="image_gen",
+        )
         await session.commit()
     await show_keys(client, chat_id)
 
 
 async def toggle_image_edit(client: MaxApiClient, chat_id: int) -> None:
+    cycle = [PROVIDER_KIE, PROVIDER_GEMINI]
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        config.image_edit_provider = "KIE"
+        current_provider = config.image_edit_provider or PROVIDER_KIE
+        try:
+            current_index = cycle.index(current_provider)
+        except ValueError:
+            current_index = 0
+        next_provider = cycle[(current_index + 1) % len(cycle)]
+        config.image_edit_provider = next_provider
         config.image_edit_model = validate_model_selection(
-            PROVIDER_KIE,
-            get_default_model(PROVIDER_KIE, channel="image_edit"),
+            next_provider,
+            get_default_model(next_provider, channel="image_edit"),
             channel="image_edit",
         )
         await session.commit()

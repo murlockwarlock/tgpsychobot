@@ -15,6 +15,7 @@ import google.generativeai as genai  # noqa: F401
 from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+import gemini_image
 
 from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, async_session_maker
 from .logging_utils import configure_logging, get_ai_logger
@@ -1327,26 +1328,14 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def _generate_gemini(api_key: str, model: str, prompt: str) -> bytes:
-    import httpx
-
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_gen")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:predict?key={api_key}"
-    payload = {
-        "instances": [{"prompt": prompt}],
-        "parameters": {"sampleCount": 1, "aspectRatio": "1:1"},
-    }
-    async with httpx.AsyncClient(timeout=90.0, transport=_build_gemini_proxy_transport()) as http:
-        resp = await http.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-    predictions = data.get("predictions", [])
-    if not predictions:
-        raise AIServiceError("Imagen вернул пустой ответ")
-    img_b64 = predictions[0].get("bytesBase64Encoded")
-    if not img_b64:
-        raise AIServiceError("Imagen не вернул данные изображения")
-    return base64.b64decode(img_b64)
+    try:
+        return await gemini_image.generate_image(api_key, target_model, prompt)
+    except gemini_image.GeminiImageResponseError as exc:
+        raise AIResponseError(str(exc)) from exc
+    except gemini_image.GeminiImageError as exc:
+        raise AIServiceError(str(exc)) from exc
 
 
 async def _generate_openai(api_key: str, prompt: str) -> bytes:
@@ -1404,33 +1393,14 @@ async def generate_image(prompt: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 async def _edit_gemini(api_key: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
-    import httpx
-
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_edit")
-    b64_data = base64.b64encode(image_bytes).decode()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
-            ]
-        }],
-        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
-    }
-    async with httpx.AsyncClient(timeout=120.0) as http:
-        resp = await http.post(url, json=payload, headers={"Content-Type": "application/json"})
-        resp.raise_for_status()
-        data = resp.json()
-    candidates = data.get("candidates", [])
-    if not candidates:
-        raise AIServiceError("Gemini image edit returned no candidates")
-    for part in candidates[0]["content"]["parts"]:
-        inline = part.get("inlineData") or part.get("inline_data")
-        if inline:
-            return base64.b64decode(inline["data"])
-    raise AIServiceError("Gemini image edit returned no image in response")
+    try:
+        return await gemini_image.edit_image(api_key, target_model, prompt, image_bytes)
+    except gemini_image.GeminiImageResponseError as exc:
+        raise AIResponseError(str(exc)) from exc
+    except gemini_image.GeminiImageError as exc:
+        raise AIServiceError(str(exc)) from exc
 
 
 async def edit_image(prompt: str, image_bytes: bytes) -> bytes:

@@ -10,7 +10,7 @@ Covers:
 - Back-navigation callback_data is preserved in every keyboard
 - Save → reopen round-trip preserves the selected model
 - Vision toggle cycles through valid providers with valid models only
-- Image-gen toggle never writes a retired model (Gemini image-gen is retired)
+- Image-gen toggle never writes a retired model
 - Image-edit toggle never writes a retired model
 - Fallback toggle resolves defaults from SSOT, not hardcoded stale literals
 """
@@ -138,10 +138,10 @@ def test_vision_toggle_valid_model(provider):
 
 
 # ---------------------------------------------------------------------------
-# 5. Image-gen toggle: Gemini retired, cycle is OpenAI <-> KIE only
+# 5. Image-gen toggle: all configured image providers have valid defaults
 # ---------------------------------------------------------------------------
 
-_IMG_GEN_CYCLE = [PROVIDER_OPENAI, PROVIDER_KIE]
+_IMG_GEN_CYCLE = [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_KIE]
 
 
 @pytest.mark.parametrize("provider", _IMG_GEN_CYCLE)
@@ -155,35 +155,17 @@ def test_image_gen_toggle_valid_model(provider):
     )
 
 
-def test_gemini_not_in_image_gen_cycle():
-    assert PROVIDER_GEMINI not in _IMG_GEN_CYCLE
-
-
-def test_gemini_image_gen_selectable_empty():
-    """Gemini image-gen is retired; catalog must be empty until migration."""
-    gemini_models = get_selectable_models(PROVIDER_GEMINI, channel="image_gen")
-    assert len(gemini_models) == 0, (
-        f"Gemini image-gen should have 0 selectable models, got {gemini_models}"
-    )
-
-
 # ---------------------------------------------------------------------------
-# 6. Image-edit toggle: Gemini retired, only KIE
+# 6. Image-edit toggle: KIE and direct Gemini
 # ---------------------------------------------------------------------------
 
-def test_image_edit_toggle_valid_model():
-    model = get_default_model(PROVIDER_KIE, channel="image_edit")
+@pytest.mark.parametrize("provider", [PROVIDER_KIE, PROVIDER_GEMINI])
+def test_image_edit_toggle_valid_model(provider):
+    model = get_default_model(provider, channel="image_edit")
     assert model not in RETIRED_UPSTREAM_MODELS
     assert model not in APP_DISABLED_OR_MIGRATED_MODELS
-    edit_models = get_selectable_models(PROVIDER_KIE, channel="image_edit")
+    edit_models = get_selectable_models(provider, channel="image_edit")
     assert model in edit_models
-
-
-def test_gemini_image_edit_selectable_empty():
-    gemini_edit = get_selectable_models(PROVIDER_GEMINI, channel="image_edit")
-    assert len(gemini_edit) == 0, (
-        f"Gemini image-edit should have 0 selectable models, got {gemini_edit}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +242,9 @@ def test_image_gen_active_providers_have_models():
         assert len(get_selectable_models(provider, channel="image_gen")) > 0
 
 
-def test_image_edit_kie_has_models():
-    assert len(get_selectable_models(PROVIDER_KIE, channel="image_edit")) > 0
+@pytest.mark.parametrize("provider", [PROVIDER_KIE, PROVIDER_GEMINI])
+def test_image_edit_active_providers_have_models(provider):
+    assert len(get_selectable_models(provider, channel="image_edit")) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -374,28 +357,39 @@ def test_database_migration_replaces_all_legacy_and_retired_models():
                 vision_provider VARCHAR,
                 vision_model VARCHAR,
                 fallback_provider VARCHAR,
-                fallback_model VARCHAR
+                fallback_model VARCHAR,
+                image_generation_provider VARCHAR,
+                image_generation_model VARCHAR,
+                image_edit_provider VARCHAR,
+                image_edit_model VARCHAR
             )
         """))
         conn.execute(text("""
             INSERT INTO ai_config (
                 id, openai_model, claude_model, gemini_model, deepseek_model,
-                vision_provider, vision_model, fallback_provider, fallback_model
+                vision_provider, vision_model, fallback_provider, fallback_model,
+                image_generation_provider, image_generation_model,
+                image_edit_provider, image_edit_model
             )
             VALUES
                 (1, 'gpt-4o', 'claude-sonnet-4-5-20250929', 'gemini-2.0-flash', 'deepseek-chat',
-                 'Gemini', 'gemini-2.0-flash', 'OpenAI', 'gpt-4o'),
+                 'Gemini', 'gemini-2.0-flash', 'OpenAI', 'gpt-4o',
+                 'Gemini', 'imagen-4.0-generate-001', 'Gemini', 'gemini-3-pro-image-preview'),
                 (2, 'gpt-4.1', 'claude-opus-4-1-20250805', 'gemini-1.5-pro', 'deepseek-v4-pro',
-                 'Claude', 'claude-opus-4-1-20250805', 'Claude', 'claude-opus-4-1-20250805'),
+                 'Claude', 'claude-opus-4-1-20250805', 'Claude', 'claude-opus-4-1-20250805',
+                 'KIE', 'google/imagen4-fast', 'KIE', 'google/nano-banana-edit'),
                 (3, 'gpt-4-turbo', 'claude-3-haiku-20240307', 'gemini-2.5-flash-preview-05-20', 'deepseek-coder',
-                 'OpenAI', 'gpt-4o', 'Gemini', 'gemini-2.0-flash')
+                 'OpenAI', 'gpt-4o', 'Gemini', 'gemini-2.0-flash',
+                 'gemini', 'gemini-3-pro-image-preview', 'gemini', 'imagen-4.0-generate-001')
         """))
 
         _migrate_ai_config_models(conn)
 
         rows = conn.execute(text("""
             SELECT id, openai_model, claude_model, gemini_model, deepseek_model,
-                   vision_provider, vision_model, fallback_provider, fallback_model
+                   vision_provider, vision_model, fallback_provider, fallback_model,
+                   image_generation_provider, image_generation_model,
+                   image_edit_provider, image_edit_model
             FROM ai_config ORDER BY id
         """)).all()
 
@@ -406,6 +400,8 @@ def test_database_migration_replaces_all_legacy_and_retired_models():
     assert rows[0][4] == "deepseek-v4-flash"
     assert rows[0][6] == "gemini-3.7-flash"
     assert rows[0][8] == "gpt-5.6-terra"
+    assert rows[0][10] == "gemini-3.1-flash-image"
+    assert rows[0][12] == "gemini-3.1-flash-image"
 
     # Row 2 (Opus family preserved)
     assert rows[1][1] == "gpt-5.6-terra"
@@ -414,6 +410,8 @@ def test_database_migration_replaces_all_legacy_and_retired_models():
     assert rows[1][4] == "deepseek-v4-pro"
     assert rows[1][6] == "claude-opus-5"
     assert rows[1][8] == "claude-opus-5"
+    assert rows[1][10] == "google/imagen4-fast"
+    assert rows[1][12] == "google/nano-banana-edit"
 
     # Row 3 (Haiku family preserved)
     assert rows[2][1] == "gpt-5.6-terra"
@@ -422,6 +420,8 @@ def test_database_migration_replaces_all_legacy_and_retired_models():
     assert rows[2][4] == "deepseek-v4-flash"
     assert rows[2][6] == "gpt-5.6-terra"
     assert rows[2][8] == "gemini-3.7-flash"
+    assert rows[2][10] == "gemini-3.1-flash-image"
+    assert rows[2][12] == "gemini-3.1-flash-image"
 
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,11 @@ PROVIDER_DEFAULT_MODELS = {
 
 DEFAULT_VISION_MODEL = "gemini-3.7-flash"
 DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2"
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
+GEMINI_IMAGE_MODELS = (
+    DEFAULT_GEMINI_IMAGE_MODEL,
+    "gemini-3-pro-image",
+)
 DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "whisper-1"
 DEFAULT_KIE_TRANSCRIPTION_MODEL = "elevenlabs/speech-to-text"
 
@@ -161,8 +166,9 @@ SELECTABLE_VISION_MODELS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Active text-to-image models (Google Imagen retired, excluded until protocol migration)
+# Active direct Gemini and KIE text-to-image models.
 SELECTABLE_IMAGE_GEN_MODELS: dict[str, tuple[str, ...]] = {
+    PROVIDER_GEMINI: GEMINI_IMAGE_MODELS,
     PROVIDER_OPENAI: (
         DEFAULT_OPENAI_IMAGE_MODEL,
     ),
@@ -174,8 +180,9 @@ SELECTABLE_IMAGE_GEN_MODELS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Active image edit models (Google Image Edit retired, excluded until protocol migration)
+# Active direct Gemini and KIE image edit models.
 SELECTABLE_IMAGE_EDIT_MODELS: dict[str, tuple[str, ...]] = {
+    PROVIDER_GEMINI: GEMINI_IMAGE_MODELS,
     PROVIDER_KIE: (
         "seedream/4.5-edit",
         "bytedance/seedream-v4-edit",
