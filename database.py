@@ -1,7 +1,7 @@
 import asyncio
 import textwrap
 from sqlalchemy import (create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, BigInteger, Table,
-                        Float, Interval, Index, UniqueConstraint, func)
+                        Float, Interval, Index, UniqueConstraint, func, text)
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from datetime import datetime, timedelta
@@ -15,6 +15,8 @@ if not DATABASE_URL.startswith("sqlite"):
     _engine_options.update(pool_recycle=1800, pool_use_lifo=True)
 engine = create_async_engine(DATABASE_URL, **_engine_options)
 async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+DATABASE_INIT_ADVISORY_LOCK_KEY = 0x544750535943484F
 
 Base = declarative_base()
 
@@ -695,8 +697,18 @@ def _migrate_ai_config_models(sync_conn) -> None:
     """))
 
 
+async def _acquire_database_init_lock(conn):
+    if getattr(getattr(conn, 'dialect', None), 'name', None) != 'postgresql':
+        return
+    await conn.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+        {'lock_key': DATABASE_INIT_ADVISORY_LOCK_KEY},
+    )
+
+
 async def init_db():
     async with engine.begin() as conn:
+        await _acquire_database_init_lock(conn)
         await conn.run_sync(Base.metadata.create_all)
 
         from sqlalchemy import text, inspect as sa_inspect
