@@ -140,6 +140,17 @@ class Message(Base):
     test_attempt_id = Column(Integer, ForeignKey('test_attempts.id', ondelete='SET NULL'), nullable=True)
 
 
+class TelegramPendingAIReply(Base):
+    """Durable one-shot Telegram AI reply-keyboard state per user."""
+
+    __tablename__ = 'telegram_pending_ai_replies'
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    mapping_json = Column(Text, default='{}', nullable=False)
+    consumed_message_id = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class AIConfig(Base):
     __tablename__ = 'ai_config'
     id = Column(Integer, primary_key=True, default=1)
