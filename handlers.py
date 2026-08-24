@@ -308,6 +308,11 @@ async def _replace_telegram_pending_replies(user_id: int, mapping: dict[str, str
     return bool(previous_mapping)
 
 
+async def _invalidate_telegram_pending_reply(user_id: int) -> bool:
+    """Invalidate the current answer keyboard and report whether it was visible."""
+    return await _replace_telegram_pending_replies(user_id, {})
+
+
 async def _consume_telegram_pending_reply(
     user_id: int,
     label: str | None,
@@ -517,20 +522,33 @@ async def _disable_ai_button_keyboard(callback: CallbackQuery) -> None:
         logging.warning("Failed to remove AI button keyboard: %s", exc)
 
 
-async def _echo_ai_button_label(callback: CallbackQuery, bot: Bot, button_text: str | None) -> None:
+async def _echo_ai_button_label(
+    callback: CallbackQuery,
+    bot: Bot,
+    button_text: str | None,
+    *,
+    reply_markup=None,
+) -> None:
     if not isinstance(button_text, str) or not button_text:
         return
     acknowledgement = f"Ответ принят: {button_text}"
     message = getattr(callback, "message", None)
     answer = getattr(message, "answer", None)
     try:
+        answer_kwargs = {"parse_mode": None}
+        if reply_markup is not None:
+            answer_kwargs["reply_markup"] = reply_markup
         if callable(answer):
-            await answer(acknowledgement, parse_mode=None)
+            await answer(acknowledgement, **answer_kwargs)
             return
         chat = getattr(message, "chat", None)
         chat_id = getattr(chat, "id", None)
         if chat_id is not None:
-            await bot.send_message(chat_id=chat_id, text=acknowledgement, parse_mode=None)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=acknowledgement,
+                **answer_kwargs,
+            )
     except Exception as exc:
         logging.warning("Failed to echo AI button label: %s", exc)
 
@@ -560,7 +578,13 @@ async def _prepare_ai_button_submission(
         await _disable_ai_button_keyboard(callback)
         return False, None
     await _disable_ai_button_keyboard(callback)
-    await _echo_ai_button_label(callback, bot, button_text)
+    pending_reply_was_active = await _invalidate_telegram_pending_reply(callback.from_user.id)
+    await _echo_ai_button_label(
+        callback,
+        bot,
+        button_text,
+        reply_markup=ReplyKeyboardRemove() if pending_reply_was_active else None,
+    )
     return True, button_text
 
 user_spread_state = {}  # Runtime cache; the source of truth is card_spread_states in the database.
