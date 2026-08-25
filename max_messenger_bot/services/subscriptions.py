@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from datetime import timedelta
-from urllib.parse import urlencode
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
@@ -31,13 +29,11 @@ from ..legacy import (
 from ..storage import StateStore
 from ..time_utils import format_msk, utc_now
 from .subscription_access import load_active_subscription
+from robokassa_signing import generate_robokassa_payment_url
+from error_reporting import sanitize_secret_values
 
 
 log = get_payments_logger("subscriptions")
-
-
-def _calculate_signature(*args) -> str:
-    return hashlib.md5(":".join(str(arg) for arg in args).encode()).hexdigest()
 
 
 def _generate_robokassa_payment_url(
@@ -47,16 +43,13 @@ def _generate_robokassa_payment_url(
     invoice_id: int,
     description: str,
 ) -> str:
-    signature = _calculate_signature(merchant_login, f"{cost:.2f}", invoice_id, merchant_password_1)
-    return "https://auth.robokassa.ru/Merchant/Index.aspx?" + urlencode(
-        {
-            "MerchantLogin": merchant_login,
-            "OutSum": f"{cost:.2f}",
-            "InvId": invoice_id,
-            "Description": description,
-            "SignatureValue": signature,
-            "IsTest": 0,
-        }
+    return generate_robokassa_payment_url(
+        merchant_login=merchant_login,
+        merchant_password_1=merchant_password_1,
+        cost=cost,
+        invoice_id=invoice_id,
+        description=description,
+        is_test=0,
     )
 
 
@@ -299,8 +292,14 @@ async def create_yookassa_link(client: MaxApiClient, chat_id: int, user_id: int,
             f"{payment_type_line}"
         )
         await client.send_message(chat_id=chat_id, text=text, attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через ЮKassa", payment.confirmation.confirmation_url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")], main_menu_row()]}}])
-    except Exception:
-        log.exception("Yookassa payment creation failed user_id=%s plan_id=%s amount=%.2f", user_id, plan_id, price)
+    except Exception as exc:
+        log.error(
+            "Yookassa payment creation failed user_id=%s plan_id=%s amount=%.2f error=%s",
+            user_id,
+            plan_id,
+            price,
+            sanitize_secret_values(str(exc)),
+        )
         await client.send_message(chat_id=chat_id, text="Не удалось сформировать ссылку ЮKassa. Попробуйте позже.")
 
 
@@ -356,8 +355,14 @@ async def create_robokassa_link(client: MaxApiClient, chat_id: int, user_id: int
             text=text,
             attachments=[{"type": "inline_keyboard", "payload": {"buttons": [[link_button("💳 Оплатить через Robokassa", url)], [callback_button("⬅️ Назад", f"sub_pay_{plan_id}")], main_menu_row()]}}],
         )
-    except Exception:
-        log.exception("Robokassa payment link creation failed user_id=%s plan_id=%s amount=%.2f", user_id, plan_id, price)
+    except Exception as exc:
+        log.error(
+            "Robokassa payment link creation failed user_id=%s plan_id=%s amount=%.2f error=%s",
+            user_id,
+            plan_id,
+            price,
+            sanitize_secret_values(str(exc)),
+        )
         await client.send_message(chat_id=chat_id, text="Не удалось сформировать ссылку Robokassa. Попробуйте позже.")
 
 

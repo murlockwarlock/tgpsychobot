@@ -35,7 +35,8 @@ from alert_cooldown import AlertCooldown
 from birthday_mailings import process_birthday_mailings
 from subscription_notifications import is_trial_bonus_subscription, should_send_upcoming_charge_notification
 from subscription_retry_policy import can_retry_now, get_next_retry_at
-from error_reporting import notify_admins_about_error
+from error_reporting import notify_admins_about_error, sanitize_secret_values
+from robokassa_signing import build_robokassa_recurring_params, format_robokassa_amount
 from payment_failure_reasons import (
     format_yookassa_admin_reason_line,
     get_yookassa_cancellation_reason,
@@ -51,7 +52,7 @@ MSK = timezone(timedelta(hours=3))
 _kie_credit_error_alert_cooldown = AlertCooldown(timedelta(hours=3))
 
 def _sanitize_log_value(value, limit: int = 2000) -> str:
-    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    text = sanitize_secret_values(str(value)).replace("\r", " ").replace("\n", " ").strip()
     if len(text) > limit:
         return f"{text[:limit - 3]}..."
     return text
@@ -363,11 +364,50 @@ def has_robokassa_pending_timed_out(sub: UserSubscription, now: datetime) -> boo
     )
 
 
+async def _notify_yookassa_recurring_failure(
+    bot: Bot,
+    sub: UserSubscription,
+    plan: SubscriptionPlan,
+    amount: float,
+    config: SubscriptionConfig,
+    exception: Exception,
+) -> None:
+    """Send a safe root-cause alert without changing retry accounting."""
+    if bot is None or not config or not getattr(config, "notifications_enabled", True):
+        return
+    try:
+        await notify_admins_about_error(
+            bot,
+            title="Сбой создания recurring-платежа YooKassa",
+            user_id=sub.user_id,
+            provider="YooKassa",
+            stage="recurring_payment_create",
+            extra={
+                "subscription_id": sub.id,
+                "plan_id": plan.id,
+                "amount": f"{amount:.2f}",
+                "payment_attempt_count": sub.payment_attempt_count,
+            },
+            exception=exception,
+            include_traceback=False,
+            logger=log,
+        )
+    except Exception as notify_error:
+        log.error("Failed to notify about YooKassa recurring failure: %s", notify_error)
+
+
 async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: SubscriptionPlan,
                                     price_to_charge: float, config: SubscriptionConfig,
                                     attempt_started_at: datetime):
     log.info(f"Attempting recurring payment for user {sub.user_id}, sub {sub.id} for plan {plan.name} ({price_to_charge} RUB)")
     try:
+        if not config or not config.yookassa_shop_id or not config.yookassa_secret_key:
+            configuration_error = ValueError("YooKassa shop_id or secret_key is not configured")
+            await _notify_yookassa_recurring_failure(
+                bot, sub, plan, price_to_charge, config, configuration_error
+            )
+            return 'provider_error', None, None, None
+
         Configuration.account_id = config.yookassa_shop_id
         Configuration.secret_key = config.yookassa_secret_key
 
@@ -419,8 +459,14 @@ async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: Subsc
             return False, payment.id, payment.status, cancellation_reason
 
     except BadRequestError as e:
-        log.error(f"Failed to charge user {sub.user_id}. API BadRequestError: {e}")
-        error_code = (e.content or {}).get('code') if isinstance(e.content, dict) else None
+        log.error(
+            "Failed to charge user %s. API BadRequestError: %s",
+            sub.user_id,
+            _sanitize_log_value(e),
+        )
+        await _notify_yookassa_recurring_failure(bot, sub, plan, price_to_charge, config, e)
+        error_content = getattr(e, "content", None)
+        error_code = (error_content or {}).get('code') if isinstance(error_content, dict) else None
         _plog_yookassa_tech(
             "TECH_RECURRING_ERROR",
             ErrorClass=type(e).__name__,
@@ -431,7 +477,12 @@ async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: Subsc
             return 'deactivate', None, None, error_code
         return 'integration_error', None, None, error_code
     except (ForbiddenError, InternalServerError, TooManyRequestsError, UnauthorizedError) as e:
-        log.error(f"Failed to charge user {sub.user_id}. API Error: {e}")
+        log.error(
+            "Failed to charge user %s. API Error: %s",
+            sub.user_id,
+            _sanitize_log_value(e),
+        )
+        await _notify_yookassa_recurring_failure(bot, sub, plan, price_to_charge, config, e)
         _plog_yookassa_tech(
             "TECH_RECURRING_ERROR",
             ErrorClass=type(e).__name__,
@@ -439,7 +490,12 @@ async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: Subsc
         )
         return 'provider_error', None, None, None
     except Exception as e:
-        log.error(f"Unknown error during payment processing for user {sub.user_id}: {e}")
+        log.error(
+            "Unknown error during payment processing for user %s: %s",
+            sub.user_id,
+            _sanitize_log_value(e),
+        )
+        await _notify_yookassa_recurring_failure(bot, sub, plan, price_to_charge, config, e)
         _plog_yookassa_tech(
             "TECH_RECURRING_ERROR",
             ErrorClass=type(e).__name__,
@@ -1213,24 +1269,32 @@ async def process_recurring_robokassa_payment(
 
     merchant_login = config.robokassa_merchant_login
     password = config.robokassa_password_1
-    cost = decimal.Decimal(f"{price_to_charge:.2f}")
-    description = ''.join(c for c in f"Автопродление подписки: {plan_to_charge.name}" if ord(c) <= 0xFFFF)[:100]
-
-    signature = calculate_signature(
-        merchant_login,
-        cost,
-        new_invoice_id,
-        password
-    )
-
-    data = {
-        'MerchantLogin': merchant_login,
-        'OutSum': str(cost),
-        'InvId': str(new_invoice_id),
-        'PreviousInvoiceID': str(parent_invoice_id),
-        'Description': description,
-        'SignatureValue': signature
-    }
+    if not merchant_login or not password:
+        log.error(
+            "Robokassa recurring configuration is invalid: MerchantLogin=%s Pass1Configured=%s",
+            bool(merchant_login),
+            bool(password),
+        )
+        return 'provider_error'
+    try:
+        cost = format_robokassa_amount(price_to_charge)
+        description = ''.join(c for c in f"Автопродление подписки: {plan_to_charge.name}" if ord(c) <= 0xFFFF)[:100]
+        data = build_robokassa_recurring_params(
+            merchant_login,
+            password,
+            cost,
+            parent_invoice_id,
+            new_invoice_id,
+            description,
+        )
+    except Exception as e:
+        log.error("Robokassa recurring request build failed: %s", _sanitize_log_value(e))
+        _plog_robokassa_tech(
+            "TECH_RECURRING_BUILD_ERROR",
+            NewInv=new_invoice_id,
+            Error=_sanitize_log_value(e),
+        )
+        return 'provider_error'
 
     url = 'https://auth.robokassa.ru/Merchant/Recurring'
     _plog_robokassa_tech(
@@ -1239,7 +1303,7 @@ async def process_recurring_robokassa_payment(
         URL=url,
         ParentInv=parent_invoice_id,
         NewInv=new_invoice_id,
-        Sum=f"{cost:.2f}",
+        Sum=cost,
         Plan=plan_to_charge.name,
         Body=_encode_log_params(data)
     )
@@ -1249,33 +1313,34 @@ async def process_recurring_robokassa_payment(
         async with aiohttp.ClientSession(timeout=api_timeout) as session:
             async with session.post(url, data=data) as response:
                 response_text = await response.text()
-                log.info(f"Robokassa response ({response.status}): {response_text}")
+                safe_response_text = _sanitize_log_value(response_text)
+                log.info(f"Robokassa response ({response.status}): {safe_response_text}")
                 _plog_robokassa_tech(
                     "TECH_RECURRING_RESPONSE",
                     NewInv=new_invoice_id,
                     HTTP=response.status,
-                    Body=response_text
+                    Body=safe_response_text
                 )
 
                 if response.status == 200:
-                    if response_text.startswith("OK"):
+                    if safe_response_text.startswith("OK"):
                         return True
                     else:
-                        log.error(f"Robokassa logical error: {response_text}")
+                        log.error(f"Robokassa logical error: {safe_response_text}")
                         return False
                 elif 400 <= response.status < 500:
-                    log.error(f"Robokassa client error: {response.status} - {response_text}")
+                    log.error(f"Robokassa client error: {response.status} - {safe_response_text}")
                     return 'deactivate'
                 else:
                     log.error(f"Robokassa server error: {response.status}")
                     return 'provider_error'
 
     except Exception as e:
-        log.error(f"Robokassa connection error: {e}")
+        log.error(f"Robokassa connection error: {_sanitize_log_value(e)}")
         _plog_robokassa_tech(
             "TECH_RECURRING_EXCEPTION",
             NewInv=new_invoice_id,
-            Error=e
+            Error=_sanitize_log_value(e)
         )
         return 'provider_error'
 

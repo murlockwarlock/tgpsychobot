@@ -2,7 +2,7 @@ import os
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -15,6 +15,10 @@ from alert_cooldown import AlertCooldown
 class EmptyMessageError(Exception):
     def __str__(self):
         return ""
+
+
+class FakeSSLError(Exception):
+    pass
 
 
 class ErrorReportingTests(unittest.IsolatedAsyncioTestCase):
@@ -69,6 +73,57 @@ class ErrorReportingTests(unittest.IsolatedAsyncioTestCase):
     def test_classify_ai_error_missing_config(self):
         code, msg = error_reporting.classify_ai_error(Exception("Не указан API ключ OpenAI"))
         self.assertEqual(code, "missing_config")
+
+    def test_chained_ssl_error_uses_deep_root_cause(self):
+        ssl_error = FakeSSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF")
+        sdk_error = AttributeError("'NoneType' object has no attribute 'status_code'")
+        sdk_error.__cause__ = ssl_error
+
+        self.assertEqual(error_reporting.classify_external_error(sdk_error)[0], "network_ssl")
+        self.assertEqual(error_reporting.exception_summary(sdk_error), str(ssl_error))
+
+    async def test_admin_alert_exposes_root_classification_not_secondary_sdk_error(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        ssl_error = FakeSSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF")
+        sdk_error = AttributeError("'NoneType' object has no attribute 'status_code'")
+        sdk_error.__cause__ = ssl_error
+
+        with patch.object(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[123])):
+            await error_reporting.notify_admins_about_error(
+                bot,
+                title="Сбой создания платежа YooKassa",
+                provider="YooKassa",
+                stage="create_payment",
+                exception=sdk_error,
+                include_traceback=False,
+            )
+
+        text = bot.send_message.await_args.args[1]
+        self.assertIn("network_ssl", text)
+        self.assertIn("FakeSSLError", text)
+        self.assertIn("UNEXPECTED_EOF_WHILE_READING", text)
+        self.assertNotIn("NoneType", text)
+
+    async def test_chained_exception_secrets_are_redacted(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        root = FakeSSLError("TLS failed password=pass1 signature=deadbeef")
+        outer = RuntimeError("SDK wrapper password=pass2")
+        outer.__cause__ = root
+
+        with patch.object(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[123])):
+            await error_reporting.notify_admins_about_error(
+                bot,
+                title="External failure",
+                provider="Robokassa",
+                exception=outer,
+                include_traceback=True,
+                extra={"password": "pass3", "safe": "ok"},
+            )
+
+        text = bot.send_message.await_args.args[1]
+        for secret in ("pass1", "pass2", "pass3", "deadbeef"):
+            self.assertNotIn(secret, text)
+        self.assertIn("[REDACTED]", text)
 
     def test_sanitize_secret_values_redacts_keys_and_tokens(self):
         sample = (
@@ -125,6 +180,30 @@ class ErrorReportingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TranscriptionProviderChainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_kie_multimodal_exception_is_not_reported_as_blank_reason(self):
+        class EmptyProviderError(Exception):
+            def __str__(self):
+                return ""
+
+        response = SimpleNamespace(status_code=200, json=Mock(side_effect=EmptyProviderError()))
+        client = SimpleNamespace(post=AsyncMock(return_value=response))
+        client_context = MagicMock()
+        client_context.__aenter__.return_value = client
+        client_context.__aexit__.return_value = False
+
+        with patch.object(ai_integration.httpx, "AsyncClient", return_value=client_context):
+            with self.assertRaises(ai_integration.AIServiceError) as raised:
+                await ai_integration._call_kie_multimodal(
+                    "kie-key",
+                    "https://kie.example",
+                    "gemini-3-flash",
+                    "system",
+                    [{"type": "text", "text": "hello"}],
+                )
+
+        self.assertIn("EmptyProviderError", str(raised.exception))
+        self.assertFalse(str(raised.exception).endswith(":"))
+
     async def test_kie_stt_converts_telegram_ogg_to_wav_before_upload(self):
         with (
             patch.object(

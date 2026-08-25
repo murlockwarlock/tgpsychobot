@@ -23,7 +23,7 @@ from automation_engine import apply_service_data_blocks, build_runtime_automatio
 from user_metadata import extract_service_data
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
 from result_history import ai_history_role_filter, select_ai_history_messages
-from error_reporting import classify_ai_error
+from error_reporting import classify_ai_error, exception_summary
 from provider_models import (
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     PROVIDER_CLAUDE,
@@ -316,11 +316,12 @@ def _extract_kie_chat_text(payload: dict) -> str:
 
 
 def _validate_kie_json_response(status_code: int, payload: dict, *, context: str) -> dict:
-    detail = (
+    raw_detail = (
         payload.get("msg") or payload.get("message") or str(payload)
         if isinstance(payload, dict)
         else str(payload)
     )
+    detail = str(raw_detail).strip() or f"HTTP {status_code} без описания"
     if status_code != 200:
         if is_kie_insufficient_balance(status_code, payload):
             raise InsufficientBalanceError(f"KIE API Error: {detail}")
@@ -382,7 +383,7 @@ async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: by
         raise
     except Exception as e:
         logging.error("KIE upload error", exc_info=e)
-        raise AIServiceError(f"Ошибка загрузки файла в KIE: {e}")
+        raise AIServiceError(f"Ошибка загрузки файла в KIE: {exception_summary(e)}") from e
 
 
 async def _create_kie_task(api_key: str, base_url: str, model: str, input_payload: dict) -> str:
@@ -402,7 +403,7 @@ async def _create_kie_task(api_key: str, base_url: str, model: str, input_payloa
         raise
     except Exception as e:
         logging.error("KIE create task error", exc_info=e)
-        raise AIServiceError(f"Ошибка создания задачи KIE: {e}")
+        raise AIServiceError(f"Ошибка создания задачи KIE: {exception_summary(e)}") from e
 
 
 async def _poll_kie_task(api_key: str, base_url: str, task_id: str, *, timeout_sec: int = 180) -> dict:
@@ -498,7 +499,7 @@ async def _call_kie_multimodal(
         raise
     except Exception as e:
         logging.error("KIE multimodal error", exc_info=e)
-        raise AIServiceError(f"Ошибка обращения к KIE multimodal API: {e}")
+        raise AIServiceError(f"Ошибка обращения к KIE multimodal API: {exception_summary(e)}") from e
 
 
 def _select_image_generation_shape(prompt: str) -> tuple[str, str]:
@@ -567,7 +568,7 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
         raise
     except Exception as e:
         logging.error("KIE transcription error", exc_info=e)
-        raise AIServiceError(f"Ошибка при транскрибации (KIE API): {e}")
+        raise AIServiceError(f"Ошибка при транскрибации (KIE API): {exception_summary(e)}") from e
 
 
 async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
@@ -598,7 +599,7 @@ async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model:
         raise
     except Exception as e:
         logging.error("KIE vision error", exc_info=e)
-        raise AIServiceError(f"Ошибка анализа изображения (KIE): {e}")
+        raise AIServiceError(f"Ошибка анализа изображения (KIE): {exception_summary(e)}") from e
 
 
 async def _generate_kie(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
@@ -706,7 +707,7 @@ async def _call_kie_text_chat(
         raise
     except Exception as e:
         log.error("KIE chat error: %s", e, exc_info=True)
-        raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {e}") from e
+        raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {exception_summary(e)}") from e
 
 
 def _resolve_provider(ai_config: AIConfig) -> tuple[str, float]:

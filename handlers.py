@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import math
 import html
+import zlib
 import re
 import io
 import os
@@ -19,7 +21,7 @@ from client_search import normalize_client_search_query
 from database import TestSession, TestAttempt, TestQuestion, TestConfig, BotGeneralConfig, SecretTestQuestion, CaseStudy
 from aiogram import Router, F, Bot
 from pydantic import ValidationError
-from aiogram.types import (Message, CallbackQuery, FSInputFile, Document,
+from aiogram.types import (Message, MessageEntity, CallbackQuery, FSInputFile, Document,
                            InlineKeyboardMarkup, InlineKeyboardButton)
 from aiogram.filters import CommandStart, Command, StateFilter, Filter, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -32,6 +34,7 @@ from sqlalchemy.orm import selectinload, relationship
 from aiogram.types import PreCheckoutQuery, SuccessfulPayment
 from aiogram.types import InputMediaPhoto, InputMediaVideo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.utils.formatting import Text
 
 from config import OWNER_IDS
 from database import (async_session_maker, User, Message as DBMessage, AIConfig, KnowledgeBase, Content, IndexingQueue,
@@ -59,7 +62,7 @@ from ai_integration import (
     _call_kie_chat,
     _get_kie_base_url,
 )
-from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error
+from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error, sanitize_secret_values
 from provider_models import (
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
@@ -168,8 +171,11 @@ from vector_store import delete_document_vectors, update_case_study_index, searc
 from uuid import uuid4
 try:
     from yookassa import Configuration, Payment
+    from yookassa.domain.exceptions import UnauthorizedError
 except ModuleNotFoundError:
     Configuration = Payment = None
+    class UnauthorizedError(Exception):
+        pass
 import decimal
 import hashlib
 from urllib import parse
@@ -179,6 +185,10 @@ try:
 except ModuleNotFoundError:
     relativedelta = None
 from payment_failure_reasons import format_yookassa_admin_reason_line
+from robokassa_signing import (
+    format_robokassa_expiration,
+    generate_robokassa_payment_url,
+)
 from scheduler import (
     process_recurring_payment,
     process_recurring_robokassa_payment,
@@ -335,6 +345,77 @@ def normalize_ai_processing_message_text(value: str | None) -> str:
             f"Текст слишком длинный. Максимум — {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов."
         )
     return text
+
+
+_AI_PROCESSING_ENTITIES_PREFIX = "tg_entities_v1:"
+
+
+def serialize_ai_processing_message_text(
+    value: str | None,
+    entities: list[MessageEntity] | tuple[MessageEntity, ...] | None = None,
+) -> str:
+    """Store Telegram entities compactly without changing the existing DB column."""
+    text = normalize_ai_processing_message_text(value)
+    if not entities:
+        return text
+
+    serialized_entities = []
+    for entity in entities:
+        if isinstance(entity, MessageEntity):
+            serialized_entities.append(entity.model_dump(mode="json", exclude_none=True))
+        elif isinstance(entity, dict):
+            serialized_entities.append(MessageEntity.model_validate(entity).model_dump(mode="json", exclude_none=True))
+        else:
+            raise ValueError("Сообщение содержит неподдерживаемое форматирование.")
+
+    payload = json.dumps(
+        {"text": text, "entities": serialized_entities},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = _AI_PROCESSING_ENTITIES_PREFIX + base64.urlsafe_b64encode(
+        zlib.compress(payload, level=9)
+    ).decode("ascii")
+    if len(encoded) > AI_PROCESSING_MESSAGE_MAX_LENGTH:
+        raise ValueError(
+            "Текст с форматированием слишком длинный для сохранения. "
+            f"Максимум — {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов."
+        )
+    return encoded
+
+
+def _decode_ai_processing_message_text(value: str | None) -> tuple[str, list[MessageEntity] | None, bool]:
+    """Decode stored entities; return a safe marker for malformed serialized values."""
+    if not isinstance(value, str):
+        return "", None, False
+    if not value.startswith(_AI_PROCESSING_ENTITIES_PREFIX):
+        return value.strip(), None, False
+
+    try:
+        encoded = value[len(_AI_PROCESSING_ENTITIES_PREFIX):]
+        payload = json.loads(zlib.decompress(base64.urlsafe_b64decode(encoded)).decode("utf-8"))
+        text = normalize_ai_processing_message_text(payload.get("text"))
+        raw_entities = payload.get("entities")
+        if not isinstance(raw_entities, list) or not raw_entities:
+            raise ValueError("serialized entities are missing")
+        entities = [MessageEntity.model_validate(item) for item in raw_entities]
+        return text, entities, True
+    except Exception as exc:
+        logging.warning("Malformed AI processing message formatting was ignored: %s", exception_summary(exc))
+        return "", None, True
+
+
+def _ai_processing_message_html(value: str | None) -> str:
+    text, entities, encoded = _decode_ai_processing_message_text(value)
+    if encoded and not text:
+        text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+        entities = None
+    if entities:
+        try:
+            return Text.from_entities(text, entities).as_html()
+        except Exception as exc:
+            logging.warning("Could not render AI processing message preview: %s", exception_summary(exc))
+    return html.escape(text)
 
 
 async def _disable_ai_button_keyboard(callback: CallbackQuery) -> None:
@@ -964,10 +1045,12 @@ async def _report_ai_failure(
     include_traceback: bool = False,
 ) -> None:
     provider_attempts = getattr(exception, "provider_attempts", None) if exception else None
+    if provider_attempts and title == "Сбой AI-сервиса":
+        title = "Не удалось получить ответ ИИ"
     if not details and exception:
         _, classified_desc = classify_ai_error(exception, provider=provider)
         details = classified_desc
-    await notify_admins_about_error(
+    await _safe_notify_admins_about_error(
         bot,
         title=title,
         user_id=getattr(user, "id", None),
@@ -983,6 +1066,17 @@ async def _report_ai_failure(
         include_traceback=include_traceback,
         logger=log,
     )
+
+
+async def _safe_notify_admins_about_error(bot: Bot, **kwargs) -> None:
+    """Reporting must not prevent the user-facing failure response."""
+    try:
+        await notify_admins_about_error(bot, **kwargs)
+    except Exception as report_error:
+        log.error(
+            "Failed to deliver external-failure admin notification: %s",
+            exception_summary(report_error),
+        )
 
 
 def _start_chat_action_loop(bot: Bot, chat_id: int, action: str, interval: float = 4.5) -> asyncio.Task:
@@ -1006,20 +1100,26 @@ async def _send_ai_processing_message(
 ):
     if not config or not bool(getattr(config, "ai_processing_message_enabled", False)):
         return None
-    text = getattr(config, "ai_processing_message_text", None)
-    text = text.strip() if isinstance(text, str) else ""
-    if not text:
+    stored_text = getattr(config, "ai_processing_message_text", None)
+    text, entities, encoded = _decode_ai_processing_message_text(stored_text)
+    if encoded and not text:
+        text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+        entities = None
+    if not isinstance(text, str) or not text.strip():
         logging.warning("AI processing message is enabled without usable text")
         return None
     try:
+        if entities:
+            message_kwargs = Text.from_entities(text, entities).as_kwargs()
+        else:
+            message_kwargs = {"text": text, "parse_mode": None}
         return await bot.send_message(
             chat_id=user_id,
-            text=text,
-            parse_mode=None,
+            **message_kwargs,
             reply_markup=reply_markup,
         )
     except Exception as exc:
-        logging.warning("Failed to send AI processing message: %s", exc)
+        logging.warning("Failed to send AI processing message: %s", exception_summary(exc))
         return None
 
 
@@ -1840,7 +1940,11 @@ async def process_buffered_messages(
         provider, model = _resolve_ai_provider_model(ai_config, "chat")
         await _report_ai_failure(
             bot,
-            title="Сбой AI-сервиса",
+            title=(
+                "Не удалось получить ответ ИИ"
+                if getattr(e, "provider_attempts", None)
+                else "Сбой AI-сервиса"
+            ),
             user=SimpleNamespace(id=user_id),
             provider=provider,
             model=model,
@@ -1954,6 +2058,10 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
         await callback.answer("Эта карта уже не участвует в текущем выборе.", show_alert=True)
         return
 
+    # A card interpretation performs database work and a slow AI call below.
+    # Acknowledge the callback before starting that I/O and never acknowledge it again.
+    await callback.answer()
+
     async with async_session_maker() as cfg_session:
         ai_config = await cfg_session.get(AIConfig, 1)
 
@@ -1966,7 +2074,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
         media = await session.get(MediaLibrary, card_id)
         if media:
             if media.file_name == '_back':
-                await callback.answer("Эта техническая рубашка не должна выбираться.", show_alert=True)
+                await callback.message.answer("Эта техническая рубашка не должна выбираться.")
                 return
 
             caption = f"<b>Твой выбор подтвержден.</b>\n\n{media.description or ''}"
@@ -1975,7 +2083,6 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 caption=caption,
                 parse_mode='HTML'
             )
-            await callback.answer()
 
             card_info = f"{media.file_name}: {media.description or 'без описания'}"
             card_system_msg = _card_selection_system_message(card_info, spread)
@@ -2020,6 +2127,10 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                     details=str(e),
                     exception=e,
                 )
+                await bot.send_message(
+                    chat_id=user_id,
+                    text="Не удалось получить интерпретацию карты. Попробуйте выбрать карту ещё раз через несколько минут.",
+                )
             final_spread_file_ids = await _advance_card_spread_after_selection(
                 bot=bot,
                 user_id=user_id,
@@ -2027,7 +2138,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 selected_file_id=media.file_id,
             )
         else:
-            await callback.answer("Ошибка: Карта не найдена.", show_alert=True)
+            await callback.message.answer("Ошибка: карта не найдена. Попробуйте начать выбор заново.")
 
     if len(final_spread_file_ids) > 1:
         await bot.send_message(chat_id=user_id, text="Твой расклад целиком:")
@@ -2214,29 +2325,17 @@ def generate_payment_link(
         robokassa_payment_url='https://auth.robokassa.ru/Merchant/Index.aspx',
         recurring: bool = False
 ) -> str:
-    signature = calculate_signature(
-        merchant_login,
-        cost,
-        number,
-        merchant_password_1
+    return generate_robokassa_payment_url(
+        merchant_login=merchant_login,
+        merchant_password_1=merchant_password_1,
+        cost=cost,
+        invoice_id=number,
+        description=description,
+        expiration_date=expiration_date,
+        recurring=recurring,
+        is_test=is_test,
+        payment_url=robokassa_payment_url,
     )
-
-    data = {
-        'MerchantLogin': merchant_login,
-        'OutSum': cost,
-        'InvId': number,
-        'Description': description,
-        'SignatureValue': signature,
-        'IsTest': is_test
-    }
-
-    if recurring:
-        data['Recurring'] = 'true'
-    if expiration_date:
-        msk_expiration = expiration_date.astimezone(timezone(timedelta(hours=3)))
-        data['ExpirationDate'] = msk_expiration.strftime('%Y-%m-%dT%H:%M')
-
-    return f'{robokassa_payment_url}?{parse.urlencode(data)}'
 
 
 def build_robokassa_invoice_access_token(invoice_id: int, user_id: int, password: str) -> str:
@@ -5932,7 +6031,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         provider, model = _resolve_ai_provider_model(ai_config, "chat")
         await _report_ai_failure(
             bot,
-            title="Сбой AI-сервиса",
+            title=(
+                "Не удалось получить ответ ИИ"
+                if getattr(e, "provider_attempts", None)
+                else "Сбой AI-сервиса"
+            ),
             user=message.from_user,
             provider=provider,
             model=model,
@@ -8378,6 +8481,8 @@ async def handle_sub_cancel_retry(callback: CallbackQuery, state: FSMContext, bo
 
 @router.callback_query(F.data == "sub_retry_now")
 async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    # OpStateExt and recurring charge calls are external I/O; acknowledge once up front.
+    await callback.answer()
     user_id = callback.from_user.id
     now = datetime.utcnow()
     MSK = timezone(timedelta(hours=3))
@@ -8411,7 +8516,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 user_sub.payment_attempt_count if user_sub else "none",
                 user_sub.pending_robokassa_invoice_id if user_sub else "none",
             )
-            await callback.answer("Невозможно выполнить списание.", show_alert=True)
+            await bot.send_message(user_id, "Невозможно выполнить списание.")
             return
 
         if user_sub.pending_robokassa_invoice_id and config and config.robokassa_password_2:
@@ -8449,7 +8554,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 await _send_subscription_info(user_id, callback.message.chat.id, bot, state)
                 return
             elif op_state == 'pending':
-                await callback.answer("Запрос уже в обработке, ожидайте подтверждения.", show_alert=True)
+                await bot.send_message(user_id, "Запрос уже в обработке, ожидайте подтверждения.")
                 return
             elif op_state == 'failed':
                 # Явный отказ провайдера: очищаем pending и, если это 3-я неудача, отключаем автопродление.
@@ -8480,9 +8585,9 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     return
                 user_sub.pending_robokassa_invoice_id = None
                 await session.commit()
-                await callback.answer(
+                await bot.send_message(
+                    user_id,
                     f"Банк отклонил списание. Подписка пока активна до {user_sub.end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M МСК')}.",
-                    show_alert=True
                 )
                 try:
                     await callback.message.delete()
@@ -8493,9 +8598,9 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 # unknown в первые часы после запроса считаем "ещё не отражён в Robokassa":
                 # иначе можно преждевременно отключить автопродление, хотя провайдер позже проведёт платёж.
                 if not has_robokassa_pending_timed_out(user_sub, now):
-                    await callback.answer(
+                    await bot.send_message(
+                        user_id,
                         "Предыдущий запрос ещё не отражён в Robokassa. Подождите до 3 часов.",
-                        show_alert=True
                     )
                     return
 
@@ -8527,9 +8632,9 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     pending_payment_timeout.status = 'timeout'
                 user_sub.pending_robokassa_invoice_id = None
                 await session.commit()
-                await callback.answer(
+                await bot.send_message(
+                    user_id,
                     "Статус платежа в Robokassa не подтвердился. Новый запрос сейчас не отправлялся.",
-                    show_alert=True
                 )
                 try:
                     await callback.message.delete()
@@ -8538,20 +8643,20 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 return
 
         if not config:
-            await callback.answer("Ошибка конфигурации.", show_alert=True)
+            await bot.send_message(user_id, "Ошибка конфигурации.")
             return
 
         if user_sub.payment_provider == 'Robokassa' and not can_retry_manually(user_sub.payment_attempt_count):
             plog.info(f"РУЧНОЙ_РЕТРАЙ_ЗАБЛОКИРОВАН | {callback.from_user.id} | Robokassa | исчерпан лимит попыток")
-            await callback.answer(
+            await bot.send_message(
+                user_id,
                 "Повторное списание недоступно: исчерпан лимит из 3 попыток.",
-                show_alert=True
             )
             return
 
         plan = user_sub.plan
         if not plan:
-            await callback.answer("Тариф не найден.", show_alert=True)
+            await bot.send_message(user_id, "Тариф не найден.")
             return
 
         plan_to_charge = plan.upgrades_to_plan if (plan.is_trial and plan.upgrades_to_plan) else plan
@@ -8586,7 +8691,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
             user_sub.pending_robokassa_invoice_id or "none",
         )
 
-        await callback.answer("Отправляем запрос на списание...", show_alert=False)
+        await bot.send_message(user_id, "Отправляем запрос на списание...")
 
         if user_sub.payment_provider == 'Yookassa':
             if not can_retry_now(
@@ -8603,9 +8708,9 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     format_msk(user_sub.last_payment_attempt, '%d.%m.%Y %H:%M:%S МСК') if user_sub.last_payment_attempt else "none",
                     next_retry_str,
                 )
-                await callback.answer(
+                await bot.send_message(
+                    user_id,
                     f"Повторное списание пока недоступно. Следующая попытка после {next_retry_str}.",
-                    show_alert=True
                 )
                 return
             attempt_started_at = user_sub.last_payment_attempt or now
@@ -8649,7 +8754,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 user_sub.payment_attempt_count = 0
                 user_sub.last_payment_attempt = None
                 await session.commit()
-                await callback.answer("Платёж уже обработан.", show_alert=True)
+                await bot.send_message(user_id, "Платёж уже обработан.")
                 try:
                     await callback.message.delete()
                 except TelegramBadRequest:
@@ -8835,7 +8940,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 )
 
         else:
-            await callback.answer("Провайдер не поддерживает ручное списание.", show_alert=True)
+            await bot.send_message(user_id, "Провайдер не поддерживает ручное списание.")
             return
 
     try:
@@ -9207,8 +9312,41 @@ async def choose_payment_provider(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("pay_yookassa_"))
 async def create_yookassa_invoice(callback: CallbackQuery, state: FSMContext):
-    from yookassa.domain.exceptions import UnauthorizedError
+    # Stop Telegram's callback spinner before touching the provider.
+    await callback.answer()
 
+    try:
+        await _create_yookassa_invoice_impl(callback, state)
+    except Exception as e:
+        logging.error(
+            "Unexpected YooKassa payment-flow error: %s",
+            sanitize_secret_values(str(e)),
+            exc_info=e,
+        )
+        await _safe_notify_admins_about_error(
+            callback.bot,
+            title="Сбой payment-flow YooKassa",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="YooKassa",
+            stage="create_payment",
+            exception=e,
+            include_traceback=False,
+            logger=log,
+        )
+        try:
+            await callback.message.edit_text(
+                "❌ Не удалось подготовить платёж. Попробуйте ещё раз через несколько минут."
+            )
+        except Exception as user_error:
+            logging.warning(
+                "Could not show YooKassa payment-flow failure to user: %s",
+                sanitize_secret_values(str(user_error)),
+            )
+
+
+async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     plan_id = int(parts[2])
 
@@ -9224,7 +9362,7 @@ async def create_yookassa_invoice(callback: CallbackQuery, state: FSMContext):
         )
 
     if not plan:
-        await callback.answer("Тариф не найден.", show_alert=True)
+        await callback.message.edit_text("Тариф не найден.")
         return
 
     user_sub = user.subscription if user else None
@@ -9246,7 +9384,20 @@ async def create_yookassa_invoice(callback: CallbackQuery, state: FSMContext):
     if discount_percent > 0 and not plan.is_trial:
         price *= (1 - discount_percent / 100)
 
-    if not config.yookassa_shop_id or not config.yookassa_secret_key:
+    if not config or not config.yookassa_shop_id or not config.yookassa_secret_key:
+        await _safe_notify_admins_about_error(
+            callback.bot,
+            title="Конфигурация YooKassa не задана",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="YooKassa",
+            stage="create_payment",
+            details="Shop ID or Secret Key is not configured",
+            extra={"plan_id": plan_id, "price": f"{price:.2f}"},
+            include_traceback=False,
+            logger=log,
+        )
         await callback.message.edit_text(
             "❌ Платёжная система временно недоступна. Администратор не настроил ключи API.")
         return
@@ -9334,33 +9485,14 @@ async def create_yookassa_invoice(callback: CallbackQuery, state: FSMContext):
 
         await callback.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
 
-    except UnauthorizedError:
+    except UnauthorizedError as e:
         logging.error("YooKassa UnauthorizedError: Invalid Shop ID or Secret Key.")
         _plog_yookassa_tech(
             "TECH_INVOICE_ERROR",
             ErrorClass="UnauthorizedError",
             Body="Invalid Shop ID or Secret Key",
         )
-        await callback.message.edit_text(
-            "❌ Не удалось создать платеж. Похоже, возникла проблема с настройками платежной системы. Мы уже работаем над этим."
-        )
-        for owner_id in OWNER_IDS:
-            try:
-                await callback.bot.send_message(
-                    owner_id,
-                    "🚨 <b>Критическая ошибка ЮKassa!</b>\n\nНе удалось создать платеж из-за неверных учетных данных (Shop ID или Secret Key). Пожалуйста, срочно проверьте их в админ-панели."
-                )
-            except Exception:
-                pass
-    except Exception as e:
-        logging.error(f"An unexpected error occurred with YooKassa: {e}")
-        error_content = getattr(e, "content", None)
-        _plog_yookassa_tech(
-            "TECH_INVOICE_ERROR",
-            ErrorClass=type(e).__name__,
-            Body=_encode_log_json(error_content) if isinstance(error_content, dict) else str(e),
-        )
-        await notify_admins_about_error(
+        await _safe_notify_admins_about_error(
             callback.bot,
             title="Сбой создания платежа YooKassa",
             user_id=callback.from_user.id,
@@ -9368,19 +9500,46 @@ async def create_yookassa_invoice(callback: CallbackQuery, state: FSMContext):
             full_name=callback.from_user.full_name,
             provider="YooKassa",
             stage="create_payment",
-            details=str(e),
             extra={"plan_id": plan_id, "price": f"{price:.2f}"},
             exception=e,
+            include_traceback=False,
             logger=log,
         )
         await callback.message.edit_text(
-            "❌ Произошла непредвиденная ошибка при создании платежа. Пожалуйста, попробуйте позже.")
-
-    await callback.answer()
+            "❌ Не удалось создать платеж. Похоже, возникла проблема с настройками платежной системы. Мы уже работаем над этим."
+        )
+    except Exception as e:
+        logging.error(
+            "An unexpected error occurred with YooKassa: %s",
+            sanitize_secret_values(str(e)),
+        )
+        error_content = getattr(e, "content", None)
+        _plog_yookassa_tech(
+            "TECH_INVOICE_ERROR",
+            ErrorClass=type(e).__name__,
+            Body=_encode_log_json(error_content) if isinstance(error_content, dict) else str(e),
+        )
+        await _safe_notify_admins_about_error(
+            callback.bot,
+            title="Сбой создания платежа YooKassa",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="YooKassa",
+            stage="create_payment",
+            extra={"plan_id": plan_id, "price": f"{price:.2f}"},
+            exception=e,
+            include_traceback=False,
+            logger=log,
+        )
+        await callback.message.edit_text(
+            "❌ Не удалось связаться с платёжным сервисом. Попробуйте ещё раз через несколько минут.")
 
 
 @router.callback_query(F.data.startswith("pay_tg_"))
 async def create_telegram_pay_invoice(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    # Telegram Pay also performs provider I/O; stop the callback spinner first.
+    await callback.answer()
     parts = callback.data.split("_")
     plan_id = int(parts[2])
 
@@ -9396,7 +9555,7 @@ async def create_telegram_pay_invoice(callback: CallbackQuery, state: FSMContext
         )
 
     if not plan:
-        await callback.answer("Тариф не найден.", show_alert=True)
+        await callback.message.edit_text("Тариф не найден.")
         return
 
     user_sub = user.subscription if user else None
@@ -9418,21 +9577,37 @@ async def create_telegram_pay_invoice(callback: CallbackQuery, state: FSMContext
     if discount_percent > 0 and not plan.is_trial:
         price *= (1 - discount_percent / 100)
 
-    if not config.telegram_pay_token:
+    if not config or not config.telegram_pay_token:
         await callback.message.answer("❌ Оплата через Telegram Pay временно недоступна. Администратор не настроил токен.")
-        await callback.answer()
         return
 
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=f"Подписка на тариф «{plan.name}»",
-        description=plan.description,
-        payload=f"sub-plan-{plan_id}-user-{callback.from_user.id}",
-        provider_token=config.telegram_pay_token,
-        currency="RUB",
-        prices=[LabeledPrice(label=f"Тариф «{plan.name}»", amount=int(price * 100))]
-    )
-    await callback.answer()
+    try:
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title=f"Подписка на тариф «{plan.name}»",
+            description=plan.description,
+            payload=f"sub-plan-{plan_id}-user-{callback.from_user.id}",
+            provider_token=config.telegram_pay_token,
+            currency="RUB",
+            prices=[LabeledPrice(label=f"Тариф «{plan.name}»", amount=int(price * 100))]
+        )
+    except Exception as e:
+        await _safe_notify_admins_about_error(
+            bot,
+            title="Сбой создания платежа Telegram Pay",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="Telegram Pay",
+            stage="send_invoice",
+            extra={"plan_id": plan_id, "price": f"{price:.2f}"},
+            exception=e,
+            include_traceback=False,
+            logger=log,
+        )
+        await callback.message.answer(
+            "❌ Не удалось связаться с платёжным сервисом. Попробуйте ещё раз через несколько минут."
+        )
 
 
 @router.callback_query(F.data == "sub_cancel_renewal")
@@ -12046,6 +12221,41 @@ async def _show_admin_manage_buttons(bot: Bot, chat_id: int, message_id: int):
 
 @router.callback_query(F.data.startswith("pay_robokassa_"))
 async def create_robokassa_invoice(callback: CallbackQuery, state: FSMContext):
+    # The callback only prepares a local redirect; acknowledge it before DB work.
+    await callback.answer()
+
+    try:
+        await _create_robokassa_invoice_impl(callback, state)
+    except Exception as e:
+        logging.error(
+            "Unexpected Robokassa payment-flow error: %s",
+            sanitize_secret_values(str(e)),
+            exc_info=e,
+        )
+        await _safe_notify_admins_about_error(
+            callback.bot,
+            title="Сбой формирования платежа Robokassa",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="Robokassa",
+            stage="create_payment",
+            exception=e,
+            include_traceback=False,
+            logger=log,
+        )
+        try:
+            await callback.message.edit_text(
+                "❌ Не удалось подготовить ссылку на оплату. Попробуйте ещё раз через несколько минут."
+            )
+        except Exception as user_error:
+            logging.warning(
+                "Could not show Robokassa payment-flow failure to user: %s",
+                sanitize_secret_values(str(user_error)),
+            )
+
+
+async def _create_robokassa_invoice_impl(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     plan_id = int(parts[2])
 
@@ -12061,7 +12271,7 @@ async def create_robokassa_invoice(callback: CallbackQuery, state: FSMContext):
         )
 
     if not plan:
-        await callback.answer("Тариф не найден.", show_alert=True)
+        await callback.message.edit_text("Тариф не найден.")
         return
 
     user_sub = user.subscription if user else None
@@ -12084,15 +12294,36 @@ async def create_robokassa_invoice(callback: CallbackQuery, state: FSMContext):
         price *= (1 - discount_percent / 100)
     price_decimal = decimal.Decimal(f"{price:.2f}")
 
-    if not config.robokassa_merchant_login or not config.robokassa_password_1:
+    if not config or not config.robokassa_merchant_login or not config.robokassa_password_1:
+        await _safe_notify_admins_about_error(
+            callback.bot,
+            title="Конфигурация Robokassa не задана",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="Robokassa",
+            stage="create_payment",
+            details="MerchantLogin or MerchantPass1 is not configured",
+            extra={
+                "runtime_config_source": "database:SubscriptionConfig",
+                "MerchantLogin": getattr(config, "robokassa_merchant_login", "") or "",
+                "IsTest": 0,
+                "hash_algorithm": "md5",
+                "pass1_configured": bool(getattr(config, "robokassa_password_1", None)),
+                "pass2_configured": bool(getattr(config, "robokassa_password_2", None)),
+                "amount": f"{price:.2f}",
+            },
+            include_traceback=False,
+            logger=log,
+        )
         await callback.message.edit_text(
             "❌ Платёжная система Robokassa временно недоступна. Администратор не настроил ключи API.")
         return
 
     if price < 1.0:
-        await callback.answer(
-            "❌ Сумма к оплате меньше 1 руб. — Robokassa не принимает такие платежи. Обратитесь к администратору.",
-            show_alert=True)
+        await callback.message.edit_text(
+            "❌ Сумма к оплате меньше 1 руб. — Robokassa не принимает такие платежи. Обратитесь к администратору."
+        )
         return
 
     promo_code_str = None
@@ -12121,7 +12352,10 @@ async def create_robokassa_invoice(callback: CallbackQuery, state: FSMContext):
         user_id=callback.from_user.id,
         password=config.robokassa_password_1
     )
-    expires_at_msk = new_payment.expires_at.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M МСК')
+    expires_at_msk = datetime.strptime(
+        format_robokassa_expiration(new_payment.expires_at),
+        "%Y-%m-%dT%H:%M",
+    ).strftime('%d.%m.%Y %H:%M МСК')
     user_ref = f"{callback.from_user.first_name or ''}"
     if callback.from_user.username:
         user_ref += f" (@{callback.from_user.username})"
@@ -12162,7 +12396,6 @@ async def create_robokassa_invoice(callback: CallbackQuery, state: FSMContext):
         ]),
         disable_web_page_preview=True
     )
-    await callback.answer()
 
 
 @router.message(F.voice, StateFilter(None))
@@ -12293,7 +12526,7 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
             include_traceback=False,
         )
         await thinking_msg.edit_text(
-            f"Произошла непредвиденная ошибка при обработке аудио.\n<code>{html.escape(str(e))}</code>")
+            "Произошла непредвиденная ошибка при обработке аудио. Попробуйте ещё раз через несколько минут.")
         return
 
     async with async_session_maker() as session:
@@ -14102,7 +14335,7 @@ async def admin_general_settings(callback: CallbackQuery):
 
     processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
     processing_text = getattr(config, "ai_processing_message_text", None) or DEFAULT_AI_PROCESSING_MESSAGE_TEXT
-    processing_text_display = html.escape(processing_text)
+    processing_text_display = _ai_processing_message_html(processing_text)
 
     await callback.message.edit_text(
         "⚙️ <b>Общие настройки</b>\n\n"
@@ -14112,6 +14345,7 @@ async def admin_general_settings(callback: CallbackQuery):
         "Отключённое поле можно заполнить позже через настройки пользователя.\n\n"
         f"Сообщение ожидания ИИ: {'включено' if processing_enabled else 'выключено'}\n"
         f"Текущий текст: {processing_text_display}",
+        parse_mode="HTML",
         reply_markup=kb.admin_general_settings_keyboard(config),
     )
 
@@ -14147,13 +14381,14 @@ async def admin_edit_ai_processing_message_text(callback: CallbackQuery, state: 
         config = await session.get(BotGeneralConfig, 1)
         current_text = getattr(config, "ai_processing_message_text", None) if config else None
     current_text = current_text or DEFAULT_AI_PROCESSING_MESSAGE_TEXT
-    current_text_display = html.escape(current_text)
+    current_text_display = _ai_processing_message_html(current_text)
     await state.set_state(AdminStates.set_ai_processing_message_text)
     await state.update_data(message_id=callback.message.message_id)
     await callback.message.edit_text(
         "Введите текст временного сообщения во время ответа ИИ.\n"
         f"Текущее значение: {current_text_display}\n\n"
         f"После очистки текст должен содержать от 1 до {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов.",
+        parse_mode="HTML",
         reply_markup=kb.back_to_previous_menu("admin_general_settings"),
     )
     await callback.answer()
@@ -14162,7 +14397,10 @@ async def admin_edit_ai_processing_message_text(callback: CallbackQuery, state: 
 @router.message(AdminStates.set_ai_processing_message_text, F.text)
 async def admin_save_ai_processing_message_text(message: Message, state: FSMContext, bot: Bot):
     try:
-        value = normalize_ai_processing_message_text(message.text)
+        value = serialize_ai_processing_message_text(
+            message.text,
+            getattr(message, "entities", None),
+        )
     except ValueError as exc:
         await message.answer(str(exc))
         return

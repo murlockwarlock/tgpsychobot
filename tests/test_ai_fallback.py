@@ -1,7 +1,7 @@
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -25,7 +25,7 @@ class _Result:
 
 
 class _Session:
-    def __init__(self, module, user, ai_config, *, telegram):
+    def __init__(self, module, user, ai_config, *, telegram, commit_error=None):
         self.module = module
         self.user = user
         self.ai_config = ai_config
@@ -37,6 +37,7 @@ class _Session:
         )
         self._scalar_calls = 0
         self.added = []
+        self.commit_error = commit_error
 
     async def execute(self, statement):
         assert self._execute_results, "unexpected database execute in fallback test"
@@ -57,6 +58,8 @@ class _Session:
         self.added.append(value)
 
     async def commit(self):
+        if self.commit_error is not None:
+            raise self.commit_error
         return None
 
 
@@ -114,6 +117,16 @@ def _failure(module, kind):
         return module.InsufficientBalanceError("KIE API Error: Insufficient credits")
     if kind == "timeout":
         return TimeoutError("primary provider timed out")
+    if kind == "network":
+        return ConnectionError("provider connection reset")
+    if kind == "ssl":
+        return Exception("SSLError: UNEXPECTED_EOF_WHILE_READING")
+    if kind == "auth":
+        return Exception("401 Unauthorized: invalid API key")
+    if kind == "rate":
+        return Exception("429 Too Many Requests: rate limit")
+    if kind == "provider_5xx":
+        return Exception("503 Service Unavailable")
     raise AssertionError(f"unknown failure kind: {kind}")
 
 
@@ -167,6 +180,8 @@ async def _run_telegram(
     fallback_enabled,
     fallback_configured=None,
     fallback_call=None,
+    commit_error=None,
+    bot=None,
 ):
     import ai_integration
 
@@ -174,7 +189,7 @@ async def _run_telegram(
         fallback_enabled=fallback_enabled,
         fallback_configured=fallback_configured,
     )
-    session = _Session(ai_integration, _user(), config, telegram=True)
+    session = _Session(ai_integration, _user(), config, telegram=True, commit_error=commit_error)
     primary = (
         AsyncMock(side_effect=primary_outcome)
         if isinstance(primary_outcome, BaseException)
@@ -190,6 +205,7 @@ async def _run_telegram(
         "question",
         "Test User",
         "unknown",
+        bot=bot,
         include_test_context=False,
     )
     return result, primary, fallback
@@ -223,12 +239,19 @@ async def _run_max(
     return result, primary, fallback
 
 
-async def _run_kie_primary_with_fallback(monkeypatch, surface, payload, status_code):
+async def _run_kie_primary_with_fallback(
+    monkeypatch,
+    surface,
+    payload,
+    status_code,
+    *,
+    primary_model="grok-4-3",
+):
     module = _module(surface)
     config = _config(fallback_enabled=True)
     config.provider = "kie"
     config.kie_api_key = "primary-key"
-    config.kie_model = "grok-4-3"
+    config.kie_model = primary_model
     config.kie_base_url = "https://api.example"
     user = _user()
     session = _Session(module, user, config, telegram=surface == "telegram")
@@ -254,7 +277,10 @@ async def _run_kie_primary_with_fallback(monkeypatch, surface, payload, status_c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ("telegram", "max"))
-@pytest.mark.parametrize("failure_kind", ("service", "balance", "timeout"))
+@pytest.mark.parametrize(
+    "failure_kind",
+    ("service", "balance", "timeout", "network", "ssl", "auth", "rate", "provider_5xx"),
+)
 async def test_any_primary_failure_attempts_fallback_and_returns_its_answer(
     monkeypatch, surface, failure_kind
 ):
@@ -428,3 +454,199 @@ async def test_without_configured_fallback_primary_error_is_preserved(monkeypatc
         await runner(monkeypatch, primary_error, fallback_enabled=False)
 
     assert raised.value is primary_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+async def test_kie_empty_content_for_gemini_25_flash_uses_configured_fallback(
+    monkeypatch, surface
+):
+    result, client, fallback = await _run_kie_primary_with_fallback(
+        monkeypatch,
+        surface,
+        {"data": {"candidates": []}},
+        200,
+        primary_model="gemini-2.5-flash",
+    )
+
+    assert result == "fallback answer"
+    assert "gemini-2.5-flash" in client.calls[0][0]
+    fallback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fallback_success_admin_outcome_contains_primary_and_success_status(monkeypatch):
+    import ai_integration
+    import error_reporting
+
+    bot = SimpleNamespace(send_message=AsyncMock())
+    primary_error = ai_integration.AIResponseError("KIE chat returned empty content")
+
+    with patch.object(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[9001])):
+        await ai_integration._notify_ai_fallback_used(
+            bot,
+            user=SimpleNamespace(id=123, username="tester", full_name="Test User"),
+            primary_provider="KIE",
+            primary_model="gemini-2.5-flash",
+            fallback_provider="OpenAI",
+            fallback_model="gpt-test",
+            error=primary_error,
+        )
+
+    text = bot.send_message.await_args.args[1]
+    assert "Основной AI-провайдер не сработал" in text
+    assert "gemini-2.5-flash" in text
+    assert "KIE" in text
+    assert "OpenAI" in text
+    assert "SUCCESS" in text
+    assert "empty_response" in text
+
+
+@pytest.mark.asyncio
+async def test_successful_fallback_does_not_raise_or_emit_generic_ai_failure(monkeypatch):
+    import ai_integration
+
+    fallback_notice = AsyncMock()
+    monkeypatch.setattr(ai_integration, "_notify_ai_fallback_used", fallback_notice)
+    result, _, fallback = await _run_telegram(
+        monkeypatch,
+        ai_integration.AIResponseError("KIE chat returned empty content"),
+        fallback_enabled=True,
+        bot=SimpleNamespace(),
+    )
+
+    assert result == "fallback answer"
+    fallback.assert_awaited_once()
+    fallback_notice.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fallback_configuration_error_preserves_primary_cause(monkeypatch):
+    import ai_integration
+    import error_reporting
+
+    primary_error = ai_integration.AIResponseError("KIE chat returned empty content")
+    with pytest.raises(ai_integration.AIServiceError) as raised:
+        await _run_telegram(
+            monkeypatch,
+            primary_error,
+            fallback_enabled=True,
+            fallback_configured=False,
+        )
+
+    error = raised.value
+    assert error.ai_outcome == "PRIMARY_FAILED + FALLBACK_CONFIGURATION_ERROR"
+    assert [attempt["status"] for attempt in error.provider_attempts] == [
+        "FAILED",
+        "CONFIGURATION_ERROR",
+    ]
+    assert error.provider_attempts[0]["error"] == "KIE chat returned empty content"
+    assert error.provider_attempts[1]["classification"] == "configuration"
+    assert error_reporting.exception_summary(error) == "KIE chat returned empty content"
+
+
+@pytest.mark.asyncio
+async def test_primary_and_fallback_failure_have_both_attempts_and_one_admin_report(monkeypatch):
+    import ai_integration
+    import handlers
+
+    primary_error = ai_integration.AIResponseError("KIE chat returned empty content")
+    fallback_error = TimeoutError("fallback timed out")
+    fallback = AsyncMock(side_effect=fallback_error)
+
+    with pytest.raises(ai_integration.AIServiceError) as raised:
+        await _run_telegram(
+            monkeypatch,
+            primary_error,
+            fallback_enabled=True,
+            fallback_call=fallback,
+        )
+
+    error = raised.value
+    assert error.ai_outcome == "BOTH_FAILED"
+    assert len(error.provider_attempts) == 2
+    assert error.provider_attempts[0]["error"] == "KIE chat returned empty content"
+    assert error.provider_attempts[1]["error"] == "fallback timed out"
+    notify = AsyncMock()
+    with patch.object(handlers, "notify_admins_about_error", notify):
+        await handlers._report_ai_failure(
+            SimpleNamespace(),
+            title="Сбой AI-сервиса",
+            user=SimpleNamespace(id=123),
+            stage="process_buffered_messages",
+            exception=error,
+        )
+
+    notify.assert_awaited_once()
+    kwargs = notify.await_args.kwargs
+    assert kwargs["title"] == "Не удалось получить ответ ИИ"
+    assert kwargs["provider_attempts"] == error.provider_attempts
+
+
+@pytest.mark.asyncio
+async def test_post_response_application_failure_does_not_invoke_fallback(monkeypatch):
+    import ai_integration
+
+    fallback = AsyncMock(return_value="must not be called")
+    with pytest.raises(RuntimeError, match="database commit failed"):
+        await _run_telegram(
+            monkeypatch,
+            "valid primary answer",
+            fallback_enabled=True,
+            fallback_call=fallback,
+            commit_error=RuntimeError("database commit failed"),
+        )
+
+    fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_buffered_messages_reports_both_attempts_once_and_replies_safely(monkeypatch):
+    import handlers
+    import ai_integration
+
+    config = _config(fallback_enabled=True)
+    session = _Session(handlers, _user(), config, telegram=True)
+    service_error = ai_integration.AIServiceError("both providers unavailable")
+    service_error.ai_outcome = "BOTH_FAILED"
+    service_error.provider_attempts = (
+        {
+            "provider": "KIE",
+            "model": "gemini-2.5-flash",
+            "status": "FAILED",
+            "classification": "empty_response",
+            "error": "KIE chat returned empty content",
+        },
+        {
+            "provider": "OpenAI",
+            "model": "gpt-test",
+            "status": "FAILED",
+            "classification": "timeout",
+            "error": "fallback timed out",
+        },
+    )
+    bot = SimpleNamespace(
+        send_chat_action=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    handlers.user_message_buffers[123] = ["question"]
+
+    monkeypatch.setattr(handlers, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(handlers, "_resend_active_spread_choice", AsyncMock(return_value=False))
+    monkeypatch.setattr(handlers, "_send_ai_processing_message", AsyncMock(return_value=None))
+    monkeypatch.setattr(handlers, "_delete_ai_processing_message", AsyncMock())
+    monkeypatch.setattr(
+        handlers.ai_integration,
+        "generate_response",
+        AsyncMock(side_effect=service_error),
+    )
+    notify = AsyncMock()
+    monkeypatch.setattr(handlers, "notify_admins_about_error", notify)
+
+    await handlers.process_buffered_messages(123, bot)
+
+    notify.assert_awaited_once()
+    assert notify.await_args.kwargs["title"] == "Не удалось получить ответ ИИ"
+    assert notify.await_args.kwargs["provider_attempts"] == service_error.provider_attempts
+    assert bot.send_message.await_count == 1
+    assert "Попробуйте" in bot.send_message.await_args.kwargs["text"]

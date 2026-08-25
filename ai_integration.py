@@ -35,7 +35,12 @@ from result_history import (
     ai_history_role_filter,
     select_ai_history_messages,
 )
-from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error
+from error_reporting import (
+    classify_external_error,
+    exception_summary,
+    notify_admins_about_error,
+    root_cause_exception,
+)
 from vector_store import search_relevant_chunks
 from user_metadata import extract_service_data
 from provider_models import (
@@ -231,10 +236,11 @@ async def _notify_ai_fallback_used(
         return
 
     try:
-        _, classified_error = classify_ai_error(error, provider=primary_provider)
+        classification, classified_error = classify_external_error(error, provider=primary_provider)
+        primary_root = root_cause_exception(error) or error
         await notify_admins_about_error(
             bot,
-            title="Основной AI-провайдер недоступен, включен резервный",
+            title="Основной AI-провайдер не сработал — использован резервный",
             user_id=getattr(user, "id", None),
             username=getattr(user, "username", None),
             full_name=getattr(user, "full_name", None),
@@ -242,9 +248,27 @@ async def _notify_ai_fallback_used(
             model=primary_model,
             stage="ai_provider_fallback",
             details=classified_error,
+            provider_attempts=(
+                {
+                    "provider": primary_provider,
+                    "model": primary_model,
+                    "status": "FAILED",
+                    "classification": classification,
+                    "exception_class": type(primary_root).__name__,
+                    "error": exception_summary(error),
+                },
+                {
+                    "provider": fallback_provider,
+                    "model": fallback_model,
+                    "status": "SUCCESS",
+                    "classification": None,
+                    "error": "Ответ получен",
+                },
+            ),
             extra={
                 "fallback_provider": fallback_provider,
                 "fallback_model": fallback_model,
+                "fallback_status": "SUCCESS",
             },
             exception=error,
             include_traceback=False,
@@ -260,6 +284,44 @@ def _get_kie_base_url(ai_config: AIConfig) -> str:
 
 def _get_kie_upload_base_url(ai_config: AIConfig) -> str:
     return (getattr(ai_config, "kie_upload_base_url", None) or "https://kieai.redpandaai.co").rstrip("/")
+
+
+def _nonempty_provider_reason(value: object, fallback: str) -> str:
+    reason = str(value).strip() if value is not None else ""
+    return reason or fallback
+
+
+def _build_ai_attempt(
+    provider: str | None,
+    model: str | None,
+    error: Exception | None = None,
+    *,
+    status: str = "FAILED",
+    classification: str | None = None,
+    include_context: bool = True,
+) -> dict[str, str | None]:
+    if error is None:
+        return {
+            "provider": provider,
+            "model": model,
+            "status": status,
+            "classification": classification,
+            "error": "Ответ получен" if status == "SUCCESS" else "Неизвестная ошибка",
+        }
+    error_classification, _ = classify_external_error(
+        error,
+        provider=provider,
+        include_context=include_context,
+    )
+    root = root_cause_exception(error, include_context=include_context) or error
+    return {
+        "provider": provider,
+        "model": model,
+        "status": status,
+        "classification": classification or error_classification,
+        "exception_class": type(root).__name__,
+        "error": exception_summary(error, include_context=include_context),
+    }
 
 
 def _kie_model_base_url(base_url: str, model: str) -> str:
@@ -415,11 +477,12 @@ async def _retry_kie_transcription_step(step: str, operation, attempts: int = 3)
 
 
 def _validate_kie_json_response(status_code: int, payload: dict, *, context: str) -> dict:
-    detail = (
+    raw_detail = (
         payload.get("msg") or payload.get("message") or str(payload)
         if isinstance(payload, dict)
         else str(payload)
     )
+    detail = _nonempty_provider_reason(raw_detail, f"HTTP {status_code} без описания")
     if status_code != 200:
         if is_kie_insufficient_balance(status_code, payload):
             raise InsufficientBalanceError(f"KIE API Error: {detail}")
@@ -789,7 +852,14 @@ async def _call_gemini_api(
             response = await client.post(url, json=payload, headers={'Content-Type': 'application/json'})
             if response.status_code != 200:
                 error_data = response.json()
-                error_msg = error_data.get('error', {}).get('message', str(response.text))
+                error_payload = error_data.get('error', {}) if isinstance(error_data, dict) else {}
+                error_msg = _nonempty_provider_reason(
+                    error_payload.get('message') if isinstance(error_payload, dict) else None,
+                    _nonempty_provider_reason(
+                        getattr(response, 'text', None),
+                        f"HTTP {response.status_code} без описания",
+                    ),
+                )
                 if "location" in error_msg.lower():
                     raise InsufficientBalanceError(f"Geo-Block: {error_msg}")
                 raise AIServiceError(f"Ошибка API Gemini: {error_msg}")
@@ -803,8 +873,8 @@ async def _call_gemini_api(
             )
     except Exception as e:
         if any(word in str(e).lower() for word in ["billing", "quota", "location", "geo-block"]):
-            raise InsufficientBalanceError(f"Gemini API Error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к Gemini: {e}")
+            raise InsufficientBalanceError(f"Gemini API Error: {exception_summary(e)}") from e
+        raise AIServiceError(f"Ошибка при обращении к Gemini: {exception_summary(e)}") from e
 
 
 async def _call_kie_chat(
@@ -891,7 +961,7 @@ async def _call_kie_chat(
         raise
     except Exception as e:
         logging.error("KIE chat error", exc_info=e)
-        raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {e}")
+        raise AIServiceError(f"Ошибка при обращении к KIE Chat API: {exception_summary(e)}") from e
 
 
 async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: bytes, filename: str, upload_path: str) -> str:
@@ -917,7 +987,7 @@ async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: by
         raise
     except Exception as e:
         logging.error("KIE upload error", exc_info=e)
-        raise AIServiceError(f"Ошибка загрузки файла в KIE: {exception_summary(e)}")
+        raise AIServiceError(f"Ошибка загрузки файла в KIE: {exception_summary(e)}") from e
 
 
 async def _call_kie_multimodal(
@@ -971,7 +1041,7 @@ async def _call_kie_multimodal(
         raise
     except Exception as e:
         logging.error("KIE multimodal error", exc_info=e)
-        raise AIServiceError(f"Ошибка обращения к KIE multimodal API: {e}")
+        raise AIServiceError(f"Ошибка обращения к KIE multimodal API: {exception_summary(e)}") from e
 
 
 async def _create_kie_task(api_key: str, base_url: str, model: str, input_payload: dict) -> str:
@@ -996,7 +1066,7 @@ async def _create_kie_task(api_key: str, base_url: str, model: str, input_payloa
         raise
     except Exception as e:
         logging.error("KIE create task error", exc_info=e)
-        raise AIServiceError(f"Ошибка создания задачи KIE: {exception_summary(e)}")
+        raise AIServiceError(f"Ошибка создания задачи KIE: {exception_summary(e)}") from e
 
 
 def _extract_kie_task_result(task_payload: dict) -> dict:
@@ -1008,7 +1078,7 @@ def _extract_kie_task_result(task_payload: dict) -> dict:
         try:
             return json.loads(result_json)
         except json.JSONDecodeError as exc:
-            raise AIResponseError(f"Cannot decode KIE resultJson: {exc}: {result_json}") from exc
+            raise AIResponseError(f"Cannot decode KIE resultJson: {exception_summary(exc)}") from exc
     if isinstance(result_json, dict):
         return result_json
     return {}
@@ -1166,13 +1236,13 @@ async def _call_claude_api(
         )
         return message.content[0].text
     except anthropic.AuthenticationError as e:
-        raise InsufficientBalanceError(f"Claude API Error: {e}")
+        raise InsufficientBalanceError(f"Claude API Error: {exception_summary(e)}") from e
     except Exception as e:
         error_text = str(e).lower()
         if any(marker in error_text for marker in ["credit balance", "billing", "quota", "purchase credits", "insufficient"]):
-            raise InsufficientBalanceError(f"Claude API Error: {e}")
+            raise InsufficientBalanceError(f"Claude API Error: {exception_summary(e)}") from e
         logging.error(f"Claude API error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к Claude API: {e}")
+        raise AIServiceError(f"Ошибка при обращении к Claude API: {exception_summary(e)}") from e
 
 
 async def _call_claude_vision(
@@ -1237,13 +1307,13 @@ async def _call_claude_vision(
             raise AIResponseError("Claude vision returned empty content")
         return result
     except anthropic.AuthenticationError as e:
-        raise InsufficientBalanceError(f"Claude Vision API Error: {e}")
+        raise InsufficientBalanceError(f"Claude Vision API Error: {exception_summary(e)}") from e
     except Exception as e:
         error_text = str(e).lower()
         if any(marker in error_text for marker in ["credit balance", "billing", "quota", "purchase credits", "insufficient"]):
-            raise InsufficientBalanceError(f"Claude Vision API Error: {e}")
+            raise InsufficientBalanceError(f"Claude Vision API Error: {exception_summary(e)}") from e
         logging.error("Claude vision error", exc_info=e)
-        raise AIServiceError(f"Ошибка анализа изображения (Claude): {e}")
+        raise AIServiceError(f"Ошибка анализа изображения (Claude): {exception_summary(e)}") from e
 
 
 async def _call_deepseek_api(
@@ -1303,9 +1373,9 @@ async def _call_deepseek_api(
         return _extract_openai_chat_text(chat_completion, provider="Deepseek")
     except Exception as e:
         if hasattr(e, 'code') and e.code == 'insufficient_quota':
-            raise InsufficientBalanceError(f"Deepseek API Error: {e}")
+            raise InsufficientBalanceError(f"Deepseek API Error: {exception_summary(e)}") from e
         logging.error(f"Deepseek API error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к Deepseek API: {e}")
+        raise AIServiceError(f"Ошибка при обращении к Deepseek API: {exception_summary(e)}") from e
     finally:
         if client is not None:
             await client.close()
@@ -1324,17 +1394,17 @@ async def _call_openai_transcribe(api_key: str, file_bytes: bytes, filename: str
         )
         return transcription.text
     except AuthenticationError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {e}")
+        raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {exception_summary(e)}") from e
     except RateLimitError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Rate limit or quota exceeded. {e}")
+        raise InsufficientBalanceError(f"OpenAI API Error: Rate limit or quota exceeded. {exception_summary(e)}") from e
     except BadRequestError as e:
         if "billing" in str(e) or "quota" in str(e).lower():
-            raise InsufficientBalanceError(f"OpenAI API Error: Billing issue or insufficient quota. {e}")
+            raise InsufficientBalanceError(f"OpenAI API Error: Billing issue or insufficient quota. {exception_summary(e)}") from e
         logging.error(f"OpenAI API error: {e}")
-        raise AIServiceError(f"Ошибка при транскрибации (OpenAI API): {e}")
+        raise AIServiceError(f"Ошибка при транскрибации (OpenAI API): {exception_summary(e)}") from e
     except Exception as e:
         logging.error(f"OpenAI API transcription error: {e}")
-        raise AIServiceError(f"Ошибка при транскрибации: {e}")
+        raise AIServiceError(f"Ошибка при транскрибации: {exception_summary(e)}") from e
 
 
 async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
@@ -1393,7 +1463,9 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                         {
                             "provider": "OpenAI",
                             "model": "whisper-1",
-                            "error": exception_summary(fallback_exc),
+                            # The active KIE exception is an implicit context here;
+                            # this attempt must describe OpenAI itself.
+                            "error": exception_summary(fallback_exc, include_context=False),
                         },
                     )
                     raise fallback_exc from kie_exc
@@ -1449,17 +1521,17 @@ async def _call_openai_api(
         )
         return _extract_openai_chat_text(chat_completion, provider="OpenAI")
     except AuthenticationError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {e}")
+        raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {exception_summary(e)}") from e
     except RateLimitError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Rate limit or quota exceeded. {e}")
+        raise InsufficientBalanceError(f"OpenAI API Error: Rate limit or quota exceeded. {exception_summary(e)}") from e
     except BadRequestError as e:
         if "billing" in str(e) or "quota" in str(e).lower():
-            raise InsufficientBalanceError(f"OpenAI API Error: Billing issue or insufficient quota. {e}")
+            raise InsufficientBalanceError(f"OpenAI API Error: Billing issue or insufficient quota. {exception_summary(e)}") from e
         logging.error(f"OpenAI API error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к OpenAI API: {e}")
+        raise AIServiceError(f"Ошибка при обращении к OpenAI API: {exception_summary(e)}") from e
     except Exception as e:
         logging.error(f"OpenAI API error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к OpenAI API: {e}")
+        raise AIServiceError(f"Ошибка при обращении к OpenAI API: {exception_summary(e)}") from e
 
 
 async def get_ai_response(
@@ -1578,8 +1650,11 @@ async def get_ai_response(
         if provider_key in ['anthropic', 'claude'] and not api_key:
             api_key = _normalize_config_value(ai_config.claude_api_key)
 
+        primary_config_error = None
         if not api_key:
-            return f"⚠️ Ошибка настройки: Не указан API ключ для провайдера '{provider}'. Пожалуйста, сообщите администратору."
+            primary_config_error = AIServiceError(
+                f"API key for primary AI provider '{provider}' is not configured"
+            )
 
         model = _normalize_config_value(getattr(ai_config, f"{provider_key}_model", None))
         if provider_key in ['anthropic', 'claude'] and not model:
@@ -1735,12 +1810,33 @@ async def get_ai_response(
         actual_model = model
 
         try:
+            if primary_config_error is not None:
+                raise primary_config_error
             response_text = await _dispatch_call(provider_key, api_key, model)
         except (AIServiceError, Exception) as primary_err:
             allow_fallback = getattr(ai_config, 'allow_fallback', False)
             fb_provider = getattr(ai_config, 'fallback_provider', None)
             fb_model = getattr(ai_config, 'fallback_model', None)
             if not allow_fallback or not fb_provider or not fb_model:
+                if allow_fallback:
+                    fallback_config_error = AIServiceError(
+                        "Fallback AI provider configuration is incomplete: provider and model are required"
+                    )
+                    service_err = AIServiceError(
+                        "Основной AI-провайдер не сработал, резервный провайдер не настроен"
+                    )
+                    service_err.ai_outcome = "PRIMARY_FAILED + FALLBACK_CONFIGURATION_ERROR"
+                    service_err.provider_attempts = (
+                        _build_ai_attempt(provider, model, primary_err),
+                        _build_ai_attempt(
+                            fb_provider,
+                            fb_model,
+                            fallback_config_error,
+                            status="CONFIGURATION_ERROR",
+                            classification="configuration",
+                        ),
+                    )
+                    raise service_err from primary_err
                 raise
 
             fb_key = fb_provider.strip().lower()
@@ -1748,8 +1844,28 @@ async def get_ai_response(
             if fb_key in ['anthropic', 'claude'] and not fb_api_key:
                 fb_api_key = _normalize_config_value(ai_config.claude_api_key)
             if not fb_api_key:
-                logging.error(f"Fallback provider '{fb_provider}' has no API key configured, re-raising original error")
-                raise
+                fallback_config_error = AIServiceError(
+                    f"API key for fallback AI provider '{fb_provider}' is not configured"
+                )
+                logging.error(
+                    "Fallback provider '%s' has no API key configured",
+                    fb_provider,
+                )
+                service_err = AIServiceError(
+                    "Основной AI-провайдер не сработал, резервный провайдер не настроен"
+                )
+                service_err.ai_outcome = "PRIMARY_FAILED + FALLBACK_CONFIGURATION_ERROR"
+                service_err.provider_attempts = (
+                    _build_ai_attempt(provider, model, primary_err),
+                    _build_ai_attempt(
+                        fb_provider,
+                        fb_model,
+                        fallback_config_error,
+                        status="CONFIGURATION_ERROR",
+                        classification="configuration",
+                    ),
+                )
+                raise service_err from primary_err
 
             logging.warning(
                 f"Primary provider '{provider}' failed ({primary_err}), "
@@ -1770,16 +1886,29 @@ async def get_ai_response(
                 )
             except Exception as fb_err:
                 logging.error(f"Fallback provider '{fb_provider}' also failed: {fb_err}")
-                _, primary_desc = classify_ai_error(primary_err, provider=provider)
-                _, fb_desc = classify_ai_error(fb_err, provider=fb_provider)
                 attempts = (
-                    {"provider": provider, "model": model, "error": primary_desc},
-                    {"provider": fb_provider, "model": fb_model, "error": fb_desc},
+                    _build_ai_attempt(provider, model, primary_err),
+                    _build_ai_attempt(
+                        fb_provider,
+                        fb_model,
+                        fb_err,
+                        include_context=False,
+                    ),
+                )
+                fallback_classification, _ = classify_external_error(
+                    fb_err,
+                    provider=fb_provider,
+                    include_context=False,
                 )
                 service_err = AIServiceError(
                     f"Основной провайдер ({provider}) и резервный ({fb_provider}) недоступны"
                 )
                 service_err.provider_attempts = attempts
+                service_err.ai_outcome = (
+                    "PRIMARY_FAILED + FALLBACK_CONFIGURATION_ERROR"
+                    if fallback_classification == "configuration"
+                    else "BOTH_FAILED"
+                )
                 raise service_err from fb_err
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
@@ -1879,7 +2008,14 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
 
             if response.status_code != 200:
                 error_data = response.json()
-                error_msg = error_data.get('error', {}).get('message', str(response.text))
+                error_payload = error_data.get('error', {}) if isinstance(error_data, dict) else {}
+                error_msg = _nonempty_provider_reason(
+                    error_payload.get('message') if isinstance(error_payload, dict) else None,
+                    _nonempty_provider_reason(
+                        getattr(response, 'text', None),
+                        f"HTTP {response.status_code} без описания",
+                    ),
+                )
 
                 if "User location" in error_msg:
                     raise InsufficientBalanceError(f"Gemini Geo-Block (Transcription): {error_msg}")
@@ -1901,8 +2037,8 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
     except Exception as e:
         logging.error(f"Gemini API transcription error: {e}")
         if "billing" in str(e).lower() or "geo-block" in str(e).lower():
-            raise InsufficientBalanceError(f"Gemini Error: {e}")
-        raise AIServiceError(f"Ошибка при транскрибации (Gemini API): {e}")
+            raise InsufficientBalanceError(f"Gemini Error: {exception_summary(e)}") from e
+        raise AIServiceError(f"Ошибка при транскрибации (Gemini API): {exception_summary(e)}") from e
 
 
 async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str, model: str, file_bytes: bytes, filename: str) -> str:
@@ -1961,7 +2097,7 @@ async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str
         raise
     except Exception as e:
         logging.error("KIE transcription error", exc_info=e)
-        raise AIServiceError(f"Ошибка при транскрибации (KIE API): {e}")
+        raise AIServiceError(f"Ошибка при транскрибации (KIE API): {exception_summary(e)}") from e
 
 
 async def _call_gemini_image_generation(api_key: str, model: str, prompt: str) -> bytes:
@@ -2261,7 +2397,7 @@ async def generate_openai_image(prompt: str) -> str:
 
     except Exception as e:
         logging.error(f"OpenAI Image Error ({model}): {e}")
-        raise AIServiceError(f"Ошибка генерации изображения: {e}")
+        raise AIServiceError(f"Ошибка генерации изображения: {exception_summary(e)}") from e
 
 
 async def analyze_image_content(
@@ -2402,7 +2538,7 @@ async def analyze_image_content(
             return _extract_openai_chat_text(response, provider="OpenAI Vision")
         except Exception as e:
             logging.error(f"OpenAI Vision Error: {e}")
-            raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {e}")
+            raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {exception_summary(e)}") from e
 
 
 async def _call_gemini_vision(
@@ -2494,7 +2630,7 @@ async def _call_gemini_vision(
                 retry_delay *= 2
                 continue
             logging.error(f"Ошибка вызова Gemini Vision: {e}")
-            raise AIServiceError(f"Ошибка анализа изображения (Gemini): {e}")
+            raise AIServiceError(f"Ошибка анализа изображения (Gemini): {exception_summary(e)}") from e
 
     raise AIServiceError("Сервис Gemini Vision временно перегружен.")
 
@@ -2550,4 +2686,4 @@ async def _call_kie_vision(
         raise
     except Exception as e:
         logging.error("KIE vision error", exc_info=e)
-        raise AIServiceError(f"Ошибка анализа изображения (KIE): {e}")
+        raise AIServiceError(f"Ошибка анализа изображения (KIE): {exception_summary(e)}") from e

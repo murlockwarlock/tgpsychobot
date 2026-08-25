@@ -17,7 +17,12 @@ from database import (async_session_maker, UserSubscription, SubscriptionPlan, S
 from sqlalchemy import func
 from aiogram.fsm.context import FSMContext
 from subscription_retry_policy import get_next_retry_at
-from error_reporting import notify_admins_about_error
+from error_reporting import notify_admins_about_error, sanitize_secret_values
+from robokassa_signing import (
+    build_robokassa_payment_params,
+    format_robokassa_expiration,
+    robokassa_payment_diagnostics,
+)
 
 import os
 import re
@@ -94,28 +99,23 @@ def generate_robokassa_payment_url(
     number: int,
     description: str,
     expiration_date: datetime | None = None,
-    recurring: bool = False
+    recurring: bool = False,
+    is_test: int | bool = 0,
+    hash_algorithm: str = "md5",
+    shp_params: dict[str, object] | None = None,
 ) -> str:
-    signature = calculate_signature(
+    data = build_robokassa_payment_params(
         merchant_login,
+        merchant_password_1,
         cost,
         number,
-        merchant_password_1
+        description,
+        expiration_date=expiration_date,
+        recurring=recurring,
+        is_test=is_test,
+        hash_algorithm=hash_algorithm,
+        shp_params=shp_params,
     )
-
-    data = {
-        'MerchantLogin': merchant_login,
-        'OutSum': cost,
-        'InvId': number,
-        'Description': description,
-        'SignatureValue': signature,
-        'IsTest': 0
-    }
-    if recurring:
-        data['Recurring'] = 'true'
-    if expiration_date:
-        msk_expiration = expiration_date.astimezone(timezone(timedelta(hours=3)))
-        data['ExpirationDate'] = msk_expiration.strftime('%Y-%m-%dT%H:%M')
 
     return f"https://auth.robokassa.ru/Merchant/Index.aspx?{parse.urlencode(data)}"
 
@@ -526,6 +526,33 @@ async def handle_robokassa_invoice_redirect(request: web.Request):
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
         if not config or not config.robokassa_merchant_login or not config.robokassa_password_1:
+            safe_config = {
+                "runtime_config_source": "database:SubscriptionConfig",
+                "MerchantLogin": getattr(config, "robokassa_merchant_login", "") or "",
+                "IsTest": 0,
+                "hash_algorithm": "md5",
+                "pass1_configured": bool(getattr(config, "robokassa_password_1", None)),
+                "pass2_configured": bool(getattr(config, "robokassa_password_2", None)),
+            }
+            log.error("Robokassa payment URL config is invalid: %s", safe_config)
+            bot = request.app.get("bot")
+            if bot is not None:
+                try:
+                    await notify_admins_about_error(
+                        bot,
+                        title="Конфигурация Robokassa не задана",
+                        provider="Robokassa",
+                        stage="create_payment_url",
+                        exception=ValueError("Robokassa MerchantLogin or MerchantPass1 is not configured"),
+                        extra=safe_config,
+                        include_traceback=False,
+                        logger=log,
+                    )
+                except Exception as notify_error:
+                    log.error(
+                        "Failed to notify about Robokassa config: %s",
+                        sanitize_secret_values(str(notify_error)),
+                    )
             return web.Response(text="Платежная система временно недоступна.", status=503)
 
         payment = await session.get(RobokassaPayment, payment_id)
@@ -575,7 +602,10 @@ async def handle_robokassa_invoice_redirect(request: web.Request):
             current_payment = replacement
             await session.commit()
             user_ref, plan_name = await get_payment_context(session, current_payment)
-            expires_at_msk = current_payment.expires_at.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M МСК')
+            expires_at_msk = datetime.strptime(
+                format_robokassa_expiration(current_payment.expires_at),
+                "%Y-%m-%dT%H:%M",
+            ).strftime('%d.%m.%Y %H:%M МСК')
             plog.info(
                 f"СЧЕТ_ОБНОВЛЕН | Robokassa | {user_ref} | {plan_name} | "
                 f"InvId={old_payment_id} -> InvId={current_payment.id} | до {expires_at_msk}"
@@ -597,17 +627,85 @@ async def handle_robokassa_invoice_redirect(request: web.Request):
             return web.Response(text="Тариф не найден. Вернитесь в бот и оформите новый счёт.", status=404)
 
         description = ''.join(c for c in f"Оплата подписки на тариф «{plan.name}»" if ord(c) <= 0xFFFF)
-        payment_url = generate_robokassa_payment_url(
-            merchant_login=config.robokassa_merchant_login,
-            merchant_password_1=config.robokassa_password_1,
-            cost=decimal.Decimal(f"{current_payment.amount:.2f}"),
-            number=current_payment.id,
-            description=description,
-            expiration_date=current_payment.expires_at,
-            recurring=getattr(plan, 'allow_auto_renewal', True)
+        recurring = getattr(plan, 'allow_auto_renewal', True)
+        try:
+            payment_amount = decimal.Decimal(f"{current_payment.amount:.2f}")
+            payment_url = generate_robokassa_payment_url(
+                merchant_login=config.robokassa_merchant_login,
+                merchant_password_1=config.robokassa_password_1,
+                cost=payment_amount,
+                number=current_payment.id,
+                description=description,
+                expiration_date=current_payment.expires_at,
+                recurring=recurring,
+            )
+            diagnostics = robokassa_payment_diagnostics(
+                merchant_login=config.robokassa_merchant_login,
+                merchant_password_1=config.robokassa_password_1,
+                merchant_password_2=config.robokassa_password_2,
+                cost=payment_amount,
+                invoice_id=current_payment.id,
+                description=description,
+                expiration_date=current_payment.expires_at,
+                recurring=recurring,
+            )
+        except Exception as e:
+            log.error(
+                "Robokassa payment URL build failed: %s",
+                sanitize_secret_values(str(e)),
+            )
+            bot = request.app.get("bot")
+            if bot is not None:
+                try:
+                    await notify_admins_about_error(
+                        bot,
+                        title="Сбой формирования ссылки Robokassa",
+                        provider="Robokassa",
+                        stage="create_payment_url",
+                        user_id=current_payment.user_id,
+                        exception=e,
+                        extra={
+                            "plan_id": current_payment.plan_id,
+                            "invoice_id": current_payment.id,
+                            "amount": str(current_payment.amount),
+                        },
+                        include_traceback=False,
+                        logger=log,
+                    )
+                except Exception as notify_error:
+                    log.error(
+                        "Failed to notify about Robokassa URL build: %s",
+                        sanitize_secret_values(str(notify_error)),
+                    )
+            return web.Response(
+                text="Не удалось сформировать ссылку на оплату. Попробуйте запросить новый счёт.",
+                status=503,
+            )
+        plog.info(
+            "ROBOKASSA_PAYMENT_BUILD | source=%s | MerchantLogin=%s | IsTest=%s | "
+            "hash_algorithm=%s | Pass1Configured=%s | Pass2Configured=%s | OutSum=%s | "
+            "InvId=%s | ShpNames=%s | CanonicalOrder=%s | CanonicalValuesMatchURL=%s | "
+            "SignaturePresent=%s | SignatureLength=%s | URLParams=%s",
+            diagnostics["runtime_config_source"],
+            diagnostics["MerchantLogin"],
+            diagnostics["IsTest"],
+            diagnostics["hash_algorithm"],
+            diagnostics["pass1_configured"],
+            diagnostics["pass2_configured"],
+            diagnostics["OutSum"],
+            diagnostics["InvId"],
+            ",".join(diagnostics["Shp_names"]),
+            ":".join(diagnostics["canonical_field_order"]),
+            diagnostics["canonical_values_match_url"],
+            diagnostics["signature_present"],
+            diagnostics["signature_length"],
+            diagnostics["url_parameters"],
         )
         user_ref, plan_name = await get_payment_context(session, current_payment)
-        expires_at_msk = current_payment.expires_at.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M МСК')
+        expires_at_msk = datetime.strptime(
+            format_robokassa_expiration(current_payment.expires_at),
+            "%Y-%m-%dT%H:%M",
+        ).strftime('%d.%m.%Y %H:%M МСК')
         plog.info(f"СЧЕТ_ОТКРЫТ | Robokassa | {user_ref} | {plan_name} | InvId={current_payment.id} | до {expires_at_msk}")
         return web.HTTPFound(payment_url)
 
@@ -625,7 +723,10 @@ async def handle_robokassa_result(request: web.Request):
         inv_id = int(normalized_data['invid'])
         signature = normalized_data['signaturevalue']
     except KeyError as e:
-        print(f"Robokassa ResultURL Error: Missing parameter {e} in {data}")
+        print(
+            f"Robokassa ResultURL Error: Missing parameter {e}; "
+            f"received_keys={sorted(data)}"
+        )
         return web.Response(text="bad sign", status=400)
 
     try:
@@ -830,7 +931,11 @@ async def handle_robokassa_result(request: web.Request):
         return web.Response(text=f"OK{inv_id}")
 
     except Exception as e:
-        log.error("Ошибка в обработке вебхука Robokassa Result: %s", e, exc_info=e)
+        log.error(
+            "Ошибка в обработке вебхука Robokassa Result: %s",
+            sanitize_secret_values(str(e)),
+            exc_info=e,
+        )
         await notify_admins_about_error(
             bot,
             title="Сбой webhook Robokassa",
@@ -866,10 +971,14 @@ async def handle_robokassa_success(request: web.Request):
         return web.HTTPFound(f"https://t.me/{bot_info.username}")
 
     except KeyError as e:
-        log.error("Robokassa SuccessURL missing parameter %s in %s", e, data)
+        log.error("Robokassa SuccessURL missing parameter %s; received_keys=%s", e, sorted(data))
         return web.Response(text="bad sign", status=400)
     except Exception as e:
-        log.error("Ошибка в обработке вебхука Robokassa Success: %s", e, exc_info=e)
+        log.error(
+            "Ошибка в обработке вебхука Robokassa Success: %s",
+            sanitize_secret_values(str(e)),
+            exc_info=e,
+        )
         await notify_admins_about_error(
             bot,
             title="Сбой webhook Robokassa",
