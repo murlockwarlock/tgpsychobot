@@ -16,7 +16,12 @@ from database import (
     AutomationStepTransition,
     User,
 )
-from user_metadata import ServiceDataBlock, append_metadata_records, merge_metadata
+from user_metadata import (
+    ServiceDataBlock,
+    append_metadata_records,
+    merge_metadata,
+    service_data_history_block,
+)
 
 
 @dataclass(frozen=True)
@@ -120,9 +125,9 @@ async def apply_service_data_blocks(
     """Atomically persist a model response in the current dialogue scope."""
     blocks = list(blocks)
     metadata_blocks = [
-        {"data": block.metadata, "raw_json": block.raw_json}
+        history_block
         for block in blocks
-        if block.metadata
+        if (history_block := service_data_history_block(block)) is not None
     ]
     if metadata_blocks:
         # Keep the existing admin export/history fully backward compatible.

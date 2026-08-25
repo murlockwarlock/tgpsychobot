@@ -35,6 +35,22 @@ class UserMetadataTests(unittest.TestCase):
         self.assertIsNone(records[0]["saved_at"])
         self.assertEqual(records[0]["data"], {"saved": True})
 
+    def test_loads_existing_records_v1_history_unchanged(self):
+        stored = json.dumps({
+            "_format": "records_v1",
+            "records": [{
+                "saved_at": "2026-07-19T10:00:00+00:00",
+                "data": {"score": 7},
+                "raw_json": '{"score":7}',
+            }],
+        })
+
+        self.assertEqual(load_metadata_records(stored), [{
+            "saved_at": "2026-07-19T10:00:00+00:00",
+            "data": {"score": 7},
+            "raw_json": '{"score":7}',
+        }])
+
     def test_futuro_analyzer_response_keeps_reveal_and_hides_full_profile(self):
         response = """Ты — Штурман: тебе важно самому выбирать направление. Твоя сила — идти своим путём.
 

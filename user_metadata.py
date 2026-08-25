@@ -259,6 +259,22 @@ def append_metadata_records(
     )
 
 
+def service_data_history_block(block: ServiceDataBlock) -> dict[str, Any] | None:
+    """Build one backward-compatible user history entry for a service block."""
+    if block.legacy:
+        if not block.metadata:
+            return None
+        data = block.metadata
+    else:
+        data = {
+            "current_state": block.current_state,
+            "events": block.events,
+            "metadata": block.metadata,
+            "save_mode": block.save_mode,
+        }
+    return {"data": data, "raw_json": block.raw_json}
+
+
 def extract_data_blocks(text: str | None) -> tuple[str, list[dict[str, Any]], int]:
     """Return visible text, valid data blocks in source order, and invalid count.
 

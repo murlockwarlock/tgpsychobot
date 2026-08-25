@@ -20,7 +20,7 @@ from database import (
     Base,
     User,
 )
-from user_metadata import extract_service_data, load_metadata
+from user_metadata import extract_service_data, load_metadata, load_metadata_records
 
 
 class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -94,6 +94,105 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
             "current_step": "STEP_1",
             "score": 2,
         })
+
+    async def test_structured_service_payload_is_stored_once_in_user_history(self):
+        raw_payload = (
+            '{"current_state":{"current_step":"completed","score":2},'
+            '"events":["CHILD_WORDS_SENT","DIALOG_COMPLETED"],'
+            '"metadata":{},"save_mode":"snapshot"}'
+        )
+        async with self.sessions() as session:
+            user = await session.get(User, 42)
+            await apply_service_data_blocks(
+                session,
+                user=user,
+                dialogue_id=1,
+                topic_id=7,
+                blocks=self._blocks(raw_payload),
+            )
+            await session.commit()
+            records = load_metadata_records(user.metadata_json)
+            state = await get_conversation_automation_state(
+                session, user_id=42, dialogue_id=1, topic_id=7
+            )
+            events = (
+                await session.execute(select(AutomationEvent).order_by(AutomationEvent.id))
+            ).scalars().all()
+            transition_count = await session.scalar(
+                select(func.count(AutomationStepTransition.id))
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["raw_json"], raw_payload)
+        self.assertEqual(records[0]["data"], {
+            "current_state": {"current_step": "completed", "score": 2},
+            "events": ["CHILD_WORDS_SENT", "DIALOG_COMPLETED"],
+            "metadata": {},
+            "save_mode": "snapshot",
+        })
+        self.assertEqual(load_metadata(state.current_state_json), {
+            "current_step": "completed",
+            "score": 2,
+        })
+        self.assertEqual([event.name for event in events], [
+            "CHILD_WORDS_SENT",
+            "DIALOG_COMPLETED",
+        ])
+        self.assertEqual(transition_count, 1)
+
+    async def test_structured_metadata_is_kept_in_same_history_record(self):
+        async with self.sessions() as session:
+            user = await session.get(User, 42)
+            await apply_service_data_blocks(
+                session,
+                user=user,
+                dialogue_id=1,
+                topic_id=None,
+                blocks=self._blocks(
+                    '{"current_state":{"current_step":"READY"},'
+                    '"events":["READY_EVENT"],"metadata":{"score":7}}'
+                ),
+            )
+            await session.commit()
+            records = load_metadata_records(user.metadata_json)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["data"]["metadata"], {"score": 7})
+        self.assertEqual(records[0]["data"]["current_state"]["current_step"], "READY")
+        self.assertEqual(records[0]["data"]["events"], ["READY_EVENT"])
+        self.assertEqual(records[0]["data"]["save_mode"], "merge")
+
+    async def test_legacy_data_history_remains_metadata_only(self):
+        _, blocks, invalid = extract_service_data(
+            '[DATA]{"events":["ordinary metadata"],"score":5}[/DATA]'
+        )
+        self.assertEqual(invalid, 0)
+
+        async with self.sessions() as session:
+            user = await session.get(User, 42)
+            result = await apply_service_data_blocks(
+                session,
+                user=user,
+                dialogue_id=1,
+                topic_id=None,
+                blocks=blocks,
+            )
+            await session.commit()
+            records = load_metadata_records(user.metadata_json)
+            state_count = await session.scalar(
+                select(func.count(AutomationConversationState.id))
+            )
+            event_count = await session.scalar(select(func.count(AutomationEvent.id)))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["data"], {
+            "events": ["ordinary metadata"],
+            "score": 5,
+        })
+        self.assertFalse(result.state_changed)
+        self.assertEqual(result.event_names, ())
+        self.assertEqual(state_count, 0)
+        self.assertEqual(event_count, 0)
 
     async def test_topic_and_dialogue_have_independent_state(self):
         async with self.sessions() as session:
