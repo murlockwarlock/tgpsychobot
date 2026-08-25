@@ -104,6 +104,27 @@ class ErrorReportingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("UNEXPECTED_EOF_WHILE_READING", text)
         self.assertNotIn("NoneType", text)
 
+    async def test_yookassa_persistence_alert_uses_application_classification_override(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+
+        with patch.object(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[123])):
+            await error_reporting.notify_admins_about_error(
+                bot,
+                title="Сбой сохранения платежа YooKassa",
+                provider="YooKassa",
+                stage="persist_payment",
+                exception=RuntimeError("database commit failed"),
+                classification_override="application_internal",
+                extra={"payment_id": "payment-1", "provider_status": "SUCCESS"},
+                include_traceback=False,
+            )
+
+        text = bot.send_message.await_args.args[1]
+        self.assertIn("persist_payment", text)
+        self.assertIn("application_internal", text)
+        self.assertIn("provider_status=SUCCESS", text)
+        self.assertNotIn("network_ssl", text)
+
     async def test_chained_exception_secrets_are_redacted(self):
         bot = SimpleNamespace(send_message=AsyncMock())
         root = FakeSSLError("TLS failed password=pass1 signature=deadbeef")

@@ -9436,55 +9436,9 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
             Payload=_encode_log_json(payload),
         )
         payment = await asyncio.to_thread(Payment.create, payload, idempotence_key)
-        _plog_yookassa_tech(
-            "TECH_INVOICE_RESPONSE",
-            PaymentId=payment.id,
-            Status=payment.status,
-            Body=_encode_log_json(_serialize_yookassa_payment(payment)),
-        )
-
-        payment_url = payment.confirmation.confirmation_url
-        async with async_session_maker() as session:
-            session.add(YookassaPayment(
-                payment_id=payment.id,
-                user_id=callback.from_user.id,
-                plan_id=plan_id,
-                amount=price,
-                status=payment.status,
-                payment_method_id=payment.payment_method.id if payment.payment_method else None,
-                is_recurring=False
-            ))
-            await session.commit()
-
-        privacy_url = config.privacy_policy_url or "#"
-        offer_url = config.offer_agreement_url or "#"
-        user_ref = f"{callback.from_user.first_name or ''}"
-        if callback.from_user.username:
-            user_ref += f" (@{callback.from_user.username})"
-        user_ref += f" [id=<code>{callback.from_user.id}</code>]"
-        plog.info(f"СЧЕТ_СОЗДАН | Yookassa | {user_ref} | {plan.name} | {price:.2f} руб | PayId={payment.id}")
-
-        plan_allows_renewal = getattr(plan, 'allow_auto_renewal', True)
-        payment_type_line = (
-            "Регулярная оплата, можно отключить в любой момент"
-            if (plan_allows_renewal or plan.is_trial)
-            else "Разовая оплата"
-        )
-
-        text = (
-            "Ваша ссылка на оплату готова.\n\n"
-            f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>.\n\n"
-            f"<b>Сумма:</b> {price:.2f} руб.\n"
-            f"{payment_type_line}"
-        )
-
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", url=payment_url)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sub_pay_{plan_id}_{price}")]
-        ])
-
-        await callback.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
-
+        payment_id = str(getattr(payment, "id", "") or "").strip()
+        if not payment_id:
+            raise ValueError("YooKassa returned invalid response: payment id is missing")
     except UnauthorizedError as e:
         logging.error("YooKassa UnauthorizedError: Invalid Shop ID or Secret Key.")
         _plog_yookassa_tech(
@@ -9508,6 +9462,7 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
         await callback.message.edit_text(
             "❌ Не удалось создать платеж. Похоже, возникла проблема с настройками платежной системы. Мы уже работаем над этим."
         )
+        return
     except Exception as e:
         logging.error(
             "An unexpected error occurred with YooKassa: %s",
@@ -9534,6 +9489,182 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
         )
         await callback.message.edit_text(
             "❌ Не удалось связаться с платёжным сервисом. Попробуйте ещё раз через несколько минут.")
+        return
+
+    try:
+        provider_payment_status = str(getattr(payment, "status", "unknown") or "unknown")
+    except Exception as status_error:
+        provider_payment_status = "unknown"
+        logging.warning(
+            "Could not read YooKassa status payment_id=%s: %s",
+            payment_id,
+            sanitize_secret_values(str(status_error)),
+        )
+    try:
+        _plog_yookassa_tech(
+            "TECH_INVOICE_RESPONSE",
+            PaymentId=payment_id,
+            Status=provider_payment_status,
+            Body=_encode_log_json(_serialize_yookassa_payment(payment)),
+        )
+    except Exception as log_error:
+        logging.warning(
+            "Could not serialize YooKassa create response payment_id=%s: %s",
+            payment_id,
+            sanitize_secret_values(str(log_error)),
+        )
+
+    try:
+        payment_method = getattr(payment, "payment_method", None)
+        async with async_session_maker() as session:
+            session.add(YookassaPayment(
+                payment_id=payment_id,
+                user_id=callback.from_user.id,
+                plan_id=plan_id,
+                amount=price,
+                status=provider_payment_status,
+                payment_method_id=getattr(payment_method, "id", None) if payment_method else None,
+                is_recurring=False
+            ))
+            await session.commit()
+    except Exception as e:
+        logging.error(
+            "YooKassa payment created but local persistence failed payment_id=%s error=%s",
+            payment_id,
+            sanitize_secret_values(str(e)),
+            exc_info=e,
+        )
+        await _safe_notify_admins_about_error(
+            callback.bot,
+            title="Сбой сохранения платежа YooKassa",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="YooKassa",
+            stage="persist_payment",
+            classification_override="application_internal",
+            extra={
+                "payment_id": payment_id,
+                "provider_status": "SUCCESS",
+                "provider_payment_status": provider_payment_status,
+                "plan_id": plan_id,
+                "price": f"{price:.2f}",
+                "webhook_recovery": "AVAILABLE_FROM_PROVIDER_METADATA",
+            },
+            exception=e,
+            include_traceback=False,
+            logger=log,
+        )
+
+    try:
+        user_ref = f"{callback.from_user.first_name or ''}"
+        if callback.from_user.username:
+            user_ref += f" (@{callback.from_user.username})"
+        user_ref += f" [id=<code>{callback.from_user.id}</code>]"
+        plog.info(f"СЧЕТ_СОЗДАН | Yookassa | {user_ref} | {plan.name} | {price:.2f} руб | PayId={payment_id}")
+    except Exception as log_error:
+        logging.warning(
+            "Could not write YooKassa business log payment_id=%s: %s",
+            payment_id,
+            sanitize_secret_values(str(log_error)),
+        )
+
+    text = "Платёж создан, но не удалось показать ссылку. Обратитесь в поддержку, чтобы не создавать повторный платёж."
+    keyboard = None
+    try:
+        privacy_url = config.privacy_policy_url or "#"
+        offer_url = config.offer_agreement_url or "#"
+        plan_allows_renewal = getattr(plan, 'allow_auto_renewal', True)
+        payment_type_line = (
+            "Регулярная оплата, можно отключить в любой момент"
+            if (plan_allows_renewal or plan.is_trial)
+            else "Разовая оплата"
+        )
+        text = (
+            "Ваша ссылка на оплату готова.\n\n"
+            f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>.\n\n"
+            f"<b>Сумма:</b> {price:.2f} руб.\n"
+            f"{payment_type_line}"
+        )
+        payment_url = payment.confirmation.confirmation_url
+        if not payment_url:
+            raise ValueError("YooKassa payment confirmation URL is empty")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", url=payment_url)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sub_pay_{plan_id}_{price}")]
+        ])
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        fallback_status = "UNAVAILABLE"
+        fallback_method = None
+        fallback_error = None
+        fallback_kwargs = {
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if keyboard is not None:
+            fallback_kwargs["reply_markup"] = keyboard
+
+        answer = getattr(callback.message, "answer", None)
+        if callable(answer):
+            try:
+                await answer(**fallback_kwargs)
+                fallback_status = "SUCCESS"
+                fallback_method = "message.answer"
+            except Exception as answer_error:
+                fallback_error = answer_error
+
+        if fallback_status != "SUCCESS":
+            send_message = getattr(callback.bot, "send_message", None)
+            if callable(send_message):
+                try:
+                    await send_message(
+                        chat_id=callback.from_user.id,
+                        **fallback_kwargs,
+                    )
+                    fallback_status = "SUCCESS"
+                    fallback_method = "bot.send_message"
+                except Exception as send_error:
+                    fallback_error = send_error
+
+        logging.error(
+            "YooKassa payment created but Telegram presentation failed payment_id=%s error=%s fallback=%s",
+            payment_id,
+            sanitize_secret_values(str(e)),
+            fallback_status,
+            exc_info=e,
+        )
+        await _safe_notify_admins_about_error(
+            callback.bot,
+            title="Сбой показа ссылки YooKassa",
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+            provider="YooKassa",
+            stage="present_payment",
+            classification_override="application_internal",
+            extra={
+                "payment_id": payment_id,
+                "provider_status": "SUCCESS",
+                "provider_payment_status": provider_payment_status,
+                "plan_id": plan_id,
+                "price": f"{price:.2f}",
+                "presentation_fallback": fallback_status,
+                "fallback_method": fallback_method or "none",
+                "fallback_error": (
+                    exception_summary(fallback_error, include_context=False)
+                    if fallback_error
+                    else None
+                ),
+            },
+            exception=e,
+            include_traceback=False,
+            logger=log,
+        )
 
 
 @router.callback_query(F.data.startswith("pay_tg_"))

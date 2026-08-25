@@ -11,9 +11,10 @@ import scheduler
 
 
 class _Session:
-    def __init__(self, values):
+    def __init__(self, values, *, commit_error=None):
         self.values = values
         self.added = []
+        self.commit_error = commit_error
 
     async def __aenter__(self):
         return self
@@ -28,6 +29,8 @@ class _Session:
         self.added.append(value)
 
     async def commit(self):
+        if self.commit_error is not None:
+            raise self.commit_error
         return None
 
 
@@ -102,13 +105,19 @@ def _payment():
     )
 
 
-async def _run_yookassa_callback(callback, provider_create, events):
+async def _run_yookassa_callback(
+    callback,
+    provider_create,
+    events,
+    *,
+    persistence_session=None,
+):
     first = _Session({
         handlers.SubscriptionConfig: _yookassa_config(),
         handlers.SubscriptionPlan: _plan(),
         handlers.User: _user(),
     })
-    second = _Session({})
+    second = persistence_session or _Session({})
     sessions = _SessionFactory(first, second)
 
     async def fake_to_thread(function, *args):
@@ -165,6 +174,84 @@ async def _test_yookassa_ssl_failure_is_safe_for_user_and_reports_original_chain
     assert "NoneType" not in callback.message.edits[-1][0][0]
     assert notify.await_count == 1
     assert notify.await_args.kwargs["exception"] is sdk_error
+    assert notify.await_args.kwargs["stage"] == "create_payment"
+
+
+async def _test_yookassa_persistence_failure_keeps_created_payment_and_is_local_error():
+    events = []
+    callback = _Callback(events)
+    provider_create = MagicMock(return_value=_payment())
+    persistence_error = RuntimeError("database commit failed")
+
+    with patch.object(handlers, "_safe_notify_admins_about_error", AsyncMock()) as notify:
+        await _run_yookassa_callback(
+            callback,
+            provider_create,
+            events,
+            persistence_session=_Session({}, commit_error=persistence_error),
+        )
+
+    assert provider_create.call_count == 1
+    assert "платёжным сервисом" not in " ".join(
+        str(args[0]) for args, _ in callback.message.edits if args
+    )
+    keyboard = callback.message.edits[-1][1]["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].url == "https://yookassa.example/pay/1"
+    assert notify.await_count == 1
+    alert = notify.await_args.kwargs
+    assert alert["provider"] == "YooKassa"
+    assert alert["stage"] == "persist_payment"
+    assert alert["classification_override"] == "application_internal"
+    assert alert["extra"]["payment_id"] == "payment-1"
+    assert alert["extra"]["provider_status"] == "SUCCESS"
+
+
+async def _test_yookassa_presentation_failure_reuses_same_payment_link():
+    events = []
+
+    class PresentationMessage(_Message):
+        def __init__(self, message_events):
+            super().__init__(message_events)
+            self.fallbacks = []
+
+        async def edit_text(self, *args, **kwargs):
+            self.events.append("edit_failed")
+            raise RuntimeError("Telegram edit failed")
+
+        async def answer(self, *args, **kwargs):
+            self.events.append("fallback_answer")
+            self.fallbacks.append((args, kwargs))
+
+    callback = _Callback(events)
+    callback.message = PresentationMessage(events)
+    provider_create = MagicMock(return_value=_payment())
+
+    with patch.object(handlers, "_safe_notify_admins_about_error", AsyncMock()) as notify:
+        await _run_yookassa_callback(callback, provider_create, events)
+
+    assert provider_create.call_count == 1
+    assert callback.message.fallbacks
+    fallback_keyboard = callback.message.fallbacks[0][1]["reply_markup"]
+    assert fallback_keyboard.inline_keyboard[0][0].url == "https://yookassa.example/pay/1"
+    alert = notify.await_args.kwargs
+    assert alert["stage"] == "present_payment"
+    assert alert["classification_override"] == "application_internal"
+    assert alert["extra"]["provider_status"] == "SUCCESS"
+    assert alert["extra"]["presentation_fallback"] == "SUCCESS"
+
+
+async def _test_yookassa_provider_call_keeps_single_fixed_idempotency_key():
+    events = []
+    callback = _Callback(events)
+    provider_create = MagicMock(return_value=_payment())
+
+    with patch.object(handlers, "uuid4", return_value="fixed-idempotency-key"):
+        await _run_yookassa_callback(callback, provider_create, events)
+
+    assert provider_create.call_count == 1
+    payload, idempotency_key = provider_create.call_args.args
+    assert idempotency_key == "fixed-idempotency-key"
+    assert payload["metadata"] == {"user_id": 42, "plan_id": 7}
 
 
 async def _test_yookassa_recurring_provider_failure_does_not_consume_attempt_and_success_stays_success():
@@ -279,6 +366,18 @@ def test_yookassa_callback_acknowledges_before_provider_io_and_preserves_link():
 
 def test_yookassa_ssl_failure_is_safe_for_user_and_reports_original_chain():
     asyncio.run(_test_yookassa_ssl_failure_is_safe_for_user_and_reports_original_chain())
+
+
+def test_yookassa_persistence_failure_keeps_created_payment_and_is_local_error():
+    asyncio.run(_test_yookassa_persistence_failure_keeps_created_payment_and_is_local_error())
+
+
+def test_yookassa_presentation_failure_reuses_same_payment_link():
+    asyncio.run(_test_yookassa_presentation_failure_reuses_same_payment_link())
+
+
+def test_yookassa_provider_call_keeps_single_fixed_idempotency_key():
+    asyncio.run(_test_yookassa_provider_call_keeps_single_fixed_idempotency_key())
 
 
 def test_yookassa_recurring_provider_failure_does_not_consume_attempt_and_success_stays_success():

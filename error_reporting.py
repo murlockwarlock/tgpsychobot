@@ -372,18 +372,27 @@ async def notify_admins_about_error(
     extra: dict[str, Any] | None = None,
     provider_attempts: Sequence[dict[str, str | None]] | None = None,
     exception: Exception | None = None,
+    classification_override: str | None = None,
     include_traceback: bool = True,
     logger: logging.Logger | None = None,
     level: int = logging.ERROR,
 ) -> None:
     log = logger or logging.getLogger(__name__)
     root_exception = root_cause_exception(exception)
-    classification = None
+    classification = classification_override
     classification_description = None
     root_summary = None
     outcome = getattr(exception, "ai_outcome", None) if exception is not None else None
     if exception is not None:
-        classification, classification_description = classify_external_error(exception, provider=provider)
+        detected_classification, detected_description = classify_external_error(exception, provider=provider)
+        if classification is None:
+            classification = detected_classification
+            classification_description = detected_description
+        else:
+            classification_description = _ERROR_CLASS_DESCRIPTIONS.get(
+                classification,
+                detected_description,
+            )
         root_summary = sanitize_secret_values(exception_summary(root_exception or exception))
 
     if exception is not None and include_traceback:
