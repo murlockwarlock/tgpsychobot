@@ -1703,6 +1703,8 @@ async def _show_followup_metadata_operator(
         await _reset_followup_navigation(state)
         await _show_followup_conditions(target, campaign_id, edit=edit)
         return
+    await state.set_state(AutomationAdminStates.followup_metadata_operator)
+    await state.update_data(metadata_operator=None)
     builder = InlineKeyboardBuilder()
     for operator, label in FOLLOWUP_METADATA_OPERATOR_LABELS.items():
         builder.button(text=label, callback_data=f"followup_metadata_operator_{campaign_id}_{operator}")

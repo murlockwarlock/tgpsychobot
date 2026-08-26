@@ -518,6 +518,48 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertIsNone(await state.get_state())
 
+    async def test_metadata_back_restores_fsm_states_and_clears_operator(self):
+        state = MemoryState({"followup_return_topic_id": 7})
+        await automation_admin.followup_metadata_edit(
+            make_callback(f"followup_metadata_edit_{self.campaign_id}"), state
+        )
+        await automation_admin.followup_metadata_field_received(
+            SimpleNamespace(text="profile.outcome", answer=AsyncMock()), state
+        )
+        self.assertEqual(
+            automation_admin.AutomationAdminStates.followup_metadata_operator.state,
+            await state.get_state(),
+        )
+        await automation_admin.followup_metadata_operator(
+            make_callback(f"followup_metadata_operator_{self.campaign_id}_equals"), state
+        )
+        self.assertEqual(
+            automation_admin.AutomationAdminStates.followup_metadata_value.state,
+            await state.get_state(),
+        )
+        await automation_admin.followup_metadata_operator_edit(
+            make_callback(f"followup_metadata_operator_edit_{self.campaign_id}"), state
+        )
+        data = await state.get_data()
+        self.assertEqual(
+            automation_admin.AutomationAdminStates.followup_metadata_operator.state,
+            await state.get_state(),
+        )
+        self.assertEqual(self.campaign_id, data["campaign_id"])
+        self.assertEqual("profile.outcome", data["metadata_field_path"])
+        self.assertEqual(7, data["followup_return_topic_id"])
+        self.assertIsNone(data.get("metadata_operator"))
+        await automation_admin.followup_metadata_edit(
+            make_callback(f"followup_metadata_edit_{self.campaign_id}"), state
+        )
+        data = await state.get_data()
+        self.assertEqual(
+            automation_admin.AutomationAdminStates.followup_metadata_field.state,
+            await state.get_state(),
+        )
+        self.assertEqual(self.campaign_id, data["campaign_id"])
+        self.assertEqual(7, data["followup_return_topic_id"])
+
     async def test_explicit_delete_removes_unsent_step_without_touching_other_steps(self):
         callback = make_callback(f"followup_step_delete_{self.campaign_id}_{self.second_step_id}")
         with patch.object(automation_admin, "async_session_maker", self.sessions):
