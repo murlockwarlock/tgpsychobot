@@ -119,6 +119,7 @@ class AutomationAdminStates(StatesGroup):
     followup_step_edit = State()
     followup_stage_values = State()
     followup_metadata_field = State()
+    followup_metadata_operator = State()
     followup_metadata_value = State()
     followup_stop_events = State()
     quiet_hours = State()
@@ -1634,7 +1635,7 @@ async def followup_stage_mode(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"🪜 <b>{FOLLOWUP_STAGE_MODE_LABELS[mode]}</b>\n\n"
         "Введите точные названия этапов через запятую. Регистр сохраняется.",
-        reply_markup=InlineKeyboardBuilder().row(_back(f"followup_conditions_{campaign_id}")).as_markup(),
+        reply_markup=InlineKeyboardBuilder().row(_back(f"followup_stage_edit_{campaign_id}")).as_markup(),
     )
 
 
@@ -1684,14 +1685,34 @@ async def followup_metadata_field_received(message: Message, state: FSMContext):
         await message.answer("Введите непустой путь без пробелов, например <code>profile.outcome</code>.")
         return
     data = await state.get_data()
-    await state.set_state(AutomationAdminStates.followup_metadata_value)
+    await state.set_state(AutomationAdminStates.followup_metadata_operator)
     await state.update_data(metadata_field_path=field_path)
+    await _show_followup_metadata_operator(message, data["campaign_id"], state, edit=False)
+
+
+async def _show_followup_metadata_operator(
+    target,
+    campaign_id: int,
+    state: FSMContext,
+    *,
+    edit: bool = True,
+):
+    data = await state.get_data()
+    field_path = data.get("metadata_field_path")
+    if data.get("campaign_id") != campaign_id or not field_path:
+        await _reset_followup_navigation(state)
+        await _show_followup_conditions(target, campaign_id, edit=edit)
+        return
     builder = InlineKeyboardBuilder()
     for operator, label in FOLLOWUP_METADATA_OPERATOR_LABELS.items():
-        builder.button(text=label, callback_data=f"followup_metadata_operator_{data['campaign_id']}_{operator}")
-    builder.row(_back(f"followup_conditions_{data['campaign_id']}"))
+        builder.button(text=label, callback_data=f"followup_metadata_operator_{campaign_id}_{operator}")
+    builder.row(_back(f"followup_metadata_edit_{campaign_id}"))
     builder.adjust(1)
-    await message.answer("Выберите оператор:", reply_markup=builder.as_markup())
+    text = f"Поле: <code>{html.escape(field_path)}</code>\n\nВыберите оператор:"
+    if edit:
+        await _safe_edit_text_or_markup(target, text, reply_markup=builder.as_markup())
+    else:
+        await target.answer(text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.regexp(r"^followup_metadata_operator_(\d+)_(equals|not_equals|contains)$"))
@@ -1709,8 +1730,14 @@ async def followup_metadata_operator(callback: CallbackQuery, state: FSMContext)
         f"🧩 Поле: <code>{html.escape(data['metadata_field_path'])}</code>\n"
         f"Оператор: <b>{html.escape(FOLLOWUP_METADATA_OPERATOR_LABELS[operator])}</b>\n\n"
         "Введите значение:",
-        reply_markup=InlineKeyboardBuilder().row(_back(f"followup_conditions_{campaign_id}")).as_markup(),
+        reply_markup=InlineKeyboardBuilder().row(_back(f"followup_metadata_operator_edit_{campaign_id}")).as_markup(),
     )
+
+
+@router.callback_query(F.data.regexp(r"^followup_metadata_operator_edit_(\d+)$"))
+async def followup_metadata_operator_edit(callback: CallbackQuery, state: FSMContext):
+    campaign_id = int(callback.data.rsplit("_", 1)[1])
+    await _show_followup_metadata_operator(callback, campaign_id, state)
 
 
 @router.message(AutomationAdminStates.followup_metadata_value)
@@ -2062,7 +2089,7 @@ async def followup_toggle(callback: CallbackQuery, state: FSMContext | None = No
 @router.callback_query(F.data.regexp(r"^followup_topics_(\d+)$"))
 async def followup_topics(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
-    return_topic_id = await _reset_followup_navigation(state)
+    await _reset_followup_navigation(state)
     async with async_session_maker() as session:
         item = await _campaign_with_relations(session, campaign_id)
         topics = (await session.execute(select(Topic).order_by(Topic.name))).scalars().all()
@@ -2077,12 +2104,7 @@ async def followup_topics(callback: CallbackQuery, state: FSMContext | None = No
             text=f"{'✅' if topic.id in selected else '❌'} {topic.name}",
             callback_data=f"followup_ftopic_{campaign_id}_{topic.id}",
         )
-    back_callback = (
-        f"topic_followup_campaigns_{return_topic_id}"
-        if return_topic_id is not None
-        else f"followup_campaign_{campaign_id}"
-    )
-    builder.row(_back(back_callback))
+    builder.row(_back(f"followup_campaign_{campaign_id}"))
     builder.adjust(1)
     await callback.message.edit_text(
         "💬 <b>Темы цепочки</b>\n\n"

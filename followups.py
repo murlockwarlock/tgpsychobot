@@ -431,6 +431,7 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
                 or not _campaign_matches_scope(campaign, run.topic_id)
             ):
                 run.status = "cancelled"
+                await session.commit()
                 continue
             eligibility = await check_campaign_eligibility(
                 session,
@@ -441,9 +442,11 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
             )
             if not eligibility.eligible:
                 run.status = "cancelled"
+                await session.commit()
                 continue
             if run.next_step_index >= len(campaign.steps):
                 run.status = "completed"
+                await session.commit()
                 continue
 
             step = campaign.steps[run.next_step_index]
@@ -456,8 +459,11 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
             )
             if already_sent:
                 run.next_step_index += 1
+                await session.commit()
                 continue
 
+            run_id = run.id
+            step_id = step.id
             try:
                 send_result = await send_followup_step(
                     bot,
@@ -489,9 +495,9 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
                 await session.commit()
                 delivered += 1
             except Exception:
-                log.exception("Follow-up delivery failed: run=%s step=%s", run.id, step.id)
+                log.exception("Follow-up delivery failed: run=%s step=%s", run_id, step_id)
                 await session.rollback()
-                retry_run = await session.get(FollowupRun, run.id)
+                retry_run = await session.get(FollowupRun, run_id)
                 if retry_run is not None:
                     retry_run.due_at = datetime.utcnow() + timedelta(minutes=5)
                     await session.commit()

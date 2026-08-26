@@ -251,6 +251,95 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.status, "cancelled")
         self.assertEqual(bot.sent, [])
 
+    async def test_terminal_cancellation_survives_later_delivery_failure(self):
+        now = datetime.utcnow()
+        async with self.sessions() as session:
+            blocked_campaign = FollowupCampaign(
+                name="Заблокированная",
+                is_active=True,
+                include_main_dialogue=True,
+                stop_events="CRISIS_DETECTED",
+                quiet_start_minute=0,
+                quiet_end_minute=0,
+            )
+            blocked_campaign.steps.append(FollowupStep(
+                sort_order=0,
+                delay_minutes=1,
+                message_type="static",
+                message_text="Заблокированное сообщение",
+            ))
+            failing_campaign = FollowupCampaign(
+                name="С ошибкой",
+                is_active=True,
+                include_main_dialogue=True,
+                quiet_start_minute=0,
+                quiet_end_minute=0,
+            )
+            failing_campaign.steps.append(FollowupStep(
+                sort_order=0,
+                delay_minutes=1,
+                message_type="static",
+                message_text="Сообщение с ошибкой",
+            ))
+            session.add_all([blocked_campaign, failing_campaign])
+            await session.flush()
+            run_a = FollowupRun(
+                campaign_id=blocked_campaign.id,
+                user_id=42,
+                dialogue_id=1,
+                topic_id=0,
+                next_step_index=0,
+                generation=1,
+                last_activity_at=now,
+                due_at=now - timedelta(minutes=2),
+                status="active",
+            )
+            run_b = FollowupRun(
+                campaign_id=failing_campaign.id,
+                user_id=42,
+                dialogue_id=1,
+                topic_id=0,
+                next_step_index=0,
+                generation=1,
+                last_activity_at=now,
+                due_at=now - timedelta(minutes=1),
+                status="active",
+            )
+            session.add_all([
+                run_a,
+                run_b,
+                AutomationEvent(
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=0,
+                    name="CRISIS_DETECTED",
+                ),
+            ])
+            await session.commit()
+            run_a_id = run_a.id
+            run_b_id = run_b.id
+
+        class FailingBot(FakeBot):
+            async def send_message(self, chat_id, text, **kwargs):
+                if text == "Сообщение с ошибкой":
+                    raise RuntimeError("delivery failure")
+                return await super().send_message(chat_id, text, **kwargs)
+
+        bot = FailingBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            delivered = await process_due_followups(bot)
+            next_delivered = await process_due_followups(bot)
+
+        async with self.sessions() as session:
+            stored_a = await session.get(FollowupRun, run_a_id)
+            stored_b = await session.get(FollowupRun, run_b_id)
+        self.assertEqual(0, delivered)
+        self.assertEqual(0, next_delivered)
+        self.assertEqual("cancelled", stored_a.status)
+        self.assertEqual("active", stored_b.status)
+        self.assertGreater(stored_b.due_at, now)
+        self.assertEqual([], bot.sent)
+
     async def test_eligibility_checks_do_not_create_automation_history_rows(self):
         async with self.sessions() as session:
             campaign = await session.scalar(select(FollowupCampaign))

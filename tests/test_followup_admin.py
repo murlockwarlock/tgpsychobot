@@ -406,27 +406,117 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await state.get_state())
         self.assertEqual(7, (await state.get_data())["followup_return_topic_id"])
 
-    async def test_topic_scoped_steps_and_add_back_keep_topic_origin(self):
-        state = MemoryState({"followup_return_topic_id": 7})
-        callback = make_callback(f"followup_topics_{self.campaign_id}")
+    async def test_topic_scoped_navigation_keeps_intermediate_campaign_detail(self):
+        state = MemoryState()
+        topic_list = make_callback("topic_followup_campaigns_7")
         with patch.object(automation_admin, "async_session_maker", self.sessions):
-            await automation_admin.followup_topics(callback, state=state)
+            await automation_admin.topic_followup_campaigns(topic_list, state=state)
+        campaign = make_callback(f"followup_campaign_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_campaign_view(campaign, state=state)
+        detail_markup = campaign.message.edit_text.await_args.kwargs["reply_markup"]
+        self.assertIn("topic_followup_campaigns_7", callback_data(detail_markup))
+        topics = make_callback(f"followup_topics_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_topics(topics, state=state)
+        topics_markup = topics.message.edit_text.await_args.kwargs["reply_markup"]
+        self.assertIn(f"followup_campaign_{self.campaign_id}", callback_data(topics_markup))
+        self.assertNotIn("topic_followup_campaigns_7", callback_data(topics_markup))
+        campaign_back = make_callback(f"followup_campaign_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_campaign_view(campaign_back, state=state)
+        topic_back = make_callback("topic_followup_campaigns_7")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.topic_followup_campaigns(topic_back, state=state)
         self.assertIn(
-            "topic_followup_campaigns_7",
-            callback_data(callback.message.edit_text.await_args.kwargs["reply_markup"]),
+            f"followup_campaign_{self.campaign_id}",
+            callback_data(topic_back.message.edit_text.await_args.kwargs["reply_markup"]),
         )
-        step_callback = make_callback(f"followup_steps_{self.campaign_id}")
+
+    async def test_global_navigation_stays_global_through_topics(self):
+        state = MemoryState()
+        campaign_list = make_callback("followup_campaigns")
         with patch.object(automation_admin, "async_session_maker", self.sessions):
-            await automation_admin.followup_steps(step_callback, state=state)
-        add_callback = make_callback(f"followup_step_add_{self.campaign_id}_static")
+            await automation_admin.followup_campaigns(campaign_list, state=state)
+        campaign = make_callback(f"followup_campaign_{self.campaign_id}")
         with patch.object(automation_admin, "async_session_maker", self.sessions):
-            await automation_admin.followup_step_add(add_callback, state)
-        data = await state.get_data()
-        self.assertEqual(7, data["followup_return_topic_id"])
-        self.assertEqual(
-            automation_admin.AutomationAdminStates.followup_step.state,
-            await state.get_state(),
-        )
+            await automation_admin.followup_campaign_view(campaign, state=state)
+        detail_markup = campaign.message.edit_text.await_args.kwargs["reply_markup"]
+        self.assertIn("followup_campaigns", callback_data(detail_markup))
+        topics = make_callback(f"followup_topics_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_topics(topics, state=state)
+        self.assertIn(f"followup_campaign_{self.campaign_id}", callback_data(
+            topics.message.edit_text.await_args.kwargs["reply_markup"]
+        ))
+        campaign_back = make_callback(f"followup_campaign_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_campaign_view(campaign_back, state=state)
+        self.assertIn("followup_campaigns", callback_data(
+            campaign_back.message.edit_text.await_args.kwargs["reply_markup"]
+        ))
+
+    async def test_stage_value_back_chain_invokes_previous_handlers(self):
+        state = MemoryState({"followup_return_topic_id": 7})
+        conditions = make_callback(f"followup_conditions_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_conditions(conditions, state=state)
+        stages = make_callback(f"followup_stage_edit_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_stage_edit(stages, state=state)
+        values = make_callback(f"followup_stage_mode_{self.campaign_id}_selected")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_stage_mode(values, state=state)
+        self.assertIn(f"followup_stage_edit_{self.campaign_id}", callback_data(
+            values.message.edit_text.await_args.kwargs["reply_markup"]
+        ))
+        stages_back = make_callback(f"followup_stage_edit_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_stage_edit(stages_back, state=state)
+        conditions_back = make_callback(f"followup_conditions_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_conditions(conditions_back, state=state)
+        campaign_back = make_callback(f"followup_campaign_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_campaign_view(campaign_back, state=state)
+        self.assertIn("topic_followup_campaigns_7", callback_data(
+            campaign_back.message.edit_text.await_args.kwargs["reply_markup"]
+        ))
+        self.assertIsNone(await state.get_state())
+
+    async def test_metadata_back_chain_invokes_previous_handlers(self):
+        state = MemoryState({"followup_return_topic_id": 7})
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_conditions(
+                make_callback(f"followup_conditions_{self.campaign_id}"), state=state
+            )
+            field = make_callback(f"followup_metadata_edit_{self.campaign_id}")
+            await automation_admin.followup_metadata_edit(field, state)
+            field_message = SimpleNamespace(text="profile.outcome", answer=AsyncMock())
+            await automation_admin.followup_metadata_field_received(field_message, state)
+            self.assertIn(f"followup_metadata_edit_{self.campaign_id}", callback_data(
+                field_message.answer.await_args.kwargs["reply_markup"]
+            ))
+            operator = make_callback(f"followup_metadata_operator_{self.campaign_id}_equals")
+            await automation_admin.followup_metadata_operator(operator, state)
+            self.assertIn(f"followup_metadata_operator_edit_{self.campaign_id}", callback_data(
+                operator.message.edit_text.await_args.kwargs["reply_markup"]
+            ))
+            operator_back = make_callback(f"followup_metadata_operator_edit_{self.campaign_id}")
+            await automation_admin.followup_metadata_operator_edit(operator_back, state)
+            self.assertIn(f"followup_metadata_edit_{self.campaign_id}", callback_data(
+                operator_back.message.edit_text.await_args.kwargs["reply_markup"]
+            ))
+            field_back = make_callback(f"followup_metadata_edit_{self.campaign_id}")
+            await automation_admin.followup_metadata_edit(field_back, state)
+            conditions_back = make_callback(f"followup_conditions_{self.campaign_id}")
+            await automation_admin.followup_conditions(conditions_back, state=state)
+            campaign_back = make_callback(f"followup_campaign_{self.campaign_id}")
+            await automation_admin.followup_campaign_view(campaign_back, state=state)
+        self.assertIn("topic_followup_campaigns_7", callback_data(
+            campaign_back.message.edit_text.await_args.kwargs["reply_markup"]
+        ))
+        self.assertIsNone(await state.get_state())
 
     async def test_explicit_delete_removes_unsent_step_without_touching_other_steps(self):
         callback = make_callback(f"followup_step_delete_{self.campaign_id}_{self.second_step_id}")
@@ -476,6 +566,17 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
             step.message_type,
             step.sort_order,
         ))
+
+        detail_back = make_callback(f"followup_step_{self.campaign_id}_{self.first_step_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_step_detail(detail_back, state=state)
+        steps_back = make_callback(f"followup_steps_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_steps(steps_back, state=state)
+        self.assertIn(
+            f"followup_step_{self.campaign_id}_{self.first_step_id}",
+            callback_data(steps_back.message.edit_text.await_args.kwargs["reply_markup"]),
+        )
 
         async with self.sessions() as session:
             run = FollowupRun(
