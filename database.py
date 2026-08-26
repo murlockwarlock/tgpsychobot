@@ -754,6 +754,36 @@ async def init_db():
             if 'ai_debug_enabled' not in user_columns:
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN ai_debug_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
 
+            followup_columns = [c['name'] for c in insp.get_columns('followup_campaigns')]
+            if 'stage_mode' not in followup_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE followup_campaigns ADD COLUMN stage_mode VARCHAR DEFAULT 'all' NOT NULL"
+                ))
+            if 'stage_values' not in followup_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE followup_campaigns ADD COLUMN stage_values TEXT DEFAULT '' NOT NULL"
+                ))
+            if 'metadata_field_path' not in followup_columns:
+                sync_conn.execute(text("ALTER TABLE followup_campaigns ADD COLUMN metadata_field_path VARCHAR"))
+            if 'metadata_operator' not in followup_columns:
+                sync_conn.execute(text("ALTER TABLE followup_campaigns ADD COLUMN metadata_operator VARCHAR"))
+            if 'metadata_expected_value' not in followup_columns:
+                sync_conn.execute(text("ALTER TABLE followup_campaigns ADD COLUMN metadata_expected_value TEXT"))
+            if 'stop_events' not in followup_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE followup_campaigns ADD COLUMN stop_events TEXT DEFAULT '' NOT NULL"
+                ))
+            sync_conn.execute(text(
+                "UPDATE followup_campaigns SET stage_mode = 'all' "
+                "WHERE stage_mode IS NULL OR stage_mode = ''"
+            ))
+            sync_conn.execute(text(
+                "UPDATE followup_campaigns SET stage_values = '' WHERE stage_values IS NULL"
+            ))
+            sync_conn.execute(text(
+                "UPDATE followup_campaigns SET stop_events = '' WHERE stop_events IS NULL"
+            ))
+
             general_columns = [c['name'] for c in insp.get_columns('bot_general_config')]
             if 'ai_processing_message_enabled' not in general_columns:
                 sync_conn.execute(text(
@@ -1195,6 +1225,12 @@ class FollowupCampaign(Base):
     is_active = Column(Boolean, default=False, nullable=False)
     all_topics = Column(Boolean, default=False, nullable=False)
     include_main_dialogue = Column(Boolean, default=True, nullable=False)
+    stage_mode = Column(String, default='all', nullable=False)
+    stage_values = Column(Text, default='', nullable=False)
+    metadata_field_path = Column(String, nullable=True)
+    metadata_operator = Column(String, nullable=True)
+    metadata_expected_value = Column(Text, nullable=True)
+    stop_events = Column(Text, default='', nullable=False)
     timezone = Column(String, default='Europe/Moscow', nullable=False)
     quiet_start_minute = Column(Integer, default=22 * 60, nullable=False)
     quiet_end_minute = Column(Integer, default=9 * 60, nullable=False)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -13,6 +14,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from database import (
+    AutomationConversationState,
+    AutomationEvent,
     FollowupCampaign,
     FollowupDelivery,
     FollowupRun,
@@ -20,11 +23,183 @@ from database import (
     User,
     async_session_maker,
 )
+from automation_events import condition_value_matches, resolve_condition_path
 from response_buttons import extract_response_buttons
-from user_metadata import extract_service_data
+from user_metadata import extract_service_data, load_metadata
 
 
 log = logging.getLogger(__name__)
+
+
+FOLLOWUP_STAGE_MODE_LABELS = {
+    "all": "На всех этапах",
+    "selected": "На выбранных этапах",
+    "all_except": "На всех этапах кроме",
+    "not_set": "Этап не задан",
+}
+FOLLOWUP_STAGE_MODES = tuple(FOLLOWUP_STAGE_MODE_LABELS)
+FOLLOWUP_METADATA_OPERATOR_LABELS = {
+    "equals": "=",
+    "not_equals": "!=",
+    "contains": "содержит",
+}
+_FOLLOWUP_STAGE_MODE_ALIASES = {
+    "all_stages": "all",
+    "selected_stages": "selected",
+    "step_not_set": "not_set",
+}
+
+
+@dataclass(frozen=True)
+class FollowupEligibility:
+    eligible: bool
+    reason: str
+    current_step: str | None = None
+    stage_matches: bool = True
+    metadata_configured: bool = False
+    metadata_matches: bool = True
+    matched_stop_event: str | None = None
+
+
+@dataclass(frozen=True)
+class FollowupStepSendResult:
+    text: str
+    history_text: str
+    telegram_message_id: int | None
+
+
+def parse_followup_csv(value: str | None) -> tuple[str, ...]:
+    return tuple(part.strip() for part in str(value or "").split(",") if part.strip())
+
+
+def _normalize_stage_mode(value: str | None) -> str:
+    mode = str(value or "all").strip().lower()
+    return _FOLLOWUP_STAGE_MODE_ALIASES.get(mode, mode)
+
+
+def _normalize_current_step(value: str | None) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def evaluate_followup_eligibility(
+    campaign: FollowupCampaign,
+    *,
+    current_step: str | None,
+    metadata: dict,
+    stop_event_names: list[str] | tuple[str, ...] | set[str] = (),
+) -> FollowupEligibility:
+    configured_stop_events = parse_followup_csv(getattr(campaign, "stop_events", ""))
+    observed_stop_events = set(stop_event_names or ())
+    matched_stop_event = next(
+        (event_name for event_name in configured_stop_events if event_name in observed_stop_events),
+        None,
+    )
+
+    normalized_step = _normalize_current_step(current_step)
+    stage_mode = _normalize_stage_mode(getattr(campaign, "stage_mode", "all"))
+    configured_steps = parse_followup_csv(getattr(campaign, "stage_values", ""))
+    if stage_mode == "all":
+        stage_matches = True
+    elif stage_mode == "selected":
+        stage_matches = normalized_step in configured_steps
+    elif stage_mode == "all_except":
+        stage_matches = normalized_step not in configured_steps
+    elif stage_mode == "not_set":
+        stage_matches = normalized_step is None
+    else:
+        stage_matches = False
+
+    field_path = str(getattr(campaign, "metadata_field_path", "") or "").strip()
+    metadata_configured = bool(field_path)
+    expected = getattr(campaign, "metadata_expected_value", None)
+    if not metadata_configured:
+        metadata_matches = True
+    elif expected is None:
+        metadata_matches = False
+    else:
+        actual = resolve_condition_path(metadata or {}, field_path)
+        metadata_matches = condition_value_matches(
+            actual,
+            str(expected),
+            getattr(campaign, "metadata_operator", None) or "equals",
+        )
+
+    if matched_stop_event is not None:
+        return FollowupEligibility(
+            eligible=False,
+            reason="stop_event_found",
+            current_step=normalized_step,
+            stage_matches=stage_matches,
+            metadata_configured=metadata_configured,
+            metadata_matches=metadata_matches,
+            matched_stop_event=matched_stop_event,
+        )
+    if not stage_matches:
+        return FollowupEligibility(
+            eligible=False,
+            reason="stage_not_allowed",
+            current_step=normalized_step,
+            stage_matches=False,
+            metadata_configured=metadata_configured,
+            metadata_matches=metadata_matches,
+        )
+    if not metadata_matches:
+        return FollowupEligibility(
+            eligible=False,
+            reason="metadata_mismatch",
+            current_step=normalized_step,
+            stage_matches=True,
+            metadata_configured=metadata_configured,
+            metadata_matches=False,
+        )
+    return FollowupEligibility(
+        eligible=True,
+        reason="eligible",
+        current_step=normalized_step,
+        stage_matches=True,
+        metadata_configured=metadata_configured,
+        metadata_matches=True,
+    )
+
+
+async def check_campaign_eligibility(
+    session,
+    campaign: FollowupCampaign,
+    *,
+    user_id: int,
+    dialogue_id: int,
+    topic_id: int | None,
+) -> FollowupEligibility:
+    scope_topic_id = topic_id or 0
+    state = await session.scalar(
+        select(AutomationConversationState).where(
+            AutomationConversationState.user_id == user_id,
+            AutomationConversationState.dialogue_id == dialogue_id,
+            AutomationConversationState.topic_id == scope_topic_id,
+        )
+    )
+    configured_stop_events = parse_followup_csv(getattr(campaign, "stop_events", ""))
+    stop_event_names: tuple[str, ...] = ()
+    if configured_stop_events:
+        stop_event_name = await session.scalar(
+            select(AutomationEvent.name)
+            .where(
+                AutomationEvent.user_id == user_id,
+                AutomationEvent.dialogue_id == dialogue_id,
+                AutomationEvent.topic_id == scope_topic_id,
+                AutomationEvent.name.in_(configured_stop_events),
+            )
+            .limit(1)
+        )
+        if stop_event_name is not None:
+            stop_event_names = (stop_event_name,)
+    return evaluate_followup_eligibility(
+        campaign,
+        current_step=state.current_step if state is not None else None,
+        metadata=load_metadata(state.metadata_json if state is not None else None),
+        stop_event_names=stop_event_names,
+    )
 
 
 def _campaign_matches_scope(campaign: FollowupCampaign, topic_id: int) -> bool:
@@ -73,6 +248,52 @@ def _due_at(activity_at: datetime, campaign: FollowupCampaign, delay_minutes: in
     return _outside_quiet_hours(raw_due, campaign)
 
 
+async def send_followup_step(
+    bot,
+    *,
+    user: User,
+    step,
+    dialogue_id: int,
+    topic_id: int,
+) -> FollowupStepSendResult:
+    if step.message_type == "ai":
+        from ai_integration import get_ai_response
+
+        instruction = (
+            "[Служебная команда системы]: Пользователь замолчал.\n"
+            "Сформируй одно догоняющее сообщение после паузы пользователя. "
+            "Не упоминай автоматизацию и не добавляй блок DATA.\n\n"
+            + (step.ai_instruction or "Мягко верни пользователя к текущему диалогу.")
+        )
+        text = await get_ai_response(
+            user.id,
+            instruction,
+            user.name or user.first_name or "Не указано",
+            user.gender or "Не указан",
+            bot=None,
+            topic_id_override=None if topic_id == 0 else topic_id,
+            dialogue_id_override=dialogue_id,
+            persist_service_data=False,
+            request_type="followup",
+        )
+        if not text:
+            raise ValueError("AI вернул пустое догоняющее сообщение")
+        from handlers import _send_generated_response
+
+        visible_text, _, _ = extract_service_data(text)
+        history_text, _ = extract_response_buttons(visible_text)
+        await _send_generated_response(bot, user.id, text)
+        return FollowupStepSendResult(text, history_text, None)
+
+    if step.message_type != "static":
+        raise ValueError("Неизвестный тип догоняющего шага")
+    text = (step.message_text or "").strip()
+    if not text:
+        raise ValueError("Пустой текст догоняющего сообщения")
+    sent = await bot.send_message(user.id, text)
+    return FollowupStepSendResult(text, text, getattr(sent, "message_id", None))
+
+
 async def record_user_activity(
     user_id: int,
     *,
@@ -103,6 +324,17 @@ async def record_user_activity(
                     FollowupRun.topic_id == scope_topic_id,
                 ).with_for_update()
             )
+            eligibility = await check_campaign_eligibility(
+                session,
+                campaign,
+                user_id=user_id,
+                dialogue_id=dialogue_id,
+                topic_id=scope_topic_id,
+            )
+            if not eligibility.eligible:
+                if run is not None and run.status == "active":
+                    run.status = "cancelled"
+                continue
             first_step = campaign.steps[0]
             if run is None:
                 run = FollowupRun(
@@ -129,8 +361,6 @@ async def record_user_activity(
             await session.rollback()
             if not _allow_conflict_retry:
                 raise
-            # Another update for the same user created the unique run first.
-            # Re-read it under a row lock and apply the latest activity once.
             await record_user_activity(
                 user_id,
                 dialogue_id=dialogue_id,
@@ -202,6 +432,16 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
             ):
                 run.status = "cancelled"
                 continue
+            eligibility = await check_campaign_eligibility(
+                session,
+                campaign,
+                user_id=run.user_id,
+                dialogue_id=run.dialogue_id,
+                topic_id=run.topic_id,
+            )
+            if not eligibility.eligible:
+                run.status = "cancelled"
+                continue
             if run.next_step_index >= len(campaign.steps):
                 run.status = "completed"
                 continue
@@ -219,59 +459,26 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
                 continue
 
             try:
-                if step.message_type == "ai":
-                    from ai_integration import get_ai_response
-
-                    instruction = (
-                        "[Служебная команда системы]: Пользователь замолчал.\n"
-                        "Сформируй одно догоняющее сообщение после паузы пользователя. "
-                        "Не упоминай автоматизацию и не добавляй блок DATA.\n\n"
-                        + (step.ai_instruction or "Мягко верни пользователя к текущему диалогу.")
-                    )
-                    text = await get_ai_response(
-                        user.id,
-                        instruction,
-                        user.name or user.first_name or "Не указано",
-                        user.gender or "Не указан",
-                        bot=None,
-                        topic_id_override=None if run.topic_id == 0 else run.topic_id,
-                        dialogue_id_override=run.dialogue_id,
-                        persist_service_data=False,
-                        request_type="followup",
-                    )
-                    if not text:
-                        raise ValueError("AI вернул пустое догоняющее сообщение")
-                    from handlers import _send_generated_response
-                    visible_text, _, _ = extract_service_data(text)
-                    history_text, _ = extract_response_buttons(visible_text)
-                    await _send_generated_response(bot, run.user_id, text)
-                    session.add(DBMessage(
-                        user_id=run.user_id,
-                        role="assistant",
-                        content=history_text or "Выберите действие:",
-                        ai_context_content=text,
-                        dialogue_id=run.dialogue_id,
-                        topic_id=None if run.topic_id == 0 else run.topic_id,
-                    ))
-                    telegram_message_id = None
-                else:
-                    text = (step.message_text or "").strip()
-                    if not text:
-                        raise ValueError("Пустой текст догоняющего сообщения")
-                    sent = await bot.send_message(run.user_id, text)
-                    telegram_message_id = getattr(sent, "message_id", None)
-                    session.add(DBMessage(
-                        user_id=run.user_id,
-                        role="assistant",
-                        content=text,
-                        dialogue_id=run.dialogue_id,
-                        topic_id=None if run.topic_id == 0 else run.topic_id,
-                    ))
+                send_result = await send_followup_step(
+                    bot,
+                    user=user,
+                    step=step,
+                    dialogue_id=run.dialogue_id,
+                    topic_id=run.topic_id,
+                )
+                session.add(DBMessage(
+                    user_id=run.user_id,
+                    role="assistant",
+                    content=send_result.history_text or "Выберите действие:",
+                    ai_context_content=send_result.text if step.message_type == "ai" else None,
+                    dialogue_id=run.dialogue_id,
+                    topic_id=None if run.topic_id == 0 else run.topic_id,
+                ))
                 session.add(FollowupDelivery(
                     run_id=run.id,
                     step_id=step.id,
                     generation=run.generation,
-                    telegram_message_id=telegram_message_id,
+                    telegram_message_id=send_result.telegram_message_id,
                 ))
                 run.next_step_index += 1
                 if run.next_step_index >= len(campaign.steps):

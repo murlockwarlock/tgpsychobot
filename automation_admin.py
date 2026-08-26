@@ -7,7 +7,7 @@ import json
 import re
 from datetime import datetime
 
-from aiogram import BaseMiddleware, F, Router
+from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.filters import Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,6 +23,8 @@ from database import (
     AutomationHandler,
     AutomationStepTransition,
     FollowupCampaign,
+    FollowupDelivery,
+    FollowupRun,
     FollowupStep,
     Topic,
     User,
@@ -31,6 +33,15 @@ from database import (
     followup_campaign_topic_association,
     get_all_admin_ids,
 )
+from followups import (
+    FOLLOWUP_METADATA_OPERATOR_LABELS,
+    FOLLOWUP_STAGE_MODE_LABELS,
+    FOLLOWUP_STAGE_MODES,
+    _campaign_matches_scope,
+    check_campaign_eligibility,
+    parse_followup_csv,
+    send_followup_step,
+)
 from time_helpers import format_msk
 
 
@@ -38,6 +49,7 @@ import logging
 
 router = Router(name="automation_admin")
 _answered_callback_ids: set[str] = set()
+_manual_followup_tests_inflight: set[tuple[int, int]] = set()
 
 
 async def _answer_callback(callback: CallbackQuery, *args, **kwargs) -> None:
@@ -104,6 +116,11 @@ class AutomationAdminStates(StatesGroup):
     action_edit_value = State()
     campaign_name = State()
     followup_step = State()
+    followup_step_edit = State()
+    followup_stage_values = State()
+    followup_metadata_field = State()
+    followup_metadata_value = State()
+    followup_stop_events = State()
     quiet_hours = State()
     jitter = State()
 
@@ -1277,6 +1294,47 @@ async def _campaign_with_relations(session, campaign_id: int):
     )
 
 
+async def _reset_followup_navigation(state: FSMContext | None) -> int | None:
+    return_topic_id = await _navigation_topic_id(state, "followup_return_topic_id")
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
+    return return_topic_id
+
+
+def _campaign_stage_text(item: FollowupCampaign) -> str:
+    mode = (getattr(item, "stage_mode", None) or "all").strip().lower()
+    label = FOLLOWUP_STAGE_MODE_LABELS.get(mode, FOLLOWUP_STAGE_MODE_LABELS["all"])
+    if mode in {"selected", "all_except"}:
+        values = parse_followup_csv(getattr(item, "stage_values", ""))
+        return f"{html.escape(label)}: {html.escape(', '.join(values) or 'не заданы')}"
+    return html.escape(label)
+
+
+def _campaign_metadata_text(item: FollowupCampaign) -> str:
+    field_path = (getattr(item, "metadata_field_path", None) or "").strip()
+    if not field_path:
+        return "не заданы"
+    operator = getattr(item, "metadata_operator", None) or "equals"
+    operator_label = FOLLOWUP_METADATA_OPERATOR_LABELS.get(operator, operator)
+    value = "" if getattr(item, "metadata_expected_value", None) is None else str(item.metadata_expected_value)
+    return (
+        f"{html.escape(field_path)} {html.escape(operator_label)} "
+        f"{html.escape(value)}"
+    )
+
+
+def _campaign_stop_events_text(item: FollowupCampaign) -> str:
+    values = parse_followup_csv(getattr(item, "stop_events", ""))
+    return html.escape(", ".join(values) or "не заданы")
+
+
+def _campaign_has_metadata_condition(item: FollowupCampaign) -> bool:
+    return bool((getattr(item, "metadata_field_path", None) or "").strip())
+
+
+def _campaign_has_stop_events(item: FollowupCampaign) -> bool:
+    return bool(parse_followup_csv(getattr(item, "stop_events", "")))
+
+
 @router.callback_query(F.data == "followup_campaigns")
 async def followup_campaigns(callback: CallbackQuery, state: FSMContext | None = None):
     await _show_followup_campaigns(callback, state=state)
@@ -1435,7 +1493,7 @@ async def _show_campaign(
     edit: bool = True,
     state: FSMContext | None = None,
 ):
-    return_topic_id = await _navigation_topic_id(state, "followup_return_topic_id")
+    return_topic_id = await _reset_followup_navigation(state)
     back_callback = (
         f"topic_followup_campaigns_{return_topic_id}"
         if return_topic_id is not None
@@ -1456,6 +1514,8 @@ async def _show_campaign(
     )
     builder.button(text="💬 Темы", callback_data=f"followup_topics_{item.id}")
     builder.button(text=f"🪜 Шаги ({len(item.steps)})", callback_data=f"followup_steps_{item.id}")
+    builder.button(text="⚙️ Условия", callback_data=f"followup_conditions_{item.id}")
+    builder.button(text="🧪 Проверить на себе", callback_data=f"followup_self_test_{item.id}")
     builder.button(text="🌙 Тихие часы", callback_data=f"followup_quiet_{item.id}")
     builder.button(text="🎲 Случайная задержка", callback_data=f"followup_jitter_{item.id}")
     builder.button(text="🗑 Удалить", callback_data=f"followup_delete_ask_{item.id}")
@@ -1484,6 +1544,506 @@ async def followup_campaign_view(callback: CallbackQuery, state: FSMContext | No
     await _show_campaign(callback.message, int(callback.data.rsplit("_", 1)[1]), state=state)
 
 
+async def _show_followup_conditions(
+    target,
+    campaign_id: int,
+    *,
+    edit: bool = True,
+):
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, campaign_id)
+    if item is None:
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить этапы", callback_data=f"followup_stage_edit_{campaign_id}")
+    builder.button(text="✏️ Изменить метаданные", callback_data=f"followup_metadata_edit_{campaign_id}")
+    if _campaign_has_metadata_condition(item):
+        builder.button(text="🧹 Очистить метаданные", callback_data=f"followup_metadata_clear_{campaign_id}")
+    builder.button(text="✏️ Изменить события остановки", callback_data=f"followup_stop_events_edit_{campaign_id}")
+    if _campaign_has_stop_events(item):
+        builder.button(text="🧹 Очистить события", callback_data=f"followup_stop_events_clear_{campaign_id}")
+    builder.row(_back(f"followup_campaign_{campaign_id}"))
+    builder.adjust(1)
+    text = (
+        f"⚙️ <b>Условия цепочки</b>\n\n"
+        f"Этапы:\n{_campaign_stage_text(item)}\n\n"
+        f"Метаданные:\n{_campaign_metadata_text(item)}\n\n"
+        f"События остановки:\n{_campaign_stop_events_text(item)}"
+    )
+    if edit:
+        await _safe_edit_text_or_markup(target, text, reply_markup=builder.as_markup())
+    else:
+        await target.answer(text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.regexp(r"^followup_conditions_(\d+)$"))
+async def followup_conditions(callback: CallbackQuery, state: FSMContext | None = None):
+    campaign_id = int(callback.data.rsplit("_", 1)[1])
+    await _reset_followup_navigation(state)
+    await _show_followup_conditions(callback, campaign_id)
+
+
+@router.callback_query(F.data.regexp(r"^followup_stage_edit_(\d+)$"))
+async def followup_stage_edit(callback: CallbackQuery, state: FSMContext | None = None):
+    campaign_id = int(callback.data.rsplit("_", 1)[1])
+    return_topic_id = await _reset_followup_navigation(state)
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, campaign_id)
+    if item is None:
+        return
+    current_mode = (getattr(item, "stage_mode", None) or "all").strip().lower()
+    builder = InlineKeyboardBuilder()
+    for mode in FOLLOWUP_STAGE_MODES:
+        prefix = "✅ " if mode == current_mode else ""
+        builder.button(
+            text=prefix + FOLLOWUP_STAGE_MODE_LABELS[mode],
+            callback_data=f"followup_stage_mode_{campaign_id}_{mode}",
+        )
+    builder.row(_back(f"followup_conditions_{campaign_id}"))
+    builder.adjust(1)
+    await callback.message.edit_text(
+        "🪜 <b>Этапы запуска</b>\n\nВыберите режим проверки текущего этапа.",
+        reply_markup=builder.as_markup(),
+    )
+    if return_topic_id is not None:
+        await state.update_data(followup_return_topic_id=return_topic_id)
+
+
+@router.callback_query(F.data.regexp(r"^followup_stage_mode_(\d+)_(all_except|all|selected|not_set)$"))
+async def followup_stage_mode(callback: CallbackQuery, state: FSMContext):
+    match = re.match(r"^followup_stage_mode_(\d+)_(all_except|all|selected|not_set)$", callback.data)
+    campaign_id, mode = int(match.group(1)), match.group(2)
+    if mode in {"all", "not_set"}:
+        async with async_session_maker() as session:
+            item = await session.get(FollowupCampaign, campaign_id)
+            if item is None:
+                return
+            item.stage_mode = mode
+            item.stage_values = ""
+            await session.commit()
+        await _reset_followup_navigation(state)
+        await _show_followup_conditions(callback, campaign_id)
+        return
+    return_topic_id = await _reset_followup_navigation(state)
+    await state.set_state(AutomationAdminStates.followup_stage_values)
+    await state.update_data(
+        campaign_id=campaign_id,
+        pending_stage_mode=mode,
+        followup_return_topic_id=return_topic_id,
+    )
+    await callback.message.edit_text(
+        f"🪜 <b>{FOLLOWUP_STAGE_MODE_LABELS[mode]}</b>\n\n"
+        "Введите точные названия этапов через запятую. Регистр сохраняется.",
+        reply_markup=InlineKeyboardBuilder().row(_back(f"followup_conditions_{campaign_id}")).as_markup(),
+    )
+
+
+@router.message(AutomationAdminStates.followup_stage_values)
+async def followup_stage_values_received(message: Message, state: FSMContext):
+    values = parse_followup_csv(message.text)
+    if not values:
+        await message.answer("Укажите хотя бы один этап через запятую.")
+        return
+    data = await state.get_data()
+    mode = data.get("pending_stage_mode")
+    if mode not in {"selected", "all_except"}:
+        await state.clear()
+        await message.answer("Настройка этапов устарела. Откройте её заново.")
+        return
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, data["campaign_id"])
+        if item is None:
+            await state.clear()
+            await message.answer("Цепочка не найдена.")
+            return
+        item.stage_mode = mode
+        item.stage_values = ", ".join(values)
+        await session.commit()
+    return_topic_id = data.get("followup_return_topic_id")
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
+    await message.answer("✅ Условия этапов сохранены.")
+    await _show_followup_conditions(message, data["campaign_id"], edit=False)
+
+
+@router.callback_query(F.data.regexp(r"^followup_metadata_edit_(\d+)$"))
+async def followup_metadata_edit(callback: CallbackQuery, state: FSMContext):
+    campaign_id = int(callback.data.rsplit("_", 1)[1])
+    return_topic_id = await _reset_followup_navigation(state)
+    await state.set_state(AutomationAdminStates.followup_metadata_field)
+    await state.update_data(campaign_id=campaign_id, followup_return_topic_id=return_topic_id)
+    await callback.message.edit_text(
+        "🧩 <b>Метаданные</b>\n\nВведите путь поля, например <code>profile.outcome</code>.",
+        reply_markup=InlineKeyboardBuilder().row(_back(f"followup_conditions_{campaign_id}")).as_markup(),
+    )
+
+
+@router.message(AutomationAdminStates.followup_metadata_field)
+async def followup_metadata_field_received(message: Message, state: FSMContext):
+    field_path = (message.text or "").strip()
+    if not field_path or any(char.isspace() for char in field_path) or len(field_path) > 200:
+        await message.answer("Введите непустой путь без пробелов, например <code>profile.outcome</code>.")
+        return
+    data = await state.get_data()
+    await state.set_state(AutomationAdminStates.followup_metadata_value)
+    await state.update_data(metadata_field_path=field_path)
+    builder = InlineKeyboardBuilder()
+    for operator, label in FOLLOWUP_METADATA_OPERATOR_LABELS.items():
+        builder.button(text=label, callback_data=f"followup_metadata_operator_{data['campaign_id']}_{operator}")
+    builder.row(_back(f"followup_conditions_{data['campaign_id']}"))
+    builder.adjust(1)
+    await message.answer("Выберите оператор:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.regexp(r"^followup_metadata_operator_(\d+)_(equals|not_equals|contains)$"))
+async def followup_metadata_operator(callback: CallbackQuery, state: FSMContext):
+    match = re.match(r"^followup_metadata_operator_(\d+)_(equals|not_equals|contains)$", callback.data)
+    campaign_id, operator = int(match.group(1)), match.group(2)
+    data = await state.get_data()
+    if data.get("campaign_id") != campaign_id or not data.get("metadata_field_path"):
+        await _reset_followup_navigation(state)
+        await _show_followup_conditions(callback, campaign_id)
+        return
+    await state.set_state(AutomationAdminStates.followup_metadata_value)
+    await state.update_data(metadata_operator=operator)
+    await callback.message.edit_text(
+        f"🧩 Поле: <code>{html.escape(data['metadata_field_path'])}</code>\n"
+        f"Оператор: <b>{html.escape(FOLLOWUP_METADATA_OPERATOR_LABELS[operator])}</b>\n\n"
+        "Введите значение:",
+        reply_markup=InlineKeyboardBuilder().row(_back(f"followup_conditions_{campaign_id}")).as_markup(),
+    )
+
+
+@router.message(AutomationAdminStates.followup_metadata_value)
+async def followup_metadata_value_received(message: Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("Значение не должно быть пустым.")
+        return
+    data = await state.get_data()
+    field_path = data.get("metadata_field_path")
+    operator = data.get("metadata_operator")
+    if not field_path or operator not in FOLLOWUP_METADATA_OPERATOR_LABELS:
+        await state.clear()
+        await message.answer("Настройка метаданных устарела. Откройте её заново.")
+        return
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, data["campaign_id"])
+        if item is None:
+            await state.clear()
+            await message.answer("Цепочка не найдена.")
+            return
+        item.metadata_field_path = field_path
+        item.metadata_operator = operator
+        item.metadata_expected_value = value
+        await session.commit()
+    return_topic_id = data.get("followup_return_topic_id")
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
+    await message.answer("✅ Условие метаданных сохранено.")
+    await _show_followup_conditions(message, data["campaign_id"], edit=False)
+
+
+@router.callback_query(F.data.regexp(r"^followup_metadata_clear_(\d+)$"))
+async def followup_metadata_clear(callback: CallbackQuery, state: FSMContext | None = None):
+    campaign_id = int(callback.data.rsplit("_", 1)[1])
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, campaign_id)
+        if item is not None:
+            item.metadata_field_path = None
+            item.metadata_operator = None
+            item.metadata_expected_value = None
+            await session.commit()
+    await _reset_followup_navigation(state)
+    await _show_followup_conditions(callback, campaign_id)
+
+
+@router.callback_query(F.data.regexp(r"^followup_stop_events_edit_(\d+)$"))
+async def followup_stop_events_edit(callback: CallbackQuery, state: FSMContext):
+    campaign_id = int(callback.data.rsplit("_", 1)[1])
+    return_topic_id = await _reset_followup_navigation(state)
+    await state.set_state(AutomationAdminStates.followup_stop_events)
+    await state.update_data(campaign_id=campaign_id, followup_return_topic_id=return_topic_id)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🧹 Очистить список", callback_data=f"followup_stop_events_clear_{campaign_id}")
+    builder.row(_back(f"followup_conditions_{campaign_id}"))
+    await callback.message.edit_text(
+        "🛑 <b>События остановки</b>\n\n"
+        "Введите точные имена событий через запятую. Пустой список не останавливает цепочку.",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.message(AutomationAdminStates.followup_stop_events)
+async def followup_stop_events_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    values = parse_followup_csv(message.text)
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, data["campaign_id"])
+        if item is None:
+            await state.clear()
+            await message.answer("Цепочка не найдена.")
+            return
+        item.stop_events = ", ".join(values)
+        await session.commit()
+    return_topic_id = data.get("followup_return_topic_id")
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
+    await message.answer("✅ События остановки сохранены.")
+    await _show_followup_conditions(message, data["campaign_id"], edit=False)
+
+
+@router.callback_query(F.data.regexp(r"^followup_stop_events_clear_(\d+)$"))
+async def followup_stop_events_clear(callback: CallbackQuery, state: FSMContext | None = None):
+    campaign_id = int(callback.data.rsplit("_", 1)[1])
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, campaign_id)
+        if item is not None:
+            item.stop_events = ""
+            await session.commit()
+    await _reset_followup_navigation(state)
+    await _show_followup_conditions(callback, campaign_id)
+
+
+async def _followup_self_test_snapshot(session, campaign_id: int, test_user_id: int):
+    item = await _campaign_with_relations(session, campaign_id)
+    user = await session.scalar(
+        select(User)
+        .options(selectinload(User.current_topic))
+        .where(User.id == test_user_id)
+    )
+    snapshot = {
+        "campaign": item,
+        "user": user,
+        "dialogue_id": None,
+        "topic_id": 0,
+        "eligibility": None,
+        "run": None,
+        "step": None,
+        "step_index": None,
+        "campaign_valid": False,
+        "can_send": False,
+        "reason": "campaign_not_found" if item is None else "user_not_found",
+    }
+    if item is None or user is None:
+        return snapshot
+
+    dialogue_id = user.current_dialogue_id if user.current_dialogue_id is not None else 1
+    topic_id = user.current_topic_id or 0
+    eligibility = await check_campaign_eligibility(
+        session,
+        item,
+        user_id=test_user_id,
+        dialogue_id=dialogue_id,
+        topic_id=topic_id,
+    )
+    run = await session.scalar(
+        select(FollowupRun).where(
+            FollowupRun.campaign_id == campaign_id,
+            FollowupRun.user_id == test_user_id,
+            FollowupRun.dialogue_id == dialogue_id,
+            FollowupRun.topic_id == topic_id,
+            FollowupRun.status == "active",
+        )
+    )
+    if run is not None:
+        step_index = run.next_step_index
+    elif eligibility.eligible:
+        step_index = 0
+    else:
+        step_index = None
+    step = item.steps[step_index] if step_index is not None and 0 <= step_index < len(item.steps) else None
+    campaign_valid = bool(
+        item.is_active
+        and item.steps
+        and _campaign_matches_scope(item, topic_id)
+    )
+    if not item.is_active:
+        reason = "campaign_inactive"
+    elif not _campaign_matches_scope(item, topic_id):
+        reason = "scope_not_allowed"
+    elif not eligibility.eligible:
+        reason = eligibility.reason
+    elif not item.steps or step is None:
+        reason = "step_missing"
+    elif step.message_type not in {"static", "ai"}:
+        reason = "step_invalid"
+    elif step.message_type == "static" and not (step.message_text or "").strip():
+        reason = "step_invalid"
+    else:
+        reason = "eligible"
+    snapshot.update({
+        "dialogue_id": dialogue_id,
+        "topic_id": topic_id,
+        "eligibility": eligibility,
+        "run": run,
+        "step": step,
+        "step_index": step_index,
+        "campaign_valid": campaign_valid,
+        "can_send": reason == "eligible" and campaign_valid,
+        "reason": reason,
+    })
+    return snapshot
+
+
+def _followup_self_test_keyboard(campaign_id: int, can_send: bool):
+    builder = InlineKeyboardBuilder()
+    if can_send:
+        builder.button(
+            text="▶️ Отправить следующий шаг сейчас",
+            callback_data=f"followup_self_test_send_{campaign_id}",
+        )
+    builder.button(text="🔄 Проверить условия заново", callback_data=f"followup_self_test_{campaign_id}")
+    builder.row(_back(f"followup_campaign_{campaign_id}"))
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _followup_self_test_text(snapshot, test_user_id: int) -> str:
+    item = snapshot["campaign"]
+    user = snapshot["user"]
+    if item is None:
+        return "Цепочка не найдена."
+    identity = (
+        f"@{html.escape(user.username)}"
+        if user is not None and user.username
+        else html.escape((user.first_name or user.name or "Не найден") if user is not None else "Не найден")
+    )
+    if user is None:
+        return (
+            "🧪 <b>Проверка цепочки на себе</b>\n\n"
+            f"Пользователь: {identity} / ID {test_user_id}\n\n"
+            "Итог:\n❌ Пользователь не найден в базе бота"
+        )
+    eligibility = snapshot["eligibility"]
+    current_step = eligibility.current_step or "не задан"
+    topic_id = snapshot["topic_id"]
+    topic = user.current_topic
+    topic_text = "Основной диалог" if topic_id == 0 else (
+        topic.name if topic is not None else f"ID {topic_id}"
+    )
+    stage_status = "✅" if eligibility.stage_matches else "❌"
+    metadata_status = "✅" if eligibility.metadata_matches else "❌"
+    if eligibility.metadata_configured:
+        metadata_text = _campaign_metadata_text(item)
+    else:
+        metadata_text = "не заданы"
+    if eligibility.matched_stop_event:
+        stop_text = f"❌ Событие остановки: {html.escape(eligibility.matched_stop_event)}"
+    elif _campaign_has_stop_events(item):
+        stop_text = "✅ События остановки: совпадений нет"
+    else:
+        stop_text = "✅ События остановки: не заданы"
+    reason_labels = {
+        "campaign_inactive": "цепочка выключена",
+        "scope_not_allowed": "текущая тема не входит в область цепочки",
+        "step_missing": "следующий шаг отсутствует",
+        "step_invalid": "следующий шаг заполнен некорректно",
+        "stage_not_allowed": "этап не подходит",
+        "metadata_mismatch": "метаданные не подходят",
+        "stop_event_found": "найдено событие остановки",
+    }
+    result = "✅ Цепочка сейчас может запуститься" if snapshot["can_send"] else (
+        f"❌ Цепочка сейчас не запустится\nПричина: {reason_labels.get(snapshot['reason'], snapshot['reason'])}"
+    )
+    next_step = snapshot["step"]
+    if next_step is None:
+        next_text = "Следующий шаг:\nнет доступного шага"
+    else:
+        kind = "AI" if next_step.message_type == "ai" else "static"
+        preview = (next_step.ai_instruction if next_step.message_type == "ai" else next_step.message_text) or ""
+        preview = " ".join(preview.split())
+        if len(preview) > 120:
+            preview = preview[:119] + "…"
+        next_text = (
+            f"Следующий шаг:\n#{snapshot['step_index'] + 1} · через {next_step.delay_minutes} мин · {kind}\n"
+            f"{html.escape(preview or 'не задано')}"
+        )
+    return (
+        "🧪 <b>Проверка цепочки на себе</b>\n\n"
+        f"Пользователь: {identity} / ID {test_user_id}\n"
+        f"Диалог: {snapshot['dialogue_id']}\n"
+        f"Тема: {html.escape(topic_text)}\n"
+        f"Этап: {html.escape(current_step)}\n\n"
+        "Условия:\n"
+        f"{stage_status} Этап: {_campaign_stage_text(item)}\n"
+        f"{metadata_status} Метаданные: {metadata_text}\n"
+        f"{stop_text}\n\n"
+        f"Итог:\n{result}\n\n"
+        f"{next_text}"
+    )
+
+
+async def _show_followup_self_test(
+    target,
+    campaign_id: int,
+    test_user_id: int,
+    *,
+    state: FSMContext | None = None,
+):
+    await _reset_followup_navigation(state)
+    async with async_session_maker() as session:
+        snapshot = await _followup_self_test_snapshot(session, campaign_id, test_user_id)
+    text = _followup_self_test_text(snapshot, test_user_id)
+    await _safe_edit_text_or_markup(
+        target,
+        text,
+        reply_markup=_followup_self_test_keyboard(campaign_id, snapshot["can_send"]),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^followup_self_test_(\d+)$"))
+async def followup_self_test(callback: CallbackQuery, state: FSMContext | None = None):
+    await _show_followup_self_test(
+        callback,
+        int(callback.data.rsplit("_", 1)[1]),
+        callback.from_user.id,
+        state=state,
+    )
+
+
+@router.callback_query(F.data.regexp(r"^followup_self_test_send_(\d+)$"))
+async def followup_self_test_send(callback: CallbackQuery, bot: Bot, state: FSMContext | None = None):
+    campaign_id = int(callback.data.rsplit("_", 1)[1])
+    test_user_id = callback.from_user.id
+    key = (test_user_id, campaign_id)
+    if key in _manual_followup_tests_inflight:
+        await _answer_callback(callback, "Проверка уже выполняется.")
+        return
+    _manual_followup_tests_inflight.add(key)
+    try:
+        await _answer_callback(callback, "Проверяю условия…")
+        edit_reply_markup = getattr(callback.message, "edit_reply_markup", None)
+        if edit_reply_markup is not None:
+            try:
+                await edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        async with async_session_maker() as session:
+            snapshot = await _followup_self_test_snapshot(session, campaign_id, test_user_id)
+        if snapshot["can_send"]:
+            await send_followup_step(
+                bot,
+                user=snapshot["user"],
+                step=snapshot["step"],
+                dialogue_id=snapshot["dialogue_id"],
+                topic_id=snapshot["topic_id"],
+            )
+        await _show_followup_self_test(
+            callback,
+            campaign_id,
+            test_user_id,
+            state=state,
+        )
+    except Exception:
+        logging.exception("Manual follow-up self-test failed: campaign=%s user=%s", campaign_id, test_user_id)
+        await _show_followup_self_test(
+            callback,
+            campaign_id,
+            test_user_id,
+            state=state,
+        )
+    finally:
+        _manual_followup_tests_inflight.discard(key)
+
+
 @router.callback_query(F.data.regexp(r"^followup_toggle_(\d+)$"))
 async def followup_toggle(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
@@ -1500,8 +2060,9 @@ async def followup_toggle(callback: CallbackQuery, state: FSMContext | None = No
 
 
 @router.callback_query(F.data.regexp(r"^followup_topics_(\d+)$"))
-async def followup_topics(callback: CallbackQuery):
+async def followup_topics(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
+    return_topic_id = await _reset_followup_navigation(state)
     async with async_session_maker() as session:
         item = await _campaign_with_relations(session, campaign_id)
         topics = (await session.execute(select(Topic).order_by(Topic.name))).scalars().all()
@@ -1516,7 +2077,12 @@ async def followup_topics(callback: CallbackQuery):
             text=f"{'✅' if topic.id in selected else '❌'} {topic.name}",
             callback_data=f"followup_ftopic_{campaign_id}_{topic.id}",
         )
-    builder.row(_back(f"followup_campaign_{campaign_id}"))
+    back_callback = (
+        f"topic_followup_campaigns_{return_topic_id}"
+        if return_topic_id is not None
+        else f"followup_campaign_{campaign_id}"
+    )
+    builder.row(_back(back_callback))
     builder.adjust(1)
     await callback.message.edit_text(
         "💬 <b>Темы цепочки</b>\n\n"
@@ -1527,7 +2093,7 @@ async def followup_topics(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.regexp(r"^followup_ftopic_(all|main)_(\d+)$"))
-async def followup_scope_toggle(callback: CallbackQuery):
+async def followup_scope_toggle(callback: CallbackQuery, state: FSMContext | None = None):
     scope, campaign_id_raw = callback.data.split("_")[-2:]
     campaign_id = int(campaign_id_raw)
     await _answer_callback(callback)
@@ -1540,11 +2106,11 @@ async def followup_scope_toggle(callback: CallbackQuery):
                 item.include_main_dialogue = not item.include_main_dialogue
             await session.commit()
     callback.data = f"followup_topics_{campaign_id}"
-    await followup_topics(callback)
+    await followup_topics(callback, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^followup_ftopic_(\d+)_(\d+)$"))
-async def followup_topic_toggle(callback: CallbackQuery):
+async def followup_topic_toggle(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id_raw, topic_id_raw = callback.data.split("_")[-2:]
     campaign_id, topic_id = int(campaign_id_raw), int(topic_id_raw)
     await _answer_callback(callback)
@@ -1565,12 +2131,13 @@ async def followup_topic_toggle(callback: CallbackQuery):
             await session.execute(followup_campaign_topic_association.insert().values(campaign_id=campaign_id, topic_id=topic_id))
         await session.commit()
     callback.data = f"followup_topics_{campaign_id}"
-    await followup_topics(callback)
+    await followup_topics(callback, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^followup_steps_(\d+)$"))
-async def followup_steps(callback: CallbackQuery):
+async def followup_steps(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
+    await _reset_followup_navigation(state)
     async with async_session_maker() as session:
         item = await _campaign_with_relations(session, campaign_id)
     if item is None:
@@ -1579,8 +2146,8 @@ async def followup_steps(callback: CallbackQuery):
     for index, step in enumerate(item.steps, 1):
         kind = "AI" if step.message_type == "ai" else "текст"
         builder.button(
-            text=f"🗑 {index}. через {step.delay_minutes} мин. — {kind}",
-            callback_data=f"followup_step_delete_{campaign_id}_{step.id}",
+            text=f"{index}. через {step.delay_minutes} мин. — {kind}",
+            callback_data=f"followup_step_{campaign_id}_{step.id}",
         )
     builder.button(text="➕ Обычный текст", callback_data=f"followup_step_add_{campaign_id}_static")
     builder.button(text="➕ Сгенерировать через AI", callback_data=f"followup_step_add_{campaign_id}_ai")
@@ -1591,18 +2158,72 @@ async def followup_steps(callback: CallbackQuery):
         "Первое время считается от последнего действия пользователя, следующие — от предыдущего сообщения. "
         "Новое действие пользователя начинает цепочку заново.\n\n"
         "Шаг «Обычный текст» отправляет ваш текст. Шаг «Сгенерировать через AI» передаёт AI вашу инструкцию "
-        "и текущий диалог.\n\n"
-        "Нажатие на существующий шаг удаляет его."
+        "и текущий диалог. Нажмите на шаг, чтобы открыть его детали."
     )
     await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
+
+
+async def _show_followup_step_detail(
+    target,
+    campaign_id: int,
+    step_id: int,
+    *,
+    edit: bool = True,
+    state: FSMContext | None = None,
+):
+    await _reset_followup_navigation(state)
+    async with async_session_maker() as session:
+        item = await _campaign_with_relations(session, campaign_id)
+    if item is None:
+        return
+    step = next((candidate for candidate in item.steps if candidate.id == step_id), None)
+    if step is None:
+        return
+    index = next(index for index, candidate in enumerate(item.steps, 1) if candidate.id == step_id)
+    kind = "AI" if step.message_type == "ai" else "static"
+    content_label = "Инструкция" if step.message_type == "ai" else "Текст"
+    content = (step.ai_instruction if step.message_type == "ai" else step.message_text) or "не задано"
+    content = content[:3000] + ("…" if len(content) > 3000 else "")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Редактировать", callback_data=f"followup_step_edit_{campaign_id}_{step_id}")
+    builder.button(text="🗑 Удалить", callback_data=f"followup_step_delete_{campaign_id}_{step_id}")
+    builder.row(_back(f"followup_steps_{campaign_id}"))
+    builder.adjust(1)
+    text = (
+        f"🪜 <b>Шаг {index}</b>\n\n"
+        f"Индекс: <b>{index}</b>\n"
+        f"Задержка: <b>{step.delay_minutes} мин.</b>\n"
+        f"Тип: <b>{kind}</b>\n"
+        f"{content_label}:\n<code>{html.escape(content)}</code>"
+    )
+    if edit:
+        await _safe_edit_text_or_markup(target, text, reply_markup=builder.as_markup())
+    else:
+        await target.answer(text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.regexp(r"^followup_step_(\d+)_(\d+)$"))
+async def followup_step_detail(callback: CallbackQuery, state: FSMContext | None = None):
+    match = re.match(r"^followup_step_(\d+)_(\d+)$", callback.data)
+    await _show_followup_step_detail(
+        callback,
+        int(match.group(1)),
+        int(match.group(2)),
+        state=state,
+    )
 
 
 @router.callback_query(F.data.regexp(r"^followup_step_add_(\d+)_(static|ai)$"))
 async def followup_step_add(callback: CallbackQuery, state: FSMContext):
     match = re.match(r"^followup_step_add_(\d+)_(static|ai)$", callback.data)
     campaign_id, kind = int(match.group(1)), match.group(2)
+    return_topic_id = await _reset_followup_navigation(state)
     await state.set_state(AutomationAdminStates.followup_step)
-    await state.update_data(campaign_id=campaign_id, step_kind=kind)
+    await state.update_data(
+        campaign_id=campaign_id,
+        step_kind=kind,
+        followup_return_topic_id=return_topic_id,
+    )
     label = "текст сообщения" if kind == "static" else "инструкцию для AI"
     await callback.message.edit_text(
         "<b>Новый шаг</b>\n\n"
@@ -1613,16 +2234,54 @@ async def followup_step_add(callback: CallbackQuery, state: FSMContext):
     )
 
 
+@router.callback_query(F.data.regexp(r"^followup_step_edit_(\d+)_(\d+)$"))
+async def followup_step_edit(callback: CallbackQuery, state: FSMContext):
+    match = re.match(r"^followup_step_edit_(\d+)_(\d+)$", callback.data)
+    campaign_id, step_id = int(match.group(1)), int(match.group(2))
+    return_topic_id = await _reset_followup_navigation(state)
+    async with async_session_maker() as session:
+        step = await session.get(FollowupStep, step_id)
+    if step is None or step.campaign_id != campaign_id:
+        await _answer_callback(callback, "Шаг не найден.", show_alert=True)
+        return
+    await state.set_state(AutomationAdminStates.followup_step_edit)
+    await state.update_data(
+        campaign_id=campaign_id,
+        step_id=step_id,
+        followup_return_topic_id=return_topic_id,
+    )
+    label = "текст сообщения" if step.message_type == "static" else "инструкцию для AI"
+    await callback.message.edit_text(
+        "<b>Редактирование шага</b>\n\n"
+        f"В первой строке укажите задержку в минутах, ниже — {label}.",
+        reply_markup=InlineKeyboardBuilder().row(_back(f"followup_step_{campaign_id}_{step_id}")).as_markup(),
+    )
+
+
+def _parse_followup_step_input(raw_text: str | None) -> tuple[int, str] | None:
+    first, separator, body = (raw_text or "").partition("\n")
+    if not separator or not first.strip().isdigit() or not body.strip():
+        return None
+    delay = int(first.strip())
+    if not 1 <= delay <= 525600:
+        return None
+    return delay, body.strip()
+
+
 @router.message(AutomationAdminStates.followup_step)
 async def followup_step_received(message: Message, state: FSMContext):
     data = await state.get_data()
-    first, separator, body = (message.text or "").partition("\n")
-    if not separator or not first.strip().isdigit() or not body.strip():
-        await message.answer("Нужны минуты в первой строке и текст ниже.")
-        return
-    delay = int(first.strip())
-    if not 1 <= delay <= 525600:
+    parsed = _parse_followup_step_input(message.text)
+    if parsed is None:
+        first, separator, body = (message.text or "").partition("\n")
+        if not separator or not first.strip().isdigit() or not body.strip():
+            await message.answer("Нужны минуты в первой строке и текст ниже.")
+            return
         await message.answer("Задержка должна быть от 1 минуты до 365 дней.")
+        return
+    delay, body = parsed
+    if not body:
+        await message.answer("Нужны минуты в первой строке и текст ниже.")
         return
     async with async_session_maker() as session:
         order = await session.scalar(
@@ -1646,33 +2305,83 @@ async def followup_step_received(message: Message, state: FSMContext):
     await _show_campaign(message, data["campaign_id"], edit=False, state=state)
 
 
+@router.message(AutomationAdminStates.followup_step_edit)
+async def followup_step_edit_received(message: Message, state: FSMContext):
+    parsed = _parse_followup_step_input(message.text)
+    if parsed is None:
+        first, separator, body = (message.text or "").partition("\n")
+        if not separator or not first.strip().isdigit() or not body.strip():
+            await message.answer("Нужны минуты в первой строке и текст ниже.")
+            return
+        await message.answer("Задержка должна быть от 1 минуты до 365 дней.")
+        return
+    delay, body = parsed
+    data = await state.get_data()
+    async with async_session_maker() as session:
+        step = await session.get(FollowupStep, data["step_id"])
+        if step is None or step.campaign_id != data["campaign_id"]:
+            await state.clear()
+            await message.answer("Шаг не найден.")
+            return
+        step.delay_minutes = delay
+        if step.message_type == "ai":
+            step.ai_instruction = body
+        else:
+            step.message_text = body
+        await session.commit()
+    return_topic_id = data.get("followup_return_topic_id")
+    await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
+    await message.answer("✅ Шаг обновлён.")
+    await _show_followup_step_detail(
+        message,
+        data["campaign_id"],
+        data["step_id"],
+        edit=False,
+        state=state,
+    )
+
+
 @router.callback_query(F.data.regexp(r"^followup_step_delete_(\d+)_(\d+)$"))
-async def followup_step_delete(callback: CallbackQuery):
+async def followup_step_delete(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id_raw, step_id_raw = callback.data.split("_")[-2:]
+    blocked = False
     async with async_session_maker() as session:
         step = await session.get(FollowupStep, int(step_id_raw))
         if step and step.campaign_id == int(campaign_id_raw):
-            await session.delete(step)
-            await session.flush()
-            remaining = (
-                await session.execute(
-                    select(FollowupStep)
-                    .where(FollowupStep.campaign_id == int(campaign_id_raw))
-                    .order_by(FollowupStep.sort_order, FollowupStep.id)
-                )
-            ).scalars().all()
-            for index, item in enumerate(remaining):
-                item.sort_order = index
-            await session.commit()
+            sent_count = await session.scalar(
+                select(func.count(FollowupDelivery.id)).where(FollowupDelivery.step_id == step.id)
+            ) or 0
+            if sent_count:
+                blocked = True
+            else:
+                await session.delete(step)
+                await session.flush()
+                remaining = (
+                    await session.execute(
+                        select(FollowupStep)
+                        .where(FollowupStep.campaign_id == int(campaign_id_raw))
+                        .order_by(FollowupStep.sort_order, FollowupStep.id)
+                    )
+                ).scalars().all()
+                for index, item in enumerate(remaining):
+                    item.sort_order = index
+                await session.commit()
+    if blocked:
+        await _answer_callback(
+            callback,
+            "Шаг уже отправлялся, его нельзя удалить без потери истории.",
+            show_alert=True,
+        )
     callback.data = f"followup_steps_{campaign_id_raw}"
-    await followup_steps(callback)
+    await followup_steps(callback, state=state)
 
 
 @router.callback_query(F.data.regexp(r"^followup_quiet_(\d+)$"))
 async def followup_quiet(callback: CallbackQuery, state: FSMContext):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
+    return_topic_id = await _reset_followup_navigation(state)
     await state.set_state(AutomationAdminStates.quiet_hours)
-    await state.update_data(campaign_id=campaign_id)
+    await state.update_data(campaign_id=campaign_id, followup_return_topic_id=return_topic_id)
     await callback.message.edit_text(
         "🌙 <b>Тихие часы</b>\n\n"
         "Введите интервал и часовую зону в формате:\n"
@@ -1714,8 +2423,9 @@ async def followup_quiet_received(message: Message, state: FSMContext):
 @router.callback_query(F.data.regexp(r"^followup_jitter_(\d+)$"))
 async def followup_jitter(callback: CallbackQuery, state: FSMContext):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
+    return_topic_id = await _reset_followup_navigation(state)
     await state.set_state(AutomationAdminStates.jitter)
-    await state.update_data(campaign_id=campaign_id)
+    await state.update_data(campaign_id=campaign_id, followup_return_topic_id=return_topic_id)
     await callback.message.edit_text(
         "🎲 <b>Случайная задержка</b>\n\n"
         "Введите диапазон в секундах, например <code>30-180</code>. "

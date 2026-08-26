@@ -50,6 +50,21 @@ def _resolve_path(data: dict[str, Any], path: str | None) -> Any:
     return current
 
 
+def resolve_condition_path(data: dict[str, Any], path: str | None) -> Any:
+    return _resolve_path(data, path)
+
+
+def condition_value_matches(actual: Any, expected: str, operator: str = "equals") -> bool:
+    operator = operator or "equals"
+    if operator == "not_equals":
+        return str(actual) != expected
+    if operator == "contains":
+        if isinstance(actual, (list, tuple, set)):
+            return expected in {str(item) for item in actual}
+        return expected in str(actual or "")
+    return str(actual) == expected
+
+
 def condition_matches(condition: AutomationCondition, event: AutomationEvent) -> bool:
     state = _load_object(event.state_json)
     metadata = _load_object(event.metadata_json)
@@ -68,13 +83,7 @@ def condition_matches(condition: AutomationCondition, event: AutomationEvent) ->
     operator = condition.operator or "equals"
     if operator == "exists":
         return actual is not None
-    if operator == "not_equals":
-        return str(actual) != expected
-    if operator == "contains":
-        if isinstance(actual, (list, tuple, set)):
-            return expected in {str(item) for item in actual}
-        return expected in str(actual or "")
-    return str(actual) == expected
+    return condition_value_matches(actual, expected, operator)
 
 
 def handler_matches(handler: AutomationHandler, event: AutomationEvent) -> bool:

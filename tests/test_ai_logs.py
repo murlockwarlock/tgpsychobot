@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("BOT_TOKEN", "test")
@@ -12,6 +13,7 @@ from keyboards import (
     admin_panel_keyboard,
     ai_settings_keyboard,
     fixed_pagination_rows,
+    format_ai_log_button,
 )
 
 
@@ -44,10 +46,16 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('"temperature":0.1', fetched.request_payload)
 
     def test_ai_log_keyboards_structure(self):
-        fake_log = AILog(id=1, provider="Deepseek", model="deepseek-chat", latency_ms=850)
+        fake_log = AILog(
+            id=1,
+            provider="Deepseek",
+            model="deepseek-chat",
+            latency_ms=850,
+            created_at=datetime(2026, 8, 26, 14, 41),
+        )
         markup = admin_ai_logs_keyboard([fake_log], page=0, total_pages=1)
         buttons = [b.text for row in markup.inline_keyboard for b in row]
-        self.assertTrue(any("#1 | Deepseek: deepseek-chat" in btn for btn in buttons))
+        self.assertTrue(any("26.08 17:41 | Deepseek: deepseek-chat" in btn for btn in buttons))
 
         detail_markup = admin_ai_log_detail_keyboard(1, page=0)
         detail_buttons = [b.text for row in detail_markup.inline_keyboard for b in row]
@@ -70,17 +78,54 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     def test_followup_log_filter_is_available(self):
         markup = admin_ai_logs_keyboard(
-            [AILog(id=10, request_type="followup", provider="Gemini", model="flash", latency_ms=100)],
+            [AILog(
+                id=10,
+                request_type="followup",
+                provider="Gemini",
+                model="flash",
+                latency_ms=100,
+                created_at=datetime(2026, 8, 26, 14, 41),
+            )],
             page=0,
             total_pages=1,
             period="7d",
             request_type="followup",
         )
         pairs = [(button.text, button.callback_data) for row in markup.inline_keyboard for button in row]
-        self.assertIn(("#10 | Gemini: flash (0.1s)", "admin_ai_log_10_0_0_7d_followup"), pairs)
+        self.assertIn(("↪️ 26.08 17:41 | Gemini: flash (0.1s)", "admin_ai_log_10_0_0_7d_followup"), pairs)
         self.assertIn(("✅ Догоняющие", "admin_ai_logs_0_7d_followup"), pairs)
         self.assertIn(("Сегодня", "admin_ai_logs_0_today_followup"), pairs)
         self.assertIn(("📦 Скачать пакет логов", "export_ai_logs_0_7d_followup"), pairs)
+
+    def test_ai_log_button_format_is_shared_for_global_and_user_lists(self):
+        log = AILog(
+            id=12,
+            request_type="followup",
+            provider="Gemini",
+            model="flash",
+            latency_ms=100,
+            created_at=datetime(2026, 8, 26, 14, 41),
+        )
+        global_markup = admin_ai_logs_keyboard([log], page=0, total_pages=1)
+        user_markup = admin_ai_logs_keyboard([log], page=0, total_pages=1, filter_user_id=42)
+        global_label = global_markup.inline_keyboard[0][0].text
+        user_label = user_markup.inline_keyboard[0][0].text
+        self.assertEqual(global_label, user_label)
+        self.assertEqual(global_label, format_ai_log_button(log))
+
+    def test_ai_log_button_truncates_only_model_portion(self):
+        log = AILog(
+            id=13,
+            request_type="chat",
+            provider="Gemini",
+            model="a-very-long-model-name-that-does-not-fit-in-a-telegram-button",
+            latency_ms=100,
+            created_at=datetime(2026, 8, 26, 14, 41),
+        )
+        label = format_ai_log_button(log)
+        self.assertLessEqual(len(label), 60)
+        self.assertTrue(label.startswith("26.08 17:41 | Gemini: a-very"))
+        self.assertNotIn("#13", label)
 
     def test_fixed_navigation_has_same_two_rows_on_every_page(self):
         callback = lambda page: f"page_{page}"

@@ -13,8 +13,25 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import followups
-from database import Base, FollowupCampaign, FollowupDelivery, FollowupRun, FollowupStep, Message, User
-from followups import _outside_quiet_hours, process_due_followups, record_user_activity
+from database import (
+    AutomationConversationState,
+    AutomationEvent,
+    AutomationStepTransition,
+    Base,
+    FollowupCampaign,
+    FollowupDelivery,
+    FollowupRun,
+    FollowupStep,
+    Message,
+    User,
+)
+from followups import (
+    _outside_quiet_hours,
+    check_campaign_eligibility,
+    evaluate_followup_eligibility,
+    process_due_followups,
+    record_user_activity,
+)
 
 
 class FakeBot:
@@ -64,6 +81,216 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         # 20:30 UTC is 23:30 Moscow and must move to 09:00 Moscow next day.
         shifted = _outside_quiet_hours(datetime(2026, 8, 4, 20, 30), campaign)
         self.assertEqual(shifted, datetime(2026, 8, 5, 6, 0))
+
+    def test_default_and_stage_modes(self):
+        default = SimpleNamespace()
+        self.assertTrue(evaluate_followup_eligibility(default, current_step="completed", metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(default, current_step=None, metadata={}).eligible)
+
+        selected = SimpleNamespace(stage_mode="selected", stage_values=" step_1, , step_2 ")
+        self.assertTrue(evaluate_followup_eligibility(selected, current_step="step_1", metadata={}).eligible)
+        self.assertFalse(evaluate_followup_eligibility(selected, current_step="STEP_1", metadata={}).eligible)
+        self.assertFalse(evaluate_followup_eligibility(selected, current_step="other", metadata={}).eligible)
+        self.assertFalse(evaluate_followup_eligibility(selected, current_step=None, metadata={}).eligible)
+
+        excluded = SimpleNamespace(stage_mode="all_except", stage_values="completed, crisis")
+        self.assertFalse(evaluate_followup_eligibility(excluded, current_step="completed", metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(excluded, current_step="active", metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(excluded, current_step=None, metadata={}).eligible)
+
+        not_set = SimpleNamespace(stage_mode="not_set", stage_values="obsolete")
+        self.assertTrue(evaluate_followup_eligibility(not_set, current_step=None, metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(not_set, current_step="", metadata={}).eligible)
+        self.assertFalse(evaluate_followup_eligibility(not_set, current_step="active", metadata={}).eligible)
+
+    def test_metadata_operators_nested_values_and_stop_veto(self):
+        campaign = SimpleNamespace(
+            stage_mode="all",
+            stage_values="",
+            metadata_field_path="profile.outcome",
+            metadata_operator="equals",
+            metadata_expected_value="signup",
+            stop_events="",
+        )
+        self.assertTrue(
+            evaluate_followup_eligibility(
+                campaign,
+                current_step=None,
+                metadata={"profile": {"outcome": "signup"}},
+            ).eligible
+        )
+        campaign.metadata_operator = "not_equals"
+        self.assertTrue(
+            evaluate_followup_eligibility(
+                campaign,
+                current_step=None,
+                metadata={"profile": {"outcome": "other"}},
+            ).eligible
+        )
+        campaign.metadata_field_path = "summary"
+        campaign.metadata_operator = "contains"
+        campaign.metadata_expected_value = "sign"
+        self.assertTrue(
+            evaluate_followup_eligibility(campaign, current_step=None, metadata={"summary": "signup"}).eligible
+        )
+        campaign.metadata_field_path = "tags"
+        campaign.metadata_expected_value = "signup"
+        self.assertTrue(
+            evaluate_followup_eligibility(campaign, current_step=None, metadata={"tags": ["lead", "signup"]}).eligible
+        )
+        campaign.stage_mode = "selected"
+        campaign.stage_values = "allowed"
+        campaign.stop_events = "CRISIS_DETECTED, DIALOG_COMPLETED"
+        result = evaluate_followup_eligibility(
+            campaign,
+            current_step="blocked",
+            metadata={"tags": []},
+            stop_event_names=["CRISIS_DETECTED"],
+        )
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "stop_event_found")
+
+    async def test_metadata_mismatch_uses_scoped_merged_state_not_user_history(self):
+        async with self.sessions() as session:
+            campaign = await session.scalar(select(FollowupCampaign))
+            campaign.metadata_field_path = "outcome"
+            campaign.metadata_operator = "equals"
+            campaign.metadata_expected_value = "signup"
+            user = await session.get(User, 42)
+            user.metadata_json = '{"outcome":"signup"}'
+            session.add(AutomationConversationState(
+                user_id=42,
+                dialogue_id=1,
+                topic_id=0,
+                current_step="active",
+                metadata_json='{"outcome":"other"}',
+            ))
+            await session.commit()
+
+        with patch.object(followups, "async_session_maker", self.sessions):
+            await record_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=datetime.utcnow() - timedelta(minutes=2),
+            )
+
+        async with self.sessions() as session:
+            self.assertIsNone(await session.scalar(select(FollowupRun)))
+
+    async def test_stop_event_added_after_scheduling_cancels_before_delivery(self):
+        async with self.sessions() as session:
+            campaign = await session.scalar(select(FollowupCampaign))
+            campaign.stop_events = "CRISIS_DETECTED"
+            await session.commit()
+
+        with patch.object(followups, "async_session_maker", self.sessions):
+            await record_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=datetime.utcnow() - timedelta(minutes=2),
+            )
+
+        async with self.sessions() as session:
+            session.add(AutomationEvent(
+                user_id=42,
+                dialogue_id=1,
+                topic_id=0,
+                name="CRISIS_DETECTED",
+            ))
+            await session.commit()
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            first = await process_due_followups(bot)
+            second = await process_due_followups(bot)
+
+        async with self.sessions() as session:
+            run = await session.scalar(select(FollowupRun))
+            deliveries = await session.scalar(select(func.count(FollowupDelivery.id)))
+        self.assertEqual((first, second), (0, 0))
+        self.assertEqual(run.status, "cancelled")
+        self.assertEqual(deliveries, 0)
+        self.assertEqual(bot.sent, [])
+
+    async def test_state_change_after_scheduling_is_rechecked_and_not_retried(self):
+        async with self.sessions() as session:
+            campaign = await session.scalar(select(FollowupCampaign))
+            campaign.stage_mode = "selected"
+            campaign.stage_values = "allowed"
+            session.add(AutomationConversationState(
+                user_id=42,
+                dialogue_id=1,
+                topic_id=0,
+                current_step="allowed",
+                metadata_json="{}",
+            ))
+            await session.commit()
+
+        with patch.object(followups, "async_session_maker", self.sessions):
+            await record_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=datetime.utcnow() - timedelta(minutes=2),
+            )
+
+        async with self.sessions() as session:
+            state = await session.scalar(select(AutomationConversationState))
+            state.current_step = "blocked"
+            await session.commit()
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            first = await process_due_followups(bot)
+            second = await process_due_followups(bot)
+        async with self.sessions() as session:
+            run = await session.scalar(select(FollowupRun))
+        self.assertEqual((first, second), (0, 0))
+        self.assertEqual(run.status, "cancelled")
+        self.assertEqual(bot.sent, [])
+
+    async def test_eligibility_checks_do_not_create_automation_history_rows(self):
+        async with self.sessions() as session:
+            campaign = await session.scalar(select(FollowupCampaign))
+            session.add_all([
+                AutomationConversationState(
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=0,
+                    current_step="active",
+                    metadata_json='{"outcome":"signup"}',
+                ),
+                AutomationStepTransition(
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=0,
+                    current_step="active",
+                    state_json='{"current_step":"active"}',
+                ),
+                AutomationEvent(
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=0,
+                    name="OBSERVED",
+                ),
+            ])
+            await session.commit()
+            before_events = await session.scalar(select(func.count(AutomationEvent.id)))
+            before_transitions = await session.scalar(select(func.count(AutomationStepTransition.id)))
+            first = await check_campaign_eligibility(
+                session, campaign, user_id=42, dialogue_id=1, topic_id=None
+            )
+            second = await check_campaign_eligibility(
+                session, campaign, user_id=42, dialogue_id=1, topic_id=None
+            )
+            after_events = await session.scalar(select(func.count(AutomationEvent.id)))
+            after_transitions = await session.scalar(select(func.count(AutomationStepTransition.id)))
+        self.assertTrue(first.eligible)
+        self.assertTrue(second.eligible)
+        self.assertEqual(before_events, after_events)
+        self.assertEqual(before_transitions, after_transitions)
 
     async def test_activity_restarts_generation_and_static_step_is_sent_once(self):
         with patch.object(followups, "async_session_maker", self.sessions):

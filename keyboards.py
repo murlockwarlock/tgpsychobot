@@ -12,7 +12,7 @@ from config import OWNER_IDS
 from datetime import timezone, timedelta, date
 from mailing_utils import MAILING_AUDIENCE_LABELS, get_mailing_status_label, is_birthday_mailing
 from memory_mode import memory_mode_label
-from time_helpers import to_msk
+from time_helpers import format_msk, to_msk
 from provider_models import build_telegram_model_callback_data
 
 
@@ -1777,6 +1777,33 @@ def admin_referral_template_input_cancel_keyboard():
     return builder.as_markup()
 
 
+def _truncate_ai_log_model(value: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    if limit == 1:
+        return "…"
+    return value[:limit - 1] + "…"
+
+
+def format_ai_log_button(log, max_length: int = 60) -> str:
+    marker = "↪️ " if getattr(log, "request_type", "chat") == "followup" else ""
+    timestamp = format_msk(log.created_at, "%d.%m %H:%M") if log.created_at else "--.-- --:--"
+    provider = str(log.provider or "—")
+    model = str(log.model or "—")
+    latency = f" ({log.latency_ms / 1000:.1f}s)" if log.latency_ms else ""
+    fixed = f"{marker}{timestamp} | "
+    provider_prefix = f"{provider}: "
+    model_limit = max_length - len(fixed) - len(provider_prefix) - len(latency)
+    if model_limit < 1:
+        provider_limit = max(1, max_length - len(fixed) - len(": ") - len(latency) - 1)
+        provider = _truncate_ai_log_model(provider, provider_limit)
+        provider_prefix = f"{provider}: "
+        model_limit = max(1, max_length - len(fixed) - len(provider_prefix) - len(latency))
+    return f"{fixed}{provider_prefix}{_truncate_ai_log_model(model, model_limit)}{latency}"
+
+
 def admin_ai_logs_keyboard(
     logs,
     page: int,
@@ -1795,12 +1822,10 @@ def admin_ai_logs_keyboard(
 
     builder = InlineKeyboardBuilder()
     for log in logs:
-        lat_text = f" ({log.latency_ms / 1000:.1f}s)" if log.latency_ms else ""
-        btn_text = f"#{log.id} | {log.provider}: {log.model}{lat_text}"
         cb = f"admin_ai_log_{log.id}_{page}_{filter_user_id or 0}_{period}"
         if request_type != "all":
             cb += f"_{request_type}"
-        builder.button(text=btn_text[:60], callback_data=cb)
+        builder.button(text=format_ai_log_button(log), callback_data=cb)
 
     builder.adjust(1)
     for navigation_row in fixed_pagination_rows(page, total_pages, list_callback):
