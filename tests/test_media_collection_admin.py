@@ -644,15 +644,37 @@ async def test_shared_collection_isolated_by_scope_and_ai_list_uses_same_resolve
 
 
 @pytest.mark.asyncio
-async def test_legacy_topic_media_and_decks_migrate_to_bound_collections(admin_store):
+async def test_legacy_migration_keeps_existing_collection_scope_and_ignores_decks(admin_store):
     async with admin_store() as session:
+        existing_media = MediaLibrary(file_id="existing", file_name="existing", media_type="photo")
+        direct_media = MediaLibrary(
+            file_id="direct",
+            file_name="direct",
+            media_type="photo",
+            topic_id=1,
+        )
+        deck_media = MediaLibrary(
+            file_id="deck",
+            file_name="deck",
+            media_type="photo",
+            category="tarot",
+        )
         session.add_all([
             Topic(id=1, name="Topic one"),
-            Topic(id=2, name="Topic two"),
+            MediaCollection(name="Existing"),
             TopicMediaDeck(topic_id=1, deck_name="tarot"),
-            MediaLibrary(file_id="direct", file_name="direct", media_type="photo", topic_id=1),
-            MediaLibrary(file_id="deck", file_name="deck", media_type="photo", category="tarot", topic_id=2),
+            existing_media,
+            direct_media,
+            deck_media,
         ])
+        await session.flush()
+        collection = await session.scalar(select(MediaCollection).where(MediaCollection.name == "Existing"))
+        await session.execute(
+            topic_collection_association.insert().values(topic_id=1, collection_id=collection.id)
+        )
+        await session.execute(
+            media_collection_items.insert().values(collection_id=collection.id, media_id=existing_media.id)
+        )
         await session.commit()
 
     async with admin_store() as session:
@@ -662,7 +684,106 @@ async def test_legacy_topic_media_and_decks_migrate_to_bound_collections(admin_s
         media_names = set((await session.execute(
             select_media_by_ids(scope.collection_media_ids)
         )).scalars().all())
+        direct_topic_id = await session.scalar(
+            select(MediaLibrary.topic_id).where(MediaLibrary.file_name == "direct")
+        )
+        legacy_decks = (await session.execute(select(TopicMediaDeck))).scalars().all()
 
+    assert media_names == {"existing", "direct"}
+    assert direct_topic_id is None
+    assert legacy_decks == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_migration_keeps_direct_and_deck_media_without_existing_collection(admin_store):
+    async with admin_store() as session:
+        session.add_all([
+            Topic(id=2, name="Topic two"),
+            TopicMediaDeck(topic_id=2, deck_name="tarot"),
+            MediaLibrary(file_id="direct", file_name="direct", media_type="photo", topic_id=2),
+            MediaLibrary(file_id="deck", file_name="deck", media_type="photo", category="tarot"),
+        ])
+        await session.commit()
+
+    async with admin_store() as session:
+        await session.run_sync(database._migrate_legacy_media_ownership)
+        await session.commit()
+        scope = await load_media_scope(session, 2)
+        media_names = set((await session.execute(
+            select_media_by_ids(scope.collection_media_ids)
+        )).scalars().all())
+
+    assert media_names == {"direct", "deck"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_migration_is_idempotent(admin_store):
+    async with admin_store() as session:
+        session.add_all([
+            Topic(id=3, name="Topic three"),
+            TopicMediaDeck(topic_id=3, deck_name="tarot"),
+            MediaLibrary(file_id="direct", file_name="direct", media_type="photo", topic_id=3),
+            MediaLibrary(file_id="deck", file_name="deck", media_type="photo", category="tarot"),
+        ])
+        await session.commit()
+
+    async with admin_store() as session:
+        await session.run_sync(database._migrate_legacy_media_ownership)
+        await session.commit()
+        first_collections = set((await session.execute(select(MediaCollection.name))).scalars().all())
+        first_bindings = set((await session.execute(
+            select(topic_collection_association.c.topic_id, topic_collection_association.c.collection_id)
+        )).all())
+        first_items = set((await session.execute(
+            select(media_collection_items.c.collection_id, media_collection_items.c.media_id)
+        )).all())
+
+        await session.run_sync(database._migrate_legacy_media_ownership)
+        await session.commit()
+        second_collections = set((await session.execute(select(MediaCollection.name))).scalars().all())
+        second_bindings = set((await session.execute(
+            select(topic_collection_association.c.topic_id, topic_collection_association.c.collection_id)
+        )).all())
+        second_items = set((await session.execute(
+            select(media_collection_items.c.collection_id, media_collection_items.c.media_id)
+        )).all())
+
+    assert second_collections == first_collections
+    assert second_bindings == first_bindings
+    assert second_items == first_items
+
+
+@pytest.mark.asyncio
+async def test_legacy_migration_does_not_resurrect_deleted_binding(admin_store):
+    async with admin_store() as session:
+        session.add_all([
+            Topic(id=4, name="Topic four"),
+            TopicMediaDeck(topic_id=4, deck_name="tarot"),
+            MediaLibrary(file_id="direct", file_name="direct", media_type="photo", topic_id=4),
+            MediaLibrary(file_id="deck", file_name="deck", media_type="photo", category="tarot"),
+        ])
+        await session.commit()
+
+    async with admin_store() as session:
+        await session.run_sync(database._migrate_legacy_media_ownership)
+        await session.commit()
+        await session.execute(
+            topic_collection_association.delete().where(topic_collection_association.c.topic_id == 4)
+        )
+        await session.commit()
+
+        await session.run_sync(database._migrate_legacy_media_ownership)
+        await session.commit()
+        binding_ids = (await session.execute(
+            select(topic_collection_association.c.collection_id).where(
+                topic_collection_association.c.topic_id == 4
+            )
+        )).scalars().all()
+        media_names = set((await session.execute(
+            select(MediaLibrary.file_name).where(MediaLibrary.file_name.in_(["direct", "deck"]))
+        )).scalars().all())
+
+    assert binding_ids == []
     assert media_names == {"direct", "deck"}
 
 

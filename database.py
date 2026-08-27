@@ -783,6 +783,17 @@ def _ensure_collection_media(sync_conn, collection_id: int, media_id: int) -> No
 
 
 def _migrate_legacy_media_ownership(sync_conn) -> None:
+    collection_topics = {
+        topic_id
+        for (topic_id,) in sync_conn.execute(
+            text(
+                "SELECT DISTINCT tmc.topic_id "
+                "FROM topic_media_collection tmc "
+                "JOIN topics t ON t.id = tmc.topic_id "
+                "JOIN media_collections mc ON mc.id = tmc.collection_id"
+            )
+        ).all()
+    }
     direct_media = sync_conn.execute(
         text(
             "SELECT ml.id, ml.topic_id FROM media_library ml "
@@ -817,6 +828,8 @@ def _migrate_legacy_media_ownership(sync_conn) -> None:
         )
     ).all()
     for topic_id, deck_name in legacy_decks:
+        if topic_id in collection_topics:
+            continue
         media_ids = sync_conn.execute(
             text(
                 "SELECT id FROM media_library "
@@ -834,6 +847,9 @@ def _migrate_legacy_media_ownership(sync_conn) -> None:
         _ensure_topic_collection(sync_conn, topic_id, collection_id)
         for (media_id,) in media_ids:
             _ensure_collection_media(sync_conn, collection_id, media_id)
+
+    sync_conn.execute(text("UPDATE media_library SET topic_id = NULL WHERE topic_id IS NOT NULL"))
+    sync_conn.execute(text("DELETE FROM topic_media_deck"))
 
 
 async def init_db():
