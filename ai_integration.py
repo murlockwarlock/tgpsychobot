@@ -1602,7 +1602,7 @@ async def get_ai_response(
                 if cat:
                     available_media_text += f"\nКатегория (для тегов RANDOM_IMG/CHOICE_IMG): \"{cat}\"\n"
                 for m in files:
-                    desc_part = f" — {m.description}" if m.description else ""
+                    desc_part = f" — {m.description}" if m.description and m.description.strip() else ""
                     available_media_text += f"  - [{m.media_type.upper()}] {m.file_name}{desc_part}\n"
             media_instruction_block = build_media_instruction_block(available_media_text)
 

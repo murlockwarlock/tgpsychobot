@@ -219,6 +219,88 @@ async def test_collection_upload_cancel_and_successful_save_return_to_collection
     assert "Файлы коллекции" in files_message.events[-1][1]["text"]
 
 
+@pytest.mark.asyncio
+async def test_collection_upload_can_skip_description_and_omits_empty_rendering(admin_store):
+    coll_id = await _seed_collection(admin_store)
+    bot = FakeBot()
+    state = FakeState()
+    detail_message = FakeMessage("collection")
+
+    await handlers.admin_coll_upload(
+        FakeCallback(f"admin_coll_upload_{coll_id}_0", detail_message, bot),
+        state,
+    )
+    upload_message = FakeMessage(
+        photo=[SimpleNamespace(file_id="photo-token", file_unique_id="unique-photo")],
+    )
+    await handlers.admin_coll_upload_file(upload_message, state)
+    await handlers.admin_coll_upload_name(FakeMessage("card_without_description"), state)
+    category_message = FakeMessage("tarot")
+    await handlers.admin_coll_upload_category(category_message, state)
+    description_buttons = _buttons(category_message.events[-1][1]["reply_markup"])
+    assert any(button.text == "Пропустить" for button in description_buttons)
+
+    description_prompt = FakeMessage("description")
+    await handlers.admin_coll_upload_skip_description(
+        FakeCallback("admin_coll_upload_skip_description", description_prompt, bot),
+        state,
+    )
+
+    assert state.state is None
+    async with admin_store() as session:
+        media = await session.scalar(select_media_by_file_name("card_without_description"))
+        assert media is not None
+        assert media.description is None
+        detail = handlers._collection_media_text(media, ["Cards"])
+
+    assert "Описание:" not in detail
+    assert "None" not in detail
+
+
+@pytest.mark.asyncio
+async def test_collection_description_clear_button_is_explicit_and_idempotent(admin_store):
+    coll_id = await _seed_collection(admin_store)
+    async with admin_store() as session:
+        media = MediaLibrary(
+            file_id="photo-token",
+            file_name="described-card",
+            media_type="photo",
+            description="Existing description",
+        )
+        session.add(media)
+        await session.flush()
+        await session.execute(media_collection_items.insert().values(collection_id=coll_id, media_id=media.id))
+        await session.commit()
+        media_id = media.id
+
+    bot = FakeBot()
+    state = FakeState()
+    prompt_message = FakeMessage("settings")
+    await handlers.admin_coll_media_edit_desc_start(
+        FakeCallback(f"admin_coll_media_editdesc_{media_id}_{coll_id}_0_0", prompt_message, bot),
+        state,
+    )
+    clear_data = next(
+        button.callback_data
+        for button in _buttons(prompt_message.events[-1][1]["reply_markup"])
+        if button.text == "Очистить"
+    )
+    await handlers.admin_coll_media_clear_desc(
+        FakeCallback(clear_data, prompt_message, bot),
+        state,
+    )
+
+    async with admin_store() as session:
+        assert (await session.get(MediaLibrary, media_id)).description is None
+
+    await handlers.admin_coll_media_clear_desc(
+        FakeCallback(clear_data, FakeMessage("settings"), bot),
+        FakeState(),
+    )
+    async with admin_store() as session:
+        assert (await session.get(MediaLibrary, media_id)).description is None
+
+
 def select_media_by_file_name(file_name):
     from sqlalchemy import select
 
