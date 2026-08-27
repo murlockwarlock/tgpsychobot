@@ -43,20 +43,26 @@ async def media_store(tmp_path, monkeypatch):
 
 
 class _Bot:
-    def __init__(self):
+    def __init__(self, timeline=None):
         self.events = []
+        self.timeline = timeline
+
+    def _record(self, kind, kwargs):
+        self.events.append((kind, kwargs))
+        if self.timeline is not None:
+            self.timeline.append({"kind": kind, "kwargs": kwargs, "deleted": False})
 
     async def send_message(self, **kwargs):
-        self.events.append(("message", kwargs))
+        self._record("message", kwargs)
 
     async def send_photo(self, **kwargs):
-        self.events.append(("photo", kwargs))
+        self._record("photo", kwargs)
 
     async def send_document(self, **kwargs):
-        self.events.append(("document", kwargs))
+        self._record("document", kwargs)
 
     async def send_audio(self, **kwargs):
-        self.events.append(("audio", kwargs))
+        self._record("audio", kwargs)
 
     async def send_chat_action(self, **kwargs):
         return None
@@ -88,23 +94,31 @@ class _CommandMessage:
 
 
 class _PromptThinking:
-    def __init__(self, events):
-        self.events = events
+    def __init__(self, timeline, text):
+        self.timeline = timeline
+        self.record = {"kind": "thinking", "kwargs": {"text": text}, "deleted": False}
+        self.timeline.append(self.record)
+        self.edits = []
+        self.deleted = False
 
     async def edit_text(self, text, **kwargs):
-        self.events.append(("text", {"text": text, **kwargs}))
+        self.edits.append({"text": text, **kwargs})
+        self.record["kwargs"] = {"text": text, **kwargs}
 
     async def delete(self):
-        self.events.append(("delete", {}))
+        self.deleted = True
+        self.record["deleted"] = True
 
 
 class _PromptMessage:
-    def __init__(self, events):
-        self.events = events
+    def __init__(self, timeline):
+        self.timeline = timeline
         self.from_user = SimpleNamespace(id=42)
+        self.thinking_message = None
 
     async def answer(self, text, **kwargs):
-        return _PromptThinking(self.events)
+        self.thinking_message = _PromptThinking(self.timeline, text)
+        return self.thinking_message
 
 
 async def _seed_show_media(sessions, names):
@@ -377,22 +391,89 @@ async def test_process_buffered_show_img_with_empty_clean_text_does_not_send_emp
 
 
 @pytest.mark.asyncio
-async def test_process_user_prompt_show_img_positions_surround_text(media_store, monkeypatch):
+async def test_process_user_prompt_before_show_img_retires_thinking_and_orders_messages(media_store, monkeypatch):
     await _seed_show_media(media_store, ["before", "after"])
-    bot = _Bot()
-    message = _PromptMessage(bot.events)
+    timeline = []
+    bot = _Bot(timeline)
+    message = _PromptMessage(timeline)
     monkeypatch.setattr(
         handlers,
         "get_ai_response",
-        AsyncMock(return_value="[SHOW_IMG: before] Ответ [SHOW_IMG: after | position=after]"),
+        AsyncMock(return_value="[SHOW_IMG: before]\nОтвет\n[Продолжить](btn:next)\n[SHOW_IMG: after | position=after]"),
     )
 
     await handlers.process_user_prompt(message, 42, "Покажи", bot)
 
-    assert [event[0] for event in bot.events] == ["photo", "text", "photo"]
+    visible = [item for item in timeline if not item["deleted"]]
+    assert [item["kind"] for item in visible] == ["photo", "message", "photo"]
+    assert message.thinking_message.deleted is True
+    assert message.thinking_message.edits == []
     assert bot.events[0][1]["photo"] == "before-file"
     assert bot.events[1][1]["text"] == "Ответ"
+    assert isinstance(bot.events[1][1]["reply_markup"], InlineKeyboardMarkup)
     assert bot.events[2][1]["photo"] == "after-file"
+
+
+@pytest.mark.asyncio
+async def test_process_user_prompt_before_show_img_failure_still_sends_text(media_store, monkeypatch):
+    await _seed_show_media(media_store, ["broken"])
+    timeline = []
+    bot = _BrokenDeliveryBot(timeline)
+    message = _PromptMessage(timeline)
+    monkeypatch.setattr(
+        handlers,
+        "get_ai_response",
+        AsyncMock(return_value="[SHOW_IMG: broken]\nОтвет"),
+    )
+
+    await handlers.process_user_prompt(message, 42, "Покажи", bot)
+
+    visible = [item for item in timeline if not item["deleted"]]
+    assert [item["kind"] for item in visible] == ["message"]
+    assert visible[0]["kwargs"]["text"] == "Ответ"
+    assert message.thinking_message.deleted is True
+    assert message.thinking_message.edits == []
+
+
+@pytest.mark.asyncio
+async def test_process_user_prompt_after_only_keeps_edit_in_place(media_store, monkeypatch):
+    await _seed_show_media(media_store, ["after"])
+    timeline = []
+    bot = _Bot(timeline)
+    message = _PromptMessage(timeline)
+    monkeypatch.setattr(
+        handlers,
+        "get_ai_response",
+        AsyncMock(return_value="Ответ\n[SHOW_IMG: after | position=after]"),
+    )
+
+    await handlers.process_user_prompt(message, 42, "Покажи", bot)
+
+    visible = [item for item in timeline if not item["deleted"]]
+    assert [item["kind"] for item in visible] == ["thinking", "photo"]
+    assert message.thinking_message.deleted is False
+    assert [edit["text"] for edit in message.thinking_message.edits] == ["Ответ"]
+    assert [event[0] for event in bot.events] == ["photo"]
+
+
+@pytest.mark.asyncio
+async def test_process_user_prompt_before_show_img_with_empty_text_removes_thinking(media_store, monkeypatch):
+    await _seed_show_media(media_store, ["only-photo"])
+    timeline = []
+    bot = _Bot(timeline)
+    message = _PromptMessage(timeline)
+    monkeypatch.setattr(
+        handlers,
+        "get_ai_response",
+        AsyncMock(return_value="[SHOW_IMG: only-photo]"),
+    )
+
+    await handlers.process_user_prompt(message, 42, "Покажи", bot)
+
+    visible = [item for item in timeline if not item["deleted"]]
+    assert [item["kind"] for item in visible] == ["photo"]
+    assert message.thinking_message.deleted is True
+    assert message.thinking_message.edits == []
 
 
 @pytest.mark.asyncio

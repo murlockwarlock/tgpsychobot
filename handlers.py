@@ -5825,6 +5825,14 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         await session.commit()
 
     thinking_msg = await message.answer("🤖 Думаю...")
+    thinking_msg_can_be_edited = True
+
+    async def _send_processing_error(text: str):
+        if thinking_msg_can_be_edited and thinking_msg is not None:
+            await thinking_msg.edit_text(text)
+        else:
+            await bot.send_message(chat_id=user_id, text=text)
+
     ai_prompt_text = prompt_text
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
@@ -5869,6 +5877,9 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
             before_show_imgs, after_show_imgs = _split_show_img_positions(show_imgs)
             sent_show_img_names: set[str] = set()
+            if before_show_imgs:
+                await _delete_ai_processing_message(thinking_msg)
+                thinking_msg_can_be_edited = False
             await send_show_images(
                 bot,
                 user_id,
@@ -5878,43 +5889,65 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 sent_show_img_names,
             )
 
+        async def _send_new_response_text(text: str, max_length: int):
+            html_text = markdown_to_html(text)
+            chunks = split_html_text(html_text, max_length)
+            for index, chunk in enumerate(chunks):
+                chunk_markup = response_text_markup if index == len(chunks) - 1 else None
+                await _safe_send_html(
+                    lambda value, pm, markup=chunk_markup: bot.send_message(
+                        chat_id=user_id,
+                        text=value,
+                        parse_mode=pm,
+                        reply_markup=markup,
+                    ),
+                    chunk,
+                )
+                await asyncio.sleep(0.3)
+
         # --- 1. Текст AI (сначала предисловие) ---
 
         image_prompt, text_part = _extract_ai_directive_payload(clean_text, "GEN_IMG")
         if image_prompt:
             if text_part:
-                html_text = markdown_to_html(text_part)
-                try:
-                    await thinking_msg.edit_text(
-                        html_text,
-                        parse_mode="HTML",
-                        reply_markup=response_text_markup,
-                    )
-                except Exception:
-                    fixed_html = _fix_unclosed_html_tags(html_text)
+                if not thinking_msg_can_be_edited:
+                    await _send_new_response_text(text_part, 4090)
+                else:
+                    html_text = markdown_to_html(text_part)
                     try:
                         await thinking_msg.edit_text(
-                            fixed_html,
+                            html_text,
                             parse_mode="HTML",
                             reply_markup=response_text_markup,
                         )
                     except Exception:
-                        await thinking_msg.delete()
-                        chunks = split_html_text(html_text)
-                        for index, chunk in enumerate(chunks):
-                            chunk_markup = response_text_markup if index == len(chunks) - 1 else None
-                            await _safe_send_html(
-                                lambda text, pm, markup=chunk_markup: message.answer(
-                                    text,
-                                    parse_mode=pm,
-                                    reply_markup=markup,
-                                ),
-                                chunk,
+                        fixed_html = _fix_unclosed_html_tags(html_text)
+                        try:
+                            await thinking_msg.edit_text(
+                                fixed_html,
+                                parse_mode="HTML",
+                                reply_markup=response_text_markup,
                             )
-                            await asyncio.sleep(0.3)
+                        except Exception:
+                            await thinking_msg.delete()
+                            chunks = split_html_text(html_text)
+                            for index, chunk in enumerate(chunks):
+                                chunk_markup = response_text_markup if index == len(chunks) - 1 else None
+                                await _safe_send_html(
+                                    lambda text, pm, markup=chunk_markup: message.answer(
+                                        text,
+                                        parse_mode=pm,
+                                        reply_markup=markup,
+                                    ),
+                                    chunk,
+                                )
+                                await asyncio.sleep(0.3)
             elif response_text_markup:
-                await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
-            else:
+                if thinking_msg_can_be_edited:
+                    await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
+                else:
+                    await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=response_text_markup)
+            elif thinking_msg_can_be_edited:
                 await thinking_msg.delete()
 
             upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
@@ -5943,38 +5976,44 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 upload_task.cancel()
         else:
             if clean_text:
-                html_response = markdown_to_html(clean_text)
-                try:
-                    await thinking_msg.edit_text(
-                        html_response,
-                        parse_mode="HTML",
-                        reply_markup=response_text_markup,
-                    )
-                except Exception:
-                    fixed_html = _fix_unclosed_html_tags(html_response)
+                if not thinking_msg_can_be_edited:
+                    await _send_new_response_text(clean_text, 4000)
+                else:
+                    html_response = markdown_to_html(clean_text)
                     try:
                         await thinking_msg.edit_text(
-                            fixed_html,
+                            html_response,
                             parse_mode="HTML",
                             reply_markup=response_text_markup,
                         )
                     except Exception:
-                        await thinking_msg.delete()
-                        chunks = split_html_text(html_response, 4000)
-                        for index, chunk in enumerate(chunks):
-                            chunk_markup = response_text_markup if index == len(chunks) - 1 else None
-                            await _safe_send_html(
-                                lambda text, pm, markup=chunk_markup: message.answer(
-                                    text,
-                                    parse_mode=pm,
-                                    reply_markup=markup,
-                                ),
-                                chunk,
+                        fixed_html = _fix_unclosed_html_tags(html_response)
+                        try:
+                            await thinking_msg.edit_text(
+                                fixed_html,
+                                parse_mode="HTML",
+                                reply_markup=response_text_markup,
                             )
-                            await asyncio.sleep(0.3)
+                        except Exception:
+                            await thinking_msg.delete()
+                            chunks = split_html_text(html_response, 4000)
+                            for index, chunk in enumerate(chunks):
+                                chunk_markup = response_text_markup if index == len(chunks) - 1 else None
+                                await _safe_send_html(
+                                    lambda text, pm, markup=chunk_markup: message.answer(
+                                        text,
+                                        parse_mode=pm,
+                                        reply_markup=markup,
+                                    ),
+                                    chunk,
+                                )
+                                await asyncio.sleep(0.3)
             elif response_text_markup:
-                await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
-            else:
+                if thinking_msg_can_be_edited:
+                    await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
+                else:
+                    await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=response_text_markup)
+            elif thinking_msg_can_be_edited:
                 await thinking_msg.delete()
 
         async with async_session_maker() as session:
@@ -6164,7 +6203,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             details=str(e),
             exception=e,
         )
-        await thinking_msg.edit_text("К сожалению, сервис временно недоступен из-за технической проблемы.")
+        await _send_processing_error("К сожалению, сервис временно недоступен из-за технической проблемы.")
     except AIServiceError as e:
         provider, model = _resolve_ai_provider_model(ai_config, "chat")
         await _report_ai_failure(
@@ -6182,7 +6221,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             extra={"prompt_len": len(ai_prompt_text)},
             exception=e,
         )
-        await thinking_msg.edit_text(
+        await _send_processing_error(
             "Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
         )
     except Exception as e:
@@ -6198,7 +6237,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             extra={"prompt_len": len(ai_prompt_text)},
             exception=e,
         )
-        await thinking_msg.edit_text("Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.")
+        await _send_processing_error("Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.")
 
 
 @router.callback_query(F.data == "disclaimer_accepted", UserStates.awaiting_disclaimer_acceptance)
