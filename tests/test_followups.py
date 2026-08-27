@@ -703,6 +703,164 @@ class FollowupRaceTests(unittest.IsolatedAsyncioTestCase):
             attempt = await session.scalar(select(FollowupDeliveryAttempt))
         self.assertEqual("cancelled", attempt.status)
 
+    async def test_activity_during_ai_preparation_skips_external_emission(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "ai"
+            step.ai_instruction = "Подготовь продолжение диалога."
+            await session.commit()
+
+        ai_started = asyncio.Event()
+        release_ai = asyncio.Event()
+
+        async def blocked_ai(*args, **kwargs):
+            ai_started.set()
+            await release_ai.wait()
+            return "Подготовленный ответ"
+
+        fake_handlers = types.ModuleType("handlers")
+        fake_send = AsyncMock()
+        fake_handlers._send_generated_response = fake_send
+        bot = FakeBot()
+
+        async def handler(event, data):
+            return "handled"
+
+        event = SimpleNamespace(
+            from_user=SimpleNamespace(id=42, is_bot=False),
+            data="",
+        )
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=blocked_ai,
+        ), patch.dict(sys.modules, {"handlers": fake_handlers}):
+            process_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(ai_started.wait(), timeout=2)
+            self.assertEqual("handled", await FollowupActivityMiddleware()(handler, event, {}))
+            release_ai.set()
+            self.assertEqual(0, await asyncio.wait_for(process_task, timeout=2))
+
+        self.assertEqual([], bot.sent)
+        fake_send.assert_not_awaited()
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual((2, 0, "active"), (run.generation, run.next_step_index, run.status))
+        self.assertEqual("cancelled", attempt.status)
+
+    async def test_campaign_disabled_during_ai_preparation_skips_external_emission(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "ai"
+            await session.commit()
+
+        ai_started = asyncio.Event()
+        release_ai = asyncio.Event()
+
+        async def blocked_ai(*args, **kwargs):
+            ai_started.set()
+            await release_ai.wait()
+            return "Подготовленный ответ"
+
+        fake_handlers = types.ModuleType("handlers")
+        fake_send = AsyncMock()
+        fake_handlers._send_generated_response = fake_send
+        bot = FakeBot()
+
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=blocked_ai,
+        ), patch.dict(sys.modules, {"handlers": fake_handlers}):
+            process_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(ai_started.wait(), timeout=2)
+            async with self.sessions() as session:
+                campaign = await session.get(FollowupCampaign, self.campaign_id)
+                campaign.is_active = False
+                await session.commit()
+            release_ai.set()
+            self.assertEqual(0, await asyncio.wait_for(process_task, timeout=2))
+
+        self.assertEqual([], bot.sent)
+        fake_send.assert_not_awaited()
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("cancelled", run.status)
+        self.assertEqual("cancelled", attempt.status)
+
+    async def test_stop_event_during_ai_preparation_skips_external_emission(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            campaign = await session.get(FollowupCampaign, self.campaign_id)
+            campaign.stop_events = "CRISIS_DETECTED"
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "ai"
+            await session.commit()
+
+        ai_started = asyncio.Event()
+        release_ai = asyncio.Event()
+
+        async def blocked_ai(*args, **kwargs):
+            ai_started.set()
+            await release_ai.wait()
+            return "Подготовленный ответ"
+
+        fake_handlers = types.ModuleType("handlers")
+        fake_send = AsyncMock()
+        fake_handlers._send_generated_response = fake_send
+        bot = FakeBot()
+
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=blocked_ai,
+        ), patch.dict(sys.modules, {"handlers": fake_handlers}):
+            process_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(ai_started.wait(), timeout=2)
+            async with self.sessions() as session:
+                session.add(AutomationEvent(
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=0,
+                    name="CRISIS_DETECTED",
+                ))
+                await session.commit()
+            release_ai.set()
+            self.assertEqual(0, await asyncio.wait_for(process_task, timeout=2))
+
+        self.assertEqual([], bot.sent)
+        fake_send.assert_not_awaited()
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("cancelled", run.status)
+        self.assertEqual("cancelled", attempt.status)
+
+    async def test_ai_preparation_failure_is_cancelled_without_delivery_uncertainty(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "ai"
+            await session.commit()
+
+        async def failing_ai(*args, **kwargs):
+            raise RuntimeError("AI unavailable")
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=failing_ai,
+        ):
+            self.assertEqual(0, await process_due_followups(bot))
+
+        self.assertEqual([], bot.sent)
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("cancelled", run.status)
+        self.assertEqual("cancelled", attempt.status)
+
     async def test_old_completion_records_history_without_overwriting_new_generation(self):
         run_id, _ = await self._add_due_run()
         started = asyncio.Event()
