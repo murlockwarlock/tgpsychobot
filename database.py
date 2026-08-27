@@ -117,6 +117,10 @@ class AILog(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
     request_type = Column(String, default='chat', nullable=False, index=True)
+    platform = Column(String, nullable=True, index=True)
+    context_kind = Column(String, nullable=True)
+    topic_id = Column(Integer, nullable=True)
+    topic_name_snapshot = Column(String, nullable=True)
     provider = Column(String, nullable=False)
     model = Column(String, nullable=False)
     prompt_summary = Column(Text, nullable=True)
@@ -956,6 +960,14 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN request_payload TEXT"))
             if 'request_type' not in ai_log_columns:
                 sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN request_type VARCHAR DEFAULT 'chat' NOT NULL"))
+            if 'platform' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN platform VARCHAR"))
+            if 'context_kind' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN context_kind VARCHAR"))
+            if 'topic_id' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN topic_id INTEGER"))
+            if 'topic_name_snapshot' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN topic_name_snapshot VARCHAR"))
 
             ai_columns = [c['name'] for c in insp.get_columns('ai_config')]
             if 'memory_mode' not in ai_columns:

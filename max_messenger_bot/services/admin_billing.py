@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
+from ..identity import is_max_user_id, raw_max_user_id
 from ..keyboards import (
     admin_plan_create_duration_unit_keyboard,
     admin_plan_duration_unit_keyboard,
@@ -727,8 +728,9 @@ async def reset_user_promos(client: MaxApiClient, chat_id: int, target_user_id: 
         if user:
             user.applied_promo_code = None
             await session.commit()
+    display_id = raw_max_user_id(target_user_id) if is_max_user_id(target_user_id) else target_user_id
     await client.send_message(
         chat_id=chat_id,
-        text=f"✅ Промокоды пользователя <code>{target_user_id}</code> сброшены.",
+        text=f"✅ Промокоды пользователя <code>{display_id}</code> сброшены.",
         attachments=inline_keyboard([[callback_button("◀️ Назад", f"view_client_{target_user_id}")]]),
     )

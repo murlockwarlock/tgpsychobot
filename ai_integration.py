@@ -74,6 +74,7 @@ from ai_request_context import (
     neutralize_stable_prompt,
     normalize_request_messages,
 )
+from ai_log_context import apply_ai_log_context
 
 class InsufficientBalanceError(Exception):
     pass
@@ -1895,6 +1896,12 @@ async def get_ai_response(
             raw_response=response_text,
             clean_text=visible_text,
             latency_ms=latency_ms,
+        )
+        apply_ai_log_context(
+            ai_log,
+            platform="telegram",
+            topic_id=active_topic_id,
+            topic_name=active_topic.name if active_topic else None,
         )
         session.add(ai_log)
 

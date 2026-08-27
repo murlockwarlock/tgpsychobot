@@ -12,6 +12,7 @@ except ModuleNotFoundError:
     Payment = None
 
 from ..api import MaxApiClient
+from ..identity import is_max_user_id, max_communication_name, max_username, raw_max_user_id
 from ..keyboards import callback_button, inline_keyboard, link_button, main_menu_row, payment_providers_keyboard, plans_keyboard, retry_subscription_keyboard, subscription_keyboard
 from ..logging_utils import get_payments_logger
 from ..legacy import (
@@ -429,10 +430,12 @@ async def apply_promo_code(client: MaxApiClient, states: StateStore, chat_id: in
             promo.discount_percent,
         )
 
-        user_ref_pc = f"{user.first_name or ''}"
-        if user.username:
-            user_ref_pc += f" (@{user.username})"
-        user_ref_pc += f" [id=<code>{user_id}</code>]"
+        user_ref_pc = max_communication_name(user) if is_max_user_id(user.id) else f"{user.first_name or ''}"
+        username = max_username(user) if is_max_user_id(user.id) else (f"@{user.username}" if user.username else "")
+        if username and username != "не указан":
+            user_ref_pc += f" ({username})"
+        display_id = raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id
+        user_ref_pc += f" [id=<code>{display_id}</code>]"
 
         from .common import notify_telegram_admins
         await notify_telegram_admins(
@@ -463,10 +466,16 @@ async def set_renewal(client: MaxApiClient, chat_id: int, user_id: int, enabled:
             sub.pending_robokassa_invoice_id = None
             
             user = await session.get(User, user_id)
-            user_ref_cr = f"{user.first_name or ''}" if user else ""
-            if user and user.username:
-                user_ref_cr += f" (@{user.username})"
-            user_ref_cr += f" [id=<code>{user_id}</code>]"
+            user_ref_cr = (
+                max_communication_name(user)
+                if user and is_max_user_id(user.id)
+                else f"{user.first_name or ''}" if user else ""
+            )
+            username = max_username(user) if user and is_max_user_id(user.id) else (f"@{user.username}" if user and user.username else "")
+            if username and username != "не указан":
+                user_ref_cr += f" ({username})"
+            display_id = raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id
+            user_ref_cr += f" [id=<code>{display_id}</code>]"
             
             plan_name_cr = sub.plan.name if sub.plan else "Unknown"
             from datetime import timezone, timedelta

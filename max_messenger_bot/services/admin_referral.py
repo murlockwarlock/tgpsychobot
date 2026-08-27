@@ -14,11 +14,23 @@ from ..keyboards import (
     callback_button,
     inline_keyboard,
 )
+from ..identity import is_max_user_id, max_communication_name, max_username, raw_max_user_id
 from ..legacy import ReferralPaymentLog, ReferralTemplate, SubscriptionConfig, User, async_session_maker
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 
 REFERRAL_REFERRERS_PAGE_SIZE = 10
+
+
+def _referrer_name(user: User) -> str:
+    if is_max_user_id(user.id):
+        name = html.escape(max_communication_name(user))
+        username = max_username(user)
+        return f"{name} {html.escape(username)}" if username != "не указан" else name
+    name = html.escape(user.first_name or "")
+    if user.username:
+        name += f" @{html.escape(user.username)}"
+    return name
 
 
 async def show_menu(client: MaxApiClient, chat_id: int) -> None:
@@ -406,11 +418,9 @@ async def show_referrers_page(client: MaxApiClient, chat_id: int, page: int) -> 
         for ref_id, count in referrer_rows:
             user = await session.get(User, ref_id)
             if user:
-                name = html.escape(user.first_name or "")
-                if user.username:
-                    name += f" @{html.escape(user.username)}"
+                name = _referrer_name(user)
             else:
-                name = str(ref_id)
+                name = str(raw_max_user_id(ref_id) if is_max_user_id(ref_id) else ref_id)
 
             turnover_result = await session.execute(
                 select(func.sum(ReferralPaymentLog.amount)).where(ReferralPaymentLog.referrer_id == ref_id)
@@ -438,11 +448,9 @@ async def show_referrer_detail(client: MaxApiClient, chat_id: int, referrer_id: 
     async with async_session_maker() as session:
         user = await session.get(User, referrer_id)
         if user:
-            name = html.escape(user.first_name or "")
-            if user.username:
-                name += f" @{html.escape(user.username)}"
+            name = _referrer_name(user)
         else:
-            name = str(referrer_id)
+            name = str(raw_max_user_id(referrer_id) if is_max_user_id(referrer_id) else referrer_id)
 
         referrals_result = await session.execute(
             select(User).where(User.referred_by == referrer_id, User.id >= MAX_ID_OFFSET)
@@ -456,15 +464,12 @@ async def show_referrer_detail(client: MaxApiClient, chat_id: int, referrer_id: 
 
     referral_lines = []
     for r in referrals:
-        r_name = html.escape(r.first_name or "")
-        if r.username:
-            r_name += f" @{html.escape(r.username)}"
-        referral_lines.append(r_name or str(r.id))
+        referral_lines.append(_referrer_name(r) or str(raw_max_user_id(r.id) if is_max_user_id(r.id) else r.id))
 
     referrals_text = "\n".join(referral_lines) if referral_lines else "—"
     text = (
         f"<b>👤 Реферер: {name}</b>\n\n"
-        f"ID: <code>{referrer_id}</code>\n"
+        f"ID: <code>{raw_max_user_id(referrer_id) if is_max_user_id(referrer_id) else referrer_id}</code>\n"
         f"Привлечённых: {len(referrals)}\n"
         f"Оборот: {total_turnover:.2f} руб.\n\n"
         f"<b>Рефералы:</b>\n"

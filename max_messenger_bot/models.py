@@ -33,10 +33,14 @@ class Sender:
     last_name: str | None
 
     @property
-    def full_name(self) -> str:
+    def public_name(self) -> str | None:
         parts = [self.first_name or "", self.last_name or ""]
         text = " ".join(part for part in parts if part).strip()
-        return text or self.username or str(self.user_id)
+        return text or None
+
+    @property
+    def full_name(self) -> str:
+        return self.public_name or self.username or str(self.user_id)
 
 
 @dataclass(slots=True)

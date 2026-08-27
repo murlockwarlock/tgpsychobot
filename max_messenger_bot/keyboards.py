@@ -6,6 +6,7 @@ from sqlalchemy import select
 from response_buttons import ResponseButton
 
 from .legacy import Content, SubscriptionConfig, SubscriptionPlan, TestConfig, Topic, async_session_maker
+from .identity import max_client_list_label
 
 
 def callback_button(text: str, payload: str) -> dict:
@@ -300,13 +301,12 @@ def admin_clients_keyboard(
     selected = set(selected_ids or [])
     rows: list[list[dict]] = []
     for client in clients:
-        name = client.name or client.first_name or str(client.id)
-        username = f"@{client.username}" if client.username else "без username"
+        label = max_client_list_label(client)
         if export_mode:
             mark = "✅ " if client.id in selected else ""
-            rows.append([callback_button(f"{mark}{name} ({username})", f"toggle_export_{client.id}_{page}")])
+            rows.append([callback_button(f"{mark}{label}", f"toggle_export_{client.id}_{page}")])
         else:
-            rows.append([callback_button(f"{name} ({username})", f"view_client_{client.id}")])
+            rows.append([callback_button(label, f"view_client_{client.id}")])
 
     nav_row: list[dict] = []
     page_prefix = "admin_export_page" if export_mode else "admin_clients_page"
@@ -475,9 +475,7 @@ def admin_button_editor_keyboard(button_key: str, is_visible: bool) -> list[dict
 def admin_admins_keyboard(admins: list) -> list[dict]:
     rows: list[list[dict]] = []
     for admin in admins:
-        name = admin.first_name or admin.name or str(admin.id)
-        username = f" @{admin.username}" if admin.username else ""
-        rows.append([callback_button(f"👮 {name}{username}", f"admin_profile_{admin.id}")])
+        rows.append([callback_button(f"👮 {max_client_list_label(admin)}", f"admin_profile_{admin.id}")])
     rows.append([callback_button("➕ Добавить администратора", "admin_add_admin")])
     rows.append([callback_button("⬅️ В админ-панель", "admin_panel")])
     return inline_keyboard(rows)

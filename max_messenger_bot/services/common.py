@@ -158,18 +158,31 @@ async def notify_telegram_admins(text: str) -> None:
                     pass
 
 
-async def ensure_user(user_id: int, username: str | None, full_name: str) -> User:
+async def ensure_user(
+    user_id: int,
+    username: str | None,
+    full_name: str,
+    *,
+    public_name: str | None = None,
+) -> User:
+    public_name = public_name.strip() if public_name and public_name.strip() else None
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if user:
+            changed = False
             if username and user.username != username:
                 user.username = username
+                changed = True
+            if public_name and user.first_name != public_name:
+                user.first_name = public_name
+                changed = True
+            if changed:
                 await session.commit()
             return user
         user = User(
             id=user_id,
             username=username,
-            first_name=full_name,
+            first_name=public_name or full_name,
             is_admin=await is_admin(user_id),
         )
         session.add(user)

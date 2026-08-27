@@ -87,6 +87,29 @@ from knowledge_base_admin import (
     kb_text_export_filename,
 )
 from bot_restart import get_current_pm2_identity, schedule_pm2_restart, write_restart_marker
+from ai_log_context import ai_log_context_label, apply_ai_log_context
+from max_messenger_bot.identity import (
+    max_client_list_label,
+    is_max_user_id,
+    max_communication_name,
+    max_public_name,
+    max_username,
+    raw_max_user_id,
+)
+
+
+def _display_client_id(user_id: int) -> int:
+    return raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id
+
+
+def _display_client_id_label(user_id: int) -> str:
+    return "ID max" if is_max_user_id(user_id) else "ID"
+
+
+def _display_client_name(user) -> str:
+    if is_max_user_id(user.id):
+        return max_communication_name(user)
+    return user.name or user.first_name or str(user.id)
 
 
 def _display_capability_model(provider: str | None, model: str | None, channel: str) -> str:
@@ -3632,28 +3655,39 @@ async def view_client_profile(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(viewing_client_id=user_id)
 
-    safe_first_name = html.escape(user.first_name) if user.first_name else "Не указано"
     safe_chosen_name = html.escape(user.name) if user.name else "<i>Не указано</i>"
 
-    if user.username and not user.username.isdigit():
-        username_display = f"@{html.escape(user.username)} (<a href='tg://user?id={user.id}'>перейти в профиль</a>)"
+    if is_max_user_id(user.id):
+        text = (
+            f"<b>Профиль клиента:</b>\n\n"
+            f"<b>ID max:</b> <code>{raw_max_user_id(user.id)}</code>\n"
+            f"<b>Имя для общения:</b> {safe_chosen_name}\n"
+            f"<b>Имя в max:</b> {html.escape(max_public_name(user) or 'Не указано')}\n"
+            f"<b>Username:</b> {html.escape(max_username(user))}\n"
+            f"<b>Дата регистрации:</b> {user.created_at.strftime('%d-%m-%Y %H:%M')}"
+        )
+        if user.tg_user_id:
+            text += f"\n<b>Telegram ID:</b> <code>{user.tg_user_id}</code>"
     else:
-        username_display = f"<a href='tg://user?id={user.id}'>{user.id}</a> (<a href='tg://user?id={user.id}'>перейти в профиль</a>)"
+        safe_first_name = html.escape(user.first_name) if user.first_name else "Не указано"
+        if user.username and not user.username.isdigit():
+            username_display = f"@{html.escape(user.username)} (<a href='tg://user?id={user.id}'>перейти в профиль</a>)"
+        else:
+            username_display = f"<a href='tg://user?id={user.id}'>{user.id}</a> (<a href='tg://user?id={user.id}'>перейти в профиль</a>)"
+        birthdate_display = format_birthdate(user.birth_day, user.birth_month, user.birth_year) or "Не указана / недоступна"
+        text = (f"<b>Профиль клиента:</b>\n\n"
+                f"<b>ID:</b> <code>{user.id}</code>\n"
+                f"<b>Имя для общения:</b> {safe_chosen_name}\n"
+                f"<b>Имя в Telegram:</b> {safe_first_name}\n"
+                f"<b>Username:</b> {username_display}\n"
+                f"<b>Дата рождения:</b> {birthdate_display}\n"
+                f"<b>Дата регистрации:</b> {user.created_at.strftime('%d-%m-%Y %H:%M')}")
+
+        if user.is_admin and user.id not in OWNER_IDS:
+            text += f"\n<b>Доступ к истории:</b> {'✅' if user.can_view_history else '❌'}"
 
     caller_is_owner = callback.from_user.id in OWNER_IDS
     caller_can_view_history = await check_history_permission(callback.from_user.id)
-    birthdate_display = format_birthdate(user.birth_day, user.birth_month, user.birth_year) or "Не указана / недоступна"
-
-    text = (f"<b>Профиль клиента:</b>\n\n"
-            f"<b>ID:</b> <code>{user.id}</code>\n"
-            f"<b>Имя для общения:</b> {safe_chosen_name}\n"
-            f"<b>Имя в Telegram:</b> {safe_first_name}\n"
-            f"<b>Username:</b> {username_display}\n"
-            f"<b>Дата рождения:</b> {birthdate_display}\n"
-            f"<b>Дата регистрации:</b> {user.created_at.strftime('%d-%m-%Y %H:%M')}")
-
-    if user.is_admin and user.id not in OWNER_IDS:
-        text += f"\n<b>Доступ к истории:</b> {'✅' if user.can_view_history else '❌'}"
 
     keyboard = kb.client_profile_keyboard(
         user_id,
@@ -5269,6 +5303,31 @@ AI_LOG_TYPE_LABELS = {
 }
 
 
+def _ai_log_platform(log_entry: AILog) -> str | None:
+    platform = str(getattr(log_entry, "platform", "") or "").strip().lower()
+    if platform in {"telegram", "max"}:
+        return platform
+    if log_entry.user_id is None:
+        return None
+    return "max" if is_max_user_id(log_entry.user_id) else "telegram"
+
+
+def _ai_log_platform_label(log_entry: AILog) -> str:
+    return {"telegram": "Telegram", "max": "MAX"}.get(_ai_log_platform(log_entry), "не зафиксирована")
+
+
+def _ai_log_display_user_id(log_entry: AILog) -> int | None:
+    if _ai_log_platform(log_entry) == "max" and log_entry.user_id is not None:
+        return raw_max_user_id(log_entry.user_id)
+    return log_entry.user_id
+
+
+def _ai_log_user_filter_label(user_id: int) -> str:
+    if is_max_user_id(user_id):
+        return f"ID max: {raw_max_user_id(user_id)}"
+    return f"ID {user_id}"
+
+
 def _ai_log_period_start(period: str) -> datetime | None:
     now_utc = datetime.utcnow()
     if period == "today":
@@ -5334,7 +5393,7 @@ async def show_ai_logs_list(
             await event.answer(text, reply_markup=markup, parse_mode="HTML")
         return
 
-    filter_text = f" пользователя <code>ID {filter_user_id}</code>" if filter_user_id else ""
+    filter_text = f" пользователя <code>{_ai_log_user_filter_label(filter_user_id)}</code>" if filter_user_id else ""
     header = (
         f"📜 <b>Логи вызовов ИИ{filter_text}</b> (Стр. {page + 1}/{total_pages})\n\n"
         f"Период: <b>{AI_LOG_PERIOD_LABELS[period]}</b>\n"
@@ -5401,14 +5460,50 @@ async def show_ai_log_detail(
         user_info = f"ID: {log_entry.user_id}"
         if log_entry.user_id:
             u = await session.get(User, log_entry.user_id)
+        else:
+            u = None
+
+        platform = _ai_log_platform(log_entry)
+        if platform == "max":
+            max_id = raw_max_user_id(log_entry.user_id) if log_entry.user_id is not None else "не указан"
+            identity_lines = [
+                f"📱 <b>Платформа:</b> MAX",
+                f"🆔 <b>ID max:</b> <code>{max_id}</code>",
+                f"💬 <b>Имя для общения:</b> {html.escape(u.name if u and u.name else 'Не указано')}",
+                f"👤 <b>Имя в max:</b> {html.escape(max_public_name(u) if u else 'Не указано')}",
+                f"<b>Username:</b> {html.escape(max_username(u) if u else 'не указан')}",
+            ]
+            if u and u.tg_user_id:
+                identity_lines.append(f"🔗 <b>Telegram ID:</b> <code>{u.tg_user_id}</code>")
+        elif platform == "telegram":
             if u:
                 uname = f"@{u.username}" if u.username else (u.first_name or u.name or "")
                 user_info = f"<b>{html.escape(uname)}</b> (ID: {log_entry.user_id})"
+            identity_lines = [
+                f"📱 <b>Платформа:</b> Telegram",
+                f"👤 <b>Пользователь:</b> {user_info}",
+                f"🆔 <b>Telegram ID:</b> <code>{log_entry.user_id if log_entry.user_id is not None else 'не указан'}</code>",
+                f"💬 <b>Имя для общения:</b> {html.escape(u.name if u and u.name else 'Не указано')}",
+            ]
+        else:
+            if u:
+                uname = f"@{u.username}" if u.username else (u.first_name or u.name or "")
+                user_info = f"<b>{html.escape(uname)}</b> (ID: {log_entry.user_id})"
+            identity_lines = [
+                f"📱 <b>Платформа:</b> не зафиксирована",
+                f"👤 <b>Пользователь:</b> {user_info}",
+                f"🆔 <b>ID:</b> <code>{log_entry.user_id if log_entry.user_id is not None else 'не указан'}</code>",
+            ]
+            if u and u.name:
+                identity_lines.append(f"💬 <b>Имя для общения:</b> {html.escape(u.name)}")
 
     lat_text = f"{log_entry.latency_ms / 1000:.2f} сек" if log_entry.latency_ms else "не измерялось"
     dt_str = format_msk(log_entry.created_at, "%d-%m-%Y %H:%M:%S МСК")
     log_type = getattr(log_entry, "request_type", "chat") or "chat"
-    request_preview = log_entry.request_payload or log_entry.prompt_summary or "без текста"
+    if _ai_log_platform(log_entry) == "max":
+        request_preview = log_entry.prompt_summary or "без текста"
+    else:
+        request_preview = log_entry.request_payload or log_entry.prompt_summary or "без текста"
     prompt_str = html.escape(request_preview)
     if len(prompt_str) > 1200:
         prompt_str = prompt_str[:1200] + "..."
@@ -5420,8 +5515,10 @@ async def show_ai_log_detail(
 
     text = (
         f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
-        f"👤 <b>Пользователь:</b> {user_info}\n"
+        + "\n".join(identity_lines)
+        + "\n"
         f"🧾 <b>Тип запроса:</b> {html.escape(AI_LOG_TYPE_LABELS.get(log_type, log_type))}\n"
+        f"📍 <b>Контекст:</b> {html.escape(ai_log_context_label(log_entry))}\n"
         f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider)}</b>\n"
         f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model)}</code>\n"
         f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
@@ -5445,20 +5542,28 @@ async def show_ai_log_detail(
 
 
 def _build_ai_log_file_content(log_entry: AILog) -> str:
+    platform = _ai_log_platform(log_entry)
+    request_preview = (
+        log_entry.prompt_summary or ""
+        if platform == "max"
+        else log_entry.request_payload or log_entry.prompt_summary or ""
+    )
     return (
         f"========================================\n"
         f"AI LOG RECORD #{log_entry.id}\n"
         f"========================================\n"
         f"Timestamp: {log_entry.created_at}\n"
-        f"User ID: {log_entry.user_id}\n"
+        f"User ID: {_ai_log_display_user_id(log_entry)}\n"
         f"Request type: {getattr(log_entry, 'request_type', 'chat')}\n"
+        f"Platform: {_ai_log_platform_label(log_entry)}\n"
+        f"Context: {ai_log_context_label(log_entry)}\n"
         f"Provider: {log_entry.provider}\n"
         f"Model: {log_entry.model}\n"
         f"Latency: {log_entry.latency_ms} ms\n"
         f"========================================\n\n"
         f"📤 [1] FULL REQUEST PAYLOAD:\n"
         f"----------------------------------------\n"
-        f"{log_entry.request_payload or log_entry.prompt_summary or ''}\n\n"
+        f"{request_preview}\n\n"
         f"========================================\n"
         f"🤖 [2] RAW RESPONSE FROM LLM:\n"
         f"----------------------------------------\n"
@@ -5514,7 +5619,8 @@ async def export_ai_logs_package(callback: CallbackQuery):
             manifest.append({
                 "id": log_entry.id,
                 "created_at": log_entry.created_at.isoformat() if log_entry.created_at else None,
-                "user_id": log_entry.user_id,
+                "user_id": _ai_log_display_user_id(log_entry),
+                "platform": _ai_log_platform_label(log_entry),
                 "provider": log_entry.provider,
                 "model": log_entry.model,
                 "latency_ms": log_entry.latency_ms,
@@ -5522,7 +5628,13 @@ async def export_ai_logs_package(callback: CallbackQuery):
             })
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     archive_buffer.seek(0)
-    user_suffix = f"_user_{filter_user_id}" if filter_user_id else ""
+    user_suffix = (
+        f"_user_{raw_max_user_id(filter_user_id)}"
+        if filter_user_id and is_max_user_id(filter_user_id)
+        else f"_user_{filter_user_id}"
+        if filter_user_id
+        else ""
+    )
     filename = f"ai_logs_{period}{user_suffix}_{datetime.utcnow():%Y%m%d_%H%M%S}.zip"
     await callback.message.answer_document(
         BufferedInputFile(archive_buffer.getvalue(), filename=filename),
@@ -5618,7 +5730,15 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
         total_pages = len(pages)
         page = max(0, min(page, total_pages - 1))
 
-        header_main = f"📜 <b>История клиента:</b> {html.escape(target_user.first_name)} (<a href='https://t.me/@id{target_user.id}'>{target_user.id}</a>)\n" if for_admin_view else "📜 <b>Ваша история сообщений:</b>\n"
+        if for_admin_view and is_max_user_id(target_user.id):
+            header_main = (
+                f"📜 <b>История клиента:</b> {html.escape(max_communication_name(target_user))} "
+                f"(ID max: <code>{raw_max_user_id(target_user.id)}</code>)\n"
+            )
+        elif for_admin_view:
+            header_main = f"📜 <b>История клиента:</b> {html.escape(target_user.first_name)} (<a href='https://t.me/@id{target_user.id}'>{target_user.id}</a>)\n"
+        else:
+            header_main = "📜 <b>Ваша история сообщений:</b>\n"
         text_to_show = header_main + pages[page]
 
         reply_markup = kb.user_history_keyboard(
@@ -6305,8 +6425,13 @@ async def download_client_history(callback: CallbackQuery, state: FSMContext):
     client_id = int(callback.data.split("_")[-1])
     await state.update_data(export_single_id=client_id)
 
+    client_id_text = (
+        f"{_display_client_id_label(client_id)}: <code>{_display_client_id(client_id)}</code>"
+        if is_max_user_id(client_id)
+        else f"<code>{client_id}</code>"
+    )
     await callback.message.edit_text(
-        f"Выберите формат и параметры экспорта для пользователя <code>{client_id}</code>:",
+        f"Выберите формат и параметры экспорта для пользователя {client_id_text}:",
         reply_markup=kb.single_export_options_keyboard(client_id)
     )
 
@@ -6350,7 +6475,7 @@ async def view_client_metadata(callback: CallbackQuery):
             saved_label = str(saved_at)
     else:
         saved_label = "дата неизвестна (старые данные)"
-    display_name = html.escape(user.name or user.first_name or str(user.id))
+    display_name = html.escape(_display_client_name(user))
     part_label = f", часть {chunk_index + 1}/{chunk_count}" if chunk_count > 1 else ""
     text = (
         f"<b>🧩 Метаданные клиента:</b> {display_name}\n"
@@ -6391,13 +6516,15 @@ async def view_client_merged_metadata(callback: CallbackQuery):
         )
         states = res.scalars().all()
 
-    display_name = html.escape(user.name or user.first_name or str(user.id))
+    display_name = html.escape(_display_client_name(user))
+    display_id = _display_client_id(user.id)
+    display_id_label = _display_client_id_label(user.id)
     total_states = len(states)
 
     if not states:
         text = (
             f"✨ <b>Итоговые метаданные (Merged):</b> {display_name}\n"
-            f"ID: <code>{client_id}</code>\n\n"
+            f"{display_id_label}: <code>{display_id}</code>\n\n"
             f"<i>Текущих активных слитных метаданных в БД пока нет.</i>"
         )
         builder = InlineKeyboardBuilder()
@@ -6434,7 +6561,7 @@ async def view_client_merged_metadata(callback: CallbackQuery):
         page_hdr = f" (Диалог {page + 1} из {total_states})" if total_states > 1 else ""
         text = (
             f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
-            f"ID: <code>{client_id}</code>\n\n"
+            f"{display_id_label}: <code>{display_id}</code>\n\n"
             f"📍 <b>{diag_info}</b>\n"
             f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{html.escape(str(last_event_name))}</code>\n"
             f"▫️ <b>Текущий шаг ({html.escape('{current_step}')}):</b> <code>{html.escape(str(cur_step))}</code>\n"
@@ -6470,8 +6597,13 @@ async def download_client_metadata(callback: CallbackQuery):
         await callback.answer("Клиент не найден.", show_alert=True)
         return
 
+    client_id_text = (
+        f"{_display_client_id_label(user.id)}: <code>{_display_client_id(user.id)}</code>"
+        if is_max_user_id(user.id)
+        else f"<code>{client_id}</code>"
+    )
     await callback.message.edit_text(
-        f"Выберите вариант выгрузки метаданных пользователя <code>{client_id}</code>:",
+        f"Выберите вариант выгрузки метаданных пользователя {client_id_text}:",
         reply_markup=kb.metadata_export_options_keyboard(client_id),
     )
     await callback.answer()
@@ -6527,15 +6659,20 @@ async def run_client_metadata_export(callback: CallbackQuery):
 
             export_data = {
                 "user_info": {
-                    "id": user.id,
-                    "name": user.name or user.first_name,
+                    "id": _display_client_id(user.id),
+                    "name": (
+                        _display_client_name(user)
+                        if is_max_user_id(user.id)
+                        else (user.name or user.first_name)
+                    ),
                     "username": user.username,
                 },
                 "export_type": "consolidated_merged_metadata",
                 "dialogue_states": merged_states,
             }
-            filename = f"metadata_merged_{client_id}.json"
-            caption = f"✨ Итоговые слитные метаданные пользователя {client_id}"
+            display_id = _display_client_id(user.id)
+            filename = f"metadata_merged_{display_id}.json"
+            caption = f"✨ Итоговые слитные метаданные пользователя {display_id}"
         else:
             anonymize = mode == "yes"
             export_data = metadata_export_entry(
@@ -6543,7 +6680,7 @@ async def run_client_metadata_export(callback: CallbackQuery):
                 load_metadata_records(user.metadata_json),
                 anonymize=anonymize,
             )
-            file_label = "user_1" if anonymize else str(client_id)
+            file_label = "user_1" if anonymize else str(_display_client_id(user.id))
             filename = f"metadata_history_{file_label}.json"
             caption = f"📜 История метаданных пользователя {file_label}"
 
@@ -6584,7 +6721,7 @@ async def view_client_test_attempts(callback: CallbackQuery):
         return
     if not attempts:
         await callback.message.edit_text(
-            f"<b>🧪 Результаты тестов:</b> {html.escape(user.name or user.first_name or str(user.id))}\n\n"
+            f"<b>🧪 Результаты тестов:</b> {html.escape(_display_client_name(user))}\n\n"
             "Пользователь пока не завершил ни одного теста.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")]
@@ -6596,7 +6733,7 @@ async def view_client_test_attempts(callback: CallbackQuery):
 
     pages = build_test_attempt_pages(
         attempts,
-        client_name=user.name or user.first_name or str(user.id),
+        client_name=_display_client_name(user),
         topic_names={topic_id: topic_name for topic_id, topic_name in topic_rows},
     )
     page = max(0, min(page, len(pages) - 1))
@@ -6631,8 +6768,13 @@ async def download_client_test_attempts(callback: CallbackQuery):
         return
 
     client_id = int(callback.data.split("_")[-1])
+    client_id_text = (
+        f"{_display_client_id_label(client_id)}: <code>{_display_client_id(client_id)}</code>"
+        if is_max_user_id(client_id)
+        else f"<code>{client_id}</code>"
+    )
     await callback.message.edit_text(
-        f"Выберите вариант выгрузки результатов тестов пользователя <code>{client_id}</code>:",
+        f"Выберите вариант выгрузки результатов тестов пользователя {client_id_text}:",
         reply_markup=kb.test_attempt_export_options_keyboard(client_id),
     )
     await callback.answer()
@@ -6666,6 +6808,7 @@ async def run_client_test_attempts_export(callback: CallbackQuery):
     if not user:
         await callback.answer("Клиент не найден.", show_alert=True)
         return
+    display_id = _display_client_id(user.id)
     if not attempts:
         await callback.answer("У пользователя нет завершённых тестов.", show_alert=True)
         return
@@ -6685,11 +6828,15 @@ async def run_client_test_attempts_export(callback: CallbackQuery):
         file_label = "user_1"
     else:
         client_data = {
-            "id": user.id,
+            "id": display_id,
             "username": user.username,
-            "name": user.name or user.first_name,
+            "name": (
+                _display_client_name(user)
+                if is_max_user_id(user.id)
+                else (user.name or user.first_name)
+            ),
         }
-        file_label = str(user.id)
+        file_label = str(display_id)
 
     payload = {"client": client_data, "test_attempts": attempt_data}
     await callback.message.answer_document(
@@ -6716,8 +6863,13 @@ async def export_pick_topic_menu(callback: CallbackQuery):
     async with async_session_maker() as session:
         topics = (await session.execute(select(Topic).order_by(Topic.id.asc()))).scalars().all()
 
+    client_id_text = (
+        f"{_display_client_id_label(user_id)}: <code>{_display_client_id(user_id)}</code>"
+        if is_max_user_id(user_id)
+        else f"<code>{user_id}</code>"
+    )
     await callback.message.edit_text(
-        f"Выберите тему для выгрузки истории пользователя <code>{user_id}</code>:",
+        f"Выберите тему для выгрузки истории пользователя {client_id_text}:",
         reply_markup=kb.export_topic_selection_keyboard(user_id, topics, current_topic_id)
     )
     await callback.answer()
@@ -6743,8 +6895,13 @@ async def export_set_topic(callback: CallbackQuery):
             if t:
                 topic_name = t.name
 
+    client_id_text = (
+        f"{_display_client_id_label(user_id)}: <code>{_display_client_id(user_id)}</code>"
+        if is_max_user_id(user_id)
+        else f"<code>{user_id}</code>"
+    )
     await callback.message.edit_text(
-        f"Выберите формат и параметры экспорта для пользователя <code>{user_id}</code>:\n\n"
+        f"Выберите формат и параметры экспорта для пользователя {client_id_text}:\n\n"
         f"📁 <b>Выбранная тема:</b> {html.escape(topic_name)}",
         parse_mode="HTML",
         reply_markup=kb.single_export_options_keyboard(user_id, topic_id=topic_id, topic_name=topic_name)
@@ -6784,7 +6941,8 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
             await thinking_msg.edit_text("✅ История сообщений пуста.")
             return
 
-        user_label = "user_1" if anonymize else str(user.id)
+        display_id = _display_client_id(user.id)
+        user_label = "user_1" if anonymize else str(display_id)
         selected_topic_label = ""
         if selected_topic_id == 0:
             selected_topic_label = " (Основной диалог)"
@@ -6793,7 +6951,15 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
             selected_topic_label = f" (Тема: {t_name})"
 
         if fmt == "txt":
-            header = f"History: {user_label}{selected_topic_label}\n" if anonymize else f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username}){selected_topic_label}\n"
+            if anonymize:
+                header = f"History: {user_label}{selected_topic_label}\n"
+            elif is_max_user_id(user.id):
+                header = (
+                    f"History: {_display_client_name(user)} (ID max: {display_id}, "
+                    f"Username: {max_username(user)}){selected_topic_label}\n"
+                )
+            else:
+                header = f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username}){selected_topic_label}\n"
             content_str = header + "=" * 50 + "\n"
             for m in messages:
                 t_name = topic_map.get(m.topic_id, "General")
@@ -10618,10 +10784,17 @@ async def _render_subscribers_list(callback: CallbackQuery, page: int, filter_ke
         is_trial = sub.plan_id is None
         status_icon = "⏳" if is_trial else "🟢"
 
-        name_part = f"<b>{html.escape(user.first_name or '')}</b>"
-        if user.username:
-            name_part += f" (@{user.username})"
-        name_part += f" [id=<code>{user.id}</code>]"
+        if is_max_user_id(user.id):
+            name_part = f"<b>{html.escape(_display_client_name(user))}</b>"
+            username = max_username(user)
+            if username != "не указан":
+                name_part += f" ({html.escape(username)})"
+            name_part += f" [ID max: <code>{_display_client_id(user.id)}</code>]"
+        else:
+            name_part = f"<b>{html.escape(user.first_name or '')}</b>"
+            if user.username:
+                name_part += f" (@{user.username})"
+            name_part += f" [id=<code>{user.id}</code>]"
 
         if is_trial:
             provider = sub.payment_provider or ""
@@ -11745,7 +11918,12 @@ async def admin_add_admin_process(message: Message, state: FSMContext, bot: Bot)
     await message.delete()
 
     temp_msg = await message.answer(
-        f"✅ Пользователь {user.first_name} (<code>{user.id}</code>) успешно назначен администратором.")
+        (
+            f"✅ Пользователь {_display_client_name(user)} (<code>{_display_client_id(user.id)}</code>) успешно назначен администратором."
+            if is_max_user_id(user.id)
+            else f"✅ Пользователь {user.first_name} (<code>{user.id}</code>) успешно назначен администратором."
+        )
+    )
 
     if message_id_to_edit:
         try:
@@ -11776,13 +11954,20 @@ async def admin_view_admin_profile(callback: CallbackQuery):
         await callback.answer("Админ не найден.", show_alert=True)
         return
 
-    text = (
-        f"<b>Профиль администратора:</b>\n\n"
-        f"<b>Имя:</b> {html.escape(admin.first_name)}\n"
-        f"<b>Username:</b> @{html.escape(admin.username or 'Не указан')}\n"
-        f"<b>ID:</b> <code>{admin.id}</code>\n\n"
-        f"<b>Доступ к истории:</b> {'✅' if admin.can_view_history else '❌'}"
-    )
+    if is_max_user_id(admin.id):
+        identity = (
+            f"<b>Имя для общения:</b> {html.escape(admin.name or 'Не указано')}\n"
+            f"<b>Имя в max:</b> {html.escape(max_public_name(admin) or 'Не указано')}\n"
+            f"<b>Username:</b> {html.escape(max_username(admin))}\n"
+            f"<b>ID max:</b> <code>{raw_max_user_id(admin.id)}</code>"
+        )
+    else:
+        identity = (
+            f"<b>Имя:</b> {html.escape(admin.first_name)}\n"
+            f"<b>Username:</b> @{html.escape(admin.username or 'Не указан')}\n"
+            f"<b>ID:</b> <code>{admin.id}</code>"
+        )
+    text = f"<b>Профиль администратора:</b>\n\n{identity}\n\n<b>Доступ к истории:</b> {'✅' if admin.can_view_history else '❌'}"
 
     await callback.message.edit_text(
         text,
@@ -13654,10 +13839,12 @@ async def _build_client_payment_info_text(user_id: int) -> str:
     active_welcome_bonus = bool(active_bonus and user_sub.payment_provider == 'Trial Welcome')
     active_discount = bool((user_sub.discount_percent if user_sub else 0) > 0)
 
+    display_id = _display_client_id(user.id)
+    display_id_label = _display_client_id_label(user.id)
     text_lines = [
         "<b>💳 Платежная информация клиента</b>",
         "",
-        f"<b>ID:</b> <code>{user_id}</code>",
+        f"<b>{display_id_label}:</b> <code>{display_id}</code>",
         f"<b>Статус доступа:</b> {'✅ Активен' if (active_access or active_discount) else '❌ Неактивен'}",
     ]
 
@@ -13823,13 +14010,11 @@ async def _show_admin_manage_admins(bot: Bot, chat_id: int, message_id: int):
                     text += f" • Не удалось получить инфо - <code>{owner_id}</code>\n"
         else:
             u = owner_map.get(owner_id)
+            display_id = raw_max_user_id(owner_id)
             if u:
-                name = u.first_name
-                if u.username:
-                    name += f" (@{u.username})"
-                text += f" • {name} [MAX] - <code>{owner_id}</code>\n"
+                text += f" • {max_client_list_label(u)} [MAX] - <code>{display_id}</code>\n"
             else:
-                text += f" • <code>{owner_id}</code> [MAX]\n"
+                text += f" • <code>{display_id}</code> [MAX]\n"
 
     text += "\n"
     text += "👮‍♂️ <b>Администраторы (из БД):</b>\n"
@@ -13866,7 +14051,12 @@ async def reset_user_promos(callback: CallbackQuery, state: FSMContext):
 
         await session.commit()
 
-    await callback.answer(f"✅ Все промокоды и скидки для клиента {user_id} сброшены.", show_alert=True)
+    client_label = (
+        f"ID max: {raw_max_user_id(user.id)}"
+        if is_max_user_id(user.id)
+        else str(user_id)
+    )
+    await callback.answer(f"✅ Все промокоды и скидки для клиента {client_label} сброшены.", show_alert=True)
     await view_client_profile(callback, state)
 
 
@@ -13877,8 +14067,13 @@ async def reset_user_promos(callback: CallbackQuery, state: FSMContext):
 )
 async def prompt_reset_client_subscription(callback: CallbackQuery):
     user_id = int(callback.data.split("_")[-1])
+    client_label = (
+        f"ID max: {raw_max_user_id(user_id)}"
+        if is_max_user_id(user_id)
+        else str(user_id)
+    )
     await callback.message.edit_text(
-        f"Сбросить подписку клиента <code>{user_id}</code>?\n\n"
+        f"Сбросить подписку клиента <code>{client_label}</code>?\n\n"
         "Будет удалена запись подписки (тариф, автопродление, привязка к платежу).\n"
         "Платёжные записи и остальные данные аккаунта сохранятся.",
         reply_markup=kb.confirm_client_action_keyboard(
@@ -13900,10 +14095,15 @@ async def reset_client_subscription_confirm(callback: CallbackQuery, state: FSMC
         )
         await session.commit()
 
+    client_label = (
+        f"ID max: {raw_max_user_id(user_id)}"
+        if is_max_user_id(user_id)
+        else str(user_id)
+    )
     if result.rowcount:
-        await callback.answer(f"✅ Подписка клиента {user_id} сброшена.", show_alert=True)
+        await callback.answer(f"✅ Подписка клиента {client_label} сброшена.", show_alert=True)
     else:
-        await callback.answer(f"У клиента {user_id} не было подписки.", show_alert=True)
+        await callback.answer(f"У клиента {client_label} не было подписки.", show_alert=True)
     await view_client_profile(callback, state)
 
 
@@ -14021,9 +14221,12 @@ async def reset_client_account_confirm(callback: CallbackQuery):
         await session.delete(user)
         await session.commit()
 
+    if is_max_user_id(user_id):
+        success_text = f"✅ Аккаунт пользователя ID max: <code>{_display_client_id(user_id)}</code> полностью сброшен.\n"
+    else:
+        success_text = f"✅ Аккаунт пользователя <code>{user_id}</code> полностью сброшен.\n"
     await callback.message.edit_text(
-        f"✅ Аккаунт пользователя <code>{user_id}</code> полностью сброшен.\n"
-        "При следующем /start он будет создан заново.",
+        success_text + "При следующем /start он будет создан заново.",
         reply_markup=_client_back_to_list_keyboard(),
         parse_mode="HTML"
     )
@@ -16867,6 +17070,12 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     clean_text=visible_text,
                     latency_ms=latency_ms,
                 )
+                apply_ai_log_context(
+                    ai_log,
+                    platform="telegram",
+                    topic_id=current_topic_id,
+                    topic_name=user.current_topic.name if user.current_topic else None,
+                )
                 session.add(ai_log)
                 await session.commit()
             except Exception:
@@ -17599,7 +17808,15 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
             if fmt == "txt":
                 full_content = f"MASS METADATA EXPORT - {timestamp}\n" + "=" * 60 + "\n\n"
                 for i, user, metadata in metadata_users:
-                    label = f"user_{i}" if anonymize else f"{user.name or user.first_name} (ID: {user.id}, @{user.username})"
+                    if anonymize:
+                        label = f"user_{i}"
+                    elif is_max_user_id(user.id):
+                        label = (
+                            f"{_display_client_name(user)} (ID max: {_display_client_id(user.id)}, "
+                            f"Username: {max_username(user)})"
+                        )
+                    else:
+                        label = f"{user.name or user.first_name} (ID: {user.id}, @{user.username})"
                     full_content += f"ДАННЫЕ КЛИЕНТА: {label}\n" + "-" * 40 + "\n"
                     full_content += json.dumps(metadata, ensure_ascii=False, indent=2) + "\n\n"
                 final_bytes = full_content.encode("utf-8") if metadata_users else b""
@@ -17638,7 +17855,15 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
             full_content += "=" * 60 + "\n\n"
 
             for i, user in enumerate(users, 1):
-                user_label = f"user_{i}" if anonymize else f"{user.name or user.first_name} (ID: {user.id}, @{user.username})"
+                if anonymize:
+                    user_label = f"user_{i}"
+                elif is_max_user_id(user.id):
+                    user_label = (
+                        f"{_display_client_name(user)} (ID max: {_display_client_id(user.id)}, "
+                        f"Username: {max_username(user)})"
+                    )
+                else:
+                    user_label = f"{user.name or user.first_name} (ID: {user.id}, @{user.username})"
 
                 messages = (await session.execute(build_msg_stmt(user.id))).scalars().all()
 
@@ -17661,7 +17886,8 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
         elif export_kind == "history":
             export_data = []
             for i, user in enumerate(users, 1):
-                user_label = f"user_{i}" if anonymize else str(user.id)
+                display_id = _display_client_id(user.id)
+                user_label = f"user_{i}" if anonymize else str(display_id)
 
                 messages = (await session.execute(build_msg_stmt(user.id))).scalars().all()
 
@@ -17671,8 +17897,14 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
                 user_history = {
                     "user_info": {
                         "label": user_label,
-                        "id": None if anonymize else user.id,
-                        "name": None if anonymize else (user.name or user.first_name),
+                        "id": None if anonymize else display_id,
+                        "name": (
+                            None
+                            if anonymize
+                            else _display_client_name(user)
+                            if is_max_user_id(user.id)
+                            else (user.name or user.first_name)
+                        ),
                         "username": None if anonymize else user.username
                     },
                     "history": []

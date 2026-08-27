@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
+from ..identity import is_max_user_id, raw_max_user_id
 from ..keyboards import admin_payment_keys_keyboard, admin_payment_settings_keyboard, callback_button, inline_keyboard
 from ..logging_utils import get_payments_logger
 from ..legacy import RobokassaPayment, SubscriptionConfig, SubscriptionPlan, User, UserSubscription, YookassaPayment, async_session_maker
@@ -250,7 +251,8 @@ async def show_payment_log(client: MaxApiClient, chat_id: int, page: int = 0, fi
     lines = [f"<b>💳 Журнал платежей · стр. {page + 1}/{total_pages}</b> ({total} записей)\n"]
     for e in page_entries:
         dt = e["created_at"].strftime('%d.%m %H:%M') if e["created_at"] else "?"
-        lines.append(f"<code>{dt}</code> {html.escape(e['source'])} user:{e['user_id']} {e['amount']:.2f}₽ {html.escape(e['status'] or '?')}")
+        display_user_id = raw_max_user_id(e["user_id"]) if is_max_user_id(e["user_id"]) else e["user_id"]
+        lines.append(f"<code>{dt}</code> {html.escape(e['source'])} user:{display_user_id} {e['amount']:.2f}₽ {html.escape(e['status'] or '?')}")
 
     text = "\n".join(lines)
 
