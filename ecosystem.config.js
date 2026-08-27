@@ -11,8 +11,8 @@ const apps = [
   {
     name: "tg_autobusbusbot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/psy5d_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/psy5d_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/psy5d-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/psy5d-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_AUTOBUSBUSBOT_TOKEN || "",
@@ -28,8 +28,8 @@ const apps = [
   {
     name: "tg_alena322bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/veraveda_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/veraveda_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/veraveda-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/veraveda-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_ALENA322BOT_TOKEN || "",
@@ -45,8 +45,8 @@ const apps = [
   {
     name: "tg_someonewithyou01_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone01_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone01_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone01-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone01-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONEWITHYOU01_BOT_TOKEN || "",
@@ -62,8 +62,8 @@ const apps = [
   {
     name: "tg_someonewithyou02_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone02_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone02_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone02-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone02-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONEWITHYOU02_BOT_TOKEN || "",
@@ -79,8 +79,8 @@ const apps = [
   {
     name: "tg_veraveda777_bot_legacy",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/veraveda_legacy-error.log`,
-    out_file: `${PM2_LOG_DIR}/veraveda_legacy-out.log`,
+    error_file: `${PM2_LOG_DIR}/veraveda-legacy-error.log`,
+    out_file: `${PM2_LOG_DIR}/veraveda-legacy-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_VERAVEDA777_BOT_TOKEN || "",
@@ -96,8 +96,8 @@ const apps = [
   {
     name: "tg_someonelikeyouai03_bot_legacy",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone02_legacy-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone02_legacy-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone02-legacy-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone02-legacy-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONELIKEYOUAI03_BOT_TOKEN || "",
@@ -113,8 +113,8 @@ const apps = [
   {
     name: "tg_someonelikeyouai04_bot_legacy",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone01_legacy-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone01_legacy-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone01-legacy-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone01-legacy-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONELIKEYOUAI04_BOT_TOKEN || "",
@@ -130,8 +130,8 @@ const apps = [
   {
     name: "tg_psy5d_bot_legacy",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/psy5d_legacy-error.log`,
-    out_file: `${PM2_LOG_DIR}/psy5d_legacy-out.log`,
+    error_file: `${PM2_LOG_DIR}/psy5d-legacy-error.log`,
+    out_file: `${PM2_LOG_DIR}/psy5d-legacy-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_PSY5D_BOT_TOKEN || "",
@@ -147,8 +147,8 @@ const apps = [
   {
     name: "tg_someonelikeyouai_bot_legacy",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/test01_legacy-error.log`,
-    out_file: `${PM2_LOG_DIR}/test01_legacy-out.log`,
+    error_file: `${PM2_LOG_DIR}/test01-legacy-error.log`,
+    out_file: `${PM2_LOG_DIR}/test01-legacy-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONELIKEYOUAI_BOT_TOKEN || "",
@@ -164,8 +164,8 @@ const apps = [
   {
     name: "tg_someonelikeyouai02_bot_legacy",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/test02_legacy-error.log`,
-    out_file: `${PM2_LOG_DIR}/test02_legacy-out.log`,
+    error_file: `${PM2_LOG_DIR}/test02-legacy-error.log`,
+    out_file: `${PM2_LOG_DIR}/test02-legacy-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONELIKEYOUAI02_BOT_TOKEN || "",
@@ -181,8 +181,8 @@ const apps = [
   {
     name: "tg_someonewithyou03_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone03_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone03_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone03-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone03-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONEWITHYOU03_BOT_TOKEN || "",
@@ -198,8 +198,8 @@ const apps = [
   {
     name: "tg_someonelikeyouai05_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone04_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone04_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone04-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone04-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONELIKEYOUAI05_BOT_TOKEN || "",
@@ -215,8 +215,8 @@ const apps = [
   {
     name: "tg_someonewithyou05_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone05_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone05_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone05-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone05-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONEWITHYOU05_BOT_TOKEN || "",
@@ -232,8 +232,8 @@ const apps = [
   {
     name: "tg_someonewithyou06_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone06_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone06_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone06-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone06-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONEWITHYOU06_BOT_TOKEN || "",
@@ -249,8 +249,8 @@ const apps = [
   {
     name: "tg_someonewithyou04_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/someone07_new-error.log`,
-    out_file: `${PM2_LOG_DIR}/someone07_new-out.log`,
+    error_file: `${PM2_LOG_DIR}/someone07-new-error.log`,
+    out_file: `${PM2_LOG_DIR}/someone07-new-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_SOMEONEWITHYOU04_BOT_TOKEN || "",
@@ -266,8 +266,8 @@ const apps = [
   {
     name: "tg_yourself_way_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/yourself_way_bot-error.log`,
-    out_file: `${PM2_LOG_DIR}/yourself_way_bot-out.log`,
+    error_file: `${PM2_LOG_DIR}/yourself-way-bot-error.log`,
+    out_file: `${PM2_LOG_DIR}/yourself-way-bot-out.log`,
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_YOURSELF_WAY_BOT_TOKEN || "",
@@ -283,8 +283,8 @@ const apps = [
   {
     name: "max_se13639182_bot_legacy",
     script: "/root/telegram_bots/venv/bin/python",
-    error_file: `${PM2_LOG_DIR}/max_veraveda_legacy-error.log`,
-    out_file: `${PM2_LOG_DIR}/max_veraveda_legacy-out.log`,
+    error_file: `${PM2_LOG_DIR}/max-veraveda-legacy-error.log`,
+    out_file: `${PM2_LOG_DIR}/max-veraveda-legacy-out.log`,
     args: "-m max_messenger_bot.app",
     interpreter: "none",
     cwd: "/root/telegram_bots/newbots",
@@ -301,8 +301,8 @@ const apps = [
   {
     name: "max_id519010411655_bot_new",
     script: "/root/telegram_bots/venv/bin/python",
-    error_file: `${PM2_LOG_DIR}/max_yourself_way-error.log`,
-    out_file: `${PM2_LOG_DIR}/max_yourself_way-out.log`,
+    error_file: `${PM2_LOG_DIR}/max-yourself-way-error.log`,
+    out_file: `${PM2_LOG_DIR}/max-yourself-way-out.log`,
     args: "-m max_messenger_bot.app",
     interpreter: "none",
     cwd: "/root/telegram_bots/newbots",

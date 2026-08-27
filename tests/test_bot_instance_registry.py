@@ -109,6 +109,20 @@ def test_ecosystem_uses_registry_secret_and_database_keys():
         assert f"process.env.{item['database_env']} || process.env.DATABASE_URL" not in block
 
 
+def test_ecosystem_preserves_registry_legacy_log_paths():
+    registry = verifier.load_registry(REGISTRY_PATH)
+    ecosystem = (ROOT / "ecosystem.config.js").read_text(encoding="utf-8")
+
+    for item in verifier.managed_instances(registry):
+        start = ecosystem.index(f'name: "{item["pm2_name"]}"')
+        end = ecosystem.find("\n  },", start)
+        block = ecosystem[start:end if end >= 0 else None]
+        log_stem = item["legacy_pm2_name"].replace("_", "-")
+
+        assert f"error_file: `${{PM2_LOG_DIR}}/{log_stem}-error.log`" in block
+        assert f"out_file: `${{PM2_LOG_DIR}}/{log_stem}-out.log`" in block
+
+
 def _production_migration_fixture():
     registry = verifier.load_registry(REGISTRY_PATH)
     entries = verifier.managed_instances(registry)
