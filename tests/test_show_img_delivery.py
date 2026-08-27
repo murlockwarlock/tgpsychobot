@@ -315,6 +315,112 @@ async def test_random_choice_and_audio_use_collection_scope(media_store):
     assert len(message.events) == 1
 
 
+async def _seed_spread_scope(sessions, *, topic_id: int | None, include_back: bool = False):
+    async with sessions() as session:
+        collection = MediaCollection(name=f"Spread {topic_id or 'main'}")
+        user = User(id=42, current_topic_id=topic_id)
+        session.add(collection)
+        if topic_id is not None:
+            session.add(Topic(id=topic_id, name=f"Topic {topic_id}"))
+        session.add(user)
+        cards = [
+            MediaLibrary(file_id=f"card-{index}", file_name=f"card-{index}", category="cards", media_type="photo")
+            for index in range(2)
+        ]
+        if include_back:
+            cards.append(MediaLibrary(file_id="back", file_name="_back", category="cards", media_type="photo"))
+        session.add_all(cards)
+        await session.flush()
+        if topic_id is None:
+            await session.execute(main_dialogue_collection_association.insert().values(collection_id=collection.id))
+        else:
+            await session.execute(
+                topic_collection_association.insert().values(topic_id=topic_id, collection_id=collection.id)
+            )
+        await session.execute(
+            media_collection_items.insert(),
+            [{"collection_id": collection.id, "media_id": media.id} for media in cards],
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_main_dialogue_visible_spread_accepts_none_and_survives_reload(media_store):
+    handlers.user_spread_state.clear()
+    await _seed_spread_scope(media_store, topic_id=None)
+    bot = _Bot()
+
+    await handlers.execute_media_commands(
+        _CommandMessage(),
+        "[CHOICE_IMG: cards | 1 | 2]",
+        42,
+        bot,
+    )
+    spread = await handlers._get_card_spread_state(42)
+    assert spread["topic_id"] is None
+
+    handlers.user_spread_state.clear()
+    reloaded = await handlers._get_card_spread_state(42)
+    assert reloaded["topic_id"] is None
+    first_card_id = reloaded["pending_card_ids"][0]
+    await handlers._advance_card_spread_after_selection(
+        bot=bot,
+        user_id=42,
+        card_id=first_card_id,
+        selected_file_id="card-0",
+    )
+    next_spread = await handlers._get_card_spread_state(42)
+    assert next_spread["topic_id"] is None
+    assert next_spread["pending_card_ids"]
+    assert await handlers._resend_active_spread_choice(bot, 42)
+    await handlers._clear_card_spread_state(42)
+
+
+@pytest.mark.asyncio
+async def test_main_dialogue_hidden_spread_uses_none_for_next_round(media_store):
+    handlers.user_spread_state.clear()
+    await _seed_spread_scope(media_store, topic_id=None, include_back=True)
+    bot = _Bot()
+
+    await handlers.execute_media_commands(
+        _CommandMessage(),
+        "[CHOICE_IMG_HIDDEN: cards | 1 | 2]",
+        42,
+        bot,
+    )
+    spread = await handlers._get_card_spread_state(42)
+    assert spread["topic_id"] is None
+    await handlers._advance_card_spread_after_selection(
+        bot=bot,
+        user_id=42,
+        card_id=spread["pending_card_ids"][0],
+        selected_file_id="card-0",
+    )
+    next_spread = await handlers._get_card_spread_state(42)
+    assert next_spread["topic_id"] is None
+    assert any(event[0] == "photo" and event[1]["photo"] == "back" for event in bot.events)
+    await handlers._clear_card_spread_state(42)
+
+
+@pytest.mark.asyncio
+async def test_topic_scoped_spread_keeps_topic_id(media_store):
+    handlers.user_spread_state.clear()
+    await _seed_spread_scope(media_store, topic_id=7)
+    bot = _Bot()
+
+    await handlers.execute_media_commands(
+        _CommandMessage(),
+        "[CHOICE_IMG: cards | 1 | 2]",
+        42,
+        bot,
+    )
+    spread = await handlers._get_card_spread_state(42)
+    assert spread["topic_id"] == 7
+    handlers.user_spread_state.clear()
+    assert (await handlers._get_card_spread_state(42))["topic_id"] == 7
+    await handlers._clear_card_spread_state(42)
+
+
 @pytest.mark.asyncio
 async def test_unavailable_and_wrong_bot_media_fail_safely(media_store, caplog):
     async with media_store() as session:

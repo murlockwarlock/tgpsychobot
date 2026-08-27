@@ -502,7 +502,7 @@ ROBOKASSA_INVOICE_LIFETIME = timedelta(hours=2)
 def _new_card_spread_state(
     *,
     category: str,
-    topic_id: int,
+    topic_id: int | None,
     rounds: int,
     cards_per_round: int,
     hidden: bool,
@@ -523,9 +523,10 @@ def _new_card_spread_state(
 
 def _normalize_card_spread_state(raw_state: dict) -> dict | None:
     try:
+        raw_topic_id = raw_state['topic_id']
         state = {
             'category': str(raw_state['category']),
-            'topic_id': int(raw_state['topic_id']),
+            'topic_id': None if raw_topic_id is None else int(raw_topic_id),
             'rounds_left': max(0, int(raw_state['rounds_left'])),
             'total_rounds': max(1, int(raw_state['total_rounds'])),
             'cards_per_round': max(1, int(raw_state['cards_per_round'])),
@@ -2116,9 +2117,8 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
-        media_scope = await load_media_scope(
-            session, user.current_topic_id if user else None, include_media_ids=False
-        )
+        spread_topic_id = spread.get('topic_id') if spread else (user.current_topic_id if user else None)
+        media_scope = await load_media_scope(session, spread_topic_id, include_media_ids=False)
         media = await session.scalar(
             select(MediaLibrary).where(
                 media_scope.predicate(),
@@ -2141,7 +2141,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
             card_system_msg = _card_selection_system_message(card_info, spread)
             if user:
                 session.add(DBMessage(user_id=user_id, role='user', content=card_system_msg,
-                                      dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                                      dialogue_id=user.current_dialogue_id, topic_id=spread_topic_id))
                 await session.commit()
 
             typing_task_interp = None
@@ -2163,7 +2163,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation,
-                                         dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
+                                         dialogue_id=u2.current_dialogue_id, topic_id=spread_topic_id))
                         await s2.commit()
             except Exception as e:
                 if typing_task_interp:
@@ -2799,6 +2799,18 @@ async def is_admin(user_id: int) -> bool:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         return user.is_admin if user else False
+
+
+async def _require_media_collection_admin(event, state: FSMContext | None = None) -> bool:
+    if await is_admin(event.from_user.id):
+        return True
+    if state is not None:
+        await state.clear()
+    if hasattr(event, "message"):
+        await event.answer("Недостаточно прав администратора.", show_alert=True)
+    else:
+        await event.answer("Недостаточно прав администратора.")
+    return False
 
 
 @router.message(Command("ref"))
@@ -7792,6 +7804,8 @@ async def admin_coll_view(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("admin_coll_create"), StateFilter('*'))
 async def admin_coll_create(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
     parts = callback.data.split("_")
     list_page = int(parts[3]) if len(parts) > 3 else 0
     await state.clear()
@@ -7807,6 +7821,8 @@ async def admin_coll_create(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminCollectionState.waiting_for_name, F.text)
 async def admin_coll_create_name(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     name = message.text.strip()
     if not name:
         await message.answer("Название не может быть пустым. Попробуйте ещё раз:")
@@ -7831,6 +7847,8 @@ async def admin_coll_create_name(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("admin_coll_rename_"), StateFilter('*'))
 async def admin_coll_rename(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
     parts = callback.data.split("_")
     coll_id = int(parts[3])
     list_page = int(parts[4]) if len(parts) > 4 else 0
@@ -7847,6 +7865,8 @@ async def admin_coll_rename(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminCollectionState.waiting_for_rename, F.text)
 async def admin_coll_rename_done(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     data = await state.get_data()
     coll_id = data['coll_id']
     list_page = data.get('collection_list_page', 0)
@@ -7877,6 +7897,8 @@ async def admin_coll_rename_done(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("admin_coll_delete_"), StateFilter('*'))
 async def admin_coll_delete(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
     parts = callback.data.split("_")
     coll_id = int(parts[3])
     list_page = int(parts[4]) if len(parts) > 4 else 0
@@ -8065,6 +8087,8 @@ async def admin_coll_attach(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("coll_file_"), StateFilter('*'))
 async def admin_coll_toggle_file(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
     await state.clear()
     parts = callback.data.split("_")
     action = parts[2]
@@ -8138,6 +8162,8 @@ async def _start_collection_upload(
     *,
     return_page: int | None = None,
 ):
+    if not await _require_media_collection_admin(callback, state):
+        return
     async with async_session_maker() as session:
         if not await session.get(MediaCollection, coll_id):
             await callback.answer("Коллекция не найдена.", show_alert=True)
@@ -8183,6 +8209,8 @@ async def admin_coll_upload(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminCollectionState.waiting_for_upload_file)
 async def admin_coll_upload_file(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     data = await state.get_data()
     coll_id = data.get('upload_coll_id')
     if not coll_id:
@@ -8204,6 +8232,8 @@ async def admin_coll_upload_file(message: Message, state: FSMContext):
 
 @router.message(AdminCollectionState.waiting_for_upload_name, F.text)
 async def admin_coll_upload_name(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     name = message.text.strip().lower().replace(" ", "_")
     if not name:
         await message.answer("Имя не может быть пустым.")
@@ -8227,6 +8257,8 @@ async def admin_coll_upload_name(message: Message, state: FSMContext):
 
 @router.message(AdminCollectionState.waiting_for_upload_category, F.text)
 async def admin_coll_upload_category(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     category = message.text.strip().lower().replace(" ", "_")
     await state.update_data(upload_category=category)
     await state.set_state(AdminCollectionState.waiting_for_upload_description)
@@ -8244,6 +8276,8 @@ async def admin_coll_upload_category(message: Message, state: FSMContext):
 
 @router.message(AdminCollectionState.waiting_for_upload_description, F.text)
 async def admin_coll_upload_description(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     data = await state.get_data()
     coll_id = data.get('upload_coll_id')
     if not coll_id:
@@ -8397,6 +8431,8 @@ async def admin_coll_file_view(callback: CallbackQuery, state: FSMContext):
 
 
 async def _start_collection_media_edit(callback: CallbackQuery, state: FSMContext, field: str, prompt: str):
+    if not await _require_media_collection_admin(callback, state):
+        return
     parts = callback.data.split("_")
     media_id = int(parts[4])
     coll_id = int(parts[5])
@@ -8469,6 +8505,8 @@ async def admin_coll_media_cancel(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("admin_coll_media_delete_confirm_"), StateFilter('*'))
 async def admin_coll_media_delete_confirm(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
     parts = callback.data.split("_")
     media_id = int(parts[5])
     coll_id = int(parts[6])
@@ -8487,10 +8525,12 @@ async def admin_coll_media_delete_confirm(callback: CallbackQuery, state: FSMCon
         if not media:
             await callback.answer("Файл не найден.", show_alert=True)
             return
-        await session.execute(media_collection_items.delete().where(media_collection_items.c.media_id == media_id))
-        await session.delete(media)
+        await session.execute(media_collection_items.delete().where(
+            media_collection_items.c.collection_id == coll_id,
+            media_collection_items.c.media_id == media_id,
+        ))
         await session.commit()
-    await callback.answer("Файл удалён.", show_alert=True)
+    await callback.answer("Файл убран из коллекции.", show_alert=True)
     await _show_collection_files(
         callback.bot,
         callback.message.chat.id,
@@ -8524,6 +8564,8 @@ async def admin_coll_media_delete_cancel(callback: CallbackQuery, state: FSMCont
 
 @router.callback_query(F.data.startswith("admin_coll_media_delete_"), StateFilter('*'))
 async def admin_coll_media_delete_start(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
     parts = callback.data.split("_")
     media_id = int(parts[4])
     coll_id = int(parts[5])
@@ -8536,7 +8578,7 @@ async def admin_coll_media_delete_start(callback: CallbackQuery, state: FSMConte
         return
     media, _, _ = payload
     await callback.message.answer(
-        f"Удалить файл «{html.escape(media.file_name or str(media.id))}»? Это удалит его из всех коллекций.",
+        f"Убрать файл «{html.escape(media.file_name or str(media.id))}» из этой коллекции?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🗑️ Да, удалить", callback_data=f"admin_coll_media_delete_confirm_{media_id}_{coll_id}_{page}_{list_page}")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_coll_media_delete_cancel_{coll_id}_{media_id}_{page}_{list_page}")],
@@ -8604,6 +8646,8 @@ async def admin_assign_coll_to_topic(callback: CallbackQuery, state: FSMContext)
 
 @router.callback_query(F.data.startswith("topcoll_"), StateFilter('*'))
 async def admin_toggle_coll_for_topic(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
     await state.clear()
     parts = callback.data.split("_")
     # topcoll_{action}_{topic_id}_{coll_id}_{page}
@@ -8676,6 +8720,8 @@ async def admin_main_collections_page(callback: CallbackQuery, state: FSMContext
 
 @router.callback_query(F.data.startswith("maincoll_"), StateFilter('*'))
 async def admin_toggle_coll_for_main(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
     await state.clear()
     parts = callback.data.split("_")
     action = parts[1]
@@ -16803,6 +16849,8 @@ async def _finish_collection_media_text_edit(
     value: str,
     confirmation: str,
 ) -> bool:
+    if not await _require_media_collection_admin(message, state):
+        return True
     data = await state.get_data()
     coll_id = data.get('collection_id')
     media_id = data.get('edit_media_id')
@@ -16839,8 +16887,8 @@ async def admin_media_edit_name_finish(message: Message, state: FSMContext):
             message,
             state,
             'file_name',
-            message.text.strip().lower().replace(" ", "_"),
-            f"✅ Имя изменено на <code>{message.text.strip().lower().replace(' ', '_')}</code>.",
+            (message.text or "").strip().lower().replace(" ", "_"),
+            f"✅ Имя изменено на <code>{(message.text or '').strip().lower().replace(' ', '_')}</code>.",
         ):
             return
     await state.clear()
@@ -16863,8 +16911,8 @@ async def admin_media_edit_category_finish(message: Message, state: FSMContext):
             message,
             state,
             'category',
-            message.text.strip().lower().replace(" ", "_"),
-            f"✅ Категория изменена на <code>{message.text.strip().lower().replace(' ', '_')}</code>.",
+            (message.text or "").strip().lower().replace(" ", "_"),
+            f"✅ Категория изменена на <code>{(message.text or '').strip().lower().replace(' ', '_')}</code>.",
         ):
             return
     await state.clear()
@@ -16887,7 +16935,7 @@ async def admin_media_edit_desc_finish(message: Message, state: FSMContext):
             message,
             state,
             'description',
-            message.text.strip(),
+            (message.text or "").strip(),
             "✅ Описание обновлено.",
         ):
             return
@@ -16905,6 +16953,8 @@ async def admin_media_edit_file_start(callback: CallbackQuery, state: FSMContext
 
 @router.message(AdminMediaState.editing_file, F.photo | F.video | F.audio | F.voice | F.document)
 async def admin_media_edit_file_finish(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     data = await state.get_data()
 
     if data.get('collection_id'):

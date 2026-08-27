@@ -31,7 +31,7 @@ class _Session:
         self.ai_config = ai_config
         self.telegram = telegram
         self._execute_results = (
-            [_Result(scalar=user), _Result(rows=[]), _Result(rows=[])]
+            [_Result(scalar=user), _Result(rows=[]), _Result(rows=[]), _Result(rows=[]), _Result(rows=[])]
             if telegram
             else [_Result(rows=[]), _Result(rows=[])]
         )

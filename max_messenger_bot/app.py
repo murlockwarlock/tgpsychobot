@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 from .api import MaxApiClient
 from .legacy import Content, SubscriptionConfig, Topic, User, async_session_maker, init_db
 from .logging_utils import configure_logging, get_bot_logger, get_max_logger
-from .models import IncomingCallback, IncomingMessage, parse_callback, parse_message
+from .models import IncomingCallback, IncomingMessage, canonical_media_type, parse_callback, parse_message
 from .services import admin as admin_service
 from .services import admin_ai as admin_ai_service
 from .services import admin_admins as admin_admins_service
@@ -181,6 +181,13 @@ class MaxBotApplication:
             await self.states.clear(message.sender.user_id)
             state = None
         if state:
+            if state.state in common.MEDIA_COLLECTION_ADMIN_STATES and not await common.require_media_collection_admin(
+                self.client,
+                self.states,
+                message.chat_id,
+                message.sender.user_id,
+            ):
+                return
             if state.state in {"admin_test_upload_questions", "admin_test_upload_formulas"}:
                 if message.media_type == "file" and message.media_token:
                     kind = "questions" if state.state.endswith("questions") else "formulas"
@@ -447,14 +454,28 @@ class MaxBotApplication:
                 await admin_topic_media_service.save_edit_description(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
             if state.state == "admin_media_edit_file":
-                token = message.media_token if not text else text.strip()
-                mtype = message.media_type if not text else None
+                token = message.media_token or text.strip()
+                mtype = canonical_media_type(message.media_type) if message.media_token else None
                 await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype)
                 return
             if state.state == "admin_media_add_file":
-                token = message.media_token if not text else None
-                mtype = message.media_type if not text else None
-                await admin_topic_media_service.receive_add_file(self.client, self.states, message.chat_id, message.sender.user_id, text=text, media_token=token, media_type=mtype)
+                if message.media_token:
+                    await admin_topic_media_service.receive_add_file(
+                        self.client,
+                        self.states,
+                        message.chat_id,
+                        message.sender.user_id,
+                        media_token=message.media_token,
+                        media_type=canonical_media_type(message.media_type),
+                    )
+                else:
+                    await admin_topic_media_service.receive_add_file(
+                        self.client,
+                        self.states,
+                        message.chat_id,
+                        message.sender.user_id,
+                        text=text,
+                    )
                 return
             if state.state == "admin_media_add_type":
                 await admin_topic_media_service.resolve_add_type(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -481,7 +502,7 @@ class MaxBotApplication:
             if message.media_token and state:
                 if state.state in {"admin_media_add_file", "admin_media_edit_file"}:
                     token = message.media_token
-                    mtype = "photo" if message.media_type == "image" else "audio"
+                    mtype = canonical_media_type(message.media_type)
                     if state.state == "admin_media_add_file":
                         await admin_topic_media_service.receive_add_file(self.client, self.states, message.chat_id, message.sender.user_id, media_token=token, media_type=mtype)
                     else:
@@ -492,7 +513,7 @@ class MaxBotApplication:
             if message.media_type in {"audio", "video"} and message.media_token:
                 self.spawn_user_task(message.sender.user_id, self._handle_voice(message))
                 return
-            if message.media_type == "image" and message.media_token:
+            if message.media_type in {"image", "photo"} and message.media_token:
                 self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=""))
                 return
             if message.media_type == "file" and message.media_token:
@@ -612,7 +633,7 @@ class MaxBotApplication:
         if not await common.ensure_access_before_chat(self.client, message.chat_id, user):
             return
         # If user sent image with caption, handle as vision
-        if message.media_type == "image" and message.media_token:
+        if message.media_type in {"image", "photo"} and message.media_token:
             self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=text))
             return
         self.spawn_user_task(message.sender.user_id, common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text, self.states))

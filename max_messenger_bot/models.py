@@ -9,6 +9,13 @@ MAX_ID_OFFSET = 100_000_000_000
 REUSABLE_ATTACHMENT_TYPES = frozenset({"image", "video", "audio", "file"})
 
 
+def canonical_media_type(media_type: str | None) -> str | None:
+    if media_type is None:
+        return None
+    normalized = str(media_type).lower()
+    return "photo" if normalized == "image" else normalized
+
+
 def _nested_get(data: dict[str, Any] | None, *path: str) -> Any:
     current: Any = data or {}
     for part in path:
@@ -222,7 +229,7 @@ def parse_message(update: dict[str, Any]) -> IncomingMessage | None:
                 or payload.get("download_url")
             )
             if token:
-                media_type = str(item_type)
+                media_type = canonical_media_type(item_type)
                 media_token = str(token)
                 media_url = str(url) if url else None
                 break

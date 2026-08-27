@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -33,6 +34,7 @@ async def admin_store(tmp_path, monkeypatch):
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     monkeypatch.setattr(handlers, "async_session_maker", sessions)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
     try:
         yield sessions
     finally:
@@ -63,6 +65,7 @@ class FakeMessage:
         self.text = text
         self.message_id = message_id
         self.chat = SimpleNamespace(id=900)
+        self.from_user = SimpleNamespace(id=1)
         self.photo = photo
         self.video = video
         self.audio = audio
@@ -505,8 +508,107 @@ async def test_collection_file_edit_cancel_save_delete_and_back_preserve_context
         FakeState(),
     )
     async with admin_store() as session:
-        assert await session.get(MediaLibrary, media_id) is None
+        assert await session.get(MediaLibrary, media_id) is not None
+        assert await session.scalar(select_association_count(coll_id, media_id)) == 0
     assert "Файлы коллекции" in list_message.text
+
+
+@pytest.mark.asyncio
+async def test_collection_media_delete_removes_only_selected_membership(admin_store):
+    async with admin_store() as session:
+        first_topic = Topic(id=1, name="Topic one")
+        second_topic = Topic(id=2, name="Topic two")
+        first_collection = MediaCollection(name="First")
+        second_collection = MediaCollection(name="Second")
+        media = MediaLibrary(file_id="shared", file_name="shared", media_type="photo")
+        session.add_all([first_topic, second_topic, first_collection, second_collection, media])
+        await session.flush()
+        await session.execute(
+            topic_collection_association.insert(),
+            [
+                {"topic_id": first_topic.id, "collection_id": first_collection.id},
+                {"topic_id": second_topic.id, "collection_id": second_collection.id},
+            ],
+        )
+        await session.execute(
+            media_collection_items.insert(),
+            [
+                {"collection_id": first_collection.id, "media_id": media.id},
+                {"collection_id": second_collection.id, "media_id": media.id},
+            ],
+        )
+        await session.commit()
+        first_collection_id = first_collection.id
+        second_collection_id = second_collection.id
+        media_id = media.id
+
+    callback = FakeCallback(
+        f"admin_coll_media_delete_confirm_{media_id}_{first_collection_id}_0_0",
+        FakeMessage("confirmation"),
+        FakeBot(),
+    )
+    await handlers.admin_coll_media_delete_confirm(callback, FakeState())
+
+    async with admin_store() as session:
+        assert await session.get(MediaLibrary, media_id) is not None
+        assert (await session.execute(
+            select(media_collection_items.c.collection_id)
+            .where(media_collection_items.c.media_id == media_id)
+            .order_by(media_collection_items.c.collection_id)
+        )).scalars().all() == [second_collection_id]
+        scope, available = await load_available_media(session, 2)
+        assert scope.collection_ids == (second_collection_id,)
+        assert [item.id for item in available] == [media_id]
+
+
+@pytest.mark.asyncio
+async def test_collection_media_mutation_denied_for_non_admin(admin_store, monkeypatch):
+    coll_id = await _seed_collection(admin_store)
+    async with admin_store() as session:
+        media = MediaLibrary(file_id="shared", file_name="shared", media_type="photo")
+        session.add(media)
+        await session.flush()
+        await session.execute(media_collection_items.insert().values(collection_id=coll_id, media_id=media.id))
+        await session.commit()
+        media_id = media.id
+
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=False))
+    state = FakeState()
+    state.state = "stale"
+    state.data = {"pending": True}
+    callback = FakeCallback(
+        f"coll_file_remove_{coll_id}_{media_id}_0_0",
+        FakeMessage("files"),
+        FakeBot(),
+    )
+    await handlers.admin_coll_toggle_file(callback, state)
+
+    assert state.state is None
+    assert callback.answers == [(('Недостаточно прав администратора.',), {'show_alert': True})]
+    async with admin_store() as session:
+        assert await session.scalar(select_association_count(coll_id, media_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_collection_media_fsm_rechecks_demoted_admin_before_save(admin_store, monkeypatch):
+    coll_id = await _seed_collection(admin_store)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=False))
+    state = FakeState()
+    state.state = handlers.AdminCollectionState.waiting_for_upload_description
+    state.data = {
+        "upload_coll_id": coll_id,
+        "upload_file_id": "file-token",
+        "upload_media_type": "photo",
+        "upload_file_name": "new-card",
+    }
+    message = FakeMessage("description")
+
+    await handlers.admin_coll_upload_description(message, state)
+
+    assert state.state is None
+    assert message.events[0] == ("answer", {"text": "Недостаточно прав администратора."})
+    async with admin_store() as session:
+        assert await session.scalar(select_media_by_file_name("new-card")) is None
 
 
 @pytest.mark.asyncio

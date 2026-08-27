@@ -15,7 +15,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import database
 from database import Base, MediaCollection, MediaLibrary, Topic, TopicMediaDeck, media_collection_items, topic_collection_association
 from max_messenger_bot import app as max_app
-from max_messenger_bot.models import IncomingCallback, Sender
+from max_messenger_bot.models import IncomingCallback, Sender, parse_message
 from max_messenger_bot.services import admin_collections as collection_service
 from max_messenger_bot.services import admin_topic_media as service
 from media_scope import load_available_media, load_media_scope, media_scope_predicate
@@ -414,3 +414,111 @@ async def test_max_media_callbacks_preserve_context_and_clear_state_on_back(max_
     await application.handle_callback(callback(_buttons(client.messages[-1]["attachments"])[0]["payload"]))
     assert state.state is None
     assert "Файлов: 1" in client.messages[-1]["text"]
+
+
+def _parsed_max_image_message(text="caption", token="attachment-token"):
+    return parse_message({
+        "message": {
+            "sender": {"user_id": 7},
+            "recipient": {"chat_id": 100},
+            "body": {
+                "text": text,
+                "attachments": [{"type": "image", "payload": {"token": token}}],
+            },
+        },
+    })
+
+
+@pytest.mark.asyncio
+async def test_max_app_add_attachment_with_caption_keeps_attachment_token(monkeypatch):
+    client = FakeClient()
+    state = FakeState()
+    state.state = "admin_media_add_file"
+    state.data = {"topic_id": 1, "collection_id": 2}
+    application = max_app.MaxBotApplication(client)
+    application.states = state
+    monkeypatch.setattr(max_app.common, "ensure_user", AsyncMock())
+    monkeypatch.setattr(max_app.common, "is_admin", AsyncMock(return_value=True))
+    receive = AsyncMock()
+    monkeypatch.setattr(max_app.admin_topic_media_service, "receive_add_file", receive)
+
+    message = _parsed_max_image_message()
+    assert message.media_type == "photo"
+    await application.handle_message(message)
+
+    receive.assert_awaited_once_with(
+        client,
+        state,
+        message.chat_id,
+        message.sender.user_id,
+        media_token="attachment-token",
+        media_type="photo",
+    )
+
+
+@pytest.mark.asyncio
+async def test_max_app_edit_attachment_with_caption_keeps_attachment_token(monkeypatch):
+    client = FakeClient()
+    state = FakeState()
+    state.state = "admin_media_edit_file"
+    state.data = {"topic_id": 1, "media_id": 2}
+    application = max_app.MaxBotApplication(client)
+    application.states = state
+    monkeypatch.setattr(max_app.common, "ensure_user", AsyncMock())
+    monkeypatch.setattr(max_app.common, "is_admin", AsyncMock(return_value=True))
+    save = AsyncMock()
+    monkeypatch.setattr(max_app.admin_topic_media_service, "save_edit_file", save)
+
+    message = _parsed_max_image_message()
+    await application.handle_message(message)
+
+    save.assert_awaited_once_with(
+        client,
+        state,
+        message.chat_id,
+        message.sender.user_id,
+        token="attachment-token",
+        media_type="photo",
+    )
+
+
+@pytest.mark.asyncio
+async def test_max_media_fsm_is_cleared_when_admin_is_demoted(monkeypatch):
+    client = FakeClient()
+    state = FakeState()
+    state.state = "admin_media_add_name"
+    state.data = {"token": "attachment-token"}
+    application = max_app.MaxBotApplication(client)
+    application.states = state
+    monkeypatch.setattr(max_app.common, "ensure_user", AsyncMock())
+    monkeypatch.setattr(max_app.common, "is_admin", AsyncMock(return_value=False))
+    save_name = AsyncMock()
+    monkeypatch.setattr(max_app.admin_topic_media_service, "save_add_name", save_name)
+
+    message = _parsed_max_image_message(text="new name")
+    await application.handle_message(message)
+
+    assert state.state is None
+    assert client.messages[-1]["text"] == "Недостаточно прав администратора."
+    save_name.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_max_media_callback_is_blocked_for_non_admin(monkeypatch):
+    client = FakeClient()
+    application = max_app.MaxBotApplication(client)
+    toggle = AsyncMock()
+    monkeypatch.setattr(max_app.common, "is_admin", AsyncMock(return_value=False))
+    monkeypatch.setattr(max_app.admin_collections_service, "toggle_file", toggle)
+    callback = IncomingCallback(
+        raw={},
+        callback_id="callback",
+        payload="coll_file_add_1_2_0",
+        chat_id=100,
+        message_id=None,
+        sender=Sender(user_id=7, username=None, first_name=None, last_name=None),
+    )
+
+    await application.handle_callback(callback)
+
+    toggle.assert_not_awaited()

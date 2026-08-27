@@ -6,6 +6,7 @@ from media_scope import ensure_topic_collection, load_media_scope, media_scope_p
 
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard
+from ..models import canonical_media_type
 from ..legacy import (
     MediaCollection,
     MediaLibrary,
@@ -384,6 +385,7 @@ async def save_edit_file(
     token: str | None,
     media_type: str | None,
 ) -> None:
+    media_type = canonical_media_type(media_type)
     if not token:
         await client.send_message(chat_id=chat_id, text="Отправь файл или вставь его токен.")
         return
@@ -490,6 +492,7 @@ async def receive_add_file(
     media_token: str | None = None,
     media_type: str | None = None,
 ) -> None:
+    media_type = canonical_media_type(media_type)
     snapshot = await states.get(user_id)
     data = (snapshot.data if snapshot else {}) or {}
     topic_id = data.get("topic_id")

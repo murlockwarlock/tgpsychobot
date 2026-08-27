@@ -443,6 +443,9 @@ class _FakeSession:
             return self.user
         return None
 
+    async def execute(self, _statement):
+        return SimpleNamespace(all=lambda: [])
+
     def add(self, value):
         self.added.append(value)
 

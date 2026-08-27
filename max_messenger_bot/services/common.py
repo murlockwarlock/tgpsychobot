@@ -111,6 +111,34 @@ async def is_admin(user_id: int) -> bool:
         return bool(user and user.is_admin)
 
 
+MEDIA_COLLECTION_ADMIN_STATES = frozenset({
+    "admin_coll_creating",
+    "admin_coll_renaming",
+    "admin_media_add_file",
+    "admin_media_add_type",
+    "admin_media_add_name",
+    "admin_media_add_category",
+    "admin_media_add_desc",
+    "admin_media_edit_name",
+    "admin_media_edit_category",
+    "admin_media_edit_desc",
+    "admin_media_edit_file",
+})
+
+
+async def require_media_collection_admin(
+    client: MaxApiClient,
+    states,
+    chat_id: int,
+    user_id: int,
+) -> bool:
+    if await is_admin(user_id):
+        return True
+    await states.clear(user_id)
+    await client.send_message(chat_id=chat_id, text="Недостаточно прав администратора.")
+    return False
+
+
 async def notify_telegram_admins(text: str) -> None:
     import os
     bot_token = os.getenv("BOT_TOKEN")
