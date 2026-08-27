@@ -3824,6 +3824,7 @@ async def admin_ai_settings(message: Message | CallbackQuery):
         kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0)
         fb_provider = getattr(config, 'fallback_provider', None)
         fb_model = getattr(config, 'fallback_model', None)
+        allow_fallback = bool(getattr(config, 'allow_fallback', False))
         voice_limit = config.max_voice_duration_sec
         prompt_source = (
             f"Файл: <code>{config.prompt_filename}</code>"
@@ -3835,9 +3836,13 @@ async def admin_ai_settings(message: Message | CallbackQuery):
 
     fb_text = ""
     if fb_provider:
+        fallback_status = "✅ включён" if allow_fallback else "❌ выключен"
         fb_text = (f"\n🔄 <b>Резервный провайдер (текст):</b>\n"
                    f"▫️ Провайдер: <b>{fb_provider}</b>\n"
-                   f"▫️ Модель: <code>{fb_model or 'не задана'}</code>\n")
+                   f"▫️ Модель: <code>{fb_model or 'не задана'}</code>\n"
+                   f"▫️ Статус: <b>{fallback_status}</b>\n")
+    else:
+        fb_text = "\n🔄 <b>Резервный провайдер (текст):</b> ❌ выключен\n"
 
     text = (f"🤖 <b>Настройки ИИ</b>\n\n"
             f"▫️ Текущий провайдер: <b>{provider}</b>\n"
@@ -3916,6 +3921,7 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     memory_mode = get_memory_mode(config) if config else MEMORY_MODE_RESET
     fb_provider = getattr(config, 'fallback_provider', None) if config else None
     fb_model = getattr(config, 'fallback_model', None) if config else None
+    allow_fallback = bool(getattr(config, 'allow_fallback', False)) if config else False
     use_proxy = getattr(config, 'use_proxy', True) if config else True
     api_keys = {
         'Deepseek': getattr(config, 'deepseek_api_key', None) if config else None,
@@ -3946,6 +3952,7 @@ async def admin_ai_keys_models(callback: CallbackQuery):
             memory_mode,
             fb_provider,
             fb_model,
+            allow_fallback=allow_fallback,
             use_proxy=use_proxy,
             api_keys=api_keys,
         ),
@@ -4293,6 +4300,7 @@ async def admin_toggle_fallback(callback: CallbackQuery):
             return
 
         current = getattr(config, 'fallback_provider', None)
+        was_enabled = bool(getattr(config, "allow_fallback", False))
         if current and current in _FALLBACK_CYCLE and not bool(getattr(config, "allow_fallback", False)):
             # Repair the legacy Telegram state where a provider/model was
             # saved but the separate runtime flag was never enabled.
@@ -4320,7 +4328,13 @@ async def admin_toggle_fallback(callback: CallbackQuery):
         await session.commit()
 
     label = next_val if next_val else "выкл"
-    await callback.answer(f"✅ Резервный провайдер: {label}")
+    if next_val and not was_enabled:
+        action = "включен"
+    elif next_val:
+        action = "выбран"
+    else:
+        action = "выключен"
+    await callback.answer(f"✅ Резервный провайдер: {label} ({action})")
     await admin_ai_keys_models(callback)
 
 
@@ -13549,6 +13563,7 @@ async def process_audio_limit(message: Message, state: FSMContext, bot: Bot):
                     memory_mode=get_memory_mode(config) if config else MEMORY_MODE_RESET,
                     fallback_provider=getattr(config, 'fallback_provider', None) if config else None,
                     fallback_model=getattr(config, 'fallback_model', None) if config else None,
+                    allow_fallback=bool(getattr(config, 'allow_fallback', False)) if config else False,
                     use_proxy=getattr(config, 'use_proxy', True) if config else True,
                     api_keys={
                         'Deepseek': getattr(config, 'deepseek_api_key', None) if config else None,
@@ -18558,6 +18573,7 @@ async def save_ai_timeout(message: Message, state: FSMContext):
                 memory_mode=get_memory_mode(conf2) if conf2 else "reset",
                 fallback_provider=getattr(conf2, 'fallback_provider', None) if conf2 else None,
                 fallback_model=getattr(conf2, 'fallback_model', None) if conf2 else None,
+                allow_fallback=bool(getattr(conf2, 'allow_fallback', False)) if conf2 else False,
                 use_proxy=getattr(conf2, 'use_proxy', True) if conf2 else True,
                 api_keys={
                     'Deepseek': getattr(conf2, 'deepseek_api_key', None) if conf2 else None,

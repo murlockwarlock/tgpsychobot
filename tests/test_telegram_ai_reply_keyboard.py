@@ -85,6 +85,29 @@ def _button_callback(message, data="ai_btn:some_new_action"):
     )
 
 
+def _ai_settings_config(*, allow_fallback):
+    return SimpleNamespace(
+        provider="KIE",
+        kie_model="gemini-2.5-flash",
+        transcription_provider="OpenAI",
+        vision_provider="Gemini",
+        vision_model="gemini-3.7-flash",
+        image_generation_provider="OpenAI",
+        image_generation_model="gpt-image-2",
+        image_edit_provider="KIE",
+        image_edit_model="seedream/4.5-edit",
+        kie_credit_alert_threshold=0,
+        fallback_provider="Deepseek",
+        fallback_model="deepseek-v4-flash",
+        allow_fallback=allow_fallback,
+        max_voice_duration_sec=180,
+        prompt_mode="text",
+        prompt_filename=None,
+        shared_prompt_block="shared",
+        service_prompt_block="service",
+    )
+
+
 def test_all_ai_response_buttons_are_inline_and_keep_rows_and_urls():
     _, rows = extract_response_buttons(
         "[Новый ответ](btn:some_new_action) | [Сайт](https://example.com) | [Темы](btn:topics)\n"
@@ -303,6 +326,7 @@ async def test_telegram_fallback_picker_enables_the_fallback_runtime(monkeypatch
     assert config.fallback_provider is not None
     assert config.fallback_model
     assert config.allow_fallback is True
+    assert "включен" in callback.answer.await_args_list[0].args[0]
 
     legacy_config = SimpleNamespace(
         fallback_provider="KIE",
@@ -318,3 +342,36 @@ async def test_telegram_fallback_picker_enables_the_fallback_runtime(monkeypatch
     await handlers.admin_toggle_fallback(callback)
     assert legacy_config.fallback_provider == "KIE"
     assert legacy_config.allow_fallback is True
+    assert "включен" in callback.answer.await_args_list[1].args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("allow_fallback", "status"),
+    ((False, "❌ выключен"), (True, "✅ включён")),
+)
+async def test_telegram_ai_settings_info_shows_fallback_status(monkeypatch, allow_fallback, status):
+    config = _ai_settings_config(allow_fallback=allow_fallback)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _model, _key):
+            return config
+
+    target_message = SimpleNamespace(
+        text=None,
+        reply_markup=None,
+        edit_text=AsyncMock(),
+    )
+    callback = SimpleNamespace(message=target_message)
+    monkeypatch.setattr(handlers, "async_session_maker", lambda: Session())
+
+    await handlers.admin_ai_settings(callback)
+
+    rendered_text = target_message.edit_text.await_args.args[0]
+    assert f"▫️ Статус: <b>{status}</b>" in rendered_text

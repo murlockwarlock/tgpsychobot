@@ -267,6 +267,7 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                             kie_credit_alert_threshold: float,
                             temperature: float = 0.7, memory_mode: str = "reset",
                             fallback_provider: str | None = None, fallback_model: str | None = None,
+                            allow_fallback: bool = False,
                             use_proxy: bool = True,
                             api_keys: dict[str, str | None] | None = None):
     def short_model(model: str, limit: int = 16) -> str:
@@ -305,7 +306,11 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     )
     proxy_status = "✅ ВКЛ" if use_proxy else "❌ ВЫКЛ"
     builder.button(text=f"🌍 Прокси Deepseek: {proxy_status}", callback_data="admin_toggle_proxy")
-    fb_label = f"🔄 Резерв: {fallback_provider}" if fallback_provider else "🔄 Резерв: выкл"
+    if fallback_provider:
+        fallback_status = "✅ ВКЛ" if allow_fallback else "❌ ВЫКЛ"
+        fb_label = f"🔄 Резерв: {fallback_provider} — {fallback_status}"
+    else:
+        fb_label = "🔄 Резерв: ❌ ВЫКЛ"
     builder.button(text=fb_label, callback_data="admin_toggle_fallback")
     if fallback_provider:
         fb_model_short = short_model(fallback_model) if fallback_model else "не задана"
