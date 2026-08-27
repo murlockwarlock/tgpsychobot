@@ -476,6 +476,7 @@ def test_invalid_pm2_names_are_rejected_before_git_or_ssh():
 def test_deploy_requires_one_canonical_process_for_rolling_cutover():
     environment = os.environ.copy()
     environment["PROD_PM2_NAMES"] = "tg_demo_one,tg_demo_two"
+    environment["PROD_ALLOW_PM2_RENAME"] = "1"
     environment["PROD_HOST"] = "example.invalid"
     result = subprocess.run(
         ["bash", "deploy_prod.sh"],
@@ -487,8 +488,44 @@ def test_deploy_requires_one_canonical_process_for_rolling_cutover():
     )
 
     assert result.returncode != 0
-    assert "exactly one PM2 process" in result.stderr
+    assert "one valid canonical process name" in result.stderr
     assert "ssh" not in result.stderr.lower()
+
+
+def test_rename_mode_requires_explicit_process_name():
+    environment = os.environ.copy()
+    environment.pop("PROD_PM2_NAMES", None)
+    environment["PROD_ALLOW_PM2_RENAME"] = "1"
+    environment["PROD_HOST"] = "example.invalid"
+    result = subprocess.run(
+        ["bash", "deploy_prod.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "rename mode requires exactly one" in result.stderr
+    assert "ssh" not in result.stderr.lower()
+
+
+def test_deploy_script_has_explicit_cutover_and_normal_mode_paths():
+    deploy_script = (REPO_ROOT / "deploy_prod.sh").read_text(encoding="utf-8")
+    rename_start = deploy_script.index('if [[ "$DEPLOY_MODE" == "rename" ]]')
+    normal_start = deploy_script.index("\nelse\n", rename_start)
+    rename_block = deploy_script[rename_start:normal_start]
+    normal_block = deploy_script[normal_start:]
+
+    assert "scripts/cutover_bot_instance.py" in rename_block
+    assert "--allow-rename" in rename_block
+    assert "scripts/cutover_bot_instance.py" not in normal_block
+    assert "--steady-state" in normal_block
+    assert "pm2 startOrReload" in normal_block
+    assert normal_block.index("--steady-state") < normal_block.index("pm2 startOrReload")
+    assert "PM2_NAMES=\"${REQUESTED_PM2_NAMES:-$(python3 scripts/verify_bot_instances.py --print-pm2-names)}\"" in deploy_script
+    assert "^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$" in deploy_script
 
 
 def test_deploy_chains_verifier_failure_and_cleanup_trap():
@@ -505,7 +542,8 @@ def test_deploy_chains_verifier_failure_and_cleanup_trap():
 def test_verifier_failure_is_not_masked_by_remote_shell_chain():
     deploy_script = (REPO_ROOT / "deploy_prod.sh").read_text(encoding="utf-8")
     assert "scripts/cutover_bot_instance.py" in deploy_script
-    assert "--settle-seconds 3 ${RENAME_ARG} &&" in deploy_script
+    assert "--settle-seconds 3" in deploy_script
+    assert "--allow-rename &&" in deploy_script
     assert 'pm2 delete "\\$legacy_name"' not in deploy_script
 
 

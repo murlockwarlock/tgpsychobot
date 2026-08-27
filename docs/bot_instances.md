@@ -61,3 +61,8 @@ migration-aware verifier rejects any remaining legacy entry after cutover.
 Use `scripts/migrate_bot_secrets.py --plan` before `--apply` to copy canonical
 secret keys from a verified running legacy environment. The utility prints only
 token fingerprints and database names.
+
+Normal deploys may omit `PROD_PM2_NAMES` to verify and reload all 18 canonical
+instances, or specify a canonical subset. Set `PROD_ALLOW_PM2_RENAME=1` only for
+a one-instance cutover; that mode requires exactly one canonical PM2 name and
+uses the rollback-safe cutover helper.

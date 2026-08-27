@@ -248,6 +248,42 @@ def test_migration_aware_cutover_allows_only_the_selected_stopped_legacy_process
     assert errors == []
 
 
+def test_steady_state_rejects_mixed_all_instance_runtime_before_normal_reload():
+    registry, entries, snapshot, environment = _production_migration_fixture()
+    second = entries[1]
+    process = snapshot.pop(second["pm2_name"])
+    process["name"] = second["legacy_pm2_name"]
+    snapshot[second["legacy_pm2_name"]] = process
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        snapshot,
+        environment,
+        steady_state=True,
+    )
+
+    assert f"missing_pm2_process:{second['pm2_name']}" in errors
+    assert f"legacy_process_present_after_migration:{second['legacy_pm2_name']}" in errors
+
+
+def test_steady_state_explicit_subset_allows_registered_legacy_elsewhere():
+    registry, entries, snapshot, environment = _production_migration_fixture()
+    second = entries[1]
+    process = snapshot.pop(second["pm2_name"])
+    process["name"] = second["legacy_pm2_name"]
+    snapshot[second["legacy_pm2_name"]] = process
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        snapshot,
+        environment,
+        names=[entries[0]["pm2_name"]],
+        steady_state=True,
+    )
+
+    assert errors == []
+
+
 def test_documentation_is_a_projection_of_the_registry():
     registry = verifier.load_registry(REGISTRY_PATH)
     expected = {

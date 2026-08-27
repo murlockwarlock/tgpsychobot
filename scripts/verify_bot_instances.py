@@ -527,6 +527,7 @@ def runtime_rows(
     allow_missing: bool = False,
     migration_aware: bool = False,
     cutover_pm2_name: str | None = None,
+    steady_state: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -534,7 +535,7 @@ def runtime_rows(
     entries, selection_errors = selected_instances(
         registry,
         names,
-        allow_legacy=allow_legacy,
+        allow_legacy=allow_legacy and not steady_state,
     )
     errors.extend(selection_errors)
     for entry in entries:
@@ -542,7 +543,11 @@ def runtime_rows(
         process_name = name
         process = snapshot.get(name)
         migration_errors: list[str] = []
-        if migration_aware:
+        if steady_state:
+            legacy_name = entry.get("legacy_pm2_name")
+            if legacy_name and legacy_name in snapshot:
+                errors.append(f"legacy_process_present_after_migration:{legacy_name}")
+        elif migration_aware:
             process_name, process, migration_errors = migration_process(
                 entry,
                 snapshot,
@@ -616,13 +621,29 @@ def runtime_rows(
         )
 
     if not allow_legacy:
+        runtime_token_mapping = {
+            process_name: (entry["platform"], entry["runtime_token_env"])
+            for entry in registry["instances"]
+            for process_name in (entry["pm2_name"], entry.get("legacy_pm2_name"))
+            if process_name
+        }
         for process_name, process in snapshot.items():
             if process_status(process) != "online":
                 continue
-            token = process_env(process).get("BOT_TOKEN")
+            process_environment = process_env(process)
+            platform, token_key = runtime_token_mapping.get(
+                process_name,
+                (
+                    "telegram",
+                    "BOT_TOKEN",
+                )
+                if process_environment.get("BOT_TOKEN")
+                else ("max", "MAX_BOT_TOKEN"),
+            )
+            token = process_environment.get(token_key)
             if token:
                 token_groups.setdefault(
-                    ("telegram", fingerprint_token(token) or ""), set()
+                    (platform, fingerprint_token(token) or ""), set()
                 ).add(process_name)
 
     for (platform, fingerprint), process_names in token_groups.items():
@@ -634,7 +655,7 @@ def runtime_rows(
         snapshot,
         registry,
         allow_legacy=allow_legacy,
-        migration_aware=migration_aware,
+        migration_aware=migration_aware or steady_state,
     )
     errors.extend(f"unexpected_managed_process:{name}" for name in unexpected)
     return rows, errors
@@ -674,6 +695,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-missing", action="store_true")
     parser.add_argument("--migration-aware", action="store_true")
     parser.add_argument("--cutover-pm2-name")
+    parser.add_argument("--steady-state", action="store_true")
     return parser
 
 
@@ -738,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_missing=args.allow_missing,
         migration_aware=args.migration_aware,
         cutover_pm2_name=args.cutover_pm2_name,
+        steady_state=args.steady_state,
     )
     print_rows(rows)
     if errors:
