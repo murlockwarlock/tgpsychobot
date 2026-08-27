@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from media_scope import ensure_topic_collection, load_media_scope
 
@@ -67,7 +67,6 @@ def _media_detail_keyboard(media_id: int, topic_id: int, page: int) -> list[dict
                 callback_button("✏️ Описание", f"admin_media_editdesc_{topic_id}_{page}_{media_id}"),
                 callback_button("🔄 Файл", f"admin_media_editfile_{topic_id}_{page}_{media_id}"),
             ],
-            [callback_button("🗑️ Удалить", f"admin_media_delete_{topic_id}_{page}_{media_id}")],
             [callback_button("⬅️ Назад к списку", f"admin_topic_media_{topic_id}_{page}")],
         ]
     )
@@ -81,14 +80,13 @@ async def _scoped_media(session, topic_id: int, media_id: int):
     return scope, media
 
 
-def _build_list_text(topic: Topic, total_count: int, media_list: list) -> str:
+def _build_list_text(topic: Topic, total_count: int, category_rows: list[tuple[str, int]]) -> str:
     categories: set[str] = set()
     back_categories: set[str] = set()
-    for media in media_list:
-        if media.category:
-            categories.add(media.category)
-            if media.file_name == "_back":
-                back_categories.add(media.category)
+    for category, has_back in category_rows:
+        categories.add(category)
+        if has_back:
+            back_categories.add(category)
 
     cats_info = ""
     if categories:
@@ -126,22 +124,39 @@ async def show_list(
         total_count = await session.scalar(
             select(func.count()).select_from(MediaLibrary).where(scope.predicate())
         ) or 0
-        all_media = (
+        total_pages = max(1, (total_count + MEDIA_PAGE_SIZE - 1) // MEDIA_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        media_list = (
             await session.execute(
-                select(MediaLibrary).where(scope.predicate()).order_by(MediaLibrary.id)
+                select(MediaLibrary)
+                .where(scope.predicate())
+                .order_by(MediaLibrary.id)
+                .offset(page * MEDIA_PAGE_SIZE)
+                .limit(MEDIA_PAGE_SIZE)
             )
         ).scalars().all()
+        category_rows = (
+            await session.execute(
+                select(
+                    MediaLibrary.category,
+                    func.max(case((MediaLibrary.file_name == "_back", 1), else_=0)),
+                )
+                .where(
+                    scope.predicate(),
+                    MediaLibrary.category.is_not(None),
+                    MediaLibrary.category != "",
+                )
+                .group_by(MediaLibrary.category)
+                .order_by(MediaLibrary.category)
+            )
+        ).all()
         topic = await session.get(Topic, topic_id)
 
     if not topic:
         await client.send_message(chat_id=chat_id, text="Тема не найдена.")
         return
 
-    total_pages = max(1, (total_count + MEDIA_PAGE_SIZE - 1) // MEDIA_PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    media_list = all_media[page * MEDIA_PAGE_SIZE:(page + 1) * MEDIA_PAGE_SIZE]
-
-    text = _build_list_text(topic, total_count, all_media)
+    text = _build_list_text(topic, total_count, category_rows)
     kb = _topic_media_list_keyboard(topic_id, media_list, page, total_pages)
     await client.send_message(chat_id=chat_id, text=text, attachments=kb)
 
@@ -670,11 +685,8 @@ async def delete_media(
         if not media:
             await client.send_message(chat_id=chat_id, text="Файл не найден в медиатеке этой темы.")
             return
-        await session.execute(
-            media_collection_items.delete().where(media_collection_items.c.media_id == media_id)
-        )
-        await session.delete(media)
-        await session.commit()
-
-    await client.send_message(chat_id=chat_id, text="🗑️ Файл удалён.")
-    await show_list(client, chat_id, topic_id, page)
+    await client.send_message(
+        chat_id=chat_id,
+        text="Общий файл нельзя удалить из просмотра темы. Управляйте его членством в конкретной коллекции.",
+    )
+    await show_media_detail(client, chat_id, media_id, topic_id, page)

@@ -16,6 +16,7 @@ import database
 from database import Base, MediaCollection, MediaLibrary, Topic, TopicMediaDeck, media_collection_items, topic_collection_association
 from max_messenger_bot import app as max_app
 from max_messenger_bot.models import IncomingCallback, Sender
+from max_messenger_bot.services import admin_collections as collection_service
 from max_messenger_bot.services import admin_topic_media as service
 from media_scope import load_available_media, load_media_scope
 
@@ -27,6 +28,7 @@ async def max_store(tmp_path, monkeypatch):
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     monkeypatch.setattr(service, "async_session_maker", sessions)
+    monkeypatch.setattr(collection_service, "async_session_maker", sessions)
     try:
         yield sessions
     finally:
@@ -171,7 +173,7 @@ async def test_max_add_with_multiple_collections_requires_and_preserves_collecti
 
 
 @pytest.mark.asyncio
-async def test_max_shared_media_edit_delete_keeps_scope_and_never_recreates_legacy_ownership(max_store):
+async def test_max_shared_media_edit_and_scoped_membership_never_delete_globally(max_store):
     first_collection = await _create_topic_collection(max_store, topic_id=1, collection_name="First")
     async with max_store() as session:
         topic_two = Topic(id=2, name="Topic 2")
@@ -206,6 +208,7 @@ async def test_max_shared_media_edit_delete_keeps_scope_and_never_recreates_lega
     detail_buttons = _buttons(client.messages[-1]["attachments"])
     edit_button = next(button for button in detail_buttons if button["payload"].startswith("admin_media_editname_"))
     assert edit_button["payload"] == f"admin_media_editname_1_3_{media_id}"
+    assert not any(button["payload"].startswith("admin_media_delete_") for button in detail_buttons)
     await service.start_edit_name(client, state, 100, 7, media_id, topic_id=1, page=3)
     await service.save_edit_name(client, state, 100, 7, "renamed")
 
@@ -219,11 +222,66 @@ async def test_max_shared_media_edit_delete_keeps_scope_and_never_recreates_lega
 
     await service.delete_media(client, 100, media_id, topic_id=1, page=3)
     async with max_store() as session:
-        assert await session.get(MediaLibrary, media_id) is None
+        assert await session.get(MediaLibrary, media_id) is not None
         assert (await session.execute(
-            select(media_collection_items.c.media_id).where(media_collection_items.c.media_id == media_id)
-        )).all() == []
+            select(media_collection_items.c.collection_id)
+            .where(media_collection_items.c.media_id == media_id)
+            .order_by(media_collection_items.c.collection_id)
+        )).scalars().all() == [first_collection, second_collection.id]
         assert (await session.execute(select(TopicMediaDeck))).scalars().all() == []
+
+    await collection_service.toggle_file(client, 100, "remove", first_collection, media_id, 0)
+    async with max_store() as session:
+        assert await session.get(MediaLibrary, media_id) is not None
+        remaining_collections = (await session.execute(
+            select(media_collection_items.c.collection_id)
+            .where(media_collection_items.c.media_id == media_id)
+            .order_by(media_collection_items.c.collection_id)
+        )).scalars().all()
+        assert remaining_collections == [second_collection.id]
+        first_scope = await load_media_scope(session, 1)
+        second_scope = await load_media_scope(session, 2)
+        assert media_id not in first_scope.collection_media_ids
+        assert media_id in second_scope.collection_media_ids
+
+
+@pytest.mark.asyncio
+async def test_max_listing_paginates_in_sql_and_summarizes_all_categories(max_store):
+    collection_id = await _create_topic_collection(max_store)
+    async with max_store() as session:
+        media_rows = [
+            MediaLibrary(
+                file_id=f"file-{index}",
+                file_name=f"card-{index}",
+                category="first" if index < 10 else "second",
+                media_type="photo",
+            )
+            for index in range(25)
+        ]
+        media_rows[14].file_name = "_back"
+        session.add_all(media_rows)
+        await session.flush()
+        await session.execute(
+            media_collection_items.insert(),
+            [{"collection_id": collection_id, "media_id": media.id} for media in media_rows],
+        )
+        await session.commit()
+
+    client = FakeClient()
+    await service.show_list(client, 100, 1, page=1)
+    message = client.messages[-1]
+    buttons = _buttons(message["attachments"])
+    page_media = [
+        button["text"]
+        for button in buttons
+        if button["payload"].startswith("admin_media_view_")
+    ]
+    assert len(page_media) == 10
+    expected_names = ["_back" if index == 14 else f"card-{index}" for index in range(10, 20)]
+    assert all(expected in actual for expected, actual in zip(expected_names, page_media))
+    assert "Файлов: 25" in message["text"]
+    assert "<code>first</code> — ⚠️ нет рубашки" in message["text"]
+    assert "<code>second</code> — 🃏" in message["text"]
 
 
 @pytest.mark.asyncio
