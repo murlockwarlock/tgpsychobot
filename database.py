@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import textwrap
 from sqlalchemy import (create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, BigInteger, Table,
                         Float, Interval, Index, UniqueConstraint, func, text)
@@ -45,6 +46,12 @@ topic_collection_association = Table(
     'topic_media_collection',
     Base.metadata,
     Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE'), primary_key=True),
+    Column('collection_id', Integer, ForeignKey('media_collections.id', ondelete='CASCADE'), primary_key=True),
+)
+
+main_dialogue_collection_association = Table(
+    'main_dialogue_media_collection',
+    Base.metadata,
     Column('collection_id', Integer, ForeignKey('media_collections.id', ondelete='CASCADE'), primary_key=True),
 )
 
@@ -721,6 +728,130 @@ async def _acquire_database_init_lock(conn):
     )
 
 
+def _ensure_media_collection(sync_conn, name: str) -> int:
+    collection_id = sync_conn.execute(
+        text("SELECT id FROM media_collections WHERE name = :name"),
+        {'name': name},
+    ).scalar()
+    if collection_id is not None:
+        return int(collection_id)
+
+    sync_conn.execute(
+        text("INSERT INTO media_collections (name) VALUES (:name)"),
+        {'name': name},
+    )
+    return int(sync_conn.execute(
+        text("SELECT id FROM media_collections WHERE name = :name"),
+        {'name': name},
+    ).scalar())
+
+
+def _ensure_topic_collection(sync_conn, topic_id: int, collection_id: int) -> None:
+    exists = sync_conn.execute(
+        text(
+            "SELECT 1 FROM topic_media_collection "
+            "WHERE topic_id = :topic_id AND collection_id = :collection_id"
+        ),
+        {'topic_id': topic_id, 'collection_id': collection_id},
+    ).first()
+    if exists is None:
+        sync_conn.execute(
+            text(
+                "INSERT INTO topic_media_collection (topic_id, collection_id) "
+                "VALUES (:topic_id, :collection_id)"
+            ),
+            {'topic_id': topic_id, 'collection_id': collection_id},
+        )
+
+
+def _ensure_collection_media(sync_conn, collection_id: int, media_id: int) -> None:
+    exists = sync_conn.execute(
+        text(
+            "SELECT 1 FROM media_collection_items "
+            "WHERE collection_id = :collection_id AND media_id = :media_id"
+        ),
+        {'collection_id': collection_id, 'media_id': media_id},
+    ).first()
+    if exists is None:
+        sync_conn.execute(
+            text(
+                "INSERT INTO media_collection_items (collection_id, media_id) "
+                "VALUES (:collection_id, :media_id)"
+            ),
+            {'collection_id': collection_id, 'media_id': media_id},
+        )
+
+
+def _migrate_legacy_media_ownership(sync_conn) -> None:
+    collection_topics = {
+        topic_id
+        for (topic_id,) in sync_conn.execute(
+            text(
+                "SELECT DISTINCT tmc.topic_id "
+                "FROM topic_media_collection tmc "
+                "JOIN topics t ON t.id = tmc.topic_id "
+                "JOIN media_collections mc ON mc.id = tmc.collection_id"
+            )
+        ).all()
+    }
+    direct_media = sync_conn.execute(
+        text(
+            "SELECT ml.id, ml.topic_id FROM media_library ml "
+            "JOIN topics t ON t.id = ml.topic_id "
+            "WHERE ml.topic_id IS NOT NULL ORDER BY ml.topic_id, ml.id"
+        )
+    ).all()
+    topic_collections: dict[int, int] = {}
+    for media_id, topic_id in direct_media:
+        already_available = sync_conn.execute(
+            text(
+                "SELECT 1 FROM topic_media_collection tc "
+                "JOIN media_collection_items ci ON ci.collection_id = tc.collection_id "
+                "WHERE tc.topic_id = :topic_id AND ci.media_id = :media_id"
+            ),
+            {'topic_id': topic_id, 'media_id': media_id},
+        ).first()
+        if already_available is not None:
+            continue
+        collection_id = topic_collections.get(topic_id)
+        if collection_id is None:
+            collection_id = _ensure_media_collection(sync_conn, f"__legacy_topic_{topic_id}")
+            topic_collections[topic_id] = collection_id
+            _ensure_topic_collection(sync_conn, topic_id, collection_id)
+        _ensure_collection_media(sync_conn, collection_id, media_id)
+
+    legacy_decks = sync_conn.execute(
+        text(
+            "SELECT d.topic_id, d.deck_name FROM topic_media_deck d "
+            "JOIN topics t ON t.id = d.topic_id "
+            "ORDER BY d.topic_id, d.deck_name"
+        )
+    ).all()
+    for topic_id, deck_name in legacy_decks:
+        if topic_id in collection_topics:
+            continue
+        media_ids = sync_conn.execute(
+            text(
+                "SELECT id FROM media_library "
+                "WHERE category = :deck_name ORDER BY id"
+            ),
+            {'deck_name': deck_name},
+        ).all()
+        if not media_ids:
+            continue
+        digest = hashlib.sha256(str(deck_name).encode('utf-8')).hexdigest()[:12]
+        collection_id = _ensure_media_collection(
+            sync_conn,
+            f"__legacy_deck_{topic_id}_{digest}",
+        )
+        _ensure_topic_collection(sync_conn, topic_id, collection_id)
+        for (media_id,) in media_ids:
+            _ensure_collection_media(sync_conn, collection_id, media_id)
+
+    sync_conn.execute(text("UPDATE media_library SET topic_id = NULL WHERE topic_id IS NOT NULL"))
+    sync_conn.execute(text("DELETE FROM topic_media_deck"))
+
+
 async def init_db():
     async with engine.begin() as conn:
         await _acquire_database_init_lock(conn)
@@ -730,6 +861,11 @@ async def init_db():
 
         def _check_and_migrate(sync_conn):
             insp = sa_inspect(sync_conn)
+            sync_conn.execute(text(
+                "UPDATE media_library SET media_type = 'photo' "
+                "WHERE LOWER(media_type) = 'image'"
+            ))
+            _migrate_legacy_media_ownership(sync_conn)
             user_columns = [c['name'] for c in insp.get_columns('users')]
             if 'response_length' not in user_columns:
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN response_length VARCHAR DEFAULT 'normal' NOT NULL"))

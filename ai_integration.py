@@ -11,7 +11,7 @@ import uuid
 import httpx
 import re
 from typing import Any, Iterable
-from sqlalchemy import select, or_
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 import gemini_image
@@ -19,8 +19,8 @@ import gemini_image
 import time
 
 from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestConfig, TestSession,
-                     MediaLibrary, TopicMediaDeck, MediaCollection, media_collection_items, topic_collection_association,
                      UserSubscription, KnowledgeBase, SubscriptionConfig, AILog)
+from media_scope import load_available_media
 from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
@@ -1566,6 +1566,8 @@ async def get_ai_response(
             if topic_id_override is _CURRENT_AI_CONTEXT
             else topic_id_override
         )
+        if active_topic_id == 0:
+            active_topic_id = None
         active_dialogue_id = dialogue_id_override or user.current_dialogue_id
         if active_topic_id == user.current_topic_id:
             active_topic = user.current_topic
@@ -1586,62 +1588,23 @@ async def get_ai_response(
 
         available_media_text = ""
         media_instruction_block = ""
-        if active_topic_id:
-            # Получаем ID коллекций, привязанных к этому топику
-            coll_stmt = select(topic_collection_association.c.collection_id).where(
-                topic_collection_association.c.topic_id == active_topic_id
-            )
-            coll_res = await session.execute(coll_stmt)
-            assigned_coll_ids = [r[0] for r in coll_res.all()]
-
-            if assigned_coll_ids:
-                # Медиа из привязанных коллекций + свои медиа по topic_id (для аудио и пр.)
-                media_stmt = select(MediaLibrary).where(
-                    or_(
-                        MediaLibrary.id.in_(
-                            select(media_collection_items.c.media_id).where(
-                                media_collection_items.c.collection_id.in_(assigned_coll_ids)
-                            )
-                        ),
-                        MediaLibrary.topic_id == active_topic_id
-                    )
-                )
-            else:
-                # Фоллбэк: старые колоды (topic_media_deck) или прямой topic_id
-                deck_stmt = select(TopicMediaDeck.deck_name).where(
-                    TopicMediaDeck.topic_id == active_topic_id
-                )
-                deck_res = await session.execute(deck_stmt)
-                assigned_decks = [r[0] for r in deck_res.all()]
-                if assigned_decks:
-                    media_stmt = select(MediaLibrary).where(
-                        or_(
-                            MediaLibrary.category.in_(assigned_decks),
-                            MediaLibrary.topic_id == active_topic_id
-                        )
-                    )
-                else:
-                    media_stmt = select(MediaLibrary).where(
-                        MediaLibrary.topic_id == active_topic_id
-                    )
-
-            media_res = await session.execute(media_stmt)
-            media_files = media_res.scalars().all()
-            if media_files:
-                categories = {}
-                for m in media_files:
-                    cat = m.category or ''
-                    if cat not in categories:
-                        categories[cat] = []
-                    categories[cat].append(m)
-                available_media_text = "Доступные медиа-файлы в этой теме:\n"
-                for cat, files in categories.items():
-                    if cat:
-                        available_media_text += f"\nКатегория (для тегов RANDOM_IMG/CHOICE_IMG): \"{cat}\"\n"
-                    for m in files:
-                        desc_part = f" — {m.description}" if m.description else ""
-                        available_media_text += f"  - [{m.media_type.upper()}] {m.file_name}{desc_part}\n"
-                media_instruction_block = build_media_instruction_block(available_media_text)
+        _, media_files = await load_available_media(session, active_topic_id)
+        if media_files:
+            categories = {}
+            for m in media_files:
+                cat = m.category or ''
+                if cat not in categories:
+                    categories[cat] = []
+                categories[cat].append(m)
+            scope_label = "основном диалоге" if active_topic_id is None else "этой теме"
+            available_media_text = f"Доступные медиа-файлы в {scope_label}:\n"
+            for cat, files in categories.items():
+                if cat:
+                    available_media_text += f"\nКатегория (для тегов RANDOM_IMG/CHOICE_IMG): \"{cat}\"\n"
+                for m in files:
+                    desc_part = f" — {m.description}" if m.description else ""
+                    available_media_text += f"  - [{m.media_type.upper()}] {m.file_name}{desc_part}\n"
+            media_instruction_block = build_media_instruction_block(available_media_text)
 
         provider = ai_config.provider
         provider_key = provider.strip().lower() if provider else ""

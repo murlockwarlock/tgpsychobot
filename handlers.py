@@ -40,8 +40,9 @@ from config import OWNER_IDS
 from database import (async_session_maker, User, Message as DBMessage, AIConfig, KnowledgeBase, Content, IndexingQueue,
                      ContentMedia, Topic, SubscriptionPlan, UserSubscription, PromoCode, SubscriptionConfig, Mailing,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
-                     ReferralPaymentLog, MailingDeliveryLog, TopicMediaDeck,
+                     ReferralPaymentLog, MailingDeliveryLog,
                      MediaCollection, media_collection_items, topic_collection_association,
+                     main_dialogue_collection_association,
                      ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationEvent,
                      DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_MAX_LENGTH)
 from aiogram.types import LabeledPrice
@@ -63,6 +64,7 @@ from ai_integration import (
     _get_kie_base_url,
 )
 from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error, sanitize_secret_values
+from media_scope import PHOTO_MEDIA_TYPES, TopicMediaScope, load_media_scope, photo_media_predicate
 from provider_models import (
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
@@ -500,7 +502,7 @@ ROBOKASSA_INVOICE_LIFETIME = timedelta(hours=2)
 def _new_card_spread_state(
     *,
     category: str,
-    topic_id: int,
+    topic_id: int | None,
     rounds: int,
     cards_per_round: int,
     hidden: bool,
@@ -521,9 +523,10 @@ def _new_card_spread_state(
 
 def _normalize_card_spread_state(raw_state: dict) -> dict | None:
     try:
+        raw_topic_id = raw_state['topic_id']
         state = {
             'category': str(raw_state['category']),
-            'topic_id': int(raw_state['topic_id']),
+            'topic_id': None if raw_topic_id is None else int(raw_topic_id),
             'rounds_left': max(0, int(raw_state['rounds_left'])),
             'total_rounds': max(1, int(raw_state['total_rounds'])),
             'cards_per_round': max(1, int(raw_state['cards_per_round'])),
@@ -981,10 +984,6 @@ class TopicPhrasesState(StatesGroup):
 
 
 class AdminMediaState(StatesGroup):
-    waiting_for_file = State()
-    waiting_for_name = State()
-    waiting_for_category = State()
-    waiting_for_description = State()
     editing_name = State()
     editing_category = State()
     editing_description = State()
@@ -995,6 +994,9 @@ class AdminCollectionState(StatesGroup):
     waiting_for_name = State()
     waiting_for_rename = State()
     waiting_for_upload_file = State()
+    waiting_for_upload_name = State()
+    waiting_for_upload_category = State()
+    waiting_for_upload_description = State()
 
 
 def _user_ref(user_id: int, username: str = None, full_name: str = None) -> str:
@@ -1176,7 +1178,15 @@ async def send_photo_or_document(
     caption: str | None = None,
     parse_mode: str | None = None,
     reply_markup=None,
-):
+    context: str = "media",
+) -> bool:
+    if not file_id:
+        log.warning(
+            "Media delivery skipped context=%s chat_id=%s reason=missing_file_id",
+            context,
+            chat_id,
+        )
+        return False
     try:
         await bot.send_photo(
             chat_id=chat_id,
@@ -1185,14 +1195,26 @@ async def send_photo_or_document(
             parse_mode=parse_mode,
             reply_markup=reply_markup,
         )
-    except Exception:
-        await bot.send_document(
-            chat_id=chat_id,
-            document=file_id,
-            caption=caption,
-            parse_mode=parse_mode,
-            reply_markup=reply_markup,
-        )
+        return True
+    except Exception as photo_error:
+        try:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=file_id,
+                caption=caption,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            return True
+        except Exception as document_error:
+            log.warning(
+                "Media delivery failed context=%s chat_id=%s photo_error=%s document_error=%s",
+                context,
+                chat_id,
+                sanitize_secret_values(exception_summary(photo_error))[:240],
+                sanitize_secret_values(exception_summary(document_error))[:240],
+            )
+            return False
 
 
 async def send_card_album(
@@ -1206,7 +1228,7 @@ async def send_card_album(
         return
 
     if len(file_ids) == 1:
-        await send_photo_or_document(bot, chat_id, file_ids[0])
+        await send_photo_or_document(bot, chat_id, file_ids[0], context=context)
         return
 
     for i in range(0, len(file_ids), 10):
@@ -1232,10 +1254,10 @@ async def send_card_album(
                     "send_media_group duplicate fallback failed in %s (%d cards): %s",
                     context,
                     len(batch),
-                    dup_err,
+                    sanitize_secret_values(exception_summary(dup_err))[:240],
                 )
                 for file_id in batch:
-                    await send_photo_or_document(bot, chat_id, file_id)
+                    await send_photo_or_document(bot, chat_id, file_id, context=context)
             continue
 
         media_group = [InputMediaPhoto(media=file_id) for file_id in batch]
@@ -1246,53 +1268,85 @@ async def send_card_album(
                 "send_media_group failed in %s (%d cards): %s",
                 context,
                 len(batch),
-                mg_err,
+                sanitize_secret_values(exception_summary(mg_err))[:240],
             )
             for file_id in batch:
-                await send_photo_or_document(bot, chat_id, file_id)
+                await send_photo_or_document(bot, chat_id, file_id, context=context)
 
 
-async def _get_topic_media_ids(session, topic_id: int) -> list[int] | None:
-    """Возвращает список media_id из привязанных коллекций (или None если коллекций нет)."""
-    if not topic_id:
-        return None
-    # Сначала проверяем новые коллекции
-    coll_stmt = select(topic_collection_association.c.collection_id).where(
-        topic_collection_association.c.topic_id == topic_id
-    )
-    coll_res = await session.execute(coll_stmt)
-    coll_ids = [r[0] for r in coll_res.all()]
-    if coll_ids:
-        media_stmt = select(media_collection_items.c.media_id).where(
-            media_collection_items.c.collection_id.in_(coll_ids)
+async def resolve_show_image(
+    session,
+    scope: TopicMediaScope,
+    file_name: str,
+):
+    normalized_name = file_name.strip()
+    scope_label = "main" if scope.is_main_dialogue else f"topic:{scope.topic_id}"
+    if not normalized_name:
+        log.warning(
+            "SHOW_IMG media unavailable file_name=%s scope=%s reason=empty_name",
+            normalized_name,
+            scope_label,
         )
-        media_res = await session.execute(media_stmt)
-        return [r[0] for r in media_res.all()]
+        return None
+
+    stmt = select(MediaLibrary).where(
+        scope.predicate(),
+        MediaLibrary.file_name == normalized_name,
+        photo_media_predicate(),
+    ).order_by(MediaLibrary.id).limit(1)
+    media = await session.scalar(stmt)
+    if media:
+        return media
+
+    diagnostic_result = await session.execute(
+        select(MediaLibrary.media_type)
+        .where(MediaLibrary.file_name == normalized_name)
+        .order_by(MediaLibrary.id)
+        .limit(1)
+    )
+    diagnostic = diagnostic_result.first()
+    if diagnostic is None:
+        reason = "not_found"
+    elif diagnostic[0] not in PHOTO_MEDIA_TYPES:
+        reason = f"unsupported_media_type:{diagnostic[0]}"
+    else:
+        reason = "outside_topic_scope"
+    log.warning(
+        "SHOW_IMG media unavailable file_name=%s scope=%s reason=%s",
+        normalized_name,
+        scope_label,
+        reason,
+    )
     return None
 
 
-async def _get_assigned_decks(session, topic_id: int) -> list[str]:
-    """Возвращает список имён колод (фоллбэк для старой системы)."""
-    if not topic_id:
-        return []
-    deck_stmt = select(TopicMediaDeck.deck_name).where(TopicMediaDeck.topic_id == topic_id)
-    deck_res = await session.execute(deck_stmt)
-    return [r[0] for r in deck_res.all()]
-
-
-def _media_filter(topic_id: int, collection_media_ids: list[int] | None = None, assigned_decks: list[str] | None = None, category: str = None):
-    """Универсальный фильтр: коллекции → старые колоды → topic_id."""
-    if collection_media_ids is not None:
-        if category:
-            return and_(MediaLibrary.id.in_(collection_media_ids), MediaLibrary.category == category)
-        return or_(MediaLibrary.id.in_(collection_media_ids), MediaLibrary.topic_id == topic_id)
-    if assigned_decks:
-        if category:
-            return MediaLibrary.category == category
-        return or_(MediaLibrary.category.in_(assigned_decks), MediaLibrary.topic_id == topic_id)
-    if category:
-        return and_(MediaLibrary.topic_id == topic_id, MediaLibrary.category == category)
-    return MediaLibrary.topic_id == topic_id
+async def send_show_images(
+    bot: Bot,
+    chat_id: int,
+    session,
+    scope: TopicMediaScope,
+    file_names: list[str],
+) -> int:
+    sent_count = 0
+    sent_names = set()
+    for file_name in file_names:
+        normalized_name = file_name.strip()
+        if normalized_name in sent_names:
+            continue
+        sent_names.add(normalized_name)
+        media = await resolve_show_image(session, scope, normalized_name)
+        if not media:
+            continue
+        if await send_photo_or_document(
+            bot,
+            chat_id,
+            media.file_id,
+            caption=media.description,
+            parse_mode="HTML",
+            context="SHOW_IMG",
+        ):
+            sent_count += 1
+    return sent_count
 
 
 async def execute_media_commands(message: Message, response_text: str, user_id: int, bot: Bot):
@@ -1301,21 +1355,19 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
         user_res = await session.execute(user_stmt)
         user = user_res.scalar_one_or_none()
 
-        if not user or not user.current_topic_id:
+        if not user:
             return response_text
 
         topic_id = user.current_topic_id
-
-        coll_media_ids = await _get_topic_media_ids(session, topic_id)
-        assigned_decks = await _get_assigned_decks(session, topic_id) if coll_media_ids is None else None
+        media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
 
         audio_matches = re.findall(r"\[SEND_AUDIO:\s*(.+?)\]", response_text)
         for file_name in audio_matches:
             stmt = select(MediaLibrary).where(
-                _media_filter(topic_id, coll_media_ids, assigned_decks),
+                media_scope.predicate(),
                 MediaLibrary.file_name == file_name.strip(),
                 MediaLibrary.media_type == 'audio'
-            )
+            ).order_by(MediaLibrary.id).limit(1)
             res = await session.execute(stmt)
             media = res.scalar_one_or_none()
             if media:
@@ -1327,8 +1379,8 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             category = match[0].strip() if isinstance(match, tuple) else match.strip()
             count = int(match[1]) if isinstance(match, tuple) and match[1] else 1
             stmt = select(MediaLibrary).where(
-                _media_filter(topic_id, coll_media_ids, assigned_decks, category),
-                MediaLibrary.media_type == 'photo',
+                media_scope.predicate(category),
+                MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                 MediaLibrary.file_name != '_back',
             ).order_by(func.random()).limit(count)
             res = await session.execute(stmt)
@@ -1361,8 +1413,8 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                 cards_per_round=cards_per_round, hidden=False, explicit_rounds=rounds,
             )
             stmt = select(MediaLibrary).where(
-                _media_filter(topic_id, coll_media_ids, assigned_decks, category),
-                MediaLibrary.media_type == 'photo',
+                media_scope.predicate(category),
+                MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                 MediaLibrary.file_name != '_back',
             ).order_by(func.random()).limit(cards_per_round)
             res = await session.execute(stmt)
@@ -1394,8 +1446,8 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                 cards_per_round=cards_per_round, hidden=True, explicit_rounds=rounds,
             )
             stmt = select(MediaLibrary).where(
-                _media_filter(topic_id, coll_media_ids, assigned_decks, cat_stripped),
-                MediaLibrary.media_type == 'photo',
+                media_scope.predicate(cat_stripped),
+                MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                 MediaLibrary.file_name != '_back',
             ).order_by(func.random()).limit(cards_per_round)
             res = await session.execute(stmt)
@@ -1408,7 +1460,9 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                         pending_card_ids=[card.id for card in cards],
                     ))
                 back_stmt = select(MediaLibrary).where(
+                    media_scope.predicate(cat_stripped),
                     MediaLibrary.category == cat_stripped,
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name == '_back',
                 ).limit(1)
                 back_media = await session.scalar(back_stmt)
@@ -1424,21 +1478,13 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                 await message.answer("Выбери карту, которая тебе откликается:", reply_markup=kb_markup)
 
         show_matches = re.findall(r"\[SHOW_IMG:\s*(.+?)\]", response_text)
-        for file_name in show_matches:
-            stmt = select(MediaLibrary).where(
-                MediaLibrary.file_name == file_name.strip(),
-                MediaLibrary.media_type == 'photo',
-            ).limit(1)
-            res = await session.execute(stmt)
-            media = res.scalar_one_or_none()
-            if media:
-                await send_photo_or_document(
-                    bot,
-                    message.chat.id,
-                    media.file_id,
-                    caption=media.description,
-                    parse_mode='HTML',
-                )
+        await send_show_images(
+            bot,
+            message.chat.id,
+            session,
+            media_scope,
+            show_matches,
+        )
 
     clean_text = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG_HIDDEN|CHOICE_IMG|SHOW_IMG):.*?\]", "", response_text).strip()
     return clean_text
@@ -1650,6 +1696,11 @@ async def process_buffered_messages(
 
         should_start_test, directive_clean_text = extract_test_start_directive(response_text)
         if should_start_test:
+            directive_clean_text, _, _, _, _, _ = await handle_ai_media_content(
+                bot,
+                user_id,
+                directive_clean_text,
+            )
             if directive_clean_text:
                 html_response = markdown_to_html(directive_clean_text)
                 for chunk in split_html_text(html_response):
@@ -1690,8 +1741,7 @@ async def process_buffered_messages(
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             topic_id = user.current_topic_id if user else None
-            coll_media_ids = await _get_topic_media_ids(session, topic_id) if topic_id else None
-            assigned_decks = await _get_assigned_decks(session, topic_id) if topic_id and coll_media_ids is None else None
+            media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
 
             # --- 1. Текст AI (сначала предисловие) ---
 
@@ -1760,28 +1810,21 @@ async def process_buffered_messages(
 
             for audio_name in audios:
                 stmt = select(MediaLibrary).where(
-                    _media_filter(topic_id, coll_media_ids, assigned_decks),
+                    media_scope.predicate(),
                     MediaLibrary.file_name == audio_name.strip(),
                     MediaLibrary.media_type == 'audio',
-                ).limit(1)
+                ).order_by(MediaLibrary.id).limit(1)
                 media = await session.scalar(stmt)
                 if media:
                     await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=media.description, parse_mode='HTML')
 
-            for file_name in show_imgs:
-                stmt = select(MediaLibrary).where(
-                    MediaLibrary.file_name == file_name.strip(),
-                    MediaLibrary.media_type == 'photo',
-                ).limit(1)
-                media = await session.scalar(stmt)
-                if media:
-                    await send_photo_or_document(
-                        bot,
-                        user_id,
-                        media.file_id,
-                        caption=media.description,
-                        parse_mode='HTML',
-                    )
+            await send_show_images(
+                bot,
+                user_id,
+                session,
+                media_scope,
+                show_imgs,
+            )
 
             drawn_cards_info = []
             all_random_cards = []
@@ -1789,8 +1832,8 @@ async def process_buffered_messages(
                 cat = match[0].strip() if isinstance(match, tuple) else match.strip()
                 r_count = int(match[1]) if isinstance(match, tuple) and match[1] else 1
                 stmt = select(MediaLibrary).where(
-                    _media_filter(topic_id, coll_media_ids, assigned_decks, cat),
-                    MediaLibrary.media_type == 'photo',
+                    media_scope.predicate(cat),
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name != '_back',
                 ).order_by(func.random()).limit(r_count)
                 res = await session.execute(stmt)
@@ -1824,8 +1867,8 @@ async def process_buffered_messages(
                     cards_per_round=cards_per_round, hidden=False, explicit_rounds=rounds,
                 )
                 stmt = select(MediaLibrary).where(
-                    _media_filter(topic_id, coll_media_ids, assigned_decks, cat),
-                    MediaLibrary.media_type == 'photo',
+                    media_scope.predicate(cat),
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name != '_back',
                 ).order_by(func.random()).limit(cards_per_round)
                 res = await session.execute(stmt)
@@ -1854,8 +1897,8 @@ async def process_buffered_messages(
                     cards_per_round=cards_per_round, hidden=True, explicit_rounds=rounds,
                 )
                 stmt = select(MediaLibrary).where(
-                    _media_filter(topic_id, coll_media_ids, assigned_decks, cat_stripped),
-                    MediaLibrary.media_type == 'photo',
+                    media_scope.predicate(cat_stripped),
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name != '_back',
                 ).order_by(func.random()).limit(cards_per_round)
                 res = await session.execute(stmt)
@@ -1868,7 +1911,9 @@ async def process_buffered_messages(
                             pending_card_ids=[card.id for card in cards],
                         ))
                     back_stmt = select(MediaLibrary).where(
+                        media_scope.predicate(cat_stripped),
                         MediaLibrary.category == cat_stripped,
+                        MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                         MediaLibrary.file_name == '_back',
                     ).limit(1)
                     back_media = await session.scalar(back_stmt)
@@ -2071,7 +2116,15 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
         pass
 
     async with async_session_maker() as session:
-        media = await session.get(MediaLibrary, card_id)
+        user = await session.get(User, user_id)
+        spread_topic_id = spread.get('topic_id') if spread else (user.current_topic_id if user else None)
+        media_scope = await load_media_scope(session, spread_topic_id, include_media_ids=False)
+        media = await session.scalar(
+            select(MediaLibrary).where(
+                media_scope.predicate(),
+                MediaLibrary.id == card_id,
+            )
+        )
         if media:
             if media.file_name == '_back':
                 await callback.message.answer("Эта техническая рубашка не должна выбираться.")
@@ -2086,10 +2139,9 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
 
             card_info = f"{media.file_name}: {media.description or 'без описания'}"
             card_system_msg = _card_selection_system_message(card_info, spread)
-            user = await session.get(User, user_id)
             if user:
                 session.add(DBMessage(user_id=user_id, role='user', content=card_system_msg,
-                                      dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                                      dialogue_id=user.current_dialogue_id, topic_id=spread_topic_id))
                 await session.commit()
 
             typing_task_interp = None
@@ -2111,7 +2163,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation,
-                                         dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
+                                         dialogue_id=u2.current_dialogue_id, topic_id=spread_topic_id))
                         await s2.commit()
             except Exception as e:
                 if typing_task_interp:
@@ -2174,11 +2226,10 @@ async def _advance_card_spread_after_selection(
     spread['rounds_left'] -= 1
     try:
         async with async_session_maker() as session:
-            spread_coll_ids = await _get_topic_media_ids(session, spread['topic_id'])
-            spread_decks = await _get_assigned_decks(session, spread['topic_id']) if spread_coll_ids is None else None
+            media_scope = await load_media_scope(session, spread['topic_id'], include_media_ids=False)
             stmt = select(MediaLibrary).where(
-                _media_filter(spread['topic_id'], spread_coll_ids, spread_decks, spread['category']),
-                MediaLibrary.media_type == 'photo',
+                media_scope.predicate(spread['category']),
+                MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                 MediaLibrary.file_name != '_back',
                 MediaLibrary.id.notin_(spread['chosen_card_ids']),
             ).order_by(func.random()).limit(spread['cards_per_round'])
@@ -2205,7 +2256,9 @@ async def _advance_card_spread_after_selection(
 
             if spread.get('hidden'):
                 back_stmt = select(MediaLibrary).where(
+                    media_scope.predicate(spread['category']),
                     MediaLibrary.category == spread['category'],
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name == '_back',
                 ).limit(1)
                 back_media = await session.scalar(back_stmt)
@@ -2257,7 +2310,13 @@ async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
         return False
 
     async with async_session_maker() as session:
-        result = await session.execute(select(MediaLibrary).where(MediaLibrary.id.in_(pending_ids)))
+        media_scope = await load_media_scope(session, spread.get('topic_id'), include_media_ids=False)
+        result = await session.execute(
+            select(MediaLibrary).where(
+                media_scope.predicate(),
+                MediaLibrary.id.in_(pending_ids),
+            )
+        )
         media_by_id = {media.id: media for media in result.scalars().all()}
         cards = [media_by_id[card_id] for card_id in pending_ids if card_id in media_by_id]
         if not cards:
@@ -2267,7 +2326,9 @@ async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
         if spread.get('hidden'):
             back_media = await session.scalar(
                 select(MediaLibrary).where(
+                    media_scope.predicate(spread['category']),
                     MediaLibrary.category == spread['category'],
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name == '_back',
                 ).limit(1)
             )
@@ -2738,6 +2799,18 @@ async def is_admin(user_id: int) -> bool:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         return user.is_admin if user else False
+
+
+async def _require_media_collection_admin(event, state: FSMContext | None = None) -> bool:
+    if await is_admin(event.from_user.id):
+        return True
+    if state is not None:
+        await state.clear()
+    if hasattr(event, "message"):
+        await event.answer("Недостаточно прав администратора.", show_alert=True)
+    else:
+        await event.answer("Недостаточно прав администратора.")
+    return False
 
 
 @router.message(Command("ref"))
@@ -3250,7 +3323,9 @@ async def cmd_promo(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "admin_panel")
-async def back_to_admin_panel(callback: CallbackQuery):
+async def back_to_admin_panel(callback: CallbackQuery, state: FSMContext | None = None):
+    if state is not None:
+        await state.clear()
     await callback.message.edit_text("Добро пожаловать в админ-панель!", reply_markup=kb.admin_panel_keyboard())
 
 
@@ -5839,12 +5914,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         # --- 2. Медиа (карты, аудио) после текста ---
 
         async with async_session_maker() as session:
-            coll_media_ids = await _get_topic_media_ids(session, topic_id) if topic_id else None
-            msg_assigned_decks = await _get_assigned_decks(session, topic_id) if topic_id and coll_media_ids is None else None
+            media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
 
             for audio_name in audios:
                 stmt = select(MediaLibrary).where(
-                    _media_filter(topic_id, coll_media_ids, msg_assigned_decks),
+                    media_scope.predicate(),
                     MediaLibrary.file_name == audio_name.strip(),
                     MediaLibrary.media_type == 'audio',
                 ).limit(1)
@@ -5852,20 +5926,13 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 if media:
                     await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=media.description, parse_mode='HTML')
 
-            for file_name in show_imgs:
-                stmt = select(MediaLibrary).where(
-                    MediaLibrary.file_name == file_name.strip(),
-                    MediaLibrary.media_type == 'photo',
-                ).limit(1)
-                media = await session.scalar(stmt)
-                if media:
-                    await send_photo_or_document(
-                        bot,
-                        user_id,
-                        media.file_id,
-                        caption=media.description,
-                        parse_mode='HTML',
-                    )
+            await send_show_images(
+                bot,
+                user_id,
+                session,
+                media_scope,
+                show_imgs,
+            )
 
             drawn_cards_info = []
             all_random_cards = []
@@ -5873,8 +5940,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 cat = match[0].strip() if isinstance(match, tuple) else match.strip()
                 r_count = int(match[1]) if isinstance(match, tuple) and match[1] else 1
                 stmt = select(MediaLibrary).where(
-                    _media_filter(topic_id, coll_media_ids, msg_assigned_decks, cat),
-                    MediaLibrary.media_type == 'photo',
+                    media_scope.predicate(cat),
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name != '_back',
                 ).order_by(func.random()).limit(r_count)
                 res = await session.execute(stmt)
@@ -5908,8 +5975,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                     cards_per_round=cards_per_round, hidden=False, explicit_rounds=rounds,
                 )
                 stmt = select(MediaLibrary).where(
-                    _media_filter(topic_id, coll_media_ids, msg_assigned_decks, cat),
-                    MediaLibrary.media_type == 'photo',
+                    media_scope.predicate(cat),
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name != '_back',
                 ).order_by(func.random()).limit(cards_per_round)
                 res = await session.execute(stmt)
@@ -5938,8 +6005,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                     cards_per_round=cards_per_round, hidden=True, explicit_rounds=rounds,
                 )
                 stmt = select(MediaLibrary).where(
-                    _media_filter(topic_id, coll_media_ids, msg_assigned_decks, cat_stripped),
-                    MediaLibrary.media_type == 'photo',
+                    media_scope.predicate(cat_stripped),
+                    MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                     MediaLibrary.file_name != '_back',
                 ).order_by(func.random()).limit(cards_per_round)
                 res = await session.execute(stmt)
@@ -5952,7 +6019,9 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                             pending_card_ids=[card.id for card in cards],
                         ))
                     back_stmt = select(MediaLibrary).where(
+                        media_scope.predicate(cat_stripped),
                         MediaLibrary.category == cat_stripped,
+                        MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
                         MediaLibrary.file_name == '_back',
                     ).limit(1)
                     back_media = await session.scalar(back_stmt)
@@ -7651,114 +7720,6 @@ async def admin_toggle_kb_for_topic(callback: CallbackQuery):
     )
 
 
-# ────────── Привязка медиа-колод к топикам ──────────
-
-DECK_PAGE_SIZE = 20
-
-
-async def _show_assign_deck_to_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_id: int, page: int = 0):
-    async with async_session_maker() as session:
-        topic = await session.get(Topic, topic_id)
-        if not topic:
-            return
-
-        # Все уникальные категории (колоды) из media_library
-        all_decks_res = await session.execute(
-            select(MediaLibrary.category)
-            .where(MediaLibrary.category != None, MediaLibrary.category != '')
-            .group_by(MediaLibrary.category)
-            .order_by(MediaLibrary.category)
-        )
-        all_deck_names = [r[0] for r in all_decks_res.all()]
-        total_decks = len(all_deck_names)
-        total_pages = max(1, math.ceil(total_decks / DECK_PAGE_SIZE))
-        page_decks = all_deck_names[page * DECK_PAGE_SIZE: (page + 1) * DECK_PAGE_SIZE]
-
-        # Колоды, привязанные к этому топику
-        assigned_res = await session.execute(
-            select(TopicMediaDeck.deck_name).where(TopicMediaDeck.topic_id == topic_id)
-        )
-        assigned_decks = {r[0] for r in assigned_res.all()}
-
-        # Подсчёт файлов в каждой колоде
-        count_res = await session.execute(
-            select(MediaLibrary.category, func.count(MediaLibrary.id))
-            .where(MediaLibrary.category.in_(page_decks))
-            .group_by(MediaLibrary.category)
-        )
-        deck_counts = dict(count_res.all())
-
-    deck_info = ", ".join(f"{d} ({deck_counts.get(d, 0)})" for d in page_decks)
-    text = (
-        f"🃏 Привязка колод к теме: <b>{topic.name}</b>\n"
-        f"Нажми на колоду, чтобы добавить или убрать.\n\n"
-        f"Колоды: {deck_info}"
-    )
-
-    await bot.edit_message_text(
-        text=text,
-        chat_id=chat_id,
-        message_id=message_id,
-        reply_markup=kb.assign_decks_to_topic_keyboard(topic_id, page_decks, assigned_decks, page, total_pages),
-        parse_mode='HTML'
-    )
-
-
-@router.callback_query(F.data.startswith("assign_deck_topic_"), StateFilter('*'))
-async def admin_assign_deck_to_topic(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    # assign_deck_topic_{topic_id}_page_{page}
-    topic_id = int(parts[3])
-    page = int(parts[5])
-    await callback.answer()
-    await _show_assign_deck_to_topic_menu(
-        bot=callback.bot,
-        chat_id=callback.message.chat.id,
-        message_id=callback.message.message_id,
-        topic_id=topic_id,
-        page=page
-    )
-
-
-@router.callback_query(F.data.startswith("deck_topic_"))
-async def admin_toggle_deck_for_topic(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    # deck_topic_{action}_{topic_id}_{deck_name}_{page}
-    action = parts[2]
-    topic_id = int(parts[3])
-    deck_name = parts[4]
-    page = int(parts[5])
-
-    async with async_session_maker() as session:
-        if action == "add":
-            existing = await session.execute(
-                select(TopicMediaDeck).where(
-                    TopicMediaDeck.topic_id == topic_id,
-                    TopicMediaDeck.deck_name == deck_name
-                )
-            )
-            if not existing.scalar_one_or_none():
-                session.add(TopicMediaDeck(topic_id=topic_id, deck_name=deck_name))
-        elif action == "remove":
-            await session.execute(
-                delete(TopicMediaDeck).where(
-                    TopicMediaDeck.topic_id == topic_id,
-                    TopicMediaDeck.deck_name == deck_name
-                )
-            )
-        await session.commit()
-
-    await callback.answer(f"Колода '{deck_name}' {'добавлена' if action == 'add' else 'убрана'}.")
-
-    await _show_assign_deck_to_topic_menu(
-        bot=callback.bot,
-        chat_id=callback.message.chat.id,
-        message_id=callback.message.message_id,
-        topic_id=topic_id,
-        page=page
-    )
-
-
 # ─────────── Медиа-коллекции: CRUD ───────────
 
 COLL_PAGE_SIZE = 8
@@ -7767,326 +7728,867 @@ COLL_FILES_PAGE_SIZE = 10
 
 async def _show_collections_list(bot: Bot, chat_id: int, message_id: int, page: int = 0):
     async with async_session_maker() as session:
-        # all collections with file counts
         stmt = (
             select(MediaCollection.id, MediaCollection.name, func.count(media_collection_items.c.media_id))
             .outerjoin(media_collection_items, media_collection_items.c.collection_id == MediaCollection.id)
             .group_by(MediaCollection.id)
             .order_by(MediaCollection.name)
         )
-        res = await session.execute(stmt)
-        all_colls = [{'id': r[0], 'name': r[1], 'count': r[2]} for r in res.all()]
+        rows = (await session.execute(stmt)).all()
 
-    total = len(all_colls)
-    total_pages = max(1, math.ceil(total / COLL_PAGE_SIZE))
-    page_colls = all_colls[page * COLL_PAGE_SIZE: (page + 1) * COLL_PAGE_SIZE]
-
-    text = f"🎨 <b>Медиа-коллекции</b> ({total})\nНажмите на коллекцию для управления."
+    all_colls = [{'id': row[0], 'name': row[1], 'count': row[2]} for row in rows]
+    total_pages = max(1, math.ceil(len(all_colls) / COLL_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    page_colls = all_colls[page * COLL_PAGE_SIZE:(page + 1) * COLL_PAGE_SIZE]
     await bot.edit_message_text(
-        text=text, chat_id=chat_id, message_id=message_id,
+        text=f"🎨 <b>Медиа-коллекции</b> ({len(all_colls)})\nНажмите на коллекцию для управления.",
+        chat_id=chat_id,
+        message_id=message_id,
         reply_markup=kb.admin_collections_list_keyboard(page_colls, page, total_pages),
-        parse_mode='HTML'
+        parse_mode='HTML',
     )
 
 
 @router.callback_query(F.data.startswith("admin_collections_page_"), StateFilter('*'))
 async def admin_collections_page(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    page = int(callback.data.split("_")[-1])
-    await _show_collections_list(callback.bot, callback.message.chat.id, callback.message.message_id, page)
+    await _show_collections_list(
+        callback.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        int(callback.data.split("_")[-1]),
+    )
 
 
 @router.callback_query(F.data.startswith("admin_coll_view_"), StateFilter('*'))
 async def admin_coll_view(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    coll_id = int(callback.data.split("_")[-1])
+    parts = callback.data.split("_")
+    coll_id = int(parts[3])
+    list_page = int(parts[4]) if len(parts) > 4 else 0
     async with async_session_maker() as session:
         coll = await session.get(MediaCollection, coll_id)
         if not coll:
             await callback.answer("Коллекция не найдена", show_alert=True)
             return
-        count_res = await session.execute(
+        file_count = await session.scalar(
             select(func.count()).select_from(media_collection_items).where(
                 media_collection_items.c.collection_id == coll_id
             )
-        )
-        file_count = count_res.scalar() or 0
-        # topics using this collection
-        topics_res = await session.execute(
+        ) or 0
+        topic_names = (await session.execute(
             select(Topic.name).join(
                 topic_collection_association,
-                topic_collection_association.c.topic_id == Topic.id
+                topic_collection_association.c.topic_id == Topic.id,
             ).where(topic_collection_association.c.collection_id == coll_id)
+        )).scalars().all()
+        main_attached = await session.scalar(
+            select(func.count()).select_from(main_dialogue_collection_association).where(
+                main_dialogue_collection_association.c.collection_id == coll_id
+            )
         )
-        topic_names = [r[0] for r in topics_res.all()]
 
     topics_text = ", ".join(topic_names) if topic_names else "нет"
-    text = (
-        f"📂 <b>{coll.name}</b>\n\n"
-        f"Файлов: {file_count}\n"
-        f"Привязана к темам: {topics_text}"
-    )
+    main_text = "да" if main_attached else "нет"
     await callback.message.edit_text(
-        text=text, parse_mode='HTML',
-        reply_markup=kb.admin_collection_detail_keyboard(coll_id)
+        text=(
+            f"📂 <b>{html.escape(coll.name)}</b>\n\n"
+            f"Файлов: {file_count}\n"
+            f"Привязана к темам: {html.escape(topics_text)}\n"
+            f"Привязана к основному диалогу: {main_text}"
+        ),
+        parse_mode='HTML',
+        reply_markup=kb.admin_collection_detail_keyboard(coll_id, list_page),
     )
 
 
-@router.callback_query(F.data == "admin_coll_create", StateFilter('*'))
+@router.callback_query(F.data.startswith("admin_coll_create"), StateFilter('*'))
 async def admin_coll_create(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
+    parts = callback.data.split("_")
+    list_page = int(parts[3]) if len(parts) > 3 else 0
+    await state.clear()
     await state.set_state(AdminCollectionState.waiting_for_name)
+    await state.update_data(collection_list_page=list_page)
     await callback.message.edit_text(
         "Введите название для новой коллекции:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_collections_page_0")]
-        ])
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_collections_page_{list_page}")]
+        ]),
     )
 
 
 @router.message(AdminCollectionState.waiting_for_name, F.text)
 async def admin_coll_create_name(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     name = message.text.strip()
     if not name:
         await message.answer("Название не может быть пустым. Попробуйте ещё раз:")
         return
+    data = await state.get_data()
+    list_page = data.get('collection_list_page', 0)
     async with async_session_maker() as session:
-        existing = await session.execute(
-            select(MediaCollection).where(MediaCollection.name == name)
-        )
-        if existing.scalar_one_or_none():
+        existing = await session.scalar(select(MediaCollection).where(MediaCollection.name == name))
+        if existing:
             await message.answer(f"Коллекция «{name}» уже существует. Введите другое название:")
             return
         coll = MediaCollection(name=name)
         session.add(coll)
         await session.commit()
         coll_id = coll.id
-
     await state.clear()
-    sent = await message.answer(
+    await message.answer(
         f"✅ Коллекция «{name}» создана.",
-        reply_markup=kb.admin_collection_detail_keyboard(coll_id)
+        reply_markup=kb.admin_collection_detail_keyboard(coll_id, list_page),
     )
 
 
 @router.callback_query(F.data.startswith("admin_coll_rename_"), StateFilter('*'))
 async def admin_coll_rename(callback: CallbackQuery, state: FSMContext):
-    coll_id = int(callback.data.split("_")[-1])
+    if not await _require_media_collection_admin(callback, state):
+        return
+    parts = callback.data.split("_")
+    coll_id = int(parts[3])
+    list_page = int(parts[4]) if len(parts) > 4 else 0
+    await state.clear()
     await state.set_state(AdminCollectionState.waiting_for_rename)
-    await state.update_data(coll_id=coll_id)
+    await state.update_data(coll_id=coll_id, collection_list_page=list_page)
     await callback.message.edit_text(
         "Введите новое название коллекции:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_coll_view_{coll_id}")]
-        ])
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_coll_view_{coll_id}_{list_page}")]
+        ]),
     )
 
 
 @router.message(AdminCollectionState.waiting_for_rename, F.text)
 async def admin_coll_rename_done(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
     data = await state.get_data()
     coll_id = data['coll_id']
+    list_page = data.get('collection_list_page', 0)
     name = message.text.strip()
     if not name:
         await message.answer("Название не может быть пустым.")
         return
     async with async_session_maker() as session:
-        existing = await session.execute(
+        existing = await session.scalar(
             select(MediaCollection).where(MediaCollection.name == name, MediaCollection.id != coll_id)
         )
-        if existing.scalar_one_or_none():
+        if existing:
             await message.answer(f"Коллекция «{name}» уже существует.")
             return
         coll = await session.get(MediaCollection, coll_id)
-        if coll:
-            coll.name = name
-            await session.commit()
+        if not coll:
+            await state.clear()
+            await message.answer("Коллекция не найдена.")
+            return
+        coll.name = name
+        await session.commit()
     await state.clear()
     await message.answer(
         f"✅ Коллекция переименована в «{name}».",
-        reply_markup=kb.admin_collection_detail_keyboard(coll_id)
+        reply_markup=kb.admin_collection_detail_keyboard(coll_id, list_page),
     )
 
 
 @router.callback_query(F.data.startswith("admin_coll_delete_"), StateFilter('*'))
 async def admin_coll_delete(callback: CallbackQuery, state: FSMContext):
-    coll_id = int(callback.data.split("_")[-1])
+    if not await _require_media_collection_admin(callback, state):
+        return
+    parts = callback.data.split("_")
+    coll_id = int(parts[3])
+    list_page = int(parts[4]) if len(parts) > 4 else 0
+    await state.clear()
     async with async_session_maker() as session:
         coll = await session.get(MediaCollection, coll_id)
         if coll:
+            name = coll.name
+            await session.execute(
+                main_dialogue_collection_association.delete().where(
+                    main_dialogue_collection_association.c.collection_id == coll_id
+                )
+            )
+            await session.execute(
+                topic_collection_association.delete().where(
+                    topic_collection_association.c.collection_id == coll_id
+                )
+            )
+            await session.execute(
+                media_collection_items.delete().where(
+                    media_collection_items.c.collection_id == coll_id
+                )
+            )
             await session.delete(coll)
             await session.commit()
-            await callback.answer(f"Коллекция «{coll.name}» удалена.", show_alert=True)
+            await callback.answer(f"Коллекция «{name}» удалена.", show_alert=True)
         else:
             await callback.answer("Коллекция не найдена.", show_alert=True)
-    await _show_collections_list(callback.bot, callback.message.chat.id, callback.message.message_id, 0)
+    await _show_collections_list(callback.bot, callback.message.chat.id, callback.message.message_id, list_page)
+
+
+async def _collection_files_payload(coll_id: int, page: int):
+    async with async_session_maker() as session:
+        coll = await session.get(MediaCollection, coll_id)
+        if not coll:
+            return None
+        total = await session.scalar(
+            select(func.count()).select_from(media_collection_items).where(
+                media_collection_items.c.collection_id == coll_id
+            )
+        ) or 0
+        total_pages = max(1, math.ceil(total / COLL_FILES_PAGE_SIZE))
+        page = max(0, min(page, total_pages - 1))
+        media_list = (await session.execute(
+            select(MediaLibrary)
+            .join(media_collection_items, media_collection_items.c.media_id == MediaLibrary.id)
+            .where(media_collection_items.c.collection_id == coll_id)
+            .order_by(MediaLibrary.file_name, MediaLibrary.id)
+            .offset(page * COLL_FILES_PAGE_SIZE)
+            .limit(COLL_FILES_PAGE_SIZE)
+        )).scalars().all()
+    return coll.name, list(media_list), page, total_pages, total
+
+
+def _collection_files_text(name: str, total: int) -> str:
+    return f"📎 Файлы коллекции «{html.escape(name)}»\nФайлов: {total}\nНажмите на файл для настроек."
+
+
+async def _show_collection_files(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    coll_id: int,
+    page: int = 0,
+    list_page: int = 0,
+    source_message=None,
+):
+    payload = await _collection_files_payload(coll_id, page)
+    if payload is None:
+        if source_message is not None:
+            await source_message.answer("Коллекция не найдена.")
+        return
+    name, media_list, page, total_pages, total = payload
+    markup = kb.admin_collection_files_keyboard(
+        coll_id,
+        media_list,
+        page=page,
+        total_pages=total_pages,
+        list_page=list_page,
+    )
+    text = _collection_files_text(name, total)
+    if source_message is not None:
+        try:
+            await source_message.edit_text(text, reply_markup=markup)
+            return
+        except Exception:
+            try:
+                await source_message.answer(text, reply_markup=markup)
+                await source_message.delete()
+            except Exception:
+                pass
+        return
+    await bot.edit_message_text(
+        text=text,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=markup,
+    )
+
+
+async def _answer_collection_files(message: Message, coll_id: int, page: int = 0, list_page: int = 0):
+    payload = await _collection_files_payload(coll_id, page)
+    if payload is None:
+        await message.answer("Коллекция не найдена.")
+        return
+    name, media_list, page, total_pages, total = payload
+    await message.answer(
+        _collection_files_text(name, total),
+        reply_markup=kb.admin_collection_files_keyboard(
+            coll_id,
+            media_list,
+            page=page,
+            total_pages=total_pages,
+            list_page=list_page,
+        ),
+    )
 
 
 @router.callback_query(F.data.startswith("admin_coll_files_"), StateFilter('*'))
 async def admin_coll_files(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     parts = callback.data.split("_")
-    # admin_coll_files_{coll_id}_{page}
     coll_id = int(parts[3])
-    page = int(parts[4])
+    page = int(parts[4]) if len(parts) > 4 else 0
+    list_page = int(parts[5]) if len(parts) > 5 else 0
+    await _show_collection_files(
+        callback.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        coll_id,
+        page,
+        list_page,
+        callback.message,
+    )
+
+
+async def _collection_attach_payload(coll_id: int, page: int):
     async with async_session_maker() as session:
         coll = await session.get(MediaCollection, coll_id)
         if not coll:
-            await callback.answer("Коллекция не найдена", show_alert=True)
-            return
-        # assigned file IDs
-        assigned_res = await session.execute(
+            return None
+        assigned_ids = set((await session.execute(
             select(media_collection_items.c.media_id).where(
                 media_collection_items.c.collection_id == coll_id
             )
-        )
-        assigned_ids = {r[0] for r in assigned_res.all()}
-        # all media files
-        all_media_res = await session.execute(
+        )).scalars().all())
+        all_media = list((await session.execute(
             select(MediaLibrary).order_by(MediaLibrary.file_name, MediaLibrary.id)
-        )
-        all_media = list(all_media_res.scalars().all())
+        )).scalars().all())
+    total_pages = max(1, math.ceil(len(all_media) / COLL_FILES_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    return coll.name, all_media, assigned_ids, page, total_pages
 
-    total = len(all_media)
-    total_pages = max(1, math.ceil(total / COLL_FILES_PAGE_SIZE))
-    page_media = all_media[page * COLL_FILES_PAGE_SIZE: (page + 1) * COLL_FILES_PAGE_SIZE]
 
+async def _show_collection_attach(callback: CallbackQuery, coll_id: int, page: int, list_page: int):
+    payload = await _collection_attach_payload(coll_id, page)
+    if payload is None:
+        await callback.answer("Коллекция не найдена", show_alert=True)
+        return
+    name, all_media, assigned_ids, page, total_pages = payload
+    page_media = all_media[page * COLL_FILES_PAGE_SIZE:(page + 1) * COLL_FILES_PAGE_SIZE]
     await callback.message.edit_text(
-        f"📎 Файлы коллекции «{coll.name}» (отмечено {len(assigned_ids)} из {total})\n"
-        f"Нажмите, чтобы добавить/убрать файл.",
-        reply_markup=kb.admin_collection_files_keyboard(coll_id, page_media, assigned_ids, page, total_pages)
+        f"📎 Подключение файлов к коллекции «{html.escape(name)}»",
+        reply_markup=kb.admin_collection_attach_keyboard(
+            coll_id,
+            page_media,
+            assigned_ids,
+            page,
+            total_pages,
+            list_page,
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_coll_attach_"), StateFilter('*'))
+async def admin_coll_attach(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = callback.data.split("_")
+    await _show_collection_attach(
+        callback,
+        int(parts[3]),
+        int(parts[4]) if len(parts) > 4 else 0,
+        int(parts[5]) if len(parts) > 5 else 0,
     )
 
 
 @router.callback_query(F.data.startswith("coll_file_"), StateFilter('*'))
-async def admin_coll_toggle_file(callback: CallbackQuery):
+async def admin_coll_toggle_file(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
+    await state.clear()
     parts = callback.data.split("_")
-    # coll_file_{action}_{coll_id}_{media_id}_{page}
     action = parts[2]
     coll_id = int(parts[3])
     media_id = int(parts[4])
-    page = int(parts[5])
-
+    page = int(parts[5]) if len(parts) > 5 else 0
+    list_page = int(parts[6]) if len(parts) > 6 else 0
     async with async_session_maker() as session:
-        if action == "add":
-            try:
-                await session.execute(
-                    media_collection_items.insert().values(collection_id=coll_id, media_id=media_id)
-                )
-                await session.commit()
-            except Exception:
-                await session.rollback()
-        elif action == "remove":
-            await session.execute(
-                media_collection_items.delete().where(
-                    media_collection_items.c.collection_id == coll_id,
-                    media_collection_items.c.media_id == media_id
-                )
-            )
-            await session.commit()
-
-    await callback.answer("✅")
-    # refresh the files page
-    async with async_session_maker() as session:
-        coll = await session.get(MediaCollection, coll_id)
-        if not coll:
+        if not await session.get(MediaCollection, coll_id) or not await session.get(MediaLibrary, media_id):
+            await callback.answer("Файл или коллекция не найдены.", show_alert=True)
             return
-        assigned_res = await session.execute(
-            select(media_collection_items.c.media_id).where(
-                media_collection_items.c.collection_id == coll_id
+        if action == "add":
+            exists = await session.scalar(
+                select(media_collection_items.c.media_id).where(
+                    media_collection_items.c.collection_id == coll_id,
+                    media_collection_items.c.media_id == media_id,
+                )
             )
-        )
-        assigned_ids = {r[0] for r in assigned_res.all()}
-        all_media_res = await session.execute(
-            select(MediaLibrary).order_by(MediaLibrary.file_name, MediaLibrary.id)
-        )
-        all_media = list(all_media_res.scalars().all())
-
-    total = len(all_media)
-    total_pages = max(1, math.ceil(total / COLL_FILES_PAGE_SIZE))
-    page_media = all_media[page * COLL_FILES_PAGE_SIZE: (page + 1) * COLL_FILES_PAGE_SIZE]
-
-    try:
-        await callback.message.edit_text(
-            f"📎 Файлы коллекции «{coll.name}» (отмечено {len(assigned_ids)} из {total})\n"
-            f"Нажмите, чтобы добавить/убрать файл.",
-            reply_markup=kb.admin_collection_files_keyboard(coll_id, page_media, assigned_ids, page, total_pages)
-        )
-    except TelegramBadRequest:
-        pass
+            if exists is None:
+                await session.execute(media_collection_items.insert().values(collection_id=coll_id, media_id=media_id))
+        elif action == "remove":
+            await session.execute(media_collection_items.delete().where(
+                media_collection_items.c.collection_id == coll_id,
+                media_collection_items.c.media_id == media_id,
+            ))
+        else:
+            await callback.answer("Недопустимое действие.", show_alert=True)
+            return
+        await session.commit()
+    await callback.answer("✅")
+    await _show_collection_attach(callback, coll_id, page, list_page)
 
 
-@router.callback_query(F.data.startswith("admin_coll_upload_"), StateFilter('*'))
-async def admin_coll_upload(callback: CallbackQuery, state: FSMContext):
-    coll_id = int(callback.data.split("_")[-1])
-    await state.set_state(AdminCollectionState.waiting_for_upload_file)
-    await state.update_data(upload_coll_id=coll_id)
-    await callback.message.edit_text(
-        "📤 Отправьте медиа-файл (фото, видео, аудио, документ) для добавления в коллекцию.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_coll_view_{coll_id}")]
-        ])
-    )
-
-
-@router.message(AdminCollectionState.waiting_for_upload_file)
-async def admin_coll_upload_file(message: Message, state: FSMContext):
-    data = await state.get_data()
-    coll_id = data.get('upload_coll_id')
-    if not coll_id:
-        await state.clear()
-        return
-
-    file_id = None
-    media_type = None
-    file_name = None
-
+def _detect_uploaded_media(message: Message):
     if message.photo:
-        file_id = message.photo[-1].file_id
-        media_type = "image"
-        file_name = f"photo_{message.photo[-1].file_unique_id}"
-    elif message.video:
-        file_id = message.video.file_id
-        media_type = "video"
-        file_name = message.video.file_name or f"video_{message.video.file_unique_id}"
-    elif message.audio:
-        file_id = message.audio.file_id
-        media_type = "audio"
-        file_name = message.audio.file_name or f"audio_{message.audio.file_unique_id}"
-    elif message.document:
-        file_id = message.document.file_id
+        photo = message.photo[-1]
+        return photo.file_id, "photo", f"photo_{photo.file_unique_id}"
+    if message.video:
+        return message.video.file_id, "video", message.video.file_name or f"video_{message.video.file_unique_id}"
+    if message.audio:
+        return message.audio.file_id, "audio", message.audio.file_name or f"audio_{message.audio.file_unique_id}"
+    if message.voice:
+        return message.voice.file_id, "audio", f"voice_{message.voice.file_unique_id}"
+    if message.document:
         mime = message.document.mime_type or ""
         if mime.startswith("image"):
-            media_type = "image"
+            media_type = "photo"
         elif mime.startswith("video"):
             media_type = "video"
         elif mime.startswith("audio"):
             media_type = "audio"
         else:
             media_type = "document"
-        file_name = message.document.file_name or f"doc_{message.document.file_unique_id}"
-    else:
+        return message.document.file_id, media_type, message.document.file_name or f"doc_{message.document.file_unique_id}"
+    return None, None, None
+
+
+def _collection_upload_cancel_callback(data: dict) -> str:
+    coll_id = data['upload_coll_id']
+    list_page = data.get('collection_list_page', 0)
+    if data.get('upload_return') == 'files':
+        return f"admin_coll_files_{coll_id}_{data.get('upload_return_page', 0)}_{list_page}"
+    return f"admin_coll_view_{coll_id}_{list_page}"
+
+
+async def _start_collection_upload(
+    callback: CallbackQuery,
+    state: FSMContext,
+    coll_id: int,
+    list_page: int,
+    *,
+    return_page: int | None = None,
+):
+    if not await _require_media_collection_admin(callback, state):
+        return
+    async with async_session_maker() as session:
+        if not await session.get(MediaCollection, coll_id):
+            await callback.answer("Коллекция не найдена.", show_alert=True)
+            return
+    await state.clear()
+    await state.set_state(AdminCollectionState.waiting_for_upload_file)
+    await state.update_data(
+        upload_coll_id=coll_id,
+        collection_list_page=list_page,
+        upload_return='files' if return_page is not None else 'detail',
+        upload_return_page=return_page,
+    )
+    await callback.message.edit_text(
+        "📤 Отправьте медиа-файл (фото, видео, аудио, документ) для добавления в коллекцию.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_coll_files_{coll_id}_{return_page}_{list_page}" if return_page is not None else f"admin_coll_view_{coll_id}_{list_page}")]
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_coll_upload_files_"), StateFilter('*'))
+async def admin_coll_upload_from_files(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    await _start_collection_upload(
+        callback,
+        state,
+        int(parts[4]),
+        int(parts[6]) if len(parts) > 6 else 0,
+        return_page=int(parts[5]) if len(parts) > 5 else 0,
+    )
+
+
+@router.callback_query(F.data.startswith("admin_coll_upload_"), StateFilter('*'))
+async def admin_coll_upload(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    await _start_collection_upload(
+        callback,
+        state,
+        int(parts[3]),
+        int(parts[4]) if len(parts) > 4 else 0,
+    )
+
+
+@router.message(AdminCollectionState.waiting_for_upload_file)
+async def admin_coll_upload_file(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
+    data = await state.get_data()
+    coll_id = data.get('upload_coll_id')
+    if not coll_id:
+        await state.clear()
+        return
+    file_id, media_type, suggested_name = _detect_uploaded_media(message)
+    if not file_id:
         await message.answer("Отправьте фото, видео, аудио или документ.")
         return
+    await state.update_data(upload_file_id=file_id, upload_media_type=media_type, upload_suggested_name=suggested_name)
+    await state.set_state(AdminCollectionState.waiting_for_upload_name)
+    await message.answer(
+        f"✅ Файл получен как {media_type}.\nВведите техническое имя файла:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=_collection_upload_cancel_callback(data))]
+        ]),
+    )
 
+
+@router.message(AdminCollectionState.waiting_for_upload_name, F.text)
+async def admin_coll_upload_name(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
+    name = message.text.strip().lower().replace(" ", "_")
+    if not name:
+        await message.answer("Имя не может быть пустым.")
+        return
+    data = await state.get_data()
+    await state.update_data(upload_file_name=name)
+    data = await state.get_data()
+    cancel_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=_collection_upload_cancel_callback(data),
+        )]
+    ])
+    if data.get('upload_media_type') == 'photo':
+        await state.set_state(AdminCollectionState.waiting_for_upload_category)
+        await message.answer("Введите категорию изображения:", reply_markup=cancel_markup)
+    else:
+        await state.set_state(AdminCollectionState.waiting_for_upload_description)
+        await message.answer("Введите описание файла:", reply_markup=cancel_markup)
+
+
+@router.message(AdminCollectionState.waiting_for_upload_category, F.text)
+async def admin_coll_upload_category(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
+    category = message.text.strip().lower().replace(" ", "_")
+    await state.update_data(upload_category=category)
+    await state.set_state(AdminCollectionState.waiting_for_upload_description)
+    data = await state.get_data()
+    await message.answer(
+        "Введите описание файла:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=_collection_upload_cancel_callback(data),
+            )]
+        ]),
+    )
+
+
+@router.message(AdminCollectionState.waiting_for_upload_description, F.text)
+async def admin_coll_upload_description(message: Message, state: FSMContext):
+    if not await _require_media_collection_admin(message, state):
+        return
+    data = await state.get_data()
+    coll_id = data.get('upload_coll_id')
+    if not coll_id:
+        await state.clear()
+        return
     async with async_session_maker() as session:
+        if not await session.get(MediaCollection, coll_id):
+            await state.clear()
+            await message.answer("Коллекция не найдена.")
+            return
         media = MediaLibrary(
-            media_type=media_type,
-            file_id=file_id,
-            file_name=file_name,
-            category="",
+            media_type=data['upload_media_type'],
+            file_id=data['upload_file_id'],
+            file_name=data['upload_file_name'],
+            category=data.get('upload_category', ''),
+            description=message.text.strip(),
         )
         session.add(media)
         await session.flush()
-        await session.execute(
-            media_collection_items.insert().values(collection_id=coll_id, media_id=media.id)
-        )
+        await session.execute(media_collection_items.insert().values(collection_id=coll_id, media_id=media.id))
         await session.commit()
-
+    list_page = data.get('collection_list_page', 0)
+    return_page = data.get('upload_return_page')
     await state.clear()
-    await message.answer(
-        f"✅ Файл «{file_name}» добавлен в коллекцию.",
-        reply_markup=kb.admin_collection_detail_keyboard(coll_id)
+    await message.answer(f"✅ Файл «{media.file_name}» добавлен в коллекцию.")
+    await _answer_collection_files(message, coll_id, return_page or 0, list_page)
+
+
+async def _collection_media_payload(coll_id: int, media_id: int):
+    async with async_session_maker() as session:
+        media = await session.scalar(
+            select(MediaLibrary)
+            .join(media_collection_items, media_collection_items.c.media_id == MediaLibrary.id)
+            .where(
+                media_collection_items.c.collection_id == coll_id,
+                MediaLibrary.id == media_id,
+            )
+        )
+        coll = await session.get(MediaCollection, coll_id)
+        if not media or not coll:
+            return None
+        collection_names = (await session.execute(
+            select(MediaCollection.name)
+            .join(media_collection_items, media_collection_items.c.collection_id == MediaCollection.id)
+            .where(media_collection_items.c.media_id == media_id)
+            .order_by(MediaCollection.name)
+        )).scalars().all()
+    return media, coll.name, list(collection_names)
+
+
+def _collection_media_text(media: MediaLibrary, collection_names: list[str]) -> str:
+    role_hint = ""
+    if media.file_name == '_back':
+        role_hint = f"\n🃏 <b>Рубашка</b> для категории <code>{html.escape(media.category or '')}</code>"
+    return (
+        "<b>📄 Данные файла:</b>\n"
+        f"ID: <code>{media.id}</code>\n"
+        f"Имя для AI: <code>{html.escape(media.file_name or '')}</code>\n"
+        f"Тип: {html.escape(media.media_type)}\n"
+        f"Категория: {html.escape(media.category or 'Не задана')}\n"
+        f"Коллекции: {html.escape(', '.join(collection_names) or 'нет')}\n"
+        f"Описание: {html.escape(media.description or 'Нет')}"
+        f"{role_hint}"
     )
+
+
+async def _send_collection_media_view(
+    bot: Bot,
+    chat_id: int,
+    coll_id: int,
+    media_id: int,
+    page: int = 0,
+    list_page: int = 0,
+    source_message=None,
+):
+    payload = await _collection_media_payload(coll_id, media_id)
+    if payload is None:
+        if source_message is not None:
+            await source_message.answer("Файл не найден в этой коллекции.")
+        return
+    media, _, collection_names = payload
+    text = _collection_media_text(media, collection_names)
+    markup = kb.collection_media_edit_keyboard(media_id, coll_id, page, list_page)
+    try:
+        if media.media_type == 'audio':
+            await bot.send_audio(chat_id=chat_id, audio=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
+        elif media.media_type == 'video':
+            await bot.send_video(chat_id=chat_id, video=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
+        elif media.media_type in PHOTO_MEDIA_TYPES:
+            await bot.send_photo(chat_id=chat_id, photo=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
+        else:
+            await bot.send_document(chat_id=chat_id, document=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
+    except Exception as exc:
+        log.warning(
+            "Collection media preview failed collection_id=%s media_id=%s type=%s error=%s",
+            coll_id,
+            media_id,
+            media.media_type,
+            sanitize_secret_values(exception_summary(exc))[:240],
+        )
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode='HTML')
+    if source_message is not None:
+        try:
+            await source_message.delete()
+        except Exception:
+            pass
+
+
+async def _answer_collection_media_view(message: Message, coll_id: int, media_id: int, page: int, list_page: int):
+    payload = await _collection_media_payload(coll_id, media_id)
+    if payload is None:
+        await message.answer("Файл не найден в этой коллекции.")
+        return
+    media, _, collection_names = payload
+    text = _collection_media_text(media, collection_names)
+    markup = kb.collection_media_edit_keyboard(media_id, coll_id, page, list_page)
+    try:
+        if media.media_type == 'audio':
+            await message.answer_audio(audio=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
+        elif media.media_type == 'video':
+            await message.answer_video(video=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
+        elif media.media_type in PHOTO_MEDIA_TYPES:
+            await message.answer_photo(photo=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
+        else:
+            await message.answer_document(document=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
+    except Exception as exc:
+        log.warning(
+            "Collection media preview failed collection_id=%s media_id=%s type=%s error=%s",
+            coll_id,
+            media_id,
+            media.media_type,
+            sanitize_secret_values(exception_summary(exc))[:240],
+        )
+        await message.answer(text, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data.startswith("admin_coll_file_view_"), StateFilter('*'))
+async def admin_coll_file_view(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = callback.data.split("_")
+    await _send_collection_media_view(
+        callback.bot,
+        callback.message.chat.id,
+        int(parts[4]),
+        int(parts[5]),
+        int(parts[6]) if len(parts) > 6 else 0,
+        int(parts[7]) if len(parts) > 7 else 0,
+        callback.message,
+    )
+    await callback.answer()
+
+
+async def _start_collection_media_edit(callback: CallbackQuery, state: FSMContext, field: str, prompt: str):
+    if not await _require_media_collection_admin(callback, state):
+        return
+    parts = callback.data.split("_")
+    media_id = int(parts[4])
+    coll_id = int(parts[5])
+    page = int(parts[6]) if len(parts) > 6 else 0
+    list_page = int(parts[7]) if len(parts) > 7 else 0
+    if await _collection_media_payload(coll_id, media_id) is None:
+        await callback.answer("Файл не найден в этой коллекции.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(
+        edit_media_id=media_id,
+        collection_id=coll_id,
+        collection_page=page,
+        collection_list_page=list_page,
+    )
+    await state.set_state(getattr(AdminMediaState, f"editing_{field}"))
+    await callback.message.answer(
+        prompt,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_coll_media_cancel_{coll_id}_{media_id}_{page}_{list_page}")]
+        ]),
+    )
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_coll_media_editname_"), StateFilter('*'))
+async def admin_coll_media_edit_name_start(callback: CallbackQuery, state: FSMContext):
+    await _start_collection_media_edit(callback, state, "name", "Введи новое <b>техническое имя</b> для файла:")
+
+
+@router.callback_query(F.data.startswith("admin_coll_media_editcat_"), StateFilter('*'))
+async def admin_coll_media_edit_category_start(callback: CallbackQuery, state: FSMContext):
+    await _start_collection_media_edit(callback, state, "category", "Введи новую <b>категорию</b> для файла:")
+
+
+@router.callback_query(F.data.startswith("admin_coll_media_editdesc_"), StateFilter('*'))
+async def admin_coll_media_edit_desc_start(callback: CallbackQuery, state: FSMContext):
+    await _start_collection_media_edit(callback, state, "description", "Введи новое <b>описание</b> для файла:")
+
+
+@router.callback_query(F.data.startswith("admin_coll_media_editfile_"), StateFilter('*'))
+async def admin_coll_media_edit_file_start(callback: CallbackQuery, state: FSMContext):
+    await _start_collection_media_edit(callback, state, "file", "Отправь новый файл для замены:")
+
+
+@router.callback_query(F.data.startswith("admin_coll_media_cancel_"), StateFilter('*'))
+async def admin_coll_media_cancel(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    coll_id = int(parts[4])
+    media_id = int(parts[5])
+    page = int(parts[6]) if len(parts) > 6 else 0
+    list_page = int(parts[7]) if len(parts) > 7 else 0
+    await state.clear()
+    await _send_collection_media_view(
+        callback.bot,
+        callback.message.chat.id,
+        coll_id,
+        media_id,
+        page,
+        list_page,
+        callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_coll_media_delete_confirm_"), StateFilter('*'))
+async def admin_coll_media_delete_confirm(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
+    parts = callback.data.split("_")
+    media_id = int(parts[5])
+    coll_id = int(parts[6])
+    page = int(parts[7]) if len(parts) > 7 else 0
+    list_page = int(parts[8]) if len(parts) > 8 else 0
+    await state.clear()
+    async with async_session_maker() as session:
+        media = await session.scalar(
+            select(MediaLibrary)
+            .join(media_collection_items, media_collection_items.c.media_id == MediaLibrary.id)
+            .where(
+                MediaLibrary.id == media_id,
+                media_collection_items.c.collection_id == coll_id,
+            )
+        )
+        if not media:
+            await callback.answer("Файл не найден.", show_alert=True)
+            return
+        await session.execute(media_collection_items.delete().where(
+            media_collection_items.c.collection_id == coll_id,
+            media_collection_items.c.media_id == media_id,
+        ))
+        await session.commit()
+    await callback.answer("Файл убран из коллекции.", show_alert=True)
+    await _show_collection_files(
+        callback.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        coll_id,
+        page,
+        list_page,
+        callback.message,
+    )
+
+
+@router.callback_query(F.data.startswith("admin_coll_media_delete_cancel_"), StateFilter('*'))
+async def admin_coll_media_delete_cancel(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    coll_id = int(parts[5])
+    media_id = int(parts[6])
+    page = int(parts[7]) if len(parts) > 7 else 0
+    list_page = int(parts[8]) if len(parts) > 8 else 0
+    await state.clear()
+    await _send_collection_media_view(
+        callback.bot,
+        callback.message.chat.id,
+        coll_id,
+        media_id,
+        page,
+        list_page,
+        callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_coll_media_delete_"), StateFilter('*'))
+async def admin_coll_media_delete_start(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
+    parts = callback.data.split("_")
+    media_id = int(parts[4])
+    coll_id = int(parts[5])
+    page = int(parts[6]) if len(parts) > 6 else 0
+    list_page = int(parts[7]) if len(parts) > 7 else 0
+    await state.clear()
+    payload = await _collection_media_payload(coll_id, media_id)
+    if payload is None:
+        await callback.answer("Файл не найден.", show_alert=True)
+        return
+    media, _, _ = payload
+    await callback.message.answer(
+        f"Убрать файл «{html.escape(media.file_name or str(media.id))}» из этой коллекции?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑️ Да, удалить", callback_data=f"admin_coll_media_delete_confirm_{media_id}_{coll_id}_{page}_{list_page}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_coll_media_delete_cancel_{coll_id}_{media_id}_{page}_{list_page}")],
+        ]),
+    )
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.answer()
 
 
 # ─────────── Привязка коллекций к темам ───────────
@@ -8116,10 +8618,11 @@ async def _show_assign_collections_to_topic(bot: Bot, chat_id: int, message_id: 
 
     total = len(all_colls)
     total_pages = max(1, math.ceil(total / PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
     page_colls = all_colls[page * PAGE_SIZE: (page + 1) * PAGE_SIZE]
 
     text = (
-        f"🎨 Привязка коллекций к теме: <b>{topic.name}</b>\n"
+        f"🎨 Привязка коллекций к теме: <b>{html.escape(topic.name)}</b>\n"
         f"Нажмите, чтобы добавить или убрать коллекцию."
     )
     await bot.edit_message_text(
@@ -8131,7 +8634,7 @@ async def _show_assign_collections_to_topic(bot: Bot, chat_id: int, message_id: 
 
 @router.callback_query(F.data.startswith("assign_coll_topic_"), StateFilter('*'))
 async def admin_assign_coll_to_topic(callback: CallbackQuery, state: FSMContext):
-    # assign_coll_topic_{topic_id}_page_{page}
+    await state.clear()
     parts = callback.data.split("_")
     topic_id = int(parts[3])
     page = int(parts[5])
@@ -8142,7 +8645,10 @@ async def admin_assign_coll_to_topic(callback: CallbackQuery, state: FSMContext)
 
 
 @router.callback_query(F.data.startswith("topcoll_"), StateFilter('*'))
-async def admin_toggle_coll_for_topic(callback: CallbackQuery):
+async def admin_toggle_coll_for_topic(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
+    await state.clear()
     parts = callback.data.split("_")
     # topcoll_{action}_{topic_id}_{coll_id}_{page}
     action = parts[1]
@@ -8171,6 +8677,82 @@ async def admin_toggle_coll_for_topic(callback: CallbackQuery):
     await callback.answer("✅")
     await _show_assign_collections_to_topic(
         callback.bot, callback.message.chat.id, callback.message.message_id, topic_id, page
+    )
+
+
+async def _show_assign_collections_to_main(bot: Bot, chat_id: int, message_id: int, page: int = 0):
+    page_size = 10
+    async with async_session_maker() as session:
+        rows = (await session.execute(
+            select(MediaCollection.id, MediaCollection.name, func.count(media_collection_items.c.media_id))
+            .outerjoin(media_collection_items, media_collection_items.c.collection_id == MediaCollection.id)
+            .group_by(MediaCollection.id)
+            .order_by(MediaCollection.name)
+        )).all()
+        assigned_ids = set((await session.execute(
+            select(main_dialogue_collection_association.c.collection_id)
+        )).scalars().all())
+
+    all_colls = [{'id': row[0], 'name': f"{row[1]} ({row[2]})"} for row in rows]
+    total_pages = max(1, math.ceil(len(all_colls) / page_size))
+    page = max(0, min(page, total_pages - 1))
+    page_colls = all_colls[page * page_size:(page + 1) * page_size]
+    await bot.edit_message_text(
+        text="🎨 <b>Медиаколлекции основного диалога</b>\nНажмите, чтобы добавить или убрать коллекцию.",
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=kb.assign_collections_to_main_keyboard(page_colls, assigned_ids, page, total_pages),
+        parse_mode='HTML',
+    )
+
+
+@router.callback_query(F.data.startswith("admin_main_collections_page_"), StateFilter('*'))
+async def admin_main_collections_page(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _show_assign_collections_to_main(
+        callback.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        int(callback.data.split("_")[-1]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("maincoll_"), StateFilter('*'))
+async def admin_toggle_coll_for_main(callback: CallbackQuery, state: FSMContext):
+    if not await _require_media_collection_admin(callback, state):
+        return
+    await state.clear()
+    parts = callback.data.split("_")
+    action = parts[1]
+    coll_id = int(parts[2])
+    page = int(parts[3])
+    async with async_session_maker() as session:
+        if not await session.get(MediaCollection, coll_id):
+            await callback.answer("Коллекция не найдена.", show_alert=True)
+            return
+        if action == "add":
+            exists = await session.scalar(
+                select(main_dialogue_collection_association.c.collection_id).where(
+                    main_dialogue_collection_association.c.collection_id == coll_id
+                )
+            )
+            if exists is None:
+                await session.execute(main_dialogue_collection_association.insert().values(collection_id=coll_id))
+        elif action == "remove":
+            await session.execute(main_dialogue_collection_association.delete().where(
+                main_dialogue_collection_association.c.collection_id == coll_id
+            ))
+        else:
+            await callback.answer("Недопустимое действие.", show_alert=True)
+            return
+        await session.commit()
+    await callback.answer("✅")
+    await _show_assign_collections_to_main(
+        callback.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        page,
     )
 
 
@@ -11887,8 +12469,9 @@ async def _show_edit_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_i
                 pass
             return
 
+        media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
         media_count = await session.scalar(
-            select(func.count(MediaLibrary.id)).where(MediaLibrary.topic_id == topic_id)
+            select(func.count(MediaLibrary.id)).where(media_scope.predicate())
         )
 
         # collections assigned to this topic
@@ -11927,7 +12510,7 @@ async def _show_edit_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_i
         f"<b>Приветствие:</b> {intro_status}\n"
         f"<b>Кнопка действия:</b> {btn_status}\n"
         f"<b>Файлов БЗ (RAG):</b> {kb_files_count}\n"
-        f"<b>Медиа-файлов (аудио/фото):</b> {media_count}\n"
+        f"<b>Медиа-файлов:</b> {media_count}\n"
         f"<b>Коллекции:</b> {colls_info}"
     )
 
@@ -14450,7 +15033,9 @@ async def admin_test_toggle_profile_field(callback: CallbackQuery):
 
 
 @router.callback_query(F.data == "admin_general_settings")
-async def admin_general_settings(callback: CallbackQuery):
+async def admin_general_settings(callback: CallbackQuery, state: FSMContext | None = None):
+    if state is not None:
+        await state.clear()
     if getattr(callback, "data", None) == "admin_general_settings":
         await callback.answer()
     async with async_session_maker() as session:
@@ -16210,445 +16795,225 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Произошла ошибка при обработке фото.")
 
 
-@router.callback_query(F.data.startswith("admin_topic_media_"))
-async def admin_topic_media_list(callback: CallbackQuery):
-    MEDIA_PAGE_SIZE = 10
-    parts = callback.data.split("_")
-    topic_id = int(parts[3])
-    page = int(parts[4]) if len(parts) > 4 else 0
-
-    async with async_session_maker() as session:
-        total_count = await session.scalar(
-            select(func.count()).select_from(MediaLibrary).where(MediaLibrary.topic_id == topic_id)
-        )
-        stmt = (
-            select(MediaLibrary)
-            .where(MediaLibrary.topic_id == topic_id)
-            .order_by(MediaLibrary.id)
-            .offset(page * MEDIA_PAGE_SIZE)
-            .limit(MEDIA_PAGE_SIZE)
-        )
-        result = await session.execute(stmt)
-        media_list = result.scalars().all()
-        topic = await session.get(Topic, topic_id)
-
-        # Проверяем какие категории есть и у каких есть _back
-        cat_stmt = select(MediaLibrary.category, MediaLibrary.file_name).where(
-            MediaLibrary.topic_id == topic_id,
-            MediaLibrary.category != None,
-            MediaLibrary.category != ''
-        )
-        cat_res = await session.execute(cat_stmt)
-        cat_rows = cat_res.all()
-        categories = set()
-        back_categories = set()
-        for cat, fname in cat_rows:
-            categories.add(cat)
-            if fname == '_back':
-                back_categories.add(cat)
-
-    total_pages = max(1, (total_count + MEDIA_PAGE_SIZE - 1) // MEDIA_PAGE_SIZE)
-
-    cats_info = ""
-    if categories:
-        cat_lines = []
-        for cat in sorted(categories):
-            has_back = "🃏" if cat in back_categories else "⚠️ нет рубашки"
-            cat_lines.append(f"  <code>{cat}</code> — {has_back}")
-        cats_info = "\n<b>Категории:</b>\n" + "\n".join(cat_lines) + "\n"
-
-    text = (
-        f"📁 Медиа-библиотека темы: <b>{topic.name}</b>\n"
-        f"Файлов: {total_count}"
-        f"{cats_info}\n"
-        f"<b>Теги для AI:</b>\n"
-        f"<code>[RANDOM_IMG: категория]</code> — случайная карта\n"
-        f"<code>[RANDOM_IMG: категория | N]</code> — N случайных карт сразу\n"
-        f"<code>[CHOICE_IMG: категория | N]</code> — выбор из N (лицом)\n"
-        f"<code>[CHOICE_IMG: категория | N | R]</code> — расклад из R карт, выбор из N\n"
-        f"<code>[CHOICE_IMG_HIDDEN: категория | N]</code> — выбор из N (рубашкой)\n"
-        f"<code>[CHOICE_IMG_HIDDEN: категория | N | R]</code> — расклад из R карт вслепую\n"
-        f"<code>[SHOW_IMG: имя_файла]</code> — конкретная карта\n"
-        f"<code>[SEND_AUDIO: имя_файла]</code> — аудиофайл\n\n"
-        f"🃏 Для скрытого выбора добавьте файл с именем <code>_back</code> в нужную категорию."
+@router.callback_query(F.data.startswith("admin_topic_media_"), StateFilter('*'))
+async def admin_topic_media_list(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    topic_id = int(callback.data.split("_")[3])
+    await _show_assign_collections_to_topic(
+        callback.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        topic_id,
+        0,
     )
-    kb = keyboards.topic_media_manage_keyboard(topic_id, media_list, page, total_pages)
-
-    if callback.message.text:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
-    else:
-        await callback.message.answer(text, reply_markup=kb, parse_mode='HTML')
-        await callback.message.delete()
+    await callback.answer("Управление файлами перенесено в медиа-коллекции.", show_alert=True)
+    return
 
 
 @router.callback_query(F.data.startswith("admin_media_view_"))
 async def admin_media_view(callback: CallbackQuery):
     media_id = int(callback.data.split("_")[3])
     async with async_session_maker() as session:
-        media = await session.get(MediaLibrary, media_id)
-        if not media:
-            await callback.answer("Файл не найден.", show_alert=True)
-            return
-        # collections this file belongs to
-        coll_res = await session.execute(
-            select(MediaCollection.name).join(
-                media_collection_items,
-                media_collection_items.c.collection_id == MediaCollection.id
-            ).where(media_collection_items.c.media_id == media_id)
+        collection_id = await session.scalar(
+            select(media_collection_items.c.collection_id)
+            .where(media_collection_items.c.media_id == media_id)
+            .order_by(media_collection_items.c.collection_id)
         )
-        coll_names = [r[0] for r in coll_res.all()]
-
-    role_hint = ""
-    if media.file_name == '_back':
-        role_hint = f"\n🃏 <b>Рубашка</b> для категории <code>{media.category}</code>"
-
-    colls_text = ", ".join(coll_names) if coll_names else "нет"
-    text = (
-        f"<b>📄 Данные файла:</b>\n"
-        f"ID: <code>{media.id}</code>\n"
-        f"Имя для AI: <code>{media.file_name}</code>\n"
-        f"Тип: {media.media_type}\n"
-        f"Категория: {media.category or 'Не задана'}\n"
-        f"Коллекции: {colls_text}\n"
-        f"Описание: {media.description or 'Нет'}"
-        f"{role_hint}"
-    )
-
-    kb = keyboards.media_edit_keyboard(media.id, media.topic_id)
-    try:
-        if media.media_type == 'audio':
-            await callback.message.answer_audio(
-                audio=media.file_id, caption=text, reply_markup=kb, parse_mode='HTML'
-            )
-        else:
-            await callback.message.answer_photo(
-                photo=media.file_id, caption=text, reply_markup=kb, parse_mode='HTML'
-            )
-    except Exception:
-        await callback.message.answer_document(
-            document=media.file_id, caption=text, reply_markup=kb, parse_mode='HTML'
+    if collection_id is not None:
+        await _send_collection_media_view(
+            callback.bot,
+            callback.message.chat.id,
+            collection_id,
+            media_id,
+            0,
+            0,
+            callback.message,
         )
-
-    await callback.message.delete()
-    await callback.answer()
+        await callback.answer()
+        return
+    await callback.answer("Файл не привязан к коллекции.", show_alert=True)
+    return
 
 
 @router.callback_query(F.data.startswith("admin_media_editname_"))
 async def admin_media_edit_name_start(callback: CallbackQuery, state: FSMContext):
-    media_id = int(callback.data.split("_")[3])
-    await state.update_data(edit_media_id=media_id)
-    await state.set_state(AdminMediaState.editing_name)
-    await callback.message.answer(
-        "Введи новое <b>техническое имя</b> для файла (на английском, без пробелов):",
-        parse_mode='HTML'
-    )
-    await callback.answer()
+    await state.clear()
+    await callback.answer("Управление файлами доступно внутри медиа-коллекции.", show_alert=True)
+    return
+
+
+async def _finish_collection_media_text_edit(
+    message: Message,
+    state: FSMContext,
+    field: str,
+    value: str,
+    confirmation: str,
+) -> bool:
+    if not await _require_media_collection_admin(message, state):
+        return True
+    data = await state.get_data()
+    coll_id = data.get('collection_id')
+    media_id = data.get('edit_media_id')
+    if not coll_id or not media_id:
+        return False
+    async with async_session_maker() as session:
+        media = await session.scalar(
+            select(MediaLibrary)
+            .join(media_collection_items, media_collection_items.c.media_id == MediaLibrary.id)
+            .where(
+                MediaLibrary.id == media_id,
+                media_collection_items.c.collection_id == coll_id,
+            )
+        )
+        if not media:
+            await state.clear()
+            await message.answer("Файл не найден в этой коллекции.")
+            return True
+        setattr(media, field, value)
+        await session.commit()
+    page = data.get('collection_page', 0)
+    list_page = data.get('collection_list_page', 0)
+    await state.clear()
+    await message.answer(confirmation, parse_mode='HTML')
+    await _answer_collection_media_view(message, coll_id, media_id, page, list_page)
+    return True
 
 
 @router.message(AdminMediaState.editing_name)
 async def admin_media_edit_name_finish(message: Message, state: FSMContext):
     data = await state.get_data()
-    media_id = data['edit_media_id']
-    new_name = message.text.strip().lower().replace(" ", "_")
-
-    async with async_session_maker() as session:
-        media = await session.get(MediaLibrary, media_id)
-        if media:
-            media.file_name = new_name
-            await session.commit()
-            topic_id = media.topic_id
+    if data.get('collection_id'):
+        if await _finish_collection_media_text_edit(
+            message,
+            state,
+            'file_name',
+            (message.text or "").strip().lower().replace(" ", "_"),
+            f"✅ Имя изменено на <code>{(message.text or '').strip().lower().replace(' ', '_')}</code>.",
+        ):
+            return
     await state.clear()
-    await message.answer(f"✅ Имя изменено на <code>{new_name}</code>.", parse_mode='HTML')
+    await message.answer("Управление файлами доступно внутри медиа-коллекции.")
+    return
 
 
 @router.callback_query(F.data.startswith("admin_media_editcat_"))
 async def admin_media_edit_category_start(callback: CallbackQuery, state: FSMContext):
-    media_id = int(callback.data.split("_")[3])
-    await state.update_data(edit_media_id=media_id)
-    await state.set_state(AdminMediaState.editing_category)
-    await callback.message.answer(
-        "Введи новую <b>категорию</b> (например: <code>tarot</code>, <code>mak</code>, <code>oracle</code>):",
-        parse_mode='HTML'
-    )
-    await callback.answer()
+    await state.clear()
+    await callback.answer("Управление файлами доступно внутри медиа-коллекции.", show_alert=True)
+    return
 
 
 @router.message(AdminMediaState.editing_category)
 async def admin_media_edit_category_finish(message: Message, state: FSMContext):
     data = await state.get_data()
-    media_id = data['edit_media_id']
-    new_category = message.text.strip().lower().replace(" ", "_")
-
-    async with async_session_maker() as session:
-        media = await session.get(MediaLibrary, media_id)
-        if media:
-            media.category = new_category
-            await session.commit()
+    if data.get('collection_id'):
+        if await _finish_collection_media_text_edit(
+            message,
+            state,
+            'category',
+            (message.text or "").strip().lower().replace(" ", "_"),
+            f"✅ Категория изменена на <code>{(message.text or '').strip().lower().replace(' ', '_')}</code>.",
+        ):
+            return
     await state.clear()
-    await message.answer(f"✅ Категория изменена на <code>{new_category}</code>.", parse_mode='HTML')
+    await message.answer("Управление файлами доступно внутри медиа-коллекции.")
+    return
 
 
 @router.callback_query(F.data.startswith("admin_media_editdesc_"))
 async def admin_media_edit_desc_start(callback: CallbackQuery, state: FSMContext):
-    media_id = int(callback.data.split("_")[3])
-    await state.update_data(edit_media_id=media_id)
-    await state.set_state(AdminMediaState.editing_description)
-    await callback.message.answer(
-        "Введи новое <b>описание</b> для файла:",
-        parse_mode='HTML'
-    )
-    await callback.answer()
+    await state.clear()
+    await callback.answer("Управление файлами доступно внутри медиа-коллекции.", show_alert=True)
+    return
 
 
 @router.message(AdminMediaState.editing_description)
 async def admin_media_edit_desc_finish(message: Message, state: FSMContext):
     data = await state.get_data()
-    media_id = data['edit_media_id']
-
-    async with async_session_maker() as session:
-        media = await session.get(MediaLibrary, media_id)
-        if media:
-            media.description = message.text.strip()
-            await session.commit()
+    if data.get('collection_id'):
+        if await _finish_collection_media_text_edit(
+            message,
+            state,
+            'description',
+            (message.text or "").strip(),
+            "✅ Описание обновлено.",
+        ):
+            return
     await state.clear()
-    await message.answer("✅ Описание обновлено.")
+    await message.answer("Управление файлами доступно внутри медиа-коллекции.")
+    return
 
 
 @router.callback_query(F.data.startswith("admin_media_editfile_"))
 async def admin_media_edit_file_start(callback: CallbackQuery, state: FSMContext):
-    media_id = int(callback.data.split("_")[3])
-    await state.update_data(edit_media_id=media_id)
-    await state.set_state(AdminMediaState.editing_file)
-    await callback.message.answer("Отправь новый файл (фото или аудио) для замены:")
-    await callback.answer()
+    await state.clear()
+    await callback.answer("Управление файлами доступно внутри медиа-коллекции.", show_alert=True)
+    return
 
 
-@router.message(AdminMediaState.editing_file, F.photo | F.audio | F.voice | F.document)
+@router.message(AdminMediaState.editing_file, F.photo | F.video | F.audio | F.voice | F.document)
 async def admin_media_edit_file_finish(message: Message, state: FSMContext):
-    data = await state.get_data()
-    media_id = data['edit_media_id']
-
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        m_type = "photo"
-    elif message.audio:
-        file_id = message.audio.file_id
-        m_type = "audio"
-    elif message.voice:
-        file_id = message.voice.file_id
-        m_type = "audio"
-    elif message.document:
-        file_id = message.document.file_id
-        m_type = "photo" if message.document.mime_type and message.document.mime_type.startswith('image/') else "audio"
-    else:
-        await message.answer("Отправь фото или аудиофайл.")
+    if not await _require_media_collection_admin(message, state):
         return
+    data = await state.get_data()
 
-    async with async_session_maker() as session:
-        media = await session.get(MediaLibrary, media_id)
-        if media:
+    if data.get('collection_id'):
+        media_id = data.get('edit_media_id')
+        if not media_id:
+            await state.clear()
+            await message.answer("Файл не найден в этой коллекции.")
+            return
+        file_id, m_type, _ = _detect_uploaded_media(message)
+        if not file_id:
+            await message.answer("Отправь фото, видео, аудио или документ.")
+            return
+        coll_id = data['collection_id']
+        async with async_session_maker() as session:
+            media = await session.scalar(
+                select(MediaLibrary)
+                .join(media_collection_items, media_collection_items.c.media_id == MediaLibrary.id)
+                .where(
+                    MediaLibrary.id == media_id,
+                    media_collection_items.c.collection_id == coll_id,
+                )
+            )
+            if not media:
+                await state.clear()
+                await message.answer("Файл не найден в этой коллекции.")
+                return
             media.file_id = file_id
             media.media_type = m_type
             await session.commit()
+        page = data.get('collection_page', 0)
+        list_page = data.get('collection_list_page', 0)
+        await state.clear()
+        await message.answer("✅ Файл заменён.")
+        await _answer_collection_media_view(message, coll_id, media_id, page, list_page)
+        return
     await state.clear()
-    await message.answer("✅ Файл заменён.")
+    await message.answer("Управление файлами доступно внутри медиа-коллекции.")
+    return
 
 
 @router.callback_query(F.data.startswith("admin_media_add_"))
 async def admin_media_add_start(callback: CallbackQuery, state: FSMContext):
     topic_id = int(callback.data.split("_")[3])
-    await state.update_data(target_topic_id=topic_id)
-    await state.set_state(AdminMediaState.waiting_for_file)
-    await callback.message.edit_text("Отправь мне файл (фото или аудио), который хочешь добавить в эту тему.")
-
-
-@router.message(AdminMediaState.waiting_for_file, F.photo | F.audio | F.voice | F.document)
-async def admin_media_file_receive(message: Message, state: FSMContext):
-    m_type = ""
-    file_id = ""
-
-    if message.photo:
-        m_type = "photo"
-        file_id = message.photo[-1].file_id
-    elif message.audio:
-        m_type = "audio"
-        file_id = message.audio.file_id
-    elif message.voice:
-        m_type = "audio"
-        file_id = message.voice.file_id
-    elif message.document:
-        m_type = "photo" if message.document.mime_type.startswith('image/') else "audio"
-        file_id = message.document.file_id
-
-    await state.update_data(m_file_id=file_id, m_type=m_type)
-    await state.set_state(AdminMediaState.waiting_for_name)
-
-    await message.answer(
-        f"✅ <b>Файл получен как {m_type}!</b>\n\n"
-        f"Теперь придумай короткое <b>техническое имя</b> для этого файла на английском (например: <code>morning_meditation</code>, <code>card_death</code>).\n\n"
-        f"⚠️ <b>ВАЖНО:</b> Это имя вы будете вставлять в системный промпт в формате <code>[SEND_AUDIO: имя]</code>, чтобы AI отправил этот файл пользователю.",
-        parse_mode='HTML'
-    )
-
-
-@router.message(AdminMediaState.waiting_for_name)
-async def admin_media_name_receive(message: Message, state: FSMContext):
-    tech_name = message.text.strip().lower().replace(" ", "_")
-    await state.update_data(m_name=tech_name)
-    data = await state.get_data()
-    m_type = data.get('m_type', '')
-
-    if m_type == 'photo':
-        await state.set_state(AdminMediaState.waiting_for_category)
-        await message.answer(
-            f"👌 Имя <code>{tech_name}</code> принято.\n\n"
-            f"Теперь введи <b>категорию</b> для этого изображения (например: <code>tarot</code>, <code>mak</code>, <code>oracle</code>).\n\n"
-            f"Категория используется для группировки — AI будет случайно выбирать карту из всех файлов одной категории.\n"
-            f"Если карты из одной колоды — используй одинаковую категорию для всех.",
-            parse_mode='HTML'
-        )
-    else:
-        await state.set_state(AdminMediaState.waiting_for_description)
-        await message.answer(
-            f"👌 Имя <code>{tech_name}</code> принято.\n\n"
-            f"Теперь введи описание файла.\n\n"
-            f"Для аудио — опиши, в какой момент AI должен предложить эту практику пользователю.",
-            parse_mode='HTML'
-        )
-
-
-@router.message(AdminMediaState.waiting_for_category)
-async def admin_media_category_receive(message: Message, state: FSMContext):
-    category = message.text.strip().lower().replace(" ", "_")
-    await state.update_data(m_category=category)
-    await state.set_state(AdminMediaState.waiting_for_description)
-    await message.answer(
-        f"👌 Категория <code>{category}</code> принята.\n\n"
-        f"Теперь введи описание карты — это будет её трактовка, которую AI учтёт при интерпретации.",
-        parse_mode='HTML'
-    )
-
-
-@router.message(AdminMediaState.waiting_for_description)
-async def admin_media_final(message: Message, state: FSMContext):
-    data = await state.get_data()
-    topic_id = data['target_topic_id']
-    m_type = data['m_type']
-    m_name = data['m_name']
-
-    category = data.get('m_category', '')
-
-    async with async_session_maker() as session:
-        new_media = MediaLibrary(
-            topic_id=topic_id,
-            media_type=m_type,
-            file_id=data['m_file_id'],
-            file_name=m_name,
-            category=category,
-            description=message.text.strip()
-        )
-        session.add(new_media)
-
-        # Автопривязка колоды к текущему топику
-        if category and topic_id:
-            existing_deck = await session.execute(
-                select(TopicMediaDeck).where(
-                    TopicMediaDeck.topic_id == topic_id,
-                    TopicMediaDeck.deck_name == category
-                )
-            )
-            if not existing_deck.scalar_one_or_none():
-                session.add(TopicMediaDeck(topic_id=topic_id, deck_name=category))
-
-        await session.commit()
-
-        MEDIA_PAGE_SIZE = 10
-        total_count = await session.scalar(
-            select(func.count()).select_from(MediaLibrary).where(MediaLibrary.topic_id == topic_id)
-        )
-        total_pages = max(1, (total_count + MEDIA_PAGE_SIZE - 1) // MEDIA_PAGE_SIZE)
-        last_page = total_pages - 1
-        stmt = (
-            select(MediaLibrary).where(MediaLibrary.topic_id == topic_id)
-            .order_by(MediaLibrary.id)
-            .offset(last_page * MEDIA_PAGE_SIZE).limit(MEDIA_PAGE_SIZE)
-        )
-        result = await session.execute(stmt)
-        media_list = result.scalars().all()
-        topic = await session.get(Topic, topic_id)
-
     await state.clear()
-
-    if m_name == '_back':
-        usage_hint = (
-            f"🃏 Это рубашка для категории <code>{category}</code>.\n"
-            f"Теперь AI может использовать скрытый выбор:\n"
-            f"<code>[CHOICE_IMG_HIDDEN: {category} | 3]</code>"
-        )
-    elif m_type == 'audio':
-        usage_hint = f"<code>[SEND_AUDIO: {m_name}]</code>"
-    else:
-        usage_hint = (
-            f"<code>[RANDOM_IMG: {category}]</code> — одна случайная карта\n"
-            f"<code>[RANDOM_IMG: {category} | 5]</code> — 5 случайных карт сразу\n"
-            f"<code>[CHOICE_IMG: {category} | 3]</code> — выбор из 3 карт (лицом)\n"
-            f"<code>[CHOICE_IMG: {category} | 3 | 5]</code> — расклад из 5 карт, выбор из 3\n"
-            f"<code>[CHOICE_IMG_HIDDEN: {category} | 3]</code> — выбор вслепую (рубашкой)\n"
-            f"<code>[CHOICE_IMG_HIDDEN: {category} | 3 | 5]</code> — расклад из 5 вслепую\n"
-            f"<code>[SHOW_IMG: {m_name}]</code> — показать именно эту карту"
-        )
-
-    await message.answer(
-        f"✅ <b>Файл успешно добавлен!</b>\n\n"
-        f"AI автоматически знает об этом файле и может использовать его через теги:\n"
-        f"{usage_hint}\n\n"
-        f"Файл привязан к теме: <b>{topic.name}</b>",
-        parse_mode='HTML'
+    await _show_assign_collections_to_topic(
+        callback.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        topic_id,
+        0,
     )
-
-    await message.answer(
-        f"📁 Медиа-библиотека темы: <b>{topic.name}</b>\nФайлов: {total_count}",
-        reply_markup=keyboards.topic_media_manage_keyboard(topic_id, media_list, last_page, total_pages),
-        parse_mode='HTML'
-    )
+    await callback.answer("Сначала привяжите коллекцию и добавьте файл в ней.", show_alert=True)
+    return
 
 
-@router.callback_query(F.data.startswith("admin_media_delete_"))
-async def admin_media_delete(callback: CallbackQuery):
-    media_id = int(callback.data.split("_")[3])
-    async with async_session_maker() as session:
-        media = await session.get(MediaLibrary, media_id)
-        if not media:
-            await callback.answer("Файл не найден.")
-            return
-
-        MEDIA_PAGE_SIZE = 10
-        topic_id = media.topic_id
-        await session.delete(media)
-        await session.commit()
-
-        total_count = await session.scalar(
-            select(func.count()).select_from(MediaLibrary).where(MediaLibrary.topic_id == topic_id)
-        )
-        total_pages = max(1, (total_count + MEDIA_PAGE_SIZE - 1) // MEDIA_PAGE_SIZE)
-        stmt = (
-            select(MediaLibrary).where(MediaLibrary.topic_id == topic_id)
-            .order_by(MediaLibrary.id).limit(MEDIA_PAGE_SIZE)
-        )
-        res = await session.execute(stmt)
-        media_list = res.scalars().all()
-        topic = await session.get(Topic, topic_id)
-
-    await callback.answer("Файл удален")
-
-    text = (
-        f"📁 Медиа-библиотека темы: <b>{topic.name}</b>\n"
-        f"Файлов: {total_count}"
-    )
-    kb = keyboards.topic_media_manage_keyboard(topic_id, media_list, 0, total_pages)
-
-    await callback.message.answer(text, reply_markup=kb, parse_mode='HTML')
-    await callback.message.delete()
+@router.callback_query(F.data.startswith("admin_media_delete_"), StateFilter('*'))
+async def admin_media_delete(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Управление файлами доступно внутри медиа-коллекции.", show_alert=True)
 
 
 # ── Реферальная кнопка меню — регистрируется ДО AI-хэндлера ──

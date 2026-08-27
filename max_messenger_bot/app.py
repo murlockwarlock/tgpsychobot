@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 from .api import MaxApiClient
 from .legacy import Content, SubscriptionConfig, Topic, User, async_session_maker, init_db
 from .logging_utils import configure_logging, get_bot_logger, get_max_logger
-from .models import IncomingCallback, IncomingMessage, parse_callback, parse_message
+from .models import IncomingCallback, IncomingMessage, canonical_media_type, parse_callback, parse_message
 from .services import admin as admin_service
 from .services import admin_ai as admin_ai_service
 from .services import admin_admins as admin_admins_service
@@ -53,6 +53,15 @@ TEXT_FILE_INPUT_STATES = {
     "admin_ref_tpl_add",
     "admin_ref_tpl_edit",
 }
+
+
+def _parse_numeric_callback_payload(data: str, prefix: str, count: int) -> tuple[int, ...] | None:
+    if not data.startswith(prefix):
+        return None
+    parts = data[len(prefix):].split("_")
+    if len(parts) != count or not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
 
 
 def _log_background_task_result(task: asyncio.Task[None]) -> None:
@@ -172,6 +181,13 @@ class MaxBotApplication:
             await self.states.clear(message.sender.user_id)
             state = None
         if state:
+            if state.state in common.MEDIA_COLLECTION_ADMIN_STATES and not await common.require_media_collection_admin(
+                self.client,
+                self.states,
+                message.chat_id,
+                message.sender.user_id,
+            ):
+                return
             if state.state in {"admin_test_upload_questions", "admin_test_upload_formulas"}:
                 if message.media_type == "file" and message.media_token:
                     kind = "questions" if state.state.endswith("questions") else "formulas"
@@ -438,14 +454,28 @@ class MaxBotApplication:
                 await admin_topic_media_service.save_edit_description(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
             if state.state == "admin_media_edit_file":
-                token = message.media_token if not text else None
-                mtype = message.media_type if not text else None
+                token = message.media_token or text.strip()
+                mtype = canonical_media_type(message.media_type) if message.media_token else None
                 await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype)
                 return
             if state.state == "admin_media_add_file":
-                token = message.media_token if not text else None
-                mtype = message.media_type if not text else None
-                await admin_topic_media_service.receive_add_file(self.client, self.states, message.chat_id, message.sender.user_id, text=text, media_token=token, media_type=mtype)
+                if message.media_token:
+                    await admin_topic_media_service.receive_add_file(
+                        self.client,
+                        self.states,
+                        message.chat_id,
+                        message.sender.user_id,
+                        media_token=message.media_token,
+                        media_type=canonical_media_type(message.media_type),
+                    )
+                else:
+                    await admin_topic_media_service.receive_add_file(
+                        self.client,
+                        self.states,
+                        message.chat_id,
+                        message.sender.user_id,
+                        text=text,
+                    )
                 return
             if state.state == "admin_media_add_type":
                 await admin_topic_media_service.resolve_add_type(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -472,7 +502,7 @@ class MaxBotApplication:
             if message.media_token and state:
                 if state.state in {"admin_media_add_file", "admin_media_edit_file"}:
                     token = message.media_token
-                    mtype = "photo" if message.media_type == "image" else "audio"
+                    mtype = canonical_media_type(message.media_type)
                     if state.state == "admin_media_add_file":
                         await admin_topic_media_service.receive_add_file(self.client, self.states, message.chat_id, message.sender.user_id, media_token=token, media_type=mtype)
                     else:
@@ -483,7 +513,7 @@ class MaxBotApplication:
             if message.media_type in {"audio", "video"} and message.media_token:
                 self.spawn_user_task(message.sender.user_id, self._handle_voice(message))
                 return
-            if message.media_type == "image" and message.media_token:
+            if message.media_type in {"image", "photo"} and message.media_token:
                 self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=""))
                 return
             if message.media_type == "file" and message.media_token:
@@ -603,7 +633,7 @@ class MaxBotApplication:
         if not await common.ensure_access_before_chat(self.client, message.chat_id, user):
             return
         # If user sent image with caption, handle as vision
-        if message.media_type == "image" and message.media_token:
+        if message.media_type in {"image", "photo"} and message.media_token:
             self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=text))
             return
         self.spawn_user_task(message.sender.user_id, common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text, self.states))
@@ -1168,6 +1198,7 @@ class MaxBotApplication:
                 await admin_topics_service.start_create_topic(self.client, self.states, chat_id, user_id)
                 return
             if data.startswith("admin_edit_topic_"):
+                await self.states.clear(user_id)
                 await admin_topics_service.show_topic_editor(self.client, chat_id, int(data.rsplit("_", 1)[1]))
                 return
             if data.startswith("admin_topic_edit_name_"):
@@ -1718,29 +1749,88 @@ class MaxBotApplication:
             # ── Topic media ───────────────────────────────────────────────
             if data.startswith("admin_topic_media_"):
                 # admin_topic_media_{topic_id}_{page}
-                parts = data.split("_")
-                await admin_topic_media_service.show_list(self.client, chat_id, int(parts[3]), int(parts[4]))
+                context = _parse_numeric_callback_payload(data, "admin_topic_media_", 2)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст темы потерян.")
+                    return
+                topic_id, page = context
+                await self.states.clear(user_id)
+                await admin_topic_media_service.show_list(self.client, chat_id, topic_id, page)
                 return
             if data.startswith("admin_media_view_"):
-                await admin_topic_media_service.show_media_detail(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                context = _parse_numeric_callback_payload(data, "admin_media_view_", 3)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                topic_id, page, media_id = context
+                await admin_topic_media_service.show_media_detail(self.client, chat_id, media_id, topic_id, page)
                 return
             if data.startswith("admin_media_editname_"):
-                await admin_topic_media_service.start_edit_name(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                context = _parse_numeric_callback_payload(data, "admin_media_editname_", 3)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                topic_id, page, media_id = context
+                await admin_topic_media_service.start_edit_name(self.client, self.states, chat_id, user_id, media_id, topic_id, page)
                 return
             if data.startswith("admin_media_editcat_"):
-                await admin_topic_media_service.start_edit_category(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                context = _parse_numeric_callback_payload(data, "admin_media_editcat_", 3)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                topic_id, page, media_id = context
+                await admin_topic_media_service.start_edit_category(self.client, self.states, chat_id, user_id, media_id, topic_id, page)
                 return
             if data.startswith("admin_media_editdesc_"):
-                await admin_topic_media_service.start_edit_description(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                context = _parse_numeric_callback_payload(data, "admin_media_editdesc_", 3)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                topic_id, page, media_id = context
+                await admin_topic_media_service.start_edit_description(self.client, self.states, chat_id, user_id, media_id, topic_id, page)
                 return
             if data.startswith("admin_media_editfile_"):
-                await admin_topic_media_service.start_edit_file(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                context = _parse_numeric_callback_payload(data, "admin_media_editfile_", 3)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                topic_id, page, media_id = context
+                await admin_topic_media_service.start_edit_file(self.client, self.states, chat_id, user_id, media_id, topic_id, page)
+                return
+            if data.startswith("admin_media_add_collection_"):
+                context = _parse_numeric_callback_payload(data, "admin_media_add_collection_", 3)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                topic_id, page, collection_id = context
+                await admin_topic_media_service.start_add_media(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    topic_id,
+                    page,
+                    collection_id,
+                )
                 return
             if data.startswith("admin_media_add_"):
-                await admin_topic_media_service.start_add_media(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                context = _parse_numeric_callback_payload(data, "admin_media_add_", 2)
+                if context is None:
+                    context = _parse_numeric_callback_payload(data, "admin_media_add_", 1)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                topic_id = context[0]
+                page = context[1] if len(context) == 2 else 0
+                await admin_topic_media_service.start_add_media(self.client, self.states, chat_id, user_id, topic_id, page)
                 return
             if data.startswith("admin_media_delete_"):
-                await admin_topic_media_service.delete_media(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                context = _parse_numeric_callback_payload(data, "admin_media_delete_", 3)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                topic_id, page, media_id = context
+                await admin_topic_media_service.delete_media(self.client, chat_id, media_id, topic_id, page)
                 return
             # ── Export with date filters ───────────────────────────────────
             if data == "admin_export_date_filter":

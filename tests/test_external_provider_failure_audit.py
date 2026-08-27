@@ -25,6 +25,12 @@ class _Session:
     async def get(self, model, object_id, *args, **kwargs):
         return self.values.get(model)
 
+    async def execute(self, _statement):
+        return SimpleNamespace(all=lambda: [])
+
+    async def scalar(self, _statement):
+        return self.values.get(handlers.MediaLibrary)
+
     def add(self, value):
         self.added.append(value)
 
