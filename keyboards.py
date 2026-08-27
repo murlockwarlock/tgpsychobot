@@ -183,6 +183,10 @@ def admin_general_settings_keyboard(config):
         text="✏️ Текст сообщения ожидания",
         callback_data="admin_general_edit_ai_processing_message_text",
     )
+    builder.button(
+        text="🎨 Медиаколлекции основного диалога",
+        callback_data="admin_main_collections_page_0",
+    )
     builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
     builder.adjust(1)
     return builder.as_markup()
@@ -702,7 +706,6 @@ def edit_topic_keyboard(topic_id: int, is_active: bool, in_menu: bool = False, i
 
     builder.button(text="📎 Привязать файлы БЗ", callback_data=f"assign_kb_topic_{topic_id}_page_0")
 
-    builder.button(text="📁 Медиа-файлы темы", callback_data=f"admin_topic_media_{topic_id}")
     builder.button(text="🎨 Привязать коллекции", callback_data=f"assign_coll_topic_{topic_id}_page_0")
 
     builder.button(text="⚡ Обработчики событий", callback_data=f"topic_automation_handlers_{topic_id}")
@@ -743,7 +746,7 @@ def assign_kb_to_topic_keyboard(topic_id: int, all_files: list, assigned_file_id
     if nav_buttons:
         builder.row(*nav_buttons)
 
-    builder.row(InlineKeyboardButton(text="⬅️ Назад к теме", callback_data=f"edit_topic_{topic_id}"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад к теме", callback_data=f"cancel_state_edit_topic_{topic_id}"))
     return builder.as_markup()
 
 
@@ -1479,79 +1482,12 @@ def card_selection_keyboard(category: str, card_ids: list):
     return builder.as_markup()
 
 
-def topic_media_manage_keyboard(topic_id: int, media_list: list, page: int = 0, total_pages: int = 1):
-    builder = InlineKeyboardBuilder()
-    for m in media_list:
-        if m.media_type == 'audio':
-            icon = "🎵"
-        elif m.file_name == '_back':
-            icon = "🃏"
-        else:
-            icon = "🖼️"
-        builder.button(text=f"{icon} {m.file_name}", callback_data=f"admin_media_view_{m.id}")
-
-    if total_pages > 1:
-        if page > 0:
-            builder.button(text="⬅️", callback_data=f"admin_topic_media_{topic_id}_{page - 1}")
-        builder.button(text=f"{page + 1}/{total_pages}", callback_data="noop")
-        if page < total_pages - 1:
-            builder.button(text="➡️", callback_data=f"admin_topic_media_{topic_id}_{page + 1}")
-
-    builder.button(text="➕ Добавить файл", callback_data=f"admin_media_add_{topic_id}")
-    builder.button(text="⬅️ Назад к теме", callback_data=f"edit_topic_{topic_id}")
-
-    # Файлы по 1 в ряд, пагинация в одну строку, кнопки действий по 1
-    rows = [1] * len(media_list)
-    if total_pages > 1:
-        nav_buttons = (1 if page > 0 else 0) + 1 + (1 if page < total_pages - 1 else 0)
-        rows.append(nav_buttons)
-    rows.extend([1, 1])
-    builder.adjust(*rows)
-    return builder.as_markup()
-
-
-def media_edit_keyboard(media_id: int, topic_id: int):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Имя", callback_data=f"admin_media_editname_{media_id}")
-    builder.button(text="📂 Категория", callback_data=f"admin_media_editcat_{media_id}")
-    builder.button(text="📝 Описание", callback_data=f"admin_media_editdesc_{media_id}")
-    builder.button(text="🔄 Заменить файл", callback_data=f"admin_media_editfile_{media_id}")
-    builder.button(text="🗑️ Удалить", callback_data=f"admin_media_delete_{media_id}_{topic_id}")
-    builder.button(text="⬅️ Назад к списку", callback_data=f"admin_topic_media_{topic_id}")
-    builder.adjust(2, 2, 1, 1)
-    return builder.as_markup()
-
-
-def assign_decks_to_topic_keyboard(topic_id: int, all_decks: list[str], assigned_decks: set[str], page: int, total_pages: int):
-    builder = InlineKeyboardBuilder()
-    for deck in all_decks:
-        is_assigned = deck in assigned_decks
-        text = f"✅ {deck}" if is_assigned else f"⭕️ {deck}"
-        action = "remove" if is_assigned else "add"
-        callback_data = f"deck_topic_{action}_{topic_id}_{deck}_{page}"
-        builder.button(text=text, callback_data=callback_data)
-    builder.adjust(1)
-
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"assign_deck_topic_{topic_id}_page_{page - 1}"))
-    nav_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"assign_deck_topic_{topic_id}_page_{page + 1}"))
-
-    if nav_buttons:
-        builder.row(*nav_buttons)
-
-    builder.row(InlineKeyboardButton(text="⬅️ Назад к теме", callback_data=f"edit_topic_{topic_id}"))
-    return builder.as_markup()
-
-
 # ──────────────── Медиа-коллекции — клавиатуры ────────────────
 
 def admin_collections_list_keyboard(collections: list, page: int = 0, total_pages: int = 1):
     builder = InlineKeyboardBuilder()
     for c in collections:
-        builder.button(text=f"📂 {c['name']} ({c['count']})", callback_data=f"admin_coll_view_{c['id']}")
+        builder.button(text=f"📂 {c['name']} ({c['count']})", callback_data=f"admin_coll_view_{c['id']}_{page}")
     builder.adjust(1)
 
     if total_pages > 1:
@@ -1563,42 +1499,97 @@ def admin_collections_list_keyboard(collections: list, page: int = 0, total_page
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_collections_page_{page + 1}"))
         builder.row(*nav)
 
-    builder.row(InlineKeyboardButton(text="➕ Создать коллекцию", callback_data="admin_coll_create"))
+    builder.row(InlineKeyboardButton(text="➕ Создать коллекцию", callback_data=f"admin_coll_create_{page}"))
     builder.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel"))
     return builder.as_markup()
 
 
-def admin_collection_detail_keyboard(coll_id: int):
+def admin_collection_detail_keyboard(coll_id: int, list_page: int = 0):
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Переименовать", callback_data=f"admin_coll_rename_{coll_id}")
-    builder.button(text="📎 Управление файлами", callback_data=f"admin_coll_files_{coll_id}_0")
-    builder.button(text="➕ Загрузить файл", callback_data=f"admin_coll_upload_{coll_id}")
-    builder.button(text="🗑️ Удалить коллекцию", callback_data=f"admin_coll_delete_{coll_id}")
-    builder.button(text="⬅️ К списку коллекций", callback_data="admin_collections_page_0")
+    builder.button(text="✏️ Переименовать", callback_data=f"admin_coll_rename_{coll_id}_{list_page}")
+    builder.button(text="📁 Файлы", callback_data=f"admin_coll_files_{coll_id}_0_{list_page}")
+    builder.button(text="➕ Загрузить файл", callback_data=f"admin_coll_upload_{coll_id}_{list_page}")
+    builder.button(text="🗑️ Удалить коллекцию", callback_data=f"admin_coll_delete_{coll_id}_{list_page}")
+    builder.button(text="⬅️ К списку коллекций", callback_data=f"admin_collections_page_{list_page}")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def admin_collection_files_keyboard(coll_id: int, all_media: list, assigned_ids: set, page: int, total_pages: int):
+def admin_collection_files_keyboard(
+    coll_id: int,
+    all_media: list,
+    assigned_ids: set | None = None,
+    page: int = 0,
+    total_pages: int = 1,
+    list_page: int = 0,
+):
     builder = InlineKeyboardBuilder()
     for m in all_media:
-        is_in = m.id in assigned_ids
-        icon = "✅" if is_in else "⭕️"
-        action = "remove" if is_in else "add"
+        if m.media_type == "audio":
+            icon = "🎵"
+        elif m.media_type == "video":
+            icon = "🎬"
+        elif m.media_type == "document":
+            icon = "📄"
+        else:
+            icon = "🖼️"
         label = f"{icon} {m.file_name or m.id} [{m.media_type}]"
-        builder.button(text=label, callback_data=f"coll_file_{action}_{coll_id}_{m.id}_{page}")
+        builder.button(text=label, callback_data=f"admin_coll_file_view_{coll_id}_{m.id}_{page}_{list_page}")
     builder.adjust(1)
 
     if total_pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_coll_files_{coll_id}_{page - 1}"))
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_coll_files_{coll_id}_{page - 1}_{list_page}"))
         nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
         if page < total_pages - 1:
-            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_coll_files_{coll_id}_{page + 1}"))
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_coll_files_{coll_id}_{page + 1}_{list_page}"))
         builder.row(*nav)
 
-    builder.row(InlineKeyboardButton(text="⬅️ К коллекции", callback_data=f"admin_coll_view_{coll_id}"))
+    builder.row(InlineKeyboardButton(text="➕ Загрузить файл", callback_data=f"admin_coll_upload_files_{coll_id}_{page}_{list_page}"))
+    builder.row(InlineKeyboardButton(text="📎 Подключить существующий", callback_data=f"admin_coll_attach_{coll_id}_{page}_{list_page}"))
+    builder.row(InlineKeyboardButton(text="⬅️ К коллекции", callback_data=f"admin_coll_view_{coll_id}_{list_page}"))
+    return builder.as_markup()
+
+
+def admin_collection_attach_keyboard(
+    coll_id: int,
+    all_media: list,
+    assigned_ids: set,
+    page: int,
+    total_pages: int,
+    list_page: int = 0,
+):
+    builder = InlineKeyboardBuilder()
+    for m in all_media:
+        is_in = m.id in assigned_ids
+        action = "remove" if is_in else "add"
+        icon = "✅" if is_in else "⭕️"
+        label = f"{icon} {m.file_name or m.id} [{m.media_type}]"
+        builder.button(text=label, callback_data=f"coll_file_{action}_{coll_id}_{m.id}_{page}_{list_page}")
+    builder.adjust(1)
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_coll_attach_{coll_id}_{page - 1}_{list_page}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_coll_attach_{coll_id}_{page + 1}_{list_page}"))
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="⬅️ К файлам коллекции", callback_data=f"admin_coll_files_{coll_id}_{page}_{list_page}"))
+    return builder.as_markup()
+
+
+def collection_media_edit_keyboard(media_id: int, coll_id: int, page: int = 0, list_page: int = 0):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Имя", callback_data=f"admin_coll_media_editname_{media_id}_{coll_id}_{page}_{list_page}")
+    builder.button(text="📂 Категория", callback_data=f"admin_coll_media_editcat_{media_id}_{coll_id}_{page}_{list_page}")
+    builder.button(text="📝 Описание", callback_data=f"admin_coll_media_editdesc_{media_id}_{coll_id}_{page}_{list_page}")
+    builder.button(text="🔄 Заменить файл", callback_data=f"admin_coll_media_editfile_{media_id}_{coll_id}_{page}_{list_page}")
+    builder.button(text="🗑️ Удалить", callback_data=f"admin_coll_media_delete_{media_id}_{coll_id}_{page}_{list_page}")
+    builder.button(text="⬅️ Назад к файлам", callback_data=f"admin_coll_files_{coll_id}_{page}_{list_page}")
+    builder.adjust(2, 2, 1, 1)
     return builder.as_markup()
 
 
@@ -1620,7 +1611,28 @@ def assign_collections_to_topic_keyboard(topic_id: int, all_colls: list, assigne
     if nav:
         builder.row(*nav)
 
-    builder.row(InlineKeyboardButton(text="⬅️ Назад к теме", callback_data=f"edit_topic_{topic_id}"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад к теме", callback_data=f"cancel_state_edit_topic_{topic_id}"))
+    return builder.as_markup()
+
+
+def assign_collections_to_main_keyboard(all_colls: list, assigned_ids: set, page: int, total_pages: int):
+    builder = InlineKeyboardBuilder()
+    for c in all_colls:
+        is_assigned = c['id'] in assigned_ids
+        text = f"✅ {c['name']}" if is_assigned else f"⭕️ {c['name']}"
+        action = "remove" if is_assigned else "add"
+        builder.button(text=text, callback_data=f"maincoll_{action}_{c['id']}_{page}")
+    builder.adjust(1)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_main_collections_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_main_collections_page_{page + 1}"))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="⬅️ Назад к общим настройкам", callback_data="admin_general_settings"))
     return builder.as_markup()
 
 
