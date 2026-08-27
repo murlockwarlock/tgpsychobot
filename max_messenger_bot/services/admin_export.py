@@ -12,6 +12,7 @@ from pathlib import Path
 from sqlalchemy import func, select
 
 from ..api import MaxApiClient
+from ..identity import is_max_user_id, max_communication_name, max_username, raw_max_user_id
 from ..keyboards import admin_clients_keyboard, admin_date_filter_keyboard, admin_export_keyboard, mass_export_options_keyboard
 from ..legacy import Message as DBMessage, User, async_session_maker
 from ..models import MAX_ID_OFFSET
@@ -289,6 +290,11 @@ def _parse_date(date_str: str | None, end_of_day: bool = False) -> datetime | No
 def _user_label(user: User, anonymize: bool, index: int) -> str:
     if anonymize:
         return f"user_{index}"
+    if is_max_user_id(user.id):
+        return (
+            f"{max_communication_name(user)} (ID max: {raw_max_user_id(user.id)}, "
+            f"Username: {max_username(user)})"
+        )
     name = user.name or user.first_name or "Без имени"
     username = f", @{user.username}" if user.username else ""
     return f"{name} (ID: {user.id}{username})"
@@ -410,14 +416,18 @@ def _build_json_export(
         messages = messages_by_user.get(user.id, [])
         if not messages:
             continue
-        user_label = f"user_{index}" if anonymize else str(user.id)
+        is_max = is_max_user_id(user.id)
+        user_label = f"user_{index}" if anonymize else str(raw_max_user_id(user.id) if is_max else user.id)
+        user_id = None if anonymize else raw_max_user_id(user.id) if is_max else user.id
+        user_name = None if anonymize else max_communication_name(user) if is_max else (user.name or user.first_name)
+        username = None if anonymize else user.username
         export_data.append(
             {
                 "user_info": {
                     "label": user_label,
-                    "id": None if anonymize else user.id,
-                    "name": None if anonymize else (user.name or user.first_name),
-                    "username": None if anonymize else user.username,
+                    "id": user_id,
+                    "name": user_name,
+                    "username": username,
                 },
                 "history": [
                     {
@@ -506,8 +516,15 @@ async def run_export(
     writer = csv.writer(buf)
     writer.writerow(["user_id", "user_name", "role", "content", "created_at"])
     for msg, user in rows:
-        user_id_val = "***" if anonymize else msg.user_id
-        user_name = "***" if anonymize else (user.name or user.first_name or user.username or "")
+        if anonymize:
+            user_id_val = "***"
+            user_name = "***"
+        elif is_max_user_id(msg.user_id):
+            user_id_val = raw_max_user_id(msg.user_id)
+            user_name = max_communication_name(user)
+        else:
+            user_id_val = msg.user_id
+            user_name = user.name or user.first_name or user.username or ""
         writer.writerow([
             user_id_val,
             user_name,
@@ -559,8 +576,9 @@ async def export_users_csv(client: MaxApiClient, chat_id: int) -> None:
     writer = csv.writer(buf)
     writer.writerow(["id", "first_name", "name", "username", "created_at", "has_subscription"])
     for u in users:
+        user_id = raw_max_user_id(u.id) if is_max_user_id(u.id) else u.id
         writer.writerow([
-            u.id,
+            user_id,
             u.first_name or "",
             u.name or "",
             u.username or "",

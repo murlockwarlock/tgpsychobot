@@ -6,6 +6,7 @@ import os
 from sqlalchemy import select
 
 from ..api import MaxApiClient
+from ..identity import is_max_user_id, max_communication_name, max_username, raw_max_user_id
 from ..keyboards import admin_admins_keyboard, admin_profile_keyboard
 from ..legacy import User, async_session_maker
 from ..models import MAX_ID_OFFSET
@@ -47,16 +48,18 @@ async def show_admins(client: MaxApiClient, chat_id: int) -> None:
             )
         ).scalars().all()
 
-    owner_map = {u.id: u.first_name for u in owner_users}
+        owner_map = {u.id: u for u in owner_users}
     db_admins = [admin for admin in admins if admin.id not in owners]
     lines = ["👮 <b>Управление администраторами</b>\n\n", "<b>Владельцы:</b>\n"]
     if owners:
         for owner_id in owners:
-            name = owner_map.get(owner_id)
-            if name:
-                lines.append(f"• {name} - <code>{owner_id}</code>\n")
+            owner = owner_map.get(owner_id)
+            display_id = raw_max_user_id(owner_id) if is_max_user_id(owner_id) else owner_id
+            if owner:
+                name = max_communication_name(owner) if is_max_user_id(owner.id) else owner.first_name
+                lines.append(f"• {name} - <code>{display_id}</code>\n")
             else:
-                lines.append(f"• <code>{owner_id}</code>\n")
+                lines.append(f"• <code>{display_id}</code>\n")
     else:
         lines.append("не заданы\n")
     lines.append("\n<b>Администраторы из БД:</b>\n")
@@ -91,7 +94,8 @@ async def add_admin(client: MaxApiClient, states: StateStore, chat_id: int, user
         target.is_admin = True
         await session.commit()
     await states.clear(user_id)
-    await client.send_message(chat_id=chat_id, text=f"✅ Пользователь <code>{target_user_id}</code> назначен администратором.")
+    display_id = raw_max_user_id(target_user_id) if is_max_user_id(target_user_id) else target_user_id
+    await client.send_message(chat_id=chat_id, text=f"✅ Пользователь <code>{display_id}</code> назначен администратором.")
     await show_admins(client, chat_id)
 
 
@@ -102,11 +106,22 @@ async def show_admin_profile(client: MaxApiClient, chat_id: int, viewer_id: int,
         await client.send_message(chat_id=chat_id, text="Администратор не найден.")
         return
     owner = is_owner(viewer_id)
+    if is_max_user_id(admin.id):
+        display_identity = (
+            f"<b>ID max:</b> <code>{raw_max_user_id(admin.id)}</code>\n"
+            f"<b>Имя для общения:</b> {html.escape(admin.name or 'Не указано')}\n"
+            f"<b>Имя в max:</b> {html.escape(admin.first_name or 'Не указано')}\n"
+            f"<b>Username:</b> {html.escape(max_username(admin))}"
+        )
+    else:
+        display_identity = (
+            f"<b>ID:</b> <code>{admin.id}</code>\n"
+            f"<b>Имя:</b> {html.escape(admin.first_name or admin.name or 'Не указано')}\n"
+            f"<b>Username:</b> {html.escape(admin.username or 'Не указан')}"
+        )
     text = (
         "<b>Профиль администратора</b>\n\n"
-        f"<b>ID:</b> <code>{admin.id}</code>\n"
-        f"<b>Имя:</b> {html.escape(admin.first_name or admin.name or 'Не указано')}\n"
-        f"<b>Username:</b> {html.escape(admin.username or 'Не указан')}\n"
+        f"{display_identity}\n"
         f"<b>Доступ к истории:</b> {'да' if admin.can_view_history else 'нет'}\n"
         f"<b>Владелец:</b> {'да' if admin.id in _owner_ids() else 'нет'}"
     )
@@ -149,5 +164,6 @@ async def revoke_admin(client: MaxApiClient, chat_id: int, viewer_id: int, admin
         admin.is_admin = False
         admin.can_view_history = False
         await session.commit()
-    await client.send_message(chat_id=chat_id, text=f"✅ Права администратора для <code>{admin_id}</code> отозваны.")
+    display_id = raw_max_user_id(admin_id) if is_max_user_id(admin_id) else admin_id
+    await client.send_message(chat_id=chat_id, text=f"✅ Права администратора для <code>{display_id}</code> отозваны.")
     await show_admins(client, chat_id)

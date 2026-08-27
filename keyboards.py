@@ -14,6 +14,7 @@ from mailing_utils import MAILING_AUDIENCE_LABELS, get_mailing_status_label, is_
 from memory_mode import memory_mode_label
 from time_helpers import format_msk, to_msk
 from provider_models import build_telegram_model_callback_data
+from max_messenger_bot.identity import is_max_user_id, max_client_list_label
 
 
 def should_show_test_button(test_config) -> bool:
@@ -363,11 +364,13 @@ def clients_paginator_keyboard(page: int, total_pages: int, clients: list, is_se
 
     builder = InlineKeyboardBuilder()
     for client in clients:
-        display_name = client.name or client.first_name
         status = "✅ " if client.id in selected_ids else ""
         cb_data = f"toggle_export_{client.id}_{page}" if export_mode else f"view_client_{client.id}"
-        builder.button(text=f"{status}{display_name} (@{client.username or 'N/A'})",
-                       callback_data=cb_data)
+        if is_max_user_id(client.id):
+            builder.button(text=f"{status}{max_client_list_label(client)}", callback_data=cb_data)
+        else:
+            display_name = client.name or client.first_name
+            builder.button(text=f"{status}{display_name} (@{client.username or 'N/A'})", callback_data=cb_data)
 
     builder.adjust(1)
 
@@ -1078,9 +1081,13 @@ def admin_management_keyboard(admins: list):
 
     for admin in admins:
         if admin.id not in OWNER_IDS:
-            display_name = admin.first_name or f"ID: {admin.id}"
-            username = f"(@{admin.username})" if admin.username else ""
-            builder.button(text=f"👮‍♂️ {display_name} {username}", callback_data=f"admin_panel_profile_{admin.id}")
+            if is_max_user_id(admin.id):
+                display_name = max_client_list_label(admin)
+                builder.button(text=f"👮‍♂️ {display_name}", callback_data=f"admin_panel_profile_{admin.id}")
+            else:
+                display_name = admin.first_name or f"ID: {admin.id}"
+                username = f"(@{admin.username})" if admin.username else ""
+                builder.button(text=f"👮‍♂️ {display_name} {username}", callback_data=f"admin_panel_profile_{admin.id}")
 
     builder.adjust(1)
     builder.row(

@@ -31,6 +31,7 @@ from .services import admin_topic_media as admin_topic_media_service
 from .services import common, settings as settings_service, subscriptions as subscriptions_service, tests as tests_service, topics as topics_service
 from .settings import get_settings, validate_webhook_runtime_settings
 from .keyboards import build_main_menu
+from .identity import is_max_user_id
 from .storage import StateStore, init_storage
 
 
@@ -165,7 +166,12 @@ class MaxBotApplication:
             force_start,
             (message.text or "")[:300],
         )
-        await common.ensure_user(message.sender.user_id, message.sender.username, message.sender.full_name)
+        await common.ensure_user(
+            message.sender.user_id,
+            message.sender.username,
+            message.sender.full_name,
+            public_name=message.sender.public_name,
+        )
         if force_start:
             await common.show_start_screen(self.client, message.chat_id, message.sender.user_id, message.start_payload, self.states)
             return
@@ -701,6 +707,13 @@ class MaxBotApplication:
 
     async def handle_callback(self, callback: IncomingCallback) -> None:
         log.info("Incoming callback user_id=%s chat_id=%s payload=%s", callback.sender.user_id, callback.chat_id, callback.payload)
+        if is_max_user_id(callback.sender.user_id):
+            await common.ensure_user(
+                callback.sender.user_id,
+                callback.sender.username,
+                callback.sender.full_name,
+                public_name=callback.sender.public_name,
+            )
         data = callback.payload
         user_id = callback.sender.user_id
         chat_id = callback.chat_id

@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import tempfile
+import time
 import uuid
 
 import anthropic
@@ -17,7 +18,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 import gemini_image
 
+from ai_log_context import apply_ai_log_context
 from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, async_session_maker
+from .legacy import AILog
 from .logging_utils import configure_logging, get_ai_logger
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context
 from user_metadata import extract_service_data
@@ -85,6 +88,19 @@ def _resolve_temperature(config, default: float = 0.7) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _resolve_log_model(ai_config: AIConfig, provider: str | None) -> str:
+    provider_key = (provider or "").strip().lower()
+    model_field = "claude_model" if provider_key in {"claude", "anthropic"} else f"{provider_key}_model"
+    model = getattr(ai_config, model_field, None)
+    if model:
+        return str(model)
+    try:
+        model = get_default_model(provider_key, channel="chat")
+    except Exception:
+        model = None
+    return str(model or "—")
 
 
 _CURRENT_AI_CONTEXT = object()
@@ -842,6 +858,9 @@ async def get_ai_response(
         if not ai_config:
             raise AIServiceError("AIConfig не найден")
 
+        actual_provider = str(ai_config.provider or "—")
+        actual_model = _resolve_log_model(ai_config, actual_provider)
+
         stable_system_prompt = _build_user_system_prompt(user, ai_config, active_topic)
         shared_instructions = tuple(
             block
@@ -912,15 +931,16 @@ async def get_ai_response(
             current_user_content=user_prompt,
         )
         temperature = _resolve_temperature(ai_config)
+        start_time = time.monotonic()
         try:
             result = await _dispatch_provider(ai_config, request_layout)
             log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, active_topic_id)
-            return result
         except (AIServiceError, Exception) as primary_err:
             # Try fallback provider if configured
             fb_provider = getattr(ai_config, "fallback_provider", None)
             fb_model = getattr(ai_config, "fallback_model", None)
             allow_fallback = getattr(ai_config, "allow_fallback", False)
+            fallback_succeeded = False
             if allow_fallback and fb_provider and fb_model:
                 fb_key = fb_provider.strip().lower()
                 if fb_key in {"claude", "anthropic"}:
@@ -959,18 +979,46 @@ async def get_ai_response(
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
                         result = _validate_text_response(result, provider=fb_key)
+                        actual_provider = str(fb_provider)
+                        actual_model = str(fb_model)
+                        fallback_succeeded = True
                         log.info("Fallback response generated user_id=%s provider=%s", user_id, fb_provider)
-                        return result
                     except Exception as fb_err:
                         log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
                         raise AIServiceError(
                             f"Основной провайдер ({ai_config.provider}) и резервный ({fb_provider}) недоступны"
                         ) from fb_err
-            if isinstance(primary_err, AIServiceError):
-                log.exception("AI request failed user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
-                raise
-            log.exception("Unexpected AI request failure user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
-            raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}") from primary_err
+            if not fallback_succeeded:
+                if isinstance(primary_err, AIServiceError):
+                    log.exception("AI request failed user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
+                    raise
+                log.exception("Unexpected AI request failure user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
+                raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}") from primary_err
+
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        visible_text, _, _ = extract_service_data(result)
+        ai_log = AILog(
+            user_id=user_id,
+            request_type="chat",
+            provider=actual_provider,
+            model=actual_model,
+            prompt_summary=user_prompt if user_prompt else None,
+            raw_response=result,
+            clean_text=visible_text,
+            latency_ms=latency_ms,
+        )
+        apply_ai_log_context(
+            ai_log,
+            platform="max",
+            topic_id=active_topic_id,
+            topic_name=active_topic.name if active_topic else None,
+        )
+        try:
+            session.add(ai_log)
+            await session.commit()
+        except Exception:
+            log.exception("Could not save shared AI log for user %s", user_id)
+        return result
 
 
 async def get_ai_response_direct(

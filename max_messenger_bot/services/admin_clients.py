@@ -15,6 +15,7 @@ from sqlalchemy.orm import aliased, selectinload
 
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
+from ..identity import max_client_list_label, max_communication_name, max_public_name, max_username, raw_max_user_id
 from ..keyboards import admin_client_profile_keyboard, admin_client_search_keyboard, admin_clients_keyboard, admin_history_keyboard, callback_button, inline_keyboard, single_export_options_keyboard
 from ..legacy import Message as DBMessage, RobokassaPayment, Topic, User, UserSubscription, YookassaPayment, async_session_maker
 from ..models import MAX_ID_OFFSET
@@ -89,13 +90,14 @@ async def show_client_profile(client: MaxApiClient, chat_id: int, target_user_id
 
     text = (
         "<b>Профиль клиента</b>\n\n"
-        f"<b>ID:</b> <code>{user.id}</code>\n"
-        f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}\n"
-        f"<b>Username:</b> {html.escape(user.username or 'Не указан')}\n"
+        f"<b>ID max:</b> <code>{raw_max_user_id(user.id)}</code>\n"
+        f"<b>Имя для общения:</b> {html.escape(user.name or 'Не указано')}\n"
+        f"<b>Имя в max:</b> {html.escape(max_public_name(user) or 'Не указано')}\n"
+        f"<b>Username:</b> {html.escape(max_username(user))}\n"
         f"<b>Пол:</b> {html.escape(user.gender or 'Не указан')}\n"
         f"<b>Возраст:</b> {html.escape(user.age or 'Не указан')}\n"
         f"<b>Подписка:</b> {html.escape(subscription_line)}\n"
-        + (f"TG ID: <code>{user.tg_user_id}</code>\n" if user.tg_user_id else "TG аккаунт: не привязан\n")
+        + (f"Telegram ID: <code>{user.tg_user_id}</code>\n" if user.tg_user_id else "Telegram аккаунт: не привязан\n")
         + f"<b>Админ:</b> {'да' if user.is_admin else 'нет'}\n"
         + f"<b>Дата регистрации:</b> {user.created_at.strftime('%d.%m.%Y %H:%M')}"
     )
@@ -137,7 +139,10 @@ async def show_client_history(client: MaxApiClient, chat_id: int, target_user_id
             f"<b>{role}</b> [<i>{msg.timestamp.strftime('%d.%m.%Y %H:%M')}</i>] [<i>{html.escape(topic_name)}</i>]:\n{content}\n"
         )
 
-    full_text = f"📜 <b>История клиента:</b> {html.escape(target_user.first_name or str(target_user.id))} (<a href='https://t.me/@id{target_user.id}'><code>{target_user.id}</code></a>)\n\n{''.join(rendered_parts)}"
+    full_text = (
+        f"📜 <b>История клиента:</b> {html.escape(max_communication_name(target_user))} "
+        f"(ID max: <code>{raw_max_user_id(target_user.id)}</code>)\n\n{''.join(rendered_parts)}"
+    )
     pages = split_text(full_text, HISTORY_SAFE_LIMIT)
     total_pages = max(1, len(pages))
     page = max(0, min(page, total_pages - 1))
@@ -218,10 +223,11 @@ async def search_clients(client: MaxApiClient, states: StateStore, chat_id: int,
 
     rows = []
     for c in clients:
-        name = c.name or c.first_name or str(c.id)
-        username_value = c.username or linked_tg_usernames.get(c.tg_user_id)
-        username = f"@{username_value}" if username_value else "без username"
-        rows.append([callback_button(f"{name} ({username})", f"view_client_{c.id}")])
+        label = max_client_list_label(c)
+        linked_tg_username = linked_tg_usernames.get(c.tg_user_id)
+        if linked_tg_username and max_username(c) == "не указан":
+            label = f"{label} (Telegram @{linked_tg_username})"
+        rows.append([callback_button(label, f"view_client_{c.id}")])
     rows.append([callback_button("⬅️ К клиентам", "admin_clients")])
     text = f"🔍 Результаты поиска <b>{html.escape(query)}</b>: найдено {len(clients)} клиент(ов)"
     await client.send_message(chat_id=chat_id, text=text, attachments=inline_keyboard(rows))
@@ -230,7 +236,7 @@ async def search_clients(client: MaxApiClient, states: StateStore, chat_id: int,
 async def download_history_txt(client: MaxApiClient, chat_id: int, target_user_id: int) -> None:
     await client.send_message(
         chat_id=chat_id,
-        text=f"Выберите формат и параметры экспорта для пользователя <code>{target_user_id}</code>:",
+        text=f"Выберите формат и параметры экспорта для пользователя MAX <code>{raw_max_user_id(target_user_id)}</code>:",
         attachments=single_export_options_keyboard(target_user_id),
     )
 
@@ -261,9 +267,13 @@ async def run_single_export(
         await client.send_message(chat_id=chat_id, text="История пуста.", attachments=admin_client_profile_keyboard(target_user_id))
         return
 
-    user_label = "user_1" if anonymize else str(user.id)
+    user_label = "user_1" if anonymize else str(raw_max_user_id(user.id))
     if fmt == "txt":
-        header = f"History: {user_label}\n" if anonymize else f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username})\n"
+        header = (
+            f"History: {user_label}\n"
+            if anonymize
+            else f"History: {max_communication_name(user)} (ID max: {raw_max_user_id(user.id)}, Username: {max_username(user)})\n"
+        )
         lines = [header + "=" * 50]
         for message in messages:
             topic = topic_map.get(message.topic_id, "General")
@@ -340,7 +350,7 @@ async def confirm_delete_history(client: MaxApiClient, states: StateStore, chat_
     await states.set(user_id, chat_id, "admin_delete_history_confirm", {"target_user_id": target_user_id})
     await client.send_message(
         chat_id=chat_id,
-        text=f"⚠️ Удалить всю историю пользователя <code>{target_user_id}</code>? Действие необратимо.",
+        text=f"⚠️ Удалить всю историю пользователя MAX <code>{raw_max_user_id(target_user_id)}</code>? Действие необратимо.",
         attachments=inline_keyboard([
             [callback_button("✅ Да, удалить", f"admin_delete_history_confirmed_{target_user_id}")],
             [callback_button("❌ Отмена", f"view_client_{target_user_id}")],
@@ -354,7 +364,7 @@ async def delete_history_confirmed(client: MaxApiClient, states: StateStore, cha
         await session.execute(sql_delete(DBMessage).where(DBMessage.user_id == target_user_id))
         await session.commit()
     await states.clear(user_id)
-    await client.send_message(chat_id=chat_id, text=f"✅ История пользователя <code>{target_user_id}</code> удалена.")
+    await client.send_message(chat_id=chat_id, text=f"✅ История пользователя MAX <code>{raw_max_user_id(target_user_id)}</code> удалена.")
     await show_client_profile(client, chat_id, target_user_id)
 
 
@@ -380,7 +390,7 @@ async def show_client_payment_info(client: MaxApiClient, chat_id: int, target_us
             )
         )).scalar() or 0.0
 
-    name = user.name or user.first_name or str(target_user_id) if user else str(target_user_id)
+    name = max_communication_name(user) if user else str(raw_max_user_id(target_user_id))
     text = (
         f"<b>💳 Платежи клиента {html.escape(name)}</b>\n\n"
         f"Итого Robokassa: {total_robo:.2f} руб.\n"
@@ -410,7 +420,7 @@ async def show_client_payment_info(client: MaxApiClient, chat_id: int, target_us
 async def reset_account(client: MaxApiClient, chat_id: int, target_user_id: int) -> None:
     await client.send_message(
         chat_id=chat_id,
-        text=f"⚠️ Сбросить аккаунт пользователя <code>{target_user_id}</code>? Это удалит историю диалога, сбросит данные профиля (имя, пол, возраст, подписку).",
+        text=f"⚠️ Сбросить аккаунт пользователя MAX <code>{raw_max_user_id(target_user_id)}</code>? Это удалит историю диалога, сбросит данные профиля (имя, пол, возраст, подписку).",
         attachments=inline_keyboard([
             [callback_button("✅ Да, сбросить", f"admin_reset_account_confirmed_{target_user_id}")],
             [callback_button("❌ Отмена", f"view_client_{target_user_id}")],
@@ -433,14 +443,14 @@ async def reset_account_confirmed(client: MaxApiClient, chat_id: int, target_use
             )
         )
         await session.commit()
-    await client.send_message(chat_id=chat_id, text=f"✅ Аккаунт пользователя <code>{target_user_id}</code> сброшен.")
+    await client.send_message(chat_id=chat_id, text=f"✅ Аккаунт пользователя MAX <code>{raw_max_user_id(target_user_id)}</code> сброшен.")
     await show_client_profile(client, chat_id, target_user_id)
 
 
 async def reset_subscription(client: MaxApiClient, chat_id: int, target_user_id: int) -> None:
     await client.send_message(
         chat_id=chat_id,
-        text=f"⚠️ Сбросить подписку пользователя <code>{target_user_id}</code>?",
+        text=f"⚠️ Сбросить подписку пользователя MAX <code>{raw_max_user_id(target_user_id)}</code>?",
         attachments=inline_keyboard([
             [callback_button("✅ Да, сбросить", f"admin_reset_sub_confirmed_{target_user_id}")],
             [callback_button("❌ Отмена", f"view_client_{target_user_id}")],
@@ -453,5 +463,5 @@ async def reset_subscription_confirmed(client: MaxApiClient, chat_id: int, targe
     async with async_session_maker() as session:
         await session.execute(sql_delete(UserSubscription).where(UserSubscription.user_id == target_user_id))
         await session.commit()
-    await client.send_message(chat_id=chat_id, text=f"✅ Подписка пользователя <code>{target_user_id}</code> сброшена.")
+    await client.send_message(chat_id=chat_id, text=f"✅ Подписка пользователя MAX <code>{raw_max_user_id(target_user_id)}</code> сброшена.")
     await show_client_profile(client, chat_id, target_user_id)

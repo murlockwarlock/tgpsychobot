@@ -6,6 +6,7 @@ apply_legacy_env_defaults()
 
 from database import (  # noqa: E402
     AIConfig,
+    AILog,
     Base,
     CaseStudy,
     Content,
