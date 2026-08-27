@@ -1298,7 +1298,7 @@ async def resolve_show_image(
         return media
 
     diagnostic_result = await session.execute(
-        select(MediaLibrary.media_type, MediaLibrary.topic_id)
+        select(MediaLibrary.media_type)
         .where(MediaLibrary.file_name == normalized_name)
         .order_by(MediaLibrary.id)
         .limit(1)

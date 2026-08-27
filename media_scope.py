@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from sqlalchemy import and_, false, select
 
 from database import (
+    MediaCollection,
     MediaLibrary,
+    Topic,
     main_dialogue_collection_association,
     media_collection_items,
     topic_collection_association,
@@ -89,6 +91,35 @@ async def load_media_scope(session, topic_id: int | None) -> MediaScope:
 
 async def load_topic_media_scope(session, topic_id: int | None) -> MediaScope:
     return await load_media_scope(session, topic_id)
+
+
+async def ensure_topic_collection(session, topic_id: int, name_prefix: str = "__max_topic") -> int | None:
+    scope = await load_media_scope(session, topic_id)
+    if scope.collection_ids:
+        return scope.collection_ids[0]
+    if not await session.get(Topic, topic_id):
+        return None
+
+    name = f"{name_prefix}_{topic_id}"
+    collection = await session.scalar(select(MediaCollection).where(MediaCollection.name == name))
+    if collection is None:
+        collection = MediaCollection(name=name)
+        session.add(collection)
+        await session.flush()
+    linked = await session.scalar(
+        select(topic_collection_association.c.collection_id).where(
+            topic_collection_association.c.topic_id == topic_id,
+            topic_collection_association.c.collection_id == collection.id,
+        )
+    )
+    if linked is None:
+        await session.execute(
+            topic_collection_association.insert().values(
+                topic_id=topic_id,
+                collection_id=collection.id,
+            )
+        )
+    return collection.id
 
 
 async def load_available_media(session, topic_id: int | None):
