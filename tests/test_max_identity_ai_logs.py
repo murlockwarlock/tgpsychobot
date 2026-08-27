@@ -304,6 +304,63 @@ async def test_max_chat_response_creates_shared_ai_log(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_max_primary_chat_log_records_provider_latency(monkeypatch):
+    user = _max_user()
+    session = _MaxAISession(user, _max_config())
+    monotonic_values = iter((100.0, 100.5))
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="MAX answer"))
+    monkeypatch.setattr(max_ai, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
+
+    await max_ai.get_ai_response(user.id, "question")
+
+    assert session.added[0].latency_ms == 500
+
+
+@pytest.mark.asyncio
+async def test_max_fallback_chat_log_records_whole_provider_latency_and_fallback_model(monkeypatch):
+    user = _max_user()
+    config = _max_config()
+    config.openai_api_key = "fallback-secret"
+    config.fallback_provider = "OpenAI"
+    config.fallback_model = "gpt-fallback"
+    config.allow_fallback = True
+    session = _MaxAISession(user, config)
+    monotonic_values = iter((200.0, 201.25))
+    primary_error = max_ai.AIServiceError("primary provider failed")
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(side_effect=primary_error))
+    monkeypatch.setattr(max_ai, "_call_openai", AsyncMock(return_value="fallback answer"))
+    monkeypatch.setattr(max_ai, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
+
+    result = await max_ai.get_ai_response(user.id, "question")
+
+    assert result == "fallback answer"
+    log_entry = session.added[0]
+    assert log_entry.provider == "OpenAI"
+    assert log_entry.model == "gpt-fallback"
+    assert log_entry.latency_ms == 1250
+
+
+@pytest.mark.asyncio
+async def test_max_failed_chat_request_preserves_provider_error_and_does_not_create_log(monkeypatch):
+    user = _max_user()
+    session = _MaxAISession(user, _max_config())
+    primary_error = max_ai.AIServiceError("primary provider failed")
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(side_effect=primary_error))
+
+    with pytest.raises(max_ai.AIServiceError) as raised:
+        await max_ai.get_ai_response(user.id, "question")
+
+    assert raised.value is primary_error
+    assert session.added == []
+
+
+@pytest.mark.asyncio
 async def test_max_log_is_visible_in_existing_global_and_per_user_log_ui(monkeypatch):
     user_id = max_models.MAX_ID_OFFSET + 55
     log_entry = AILog(

@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import tempfile
+import time
 import uuid
 
 import anthropic
@@ -930,6 +931,7 @@ async def get_ai_response(
             current_user_content=user_prompt,
         )
         temperature = _resolve_temperature(ai_config)
+        start_time = time.monotonic()
         try:
             result = await _dispatch_provider(ai_config, request_layout)
             log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, active_topic_id)
@@ -993,6 +995,7 @@ async def get_ai_response(
                 log.exception("Unexpected AI request failure user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
                 raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}") from primary_err
 
+        latency_ms = int((time.monotonic() - start_time) * 1000)
         visible_text, _, _ = extract_service_data(result)
         ai_log = AILog(
             user_id=user_id,
@@ -1002,6 +1005,7 @@ async def get_ai_response(
             prompt_summary=user_prompt if user_prompt else None,
             raw_response=result,
             clean_text=visible_text,
+            latency_ms=latency_ms,
         )
         apply_ai_log_context(
             ai_log,
