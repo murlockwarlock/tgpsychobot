@@ -6,6 +6,10 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram import Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, Chat, Message as TelegramMessage, Update, User as TelegramUser
+
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
@@ -559,6 +563,108 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.campaign_id, data["campaign_id"])
         self.assertEqual(7, data["followup_return_topic_id"])
+
+    async def test_metadata_back_navigation_is_routed_by_dispatcher(self):
+        class DispatcherBot:
+            id = 999
+
+            def __init__(self):
+                self.methods = []
+
+            async def __call__(self, method):
+                self.methods.append(method)
+                return True
+
+        def callback_update(update_id, data):
+            telegram_user = TelegramUser(
+                id=42,
+                is_bot=False,
+                first_name="Админ",
+                username="admin",
+            )
+            message = TelegramMessage(
+                message_id=update_id,
+                date=datetime.utcnow(),
+                chat=Chat(id=42, type="private"),
+                from_user=telegram_user,
+            )
+            return Update(
+                update_id=update_id,
+                callback_query=CallbackQuery(
+                    id=f"dispatcher-{update_id}",
+                    from_user=telegram_user,
+                    chat_instance="dispatcher-test",
+                    message=message,
+                    data=data,
+                ),
+            )
+
+        def message_update(update_id, text):
+            telegram_user = TelegramUser(
+                id=42,
+                is_bot=False,
+                first_name="Админ",
+                username="admin",
+            )
+            message = TelegramMessage(
+                message_id=update_id,
+                date=datetime.utcnow(),
+                chat=Chat(id=42, type="private"),
+                from_user=telegram_user,
+                text=text,
+            )
+            return Update(update_id=update_id, message=message)
+
+        dispatcher = Dispatcher(storage=MemoryStorage())
+        dispatcher.include_router(automation_admin.router)
+        bot = DispatcherBot()
+        with (
+            patch.object(automation_admin, "async_session_maker", self.sessions),
+            patch.object(automation_admin, "get_all_admin_ids", new=AsyncMock(return_value={42})),
+        ):
+            await dispatcher.feed_update(bot, callback_update(1, f"followup_conditions_{self.campaign_id}"))
+            await dispatcher.feed_update(bot, callback_update(2, f"followup_metadata_edit_{self.campaign_id}"))
+            context = dispatcher.fsm.get_context(bot, chat_id=42, user_id=42)
+            self.assertEqual(
+                automation_admin.AutomationAdminStates.followup_metadata_field.state,
+                await context.get_state(),
+            )
+            await dispatcher.feed_update(bot, message_update(3, "profile.outcome"))
+            context = dispatcher.fsm.get_context(bot, chat_id=42, user_id=42)
+            self.assertEqual(
+                automation_admin.AutomationAdminStates.followup_metadata_operator.state,
+                await context.get_state(),
+            )
+            await dispatcher.feed_update(
+                bot,
+                callback_update(4, f"followup_metadata_operator_{self.campaign_id}_equals"),
+            )
+            context = dispatcher.fsm.get_context(bot, chat_id=42, user_id=42)
+            self.assertEqual(
+                automation_admin.AutomationAdminStates.followup_metadata_value.state,
+                await context.get_state(),
+            )
+            await dispatcher.feed_update(
+                bot,
+                callback_update(5, f"followup_metadata_operator_edit_{self.campaign_id}"),
+            )
+            context = dispatcher.fsm.get_context(bot, chat_id=42, user_id=42)
+            self.assertEqual(
+                automation_admin.AutomationAdminStates.followup_metadata_operator.state,
+                await context.get_state(),
+            )
+            await dispatcher.feed_update(
+                bot,
+                callback_update(6, f"followup_metadata_edit_{self.campaign_id}"),
+            )
+            context = dispatcher.fsm.get_context(bot, chat_id=42, user_id=42)
+            self.assertEqual(
+                automation_admin.AutomationAdminStates.followup_metadata_field.state,
+                await context.get_state(),
+            )
+        rendered_texts = [getattr(method, "text", None) for method in bot.methods]
+        self.assertTrue(any(text and "Введите путь поля" in text for text in rendered_texts))
+        self.assertTrue(any(text and "Выберите оператор" in text for text in rendered_texts))
 
     async def test_explicit_delete_removes_unsent_step_without_touching_other_steps(self):
         callback = make_callback(f"followup_step_delete_{self.campaign_id}_{self.second_step_id}")

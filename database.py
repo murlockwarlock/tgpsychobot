@@ -1296,6 +1296,27 @@ class FollowupDelivery(Base):
     telegram_message_id = Column(BigInteger, nullable=True)
 
 
+class FollowupDeliveryAttempt(Base):
+    __tablename__ = 'followup_delivery_attempts'
+    __table_args__ = (
+        UniqueConstraint(
+            'run_id', 'generation', 'step_index',
+            name='uq_followup_delivery_attempt_step',
+        ),
+        Index('idx_followup_delivery_attempt_status', 'status', 'claimed_at'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(Integer, ForeignKey('followup_runs.id', ondelete='CASCADE'), nullable=False)
+    step_id = Column(Integer, ForeignKey('followup_steps.id', ondelete='CASCADE'), nullable=False)
+    step_index = Column(Integer, nullable=False)
+    generation = Column(Integer, nullable=False)
+    claim_token = Column(String, unique=True, nullable=False)
+    status = Column(String, default='claimed', nullable=False)
+    claimed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    error_text = Column(Text, nullable=True)
+
+
 class CardSpreadState(Base):
     __tablename__ = 'card_spread_states'
 

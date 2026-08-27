@@ -1,5 +1,7 @@
+import asyncio
 import os
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta
@@ -9,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import followups
@@ -20,6 +22,7 @@ from database import (
     Base,
     FollowupCampaign,
     FollowupDelivery,
+    FollowupDeliveryAttempt,
     FollowupRun,
     FollowupStep,
     Message,
@@ -27,8 +30,11 @@ from database import (
 )
 from followups import (
     _outside_quiet_hours,
+    FollowupActivityMiddleware,
     check_campaign_eligibility,
     evaluate_followup_eligibility,
+    begin_user_activity,
+    finalize_user_activity,
     process_due_followups,
     record_user_activity,
 )
@@ -410,6 +416,60 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deliveries, 1)
         self.assertEqual(bot.sent, [(42, "Продолжим?")])
 
+    async def test_allowed_chain_advances_each_step_and_keeps_delivery_history(self):
+        async with self.sessions() as session:
+            campaign = await session.scalar(select(FollowupCampaign))
+            second_step = FollowupStep(
+                campaign_id=campaign.id,
+                sort_order=1,
+                delay_minutes=20,
+                message_type="static",
+                message_text="Ещё вопрос?",
+            )
+            session.add(second_step)
+            await session.flush()
+            first_step_id = await session.scalar(
+                select(FollowupStep.id)
+                .where(FollowupStep.campaign_id == campaign.id)
+                .order_by(FollowupStep.sort_order.asc())
+            )
+            second_step_id = second_step.id
+            await session.commit()
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            await record_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=datetime.utcnow() - timedelta(minutes=5),
+            )
+            first = await process_due_followups(bot)
+            async with self.sessions() as session:
+                run = await session.scalar(select(FollowupRun))
+                run.due_at = datetime.utcnow() - timedelta(minutes=1)
+                await session.commit()
+            second = await process_due_followups(bot)
+
+        async with self.sessions() as session:
+            run = await session.scalar(select(FollowupRun))
+            deliveries = (
+                await session.execute(
+                    select(FollowupDelivery).order_by(FollowupDelivery.id.asc())
+                )
+            ).scalars().all()
+            attempts = (
+                await session.execute(
+                    select(FollowupDeliveryAttempt).order_by(FollowupDeliveryAttempt.step_index.asc())
+                )
+            ).scalars().all()
+        self.assertEqual((1, 1), (first, second))
+        self.assertEqual((2, "completed"), (run.next_step_index, run.status))
+        self.assertEqual([first_step_id, second_step_id], [item.step_id for item in deliveries])
+        self.assertEqual([1, 1], [item.generation for item in deliveries])
+        self.assertEqual(["delivered", "delivered"], [item.status for item in attempts])
+        self.assertEqual([(42, "Продолжим?"), (42, "Ещё вопрос?")], bot.sent)
+
     async def test_old_dialogue_run_is_cancelled_before_delivery(self):
         with patch.object(followups, "async_session_maker", self.sessions):
             await record_user_activity(
@@ -469,3 +529,423 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(message)
         self.assertEqual(message.content, "Вернись к нам")
+
+
+class FollowupRaceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.database_schema = os.environ.get("FOLLOWUP_TEST_SCHEMA")
+        database_url = os.environ.get("FOLLOWUP_TEST_DATABASE_URL")
+        if database_url and self.database_schema and database_url.startswith("postgresql+"):
+            self.engine = create_async_engine(
+                database_url,
+                connect_args={
+                    "server_settings": {
+                        "search_path": f"{self.database_schema},public",
+                    },
+                },
+            )
+        else:
+            self.engine = create_async_engine(database_url or (
+                f"sqlite+aiosqlite:///{self.tempdir.name}/followups.db"
+            ))
+        self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.engine.begin() as connection:
+            if database_url and database_url.startswith("postgresql+"):
+                await connection.run_sync(Base.metadata.drop_all)
+            await connection.run_sync(Base.metadata.create_all)
+        async with self.sessions() as session:
+            session.add(User(id=42, first_name="Иван", current_dialogue_id=1, current_topic_id=None))
+            campaign = FollowupCampaign(
+                name="A",
+                is_active=True,
+                include_main_dialogue=True,
+                quiet_start_minute=0,
+                quiet_end_minute=0,
+                jitter_min_seconds=0,
+                jitter_max_seconds=0,
+            )
+            campaign.steps.append(FollowupStep(
+                sort_order=0,
+                delay_minutes=1,
+                message_type="static",
+                message_text="A",
+            ))
+            session.add(campaign)
+            await session.commit()
+            self.campaign_id = campaign.id
+            self.step_id = campaign.steps[0].id
+
+    async def asyncTearDown(self):
+        if self.database_schema:
+            async with self.engine.begin() as connection:
+                await connection.execute(text(f'DROP SCHEMA "{self.database_schema}" CASCADE'))
+        await self.engine.dispose()
+        self.tempdir.cleanup()
+
+    async def _add_due_run(self, campaign_id=None, due_at=None):
+        async with self.sessions() as session:
+            campaign_id = campaign_id or self.campaign_id
+            step = await session.scalar(
+                select(FollowupStep).where(FollowupStep.campaign_id == campaign_id)
+            )
+            run = FollowupRun(
+                campaign_id=campaign_id,
+                user_id=42,
+                dialogue_id=1,
+                topic_id=0,
+                next_step_index=0,
+                generation=1,
+                last_activity_at=datetime.utcnow() - timedelta(minutes=3),
+                due_at=due_at or datetime.utcnow() - timedelta(minutes=2),
+                status="active",
+            )
+            session.add(run)
+            await session.commit()
+            return run.id, step.id
+
+    async def _run_state(self, run_id):
+        async with self.sessions() as session:
+            return await session.get(FollowupRun, run_id)
+
+    async def test_concurrent_schedulers_send_one_external_message(self):
+        run_id, _ = await self._add_due_run()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingBot(FakeBot):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            async def send_message(self, chat_id, text, **kwargs):
+                self.calls += 1
+                started.set()
+                await release.wait()
+                return await super().send_message(chat_id, text, **kwargs)
+
+        bot = BlockingBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            first_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            second_task = asyncio.create_task(process_due_followups(bot))
+            second_result = await asyncio.wait_for(second_task, timeout=2)
+            self.assertEqual(0, second_result)
+            self.assertEqual(1, bot.calls)
+            self.assertEqual([], bot.sent)
+            release.set()
+            first_result = await asyncio.wait_for(first_task, timeout=2)
+
+        self.assertEqual(1, first_result)
+        async with self.sessions() as session:
+            self.assertEqual(1, await session.scalar(select(func.count(FollowupDelivery.id))))
+            self.assertEqual(1, await session.scalar(select(func.count(FollowupDeliveryAttempt.id))))
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("delivered", attempt.status)
+        self.assertEqual(run_id, attempt.run_id)
+
+    async def test_claim_is_durable_before_worker_can_reach_external_send(self):
+        await self._add_due_run()
+        claim_started = asyncio.Event()
+        release_claim = asyncio.Event()
+        original_claim = followups._claim_due_followup
+
+        async def hold_after_claim(run_id, now):
+            claim = await original_claim(run_id, now)
+            if claim is not None and not claim_started.is_set():
+                claim_started.set()
+                await release_claim.wait()
+            return claim
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions), patch.object(
+            followups, "_claim_due_followup", new=hold_after_claim
+        ):
+            first_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(claim_started.wait(), timeout=2)
+            second_result = await asyncio.wait_for(process_due_followups(bot), timeout=2)
+            self.assertEqual(0, second_result)
+            self.assertEqual([], bot.sent)
+            release_claim.set()
+            first_result = await asyncio.wait_for(first_task, timeout=2)
+
+        self.assertEqual(1, first_result)
+        self.assertEqual([(42, "A")], bot.sent)
+
+    async def test_activity_ingress_invalidates_claim_before_external_send(self):
+        await self._add_due_run()
+        claim_started = asyncio.Event()
+        release_claim = asyncio.Event()
+        original_claim = followups._claim_due_followup
+
+        async def hold_after_claim(run_id, now):
+            claim = await original_claim(run_id, now)
+            if claim is not None and not claim_started.is_set():
+                claim_started.set()
+                await release_claim.wait()
+            return claim
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions), patch.object(
+            followups, "_claim_due_followup", new=hold_after_claim
+        ):
+            process_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(claim_started.wait(), timeout=2)
+            ingress = await begin_user_activity(42, dialogue_id=1, topic_id=None)
+            release_claim.set()
+            self.assertEqual(0, await asyncio.wait_for(process_task, timeout=2))
+
+        self.assertEqual({self.campaign_id: 2}, ingress.run_generations)
+        self.assertEqual([], bot.sent)
+        state = await self._run_state(ingress.run_ids[self.campaign_id])
+        self.assertEqual((2, 0, "pending"), (state.generation, state.next_step_index, state.status))
+        async with self.sessions() as session:
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("cancelled", attempt.status)
+
+    async def test_old_completion_records_history_without_overwriting_new_generation(self):
+        run_id, _ = await self._add_due_run()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingBot(FakeBot):
+            async def send_message(self, chat_id, text, **kwargs):
+                started.set()
+                await release.wait()
+                return await super().send_message(chat_id, text, **kwargs)
+
+        bot = BlockingBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            process_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            activity_at = datetime.utcnow()
+            ingress = await begin_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=activity_at,
+            )
+            release.set()
+            self.assertEqual(1, await asyncio.wait_for(process_task, timeout=2))
+
+        state = await self._run_state(run_id)
+        self.assertEqual((2, 0, "pending", activity_at), (
+            state.generation,
+            state.next_step_index,
+            state.status,
+            state.due_at,
+        ))
+        async with self.sessions() as session:
+            delivery = await session.scalar(select(FollowupDelivery))
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual((1, self.step_id), (delivery.generation, delivery.step_id))
+        self.assertEqual("delivered", attempt.status)
+        self.assertEqual({self.campaign_id: 2}, ingress.run_generations)
+
+    async def test_stale_batch_candidate_is_rechecked_after_another_run_restarts(self):
+        run_a_id, _ = await self._add_due_run(due_at=datetime.utcnow() - timedelta(minutes=3))
+        async with self.sessions() as session:
+            campaign_b = FollowupCampaign(
+                name="B",
+                is_active=True,
+                include_main_dialogue=True,
+                quiet_start_minute=0,
+                quiet_end_minute=0,
+                jitter_min_seconds=0,
+                jitter_max_seconds=0,
+            )
+            campaign_b.steps.append(FollowupStep(
+                sort_order=0,
+                delay_minutes=1,
+                message_type="static",
+                message_text="B",
+            ))
+            session.add(campaign_b)
+            await session.flush()
+            run_b = FollowupRun(
+                campaign_id=campaign_b.id,
+                user_id=42,
+                dialogue_id=1,
+                topic_id=0,
+                next_step_index=0,
+                generation=1,
+                last_activity_at=datetime.utcnow() - timedelta(minutes=3),
+                due_at=datetime.utcnow() - timedelta(minutes=2),
+                status="active",
+            )
+            session.add(run_b)
+            await session.commit()
+            run_b_id = run_b.id
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowFirstBot(FakeBot):
+            async def send_message(self, chat_id, text, **kwargs):
+                if text == "A":
+                    started.set()
+                    await release.wait()
+                return await super().send_message(chat_id, text, **kwargs)
+
+        bot = SlowFirstBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            process_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            await record_user_activity(42, dialogue_id=1, topic_id=None)
+            release.set()
+            delivered = await asyncio.wait_for(process_task, timeout=2)
+
+        self.assertEqual(1, delivered)
+        self.assertEqual([(42, "A")], bot.sent)
+        state_a = await self._run_state(run_a_id)
+        state_b = await self._run_state(run_b_id)
+        self.assertEqual((2, 0, "active"), (state_a.generation, state_a.next_step_index, state_a.status))
+        self.assertEqual((2, 0, "active"), (state_b.generation, state_b.next_step_index, state_b.status))
+        async with self.sessions() as session:
+            deliveries = (await session.execute(select(FollowupDelivery))).scalars().all()
+        self.assertEqual([(run_a_id, 1)], [(item.run_id, item.generation) for item in deliveries])
+
+    async def test_finalizing_old_delivery_leaves_new_generation_scheduled(self):
+        run_id, _ = await self._add_due_run()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingBot(FakeBot):
+            async def send_message(self, chat_id, text, **kwargs):
+                started.set()
+                await release.wait()
+                return await super().send_message(chat_id, text, **kwargs)
+
+        bot = BlockingBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            process_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            activity_at = datetime.utcnow()
+            ingress = await begin_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=activity_at,
+            )
+            release.set()
+            await asyncio.wait_for(process_task, timeout=2)
+            await finalize_user_activity(
+                42,
+                ingress,
+                dialogue_id=1,
+                topic_id=None,
+            )
+
+        state = await self._run_state(run_id)
+        self.assertEqual(2, state.generation)
+        self.assertEqual(0, state.next_step_index)
+        self.assertEqual("active", state.status)
+        self.assertEqual(_due_at_for_test(activity_at), state.due_at)
+
+    async def test_stale_claim_becomes_uncertain_without_a_retry(self):
+        run_id, step_id = await self._add_due_run()
+        async with self.sessions() as session:
+            session.add(FollowupDeliveryAttempt(
+                run_id=run_id,
+                step_id=step_id,
+                step_index=0,
+                generation=1,
+                claim_token="crashed-worker",
+                status="claimed",
+                claimed_at=datetime.utcnow() - timedelta(hours=1),
+            ))
+            await session.commit()
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            self.assertEqual(0, await process_due_followups(bot))
+            self.assertEqual(0, await process_due_followups(bot))
+        self.assertEqual([], bot.sent)
+        async with self.sessions() as session:
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+            run = await session.get(FollowupRun, run_id)
+            self.assertEqual(0, await session.scalar(select(func.count(FollowupDelivery.id))))
+        self.assertEqual("uncertain", attempt.status)
+        self.assertEqual("active", run.status)
+
+    async def test_ambiguous_external_failure_is_uncertain_without_a_retry(self):
+        run_id, _ = await self._add_due_run()
+
+        class AmbiguousBot(FakeBot):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            async def send_message(self, chat_id, text, **kwargs):
+                self.calls += 1
+                self.sent.append((chat_id, text))
+                raise RuntimeError("Telegram response was lost")
+
+        bot = AmbiguousBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            self.assertEqual(0, await process_due_followups(bot))
+            self.assertEqual(0, await process_due_followups(bot))
+        self.assertEqual(1, bot.calls)
+        self.assertEqual([(42, "A")], bot.sent)
+        async with self.sessions() as session:
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+            run = await session.get(FollowupRun, run_id)
+            self.assertEqual(0, await session.scalar(select(func.count(FollowupDelivery.id))))
+        self.assertEqual("uncertain", attempt.status)
+        self.assertEqual("active", run.status)
+
+    async def test_middleware_finalization_does_not_increment_generation_twice(self):
+        run_id, _ = await self._add_due_run()
+
+        async def handler(event, data):
+            return "handled"
+
+        event = SimpleNamespace(
+            from_user=SimpleNamespace(id=42, is_bot=False),
+            data="",
+        )
+        with patch.object(followups, "async_session_maker", self.sessions):
+            result = await FollowupActivityMiddleware()(handler, event, {})
+
+        self.assertEqual("handled", result)
+        state = await self._run_state(run_id)
+        self.assertEqual((2, 0, "active"), (state.generation, state.next_step_index, state.status))
+
+    async def test_middleware_invalidates_before_handler_and_uses_final_scope(self):
+        run_id, _ = await self._add_due_run()
+        observed = {}
+
+        async def handler(event, data):
+            async with self.sessions() as session:
+                run = await session.get(FollowupRun, run_id)
+                observed["run"] = (run.generation, run.status)
+                user = await session.get(User, 42)
+                user.current_dialogue_id = 2
+                await session.commit()
+            return "handled"
+
+        event = SimpleNamespace(
+            from_user=SimpleNamespace(id=42, is_bot=False),
+            data="",
+        )
+        middleware = FollowupActivityMiddleware()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            result = await middleware(handler, event, {})
+
+        self.assertEqual("handled", result)
+        self.assertEqual((2, "pending"), observed["run"])
+        async with self.sessions() as session:
+            old_run = await session.get(FollowupRun, run_id)
+            new_run = await session.scalar(
+                select(FollowupRun).where(
+                    FollowupRun.campaign_id == self.campaign_id,
+                    FollowupRun.user_id == 42,
+                    FollowupRun.dialogue_id == 2,
+                    FollowupRun.topic_id == 0,
+                )
+            )
+        self.assertEqual((2, "cancelled"), (old_run.generation, old_run.status))
+        self.assertEqual((1, "active"), (new_run.generation, new_run.status))
+
+
+def _due_at_for_test(activity_at):
+    return activity_at + timedelta(minutes=1)
