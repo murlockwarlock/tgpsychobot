@@ -21,16 +21,30 @@ def parse_media_tags(response_text: str):
     random_imgs = re.findall(random_img_pattern, response_text)
     choices = re.findall(choice_img_pattern, response_text)
     choices_hidden = re.findall(choice_hidden_pattern, response_text)
-    show_imgs = re.findall(show_img_pattern, response_text)
+    show_imgs = [_parse_show_img_directive(payload) for payload in re.findall(show_img_pattern, response_text, flags=re.IGNORECASE)]
 
     clean_text = re.sub(audio_pattern, '', response_text)
     clean_text = re.sub(random_img_pattern, '', clean_text)
     clean_text = re.sub(choice_hidden_pattern, '', clean_text)
     clean_text = re.sub(choice_img_pattern, '', clean_text)
-    clean_text = re.sub(show_img_pattern, '', clean_text)
+    clean_text = re.sub(show_img_pattern, '', clean_text, flags=re.IGNORECASE)
     clean_text = re.sub(r'\n{3,}', '\n\n', clean_text).strip()
 
     return clean_text, audios, random_imgs, choices, choices_hidden, show_imgs
+
+
+def _parse_show_img_directive(payload: str):
+    parts = payload.split("|")
+    file_name = parts[0].strip()
+    position = "before"
+    for option in parts[1:]:
+        key, separator, value = option.partition("=")
+        if key.strip().lower() != "position" or not separator:
+            continue
+        normalized = value.strip().lower()
+        position = normalized if normalized in {"before", "after"} else "before"
+        break
+    return file_name, position
 
 
 def parse_media_tags_execute(response_text: str):
@@ -39,8 +53,16 @@ def parse_media_tags_execute(response_text: str):
     random_matches = re.findall(r"\[RANDOM_IMG:\s*(.+?)\]", response_text)
     choice_matches = re.findall(r"\[CHOICE_IMG:\s*(.+?)\s*\|\s*(\d+)\]", response_text)
     choice_hidden_matches = re.findall(r"\[CHOICE_IMG_HIDDEN:\s*(.+?)\s*\|\s*(\d+)\]", response_text)
-    show_matches = re.findall(r"\[SHOW_IMG:\s*(.+?)\]", response_text)
-    clean_text = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG_HIDDEN|CHOICE_IMG|SHOW_IMG):.*?\]", "", response_text).strip()
+    show_matches = [
+        _parse_show_img_directive(payload)
+        for payload in re.findall(r"\[SHOW_IMG:\s*(.+?)\]", response_text, flags=re.IGNORECASE)
+    ]
+    clean_text = re.sub(
+        r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG_HIDDEN|CHOICE_IMG|SHOW_IMG):.*?\]",
+        "",
+        response_text,
+        flags=re.IGNORECASE,
+    ).strip()
     return clean_text, audio_matches, random_matches, choice_matches, choice_hidden_matches, show_matches
 
 
@@ -61,7 +83,7 @@ def build_available_media_text(media_files):
         if cat:
             available_media_text += f'\nКатегория (для тегов RANDOM_IMG/CHOICE_IMG): "{cat}"\n'
         for m in files:
-            desc_part = f" — {m.description}" if m.description else ""
+            desc_part = f" — {m.description}" if m.description and m.description.strip() else ""
             available_media_text += f"  - [{m.media_type.upper()}] {m.file_name}{desc_part}\n"
 
     return available_media_text
@@ -317,24 +339,24 @@ class ParseMediaTagsEdgeCasesTests(unittest.TestCase):
     def test_show_img_parsed(self):
         text = "Вот эта карта:\n[SHOW_IMG: Шут]\nОбрати внимание."
         clean, _, _, _, _, show_imgs = parse_media_tags(text)
-        self.assertEqual(show_imgs, ["Шут"])
+        self.assertEqual(show_imgs, [("Шут", "before")])
         self.assertNotIn("[SHOW_IMG", clean)
         self.assertIn("Вот эта карта:", clean)
 
     def test_show_img_with_spaces(self):
         text = "[SHOW_IMG:   Королева мечей  ]"
         _, _, _, _, _, show_imgs = parse_media_tags(text)
-        self.assertEqual(show_imgs, ["Королева мечей  "])
+        self.assertEqual(show_imgs, [("Королева мечей", "before")])
 
     def test_show_img_multiple(self):
         text = "[SHOW_IMG: Шут]\n[SHOW_IMG: Маг]"
         _, _, _, _, _, show_imgs = parse_media_tags(text)
-        self.assertEqual(show_imgs, ["Шут", "Маг"])
+        self.assertEqual(show_imgs, [("Шут", "before"), ("Маг", "before")])
 
     def test_show_img_with_other_tags(self):
         text = "Текст\n[SHOW_IMG: Шут]\n[RANDOM_IMG: tarot]\n[SEND_AUDIO: relax]"
         clean, audios, imgs, _, _, show_imgs = parse_media_tags(text)
-        self.assertEqual(show_imgs, ["Шут"])
+        self.assertEqual(show_imgs, [("Шут", "before")])
         self.assertEqual(imgs, ["tarot"])
         self.assertEqual(audios, ["relax"])
         self.assertNotIn("[SHOW_IMG", clean)
@@ -342,14 +364,14 @@ class ParseMediaTagsEdgeCasesTests(unittest.TestCase):
     def test_show_img_execute_parser(self):
         text = "Вот карта [SHOW_IMG: Шут] смотри"
         clean, _, _, _, _, show_imgs = parse_media_tags_execute(text)
-        self.assertEqual(show_imgs, ["Шут"])
+        self.assertEqual(show_imgs, [("Шут", "before")])
         self.assertNotIn("[SHOW_IMG", clean)
 
     def test_show_img_consistency(self):
         text = "[SHOW_IMG: Королева мечей]"
         _, _, _, _, _, s1 = parse_media_tags(text)
         _, _, _, _, _, s2 = parse_media_tags_execute(text)
-        self.assertEqual([s.strip() for s in s1], [s.strip() for s in s2])
+        self.assertEqual(s1, s2)
 
     def test_choice_hidden_parsed(self):
         text = "Выбери вслепую:\n[CHOICE_IMG_HIDDEN: tarot | 3]"
@@ -391,7 +413,7 @@ class ParserConsistencyTests(unittest.TestCase):
         self.assertEqual([r.strip() for r in r1], [r.strip() for r in r2])
         self.assertEqual([(c.strip(), n) for c, n in c1], [(c.strip(), n) for c, n in c2])
         self.assertEqual([(c.strip(), n) for c, n in ch1], [(c.strip(), n) for c, n in ch2])
-        self.assertEqual([s.strip() for s in s1], [s.strip() for s in s2])
+        self.assertEqual(s1, s2)
 
     def test_single_random_img(self):
         self._assert_same("[RANDOM_IMG: tarot]")
@@ -452,6 +474,12 @@ class BuildAvailableMediaTextTests(unittest.TestCase):
 
     def test_file_without_description(self):
         files = [make_media("tarot_fool", "tarot", "photo", None)]
+        result = build_available_media_text(files)
+        self.assertIn("tarot_fool", result)
+        self.assertNotIn(" — ", result)
+
+    def test_file_with_blank_description(self):
+        files = [make_media("tarot_fool", "tarot", "photo", "   ")]
         result = build_available_media_text(files)
         self.assertIn("tarot_fool", result)
         self.assertNotIn(" — ", result)

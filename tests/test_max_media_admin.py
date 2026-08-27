@@ -143,6 +143,98 @@ async def test_max_add_media_is_canonical_and_visible_without_remigration(max_st
 
 
 @pytest.mark.asyncio
+async def test_max_add_can_skip_description_and_edit_clear_is_idempotent(max_store, monkeypatch):
+    collection_id = await _create_topic_collection(max_store)
+    client = FakeClient()
+    state = FakeState()
+
+    await service.start_add_media(client, state, 100, 7, 1, page=2, collection_id=collection_id)
+    await service.receive_add_file(client, state, 100, 7, media_token="max-photo", media_type="photo")
+    await service.save_add_name(client, state, 100, 7, "undesc_card")
+    await service.save_add_category(client, state, 100, 7, "tarot")
+    assert any(
+        button["text"] == "Пропустить"
+        for button in _buttons(client.messages[-1]["attachments"])
+    )
+
+    application = max_app.MaxBotApplication(client)
+    application.states = state
+    monkeypatch.setattr(max_app.common, "is_admin", AsyncMock(return_value=True))
+    callback = IncomingCallback(
+        raw={},
+        callback_id="callback",
+        payload="admin_media_add_skip_description",
+        chat_id=100,
+        message_id=None,
+        sender=Sender(user_id=7, username=None, first_name=None, last_name=None),
+    )
+    await application.handle_callback(callback)
+
+    assert state.state is None
+    async with max_store() as session:
+        media = await session.scalar(select(MediaLibrary).where(MediaLibrary.file_name == "undesc_card"))
+        assert media is not None
+        assert media.description is None
+        media_id = media.id
+
+    await service.show_media_detail(client, 100, media_id, topic_id=1, page=2)
+    assert "Описание:" not in client.messages[-1]["text"]
+
+    replace_state = FakeState()
+    await service.start_edit_description(client, replace_state, 100, 7, media_id, topic_id=1, page=2)
+    await service.save_edit_description(client, replace_state, 100, 7, "Replaced description")
+    async with max_store() as session:
+        assert (await session.get(MediaLibrary, media_id)).description == "Replaced description"
+    await service.show_media_detail(client, 100, media_id, topic_id=1, page=2)
+    assert "Описание: Replaced description" in client.messages[-1]["text"]
+
+    media_state = FakeState()
+    await service.start_edit_description(client, media_state, 100, 7, media_id, topic_id=1, page=2)
+    clear_payload = next(
+        button["payload"]
+        for button in _buttons(client.messages[-1]["attachments"])
+        if button["text"] == "Очистить"
+    )
+    assert clear_payload == "admin_media_clear_desc_1_2_" + str(media_id)
+    application.states = media_state
+    await application.handle_callback(
+        IncomingCallback(
+            raw={},
+            callback_id="callback",
+            payload=clear_payload,
+            chat_id=100,
+            message_id=None,
+            sender=Sender(user_id=7, username=None, first_name=None, last_name=None),
+        )
+    )
+
+    async with max_store() as session:
+        assert (await session.get(MediaLibrary, media_id)).description is None
+
+    empty_state = FakeState()
+    await service.start_edit_description(client, empty_state, 100, 7, media_id, topic_id=1, page=2)
+    second_clear_payload = next(
+        button["payload"]
+        for button in _buttons(client.messages[-1]["attachments"])
+        if button["text"] == "Очистить"
+    )
+    application.states = empty_state
+    await application.handle_callback(
+        IncomingCallback(
+            raw={},
+            callback_id="callback",
+            payload=second_clear_payload,
+            chat_id=100,
+            message_id=None,
+            sender=Sender(user_id=7, username=None, first_name=None, last_name=None),
+        )
+    )
+
+    async with max_store() as session:
+        assert (await session.get(MediaLibrary, media_id)).description is None
+
+
+@pytest.mark.asyncio
 async def test_max_add_with_multiple_collections_requires_and_preserves_collection_context(max_store):
     first_collection = await _create_topic_collection(max_store, collection_name="First")
     async with max_store() as session:

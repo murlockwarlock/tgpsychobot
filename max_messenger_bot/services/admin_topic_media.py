@@ -189,16 +189,17 @@ async def show_media_detail(
         role_hint = f"\n🃏 <b>Рубашка</b> для категории <code>{media.category}</code>"
 
     colls_text = ", ".join(coll_names) if coll_names else "нет"
-    text = (
-        f"<b>📄 Данные файла:</b>\n"
-        f"ID: <code>{media.id}</code>\n"
-        f"Имя для AI: <code>{media.file_name}</code>\n"
-        f"Тип: {media.media_type}\n"
-        f"Категория: {media.category or 'Не задана'}\n"
-        f"Коллекции: {colls_text}\n"
-        f"Описание: {media.description or 'Нет'}"
-        f"{role_hint}"
-    )
+    lines = [
+        "<b>📄 Данные файла:</b>",
+        f"ID: <code>{media.id}</code>",
+        f"Имя для AI: <code>{media.file_name}</code>",
+        f"Тип: {media.media_type}",
+        f"Категория: {media.category or 'Не задана'}",
+        f"Коллекции: {colls_text}",
+    ]
+    if media.description and media.description.strip():
+        lines.append(f"Описание: {media.description}")
+    text = "\n".join(lines) + role_hint
     kb = _media_detail_keyboard(media.id, topic_id, page)
     await client.send_message(chat_id=chat_id, text=text, attachments=kb)
 
@@ -213,6 +214,7 @@ async def _start_edit(
     page: int,
     state_name: str,
     prompt: str,
+    additional_buttons: list[dict] | None = None,
 ) -> None:
     if topic_id is None:
         await states.clear(user_id)
@@ -230,12 +232,14 @@ async def _start_edit(
         state_name,
         {"media_id": media_id, "topic_id": topic_id, "page": page},
     )
+    rows = []
+    if additional_buttons:
+        rows.append(additional_buttons)
+    rows.append([callback_button("❌ Отмена", f"admin_topic_media_{topic_id}_{page}")])
     await client.send_message(
         chat_id=chat_id,
         text=prompt,
-        attachments=inline_keyboard([
-            [callback_button("❌ Отмена", f"admin_topic_media_{topic_id}_{page}")]
-        ]),
+        attachments=inline_keyboard(rows),
     )
 
 
@@ -244,7 +248,7 @@ async def _save_edit(
     states: StateStore,
     chat_id: int,
     user_id: int,
-    updates: dict[str, str],
+    updates: dict[str, str | None],
     success_text: str,
 ) -> None:
     snapshot = await states.get(user_id)
@@ -345,6 +349,7 @@ async def start_edit_description(
         client, states, chat_id, user_id, media_id, topic_id, page,
         "admin_media_edit_desc",
         "Введи новое <b>описание</b> для файла:",
+        [callback_button("Очистить", f"admin_media_clear_desc_{topic_id}_{page}_{media_id}")],
     )
 
 
@@ -356,8 +361,20 @@ async def save_edit_description(
     text: str,
 ) -> None:
     await _save_edit(
-        client, states, chat_id, user_id, {"description": text.strip()},
+        client, states, chat_id, user_id, {"description": text.strip() or None},
         "✅ Описание обновлено.",
+    )
+
+
+async def clear_description(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    await _save_edit(
+        client, states, chat_id, user_id, {"description": None},
+        "✅ Описание очищено.",
     )
 
 
@@ -580,8 +597,18 @@ async def save_add_name(
     else:
         await client.send_message(
             chat_id=chat_id,
-            text=f"👌 Имя <code>{tech_name}</code> принято.\n\nВведи описание файла.",
+            text=f"👌 Имя <code>{tech_name}</code> принято.\n\nВведи описание файла (необязательно).",
+            attachments=_description_prompt_keyboard(data),
         )
+
+
+def _description_prompt_keyboard(data: dict) -> list[dict]:
+    topic_id = data.get("topic_id")
+    page = data.get("page", 0)
+    return inline_keyboard([
+        [callback_button("Пропустить", "admin_media_add_skip_description")],
+        [callback_button("❌ Отмена", f"admin_topic_media_{topic_id}_{page}")],
+    ])
 
 
 async def save_add_category(
@@ -597,7 +624,8 @@ async def save_add_category(
     await states.set(user_id, chat_id, "admin_media_add_desc", {**data, "category": category})
     await client.send_message(
         chat_id=chat_id,
-        text=f"👌 Категория <code>{category}</code> принята.\n\nВведи описание карты.",
+        text=f"👌 Категория <code>{category}</code> принята.\n\nВведи описание карты (необязательно).",
+        attachments=_description_prompt_keyboard({**data, "category": category}),
     )
 
 
@@ -633,7 +661,7 @@ async def save_add_description(
             file_id=token,
             file_name=m_name,
             category=category,
-            description=text.strip(),
+            description=text.strip() or None,
         )
         session.add(new_media)
         await session.flush()

@@ -1781,6 +1781,13 @@ class MaxBotApplication:
                 topic_id, page, media_id = context
                 await admin_topic_media_service.start_edit_category(self.client, self.states, chat_id, user_id, media_id, topic_id, page)
                 return
+            if data.startswith("admin_media_clear_desc_"):
+                context = _parse_numeric_callback_payload(data, "admin_media_clear_desc_", 3)
+                if context is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Контекст медиатеки потерян.")
+                    return
+                await admin_topic_media_service.clear_description(self.client, self.states, chat_id, user_id)
+                return
             if data.startswith("admin_media_editdesc_"):
                 context = _parse_numeric_callback_payload(data, "admin_media_editdesc_", 3)
                 if context is None:
@@ -1811,6 +1818,15 @@ class MaxBotApplication:
                     topic_id,
                     page,
                     collection_id,
+                )
+                return
+            if data == "admin_media_add_skip_description":
+                await admin_topic_media_service.save_add_description(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    "",
                 )
                 return
             if data.startswith("admin_media_add_"):
