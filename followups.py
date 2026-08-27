@@ -21,6 +21,7 @@ from database import (
     FollowupDelivery,
     FollowupDeliveryAttempt,
     FollowupRun,
+    FollowupStep,
     Message as DBMessage,
     User,
     async_session_maker,
@@ -99,8 +100,8 @@ FOLLOWUP_ATTEMPT_CLAIMED = "claimed"
 FOLLOWUP_ATTEMPT_CANCELLED = "cancelled"
 FOLLOWUP_ATTEMPT_DELIVERED = "delivered"
 FOLLOWUP_ATTEMPT_UNCERTAIN = "uncertain"
+FOLLOWUP_RUN_UNCERTAIN = "uncertain"
 FOLLOWUP_ATTEMPT_STALE_AFTER = timedelta(minutes=15)
-FOLLOWUP_RETRY_DELAY = timedelta(minutes=5)
 
 
 def parse_followup_csv(value: str | None) -> tuple[str, ...]:
@@ -527,7 +528,7 @@ async def record_user_activity(
 async def _user_scope_for_activity(user_id: int) -> tuple[int, int] | None:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
-        if user is None or user.is_admin:
+        if user is None:
             return None
         return _scope(user.current_dialogue_id, user.current_topic_id)
 
@@ -556,29 +557,40 @@ class FollowupActivityMiddleware(BaseMiddleware):
                     )
             except Exception:
                 log.exception("Could not invalidate follow-up activity for user %s", from_user.id)
-        result = await handler(event, data)
-        if ingress is not None:
-            try:
-                scope = await _user_scope_for_activity(from_user.id)
-                if scope is not None:
-                    await finalize_user_activity(
-                        from_user.id,
-                        ingress,
-                        dialogue_id=scope[0],
-                        topic_id=scope[1],
-                    )
-            except Exception:
-                log.exception("Could not finalize follow-up activity for user %s", from_user.id)
-        return result
+        try:
+            return await handler(event, data)
+        finally:
+            if ingress is not None:
+                try:
+                    scope = await _user_scope_for_activity(from_user.id)
+                    if scope is not None:
+                        await finalize_user_activity(
+                            from_user.id,
+                            ingress,
+                            dialogue_id=scope[0],
+                            topic_id=scope[1],
+                        )
+                except Exception:
+                    log.exception("Could not finalize follow-up activity for user %s", from_user.id)
 
 
 async def _due_followup_ids(now: datetime, limit: int) -> list[int]:
     async with async_session_maker() as session:
+        uncertain_attempt = select(FollowupDeliveryAttempt.id).where(
+            FollowupDeliveryAttempt.run_id == FollowupRun.id,
+            FollowupDeliveryAttempt.generation == FollowupRun.generation,
+            FollowupDeliveryAttempt.step_index == FollowupRun.next_step_index,
+            FollowupDeliveryAttempt.status == FOLLOWUP_ATTEMPT_UNCERTAIN,
+        ).exists()
         return list(
             (
                 await session.scalars(
                     select(FollowupRun.id)
-                    .where(FollowupRun.status == "active", FollowupRun.due_at <= now)
+                    .where(
+                        FollowupRun.status == "active",
+                        FollowupRun.due_at <= now,
+                        ~uncertain_attempt,
+                    )
                     .order_by(FollowupRun.due_at.asc(), FollowupRun.id.asc())
                     .limit(limit)
                 )
@@ -697,6 +709,27 @@ async def _claim_due_followup(run_id: int, now: datetime) -> FollowupDeliveryCla
             return None
 
         step = campaign.steps[run.next_step_index]
+        step = await session.scalar(
+            select(FollowupStep)
+            .where(
+                FollowupStep.id == step.id,
+                FollowupStep.campaign_id == run.campaign_id,
+            )
+            .with_for_update()
+        )
+        if step is None:
+            await session.execute(
+                update(FollowupRun)
+                .where(
+                    FollowupRun.id == run.id,
+                    FollowupRun.generation == run.generation,
+                    FollowupRun.next_step_index == run.next_step_index,
+                    FollowupRun.status == "active",
+                )
+                .values(status="cancelled", updated_at=datetime.utcnow())
+            )
+            await session.commit()
+            return None
         already_sent = await session.scalar(
             select(FollowupDelivery.id).where(
                 FollowupDelivery.run_id == run.id,
@@ -736,6 +769,12 @@ async def _claim_due_followup(run_id: int, now: datetime) -> FollowupDeliveryCla
                 attempt.status = FOLLOWUP_ATTEMPT_UNCERTAIN
                 attempt.finished_at = now
                 attempt.error_text = "Delivery claim became stale before completion."
+                run.status = FOLLOWUP_RUN_UNCERTAIN
+                run.updated_at = now
+                await session.commit()
+            elif attempt.status == FOLLOWUP_ATTEMPT_UNCERTAIN:
+                run.status = FOLLOWUP_RUN_UNCERTAIN
+                run.updated_at = now
                 await session.commit()
             else:
                 await session.rollback()
@@ -821,6 +860,8 @@ async def _refresh_delivery_claim(
             attempt.status = FOLLOWUP_ATTEMPT_UNCERTAIN
             attempt.finished_at = now
             attempt.error_text = "Delivery claim became stale before external delivery."
+            run.status = FOLLOWUP_RUN_UNCERTAIN
+            run.updated_at = now
             await session.commit()
             return None
 
@@ -897,16 +938,8 @@ async def _mark_claim_uncertain(claim: FollowupDeliveryClaim, error: Exception |
             and run.next_step_index == claim.step_index
             and run.status == "active"
         ):
-            await session.execute(
-                update(FollowupRun)
-                .where(
-                    FollowupRun.id == claim.run_id,
-                    FollowupRun.generation == claim.generation,
-                    FollowupRun.next_step_index == claim.step_index,
-                    FollowupRun.status == "active",
-                )
-                .values(due_at=now + FOLLOWUP_RETRY_DELAY, updated_at=now)
-            )
+            run.status = FOLLOWUP_RUN_UNCERTAIN
+            run.updated_at = now
         await session.commit()
 
 

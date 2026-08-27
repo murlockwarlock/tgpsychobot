@@ -1307,7 +1307,7 @@ class FollowupDeliveryAttempt(Base):
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_id = Column(Integer, ForeignKey('followup_runs.id', ondelete='CASCADE'), nullable=False)
-    step_id = Column(Integer, ForeignKey('followup_steps.id', ondelete='CASCADE'), nullable=False)
+    step_id = Column(Integer, ForeignKey('followup_steps.id', ondelete='SET NULL'), nullable=True)
     step_index = Column(Integer, nullable=False)
     generation = Column(Integer, nullable=False)
     claim_token = Column(String, unique=True, nullable=False)

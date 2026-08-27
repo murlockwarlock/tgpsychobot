@@ -24,6 +24,7 @@ from database import (
     AutomationStepTransition,
     FollowupCampaign,
     FollowupDelivery,
+    FollowupDeliveryAttempt,
     FollowupRun,
     FollowupStep,
     Topic,
@@ -35,6 +36,9 @@ from database import (
 )
 from followups import (
     FOLLOWUP_METADATA_OPERATOR_LABELS,
+    FOLLOWUP_ATTEMPT_CLAIMED,
+    FOLLOWUP_ATTEMPT_DELIVERED,
+    FOLLOWUP_ATTEMPT_UNCERTAIN,
     FOLLOWUP_STAGE_MODE_LABELS,
     FOLLOWUP_STAGE_MODES,
     _campaign_matches_scope,
@@ -2370,12 +2374,31 @@ async def followup_step_delete(callback: CallbackQuery, state: FSMContext | None
     campaign_id_raw, step_id_raw = callback.data.split("_")[-2:]
     blocked = False
     async with async_session_maker() as session:
-        step = await session.get(FollowupStep, int(step_id_raw))
-        if step and step.campaign_id == int(campaign_id_raw):
+        step = await session.scalar(
+            select(FollowupStep)
+            .where(
+                FollowupStep.id == int(step_id_raw),
+                FollowupStep.campaign_id == int(campaign_id_raw),
+            )
+            .with_for_update()
+        )
+        if step:
             sent_count = await session.scalar(
                 select(func.count(FollowupDelivery.id)).where(FollowupDelivery.step_id == step.id)
             ) or 0
-            if sent_count:
+            protected_attempt_count = await session.scalar(
+                select(func.count(FollowupDeliveryAttempt.id)).where(
+                    FollowupDeliveryAttempt.step_id == step.id,
+                    FollowupDeliveryAttempt.status.in_(
+                        (
+                            FOLLOWUP_ATTEMPT_CLAIMED,
+                            FOLLOWUP_ATTEMPT_UNCERTAIN,
+                            FOLLOWUP_ATTEMPT_DELIVERED,
+                        )
+                    ),
+                )
+            ) or 0
+            if sent_count or protected_attempt_count:
                 blocked = True
             else:
                 await session.delete(step)
@@ -2393,7 +2416,7 @@ async def followup_step_delete(callback: CallbackQuery, state: FSMContext | None
     if blocked:
         await _answer_callback(
             callback,
-            "Шаг уже отправлялся, его нельзя удалить без потери истории.",
+            "Шаг уже отправлялся или находится в процессе отправки, его нельзя удалить без потери истории.",
             show_alert=True,
         )
     callback.data = f"followup_steps_{campaign_id_raw}"

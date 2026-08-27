@@ -23,6 +23,7 @@ from database import (
     Base,
     FollowupCampaign,
     FollowupDelivery,
+    FollowupDeliveryAttempt,
     FollowupRun,
     FollowupStep,
     Topic,
@@ -680,6 +681,94 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
             ).scalars().all()
         self.assertEqual([self.first_step_id], [step.id for step in remaining])
         self.assertEqual([0], [step.sort_order for step in remaining])
+
+    async def test_claimed_attempt_blocks_step_delete(self):
+        async with self.sessions() as session:
+            run = FollowupRun(
+                campaign_id=self.campaign_id,
+                user_id=42,
+                dialogue_id=9,
+                topic_id=7,
+                due_at=datetime.utcnow(),
+            )
+            session.add(run)
+            await session.flush()
+            session.add(FollowupDeliveryAttempt(
+                run_id=run.id,
+                step_id=self.first_step_id,
+                step_index=0,
+                generation=1,
+                claim_token="claimed-step-delete",
+                status="claimed",
+            ))
+            await session.commit()
+
+        callback = make_callback(f"followup_step_delete_{self.campaign_id}_{self.first_step_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_step_delete(callback, state=MemoryState())
+
+        async with self.sessions() as session:
+            self.assertIsNotNone(await session.get(FollowupStep, self.first_step_id))
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("claimed", attempt.status)
+
+    async def test_uncertain_attempt_blocks_step_delete(self):
+        async with self.sessions() as session:
+            run = FollowupRun(
+                campaign_id=self.campaign_id,
+                user_id=42,
+                dialogue_id=9,
+                topic_id=7,
+                due_at=datetime.utcnow(),
+            )
+            session.add(run)
+            await session.flush()
+            session.add(FollowupDeliveryAttempt(
+                run_id=run.id,
+                step_id=self.first_step_id,
+                step_index=0,
+                generation=1,
+                claim_token="uncertain-step-delete",
+                status="uncertain",
+            ))
+            await session.commit()
+
+        callback = make_callback(f"followup_step_delete_{self.campaign_id}_{self.first_step_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_step_delete(callback, state=MemoryState())
+
+        async with self.sessions() as session:
+            self.assertIsNotNone(await session.get(FollowupStep, self.first_step_id))
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("uncertain", attempt.status)
+
+    async def test_delivered_step_blocks_step_delete(self):
+        async with self.sessions() as session:
+            run = FollowupRun(
+                campaign_id=self.campaign_id,
+                user_id=42,
+                dialogue_id=9,
+                topic_id=7,
+                due_at=datetime.utcnow(),
+            )
+            session.add(run)
+            await session.flush()
+            session.add(FollowupDelivery(
+                run_id=run.id,
+                step_id=self.first_step_id,
+                generation=1,
+            ))
+            await session.commit()
+
+        callback = make_callback(f"followup_step_delete_{self.campaign_id}_{self.first_step_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_step_delete(callback, state=MemoryState())
+
+        async with self.sessions() as session:
+            self.assertIsNotNone(await session.get(FollowupStep, self.first_step_id))
+            self.assertEqual(1, await session.scalar(select(FollowupDelivery.id).where(
+                FollowupDelivery.step_id == self.first_step_id
+            )))
 
     async def test_existing_step_opens_detail_and_static_edit_preserves_type_order_and_delivery(self):
         list_callback = make_callback(f"followup_steps_{self.campaign_id}")

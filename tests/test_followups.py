@@ -15,6 +15,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import followups
+import automation_admin
 from database import (
     AutomationConversationState,
     AutomationEvent,
@@ -342,8 +343,7 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, delivered)
         self.assertEqual(0, next_delivered)
         self.assertEqual("cancelled", stored_a.status)
-        self.assertEqual("active", stored_b.status)
-        self.assertGreater(stored_b.due_at, now)
+        self.assertEqual("uncertain", stored_b.status)
         self.assertEqual([], bot.sent)
 
     async def test_eligibility_checks_do_not_create_automation_history_rows(self):
@@ -865,7 +865,7 @@ class FollowupRaceTests(unittest.IsolatedAsyncioTestCase):
             run = await session.get(FollowupRun, run_id)
             self.assertEqual(0, await session.scalar(select(func.count(FollowupDelivery.id))))
         self.assertEqual("uncertain", attempt.status)
-        self.assertEqual("active", run.status)
+        self.assertEqual("uncertain", run.status)
 
     async def test_ambiguous_external_failure_is_uncertain_without_a_retry(self):
         run_id, _ = await self._add_due_run()
@@ -891,7 +891,98 @@ class FollowupRaceTests(unittest.IsolatedAsyncioTestCase):
             run = await session.get(FollowupRun, run_id)
             self.assertEqual(0, await session.scalar(select(func.count(FollowupDelivery.id))))
         self.assertEqual("uncertain", attempt.status)
-        self.assertEqual("active", run.status)
+        self.assertEqual("uncertain", run.status)
+
+    async def test_uncertain_runs_do_not_consume_due_limit_and_real_activity_recovers_one(self):
+        now = datetime.utcnow()
+        uncertain_user_ids = list(range(1000, 1101))
+        async with self.sessions() as session:
+            session.add_all([
+                User(
+                    id=user_id,
+                    first_name=f"User {user_id}",
+                    current_dialogue_id=1,
+                    current_topic_id=None,
+                )
+                for user_id in uncertain_user_ids
+            ])
+            await session.flush()
+            runs = [
+                FollowupRun(
+                    campaign_id=self.campaign_id,
+                    user_id=user_id,
+                    dialogue_id=1,
+                    topic_id=0,
+                    next_step_index=0,
+                    generation=1,
+                    last_activity_at=now - timedelta(hours=1),
+                    due_at=now - timedelta(minutes=30),
+                    status="uncertain",
+                )
+                for user_id in uncertain_user_ids
+            ]
+            session.add_all(runs)
+            await session.flush()
+            session.add_all([
+                FollowupDeliveryAttempt(
+                    run_id=run.id,
+                    step_id=self.step_id,
+                    step_index=0,
+                    generation=1,
+                    claim_token=f"uncertain-{run.id}",
+                    status="uncertain",
+                    claimed_at=now - timedelta(hours=1),
+                    finished_at=now - timedelta(minutes=45),
+                )
+                for run in runs
+            ])
+            valid_run = FollowupRun(
+                campaign_id=self.campaign_id,
+                user_id=42,
+                dialogue_id=1,
+                topic_id=0,
+                next_step_index=0,
+                generation=1,
+                last_activity_at=now - timedelta(hours=1),
+                due_at=now - timedelta(minutes=1),
+                status="active",
+            )
+            session.add(valid_run)
+            await session.commit()
+            uncertain_run_id = runs[0].id
+            valid_run_id = valid_run.id
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            self.assertEqual(
+                [valid_run_id],
+                await followups._due_followup_ids(now, limit=100),
+            )
+            self.assertEqual(1, await process_due_followups(bot))
+            activity_at = datetime.utcnow()
+            await record_user_activity(
+                uncertain_user_ids[0],
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=activity_at,
+            )
+
+        self.assertEqual([(42, "A")], bot.sent)
+        async with self.sessions() as session:
+            recovered = await session.get(FollowupRun, uncertain_run_id)
+            attempts = (
+                await session.execute(
+                    select(FollowupDeliveryAttempt)
+                    .where(FollowupDeliveryAttempt.run_id == uncertain_run_id)
+                )
+            ).scalars().all()
+        self.assertEqual((2, 0, "active", activity_at + timedelta(minutes=1)), (
+            recovered.generation,
+            recovered.next_step_index,
+            recovered.status,
+            recovered.due_at,
+        ))
+        self.assertEqual([(1, "uncertain")], [(item.generation, item.status) for item in attempts])
 
     async def test_middleware_finalization_does_not_increment_generation_twice(self):
         run_id, _ = await self._add_due_run()
@@ -945,6 +1036,100 @@ class FollowupRaceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual((2, "cancelled"), (old_run.generation, old_run.status))
         self.assertEqual((1, "active"), (new_run.generation, new_run.status))
+
+    async def test_admin_plain_dialogue_counts_but_admin_followup_callback_does_not(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            user = await session.get(User, 42)
+            user.is_admin = True
+            await session.commit()
+
+        middleware = FollowupActivityMiddleware()
+        event = SimpleNamespace(
+            from_user=SimpleNamespace(id=42, is_bot=False),
+            data="followup_campaigns",
+        )
+
+        async def admin_handler(event, data):
+            return "admin"
+
+        with patch.object(followups, "async_session_maker", self.sessions):
+            self.assertEqual("admin", await middleware(admin_handler, event, {}))
+
+        state = await self._run_state(run_id)
+        self.assertEqual((1, "active"), (state.generation, state.status))
+        observed = {}
+
+        async def dialogue_handler(event, data):
+            async with self.sessions() as session:
+                run = await session.get(FollowupRun, run_id)
+                observed["state"] = (run.generation, run.status)
+            return "handled"
+
+        event.data = ""
+        with patch.object(followups, "async_session_maker", self.sessions):
+            result = await middleware(dialogue_handler, event, {})
+
+        self.assertEqual("handled", result)
+        self.assertEqual((2, "pending"), observed["state"])
+        state = await self._run_state(run_id)
+        self.assertEqual((2, "active"), (state.generation, state.status))
+
+    async def test_middleware_finalizes_pending_activity_when_handler_raises(self):
+        run_id, _ = await self._add_due_run()
+
+        async def failing_handler(event, data):
+            raise RuntimeError("handler failure")
+
+        event = SimpleNamespace(
+            from_user=SimpleNamespace(id=42, is_bot=False),
+            data="",
+        )
+        with patch.object(followups, "async_session_maker", self.sessions):
+            with self.assertRaisesRegex(RuntimeError, "handler failure"):
+                await FollowupActivityMiddleware()(failing_handler, event, {})
+
+        state = await self._run_state(run_id)
+        self.assertEqual((2, "active"), (state.generation, state.status))
+
+    async def test_postgres_claim_and_step_delete_preserve_claim_evidence(self):
+        if not self.database_schema or not os.environ.get("FOLLOWUP_TEST_DATABASE_URL", "").startswith("postgresql+"):
+            self.skipTest("PostgreSQL follow-up test requires FOLLOWUP_TEST_DATABASE_URL and FOLLOWUP_TEST_SCHEMA")
+        run_id, _ = await self._add_due_run()
+        claim_started = asyncio.Event()
+        release_claim = asyncio.Event()
+        original_claim = followups._claim_due_followup
+
+        async def hold_after_claim(run_id, now):
+            claim = await original_claim(run_id, now)
+            if claim is not None:
+                claim_started.set()
+                await release_claim.wait()
+            return claim
+
+        bot = FakeBot()
+        callback = SimpleNamespace(
+            id="step-delete-race",
+            data=f"followup_step_delete_{self.campaign_id}_{self.step_id}",
+            message=SimpleNamespace(edit_text=AsyncMock(), edit_reply_markup=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        with patch.object(followups, "async_session_maker", self.sessions), patch.object(
+            followups, "_claim_due_followup", new=hold_after_claim
+        ), patch.object(automation_admin, "async_session_maker", self.sessions), patch.object(
+            automation_admin, "followup_steps", new=AsyncMock()
+        ):
+            process_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(claim_started.wait(), timeout=2)
+            await automation_admin.followup_step_delete(callback)
+            release_claim.set()
+            self.assertEqual(1, await asyncio.wait_for(process_task, timeout=2))
+
+        self.assertEqual([(42, "A")], bot.sent)
+        async with self.sessions() as session:
+            self.assertIsNotNone(await session.get(FollowupStep, self.step_id))
+            self.assertEqual(1, await session.scalar(select(func.count(FollowupDelivery.id))))
+            self.assertEqual(1, await session.scalar(select(func.count(FollowupDeliveryAttempt.id))))
 
 
 def _due_at_for_test(activity_at):
