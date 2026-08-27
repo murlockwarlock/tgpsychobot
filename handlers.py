@@ -1358,7 +1358,7 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
             return response_text
 
         topic_id = user.current_topic_id
-        media_scope = await load_media_scope(session, topic_id)
+        media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
 
         audio_matches = re.findall(r"\[SEND_AUDIO:\s*(.+?)\]", response_text)
         for file_name in audio_matches:
@@ -1740,7 +1740,7 @@ async def process_buffered_messages(
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             topic_id = user.current_topic_id if user else None
-            media_scope = await load_media_scope(session, topic_id)
+            media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
 
             # --- 1. Текст AI (сначала предисловие) ---
 
@@ -2116,7 +2116,9 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
-        media_scope = await load_media_scope(session, user.current_topic_id if user else None)
+        media_scope = await load_media_scope(
+            session, user.current_topic_id if user else None, include_media_ids=False
+        )
         media = await session.scalar(
             select(MediaLibrary).where(
                 media_scope.predicate(),
@@ -2224,7 +2226,7 @@ async def _advance_card_spread_after_selection(
     spread['rounds_left'] -= 1
     try:
         async with async_session_maker() as session:
-            media_scope = await load_media_scope(session, spread['topic_id'])
+            media_scope = await load_media_scope(session, spread['topic_id'], include_media_ids=False)
             stmt = select(MediaLibrary).where(
                 media_scope.predicate(spread['category']),
                 MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
@@ -2308,7 +2310,7 @@ async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
         return False
 
     async with async_session_maker() as session:
-        media_scope = await load_media_scope(session, spread.get('topic_id'))
+        media_scope = await load_media_scope(session, spread.get('topic_id'), include_media_ids=False)
         result = await session.execute(
             select(MediaLibrary).where(
                 media_scope.predicate(),
@@ -5900,7 +5902,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         # --- 2. Медиа (карты, аудио) после текста ---
 
         async with async_session_maker() as session:
-            media_scope = await load_media_scope(session, topic_id)
+            media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
 
             for audio_name in audios:
                 stmt = select(MediaLibrary).where(
@@ -12421,7 +12423,7 @@ async def _show_edit_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_i
                 pass
             return
 
-        media_scope = await load_media_scope(session, topic_id)
+        media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
         media_count = await session.scalar(
             select(func.count(MediaLibrary.id)).where(media_scope.predicate())
         )

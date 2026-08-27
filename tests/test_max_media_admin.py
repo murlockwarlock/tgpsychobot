@@ -18,7 +18,7 @@ from max_messenger_bot import app as max_app
 from max_messenger_bot.models import IncomingCallback, Sender
 from max_messenger_bot.services import admin_collections as collection_service
 from max_messenger_bot.services import admin_topic_media as service
-from media_scope import load_available_media, load_media_scope
+from media_scope import load_available_media, load_media_scope, media_scope_predicate
 
 
 @pytest_asyncio.fixture
@@ -137,7 +137,7 @@ async def test_max_add_media_is_canonical_and_visible_without_remigration(max_st
         ) == media.id
         scope, available = await load_available_media(session, 1)
 
-    assert media.id in scope.collection_media_ids
+    assert scope.collection_ids == (collection_id,)
     assert [item.file_name for item in available] == ["new_card"]
     assert "Файлов: 1" in client.messages[-1]["text"]
 
@@ -198,6 +198,7 @@ async def test_max_shared_media_edit_and_scoped_membership_never_delete_globally
     client = FakeClient()
     state = FakeState()
     await service.show_list(client, 100, 1, page=3)
+    assert "Файлов: 1" in client.messages[-1]["text"]
     view_button = next(
         button for button in _buttons(client.messages[-1]["attachments"])
         if button["payload"].startswith("admin_media_view_")
@@ -246,7 +247,7 @@ async def test_max_shared_media_edit_and_scoped_membership_never_delete_globally
 
 
 @pytest.mark.asyncio
-async def test_max_listing_paginates_in_sql_and_summarizes_all_categories(max_store):
+async def test_max_listing_paginates_in_sql_and_summarizes_all_categories(max_store, monkeypatch):
     collection_id = await _create_topic_collection(max_store)
     async with max_store() as session:
         media_rows = [
@@ -256,7 +257,7 @@ async def test_max_listing_paginates_in_sql_and_summarizes_all_categories(max_st
                 category="first" if index < 10 else "second",
                 media_type="photo",
             )
-            for index in range(25)
+            for index in range(125)
         ]
         media_rows[14].file_name = "_back"
         session.add_all(media_rows)
@@ -268,6 +269,11 @@ async def test_max_listing_paginates_in_sql_and_summarizes_all_categories(max_st
         await session.commit()
 
     client = FakeClient()
+
+    async def fail_load_media_scope(*args, **kwargs):
+        raise AssertionError("MAX listing must not materialize scoped media IDs")
+
+    monkeypatch.setattr(service, "load_media_scope", fail_load_media_scope)
     await service.show_list(client, 100, 1, page=1)
     message = client.messages[-1]
     buttons = _buttons(message["attachments"])
@@ -279,9 +285,58 @@ async def test_max_listing_paginates_in_sql_and_summarizes_all_categories(max_st
     assert len(page_media) == 10
     expected_names = ["_back" if index == 14 else f"card-{index}" for index in range(10, 20)]
     assert all(expected in actual for expected, actual in zip(expected_names, page_media))
-    assert "Файлов: 25" in message["text"]
+    assert "Файлов: 125" in message["text"]
     assert "<code>first</code> — ⚠️ нет рубашки" in message["text"]
     assert "<code>second</code> — 🃏" in message["text"]
+
+
+def test_media_scope_predicate_uses_database_membership_queries():
+    statement = select(MediaLibrary).where(media_scope_predicate(1))
+    sql = str(statement)
+    assert "EXISTS" in sql
+    assert "media_collection_items" in sql
+    assert "topic_media_collection" in sql
+
+    main_statement = select(MediaLibrary).where(media_scope_predicate(None))
+    assert "main_dialogue_media_collection" in str(main_statement)
+
+
+@pytest.mark.asyncio
+async def test_max_duplicate_collection_membership_does_not_duplicate_rows_or_aggregates(max_store):
+    first_collection = await _create_topic_collection(max_store)
+    async with max_store() as session:
+        second_collection = MediaCollection(name="Second")
+        media_rows = [
+            MediaLibrary(file_id="card", file_name="card", category="cards", media_type="photo"),
+            MediaLibrary(file_id="back", file_name="_back", category="cards", media_type="photo"),
+        ]
+        session.add_all([second_collection, *media_rows])
+        await session.flush()
+        await session.execute(
+            topic_collection_association.insert().values(
+                topic_id=1,
+                collection_id=second_collection.id,
+            )
+        )
+        await session.execute(
+            media_collection_items.insert(),
+            [
+                {"collection_id": collection_id, "media_id": media.id}
+                for collection_id in (first_collection, second_collection.id)
+                for media in media_rows
+            ],
+        )
+        await session.commit()
+
+    client = FakeClient()
+    await service.show_list(client, 100, 1)
+    message = client.messages[-1]
+    buttons = _buttons(message["attachments"])
+    media_buttons = [button for button in buttons if button["payload"].startswith("admin_media_view_")]
+    assert "Файлов: 2" in message["text"]
+    assert len(media_buttons) == 2
+    assert message["text"].count("<code>cards</code>") == 1
+    assert "<code>cards</code> — 🃏" in message["text"]
 
 
 @pytest.mark.asyncio

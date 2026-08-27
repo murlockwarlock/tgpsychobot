@@ -18,6 +18,32 @@ PHOTO_MEDIA_TYPES = ("photo", "image")
 AI_MEDIA_TYPES = (*PHOTO_MEDIA_TYPES, "audio", "video", "document")
 
 
+def _media_membership_predicate(collection_ids):
+    return (
+        select(1)
+        .select_from(media_collection_items)
+        .where(
+            media_collection_items.c.collection_id.in_(collection_ids),
+            media_collection_items.c.media_id == MediaLibrary.id,
+        )
+        .exists()
+    )
+
+
+def media_scope_predicate(topic_id: int | None, category: str | None = None):
+    normalized_topic_id = topic_id or None
+    if normalized_topic_id is None:
+        collection_ids = select(main_dialogue_collection_association.c.collection_id)
+    else:
+        collection_ids = select(topic_collection_association.c.collection_id).where(
+            topic_collection_association.c.topic_id == normalized_topic_id
+        )
+    predicate = _media_membership_predicate(collection_ids)
+    if category:
+        predicate = and_(predicate, MediaLibrary.category == category)
+    return predicate
+
+
 @dataclass(frozen=True)
 class MediaScope:
     topic_id: int | None
@@ -29,9 +55,12 @@ class MediaScope:
         return self.topic_id is None
 
     def predicate(self, category: str | None = None):
-        if not self.collection_media_ids:
+        if self.collection_ids:
+            predicate = _media_membership_predicate(self.collection_ids)
+        elif self.collection_media_ids:
+            predicate = MediaLibrary.id.in_(self.collection_media_ids)
+        else:
             return false()
-        predicate = MediaLibrary.id.in_(self.collection_media_ids)
         if category:
             predicate = and_(predicate, MediaLibrary.category == category)
         return predicate
@@ -60,7 +89,12 @@ def make_topic_media_scope(
     return make_media_scope(topic_id, collection_media_ids=collection_media_ids)
 
 
-async def load_media_scope(session, topic_id: int | None) -> MediaScope:
+async def load_media_scope(
+    session,
+    topic_id: int | None,
+    *,
+    include_media_ids: bool = True,
+) -> MediaScope:
     normalized_topic_id = topic_id or None
     if normalized_topic_id is None:
         collection_result = await session.execute(
@@ -73,8 +107,8 @@ async def load_media_scope(session, topic_id: int | None) -> MediaScope:
             )
         )
     collection_ids = tuple(sorted({row[0] for row in collection_result.all()}))
-    if not collection_ids:
-        return make_media_scope(normalized_topic_id)
+    if not collection_ids or not include_media_ids:
+        return make_media_scope(normalized_topic_id, collection_ids=collection_ids)
 
     media_result = await session.execute(
         select(media_collection_items.c.media_id)
@@ -89,12 +123,17 @@ async def load_media_scope(session, topic_id: int | None) -> MediaScope:
     )
 
 
-async def load_topic_media_scope(session, topic_id: int | None) -> MediaScope:
-    return await load_media_scope(session, topic_id)
+async def load_topic_media_scope(
+    session,
+    topic_id: int | None,
+    *,
+    include_media_ids: bool = True,
+) -> MediaScope:
+    return await load_media_scope(session, topic_id, include_media_ids=include_media_ids)
 
 
 async def ensure_topic_collection(session, topic_id: int, name_prefix: str = "__max_topic") -> int | None:
-    scope = await load_media_scope(session, topic_id)
+    scope = await load_media_scope(session, topic_id, include_media_ids=False)
     if scope.collection_ids:
         return scope.collection_ids[0]
     if not await session.get(Topic, topic_id):
@@ -123,7 +162,7 @@ async def ensure_topic_collection(session, topic_id: int, name_prefix: str = "__
 
 
 async def load_available_media(session, topic_id: int | None):
-    scope = await load_media_scope(session, topic_id)
+    scope = await load_media_scope(session, topic_id, include_media_ids=False)
     result = await session.execute(
         select(MediaLibrary)
         .where(

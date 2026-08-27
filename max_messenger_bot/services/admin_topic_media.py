@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import case, func, select
 
-from media_scope import ensure_topic_collection, load_media_scope
+from media_scope import ensure_topic_collection, load_media_scope, media_scope_predicate
 
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard
@@ -73,11 +73,9 @@ def _media_detail_keyboard(media_id: int, topic_id: int, page: int) -> list[dict
 
 
 async def _scoped_media(session, topic_id: int, media_id: int):
-    scope = await load_media_scope(session, topic_id)
-    media = await session.scalar(
-        select(MediaLibrary).where(scope.predicate(), MediaLibrary.id == media_id)
+    return await session.scalar(
+        select(MediaLibrary).where(media_scope_predicate(topic_id), MediaLibrary.id == media_id)
     )
-    return scope, media
 
 
 def _build_list_text(topic: Topic, total_count: int, category_rows: list[tuple[str, int]]) -> str:
@@ -120,16 +118,16 @@ async def show_list(
     page: int = 0,
 ) -> None:
     async with async_session_maker() as session:
-        scope = await load_media_scope(session, topic_id)
+        predicate = media_scope_predicate(topic_id)
         total_count = await session.scalar(
-            select(func.count()).select_from(MediaLibrary).where(scope.predicate())
+            select(func.count()).select_from(MediaLibrary).where(predicate)
         ) or 0
         total_pages = max(1, (total_count + MEDIA_PAGE_SIZE - 1) // MEDIA_PAGE_SIZE)
         page = max(0, min(page, total_pages - 1))
         media_list = (
             await session.execute(
                 select(MediaLibrary)
-                .where(scope.predicate())
+                .where(predicate)
                 .order_by(MediaLibrary.id)
                 .offset(page * MEDIA_PAGE_SIZE)
                 .limit(MEDIA_PAGE_SIZE)
@@ -142,7 +140,7 @@ async def show_list(
                     func.max(case((MediaLibrary.file_name == "_back", 1), else_=0)),
                 )
                 .where(
-                    scope.predicate(),
+                    predicate,
                     MediaLibrary.category.is_not(None),
                     MediaLibrary.category != "",
                 )
@@ -173,7 +171,7 @@ async def show_media_detail(
         return
 
     async with async_session_maker() as session:
-        _, media = await _scoped_media(session, topic_id, media_id)
+        media = await _scoped_media(session, topic_id, media_id)
         if not media:
             await client.send_message(chat_id=chat_id, text="Файл не найден в медиатеке этой темы.")
             return
@@ -220,7 +218,7 @@ async def _start_edit(
         await client.send_message(chat_id=chat_id, text="Контекст темы потерян.")
         return
     async with async_session_maker() as session:
-        _, media = await _scoped_media(session, topic_id, media_id)
+        media = await _scoped_media(session, topic_id, media_id)
     if not media:
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text="Файл не найден в медиатеке этой темы.")
@@ -259,7 +257,7 @@ async def _save_edit(
         return
 
     async with async_session_maker() as session:
-        _, media = await _scoped_media(session, topic_id, media_id)
+        media = await _scoped_media(session, topic_id, media_id)
         if not media:
             await states.clear(user_id)
             await client.send_message(chat_id=chat_id, text="Файл больше недоступен в этой теме.")
@@ -422,7 +420,7 @@ async def start_add_media(
             await states.clear(user_id)
             await client.send_message(chat_id=chat_id, text="Тема не найдена.")
             return
-        scope = await load_media_scope(session, topic_id)
+        scope = await load_media_scope(session, topic_id, include_media_ids=False)
         if collection_id is not None:
             if collection_id not in scope.collection_ids:
                 await states.clear(user_id)
@@ -622,7 +620,7 @@ async def save_add_description(
         return
 
     async with async_session_maker() as session:
-        scope = await load_media_scope(session, topic_id)
+        scope = await load_media_scope(session, topic_id, include_media_ids=False)
         if collection_id not in scope.collection_ids:
             await states.clear(user_id)
             await client.send_message(chat_id=chat_id, text="Коллекция больше не привязана к этой теме.")
@@ -681,7 +679,7 @@ async def delete_media(
         await client.send_message(chat_id=chat_id, text="Контекст темы потерян. Файл не удалён.")
         return
     async with async_session_maker() as session:
-        _, media = await _scoped_media(session, topic_id, media_id)
+        media = await _scoped_media(session, topic_id, media_id)
         if not media:
             await client.send_message(chat_id=chat_id, text="Файл не найден в медиатеке этой темы.")
             return

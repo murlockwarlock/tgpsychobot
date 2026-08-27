@@ -35,7 +35,7 @@ async def _ensure_topic_collection(session, topic_id: int, collection_id: int | 
             raise RuntimeError(f"Collection {collection_id} не привязана к topic {topic_id}.")
         return collection_id
 
-    scope = await load_media_scope(session, topic_id)
+    scope = await load_media_scope(session, topic_id, include_media_ids=False)
     if len(scope.collection_ids) > 1:
         raise RuntimeError("Укажите --collection-id для темы с несколькими коллекциями.")
     return await ensure_topic_collection(session, topic_id)
