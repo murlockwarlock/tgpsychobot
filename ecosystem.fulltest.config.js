@@ -1,8 +1,12 @@
+const PM2_LOG_DIR = `${process.env.PM2_HOME || "/root/.pm2"}/logs`;
+
 module.exports = {
   apps: [
     {
-      name: "psy5d_fulltest",
+      name: "tg_kontentzavod322bot_fulltest",
       script: "/root/telegram_bots/newbots/main.py",
+      error_file: `${PM2_LOG_DIR}/psy5d_fulltest-error.log`,
+      out_file: `${PM2_LOG_DIR}/psy5d_fulltest-out.log`,
       cwd: "/root/telegram_bots/newbots",
       interpreter: "/root/telegram_bots/venv/bin/python",
       env: {

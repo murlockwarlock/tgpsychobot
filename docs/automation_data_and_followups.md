@@ -199,10 +199,10 @@ DATABASE_URL: process.env.MY_BOT_DATABASE_URL
 OWNER_IDS: process.env.MY_BOT_OWNER_IDS
 ```
 
-Для `psy5d_fulltest` используется `ecosystem.fulltest.config.js`. Запуск только этой копии:
+Для `tg_kontentzavod322bot_fulltest` используется `ecosystem.fulltest.config.js`. Запуск только этой копии:
 
 ```bash
-PROD_PM2_NAMES=psy5d_fulltest \
+PROD_PM2_NAMES=tg_kontentzavod322bot_fulltest \
 PROD_PM2_CONFIG=ecosystem.fulltest.config.js \
 bash deploy_prod.sh
 ```

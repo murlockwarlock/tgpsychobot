@@ -134,6 +134,27 @@ def test_log_baselines_are_unique_restricted_and_include_identity(tmp_path):
             _remove_baseline(path)
 
 
+def test_log_baseline_can_map_canonical_name_to_legacy_process(tmp_path):
+    log_path = tmp_path / "legacy-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(name="legacy_process", log_path=log_path)
+    baseline_path = None
+    try:
+        baseline_path = Path(
+            create_log_baseline(
+                {"legacy_process": process},
+                ["canonical_process"],
+                ["legacy_process"],
+            )
+        )
+        baseline = load_log_baseline(str(baseline_path))
+        assert set(baseline) == {"canonical_process"}
+        assert baseline["canonical_process"]["path"] == str(log_path)
+    finally:
+        if baseline_path is not None:
+            _remove_baseline(baseline_path)
+
+
 def test_log_append_ignores_history_and_detects_new_error(tmp_path):
     log_path = tmp_path / "bot-error.log"
     historical = "old Traceback (most recent call last)\n"

@@ -196,10 +196,15 @@ def _log_baseline_entry(
 def create_log_baseline(
     snapshot: dict[str, dict[str, Any]],
     expected_names: list[str],
+    source_names: list[str] | None = None,
 ) -> str:
+    if source_names is not None and len(source_names) != len(expected_names):
+        raise RuntimeError("log baseline source names do not match expected names")
     baseline: dict[str, dict[str, Any]] = {}
-    for name in expected_names:
+    for index, name in enumerate(expected_names):
         process = snapshot.get(name)
+        if process is None and source_names is not None:
+            process = snapshot.get(source_names[index])
         if process is None:
             raise RuntimeError(f"missing PM2 process for {name}")
         baseline[name] = _log_baseline_entry(name, process)
@@ -429,6 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=".")
     parser.add_argument("--settle-seconds", type=float, default=3.0)
     parser.add_argument("--create-log-baseline", action="store_true")
+    parser.add_argument("--baseline-source-names")
     parser.add_argument("--log-baseline")
     return parser
 
@@ -440,7 +446,16 @@ def main() -> int:
     if args.create_log_baseline:
         try:
             snapshot = load_pm2_snapshot()
-            baseline_path = create_log_baseline(snapshot, expected_names)
+            source_names = (
+                parse_names(args.baseline_source_names)
+                if args.baseline_source_names
+                else None
+            )
+            baseline_path = create_log_baseline(
+                snapshot,
+                expected_names,
+                source_names,
+            )
         except (RuntimeError, OSError):
             print("log_baseline=failed", file=sys.stderr)
             return 1

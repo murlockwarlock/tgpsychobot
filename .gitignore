@@ -20,7 +20,6 @@ prod_snapshots/
 .env
 .env.*
 config.ini
-ecosystem.config.js
 
 # Local production operations
 backup_postgres_remote.sh

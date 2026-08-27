@@ -17,8 +17,9 @@ SSH_KEY="${PROD_SSH_KEY:-$HOME/.ssh/yc_key}"
 REMOTE_DIR="${PROD_REMOTE_DIR:-/root/telegram_bots/newbots}"
 REMOTE_PY="${PROD_REMOTE_PY:-/root/telegram_bots/venv/bin/python}"
 REMOTE_RUNTIME_ENV="${PROD_RUNTIME_ENV:-/root/telegram_bots/runtime.env}"
-PM2_NAMES="${PROD_PM2_NAMES:-psy5d_new,veraveda_new,someone01_new,someone02_new,veraveda_legacy,someone02_legacy,someone01_legacy,psy5d_legacy,test01_legacy,test02_legacy,someone03_new,someone04_new,someone05_new,someone06_new,someone07_new,yourself_way_bot,max_veraveda_legacy,max_yourself_way}"
 PM2_CONFIG="${PROD_PM2_CONFIG:-ecosystem.config.js}"
+PM2_NAMES="${PROD_PM2_NAMES:-$(python3 scripts/verify_bot_instances.py --print-pm2-names)}"
+ALLOW_BOT_INSTANCE_PM2_RENAME="${PROD_ALLOW_PM2_RENAME:-0}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -35,6 +36,7 @@ Environment variables:
   PROD_REMOTE_PY   Optional. Defaults to /root/telegram_bots/venv/bin/python.
   PROD_RUNTIME_ENV Optional. Remote untracked runtime environment file.
   PROD_PM2_NAMES   Optional. Comma-separated PM2 process names to reload.
+  PROD_ALLOW_PM2_RENAME=1 required when replacing a legacy PM2 name.
   PROD_BLOCKED_HOSTS Optional comma-separated denylist for accidental deploy protection.
   PROD_ALLOW_BLOCKED_HOST=1 overrides that protection for an intentional rollback.
 EOF
@@ -49,6 +51,15 @@ done
 
 if [[ ! "$PM2_NAMES" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
     echo "Refusing to deploy: PROD_PM2_NAMES contains invalid process names." >&2
+    exit 1
+fi
+if [[ "$ALLOW_BOT_INSTANCE_PM2_RENAME" != "0" && "$ALLOW_BOT_INSTANCE_PM2_RENAME" != "1" ]]; then
+    echo "Refusing to deploy: PROD_ALLOW_PM2_RENAME must be 0 or 1." >&2
+    exit 1
+fi
+LEGACY_PM2_NAMES="$(python3 scripts/verify_bot_instances.py --print-legacy-pm2-names --pm2-names "$PM2_NAMES")"
+if [[ -n "$LEGACY_PM2_NAMES" && ! "$LEGACY_PM2_NAMES" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+    echo "Refusing to deploy: registry contains invalid legacy process names." >&2
     exit 1
 fi
 
@@ -141,6 +152,46 @@ tar czf - -- "${TRACKED_FILES[@]}" | \
      if [[ -f '${REMOTE_RUNTIME_ENV}' ]]; then set -a; source '${REMOTE_RUNTIME_ENV}'; set +a; fi && \
      printf '%s\n' '${REVISION}' > REVISION && \
      find . -type f -name '*.py' ! -name '._*' -print0 | xargs -0 '${REMOTE_PY}' -m py_compile && \
+     '${REMOTE_PY}' 'scripts/verify_bot_instances.py' \
+         --validate-runtime-env \
+         --runtime-env '${REMOTE_RUNTIME_ENV}' \
+         --pm2-names '${PM2_NAMES}' && \
+     baseline_path= && \
+     trap 'status=\$?; if [[ -n "\$baseline_path" ]]; then rm -f -- "\$baseline_path" 2>/dev/null || true; fi; trap - EXIT; exit "\$status"' EXIT && \
+     baseline_path=\$('${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \
+         --create-log-baseline \
+         --pm2-names '${PM2_NAMES}' \
+         --baseline-source-names '${LEGACY_PM2_NAMES}') && \
+     [[ -n "\$baseline_path" ]] && \
+     legacy_names='${LEGACY_PM2_NAMES}' && \
+     if [[ -n "\$legacy_names" ]]; then \
+         '${REMOTE_PY}' 'scripts/verify_bot_instances.py' \
+             --runtime \
+             --runtime-env '${REMOTE_RUNTIME_ENV}' \
+             --pm2-names '${LEGACY_PM2_NAMES}' \
+             --allow-legacy \
+             --allow-missing; \
+     fi && \
+     if [[ -n "\$legacy_names" ]]; then \
+         IFS=',' read -r -a legacy_name_list <<< "\$legacy_names"; \
+         for legacy_name in "\${legacy_name_list[@]}"; do \
+             if pm2 describe "\$legacy_name" >/dev/null 2>&1; then \
+                 if [[ '${ALLOW_BOT_INSTANCE_PM2_RENAME}' != '1' ]]; then \
+                     echo "Refusing to replace legacy PM2 process \$legacy_name; set PROD_ALLOW_PM2_RENAME=1 for the reviewed rename." >&2; \
+                     exit 1; \
+                 fi; \
+                 pm2 delete "\$legacy_name"; \
+             fi; \
+         done; \
+     fi && \
+     if [[ -n "\$legacy_names" ]]; then \
+         for legacy_name in "\${legacy_name_list[@]}"; do \
+             if pm2 describe "\$legacy_name" >/dev/null 2>&1; then \
+                 echo "Refusing to start canonical PM2 processes while legacy process \$legacy_name remains." >&2; \
+                 exit 1; \
+             fi; \
+         done; \
+     fi && \
      echo 'Checking for ghost processes on ports 8080-8100...' && \
      pm2_pids=\$(pm2 jlist | grep -o '\"pid\":[0-9]*' | cut -d: -f2 | tr '\n' ' ') && \
      for port in {8080..8100}; do \
@@ -151,15 +202,13 @@ tar czf - -- "${TRACKED_FILES[@]}" | \
              fi; \
          done; \
      done && \
-     baseline_path= && \
-     trap 'status=\$?; if [[ -n "\$baseline_path" ]]; then rm -f -- "\$baseline_path" 2>/dev/null || true; fi; trap - EXIT; exit "\$status"' EXIT && \
-     baseline_path=\$('${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \
-         --create-log-baseline \
-         --pm2-names '${PM2_NAMES}') && \
-     [[ -n "\$baseline_path" ]] && \
      pm2 startOrReload '${PM2_CONFIG}' --only '${PM2_NAMES}' --update-env && \
      sleep 10 && \
      pm2 status && \
+     '${REMOTE_PY}' 'scripts/verify_bot_instances.py' \
+         --runtime \
+         --runtime-env '${REMOTE_RUNTIME_ENV}' \
+         --pm2-names '${PM2_NAMES}' && \
      '${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \
          --revision '${REVISION}' \
          --pm2-names '${PM2_NAMES}' \
