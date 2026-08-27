@@ -1713,13 +1713,6 @@ async def followup_stage_mode(callback: CallbackQuery, state: FSMContext):
         await _reset_followup_navigation(state)
         await _show_followup_conditions(callback, campaign_id)
         return
-    if mode != "selected":
-        async with async_session_maker() as session:
-            item = await session.get(FollowupCampaign, campaign_id)
-            if item is None:
-                return
-            item.stage_include_unset = False
-            await session.commit()
     return_topic_id = await _reset_followup_navigation(state)
     await state.set_state(AutomationAdminStates.followup_stage_values)
     await state.update_data(

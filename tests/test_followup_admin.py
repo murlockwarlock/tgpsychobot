@@ -574,6 +574,42 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertIsNone(await state.get_state())
 
+    async def test_all_except_back_preserves_selected_unset_configuration(self):
+        await self._update_campaign(
+            stage_mode="selected",
+            stage_values="guide_choice",
+            stage_include_unset=True,
+        )
+        state = MemoryState({"followup_return_topic_id": 7})
+        await state.set_state(automation_admin.AutomationAdminStates.followup_stage_values)
+        mode_callback = make_callback(f"followup_stage_mode_{self.campaign_id}_all_except")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_stage_mode(mode_callback, state)
+
+        campaign = await self._campaign()
+        self.assertEqual(("selected", "guide_choice", True), (
+            campaign.stage_mode,
+            campaign.stage_values,
+            campaign.stage_include_unset,
+        ))
+        self.assertEqual(
+            automation_admin.AutomationAdminStates.followup_stage_values.state,
+            await state.get_state(),
+        )
+
+        back = make_callback(f"followup_stage_edit_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_stage_edit(back, state=state)
+
+        campaign = await self._campaign()
+        self.assertEqual(("selected", "guide_choice", True), (
+            campaign.stage_mode,
+            campaign.stage_values,
+            campaign.stage_include_unset,
+        ))
+        self.assertIsNone(await state.get_state())
+        self.assertEqual({"followup_return_topic_id": 7}, await state.get_data())
+
     async def test_metadata_back_chain_invokes_previous_handlers(self):
         state = MemoryState({"followup_return_topic_id": 7})
         with patch.object(automation_admin, "async_session_maker", self.sessions):
