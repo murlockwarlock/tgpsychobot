@@ -71,6 +71,18 @@ class FollowupStepSendResult:
     telegram_message_id: int | None
 
 
+class FollowupPreparationError(Exception):
+    pass
+
+
+class FollowupStepConfigurationError(FollowupPreparationError):
+    pass
+
+
+class FollowupStepExecutionError(FollowupPreparationError):
+    pass
+
+
 @dataclass(frozen=True)
 class FollowupActivityIngress:
     dialogue_id: int
@@ -97,11 +109,16 @@ class FollowupDeliveryClaim:
 
 
 FOLLOWUP_ATTEMPT_CLAIMED = "claimed"
+FOLLOWUP_ATTEMPT_RETRYABLE = "retryable"
 FOLLOWUP_ATTEMPT_CANCELLED = "cancelled"
 FOLLOWUP_ATTEMPT_DELIVERED = "delivered"
 FOLLOWUP_ATTEMPT_UNCERTAIN = "uncertain"
+FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED = "retry_exhausted"
 FOLLOWUP_RUN_UNCERTAIN = "uncertain"
+FOLLOWUP_RUN_RETRY_EXHAUSTED = "retry_exhausted"
 FOLLOWUP_ATTEMPT_STALE_AFTER = timedelta(minutes=15)
+FOLLOWUP_PREPARATION_RETRY_DELAY = timedelta(minutes=5)
+FOLLOWUP_PREPARATION_RETRY_MAX_ATTEMPTS = 3
 
 
 def parse_followup_csv(value: str | None) -> tuple[str, ...]:
@@ -138,7 +155,10 @@ def evaluate_followup_eligibility(
     if stage_mode == "all":
         stage_matches = True
     elif stage_mode == "selected":
-        stage_matches = normalized_step in configured_steps
+        stage_matches = normalized_step in configured_steps or (
+            bool(getattr(campaign, "stage_include_unset", False))
+            and normalized_step is None
+        )
     elif stage_mode == "all_except":
         stage_matches = normalized_step not in configured_steps
     elif stage_mode == "not_set":
@@ -289,8 +309,28 @@ def _followup_ai_instruction(step) -> str:
         "[Служебная команда системы]: Пользователь замолчал.\n"
         "Сформируй одно догоняющее сообщение после паузы пользователя. "
         "Не упоминай автоматизацию и не добавляй блок DATA.\n\n"
-        + (step.ai_instruction or "Мягко верни пользователя к текущему диалогу.")
+        + (getattr(step, "ai_instruction", None) or "Мягко верни пользователя к текущему диалогу.")
     )
+
+
+def validate_followup_step(step) -> None:
+    if step is None:
+        raise FollowupStepConfigurationError("Следующий шаг отсутствует")
+    message_type = getattr(step, "message_type", None)
+    if message_type not in {"static", "ai"}:
+        raise FollowupStepConfigurationError("Неизвестный тип догоняющего шага")
+    if hasattr(step, "delay_minutes"):
+        delay_minutes = getattr(step, "delay_minutes")
+        if isinstance(delay_minutes, bool) or not isinstance(delay_minutes, int) or not 1 <= delay_minutes <= 525600:
+            raise FollowupStepConfigurationError("Некорректная задержка догоняющего шага")
+    if message_type == "static":
+        message_text = getattr(step, "message_text", None)
+        if not isinstance(message_text, str) or not message_text.strip():
+            raise FollowupStepConfigurationError("Пустой текст догоняющего сообщения")
+    else:
+        ai_instruction = getattr(step, "ai_instruction", None)
+        if ai_instruction is not None and not isinstance(ai_instruction, str):
+            raise FollowupStepConfigurationError("Некорректная инструкция AI")
 
 
 async def prepare_followup_step(
@@ -300,31 +340,35 @@ async def prepare_followup_step(
     dialogue_id: int,
     topic_id: int,
 ) -> FollowupStepSendResult:
+    validate_followup_step(step)
     if step.message_type == "ai":
-        from ai_integration import get_ai_response
+        try:
+            from ai_integration import get_ai_response
 
-        text = await get_ai_response(
-            user.id,
-            _followup_ai_instruction(step),
-            user.name or user.first_name or "Не указано",
-            user.gender or "Не указан",
-            bot=None,
-            topic_id_override=None if topic_id == 0 else topic_id,
-            dialogue_id_override=dialogue_id,
-            persist_service_data=False,
-            request_type="followup",
-        )
-        if not text:
-            raise ValueError("AI вернул пустое догоняющее сообщение")
-        visible_text, _, _ = extract_service_data(text)
-        history_text, _ = extract_response_buttons(visible_text)
-        return FollowupStepSendResult(text, history_text, None)
+            text = await get_ai_response(
+                user.id,
+                _followup_ai_instruction(step),
+                user.name or user.first_name or "Не указано",
+                user.gender or "Не указан",
+                bot=None,
+                topic_id_override=None if topic_id == 0 else topic_id,
+                dialogue_id_override=dialogue_id,
+                persist_service_data=False,
+                request_type="followup",
+            )
+            if not isinstance(text, str) or not text.strip():
+                raise FollowupStepExecutionError("AI вернул пустое догоняющее сообщение")
+            visible_text, _, _ = extract_service_data(text)
+            history_text, _ = extract_response_buttons(visible_text)
+            if not visible_text or not visible_text.strip():
+                raise FollowupStepExecutionError("AI не подготовил видимое догоняющее сообщение")
+            return FollowupStepSendResult(text, history_text, None)
+        except FollowupStepExecutionError:
+            raise
+        except Exception as exc:
+            raise FollowupStepExecutionError("Не удалось подготовить AI-догоняющее сообщение") from exc
 
-    if step.message_type != "static":
-        raise ValueError("Неизвестный тип догоняющего шага")
-    text = (step.message_text or "").strip()
-    if not text:
-        raise ValueError("Пустой текст догоняющего сообщения")
+    text = step.message_text.strip()
     return FollowupStepSendResult(text, text, None)
 
 
@@ -335,13 +379,12 @@ async def emit_followup_step(
     step,
     send_result: FollowupStepSendResult,
 ) -> FollowupStepSendResult:
+    validate_followup_step(step)
     if step.message_type == "ai":
         from handlers import _send_generated_response
 
         await _send_generated_response(bot, user.id, send_result.text)
         return send_result
-    if step.message_type != "static":
-        raise ValueError("Неизвестный тип догоняющего шага")
     sent = await bot.send_message(user.id, send_result.text)
     return FollowupStepSendResult(
         send_result.text,
@@ -803,10 +846,33 @@ async def _claim_due_followup(run_id: int, now: datetime) -> FollowupDeliveryCla
             .with_for_update()
         )
         if attempt is not None:
-            claimed_at = attempt.claimed_at or now
-            if (
+            if attempt.status == FOLLOWUP_ATTEMPT_RETRYABLE and attempt.step_id != step.id:
+                attempt.status = FOLLOWUP_ATTEMPT_CANCELLED
+                attempt.finished_at = now
+                attempt.error_text = "Delivery attempt no longer matches the current step."
+                run.status = "cancelled"
+                run.updated_at = now
+                await session.commit()
+            elif attempt.status == FOLLOWUP_ATTEMPT_RETRYABLE:
+                attempt_count = max(1, int(attempt.attempt_count or 1))
+                if attempt_count >= FOLLOWUP_PREPARATION_RETRY_MAX_ATTEMPTS:
+                    attempt.status = FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED
+                    attempt.finished_at = now
+                    attempt.error_text = attempt.error_text or "Preparation retry limit reached."
+                    run.status = FOLLOWUP_RUN_RETRY_EXHAUSTED
+                    run.updated_at = now
+                    await session.commit()
+                else:
+                    attempt.status = FOLLOWUP_ATTEMPT_CLAIMED
+                    attempt.claim_token = uuid.uuid4().hex
+                    attempt.claimed_at = now
+                    attempt.finished_at = None
+                    attempt.attempt_count = attempt_count + 1
+                    await session.commit()
+                    return _claim_snapshot(attempt, run, user, campaign, step)
+            elif (
                 attempt.status == FOLLOWUP_ATTEMPT_CLAIMED
-                and now - claimed_at >= FOLLOWUP_ATTEMPT_STALE_AFTER
+                and now - (attempt.claimed_at or now) >= FOLLOWUP_ATTEMPT_STALE_AFTER
             ):
                 attempt.status = FOLLOWUP_ATTEMPT_UNCERTAIN
                 attempt.finished_at = now
@@ -830,6 +896,7 @@ async def _claim_due_followup(run_id: int, now: datetime) -> FollowupDeliveryCla
             claim_token=uuid.uuid4().hex,
             status=FOLLOWUP_ATTEMPT_CLAIMED,
             claimed_at=now,
+            attempt_count=1,
         )
         session.add(attempt)
         try:
@@ -863,6 +930,9 @@ async def _release_claim(
             select(FollowupDeliveryAttempt)
             .where(
                 FollowupDeliveryAttempt.id == claim.attempt_id,
+                FollowupDeliveryAttempt.run_id == claim.run_id,
+                FollowupDeliveryAttempt.generation == claim.generation,
+                FollowupDeliveryAttempt.step_index == claim.step_index,
                 FollowupDeliveryAttempt.claim_token == claim.claim_token,
                 FollowupDeliveryAttempt.status == FOLLOWUP_ATTEMPT_CLAIMED,
             )
@@ -878,6 +948,55 @@ async def _release_claim(
             await session.commit()
         else:
             await session.rollback()
+
+
+async def _schedule_preparation_retry(
+    claim: FollowupDeliveryClaim,
+    error: Exception | str,
+) -> None:
+    now = datetime.utcnow()
+    async with async_session_maker() as session:
+        run = await session.scalar(
+            select(FollowupRun)
+            .where(FollowupRun.id == claim.run_id)
+            .with_for_update()
+        )
+        attempt = await session.scalar(
+            select(FollowupDeliveryAttempt)
+            .where(
+                FollowupDeliveryAttempt.id == claim.attempt_id,
+                FollowupDeliveryAttempt.run_id == claim.run_id,
+                FollowupDeliveryAttempt.step_id == claim.step_id,
+                FollowupDeliveryAttempt.generation == claim.generation,
+                FollowupDeliveryAttempt.step_index == claim.step_index,
+                FollowupDeliveryAttempt.claim_token == claim.claim_token,
+                FollowupDeliveryAttempt.status == FOLLOWUP_ATTEMPT_CLAIMED,
+            )
+            .with_for_update()
+        )
+        if attempt is None:
+            await session.rollback()
+            return
+
+        attempt.finished_at = now
+        attempt.error_text = str(error)
+        current_generation = (
+            run is not None
+            and run.generation == claim.generation
+            and run.next_step_index == claim.step_index
+            and run.status == "active"
+        )
+        if not current_generation:
+            attempt.status = FOLLOWUP_ATTEMPT_CANCELLED
+        elif max(1, int(attempt.attempt_count or 1)) >= FOLLOWUP_PREPARATION_RETRY_MAX_ATTEMPTS:
+            attempt.status = FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED
+            run.status = FOLLOWUP_RUN_RETRY_EXHAUSTED
+            run.updated_at = now
+        else:
+            attempt.status = FOLLOWUP_ATTEMPT_RETRYABLE
+            run.due_at = now + FOLLOWUP_PREPARATION_RETRY_DELAY
+            run.updated_at = now
+        await session.commit()
 
 
 async def _refresh_delivery_claim(
@@ -1156,11 +1275,17 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
                 claim.run_id,
                 claim.step_id,
             )
-            await _release_claim(
-                claim,
-                f"Follow-up preparation failed before external delivery: {exc}",
-                cancel_run=True,
-            )
+            if isinstance(exc, FollowupStepConfigurationError):
+                await _release_claim(
+                    claim,
+                    f"Follow-up step configuration is invalid: {exc}",
+                    cancel_run=True,
+                )
+            else:
+                await _schedule_preparation_retry(
+                    claim,
+                    f"Follow-up preparation failed before external delivery: {exc}",
+                )
             continue
         refreshed_claim = await _refresh_delivery_claim(claim, datetime.utcnow())
         if refreshed_claim is None:
@@ -1168,12 +1293,25 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
             continue
         claim = refreshed_claim
         try:
+            validate_followup_step(claim.step)
             send_result = await emit_followup_step(
                 bot,
                 user=claim.user,
                 step=claim.step,
                 send_result=prepared_result,
             )
+        except FollowupStepConfigurationError as exc:
+            log.exception(
+                "Follow-up step configuration changed before delivery: run=%s step=%s",
+                claim.run_id,
+                claim.step_id,
+            )
+            await _release_claim(
+                claim,
+                f"Follow-up step configuration is invalid: {exc}",
+                cancel_run=True,
+            )
+            continue
         except Exception as exc:
             log.exception(
                 "Follow-up delivery failed: run=%s step=%s",

@@ -4,14 +4,14 @@ import os
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import database
-from database import TelegramPendingAIReply
+from database import Base, TelegramPendingAIReply
 
 
 class _FakeConnection:
@@ -140,5 +140,54 @@ async def test_init_db_still_succeeds_on_sqlite(tmp_path, monkeypatch):
                 )
             )
         assert has_pending_table is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'followup-migration.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.execute(text(
+                "ALTER TABLE followup_campaigns DROP COLUMN stage_include_unset"
+            ))
+            await connection.execute(text(
+                "ALTER TABLE followup_delivery_attempts DROP COLUMN attempt_count"
+            ))
+            await connection.execute(text(
+                "INSERT INTO followup_campaigns ("
+                "name, is_active, all_topics, include_main_dialogue, stage_mode, stage_values, "
+                "metadata_field_path, metadata_operator, metadata_expected_value, stop_events, "
+                "timezone, quiet_start_minute, quiet_end_minute, jitter_min_seconds, jitter_max_seconds, "
+                "created_at, updated_at"
+                ") VALUES ("
+                "'legacy', 1, 0, 1, 'selected', 'guide_choice', NULL, NULL, NULL, '', "
+                "'Europe/Moscow', 1320, 540, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
+                ")"
+            ))
+        await database.init_db()
+        async with engine.connect() as connection:
+            campaign_columns = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).get_columns("followup_campaigns")
+            )
+            attempt_columns = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).get_columns("followup_delivery_attempts")
+            )
+            migrated_value = await connection.scalar(text(
+                "SELECT stage_include_unset FROM followup_campaigns WHERE name = 'legacy'"
+            ))
+        campaign_column = next(column for column in campaign_columns if column["name"] == "stage_include_unset")
+        attempt_column = next(column for column in attempt_columns if column["name"] == "attempt_count")
+        assert campaign_column["nullable"] is False
+        assert attempt_column["nullable"] is False
+        assert migrated_value == 0
     finally:
         await engine.dispose()

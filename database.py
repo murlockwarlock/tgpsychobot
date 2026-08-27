@@ -763,6 +763,10 @@ async def init_db():
                 sync_conn.execute(text(
                     "ALTER TABLE followup_campaigns ADD COLUMN stage_values TEXT DEFAULT '' NOT NULL"
                 ))
+            if 'stage_include_unset' not in followup_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE followup_campaigns ADD COLUMN stage_include_unset BOOLEAN DEFAULT FALSE NOT NULL"
+                ))
             if 'metadata_field_path' not in followup_columns:
                 sync_conn.execute(text("ALTER TABLE followup_campaigns ADD COLUMN metadata_field_path VARCHAR"))
             if 'metadata_operator' not in followup_columns:
@@ -781,7 +785,22 @@ async def init_db():
                 "UPDATE followup_campaigns SET stage_values = '' WHERE stage_values IS NULL"
             ))
             sync_conn.execute(text(
+                "UPDATE followup_campaigns SET stage_include_unset = FALSE "
+                "WHERE stage_include_unset IS NULL"
+            ))
+            sync_conn.execute(text(
                 "UPDATE followup_campaigns SET stop_events = '' WHERE stop_events IS NULL"
+            ))
+
+            attempt_columns = [c['name'] for c in insp.get_columns('followup_delivery_attempts')]
+            if 'attempt_count' not in attempt_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE followup_delivery_attempts "
+                    "ADD COLUMN attempt_count INTEGER DEFAULT 1 NOT NULL"
+                ))
+            sync_conn.execute(text(
+                "UPDATE followup_delivery_attempts SET attempt_count = 1 "
+                "WHERE attempt_count IS NULL OR attempt_count < 1"
             ))
 
             general_columns = [c['name'] for c in insp.get_columns('bot_general_config')]
@@ -1227,6 +1246,7 @@ class FollowupCampaign(Base):
     include_main_dialogue = Column(Boolean, default=True, nullable=False)
     stage_mode = Column(String, default='all', nullable=False)
     stage_values = Column(Text, default='', nullable=False)
+    stage_include_unset = Column(Boolean, default=False, server_default=text('FALSE'), nullable=False)
     metadata_field_path = Column(String, nullable=True)
     metadata_operator = Column(String, nullable=True)
     metadata_expected_value = Column(Text, nullable=True)
@@ -1315,6 +1335,7 @@ class FollowupDeliveryAttempt(Base):
     claimed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     finished_at = Column(DateTime, nullable=True)
     error_text = Column(Text, nullable=True)
+    attempt_count = Column(Integer, default=1, server_default=text('1'), nullable=False)
 
 
 class CardSpreadState(Base):

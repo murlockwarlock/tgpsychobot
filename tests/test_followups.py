@@ -99,8 +99,14 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(evaluate_followup_eligibility(selected, current_step="STEP_1", metadata={}).eligible)
         self.assertFalse(evaluate_followup_eligibility(selected, current_step="other", metadata={}).eligible)
         self.assertFalse(evaluate_followup_eligibility(selected, current_step=None, metadata={}).eligible)
+        selected.stage_include_unset = True
+        self.assertTrue(evaluate_followup_eligibility(selected, current_step=None, metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(selected, current_step="", metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(selected, current_step="  \t", metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(selected, current_step="step_1", metadata={}).eligible)
+        self.assertFalse(evaluate_followup_eligibility(selected, current_step="completed", metadata={}).eligible)
 
-        excluded = SimpleNamespace(stage_mode="all_except", stage_values="completed, crisis")
+        excluded = SimpleNamespace(stage_mode="all_except", stage_values="completed, crisis", stage_include_unset=True)
         self.assertFalse(evaluate_followup_eligibility(excluded, current_step="completed", metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(excluded, current_step="active", metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(excluded, current_step=None, metadata={}).eligible)
@@ -837,7 +843,7 @@ class FollowupRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("cancelled", run.status)
         self.assertEqual("cancelled", attempt.status)
 
-    async def test_ai_preparation_failure_is_cancelled_without_delivery_uncertainty(self):
+    async def test_ai_preparation_failure_is_retryable_without_delivery(self):
         run_id, _ = await self._add_due_run()
         async with self.sessions() as session:
             step = await session.get(FollowupStep, self.step_id)
@@ -858,8 +864,230 @@ class FollowupRaceTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             run = await session.get(FollowupRun, run_id)
             attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("active", run.status)
+        self.assertEqual("retryable", attempt.status)
+        self.assertEqual(1, attempt.attempt_count)
+        self.assertGreater(attempt.finished_at, attempt.claimed_at)
+        self.assertGreater(run.due_at, datetime.utcnow())
+
+    async def test_ai_preparation_retry_reclaims_same_attempt_and_delivers_once(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "ai"
+            await session.commit()
+
+        async def failing_ai(*args, **kwargs):
+            raise RuntimeError("temporary provider failure")
+
+        fake_handlers = types.ModuleType("handlers")
+        fake_send = AsyncMock()
+        fake_handlers._send_generated_response = fake_send
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=failing_ai,
+        ), patch.dict(sys.modules, {"handlers": fake_handlers}):
+            self.assertEqual(0, await process_due_followups(bot))
+
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            run.due_at = datetime.utcnow() - timedelta(seconds=1)
+            await session.commit()
+
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=AsyncMock(return_value="Повторно подготовлено"),
+        ), patch.dict(sys.modules, {"handlers": fake_handlers}):
+            self.assertEqual(1, await process_due_followups(bot))
+            self.assertEqual(0, await process_due_followups(bot))
+
+        fake_send.assert_awaited_once_with(bot, 42, "Повторно подготовлено")
+        self.assertEqual([], bot.sent)
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+            delivery = await session.scalar(select(FollowupDelivery))
+        self.assertEqual("completed", run.status)
+        self.assertEqual("delivered", attempt.status)
+        self.assertEqual(2, attempt.attempt_count)
+        self.assertIsNotNone(delivery)
+
+    async def test_two_workers_cannot_reclaim_preparation_retry(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "ai"
+            await session.commit()
+
+        async def failing_ai(*args, **kwargs):
+            raise RuntimeError("temporary provider failure")
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=failing_ai,
+        ):
+            self.assertEqual(0, await process_due_followups(bot))
+
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            run.due_at = datetime.utcnow() - timedelta(seconds=1)
+            await session.commit()
+
+        ai_started = asyncio.Event()
+        release_ai = asyncio.Event()
+
+        async def blocked_ai(*args, **kwargs):
+            ai_started.set()
+            await release_ai.wait()
+            return "Один ответ"
+
+        fake_handlers = types.ModuleType("handlers")
+        fake_send = AsyncMock()
+        fake_handlers._send_generated_response = fake_send
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=blocked_ai,
+        ), patch.dict(sys.modules, {"handlers": fake_handlers}):
+            first_task = asyncio.create_task(process_due_followups(bot))
+            await asyncio.wait_for(ai_started.wait(), timeout=2)
+            second_result = await asyncio.wait_for(process_due_followups(bot), timeout=2)
+            release_ai.set()
+            first_result = await asyncio.wait_for(first_task, timeout=2)
+
+        self.assertEqual((0, 1), (second_result, first_result))
+        fake_send.assert_awaited_once_with(bot, 42, "Один ответ")
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempts = (await session.execute(select(FollowupDeliveryAttempt))).scalars().all()
+        self.assertEqual("completed", run.status)
+        self.assertEqual([("delivered", 2)], [(item.status, item.attempt_count) for item in attempts])
+
+    async def test_preparation_retry_exhaustion_is_terminal(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "ai"
+            await session.commit()
+
+        async def failing_ai(*args, **kwargs):
+            raise RuntimeError("provider remains unavailable")
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=failing_ai,
+        ), patch.object(followups, "FOLLOWUP_PREPARATION_RETRY_MAX_ATTEMPTS", 2):
+            self.assertEqual(0, await process_due_followups(bot))
+            async with self.sessions() as session:
+                run = await session.get(FollowupRun, run_id)
+                run.due_at = datetime.utcnow() - timedelta(seconds=1)
+                await session.commit()
+            self.assertEqual(0, await process_due_followups(bot))
+            self.assertEqual(0, await process_due_followups(bot))
+
+        self.assertEqual([], bot.sent)
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual("retry_exhausted", run.status)
+        self.assertEqual("retry_exhausted", attempt.status)
+        self.assertEqual(2, attempt.attempt_count)
+
+    async def test_invalid_followup_step_configuration_is_terminal_without_retry(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "unsupported"
+            await session.commit()
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            self.assertEqual(0, await process_due_followups(bot))
+            self.assertEqual(0, await process_due_followups(bot))
+
+        self.assertEqual([], bot.sent)
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
         self.assertEqual("cancelled", run.status)
         self.assertEqual("cancelled", attempt.status)
+
+    async def test_empty_static_followup_step_is_terminal_without_retry(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_text = "  \n"
+            await session.commit()
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            self.assertEqual(0, await process_due_followups(bot))
+
+        self.assertEqual([], bot.sent)
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempt = await session.scalar(select(FollowupDeliveryAttempt))
+        self.assertEqual(("cancelled", "cancelled"), (run.status, attempt.status))
+
+    async def test_generation_change_during_retry_does_not_touch_new_generation(self):
+        run_id, _ = await self._add_due_run()
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.step_id)
+            step.message_type = "ai"
+            await session.commit()
+
+        async def failing_ai(*args, **kwargs):
+            raise RuntimeError("temporary provider failure")
+
+        bot = FakeBot()
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=failing_ai,
+        ):
+            self.assertEqual(0, await process_due_followups(bot))
+
+        activity_at = datetime.utcnow()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            ingress = await begin_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=activity_at,
+            )
+            await finalize_user_activity(
+                42,
+                ingress,
+                dialogue_id=1,
+                topic_id=None,
+            )
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            run.due_at = datetime.utcnow() - timedelta(seconds=1)
+            await session.commit()
+
+        fake_handlers = types.ModuleType("handlers")
+        fake_send = AsyncMock()
+        fake_handlers._send_generated_response = fake_send
+        with patch.object(followups, "async_session_maker", self.sessions), patch(
+            "ai_integration.get_ai_response",
+            new=AsyncMock(return_value="Ответ новой генерации"),
+        ), patch.dict(sys.modules, {"handlers": fake_handlers}):
+            self.assertEqual(1, await process_due_followups(bot))
+
+        fake_send.assert_awaited_once_with(bot, 42, "Ответ новой генерации")
+        async with self.sessions() as session:
+            run = await session.get(FollowupRun, run_id)
+            attempts = (
+                await session.execute(
+                    select(FollowupDeliveryAttempt).order_by(FollowupDeliveryAttempt.generation)
+                )
+            ).scalars().all()
+        self.assertEqual((2, "completed"), (run.generation, run.status))
+        self.assertEqual([(1, "retryable"), (2, "delivered")], [
+            (item.generation, item.status) for item in attempts
+        ])
 
     async def test_old_completion_records_history_without_overwriting_new_generation(self):
         run_id, _ = await self._add_due_run()

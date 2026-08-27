@@ -188,6 +188,7 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         markup = message.edit_text.await_args.kwargs["reply_markup"]
         values = callback_data(markup)
         self.assertIn(f"followup_self_test_{self.campaign_id}", values)
+        self.assertIn(f"followup_campaign_rename_{self.campaign_id}", values)
 
     async def test_opening_self_test_uses_callback_user_and_loads_real_context(self):
         state = MemoryState({"followup_return_topic_id": 7})
@@ -202,6 +203,62 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"followup_self_test_send_{self.campaign_id}", callback_data(markup))
         self.assertIsNone(await state.get_state())
         self.assertEqual((await state.get_data())["followup_return_topic_id"], 7)
+
+    async def test_open_rename_preserves_topic_origin_and_sets_dedicated_state(self):
+        state = MemoryState({"followup_return_topic_id": 7})
+        callback = make_callback(f"followup_campaign_rename_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_campaign_rename(callback, state)
+        self.assertEqual(
+            automation_admin.AutomationAdminStates.followup_campaign_rename.state,
+            await state.get_state(),
+        )
+        data = await state.get_data()
+        self.assertEqual((self.campaign_id, 7), (data["campaign_id"], data["followup_return_topic_id"]))
+        self.assertIn(
+            f"followup_campaign_{self.campaign_id}",
+            callback_data(callback.message.edit_text.await_args.kwargs["reply_markup"]),
+        )
+
+    async def test_rename_rejects_invalid_name_and_successfully_returns_to_same_campaign(self):
+        state = MemoryState({
+            "campaign_id": self.campaign_id,
+            "followup_return_topic_id": 7,
+        })
+        await state.set_state(automation_admin.AutomationAdminStates.followup_campaign_rename)
+        invalid = SimpleNamespace(text=" x ", answer=AsyncMock())
+        await automation_admin.followup_campaign_rename_received(invalid, state)
+        invalid.answer.assert_awaited_once_with("Название должно содержать от 2 до 100 символов.")
+        self.assertEqual(
+            automation_admin.AutomationAdminStates.followup_campaign_rename.state,
+            await state.get_state(),
+        )
+
+        message = SimpleNamespace(text="  Новое имя  ", answer=AsyncMock())
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_campaign_rename_received(message, state)
+        async with self.sessions() as session:
+            campaign = await session.get(FollowupCampaign, self.campaign_id)
+        self.assertEqual("Новое имя", campaign.name)
+        self.assertEqual(2, message.answer.await_count)
+        self.assertIn("Новое имя", message.answer.await_args_list[-1].args[0])
+        self.assertIsNone(await state.get_state())
+        self.assertEqual(7, (await state.get_data())["followup_return_topic_id"])
+
+    async def test_rename_back_keeps_name_and_clears_stale_fsm(self):
+        state = MemoryState({"followup_return_topic_id": 7})
+        rename = make_callback(f"followup_campaign_rename_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_campaign_rename(rename, state)
+        back = make_callback(f"followup_campaign_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_campaign_view(back, state=state)
+        async with self.sessions() as session:
+            campaign = await session.get(FollowupCampaign, self.campaign_id)
+        self.assertEqual("Тестовая цепочка", campaign.name)
+        self.assertIsNone(await state.get_state())
+        self.assertEqual(7, (await state.get_data())["followup_return_topic_id"])
+        self.assertIn("Тестовая цепочка", back.message.edit_text.await_args.args[0])
 
     async def test_ineligible_stage_metadata_and_stop_hide_send(self):
         cases = [
@@ -262,6 +319,34 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
             callback_data(refreshed.message.edit_text.await_args.kwargs["reply_markup"]),
         )
         self.assertIn("этап не подходит", refreshed.message.edit_text.await_args.args[0])
+
+    async def test_self_test_uses_selected_stage_with_unset_eligibility(self):
+        await self._update_campaign(
+            stage_mode="selected",
+            stage_values="guide_choice",
+            stage_include_unset=True,
+        )
+        await self._update_state(current_step="  \t")
+        unset = await self._show_self_test()
+        unset_text = unset.message.edit_text.await_args.args[0]
+        unset_markup = unset.message.edit_text.await_args.kwargs["reply_markup"]
+        self.assertIn("На выбранных этапах: guide_choice\n+ если этап не задан", unset_text)
+        self.assertIn(f"followup_self_test_send_{self.campaign_id}", callback_data(unset_markup))
+
+        await self._update_state(current_step="guide_choice")
+        selected = await self._show_self_test()
+        self.assertIn(
+            f"followup_self_test_send_{self.campaign_id}",
+            callback_data(selected.message.edit_text.await_args.kwargs["reply_markup"]),
+        )
+
+        await self._update_state(current_step="other")
+        other = await self._show_self_test()
+        self.assertNotIn(
+            f"followup_self_test_send_{self.campaign_id}",
+            callback_data(other.message.edit_text.await_args.kwargs["reply_markup"]),
+        )
+        self.assertIn("этап не подходит", other.message.edit_text.await_args.args[0])
 
     async def test_active_run_selects_current_step_and_without_run_selects_first(self):
         async with self.sessions() as session:
@@ -883,6 +968,45 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
             )
         campaign = await self._campaign()
         self.assertEqual(("selected", "completed, active"), (campaign.stage_mode, campaign.stage_values))
+
+        selected_conditions = make_callback(f"followup_conditions_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_conditions(selected_conditions, state=state)
+        selected_text = selected_conditions.message.edit_text.await_args.args[0]
+        selected_markup = selected_conditions.message.edit_text.await_args.kwargs["reply_markup"]
+        self.assertIn("На выбранных этапах: completed, active", selected_text)
+        self.assertIn(
+            f"followup_stage_include_unset_{self.campaign_id}",
+            callback_data(selected_markup),
+        )
+        self.assertIn("☐ Также если этап не задан", button_texts(selected_markup))
+
+        toggle = make_callback(f"followup_stage_include_unset_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_stage_include_unset_toggle(toggle, state=state)
+        campaign = await self._campaign()
+        self.assertTrue(campaign.stage_include_unset)
+        toggle_text = toggle.message.edit_text.await_args.args[0]
+        self.assertIn("+ если этап не задан", toggle_text)
+        self.assertIn("✅ Также если этап не задан", button_texts(
+            toggle.message.edit_text.await_args.kwargs["reply_markup"]
+        ))
+
+        toggle_off = make_callback(f"followup_stage_include_unset_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_stage_include_unset_toggle(toggle_off, state=state)
+        self.assertFalse((await self._campaign()).stage_include_unset)
+
+        await self._update_campaign(stage_include_unset=True)
+        switch_all = make_callback(f"followup_stage_mode_{self.campaign_id}_all")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_stage_mode(switch_all, state)
+        campaign = await self._campaign()
+        self.assertEqual(("all", "", False), (
+            campaign.stage_mode,
+            campaign.stage_values,
+            campaign.stage_include_unset,
+        ))
 
         field_message = SimpleNamespace(text="profile.outcome", answer=AsyncMock())
         with patch.object(automation_admin, "async_session_maker", self.sessions):
