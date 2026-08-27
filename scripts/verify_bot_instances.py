@@ -54,6 +54,7 @@ def validate_registry(registry: Any) -> list[str]:
     seen_identity_database: dict[tuple[str, str], str] = {}
     seen_ids: dict[tuple[str, int], str] = {}
     seen_pm2: dict[str, str] = {}
+    seen_legacy_pm2: dict[str, str] = {}
     seen_token_env: dict[str, str] = {}
     for index, entry in enumerate(instances):
         prefix = f"instances[{index}]"
@@ -146,10 +147,23 @@ def validate_registry(registry: Any) -> list[str]:
         elif id_key:
             seen_ids[id_key] = str(pm2_name)
 
-        if pm2_name in seen_pm2:
+        if pm2_name in seen_pm2 or pm2_name in seen_legacy_pm2:
             errors.append(f"duplicate_pm2_name:{pm2_name}")
         else:
             seen_pm2[pm2_name] = str(username)
+
+        legacy_pm2_name = entry.get("legacy_pm2_name")
+        if legacy_pm2_name is not None:
+            if not isinstance(legacy_pm2_name, str) or not re.fullmatch(
+                r"[A-Za-z0-9_-]+", legacy_pm2_name
+            ):
+                errors.append(f"{prefix}:legacy_pm2_name_invalid")
+            elif legacy_pm2_name == pm2_name:
+                errors.append(f"{prefix}:legacy_pm2_name_matches_pm2_name")
+            elif legacy_pm2_name in seen_pm2 or legacy_pm2_name in seen_legacy_pm2:
+                errors.append(f"duplicate_legacy_pm2_name:{legacy_pm2_name}")
+            else:
+                seen_legacy_pm2[legacy_pm2_name] = str(username)
 
         if isinstance(token_env, str) and token_env in seen_token_env:
             errors.append(f"duplicate_token_env:{token_env}")
@@ -415,6 +429,7 @@ def unexpected_managed_processes(
     registry: dict[str, Any],
     *,
     allow_legacy: bool = False,
+    migration_aware: bool = False,
 ) -> list[str]:
     known = {
         entry["pm2_name"]
@@ -430,7 +445,7 @@ def unexpected_managed_processes(
             or process_status(snapshot[entry["legacy_pm2_name"]]) != "online"
         )
     )
-    if allow_legacy:
+    if allow_legacy or migration_aware:
         known.update(
             entry.get("legacy_pm2_name")
             for entry in registry["instances"]
@@ -441,6 +456,39 @@ def unexpected_managed_processes(
         for name, process in snapshot.items()
         if managed_runtime_process(process) and name not in known
     )
+
+
+def migration_process(
+    entry: dict[str, Any],
+    snapshot: dict[str, dict[str, Any]],
+    *,
+    cutover_pm2_name: str | None = None,
+) -> tuple[str | None, dict[str, Any] | None, list[str]]:
+    canonical_name = entry["pm2_name"]
+    legacy_name = entry.get("legacy_pm2_name")
+    canonical_process = snapshot.get(canonical_name)
+    legacy_process = snapshot.get(legacy_name) if legacy_name else None
+    canonical_online = (
+        canonical_process is not None and process_status(canonical_process) == "online"
+    )
+    legacy_online = (
+        legacy_process is not None and process_status(legacy_process) == "online"
+    )
+    errors: list[str] = []
+
+    if canonical_online and legacy_online:
+        errors.append(f"both_migration_processes_active:{canonical_name}:{legacy_name}")
+        return canonical_name, canonical_process, errors
+
+    if canonical_process is not None and legacy_process is not None:
+        if canonical_name != cutover_pm2_name:
+            errors.append(f"legacy_process_present_after_migration:{legacy_name}")
+        return canonical_name, canonical_process, errors
+    if canonical_process is not None:
+        return canonical_name, canonical_process, errors
+    if legacy_process is not None:
+        return legacy_name, legacy_process, errors
+    return None, None, errors
 
 
 def validate_runtime_env(
@@ -477,6 +525,8 @@ def runtime_rows(
     identity_check: bool = False,
     names: list[str] | None = None,
     allow_missing: bool = False,
+    migration_aware: bool = False,
+    cutover_pm2_name: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -491,7 +541,15 @@ def runtime_rows(
         name = entry["pm2_name"]
         process_name = name
         process = snapshot.get(name)
-        if process is None and allow_legacy:
+        migration_errors: list[str] = []
+        if migration_aware:
+            process_name, process, migration_errors = migration_process(
+                entry,
+                snapshot,
+                cutover_pm2_name=cutover_pm2_name,
+            )
+            errors.extend(migration_errors)
+        elif process is None and allow_legacy:
             legacy_name = entry.get("legacy_pm2_name")
             process = snapshot.get(legacy_name) if legacy_name else None
             process_name = legacy_name or name
@@ -507,6 +565,7 @@ def runtime_rows(
                     "token_env": entry["token_env"],
                     "token_fingerprint": None,
                     "identity": "missing_process",
+                    "runtime_process": None,
                 }
             )
             continue
@@ -552,6 +611,7 @@ def runtime_rows(
                 "token_env": entry["token_env"],
                 "token_fingerprint": fingerprint_token(actual_token),
                 "identity": identity,
+                "runtime_process": process_name,
             }
         )
 
@@ -574,6 +634,7 @@ def runtime_rows(
         snapshot,
         registry,
         allow_legacy=allow_legacy,
+        migration_aware=migration_aware,
     )
     errors.extend(f"unexpected_managed_process:{name}" for name in unexpected)
     return rows, errors
@@ -611,6 +672,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--identity-check", action="store_true")
     parser.add_argument("--allow-legacy", action="store_true")
     parser.add_argument("--allow-missing", action="store_true")
+    parser.add_argument("--migration-aware", action="store_true")
+    parser.add_argument("--cutover-pm2-name")
     return parser
 
 
@@ -673,6 +736,8 @@ def main(argv: list[str] | None = None) -> int:
         identity_check=args.identity_check,
         names=selected_names,
         allow_missing=args.allow_missing,
+        migration_aware=args.migration_aware,
+        cutover_pm2_name=args.cutover_pm2_name,
     )
     print_rows(rows)
     if errors:

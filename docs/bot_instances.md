@@ -45,8 +45,19 @@ then run:
 ```bash
 python3 scripts/verify_bot_instances.py --validate
 python3 scripts/verify_bot_instances.py --validate-runtime-env --runtime-env /path/to/runtime.env
+python3 scripts/verify_bot_instances.py --runtime --migration-aware
 ```
 
 The verifier compares the process token/database with those canonical values,
 reports only short token fingerprints, and can perform read-only identity checks
 with `--runtime --identity-check`.
+
+Rolling migration accepts one active process per registered instance: a migrated
+instance uses its canonical PM2 name and an unmigrated instance uses its
+`legacy_pm2_name`. An old process is allowed beside a canonical process only
+during the bounded cutover check while the old process is stopped; the normal
+migration-aware verifier rejects any remaining legacy entry after cutover.
+
+Use `scripts/migrate_bot_secrets.py --plan` before `--apply` to copy canonical
+secret keys from a verified running legacy environment. The utility prints only
+token fingerprints and database names.

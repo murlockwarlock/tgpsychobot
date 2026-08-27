@@ -90,8 +90,9 @@ def test_deploy_and_ecosystem_use_every_canonical_managed_name():
     assert 'name: "someone01_new"' not in ecosystem
     assert "scripts/verify_bot_instances.py" in deploy
     assert "PROD_ALLOW_PM2_RENAME" in deploy
-    assert 'pm2 delete "\\$legacy_name"' in deploy
-    assert "--baseline-source-names" in deploy
+    assert "scripts/cutover_bot_instance.py" in deploy
+    assert "--pm2-name '${PM2_NAMES}'" in deploy
+    assert "--migration-aware" in deploy
 
 
 def test_ecosystem_uses_registry_secret_and_database_keys():
@@ -104,6 +105,147 @@ def test_ecosystem_uses_registry_secret_and_database_keys():
         block = ecosystem[start:end if end >= 0 else None]
         assert f"process.env.{item['token_env']}" in block
         assert f"process.env.{item['database_env']}" in block
+        assert f"process.env.{item['token_env']} || process.env.BOT_TOKEN" not in block
+        assert f"process.env.{item['database_env']} || process.env.DATABASE_URL" not in block
+
+
+def _production_migration_fixture():
+    registry = verifier.load_registry(REGISTRY_PATH)
+    entries = verifier.managed_instances(registry)
+    snapshot = {}
+    environment = {}
+    for index, entry in enumerate(entries):
+        token = f"{100000 + index}:abcdefghijklmnopqrstuvwxyz{index:02d}"
+        database_url = f"postgresql://user:password@host/{entry['database']}"
+        environment[entry["token_env"]] = token
+        environment[entry["database_env"]] = database_url
+        runtime_environment = {
+            entry["runtime_token_env"]: token,
+            entry["runtime_database_env"]: database_url,
+        }
+        path = "/root/telegram_bots/newbots/main.py"
+        if entry["platform"] == "max":
+            path = "/root/telegram_bots/newbots/max_messenger_bot/app.py"
+        snapshot[entry["pm2_name"]] = _process(
+            entry["pm2_name"],
+            token,
+            database_url,
+            path=path,
+        )
+        snapshot[entry["pm2_name"]]["pm2_env"]["env"] = runtime_environment
+    return registry, entries, snapshot, environment
+
+
+def test_migration_aware_runtime_accepts_one_canonical_and_registered_legacy_processes():
+    registry, entries, snapshot, environment = _production_migration_fixture()
+    first = entries[0]
+    for entry in entries[1:]:
+        process = snapshot.pop(entry["pm2_name"])
+        process["name"] = entry["legacy_pm2_name"]
+        snapshot[entry["legacy_pm2_name"]] = process
+
+    rows, errors = verifier.runtime_rows(
+        registry,
+        snapshot,
+        environment,
+        migration_aware=True,
+    )
+
+    assert errors == []
+    assert rows[0]["runtime_process"] == first["pm2_name"]
+    assert all(row["runtime_process"] != row["pm2_name"] for row in rows[1:])
+
+
+def test_migration_aware_runtime_rejects_active_old_and_new_processes():
+    registry, entries, snapshot, environment = _production_migration_fixture()
+    first = entries[0]
+    legacy = dict(snapshot[first["pm2_name"]])
+    legacy["name"] = first["legacy_pm2_name"]
+    snapshot[first["legacy_pm2_name"]] = legacy
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        snapshot,
+        environment,
+        migration_aware=True,
+    )
+
+    assert (
+        f"both_migration_processes_active:{first['pm2_name']}:{first['legacy_pm2_name']}"
+        in errors
+    )
+
+
+def test_migration_aware_runtime_rejects_unknown_managed_process():
+    registry, _entries, snapshot, environment = _production_migration_fixture()
+    snapshot["tg_unregistered_bot_new"] = _process(
+        "tg_unregistered_bot_new",
+        "999999:abcdefghijklmnopqrstuvwxyz99",
+        "postgresql://user:password@host/unknown_db",
+    )
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        snapshot,
+        environment,
+        migration_aware=True,
+    )
+
+    assert "unexpected_managed_process:tg_unregistered_bot_new" in errors
+
+
+def test_migration_aware_runtime_rejects_any_legacy_process_after_all_migrated():
+    registry, entries, snapshot, environment = _production_migration_fixture()
+    first = entries[0]
+    legacy = _process(
+        first["legacy_pm2_name"],
+        "100000:abcdefghijklmnopqrstuvwxyz00",
+        "postgresql://user:password@host/" + first["database"],
+    )
+    legacy["name"] = first["legacy_pm2_name"]
+    legacy["pm2_env"]["status"] = "stopped"
+    legacy["pm2_env"]["env"] = {
+        first["runtime_token_env"]: "100000:abcdefghijklmnopqrstuvwxyz00",
+        first["runtime_database_env"]: "postgresql://user:password@host/" + first["database"],
+    }
+    snapshot[first["legacy_pm2_name"]] = legacy
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        snapshot,
+        environment,
+        migration_aware=True,
+    )
+
+    assert f"legacy_process_present_after_migration:{first['legacy_pm2_name']}" in errors
+
+
+def test_migration_aware_cutover_allows_only_the_selected_stopped_legacy_process():
+    registry, entries, snapshot, environment = _production_migration_fixture()
+    first = entries[0]
+    legacy = _process(
+        first["legacy_pm2_name"],
+        "100000:abcdefghijklmnopqrstuvwxyz00",
+        "postgresql://user:password@host/" + first["database"],
+    )
+    legacy["name"] = first["legacy_pm2_name"]
+    legacy["pm2_env"]["status"] = "stopped"
+    legacy["pm2_env"]["env"] = {
+        first["runtime_token_env"]: "100000:abcdefghijklmnopqrstuvwxyz00",
+        first["runtime_database_env"]: "postgresql://user:password@host/" + first["database"],
+    }
+    snapshot[first["legacy_pm2_name"]] = legacy
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        snapshot,
+        environment,
+        names=[first["pm2_name"]],
+        migration_aware=True,
+        cutover_pm2_name=first["pm2_name"],
+    )
+
+    assert errors == []
 
 
 def test_documentation_is_a_projection_of_the_registry():

@@ -473,29 +473,40 @@ def test_invalid_pm2_names_are_rejected_before_git_or_ssh():
     assert "ssh" not in result.stderr.lower()
 
 
+def test_deploy_requires_one_canonical_process_for_rolling_cutover():
+    environment = os.environ.copy()
+    environment["PROD_PM2_NAMES"] = "tg_demo_one,tg_demo_two"
+    environment["PROD_HOST"] = "example.invalid"
+    result = subprocess.run(
+        ["bash", "deploy_prod.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "exactly one PM2 process" in result.stderr
+    assert "ssh" not in result.stderr.lower()
+
+
 def test_deploy_chains_verifier_failure_and_cleanup_trap():
     deploy_script = (REPO_ROOT / "deploy_prod.sh").read_text(encoding="utf-8")
 
     assert "set -euo pipefail" in deploy_script
-    assert "--create-log-baseline" in deploy_script
-    assert "baseline_path= &&" in deploy_script
-    assert "trap 'status=\\$?; if [[ -n \"\\$baseline_path\" ]]; then rm -f -- \"\\$baseline_path\"" in deploy_script
+    assert "scripts/cutover_bot_instance.py" in deploy_script
+    assert "--allow-rename" in deploy_script
     assert "pm2 status &&" in deploy_script
-    assert '--log-baseline "\\$baseline_path"' in deploy_script
-    verifier_marker = "'${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \\\n         --revision '${REVISION}'"
-    assert verifier_marker in deploy_script
-    assert verifier_marker + " \\\n         --pm2-names" in deploy_script
+    assert "--migration-aware" in deploy_script
+    assert "PROD_PM2_NAMES" in deploy_script
 
 
 def test_verifier_failure_is_not_masked_by_remote_shell_chain():
     deploy_script = (REPO_ROOT / "deploy_prod.sh").read_text(encoding="utf-8")
-    verifier_start = deploy_script.index(
-        "     '${REMOTE_PY}' 'scripts/verify_prod_runtime.py' \\\n         --revision"
-    )
-    verifier_command = deploy_script[verifier_start:]
-
-    assert "--log-baseline \"\\$baseline_path\"\"" in verifier_command
-    assert "|| true" not in verifier_command
+    assert "scripts/cutover_bot_instance.py" in deploy_script
+    assert "--settle-seconds 3 ${RENAME_ARG} &&" in deploy_script
+    assert 'pm2 delete "\\$legacy_name"' not in deploy_script
 
 
 @pytest.mark.parametrize("revision", ["wrong", "expected"])
