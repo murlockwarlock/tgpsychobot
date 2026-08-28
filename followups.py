@@ -38,7 +38,6 @@ FOLLOWUP_STAGE_MODE_LABELS = {
     "all": "На всех этапах",
     "selected": "На выбранных этапах",
     "all_except": "На всех этапах кроме",
-    "not_set": "Этап не задан",
 }
 FOLLOWUP_STAGE_MODES = tuple(FOLLOWUP_STAGE_MODE_LABELS)
 FOLLOWUP_METADATA_OPERATOR_LABELS = {
@@ -50,6 +49,19 @@ _FOLLOWUP_STAGE_MODE_ALIASES = {
     "all_stages": "all",
     "selected_stages": "selected",
     "step_not_set": "not_set",
+    "all_explicit": "all",
+    "all_except_explicit": "all_except",
+    "all_legacy": "all",
+    "all_except_legacy": "all_except",
+}
+_FOLLOWUP_LEGACY_STAGE_MODES = {
+    "all_stages",
+    "all_legacy",
+    "all_except_legacy",
+}
+_FOLLOWUP_LEGACY_UNSET_MODES = {
+    "not_set",
+    "step_not_set",
 }
 
 
@@ -130,6 +142,27 @@ def _normalize_stage_mode(value: str | None) -> str:
     return _FOLLOWUP_STAGE_MODE_ALIASES.get(mode, mode)
 
 
+def _stage_include_unset(campaign: FollowupCampaign, *, mode: str | None = None) -> bool:
+    raw_mode = str(getattr(campaign, "stage_mode", "all") or "all").strip().lower()
+    if raw_mode in _FOLLOWUP_LEGACY_STAGE_MODES:
+        return True
+    if raw_mode in {"all_explicit", "all_except_explicit"}:
+        return False
+    value = getattr(campaign, "stage_include_unset", None)
+    if value is not None:
+        return bool(value)
+    normalized_mode = _normalize_stage_mode(mode or raw_mode)
+    return normalized_mode in {"all", "all_except"}
+
+
+def _stage_mode_for_storage(mode: str, include_unset: bool) -> str:
+    if mode not in FOLLOWUP_STAGE_MODES:
+        raise ValueError(f"Unknown follow-up stage mode: {mode}")
+    if include_unset or mode == "selected":
+        return mode
+    return f"{mode}_explicit"
+
+
 def _normalize_current_step(value: str | None) -> str | None:
     normalized = str(value or "").strip()
     return normalized or None
@@ -150,19 +183,22 @@ def evaluate_followup_eligibility(
     )
 
     normalized_step = _normalize_current_step(current_step)
-    stage_mode = _normalize_stage_mode(getattr(campaign, "stage_mode", "all"))
+    raw_stage_mode = str(getattr(campaign, "stage_mode", "all") or "all").strip().lower()
+    stage_mode = _normalize_stage_mode(raw_stage_mode)
     configured_steps = parse_followup_csv(getattr(campaign, "stage_values", ""))
-    if stage_mode == "all":
+    if normalized_step is None:
+        if raw_stage_mode in _FOLLOWUP_LEGACY_STAGE_MODES or raw_stage_mode in _FOLLOWUP_LEGACY_UNSET_MODES:
+            stage_matches = True
+        elif stage_mode in FOLLOWUP_STAGE_MODES:
+            stage_matches = _stage_include_unset(campaign, mode=stage_mode)
+        else:
+            stage_matches = False
+    elif stage_mode == "all":
         stage_matches = True
     elif stage_mode == "selected":
-        stage_matches = normalized_step in configured_steps or (
-            bool(getattr(campaign, "stage_include_unset", False))
-            and normalized_step is None
-        )
+        stage_matches = normalized_step in configured_steps
     elif stage_mode == "all_except":
         stage_matches = normalized_step not in configured_steps
-    elif stage_mode == "not_set":
-        stage_matches = normalized_step is None
     else:
         stage_matches = False
 

@@ -173,6 +173,22 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
                 "'Europe/Moscow', 1320, 540, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
                 ")"
             ))
+            for name, mode, stage_values in (
+                ("legacy all", "all", ""),
+                ("legacy all except", "all_except", "blocked"),
+                ("legacy not set", "not_set", ""),
+            ):
+                await connection.execute(text(
+                    "INSERT INTO followup_campaigns ("
+                    "name, is_active, all_topics, include_main_dialogue, stage_mode, stage_values, "
+                    "metadata_field_path, metadata_operator, metadata_expected_value, stop_events, "
+                    "timezone, quiet_start_minute, quiet_end_minute, jitter_min_seconds, jitter_max_seconds, "
+                    "created_at, updated_at"
+                    ") VALUES ("
+                    ":name, 1, 0, 1, :stage_mode, :stage_values, NULL, NULL, NULL, '', "
+                    "'Europe/Moscow', 1320, 540, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
+                    ")"
+                ), {"name": name, "stage_mode": mode, "stage_values": stage_values})
         await database.init_db()
         async with engine.connect() as connection:
             campaign_columns = await connection.run_sync(
@@ -184,10 +200,19 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
             migrated_value = await connection.scalar(text(
                 "SELECT stage_include_unset FROM followup_campaigns WHERE name = 'legacy'"
             ))
+            migrated_modes = dict((await connection.execute(text(
+                "SELECT name, stage_mode FROM followup_campaigns "
+                "WHERE name IN ('legacy all', 'legacy all except', 'legacy not set')"
+            ))).all())
         campaign_column = next(column for column in campaign_columns if column["name"] == "stage_include_unset")
         attempt_column = next(column for column in attempt_columns if column["name"] == "attempt_count")
         assert campaign_column["nullable"] is False
         assert attempt_column["nullable"] is False
         assert migrated_value == 0
+        assert migrated_modes == {
+            "legacy all": "all_legacy",
+            "legacy all except": "all_except_legacy",
+            "legacy not set": "not_set",
+        }
     finally:
         await engine.dispose()

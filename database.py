@@ -929,6 +929,16 @@ async def init_db():
                 "WHERE stage_include_unset IS NULL"
             ))
             sync_conn.execute(text(
+                "UPDATE followup_campaigns SET stage_mode = 'all_legacy' "
+                "WHERE LOWER(TRIM(COALESCE(stage_mode, ''))) IN ('all', 'all_stages') "
+                "AND COALESCE(stage_include_unset, FALSE) = FALSE"
+            ))
+            sync_conn.execute(text(
+                "UPDATE followup_campaigns SET stage_mode = 'all_except_legacy' "
+                "WHERE LOWER(TRIM(COALESCE(stage_mode, ''))) = 'all_except' "
+                "AND COALESCE(stage_include_unset, FALSE) = FALSE"
+            ))
+            sync_conn.execute(text(
                 "UPDATE followup_campaigns SET stop_events = '' WHERE stop_events IS NULL"
             ))
 
@@ -1394,7 +1404,7 @@ class FollowupCampaign(Base):
     include_main_dialogue = Column(Boolean, default=True, nullable=False)
     stage_mode = Column(String, default='all', nullable=False)
     stage_values = Column(Text, default='', nullable=False)
-    stage_include_unset = Column(Boolean, default=False, server_default=text('FALSE'), nullable=False)
+    stage_include_unset = Column(Boolean, default=True, server_default=text('TRUE'), nullable=False)
     metadata_field_path = Column(String, nullable=True)
     metadata_operator = Column(String, nullable=True)
     metadata_expected_value = Column(Text, nullable=True)

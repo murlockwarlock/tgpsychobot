@@ -111,6 +111,51 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evaluate_followup_eligibility(excluded, current_step="active", metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(excluded, current_step=None, metadata={}).eligible)
 
+        for mode in ("all", "selected", "all_except"):
+            campaign = SimpleNamespace(
+                stage_mode=mode,
+                stage_values="completed" if mode != "all" else "",
+                stage_include_unset=False,
+            )
+            self.assertFalse(
+                evaluate_followup_eligibility(campaign, current_step=None, metadata={}).eligible
+            )
+            campaign.stage_include_unset = True
+            self.assertTrue(
+                evaluate_followup_eligibility(campaign, current_step=None, metadata={}).eligible
+            )
+            campaign.stage_include_unset = False
+            self.assertTrue(
+                evaluate_followup_eligibility(
+                    campaign,
+                    current_step="completed" if mode == "selected" else "active",
+                    metadata={},
+                ).eligible
+            )
+        all_except_without_unset = SimpleNamespace(
+            stage_mode="all_except",
+            stage_values="completed",
+            stage_include_unset=False,
+        )
+        self.assertFalse(
+            evaluate_followup_eligibility(
+                all_except_without_unset,
+                current_step="completed",
+                metadata={},
+            ).eligible
+        )
+
+        legacy_all = SimpleNamespace(stage_mode="all_legacy", stage_include_unset=False)
+        self.assertTrue(evaluate_followup_eligibility(legacy_all, current_step=None, metadata={}).eligible)
+        legacy_all_except = SimpleNamespace(
+            stage_mode="all_except_legacy",
+            stage_values="completed",
+            stage_include_unset=False,
+        )
+        self.assertTrue(
+            evaluate_followup_eligibility(legacy_all_except, current_step=None, metadata={}).eligible
+        )
+
         not_set = SimpleNamespace(stage_mode="not_set", stage_values="obsolete")
         self.assertTrue(evaluate_followup_eligibility(not_set, current_step=None, metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(not_set, current_step="", metadata={}).eligible)
