@@ -50,6 +50,17 @@ class FakeBot:
         return SimpleNamespace(message_id=len(self.sent))
 
 
+class MarkupBot(FakeBot):
+    def __init__(self):
+        super().__init__()
+        self.sent_details = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.sent_details.append((chat_id, text, kwargs))
+        self.sent.append((chat_id, text))
+        return SimpleNamespace(message_id=len(self.sent))
+
+
 class FollowupTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -94,56 +105,64 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evaluate_followup_eligibility(default, current_step="completed", metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(default, current_step=None, metadata={}).eligible)
 
-        selected = SimpleNamespace(stage_mode="selected", stage_values=" step_1, , step_2 ")
+        selected = SimpleNamespace(
+            stage_mode="selected",
+            stage_values=" step_1, , step_2 ",
+            stage_include_unset=False,
+        )
         self.assertTrue(evaluate_followup_eligibility(selected, current_step="step_1", metadata={}).eligible)
         self.assertFalse(evaluate_followup_eligibility(selected, current_step="STEP_1", metadata={}).eligible)
         self.assertFalse(evaluate_followup_eligibility(selected, current_step="other", metadata={}).eligible)
         self.assertFalse(evaluate_followup_eligibility(selected, current_step=None, metadata={}).eligible)
-        selected.stage_include_unset = True
+        selected.stage_values = "step_1, step_2, [не задан]"
         self.assertTrue(evaluate_followup_eligibility(selected, current_step=None, metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(selected, current_step="", metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(selected, current_step="  \t", metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(selected, current_step="step_1", metadata={}).eligible)
         self.assertFalse(evaluate_followup_eligibility(selected, current_step="completed", metadata={}).eligible)
 
-        excluded = SimpleNamespace(stage_mode="all_except", stage_values="completed, crisis", stage_include_unset=True)
+        excluded = SimpleNamespace(
+            stage_mode="all_except",
+            stage_values="completed, crisis, [не задан]",
+            stage_include_unset=False,
+        )
         self.assertFalse(evaluate_followup_eligibility(excluded, current_step="completed", metadata={}).eligible)
         self.assertTrue(evaluate_followup_eligibility(excluded, current_step="active", metadata={}).eligible)
-        self.assertTrue(evaluate_followup_eligibility(excluded, current_step=None, metadata={}).eligible)
+        self.assertFalse(evaluate_followup_eligibility(excluded, current_step=None, metadata={}).eligible)
 
-        for mode in ("all", "selected", "all_except"):
-            campaign = SimpleNamespace(
-                stage_mode=mode,
-                stage_values="completed" if mode != "all" else "",
-                stage_include_unset=False,
-            )
-            self.assertFalse(
-                evaluate_followup_eligibility(campaign, current_step=None, metadata={}).eligible
-            )
-            campaign.stage_include_unset = True
-            self.assertTrue(
-                evaluate_followup_eligibility(campaign, current_step=None, metadata={}).eligible
-            )
-            campaign.stage_include_unset = False
-            self.assertTrue(
-                evaluate_followup_eligibility(
-                    campaign,
-                    current_step="completed" if mode == "selected" else "active",
-                    metadata={},
-                ).eligible
-            )
         all_except_without_unset = SimpleNamespace(
+            stage_mode="all_except",
+            stage_values="completed",
+            stage_include_unset=True,
+        )
+        self.assertTrue(evaluate_followup_eligibility(all_except_without_unset, current_step=None, metadata={}).eligible)
+        self.assertFalse(evaluate_followup_eligibility(all_except_without_unset, current_step="completed", metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(all_except_without_unset, current_step="active", metadata={}).eligible)
+        all_except_legacy_explicit = SimpleNamespace(
             stage_mode="all_except",
             stage_values="completed",
             stage_include_unset=False,
         )
         self.assertFalse(
             evaluate_followup_eligibility(
-                all_except_without_unset,
-                current_step="completed",
+                all_except_legacy_explicit,
+                current_step=None,
                 metadata={},
             ).eligible
         )
+
+        all_stages = SimpleNamespace(stage_mode="all", stage_values="", stage_include_unset=False)
+        self.assertTrue(evaluate_followup_eligibility(all_stages, current_step=None, metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(all_stages, current_step="completed", metadata={}).eligible)
+
+        selected_legacy = SimpleNamespace(
+            stage_mode="selected",
+            stage_values="guide_choice",
+            stage_include_unset=True,
+        )
+        self.assertTrue(evaluate_followup_eligibility(selected_legacy, current_step=None, metadata={}).eligible)
+        selected_legacy.stage_include_unset = False
+        self.assertFalse(evaluate_followup_eligibility(selected_legacy, current_step=None, metadata={}).eligible)
 
         legacy_all = SimpleNamespace(stage_mode="all_legacy", stage_include_unset=False)
         self.assertTrue(evaluate_followup_eligibility(legacy_all, current_step=None, metadata={}).eligible)
@@ -154,6 +173,21 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(
             evaluate_followup_eligibility(legacy_all_except, current_step=None, metadata={}).eligible
+        )
+
+        legacy_all_explicit = SimpleNamespace(stage_mode="all_explicit", stage_include_unset=False)
+        self.assertFalse(evaluate_followup_eligibility(legacy_all_explicit, current_step=None, metadata={}).eligible)
+        self.assertTrue(evaluate_followup_eligibility(legacy_all_explicit, current_step="active", metadata={}).eligible)
+        legacy_all_except_explicit = SimpleNamespace(
+            stage_mode="all_except_explicit",
+            stage_values="completed",
+        )
+        self.assertFalse(
+            evaluate_followup_eligibility(
+                legacy_all_except_explicit,
+                current_step=None,
+                metadata={},
+            ).eligible
         )
 
         not_set = SimpleNamespace(stage_mode="not_set", stage_values="obsolete")
@@ -466,6 +500,50 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second, 0)
         self.assertEqual(deliveries, 1)
         self.assertEqual(bot.sent, [(42, "Продолжим?")])
+
+    async def test_static_followup_buttons_use_ai_protocol_and_clean_history(self):
+        async with self.sessions() as session:
+            step = await session.scalar(select(FollowupStep))
+            step.message_text = (
+                "Кинозал уже готов...\n"
+                "[Выбрать проводника](btn:guide_choice) | [Сайт](https://example.com)\n"
+                "[Дальше](btn:next)"
+            )
+            await session.commit()
+
+        bot = MarkupBot()
+        with patch.object(followups, "async_session_maker", self.sessions):
+            await record_user_activity(
+                42,
+                dialogue_id=1,
+                topic_id=None,
+                activity_at=datetime.utcnow() - timedelta(minutes=5),
+            )
+            delivered = await process_due_followups(bot)
+            repeated = await process_due_followups(bot)
+
+        self.assertEqual((delivered, repeated), (1, 0))
+        self.assertEqual(len(bot.sent_details), 1)
+        _, visible_text, kwargs = bot.sent_details[0]
+        self.assertEqual(visible_text, "Кинозал уже готов...")
+        markup = kwargs["reply_markup"]
+        self.assertEqual(
+            [(button.text, button.callback_data, button.url) for button in markup.inline_keyboard[0]],
+            [
+                ("Выбрать проводника", "ai_btn:guide_choice", None),
+                ("Сайт", None, "https://example.com"),
+            ],
+        )
+        self.assertEqual(markup.inline_keyboard[1][0].callback_data, "ai_btn:next")
+
+        async with self.sessions() as session:
+            history = await session.scalar(
+                select(Message).where(Message.user_id == 42, Message.role == "assistant")
+            )
+            run = await session.scalar(select(FollowupRun))
+            delivery_count = await session.scalar(select(func.count(FollowupDelivery.id)))
+        self.assertEqual(history.content, "Кинозал уже готов...")
+        self.assertEqual((run.next_step_index, run.status, delivery_count), (1, "completed", 1))
 
     async def test_allowed_chain_advances_each_step_and_keeps_delivery_history(self):
         async with self.sessions() as session:

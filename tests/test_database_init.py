@@ -177,6 +177,7 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
                 ("legacy all", "all", ""),
                 ("legacy all except", "all_except", "blocked"),
                 ("legacy not set", "not_set", ""),
+                ("canonical all except unset", "all_except", "blocked, [не задан]"),
             ):
                 await connection.execute(text(
                     "INSERT INTO followup_campaigns ("
@@ -202,7 +203,8 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
             ))
             migrated_modes = dict((await connection.execute(text(
                 "SELECT name, stage_mode FROM followup_campaigns "
-                "WHERE name IN ('legacy all', 'legacy all except', 'legacy not set')"
+                "WHERE name IN ('legacy all', 'legacy all except', 'legacy not set', "
+                "'canonical all except unset')"
             ))).all())
         campaign_column = next(column for column in campaign_columns if column["name"] == "stage_include_unset")
         attempt_column = next(column for column in attempt_columns if column["name"] == "attempt_count")
@@ -213,6 +215,7 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
             "legacy all": "all_legacy",
             "legacy all except": "all_except_legacy",
             "legacy not set": "not_set",
+            "canonical all except unset": "all_except",
         }
     finally:
         await engine.dispose()

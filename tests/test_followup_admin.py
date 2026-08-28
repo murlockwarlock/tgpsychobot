@@ -323,14 +323,14 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_self_test_uses_selected_stage_with_unset_eligibility(self):
         await self._update_campaign(
             stage_mode="selected",
-            stage_values="guide_choice",
+            stage_values="guide_choice, [не задан]",
             stage_include_unset=True,
         )
         await self._update_state(current_step="  \t")
         unset = await self._show_self_test()
         unset_text = unset.message.edit_text.await_args.args[0]
         unset_markup = unset.message.edit_text.await_args.kwargs["reply_markup"]
-        self.assertIn("На выбранных этапах: guide_choice\n+ если этап не задан", unset_text)
+        self.assertIn("На выбранных этапах: guide_choice, [не задан]", unset_text)
         self.assertIn(f"followup_self_test_send_{self.campaign_id}", callback_data(unset_markup))
 
         await self._update_state(current_step="guide_choice")
@@ -500,14 +500,41 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Ручная проверка завершена", text)
         self.assertNotIn(f"followup_self_test_send_{self.campaign_id}", callback_data(markup))
 
+    async def test_self_test_renders_static_response_buttons(self):
+        async with self.sessions() as session:
+            step = await session.get(FollowupStep, self.first_step_id)
+            step.message_text = (
+                "Кинозал уже готов...\n"
+                "[Выбрать проводника](btn:guide_choice) | [Сайт](https://example.com)\n"
+                "[Дальше](btn:next)"
+            )
+            await session.commit()
+
+        bot = FakeBot()
+        callback = make_callback(f"followup_self_test_send_{self.campaign_id}")
+        with patch.object(automation_admin, "async_session_maker", self.sessions):
+            await automation_admin.followup_self_test_send(
+                callback,
+                bot,
+                state=MemoryState(),
+            )
+
+        self.assertEqual(len(bot.sent), 1)
+        _, visible_text, kwargs = bot.sent[0]
+        self.assertEqual(visible_text, "Кинозал уже готов...")
+        markup = kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "ai_btn:guide_choice")
+        self.assertEqual(markup.inline_keyboard[0][1].url, "https://example.com")
+        self.assertEqual(markup.inline_keyboard[1][0].callback_data, "ai_btn:next")
+
     async def test_self_test_and_production_use_the_same_stage_evaluator(self):
         cases = (
             ("all", "", False, None),
-            ("all", "", True, None),
             ("selected", "completed", False, "completed"),
-            ("selected", "completed", True, None),
-            ("all_except", "completed", False, "completed"),
+            ("selected", "completed, [не задан]", True, None),
             ("all_except", "completed", True, None),
+            ("all_except", "completed, [не задан]", False, None),
+            ("all_except", "completed, [не задан]", False, "completed"),
         )
         for mode, values, include_unset, current_step in cases:
             await self._update_campaign(
@@ -675,6 +702,7 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         values = make_callback(f"followup_stage_mode_{self.campaign_id}_selected")
         with patch.object(automation_admin, "async_session_maker", self.sessions):
             await automation_admin.followup_stage_mode(values, state=state)
+        self.assertIn("[не задан]", values.message.edit_text.await_args.args[0])
         self.assertIn(f"followup_stage_edit_{self.campaign_id}", callback_data(
             values.message.edit_text.await_args.kwargs["reply_markup"]
         ))
@@ -1140,27 +1168,8 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         selected_text = selected_conditions.message.edit_text.await_args.args[0]
         selected_markup = selected_conditions.message.edit_text.await_args.kwargs["reply_markup"]
         self.assertIn("На выбранных этапах: completed, active", selected_text)
-        self.assertIn(
-            f"followup_stage_include_unset_{self.campaign_id}",
-            callback_data(selected_markup),
-        )
-        self.assertIn("☐ Также если этап не задан", button_texts(selected_markup))
-
-        toggle = make_callback(f"followup_stage_include_unset_{self.campaign_id}")
-        with patch.object(automation_admin, "async_session_maker", self.sessions):
-            await automation_admin.followup_stage_include_unset_toggle(toggle, state=state)
-        campaign = await self._campaign()
-        self.assertTrue(campaign.stage_include_unset)
-        toggle_text = toggle.message.edit_text.await_args.args[0]
-        self.assertIn("+ если этап не задан", toggle_text)
-        self.assertIn("✅ Также если этап не задан", button_texts(
-            toggle.message.edit_text.await_args.kwargs["reply_markup"]
-        ))
-
-        toggle_off = make_callback(f"followup_stage_include_unset_{self.campaign_id}")
-        with patch.object(automation_admin, "async_session_maker", self.sessions):
-            await automation_admin.followup_stage_include_unset_toggle(toggle_off, state=state)
-        self.assertFalse((await self._campaign()).stage_include_unset)
+        self.assertNotIn("Также если этап не задан", button_texts(selected_markup))
+        self.assertNotIn("followup_stage_include_unset", callback_data(selected_markup))
 
         await self._update_campaign(stage_include_unset=True)
         switch_all = make_callback(f"followup_stage_mode_{self.campaign_id}_all")
@@ -1213,7 +1222,7 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", campaign.stop_events)
         self.assertIsNone(await state.get_state())
 
-    async def test_unset_checkbox_is_available_for_each_primary_stage_mode(self):
+    async def test_stage_conditions_have_three_modes_without_unset_checkbox(self):
         for mode, values in (
             ("all", ""),
             ("selected", "completed"),
@@ -1229,23 +1238,18 @@ class FollowupAdminTests(unittest.IsolatedAsyncioTestCase):
                 await automation_admin.followup_conditions(conditions)
             markup = conditions.message.edit_text.await_args.kwargs["reply_markup"]
             unset_buttons = [text for text in button_texts(markup) if "Также если этап не задан" in text]
-            self.assertEqual(["☐ Также если этап не задан"], unset_buttons)
-
-            toggle = make_callback(f"followup_stage_include_unset_{self.campaign_id}")
-            with patch.object(automation_admin, "async_session_maker", self.sessions):
-                await automation_admin.followup_stage_include_unset_toggle(toggle)
-            campaign = await self._campaign()
-            self.assertTrue(campaign.stage_include_unset)
-            self.assertEqual(mode, campaign.stage_mode)
-
-            await self._update_campaign(stage_include_unset=False)
+            self.assertEqual([], unset_buttons)
+            self.assertNotIn(
+                f"followup_stage_include_unset_{self.campaign_id}",
+                callback_data(markup),
+            )
 
     async def test_legacy_not_set_mode_stays_supported_without_ui_choice(self):
         await self._update_campaign(stage_mode="not_set", stage_values="obsolete")
         conditions = make_callback(f"followup_conditions_{self.campaign_id}")
         with patch.object(automation_admin, "async_session_maker", self.sessions):
             await automation_admin.followup_conditions(conditions)
-        self.assertIn("Этап не задан", conditions.message.edit_text.await_args.args[0])
+        self.assertIn("На выбранных этапах: [не задан]", conditions.message.edit_text.await_args.args[0])
         self.assertNotIn(
             "Также если этап не задан",
             button_texts(conditions.message.edit_text.await_args.kwargs["reply_markup"]),

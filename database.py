@@ -936,7 +936,8 @@ async def init_db():
             sync_conn.execute(text(
                 "UPDATE followup_campaigns SET stage_mode = 'all_except_legacy' "
                 "WHERE LOWER(TRIM(COALESCE(stage_mode, ''))) = 'all_except' "
-                "AND COALESCE(stage_include_unset, FALSE) = FALSE"
+                "AND COALESCE(stage_include_unset, FALSE) = FALSE "
+                "AND COALESCE(stage_values, '') NOT LIKE '%[не задан]%'"
             ))
             sync_conn.execute(text(
                 "UPDATE followup_campaigns SET stop_events = '' WHERE stop_events IS NULL"

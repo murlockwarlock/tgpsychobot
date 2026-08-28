@@ -43,10 +43,10 @@ from followups import (
     FOLLOWUP_ATTEMPT_UNCERTAIN,
     FOLLOWUP_STAGE_MODE_LABELS,
     FOLLOWUP_STAGE_MODES,
+    UNSET_STAGE_TOKEN,
     _campaign_matches_scope,
+    _canonical_followup_stage_condition,
     _normalize_stage_mode,
-    _stage_include_unset,
-    _stage_mode_for_storage,
     check_campaign_eligibility,
     parse_followup_csv,
     send_followup_step,
@@ -1319,18 +1319,14 @@ def _campaign_name_value(raw_text: str | None) -> str | None:
 
 
 def _campaign_stage_text(item: FollowupCampaign) -> str:
-    raw_mode = (getattr(item, "stage_mode", None) or "all").strip().lower()
-    if raw_mode in {"not_set", "step_not_set"}:
-        return "Этап не задан"
-    mode = _normalize_stage_mode(raw_mode)
+    condition = _canonical_followup_stage_condition(item)
+    mode = condition.mode
     label = FOLLOWUP_STAGE_MODE_LABELS.get(mode, FOLLOWUP_STAGE_MODE_LABELS["all"])
     if mode in {"selected", "all_except"}:
-        values = parse_followup_csv(getattr(item, "stage_values", ""))
+        values = condition.values
         text = f"{html.escape(label)}: {html.escape(', '.join(values) or 'не заданы')}"
     else:
         text = html.escape(label)
-    if _stage_include_unset(item, mode=mode):
-        text += "\n+ если этап не задан"
     return text
 
 
@@ -1630,12 +1626,6 @@ async def _show_followup_conditions(
         return
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить этапы", callback_data=f"followup_stage_edit_{campaign_id}")
-    mode = _normalize_stage_mode((getattr(item, "stage_mode", None) or "all").strip().lower())
-    if mode in FOLLOWUP_STAGE_MODES:
-        builder.button(
-            text=f"{'✅' if _stage_include_unset(item, mode=mode) else '☐'} Также если этап не задан",
-            callback_data=f"followup_stage_include_unset_{campaign_id}",
-        )
     builder.button(text="✏️ Изменить метаданные", callback_data=f"followup_metadata_edit_{campaign_id}")
     if _campaign_has_metadata_condition(item):
         builder.button(text="🧹 Очистить метаданные", callback_data=f"followup_metadata_clear_{campaign_id}")
@@ -1660,26 +1650,6 @@ async def _show_followup_conditions(
 async def followup_conditions(callback: CallbackQuery, state: FSMContext | None = None):
     campaign_id = int(callback.data.rsplit("_", 1)[1])
     await _reset_followup_navigation(state)
-    await _show_followup_conditions(callback, campaign_id)
-
-
-@router.callback_query(F.data.regexp(r"^followup_stage_include_unset_(\d+)$"))
-async def followup_stage_include_unset_toggle(callback: CallbackQuery, state: FSMContext | None = None):
-    campaign_id = int(callback.data.rsplit("_", 1)[1])
-    await _reset_followup_navigation(state)
-    async with async_session_maker() as session:
-        item = await session.get(FollowupCampaign, campaign_id)
-        if item is None:
-            await _answer_callback(callback, "Цепочка не найдена.", show_alert=True)
-            return
-        mode = _normalize_stage_mode((getattr(item, "stage_mode", None) or "all").strip().lower())
-        if mode not in FOLLOWUP_STAGE_MODES:
-            await _answer_callback(callback, "Сначала выберите один из основных режимов этапов.", show_alert=True)
-            return
-        item.stage_include_unset = not _stage_include_unset(item, mode=mode)
-        item.stage_mode = _stage_mode_for_storage(mode, item.stage_include_unset)
-        await session.commit()
-    await _answer_callback(callback)
     await _show_followup_conditions(callback, campaign_id)
 
 
@@ -1709,32 +1679,18 @@ async def followup_stage_edit(callback: CallbackQuery, state: FSMContext | None 
         await state.update_data(followup_return_topic_id=return_topic_id)
 
 
-@router.callback_query(F.data.regexp(r"^followup_stage_mode_(\d+)_(all_except|all|selected|not_set)$"))
+@router.callback_query(F.data.regexp(r"^followup_stage_mode_(\d+)_(all_except|all|selected)$"))
 async def followup_stage_mode(callback: CallbackQuery, state: FSMContext):
-    match = re.match(r"^followup_stage_mode_(\d+)_(all_except|all|selected|not_set)$", callback.data)
-    campaign_id, requested_mode = int(match.group(1)), match.group(2)
-    mode = _normalize_stage_mode(requested_mode)
-    if requested_mode == "not_set":
-        async with async_session_maker() as session:
-            item = await session.get(FollowupCampaign, campaign_id)
-            if item is None:
-                return
-            item.stage_mode = requested_mode
-            item.stage_values = ""
-            item.stage_include_unset = False
-            await session.commit()
-        await _reset_followup_navigation(state)
-        await _show_followup_conditions(callback, campaign_id)
-        return
+    match = re.match(r"^followup_stage_mode_(\d+)_(all_except|all|selected)$", callback.data)
+    campaign_id, mode = int(match.group(1)), match.group(2)
     if mode == "all":
         async with async_session_maker() as session:
             item = await session.get(FollowupCampaign, campaign_id)
             if item is None:
                 return
-            include_unset = _stage_include_unset(item)
-            item.stage_mode = _stage_mode_for_storage(mode, include_unset)
+            item.stage_mode = mode
             item.stage_values = ""
-            item.stage_include_unset = include_unset
+            item.stage_include_unset = True
             await session.commit()
         await _reset_followup_navigation(state)
         await _show_followup_conditions(callback, campaign_id)
@@ -1745,18 +1701,19 @@ async def followup_stage_mode(callback: CallbackQuery, state: FSMContext):
         item = await session.get(FollowupCampaign, campaign_id)
         if item is None:
             return
-        include_unset = _stage_include_unset(item)
     return_topic_id = await _reset_followup_navigation(state)
     await state.set_state(AutomationAdminStates.followup_stage_values)
     await state.update_data(
         campaign_id=campaign_id,
         pending_stage_mode=mode,
-        pending_stage_include_unset=include_unset,
         followup_return_topic_id=return_topic_id,
     )
     await callback.message.edit_text(
         f"🪜 <b>{FOLLOWUP_STAGE_MODE_LABELS[mode]}</b>\n\n"
-        "Введите точные названия этапов через запятую. Регистр сохраняется.",
+        "Введите точные названия этапов через запятую. Регистр сохраняется.\n"
+        f"Для незаданного этапа используйте <code>{UNSET_STAGE_TOKEN}</code>.\n"
+        "Примеры: <code>guide_choice, [не задан]</code>; "
+        "<code>guide_choice, thinking, child_words, completed, [не задан]</code>.",
         reply_markup=InlineKeyboardBuilder().row(_back(f"followup_stage_edit_{campaign_id}")).as_markup(),
     )
 
@@ -1779,10 +1736,12 @@ async def followup_stage_values_received(message: Message, state: FSMContext):
             await state.clear()
             await message.answer("Цепочка не найдена.")
             return
-        include_unset = bool(data.get("pending_stage_include_unset", False))
-        item.stage_mode = _stage_mode_for_storage(mode, include_unset)
+        item.stage_mode = mode
         item.stage_values = ", ".join(values)
-        item.stage_include_unset = include_unset
+        if mode == "selected":
+            item.stage_include_unset = UNSET_STAGE_TOKEN in values
+        else:
+            item.stage_include_unset = UNSET_STAGE_TOKEN not in values
         await session.commit()
     return_topic_id = data.get("followup_return_topic_id")
     await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
