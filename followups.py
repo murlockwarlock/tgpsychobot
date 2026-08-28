@@ -27,7 +27,7 @@ from database import (
     async_session_maker,
 )
 from automation_events import condition_value_matches, resolve_condition_path
-from response_buttons import extract_response_buttons
+from response_buttons import ResponseButton, extract_response_buttons
 from user_metadata import extract_service_data, load_metadata
 
 
@@ -40,6 +40,7 @@ FOLLOWUP_STAGE_MODE_LABELS = {
     "all_except": "На всех этапах кроме",
 }
 FOLLOWUP_STAGE_MODES = tuple(FOLLOWUP_STAGE_MODE_LABELS)
+UNSET_STAGE_TOKEN = "[не задан]"
 FOLLOWUP_METADATA_OPERATOR_LABELS = {
     "equals": "=",
     "not_equals": "!=",
@@ -77,10 +78,18 @@ class FollowupEligibility:
 
 
 @dataclass(frozen=True)
+class FollowupStageCondition:
+    mode: str
+    values: tuple[str, ...]
+    unset_matches: bool
+
+
+@dataclass(frozen=True)
 class FollowupStepSendResult:
     text: str
     history_text: str
     telegram_message_id: int | None
+    response_button_rows: list[list[ResponseButton]] | None = None
 
 
 class FollowupPreparationError(Exception):
@@ -142,25 +151,60 @@ def _normalize_stage_mode(value: str | None) -> str:
     return _FOLLOWUP_STAGE_MODE_ALIASES.get(mode, mode)
 
 
-def _stage_include_unset(campaign: FollowupCampaign, *, mode: str | None = None) -> bool:
+def _canonical_followup_stage_condition(campaign: FollowupCampaign) -> FollowupStageCondition:
     raw_mode = str(getattr(campaign, "stage_mode", "all") or "all").strip().lower()
-    if raw_mode in _FOLLOWUP_LEGACY_STAGE_MODES:
-        return True
-    if raw_mode in {"all_explicit", "all_except_explicit"}:
-        return False
-    value = getattr(campaign, "stage_include_unset", None)
-    if value is not None:
-        return bool(value)
-    normalized_mode = _normalize_stage_mode(mode or raw_mode)
-    return normalized_mode in {"all", "all_except"}
+    mode = _normalize_stage_mode(raw_mode)
+    values = parse_followup_csv(getattr(campaign, "stage_values", ""))
+    real_values = tuple(value for value in values if value != UNSET_STAGE_TOKEN)
+
+    if raw_mode in _FOLLOWUP_LEGACY_UNSET_MODES:
+        return FollowupStageCondition("selected", (UNSET_STAGE_TOKEN,), True)
+    if raw_mode in {"all_stages", "all_legacy"}:
+        return FollowupStageCondition("all", (), True)
+    if raw_mode == "all_explicit":
+        return FollowupStageCondition("all", (), False)
+    if raw_mode == "all_except_legacy":
+        return FollowupStageCondition("all_except", real_values, True)
+    if raw_mode == "all_except_explicit":
+        return FollowupStageCondition(
+            "all_except",
+            real_values + (UNSET_STAGE_TOKEN,),
+            False,
+        )
+
+    if mode == "selected":
+        include_unset = UNSET_STAGE_TOKEN in values
+        if not include_unset:
+            legacy_value = getattr(campaign, "stage_include_unset", None)
+            include_unset = bool(legacy_value) if legacy_value is not None else False
+        effective_values = real_values + ((UNSET_STAGE_TOKEN,) if include_unset else ())
+        return FollowupStageCondition("selected", effective_values, include_unset)
+
+    if mode == "all_except":
+        if UNSET_STAGE_TOKEN in values:
+            include_unset = False
+        else:
+            legacy_value = getattr(campaign, "stage_include_unset", None)
+            include_unset = bool(legacy_value) if legacy_value is not None else True
+        effective_values = real_values + (() if include_unset else (UNSET_STAGE_TOKEN,))
+        return FollowupStageCondition("all_except", effective_values, include_unset)
+
+    if mode == "all":
+        return FollowupStageCondition("all", (), True)
+    return FollowupStageCondition(mode, real_values, False)
+
+
+def _stage_include_unset(campaign: FollowupCampaign, *, mode: str | None = None) -> bool:
+    del mode
+    return _canonical_followup_stage_condition(campaign).unset_matches
 
 
 def _stage_mode_for_storage(mode: str, include_unset: bool) -> str:
     if mode not in FOLLOWUP_STAGE_MODES:
         raise ValueError(f"Unknown follow-up stage mode: {mode}")
-    if include_unset or mode == "selected":
+    if mode == "selected":
         return mode
-    return f"{mode}_explicit"
+    return mode if include_unset else f"{mode}_explicit"
 
 
 def _normalize_current_step(value: str | None) -> str | None:
@@ -183,22 +227,16 @@ def evaluate_followup_eligibility(
     )
 
     normalized_step = _normalize_current_step(current_step)
-    raw_stage_mode = str(getattr(campaign, "stage_mode", "all") or "all").strip().lower()
-    stage_mode = _normalize_stage_mode(raw_stage_mode)
-    configured_steps = parse_followup_csv(getattr(campaign, "stage_values", ""))
+    stage_condition = _canonical_followup_stage_condition(campaign)
+    real_values = tuple(value for value in stage_condition.values if value != UNSET_STAGE_TOKEN)
     if normalized_step is None:
-        if raw_stage_mode in _FOLLOWUP_LEGACY_STAGE_MODES or raw_stage_mode in _FOLLOWUP_LEGACY_UNSET_MODES:
-            stage_matches = True
-        elif stage_mode in FOLLOWUP_STAGE_MODES:
-            stage_matches = _stage_include_unset(campaign, mode=stage_mode)
-        else:
-            stage_matches = False
-    elif stage_mode == "all":
+        stage_matches = stage_condition.unset_matches
+    elif stage_condition.mode == "all":
         stage_matches = True
-    elif stage_mode == "selected":
-        stage_matches = normalized_step in configured_steps
-    elif stage_mode == "all_except":
-        stage_matches = normalized_step not in configured_steps
+    elif stage_condition.mode == "selected":
+        stage_matches = normalized_step in real_values
+    elif stage_condition.mode == "all_except":
+        stage_matches = normalized_step not in real_values
     else:
         stage_matches = False
 
@@ -405,7 +443,10 @@ async def prepare_followup_step(
             raise FollowupStepExecutionError("Не удалось подготовить AI-догоняющее сообщение") from exc
 
     text = step.message_text.strip()
-    return FollowupStepSendResult(text, text, None)
+    visible_text, response_button_rows = extract_response_buttons(text)
+    if not response_button_rows:
+        return FollowupStepSendResult(text, text, None)
+    return FollowupStepSendResult(text, visible_text, None, response_button_rows)
 
 
 async def emit_followup_step(
@@ -421,7 +462,38 @@ async def emit_followup_step(
 
         await _send_generated_response(bot, user.id, send_result.text)
         return send_result
-    sent = await bot.send_message(user.id, send_result.text)
+    if not send_result.response_button_rows:
+        sent = await bot.send_message(user.id, send_result.text)
+        return FollowupStepSendResult(
+            send_result.text,
+            send_result.history_text,
+            getattr(sent, "message_id", None),
+        )
+
+    from handlers import (
+        _safe_send_html,
+        _telegram_response_buttons_markup,
+        markdown_to_html,
+        split_html_text,
+    )
+
+    reply_markup = _telegram_response_buttons_markup(send_result.response_button_rows)
+    visible_text = send_result.history_text or "Выберите действие:"
+    chunks = split_html_text(markdown_to_html(visible_text))
+    sent = None
+    for index, chunk in enumerate(chunks):
+        chunk_markup = reply_markup if index == len(chunks) - 1 else None
+
+        async def send_chunk(value, parse_mode, markup=chunk_markup):
+            nonlocal sent
+            sent = await bot.send_message(
+                chat_id=user.id,
+                text=value,
+                parse_mode=parse_mode,
+                reply_markup=markup,
+            )
+
+        await _safe_send_html(send_chunk, chunk)
     return FollowupStepSendResult(
         send_result.text,
         send_result.history_text,
