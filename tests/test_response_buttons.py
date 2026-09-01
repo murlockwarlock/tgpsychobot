@@ -48,11 +48,112 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertEqual(text, source)
         self.assertEqual(rows, [])
 
-    def test_requires_pipe_between_buttons_in_same_row(self):
-        source = "[Да](btn:yes) [Нет](btn:no)"
+    def test_denis_mixed_layout_creates_rows_from_whitespace(self):
+        source = (
+            "[Спереди](btn:front_shoulder) | [Сбоку](btn:side_shoulder) "
+            "[Одинаково](btn:both_shoulder)"
+        )
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [[button.text for button in row] for row in rows],
+            [["Спереди", "Сбоку"], ["Одинаково"]],
+        )
+
+    def test_common_plain_word_phrase_remains_visible(self):
+        source = "хорошо понятно"
         text, rows = extract_response_buttons(source)
         self.assertEqual(text, source)
         self.assertEqual(rows, [])
+
+    def test_multiword_text_with_common_button_words_remains_visible(self):
+        source = "Это хорошо понятно и готово к следующему вопросу."
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_single_plain_shorthand_still_works(self):
+        text, rows = extract_response_buttons("готово")
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for button in rows[0]],
+            [("готово", "action", "готово")],
+        )
+
+    def test_single_space_between_buttons_creates_next_row(self):
+        text, rows = extract_response_buttons("[Да](btn:yes) [Нет](btn:no)")
+        self.assertEqual(text, "")
+        self.assertEqual([[button.text for button in row] for row in rows], [["Да"], ["Нет"]])
+
+    def test_multiple_spaces_between_buttons_create_next_row(self):
+        text, rows = extract_response_buttons("[Да](btn:yes)    [Нет](btn:no)")
+        self.assertEqual(text, "")
+        self.assertEqual([[button.text for button in row] for row in rows], [["Да"], ["Нет"]])
+
+    def test_pipe_between_buttons_keeps_same_row(self):
+        text, rows = extract_response_buttons("[Да](btn:yes) | [Нет](btn:no)")
+        self.assertEqual(text, "")
+        self.assertEqual([[button.text for button in row] for row in rows], [["Да", "Нет"]])
+
+    def test_mixed_whitespace_and_pipe_layout_keeps_canonical_rows(self):
+        text, rows = extract_response_buttons("[A](btn:a) [B](btn:b) | [C](btn:c)")
+        self.assertEqual(text, "")
+        self.assertEqual([[button.text for button in row] for row in rows], [["A"], ["B", "C"]])
+
+    def test_spaces_inside_labels_and_actions_are_preserved(self):
+        source = "[Первый вариант](btn:first choice) | [Второй вариант](btn:second choice)"
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [(button.text, button.value) for button in rows[0]],
+            [("Первый вариант", "first choice"), ("Второй вариант", "second choice")],
+        )
+
+    def test_url_buttons_support_whitespace_row_separators(self):
+        source = (
+            "[Документ](https://example.com/path_(version)) "
+            "[Сайт](https://example.org)"
+        )
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for button in rows[0]],
+            [("Документ", "url", "https://example.com/path_(version)")],
+        )
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for button in rows[1]],
+            [("Сайт", "url", "https://example.org")],
+        )
+
+    def test_malformed_button_line_is_kept_without_partial_extraction(self):
+        source = "[Да](btn:yes) [Сломано](btn:) [Нет](btn:no)"
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_plain_and_bracket_buttons_remain_compatible(self):
+        text, rows = extract_response_buttons("[Дальше] | готово")
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for button in rows[0]],
+            [("Дальше", "action", "Дальше"), ("готово", "action", "готово")],
+        )
+
+    def test_button_row_and_total_row_limits_are_preserved(self):
+        too_many_buttons = " | ".join(f"[{index}](btn:button_{index})" for index in range(9))
+        text, rows = extract_response_buttons(too_many_buttons)
+        self.assertEqual(text, too_many_buttons)
+        self.assertEqual(rows, [])
+
+        too_many_inline_rows = " ".join(f"[{index}](btn:button_{index})" for index in range(21))
+        text, rows = extract_response_buttons(too_many_inline_rows)
+        self.assertEqual(text, too_many_inline_rows)
+        self.assertEqual(rows, [])
+
+        too_many_lines = "\n".join(f"[{index}](btn:button_{index})" for index in range(21))
+        text, rows = extract_response_buttons(too_many_lines)
+        self.assertEqual(text, "[20](btn:button_20)")
+        self.assertEqual(len(rows), 20)
 
     def test_accepts_valid_url_with_parentheses(self):
         source = "[Документ](https://example.com/path_(version))"
