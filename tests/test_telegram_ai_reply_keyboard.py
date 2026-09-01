@@ -135,6 +135,22 @@ def test_all_ai_response_buttons_are_inline_and_keep_rows_and_urls():
     assert buttons[5].callback_data == "ai_btn:main_menu"
 
 
+def test_generated_response_buttons_use_whitespace_for_next_rows():
+    _, rows = extract_response_buttons(
+        "[A](btn:a) [B](btn:b) | [Сайт](https://example.com)"
+    )
+
+    markup = handlers._telegram_response_buttons_markup(rows)
+
+    assert [[button.text for button in row] for row in markup.inline_keyboard] == [
+        ["A"],
+        ["B", "Сайт"],
+    ]
+    assert markup.inline_keyboard[0][0].callback_data == "ai_btn:a"
+    assert markup.inline_keyboard[1][0].callback_data == "ai_btn:b"
+    assert markup.inline_keyboard[1][1].url == "https://example.com"
+
+
 @pytest.mark.asyncio
 async def test_generated_response_uses_one_inline_markup_and_does_not_touch_legacy_rows(pending_store):
     _, sessions = pending_store

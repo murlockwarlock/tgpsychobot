@@ -94,46 +94,135 @@ COMMON_PLAIN_BUTTON_WORDS = frozenset({
 })
 
 
-def _parse_button_row(line: str) -> list[ResponseButton] | None:
-    cleaned_line = _clean_part(line)
-    parts = cleaned_line.split("|")
-    if not parts or len(parts) > MAX_BUTTONS_PER_ROW:
+def _button_from_target(text: str, target: str) -> ResponseButton | None:
+    cleaned_target = target.strip()
+    if not cleaned_target or "|" in cleaned_target:
+        return None
+    if cleaned_target.lower().startswith("btn:"):
+        action = cleaned_target[4:]
+        if not _is_valid_action(action):
+            return None
+        return ResponseButton(text=text, kind="action", value=action)
+
+    try:
+        parsed_url = urlsplit(cleaned_target)
+    except ValueError:
+        return None
+    if (
+        parsed_url.scheme.lower() not in {"http", "https"}
+        or not parsed_url.netloc
+        or any(char.isspace() for char in cleaned_target)
+    ):
+        return None
+    return ResponseButton(text=text, kind="url", value=cleaned_target)
+
+
+def _parse_button_part(part: str) -> ResponseButton | None:
+    cleaned_part = _clean_part(part)
+    if not cleaned_part or "|" in cleaned_part:
         return None
 
-    row: list[ResponseButton] = []
-    for part in parts:
-        cleaned_part = _clean_part(part)
-        match = BUTTON_RE.fullmatch(cleaned_part)
-        if match:
-            text = _clean_part(match.group(1))
-            target = match.group(2).strip()
-            if not text:
-                return None
-            if target.lower().startswith("btn:"):
-                action = target[4:]
-                if not _is_valid_action(action):
-                    return None
-                row.append(ResponseButton(text=text, kind="action", value=action))
-            else:
-                parsed_url = urlsplit(target)
-                if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.netloc or any(char.isspace() for char in target):
-                    return None
-                row.append(ResponseButton(text=text, kind="url", value=target))
-        else:
-            bracket_match = re.fullmatch(r"\[([^\]\n]{1,64})\]", cleaned_part)
-            if bracket_match:
-                b_text = _clean_part(bracket_match.group(1))
-                if b_text and _is_valid_action(b_text):
-                    row.append(ResponseButton(text=b_text, kind="action", value=b_text))
-                    continue
-
-            word = cleaned_part.strip()
-            if word.lower() in COMMON_PLAIN_BUTTON_WORDS and _is_valid_action(word):
-                row.append(ResponseButton(text=word, kind="action", value=word))
-                continue
-
+    match = BUTTON_RE.fullmatch(cleaned_part)
+    if match:
+        text = _clean_part(match.group(1))
+        if not text:
             return None
-    return row
+        return _button_from_target(text, match.group(2))
+
+    bracket_match = re.fullmatch(r"\[([^\]\n]{1,64})\]", cleaned_part)
+    if bracket_match:
+        text = _clean_part(bracket_match.group(1))
+        if text and _is_valid_action(text):
+            return ResponseButton(text=text, kind="action", value=text)
+        return None
+
+    word = cleaned_part.strip()
+    if word.lower() in COMMON_PLAIN_BUTTON_WORDS and _is_valid_action(word):
+        return ResponseButton(text=word, kind="action", value=word)
+    return None
+
+
+def _split_button_line(line: str) -> tuple[list[str], list[str]]:
+    parts: list[str] = []
+    separators: list[str] = []
+    part_start = 0
+    position = 0
+    in_label = False
+    target_depth = 0
+    while position < len(line):
+        char = line[position]
+        if in_label:
+            if char == "]":
+                in_label = False
+            position += 1
+            continue
+        if target_depth:
+            if char == "(":
+                target_depth += 1
+            elif char == ")":
+                target_depth -= 1
+            position += 1
+            continue
+        if char == "[":
+            in_label = True
+            position += 1
+            continue
+        if char == "(":
+            target_depth = 1
+            position += 1
+            continue
+        if char.isspace():
+            separator_start = position
+            while position < len(line) and line[position].isspace():
+                position += 1
+            if position == len(line):
+                break
+            if line[position] == "|":
+                parts.append(line[part_start:separator_start])
+                separators.append("|")
+                position += 1
+                while position < len(line) and line[position].isspace():
+                    position += 1
+                part_start = position
+            else:
+                parts.append(line[part_start:separator_start])
+                separators.append(" ")
+                part_start = position
+            continue
+        if char == "|":
+            parts.append(line[part_start:position])
+            separators.append("|")
+            position += 1
+            while position < len(line) and line[position].isspace():
+                position += 1
+            part_start = position
+            continue
+        position += 1
+    parts.append(line[part_start:])
+    return parts, separators
+
+
+def _parse_button_row(line: str) -> list[list[ResponseButton]] | None:
+    cleaned_line = _clean_part(line)
+    if not cleaned_line:
+        return None
+
+    parts, separators = _split_button_line(cleaned_line)
+    if len(parts) != len(separators) + 1:
+        return None
+    rows: list[list[ResponseButton]] = [[]]
+    for index, part in enumerate(parts):
+        button = _parse_button_part(part)
+        if button is None:
+            return None
+        rows[-1].append(button)
+        if len(rows[-1]) > MAX_BUTTONS_PER_ROW:
+            return None
+        if index < len(separators) and separators[index] == " ":
+            if len(rows) >= MAX_BUTTON_ROWS:
+                return None
+            rows.append([])
+    return rows
 
 
 def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseButton]]]:
@@ -145,8 +234,8 @@ def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseB
     rows: list[list[ResponseButton]] = []
     for line in source.splitlines():
         parsed = _parse_button_row(line) if len(rows) < MAX_BUTTON_ROWS else None
-        if parsed:
-            rows.append(parsed)
+        if parsed and len(rows) + len(parsed) <= MAX_BUTTON_ROWS:
+            rows.extend(parsed)
         else:
             clean_lines.append(line)
 

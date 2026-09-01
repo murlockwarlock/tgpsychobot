@@ -23,7 +23,7 @@ with patch.object(sqlalchemy_asyncio, "create_async_engine", _sqlite_compatible_
     from max_messenger_bot.services.admin import _build_stats_text
     from max_messenger_bot.services.common import _notify_referrer_about_registration, _send_ai_text
     from memory_mode import MEMORY_MODE_TOPIC
-    from response_buttons import ResponseButton
+    from response_buttons import ResponseButton, extract_response_buttons
 
 
 class MaxHistoryScopeTests(unittest.TestCase):
@@ -98,6 +98,23 @@ class MaxChunkedResponseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0][0]["type"], "link")
         self.assertEqual(rows[0][0]["url"], "https://youtube.com/watch?v=1")
         self.assertEqual(rows[0][1]["payload"], "ai_btn:yes")
+
+    async def test_generated_buttons_from_parser_keep_whitespace_rows(self):
+        client = SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock())
+        _, buttons = extract_response_buttons(
+            "[A](btn:a) [B](btn:b) | [Сайт](https://example.com)"
+        )
+
+        await _send_ai_text(client, 123, "thinking-id", ["answer"], buttons)
+
+        attachment = client.edit_message.await_args.kwargs["attachments"][0]
+        rows = attachment["payload"]["buttons"]
+        self.assertEqual(
+            [[button["text"] for button in row] for row in rows[:-1]],
+            [["A"], ["B", "Сайт"]],
+        )
+        self.assertEqual(rows[1][1]["type"], "link")
+        self.assertEqual(rows[1][1]["url"], "https://example.com")
 
 
 class MaxReferralNotificationTests(unittest.IsolatedAsyncioTestCase):
