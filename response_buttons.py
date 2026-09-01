@@ -210,6 +210,15 @@ def _parse_button_row(line: str) -> list[list[ResponseButton]] | None:
     parts, separators = _split_button_line(cleaned_line)
     if len(parts) != len(separators) + 1:
         return None
+    if any(
+        separators[index] == " "
+        and (
+            not _clean_part(parts[index]).startswith("[")
+            or not _clean_part(parts[index + 1]).startswith("[")
+        )
+        for index in range(len(separators))
+    ):
+        return None
     rows: list[list[ResponseButton]] = [[]]
     for index, part in enumerate(parts):
         button = _parse_button_part(part)

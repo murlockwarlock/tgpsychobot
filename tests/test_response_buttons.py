@@ -60,6 +60,26 @@ class ResponseButtonsTests(unittest.TestCase):
             [["Спереди", "Сбоку"], ["Одинаково"]],
         )
 
+    def test_common_plain_word_phrase_remains_visible(self):
+        source = "хорошо понятно"
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_multiword_text_with_common_button_words_remains_visible(self):
+        source = "Это хорошо понятно и готово к следующему вопросу."
+        text, rows = extract_response_buttons(source)
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_single_plain_shorthand_still_works(self):
+        text, rows = extract_response_buttons("готово")
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for button in rows[0]],
+            [("готово", "action", "готово")],
+        )
+
     def test_single_space_between_buttons_creates_next_row(self):
         text, rows = extract_response_buttons("[Да](btn:yes) [Нет](btn:no)")
         self.assertEqual(text, "")
