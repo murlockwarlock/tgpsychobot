@@ -274,7 +274,11 @@ async def test_stale_legacy_rows_do_not_intercept_ordinary_typed_text(pending_st
     message = _ReplyMessage("обычный пользовательский текст", message_id=701)
     state = SimpleNamespace()
     bot = SimpleNamespace()
-    process = AsyncMock()
+    async def fake_process(user_id, *args, **kwargs):
+        assert handlers.user_message_buffers.get(user_id) == ["обычный пользовательский текст"]
+        handlers.user_message_buffers.pop(user_id, None)
+
+    process = AsyncMock(side_effect=fake_process)
     monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
     monkeypatch.setattr(handlers, "_sync_user_birthdate_from_telegram", AsyncMock())
     monkeypatch.setattr(handlers, "_request_profile_onboarding_if_needed", AsyncMock(return_value=False))
@@ -284,7 +288,7 @@ async def test_stale_legacy_rows_do_not_intercept_ordinary_typed_text(pending_st
     await handlers.user_processing_tasks[42]
 
     process.assert_awaited_once_with(42, bot, state)
-    assert handlers.user_message_buffers[42] == ["обычный пользовательский текст"]
+    assert 42 not in handlers.user_message_buffers
     async with sessions() as session:
         pending = await session.get(TelegramPendingAIReply, 42)
     assert json.loads(pending.mapping_json) == {"Старая кнопка": "old_action"}

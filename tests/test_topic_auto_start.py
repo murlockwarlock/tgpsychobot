@@ -276,6 +276,84 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ai_prompts), 2)
         self.assertEqual(ai_prompts[1], "Вопрос после завершения раннера")
 
+    async def test_telegram_drain_race_identical_message_during_provider_call(self):
+        """Ordinary user sends 'да' -> provider starts & blocks -> user sends identical 'да' -> second message is automatically processed."""
+        async with self.session_factory() as session:
+            user = User(id=115, first_name="Echo", name="Echo", gender="male", age="27", accepted_disclaimer=True, current_dialogue_id=1, current_topic_id=None)
+            session.add(user)
+            await session.commit()
+
+        bot = self._make_mock_bot()
+        state = MagicMock()
+        state.get_data = AsyncMock(return_value={})
+        state.set_state = AsyncMock()
+        state.clear = AsyncMock()
+
+        ai_prompts = []
+        turn1_started = asyncio.Event()
+        turn1_proceed = asyncio.Event()
+
+        async def fake_generate_response(user_id, prompt, *args, **kwargs):
+            ai_prompts.append(prompt)
+            if len(ai_prompts) == 1:
+                turn1_started.set()
+                await turn1_proceed.wait()
+            return f"Ответ {len(ai_prompts)}"
+
+        with patch("handlers.ai_integration.generate_response", side_effect=fake_generate_response):
+            # 1. Ordinary Telegram user sends "да"
+            msg1 = MagicMock()
+            msg1.from_user = SimpleNamespace(id=115, username="echo", full_name="Echo")
+            msg1.chat = SimpleNamespace(id=115)
+            msg1.text = "да"
+            await handlers.handle_ai_chat(msg1, state, bot)
+
+            # 2. Provider call starts and blocks AFTER first buffer has been popped
+            await turn1_started.wait()
+
+            # Verify buffer 1 was popped
+            self.assertNotIn(115, handlers.user_message_buffers)
+
+            # 3. While provider is blocked, same user sends EXACT SAME text "да"
+            msg2 = MagicMock()
+            msg2.from_user = SimpleNamespace(id=115, username="echo", full_name="Echo")
+            msg2.chat = SimpleNamespace(id=115)
+            msg2.text = "да"
+            await handlers.handle_ai_chat(msg2, state, bot)
+
+            # Verify new buffer contains ["да"]
+            self.assertEqual(handlers.user_message_buffers.get(115), ["да"])
+
+            # 4. Release first provider call
+            turn1_proceed.set()
+
+            # 5. Wait for all background runner processing to finish
+            while handlers._has_user_turn_work(115) or (115 in handlers.user_processing_tasks and not handlers.user_processing_tasks[115].done()):
+                task = handlers.user_processing_tasks.get(115)
+                if task:
+                    await task
+                await asyncio.sleep(0.01)
+
+        # Assert: Exactly 2 AI turns with identical text "да"
+        self.assertEqual(ai_prompts, ["да", "да"])
+
+        # Expected DB order: user "да", assistant "Ответ 1", user "да", assistant "Ответ 2"
+        async with self.session_factory() as session:
+            msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 115).order_by(DBMessage.id.asc()))).scalars().all()
+            self.assertEqual(len(msgs), 4)
+            self.assertEqual(msgs[0].role, "user")
+            self.assertEqual(msgs[0].content, "да")
+            self.assertEqual(msgs[1].role, "assistant")
+            self.assertEqual(msgs[1].content, "Ответ 1")
+            self.assertEqual(msgs[2].role, "user")
+            self.assertEqual(msgs[2].content, "да")
+            self.assertEqual(msgs[3].role, "assistant")
+            self.assertEqual(msgs[3].content, "Ответ 2")
+
+        # Assert no pending buffers and no active runner tasks
+        self.assertNotIn(115, handlers.user_message_buffers)
+        self.assertNotIn(115, handlers.user_processing_tasks)
+
     async def test_telegram_stale_pending_topic_after_topic_switch(self):
         """TG: User selects Topic B -> disclaimer pending -> user switches to Topic C -> accept disclaimer does NOT start Topic B."""
         async with self.session_factory() as session:

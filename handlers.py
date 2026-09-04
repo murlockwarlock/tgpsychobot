@@ -2144,7 +2144,6 @@ def _schedule_telegram_drain_runner_locked(
     async def drain_runner():
         if initial_delay > 0:
             await asyncio.sleep(initial_delay)
-        unpopped_buf_snapshot = None
         try:
             while True:
                 work_item = None
@@ -2169,8 +2168,6 @@ def _schedule_telegram_drain_runner_locked(
                         visible_user_text=None,
                     )
                 else:
-                    cur_buf = user_message_buffers.get(user_id)
-                    unpopped_buf_snapshot = list(cur_buf) if cur_buf is not None else None
                     await process_buffered_messages(
                         user_id,
                         bot,
@@ -2187,7 +2184,7 @@ def _schedule_telegram_drain_runner_locked(
                     user_processing_tasks.pop(user_id, None)
                 has_isolated = bool(user_isolated_turn_queues.get(user_id) and len(user_isolated_turn_queues[user_id]) > 0)
                 cur_buf = user_message_buffers.get(user_id)
-                has_new_buffer = bool(cur_buf and (unpopped_buf_snapshot is None or cur_buf != unpopped_buf_snapshot))
+                has_new_buffer = bool(cur_buf and len(cur_buf) > 0)
                 if has_isolated or has_new_buffer:
                     active_task = user_processing_tasks.get(user_id)
                     if not active_task or active_task.done():
