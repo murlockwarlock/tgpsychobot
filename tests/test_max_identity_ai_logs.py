@@ -675,3 +675,75 @@ async def test_max_chat_response_with_general_kb_retrieves_chunks(monkeypatch):
 
     assert result == "Ответ общий КБ"
     mock_search.assert_awaited_once_with("вопрос", n_results=3, document_ids=[201])
+
+
+@pytest.mark.asyncio
+async def test_max_chat_response_loads_prompt_from_file(monkeypatch, tmp_path):
+    user = _max_user()
+    config = _max_config()
+    config.prompt_mode = "file"
+    config.prompt_filename = "test_aurika_prompt.txt"
+    config.system_prompt = "Неправильный stub промпт"
+
+    # Create temporary prompt file in system_prompts
+    prompts_dir = tmp_path / "system_prompts"
+    prompts_dir.mkdir()
+    prompt_file = prompts_dir / "test_aurika_prompt.txt"
+    prompt_file.write_text("Ты — Аурика, трансформационный практик.", encoding="utf-8")
+
+    session = _MaxAISession(user, config)
+    captured_layout = []
+
+    async def _mock_dispatch(cfg, layout, **kwargs):
+        captured_layout.append(layout)
+        return "Ответ Аурики"
+
+    monkeypatch.setattr(max_ai, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(max_ai, "_dispatch_provider", _mock_dispatch)
+
+    result = await max_ai.get_ai_response(user.id, "привет")
+
+    assert result == "Ответ Аурики"
+    assert len(captured_layout) == 1
+    assert "Ты — Аурика, трансформационный практик." in captured_layout[0].stable_system_prompt
+    assert "Неправильный stub промпт" not in captured_layout[0].stable_system_prompt
+
+
+@pytest.mark.asyncio
+async def test_max_chat_response_with_history_topic_relationship(monkeypatch):
+    user = _max_user()
+    session = _MaxAISession(user, _max_config())
+    topic = SimpleNamespace(id=10, name="Энергетика")
+    msg1 = SimpleNamespace(
+        id=1,
+        role="user",
+        content="прошлый вопрос",
+        topic_id=10,
+        topic=topic,
+        timestamp=datetime(2026, 8, 28, 10, 0),
+    )
+    msg2 = SimpleNamespace(
+        id=2,
+        role="assistant",
+        content="прошлый ответ",
+        topic_id=10,
+        topic=topic,
+        timestamp=datetime(2026, 8, 28, 10, 1),
+    )
+
+    async def _execute_history(stmt):
+        sql = str(stmt)
+        if "messages" in sql.lower():
+            return _Result(rows=[msg1, msg2])
+        return _Result(rows=[])
+
+    session.execute = _execute_history
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="Ответ с историей"))
+
+    result = await max_ai.get_ai_response(user.id, "новый вопрос")
+
+    assert result == "Ответ с историей"

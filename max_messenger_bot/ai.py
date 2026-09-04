@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+from pathlib import Path
 import tempfile
 import time
 import uuid
@@ -130,9 +131,32 @@ def _build_max_history_scope(
     )
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_configured_system_prompt(ai_config: AIConfig, topic_prompt_text: str | None) -> str:
+    system_prompt_text = topic_prompt_text
+
+    if not system_prompt_text:
+        if getattr(ai_config, "prompt_mode", "text") == "file" and getattr(ai_config, "prompt_filename", None):
+            try:
+                file_path = PROJECT_ROOT / "system_prompts" / ai_config.prompt_filename
+                with open(file_path, "r", encoding="utf-8") as f:
+                    system_prompt_text = f.read()
+            except Exception:
+                system_prompt_text = ai_config.system_prompt
+        else:
+            system_prompt_text = ai_config.system_prompt
+
+    return system_prompt_text or ""
+
+
 def _build_user_system_prompt(user: User, ai_config: AIConfig, topic: Topic | None | object = _CURRENT_AI_CONTEXT) -> str:
     active_topic = user.current_topic if topic is _CURRENT_AI_CONTEXT else topic
-    system_prompt = active_topic.system_prompt if active_topic and active_topic.system_prompt else ai_config.system_prompt
+    system_prompt = _load_configured_system_prompt(
+        ai_config,
+        active_topic.system_prompt if active_topic and active_topic.system_prompt else None,
+    )
     if not system_prompt:
         system_prompt = "Ты полезный ИИ-помощник."
     return neutralize_stable_prompt(system_prompt)
@@ -895,6 +919,7 @@ async def get_ai_response(
         history_rows = (
             await session.execute(
                 select(DBMessage)
+                .options(selectinload(DBMessage.topic))
                 .where(history_scope, ai_history_role_filter(DBMessage))
                 .order_by(DBMessage.timestamp.asc())
             )
@@ -1318,6 +1343,7 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         history_rows = (
             await session.execute(
                 select(DBMessage)
+                .options(selectinload(DBMessage.topic))
                 .where(history_scope, ai_history_role_filter(DBMessage))
                 .order_by(DBMessage.timestamp.asc())
             )
