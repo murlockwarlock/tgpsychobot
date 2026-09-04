@@ -12,6 +12,7 @@ from ..storage import MaxContentMedia, StateStore
 
 SYSTEM_TITLES = {
     "start_message": "Приветствие (/start)",
+    "menu": "Меню",
     "disclaimer": "Дисклеймер",
     "test_intro": "Вступление теста",
     "test_results": "Результаты теста",
@@ -105,6 +106,26 @@ async def show_content_editor(
         from urllib.parse import quote
         link_line = f"<b>Ссылка:</b> <code>https://max.ru/{quote(client.bot_name)}?start={content_key}</code>\n"
 
+    button_help = (
+        "<b>💡 Справка по кнопкам в тексте:</b>\n"
+        "• <code>[Название](https://...)</code> — ссылка\n"
+        "• <code>[Меню](btn:svc:menu)</code> — открыть Меню\n"
+        "• <code>[Выбрать тему](btn:svc:topics)</code> — список тем\n"
+        "• <code>[Тема](btn:svc:topic:1)</code> — переключить тему\n"
+        "• <code>[Подписка](btn:svc:subscription)</code> — подписка\n"
+        "• <code>[Рефералы](btn:svc:referral)</code> — реферальная программа\n"
+        "• <code>[Настройки](btn:svc:settings)</code> — настройки\n"
+        "• <code>[В начало](btn:svc:start)</code> — начальный экран\n"
+        "• <code>[Новый диалог](btn:svc:reset)</code> — сбросить диалог\n"
+        "• <code>[Начать диалог](btn:svc:continue)</code> — начать/продолжить\n"
+        "• <code>[Раздел](btn:svc:content:about_me)</code> — раздел контента\n\n"
+        "<b>Расположение:</b>\n"
+        "• <code>|</code> между кнопками = в один ряд\n"
+        "• Пробел(ы) между кнопками = следующий ряд\n"
+        "• Перенос строки = следующий ряд\n"
+        "Пример: <code>[Спереди](btn:front) | [Сбоку](btn:side) [Одинаково](btn:both)</code>"
+    )
+
     message = (
         f"📝 <b>{html.escape(title)}</b>\n\n"
         f"<b>Ключ:</b> <code>{content_key}</code>\n"
@@ -113,7 +134,8 @@ async def show_content_editor(
         f"<b>Порядок:</b> {order_desc}\n\n"
         f"<b>Текущие медиафайлы:</b>\n{media_display}\n\n"
         f"<b>Предпросмотр:</b>\n{rendered_display}\n\n"
-        f"<b>Исходник:</b>\n<pre><code>{source_display}</code></pre>\n"
+        f"<b>Исходник:</b>\n<pre><code>{source_display}</code></pre>\n\n"
+        f"{button_help}\n\n"
         f"Поддерживается HTML-разметка: <b>жирный</b>, <i>курсив</i>, <u>подчёркнутый</u>.\n\n"
         f"Отправьте новый текст (сохранится форматирование) или прикрепите фото/видео, чтобы добавить медиа. "
         f"Используйте кнопки ниже для настроек."

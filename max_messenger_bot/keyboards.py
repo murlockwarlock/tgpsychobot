@@ -45,7 +45,7 @@ def response_buttons_keyboard(
     return inline_keyboard(converted_rows) if converted_rows else []
 
 
-def main_menu_row(text: str = "⬅️ В главное меню") -> list[dict]:
+def main_menu_row(text: str = "⬅️ В меню") -> list[dict]:
     return [callback_button(text, "main_menu")]
 
 
@@ -118,10 +118,8 @@ def admin_panel_keyboard() -> list[dict]:
             [callback_button("🧩 Тест", "admin_test_menu"), callback_button("🤖 ИИ", "admin_ai_settings")],
             [callback_button("⭐️ Подписки", "admin_subscriptions"), callback_button("💬 Темы", "admin_topics")],
             [callback_button("📚 База знаний", "admin_kb"), callback_button("✏️ Контент", "admin_content")],
-            [callback_button("🎛️ Кнопки меню", "admin_manage_buttons"), callback_button("👮 Админы", "admin_manage_admins")],
-            [callback_button("👫 Рефералы", "admin_referral_menu")],
-            [callback_button("✉️ Рассылки", "admin_mailing_menu")],
-            [callback_button("🎨 Коллекции", "admin_collections_page_0")],
+            [callback_button("👮 Админы", "admin_manage_admins"), callback_button("👫 Рефералы", "admin_referral_menu")],
+            [callback_button("✉️ Рассылки", "admin_mailing_menu"), callback_button("🎨 Коллекции", "admin_collections_page_0")],
         ]
     )
 

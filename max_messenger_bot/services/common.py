@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 import tempfile
@@ -12,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from ..ai import AIServiceError, generate_image, get_ai_response, edit_image
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
-from ..keyboards import build_main_menu, disclaimer_keyboard, inline_keyboard, main_menu_row, response_buttons_keyboard
+from ..keyboards import build_main_menu, callback_button, disclaimer_keyboard, inline_keyboard, link_button, main_menu_row, response_buttons_keyboard
 from ..logging_utils import get_bot_logger
 from ..legacy import (
     AIConfig,
@@ -221,9 +222,117 @@ async def get_content_attachments(content_key: str) -> list[dict]:
     return attachments
 
 
+def compose_max_keyboard(
+    parsed_rows: list[list[ResponseButton]],
+    *,
+    is_start: bool = False,
+    is_menu: bool = False,
+) -> list[dict] | None:
+    keyboard_rows: list[list[dict]] = []
+    for row in parsed_rows:
+        converted_row: list[dict] = []
+        for btn in row:
+            if btn.kind == "url":
+                converted_row.append(link_button(btn.text, btn.value))
+            else:
+                converted_row.append(callback_button(btn.text, f"ai_btn:{btn.value}"))
+        if converted_row:
+            keyboard_rows.append(converted_row)
+    if not is_start and not is_menu:
+        keyboard_rows.append(main_menu_row("⬅️ В меню"))
+    return inline_keyboard(keyboard_rows) if keyboard_rows else None
+
+
+async def render_static_content(
+    client: MaxApiClient,
+    chat_id: int,
+    user_id: int,
+    content_key: str,
+    *,
+    is_start: bool = False,
+    is_menu: bool = False,
+) -> bool:
+    content = await get_content(content_key)
+    if not content:
+        if is_menu:
+            await client.send_message(chat_id=chat_id, text="Раздел меню пока не настроен.")
+            return True
+        if is_start:
+            await client.send_message(chat_id=chat_id, text="Здравствуйте. Бот в MAX готов к работе.")
+            return True
+        return False
+
+    if not is_menu and not is_start and not content.is_visible:
+        return False
+
+    from ..formatting import translate_telegram_links_to_max
+
+    raw_text = content.text_content or ""
+    clean_text, parsed_rows = extract_response_buttons(raw_text)
+    formatted_text = translate_telegram_links_to_max(clean_text) if clean_text else ""
+    media_attachments = await get_content_attachments(content_key)
+    kb_attachment = compose_max_keyboard(parsed_rows, is_start=is_start, is_menu=is_menu)
+    order = content.content_order or "media_top"
+
+    if is_menu and not formatted_text and not media_attachments and not parsed_rows:
+        formatted_text = "Раздел меню пока не настроен."
+
+    if media_attachments and order == "media_top":
+        if formatted_text or kb_attachment:
+            await client.send_message(
+                chat_id=chat_id,
+                text="",
+                attachments=media_attachments,
+            )
+            await asyncio.sleep(0.2)
+            await client.send_message(
+                chat_id=chat_id,
+                text=formatted_text,
+                attachments=kb_attachment,
+            )
+        else:
+            await client.send_message(
+                chat_id=chat_id,
+                text="",
+                attachments=media_attachments + (kb_attachment or []),
+            )
+    elif media_attachments and order == "text_top":
+        if formatted_text or kb_attachment:
+            await client.send_message(
+                chat_id=chat_id,
+                text=formatted_text,
+                attachments=kb_attachment,
+            )
+            await asyncio.sleep(0.2)
+            await client.send_message(
+                chat_id=chat_id,
+                text="",
+                attachments=media_attachments,
+            )
+        else:
+            await client.send_message(
+                chat_id=chat_id,
+                text="",
+                attachments=media_attachments + (kb_attachment or []),
+            )
+    else:
+        text_to_send = formatted_text if formatted_text else ("" if kb_attachment else "Раздел пока пуст.")
+        await client.send_message(
+            chat_id=chat_id,
+            text=text_to_send,
+            attachments=kb_attachment,
+        )
+    return True
+
+
+async def show_menu(client: MaxApiClient, chat_id: int, user_id: int | None = None) -> None:
+    target_user_id = user_id or chat_id
+    await render_static_content(client, chat_id, target_user_id, "menu", is_menu=True)
+
+
 async def send_main_menu(client: MaxApiClient, chat_id: int, text: str = "Главное меню:", user_id: int | None = None) -> None:
     target_user_id = user_id or chat_id
-    await client.send_message(chat_id=chat_id, text=text, attachments=await build_main_menu(target_user_id))
+    await show_menu(client, chat_id, user_id=target_user_id)
 
 
 async def show_help(client: MaxApiClient, chat_id: int, user_id: int) -> None:
@@ -366,31 +475,14 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
 
             await select_topic(client, chat_id, user_id, int(start_payload.split("_", 1)[1]))
             return
-        content = await get_content(start_payload)
-        if content and content.is_visible:
-            from ..formatting import translate_telegram_links_to_max
-            content_text = translate_telegram_links_to_max(content.text_content) or "Раздел пока пуст."
-            await client.send_message(
-                chat_id=chat_id,
-                text=content_text,
-                attachments=await get_content_attachments(start_payload) or None,
-            )
-            await send_main_menu(client, chat_id, user_id=user_id)
+        rendered = await render_static_content(client, chat_id, user_id, start_payload)
+        if rendered:
             return
 
-    start_content = await get_content("start_message")
-    from ..formatting import translate_telegram_links_to_max
-    if start_content and start_content.text_content:
-        await client.send_message(
-            chat_id=chat_id,
-            text=translate_telegram_links_to_max(start_content.text_content),
-            attachments=await get_content_attachments("start_message") or None,
-        )
-    else:
-        await client.send_message(chat_id=chat_id, text="Здравствуйте. Бот в MAX готов к работе.")
+    await render_static_content(client, chat_id, user_id, "start_message", is_start=True)
     if welcome_bonus_text:
+        from ..formatting import translate_telegram_links_to_max
         await client.send_message(chat_id=chat_id, text=translate_telegram_links_to_max(welcome_bonus_text))
-    await send_main_menu(client, chat_id, user_id=user_id)
 
 
 async def reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> None:

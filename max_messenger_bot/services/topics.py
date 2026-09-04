@@ -4,7 +4,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from ..api import MaxApiClient
-from ..keyboards import build_main_menu, callback_button, inline_keyboard, main_menu_row, topics_keyboard
+from ..keyboards import callback_button, inline_keyboard, main_menu_row, topics_keyboard
 from ..legacy import AIConfig, Content, Topic, User, UserTopicState, async_session_maker
 from memory_mode import apply_memory_mode_topic_switch, normalize_memory_mode
 
@@ -85,13 +85,6 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int) -> None:
     if not user:
         return
     await _apply_topic_switch(user, 0, normalize_memory_mode(config))
-    start_message = await async_get_start_message()
-    if start_message:
-        await client.send_message(chat_id=chat_id, text=start_message)
-    await client.send_message(chat_id=chat_id, text="✅ Тема сброшена.", attachments=await build_main_menu(user_id))
-
-
-async def async_get_start_message() -> str | None:
-    async with async_session_maker() as session:
-        content = await session.get(Content, "start_message")
-        return content.text_content if content else None
+    from .common import render_static_content
+    await render_static_content(client, chat_id, user_id, "start_message", is_start=True)
+    await client.send_message(chat_id=chat_id, text="✅ Тема сброшена.", attachments=inline_keyboard([main_menu_row()]))

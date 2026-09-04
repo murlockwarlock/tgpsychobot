@@ -2101,12 +2101,112 @@ async def process_buffered_messages(
         await _delete_ai_processing_message(processing_message)
 
 
+async def render_static_content_telegram(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    content_key: str,
+    *,
+    is_start: bool = False,
+    is_menu: bool = False,
+) -> bool:
+    async with async_session_maker() as session:
+        stmt = select(Content).where(Content.key == content_key).options(selectinload(Content.media))
+        content_obj = await session.scalar(stmt)
+
+    main_kb = await kb.main_client_keyboard(user_id)
+    if not content_obj:
+        if is_start:
+            await bot.send_message(chat_id, "Приветствие не задано.", reply_markup=main_kb)
+            return True
+        return False
+
+    if not is_start and not is_menu and not content_obj.is_visible:
+        return False
+
+    raw_text = content_obj.text_content or ""
+    clean_text, parsed_rows = extract_response_buttons(raw_text)
+
+    inline_kb = None
+    if parsed_rows:
+        builder = InlineKeyboardBuilder()
+        for row in parsed_rows:
+            row_buttons = []
+            for btn in row:
+                if btn.kind == "url":
+                    row_buttons.append(InlineKeyboardButton(text=btn.text, url=btn.value))
+                else:
+                    row_buttons.append(InlineKeyboardButton(text=btn.text, callback_data=build_action_callback_data(btn.value)))
+            builder.row(*row_buttons)
+        inline_kb = builder.as_markup()
+    elif content_obj.action_btn_text and content_obj.action_btn_payload:
+        inline_kb = kb.action_button_keyboard(content_obj.action_btn_text, "start_action" if is_start else "content_action")
+
+    media = content_obj.media
+    order = content_obj.content_order or 'media_top'
+    markup_to_send = inline_kb if inline_kb else main_kb
+
+    async def send_text_func(markup):
+        text_to_send = clean_text if clean_text else ("\u200b" if inline_kb else "")
+        if text_to_send:
+            await bot.send_message(chat_id, text_to_send, reply_markup=markup, parse_mode="HTML")
+            return True
+        return False
+
+    async def send_media_func(markup):
+        if media:
+            if len(media) == 1 and len(clean_text or "") < 1000 and order == 'media_top' and clean_text:
+                item = media[0]
+                if item.file_type == 'photo':
+                    await bot.send_photo(chat_id, item.file_id, caption=clean_text, reply_markup=markup, parse_mode="HTML")
+                elif item.file_type == 'video':
+                    await bot.send_video(chat_id, item.file_id, caption=clean_text, reply_markup=markup, parse_mode="HTML")
+                return True
+            if len(media) == 1:
+                item = media[0]
+                if item.file_type == 'photo':
+                    await bot.send_photo(chat_id, item.file_id, reply_markup=markup)
+                elif item.file_type == 'video':
+                    await bot.send_video(chat_id, item.file_id, reply_markup=markup)
+                return True
+            media_group = []
+            for item in media:
+                media_to_add = InputMediaPhoto(media=item.file_id) if item.file_type == 'photo' else InputMediaVideo(media=item.file_id)
+                media_group.append(media_to_add)
+            if media_group:
+                await bot.send_media_group(chat_id, media=media_group)
+                return False
+        return False
+
+    sent_combined = False
+    if media and len(media) == 1 and len(clean_text or "") < 1000 and order == 'media_top':
+        sent_combined = await send_media_func(markup_to_send)
+
+    if not sent_combined:
+        if order == 'media_top':
+            await send_media_func(main_kb if not inline_kb else None)
+            if media:
+                await asyncio.sleep(0.2)
+            await send_text_func(markup_to_send)
+        else:
+            await send_text_func(markup_to_send)
+            if media:
+                await asyncio.sleep(0.2)
+            await send_media_func(main_kb if not inline_kb else None)
+
+    if inline_kb:
+        await asyncio.sleep(0.3)
+        await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+
+    return True
+
+
 @router.callback_query(F.data.startswith("ai_btn:"))
 async def process_response_button(callback: CallbackQuery, state: FSMContext, bot: Bot):
     callback_data = callback.data or ""
     action, _button_index = split_action_callback_data(callback_data)
     user_id = callback.from_user.id
-    delegates_topic_callback = action.startswith("topic_") and action[6:].isdigit()
+    delegates_topic_callback = (action.startswith("topic_") and action[6:].isdigit()) or (action.startswith("svc:topic:") and action[10:].isdigit())
     accepted, button_text = await _prepare_ai_button_submission(
         callback,
         bot,
@@ -2119,7 +2219,7 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
     if action == "start_test":
         await _start_test_from_ai_directive(bot, user_id, state)
         return
-    if action == "topics":
+    if action in ("topics", "svc:topics"):
         message_proxy = SimpleNamespace(
             from_user=callback.from_user,
             chat=callback.message.chat,
@@ -2128,33 +2228,55 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         await select_topic_menu(message_proxy)
         return
     if delegates_topic_callback:
-        topic_callback = callback.model_copy(update={"data": f"select_topic_{action[6:]}"})
+        topic_id_str = action[10:] if action.startswith("svc:topic:") else action[6:]
+        topic_callback = callback.model_copy(update={"data": f"select_topic_{topic_id_str}"})
         await process_topic_selection(topic_callback, state, bot)
         return
-    if action == "new_dialogue":
+    if action in ("new_dialogue", "svc:reset"):
         message_proxy = SimpleNamespace(
             from_user=callback.from_user,
             answer=callback.message.answer,
         )
         await ask_delete_history(message_proxy, state)
         return
-    if action == "main_menu":
-        await callback.message.answer("Главное меню:", reply_markup=await kb.main_client_keyboard(user_id))
+    if action in ("main_menu", "svc:menu"):
+        await callback.message.answer(NAVIGATION_MENU_HINT, reply_markup=await kb.main_client_keyboard(user_id))
         return
-    if action == "subscription":
+    if action in ("subscription", "svc:subscription"):
         message_proxy = SimpleNamespace(
             from_user=callback.from_user,
             answer=callback.message.answer,
         )
         await show_subscription_info(message_proxy, state, bot)
         return
-    if action == "referral":
+    if action in ("referral", "svc:referral"):
         message_proxy = SimpleNamespace(
             from_user=callback.from_user,
             chat=callback.message.chat,
             answer=callback.message.answer,
         )
         await show_referral_info(message_proxy, bot)
+        return
+    if action == "svc:settings":
+        message_proxy = SimpleNamespace(
+            from_user=callback.from_user,
+            chat=callback.message.chat,
+            answer=callback.message.answer,
+        )
+        await user_settings_menu(message_proxy, state)
+        return
+    if action == "svc:start":
+        await render_static_content_telegram(bot, callback.message.chat.id, user_id, "start_message", is_start=True)
+        return
+    if action == "svc:continue":
+        await callback.message.answer("Введите ваше сообщение для начала/продолжения диалога:")
+        return
+    if action.startswith("svc:content:"):
+        content_key = action[12:]
+        await render_static_content_telegram(bot, callback.message.chat.id, user_id, content_key)
+        return
+    if action.startswith("svc:"):
+        logging.warning(f"Unknown service action in Telegram: {action}")
         return
 
     if not isinstance(button_text, str) or not button_text:
@@ -3166,151 +3288,14 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 # No return — fall through to show welcome message
 
             else:
-                content_key = args
-
-                stmt_dyn = select(Content).where(Content.key == content_key, Content.is_visible == True).limit(1)
-                content_obj_dyn = await session.scalar(stmt_dyn)
-
-                if content_obj_dyn:
+                rendered = await render_static_content_telegram(bot, message.chat.id, message.from_user.id, args)
+                if rendered:
                     if bonus_messages:
                         await send_bonus_messages()
-
-                    content = await get_content_from_db(content_key)
-                    text_dyn = content.get('text')
-                    media_dyn = content.get('media', [])
-                    content_order_dyn = getattr(content_obj_dyn, 'content_order', 'media_top')
-                    html_text = text_dyn if text_dyn else ""
-
-                    async def send_text_part():
-                        if html_text:
-                            text_chunks = split_html_text(html_text, 4000)
-                            for chunk in text_chunks:
-                                await _safe_send_html(
-                                    lambda text, pm: message.answer(text, parse_mode=pm),
-                                    chunk,
-                                )
-                                await asyncio.sleep(0.2)
-
-                    async def send_media_part():
-                        if media_dyn:
-                            if 1 < len(media_dyn) <= 10:
-                                media_group = []
-                                for item in media_dyn:
-                                    media_to_add = InputMediaPhoto(media=item['file_id']) if item[
-                                                                                                 'type'] == 'photo' else InputMediaVideo(
-                                        media=item['file_id'])
-                                    media_group.append(media_to_add)
-                                if media_group:
-                                    await message.answer_media_group(media_group)
-                            elif len(media_dyn) == 1:
-                                item = media_dyn[0]
-                                if item['type'] == 'photo':
-                                    await message.answer_photo(item['file_id'])
-                                elif item['type'] == 'video':
-                                    await message.answer_video(item['file_id'])
-                            elif len(media_dyn) > 10:
-                                for i in range(0, len(media_dyn), 10):
-                                    chunk = media_dyn[i:i + 10]
-                                    media_group = []
-                                    for item in chunk:
-                                        media_to_add = InputMediaPhoto(media=item['file_id']) if item[
-                                                                                                     'type'] == 'photo' else InputMediaVideo(
-                                            media=item['file_id'])
-                                        media_group.append(media_to_add)
-                                    if media_group:
-                                        await message.answer_media_group(media_group)
-                                        await asyncio.sleep(0.5)
-
-                    if html_text and media_dyn and len(media_dyn) == 1 and len(html_text) <= 1024:
-                        item = media_dyn[0]
-                        if item['type'] == 'photo':
-                            await message.answer_photo(item['file_id'], caption=html_text, parse_mode="HTML")
-                        elif item['type'] == 'video':
-                            await message.answer_video(item['file_id'], caption=html_text, parse_mode="HTML")
-                        return
-
-                    if content_order_dyn == 'media_top':
-                        await send_media_part()
-                        await asyncio.sleep(0.2)
-                        await send_text_part()
-                    else:
-                        await send_text_part()
-                        await asyncio.sleep(0.2)
-                        await send_media_part()
                     return
 
-        stmt = select(Content).where(Content.key == "start_message").options(selectinload(Content.media))
-        content_obj = await session.scalar(stmt)
-
-    main_kb = await kb.main_client_keyboard(message.from_user.id)
-    if not content_obj:
-        text = "Приветствие не задано."
-        await message.answer(text, reply_markup=main_kb, parse_mode="HTML")
-        if bonus_messages:
-            await send_bonus_messages()
-        return
-
-    text = content_obj.text_content
-    media = content_obj.media
-    order = content_obj.content_order
-    inline_kb = None
-
-    if content_obj.action_btn_text and content_obj.action_btn_payload:
-        inline_kb = kb.action_button_keyboard(content_obj.action_btn_text, "start_action")
-
-    async def send_text_func(markup):
-        if text:
-            await message.answer(text, reply_markup=markup, parse_mode="HTML")
-            return True
-        return False
-
-    async def send_media_func(markup):
-        if media:
-            if len(media) == 1 and len(text or "") < 1000 and order == 'media_top' and text:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await message.answer_photo(item.file_id, caption=text, reply_markup=markup, parse_mode="HTML")
-                elif item.file_type == 'video':
-                    await message.answer_video(item.file_id, caption=text, reply_markup=markup, parse_mode="HTML")
-                return True
-            if len(media) == 1:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await message.answer_photo(item.file_id, reply_markup=markup)
-                elif item.file_type == 'video':
-                    await message.answer_video(item.file_id, reply_markup=markup)
-                return True
-            media_group = []
-            for item in media:
-                media_to_add = InputMediaPhoto(media=item.file_id) if item.file_type == 'photo' else InputMediaVideo(
-                    media=item.file_id)
-                media_group.append(media_to_add)
-            if media_group:
-                await message.answer_media_group(media_group)
-                return False
-        return False
-
-    sent_combined = False
-    if media and len(media) == 1 and len(text or "") < 1000 and order == 'media_top':
-        sent_combined = await send_media_func(inline_kb if inline_kb else main_kb)
-
-    if not sent_combined:
-        if order == 'media_top':
-            await send_media_func(main_kb if not inline_kb else None)
-            await asyncio.sleep(0.2)
-            await send_text_func(inline_kb if inline_kb else main_kb)
-        else:
-            await send_text_func(inline_kb if inline_kb else main_kb)
-            await asyncio.sleep(0.2)
-            await send_media_func(main_kb if not inline_kb else None)
-
-    if inline_kb:
-        await asyncio.sleep(0.3)
-        if bonus_messages:
-            await send_bonus_messages(reply_markup=main_kb)
-        else:
-            await message.answer(NAVIGATION_MENU_HINT, reply_markup=main_kb)
-    elif bonus_messages:
+    await render_static_content_telegram(bot, message.chat.id, message.from_user.id, "start_message", is_start=True)
+    if bonus_messages:
         await asyncio.sleep(0.3)
         await send_bonus_messages()
 
@@ -4814,62 +4799,7 @@ async def handle_info_buttons(message: Message):
         content_key = content_obj.key if content_obj else None
     if not content_key:
         return
-    content = await get_content_from_db(content_key)
-    text = content.get('text')
-    media = content.get('media', [])
-    content_order = getattr(content_obj, 'content_order', 'media_top')
-    html_text = text if text else ""
-    async def send_text_part():
-        if html_text:
-            text_chunks = split_html_text(html_text, 4000)
-            for chunk in text_chunks:
-                await _safe_send_html(
-                    lambda text, pm: message.answer(text, parse_mode=pm),
-                    chunk,
-                )
-                await asyncio.sleep(0.2)
-    async def send_media_part():
-        if media:
-            if 1 < len(media) <= 10:
-                media_group = []
-                for item in media:
-                    media_to_add = InputMediaPhoto(media=item['file_id']) if item['type'] == 'photo' else InputMediaVideo(
-                        media=item['file_id'])
-                    media_group.append(media_to_add)
-                if media_group:
-                    await message.answer_media_group(media_group)
-            elif len(media) == 1:
-                item = media[0]
-                if item['type'] == 'photo':
-                    await message.answer_photo(item['file_id'])
-                elif item['type'] == 'video':
-                    await message.answer_video(item['file_id'])
-            elif len(media) > 10:
-                for i in range(0, len(media), 10):
-                    chunk = media[i:i + 10]
-                    media_group = []
-                    for item in chunk:
-                        media_to_add = InputMediaPhoto(media=item['file_id']) if item['type'] == 'photo' else InputMediaVideo(
-                            media=item['file_id'])
-                        media_group.append(media_to_add)
-                    if media_group:
-                        await message.answer_media_group(media_group)
-                        await asyncio.sleep(0.5)
-    if html_text and media and len(media) == 1 and len(html_text) <= 1024:
-        item = media[0]
-        if item['type'] == 'photo':
-            await message.answer_photo(item['file_id'], caption=html_text, parse_mode="HTML")
-        elif item['type'] == 'video':
-            await message.answer_video(item['file_id'], caption=html_text, parse_mode="HTML")
-        return
-    if content_order == 'media_top':
-        await send_media_part()
-        await asyncio.sleep(0.2)
-        await send_text_part()
-    else:
-        await send_text_part()
-        await asyncio.sleep(0.2)
-        await send_media_part()
+    await render_static_content_telegram(message.bot, message.chat.id, message.from_user.id, content_key)
 
 
 @router.callback_query(F.data.startswith("view_models_"))
@@ -4960,6 +4890,7 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
 
     content_map = {
         "start_message": "Приветствие (/start)",
+        "menu": "Меню",
         "about_author": "Об авторе",
         "about_method": "О методе",
         "instruction": "Инструкция",
@@ -4998,6 +4929,26 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
     if content_key == "start_message":
         btn_info = f"\n<b><u>Кнопка действия:</u></b>\nНазвание: {btn_text or 'Нет'}\nТекст отправки: {btn_payload or 'Нет'}\n"
 
+    button_help = (
+        "<b>💡 Справка по кнопкам в тексте:</b>\n"
+        "• <code>[Название](https://...)</code> — ссылка\n"
+        "• <code>[Меню](btn:svc:menu)</code> — открыть Меню\n"
+        "• <code>[Выбрать тему](btn:svc:topics)</code> — список тем\n"
+        "• <code>[Тема](btn:svc:topic:1)</code> — переключить тему\n"
+        "• <code>[Подписка](btn:svc:subscription)</code> — подписка\n"
+        "• <code>[Рефералы](btn:svc:referral)</code> — реферальная программа\n"
+        "• <code>[Настройки](btn:svc:settings)</code> — настройки\n"
+        "• <code>[В начало](btn:svc:start)</code> — начальный экран\n"
+        "• <code>[Новый диалог](btn:svc:reset)</code> — сбросить диалог\n"
+        "• <code>[Начать диалог](btn:svc:continue)</code> — начать/продолжить\n"
+        "• <code>[Раздел](btn:svc:content:about_me)</code> — раздел контента\n\n"
+        "<b>Расположение:</b>\n"
+        "• <code>|</code> между кнопками = в один ряд\n"
+        "• Пробел(ы) между кнопками = следующий ряд\n"
+        "• Перенос строки = следующий ряд\n"
+        "Пример: <code>[Спереди](btn:front) | [Сбоку](btn:side) [Одинаково](btn:both)</code>"
+    )
+
     response_text = (
         f"📝 <b>Редактирование: '{html.escape(display_name)}'</b>\n\n"
         f"<b><u>Статус:</u></b> {visibility_status}\n"
@@ -5006,6 +4957,7 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
         f"{btn_info}\n"
         f"<b><u>Текущий текст:</u></b>\n{text_display}\n\n"
         f"<b><u>Текущие медиафайлы:</u></b>\n{media_display}\n\n"
+        f"{button_help}\n\n"
         f"Отправьте новый текст (сохранится форматирование), чтобы изменить его, или медиа, чтобы добавить. "
         f"Используйте кнопки ниже для настроек."
     )
@@ -5805,88 +5757,13 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
             await session.execute(delete(TestSession).where(TestSession.user_id == user.id))
             await session.commit()
 
-        stmt = select(Content).where(Content.key == "start_message").options(selectinload(Content.media))
-        content_obj = await session.scalar(stmt)
-
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
 
-    main_kb = await kb.main_client_keyboard(callback.from_user.id)
-
-    if not content_obj:
-        await bot.send_message(callback.from_user.id, "✅ Память очищена.", reply_markup=main_kb)
-        return
-
-    text = content_obj.text_content
-    media = content_obj.media
-    order = content_obj.content_order
-
-    inline_kb = None
-    if content_obj.action_btn_text and content_obj.action_btn_payload:
-        inline_kb = kb.action_button_keyboard(content_obj.action_btn_text, "start_action")
-
-    markup_to_send = inline_kb if inline_kb else main_kb
-    chat_id = callback.from_user.id
-
-    async def send_text_func():
-        if text:
-            await bot.send_message(chat_id, text, reply_markup=markup_to_send)
-            return True
-        return False
-
-    async def send_media_func():
-        if media:
-            if len(media) == 1 and len(text or "") < 1000 and order == 'media_top' and text:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await bot.send_photo(chat_id, item.file_id, caption=text, reply_markup=markup_to_send)
-                elif item.file_type == 'video':
-                    await bot.send_video(chat_id, item.file_id, caption=text, reply_markup=markup_to_send)
-                return True
-
-            if len(media) == 1:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await bot.send_photo(chat_id, item.file_id, reply_markup=markup_to_send)
-                elif item.file_type == 'video':
-                    await bot.send_video(chat_id, item.file_id, reply_markup=markup_to_send)
-                return True
-
-            media_group = []
-            for item in media:
-                media_to_add = InputMediaPhoto(media=item.file_id) if item.file_type == 'photo' else InputMediaVideo(
-                    media=item.file_id)
-                media_group.append(media_to_add)
-            if media_group:
-                await bot.send_media_group(chat_id, media_group)
-                return False
-        return False
-
-    sent_combined = False
-    media_sent_with_kb = False
-    text_sent_with_kb = False
-
-    if media and len(media) == 1 and len(text or "") < 1000 and order == 'media_top':
-        sent_combined = await send_media_func()
-
-    if not sent_combined:
-        if order == 'media_top':
-            media_sent_with_kb = await send_media_func()
-            await asyncio.sleep(0.2)
-            text_sent_with_kb = await send_text_func()
-        else:
-            text_sent_with_kb = await send_text_func()
-            await asyncio.sleep(0.2)
-            media_sent_with_kb = await send_media_func()
-
-    keyboard_was_sent = sent_combined or media_sent_with_kb or text_sent_with_kb
-
-    if inline_kb:
-        await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
-    elif not keyboard_was_sent and not inline_kb:
-        await bot.send_message(chat_id, "✅ Память очищена.", reply_markup=main_kb)
+    await render_static_content_telegram(bot, callback.from_user.id, callback.from_user.id, "start_message", is_start=True)
+    await bot.send_message(callback.from_user.id, "✅ Память очищена.")
 
 
 @router.callback_query(F.data == "delete_history_cancel")
@@ -7439,6 +7316,11 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
     memory_mode = MEMORY_MODE_RESET
     async with async_session_maker() as session:
         user = await session.get(User, callback.from_user.id)
+        topic = await session.get(Topic, topic_id)
+        if not topic or not topic.is_active or (topic.admin_only and not (user and user.is_admin)):
+            await callback.answer("Тема больше недоступна.", show_alert=True)
+            return
+
         restored = False
         already_in_topic = bool(user and user.current_topic_id == topic_id)
         if user and not already_in_topic:
@@ -7447,12 +7329,6 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
             memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
             restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
             await session.commit()
-
-        topic = await session.get(Topic, topic_id)
-
-    if not topic or not topic.is_active or (topic.admin_only and not (user and user.is_admin)):
-        await callback.answer("Тема больше недоступна.", show_alert=True)
-        return
 
     await callback.answer()
     if already_in_topic:
@@ -7489,88 +7365,13 @@ async def process_topic_reset(callback: CallbackQuery, bot: Bot):
             await _apply_topic_switch(session, user, 0, memory_mode)
             await session.commit()
 
-        stmt = select(Content).where(Content.key == "start_message").options(selectinload(Content.media))
-        content_obj = await session.scalar(stmt)
-
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
 
-    main_kb = await kb.main_client_keyboard(callback.from_user.id)
-    chat_id = callback.from_user.id
-
-    if not content_obj:
-        await bot.send_message(chat_id, "✅ Тема сброшена. Мы вернулись в общий режим диалога.", reply_markup=main_kb)
-        return
-
-    text = content_obj.text_content
-    media = content_obj.media
-    order = content_obj.content_order
-
-    inline_kb = None
-    if content_obj.action_btn_text and content_obj.action_btn_payload:
-        inline_kb = kb.action_button_keyboard(content_obj.action_btn_text, "start_action")
-
-    markup_to_send = inline_kb if inline_kb else main_kb
-
-    async def send_text_func():
-        if text:
-            await bot.send_message(chat_id, text, reply_markup=markup_to_send)
-            return True
-        return False
-
-    async def send_media_func():
-        if media:
-            if len(media) == 1 and len(text or "") < 1000 and order == 'media_top' and text:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await bot.send_photo(chat_id, item.file_id, caption=text, reply_markup=markup_to_send)
-                elif item.file_type == 'video':
-                    await bot.send_video(chat_id, item.file_id, caption=text, reply_markup=markup_to_send)
-                return True
-
-            if len(media) == 1:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await bot.send_photo(chat_id, item.file_id, reply_markup=markup_to_send)
-                elif item.file_type == 'video':
-                    await bot.send_video(chat_id, item.file_id, reply_markup=markup_to_send)
-                return True
-
-            media_group = []
-            for item in media:
-                media_to_add = InputMediaPhoto(media=item.file_id) if item.file_type == 'photo' else InputMediaVideo(
-                    media=item.file_id)
-                media_group.append(media_to_add)
-            if media_group:
-                await bot.send_media_group(chat_id, media_group)
-                return False
-        return False
-
-    sent_combined = False
-    media_sent_with_kb = False
-    text_sent_with_kb = False
-
-    if media and len(media) == 1 and len(text or "") < 1000 and order == 'media_top':
-        sent_combined = await send_media_func()
-
-    if not sent_combined:
-        if order == 'media_top':
-            media_sent_with_kb = await send_media_func()
-            await asyncio.sleep(0.2)
-            text_sent_with_kb = await send_text_func()
-        else:
-            text_sent_with_kb = await send_text_func()
-            await asyncio.sleep(0.2)
-            media_sent_with_kb = await send_media_func()
-
-    keyboard_was_sent = sent_combined or media_sent_with_kb or text_sent_with_kb
-
-    if inline_kb:
-        await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
-    elif not keyboard_was_sent:
-        await bot.send_message(chat_id, "✅ Тема сброшена. Мы вернулись в общий режим диалога.", reply_markup=main_kb)
+    await render_static_content_telegram(bot, callback.from_user.id, callback.from_user.id, "start_message", is_start=True)
+    await bot.send_message(callback.from_user.id, "✅ Тема сброшена. Мы вернулись в общий режим диалога.")
 
 
 @router.callback_query(F.data == "topic_select_cancel")
@@ -16778,94 +16579,16 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
 
             await session.commit()
 
-        stmt = select(Content).where(Content.key == "start_message").options(selectinload(Content.media))
-        content_obj = await session.scalar(stmt)
-
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
 
-    main_kb = await kb.main_client_keyboard(callback.from_user.id)
-    chat_id = callback.from_user.id
-
-    if not content_obj:
-        text = "✅ Вы вернулись в основной режим. Память очищена."
-        if is_global_memory_mode(memory_mode):
-            text = "✅ Вы вернулись в основной режим. Контекст диалога сохранен."
-        await bot.send_message(chat_id, text, reply_markup=main_kb)
-        return
-
-    text = content_obj.text_content
-    media = content_obj.media
-    order = content_obj.content_order
-
-    inline_kb = None
-    if content_obj.action_btn_text and content_obj.action_btn_payload:
-        inline_kb = kb.action_button_keyboard(content_obj.action_btn_text, "start_action")
-
-    markup_to_send = inline_kb if inline_kb else main_kb
-
-    async def send_text_func():
-        if text:
-            await bot.send_message(chat_id, text, reply_markup=markup_to_send, parse_mode="HTML")
-            return True
-        return False
-
-    async def send_media_func():
-        if media:
-            if len(media) == 1 and len(text or "") < 1000 and order == 'media_top' and text:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await bot.send_photo(chat_id, item.file_id, caption=text, reply_markup=markup_to_send, parse_mode="HTML")
-                elif item.file_type == 'video':
-                    await bot.send_video(chat_id, item.file_id, caption=text, reply_markup=markup_to_send, parse_mode="HTML")
-                return True
-
-            if len(media) == 1:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await bot.send_photo(chat_id, item.file_id, reply_markup=markup_to_send)
-                elif item.file_type == 'video':
-                    await bot.send_video(chat_id, item.file_id, reply_markup=markup_to_send)
-                return True
-
-            media_group = []
-            for item in media:
-                media_to_add = InputMediaPhoto(media=item.file_id) if item.file_type == 'photo' else InputMediaVideo(
-                    media=item.file_id)
-                media_group.append(media_to_add)
-            if media_group:
-                await bot.send_media_group(chat_id, media_group)
-                return False
-        return False
-
-    sent_combined = False
-    media_sent_with_kb = False
-    text_sent_with_kb = False
-
-    if media and len(media) == 1 and len(text or "") < 1000 and order == 'media_top':
-        sent_combined = await send_media_func()
-
-    if not sent_combined:
-        if order == 'media_top':
-            media_sent_with_kb = await send_media_func()
-            await asyncio.sleep(0.2)
-            text_sent_with_kb = await send_text_func()
-        else:
-            text_sent_with_kb = await send_text_func()
-            await asyncio.sleep(0.2)
-            media_sent_with_kb = await send_media_func()
-
-    keyboard_was_sent = sent_combined or media_sent_with_kb or text_sent_with_kb
-
-    if inline_kb:
-        await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
-    elif not keyboard_was_sent and not inline_kb:
-        text = "✅ Вы вернулись в основной режим. Память очищена."
-        if is_global_memory_mode(memory_mode):
-            text = "✅ Вы вернулись в основной режим. Контекст диалога сохранен."
-        await bot.send_message(chat_id, text, reply_markup=main_kb)
+    await render_static_content_telegram(bot, callback.from_user.id, callback.from_user.id, "start_message", is_start=True)
+    text = "✅ Вы вернулись в основной режим. Память очищена."
+    if is_global_memory_mode(memory_mode):
+        text = "✅ Вы вернулись в основной режим. Контекст диалога сохранен."
+    await bot.send_message(callback.from_user.id, text)
 
 
 @router.message(F.document, Command("upload_random"))
