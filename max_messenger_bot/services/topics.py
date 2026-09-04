@@ -45,7 +45,7 @@ async def _apply_topic_switch(user: User, topic_id: int, memory_mode: str) -> bo
     return restored
 
 
-async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_id: int) -> None:
+async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_id: int, states: StateStore | None = None) -> None:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         topic = await session.get(Topic, topic_id)
@@ -58,6 +58,10 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
     ):
         await client.send_message(chat_id=chat_id, text="Тема недоступна.")
         return
+
+    if user.current_topic_id == topic_id:
+        return
+
     current_memory_mode = normalize_memory_mode(config)
     restored = await _apply_topic_switch(user, topic_id, current_memory_mode)
     from ..formatting import translate_telegram_links_to_max
@@ -69,13 +73,41 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         text = f"✅ Продолжаем тему: <b>{topic.name}</b>."
     else:
         text = f"✅ Переключились на тему: <b>{topic.name}</b>.\n\nПамять диалога очищена."
+
+    auto_start = getattr(topic, "auto_start_dialogue", False)
+    if auto_start:
+        attachments = inline_keyboard([main_menu_row()])
+    else:
+        attachments = inline_keyboard([[
+            callback_button("💬 Начать диалог", "topic_start_dialogue"),
+        ], main_menu_row()])
+
     await client.send_message(
         chat_id=chat_id,
         text=text,
-        attachments=inline_keyboard([[
-            callback_button("💬 Начать диалог", "topic_start_dialogue"),
-        ], main_menu_row()]),
+        attachments=attachments,
     )
+
+    if auto_start:
+        from . import common
+        async with async_session_maker() as session:
+            fresh_user = await session.get(User, user_id, options=[selectinload(User.subscription)])
+
+        if fresh_user and not fresh_user.name:
+            if states is not None:
+                await common.begin_onboarding(client, states, chat_id, user_id, resume_data={"pending_auto_start_topic_id": topic_id})
+            return
+
+        if fresh_user and states is not None:
+            if await common.maybe_require_disclaimer(client, states, chat_id, fresh_user, resume_data={"pending_auto_start_topic_id": topic_id}):
+                return
+
+        if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
+            return
+
+        from system_events import build_topic_auto_start_system_message
+        synthetic_text = build_topic_auto_start_system_message(topic.name)
+        await common.run_ai_dialogue(client, chat_id, user_id, synthetic_text, states=states)
 
 
 async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -1035,7 +1035,7 @@ async def test_telegram_duplicate_action_buttons_collision_and_label_resolution(
         ("ai_btn:svc:referral", "max_messenger_bot.services.subscriptions.show_referral_info"),
         ("ai_btn:svc:settings", "max_messenger_bot.services.settings.show_settings"),
         ("ai_btn:svc:start", "max_messenger_bot.services.common.render_static_content"),
-        ("ai_btn:svc:reset", "max_messenger_bot.services.common.reset_dialogue"),
+        ("ai_btn:svc:reset", "max_messenger_bot.services.common.request_reset_dialogue"),
     ],
 )
 async def test_max_service_action_matrix_routing(db_session, payload, target_patch):
@@ -1107,7 +1107,7 @@ async def test_max_service_action_topic_valid_routing(db_session):
          patch("max_messenger_bot.ai.get_ai_response", new_callable=AsyncMock) as mock_ai:
         await app.handle_callback(callback)
         assert mock_client.answer_callback.call_count == 1
-        mock_select.assert_called_once_with(mock_client, 100, 100, 5)
+        mock_select.assert_called_once_with(mock_client, 100, 100, 5, ANY)
         mock_ai.assert_not_called()
 
 

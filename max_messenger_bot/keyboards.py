@@ -547,6 +547,7 @@ def admin_topic_editor_keyboard(topic, topic_url: str | None = None) -> list[dic
     admin_only_text = "🔒 Только для админов: ВКЛ" if topic.admin_only else "🔓 Только для админов: ВЫКЛ"
     menu_text = "❌ Убрать из меню" if topic.show_in_main_menu else "✅ Показать в меню"
     list_text = "❌ Убрать из списка" if topic.show_in_list else "✅ Показать в списке"
+    auto_start_text = "▶️ Начинать диалог сразу: ВКЛ" if getattr(topic, "auto_start_dialogue", False) else "⏸️ Начинать диалог сразу: ВЫКЛ"
     rows = [
         [callback_button("✏️ Название", f"admin_topic_edit_name_{topic.id}")],
         [callback_button("📝 Системный промпт", f"admin_topic_prompt_{topic.id}")],
@@ -556,6 +557,7 @@ def admin_topic_editor_keyboard(topic, topic_url: str | None = None) -> list[dic
         [callback_button(admin_only_text, f"admin_topic_toggle_admin_{topic.id}")],
         [callback_button(menu_text, f"admin_topic_toggle_menu_{topic.id}")],
         [callback_button(list_text, f"admin_topic_toggle_list_{topic.id}")],
+        [callback_button(auto_start_text, f"admin_topic_toggle_auto_start_{topic.id}")],
         [callback_button("📚 База знаний темы", f"admin_topic_kb_{topic.id}_page_0")],
         [callback_button("🖼️ Медиатека", f"admin_topic_media_{topic.id}_0")],
         [callback_button("🗑️ Удалить тему", f"admin_topic_delete_{topic.id}")],
@@ -564,6 +566,16 @@ def admin_topic_editor_keyboard(topic, topic_url: str | None = None) -> list[dic
     if topic_url:
         rows.insert(1, [link_button("🔗 Открыть тему", topic_url)])
     return inline_keyboard(rows)
+
+
+def reset_confirmation_keyboard(token: str, dialogue_id: int, topic_id: int | None = None) -> list[dict]:
+    t_id = topic_id if topic_id is not None else 0
+    return inline_keyboard(
+        [
+            [callback_button("🗑️ Да, сбросить диалог", f"confirm_reset_dialogue:{token}:{dialogue_id}:{t_id}")],
+            [callback_button("❌ Отмена", f"cancel_reset_dialogue:{token}")],
+        ]
+    )
 
 
 def admin_topic_prompt_keyboard(topic_id: int) -> list[dict]:
