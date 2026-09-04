@@ -188,23 +188,38 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         state.clear = AsyncMock()
 
         ai_prompts = []
-        turn1_done = asyncio.Event()
+        runner_empty_pause = asyncio.Event()
+        runner_proceed = asyncio.Event()
 
         async def fake_generate_response(user_id, prompt, *args, **kwargs):
             ai_prompts.append(prompt)
-            turn1_done.set()
             return "Ответ ИИ"
 
-        with patch("handlers.ai_integration.generate_response", side_effect=fake_generate_response):
-            await handlers._start_telegram_topic_auto_start(111, bot, state, topic)
-            await turn1_done.wait()
+        async def cleanup_hook(uid):
+            if uid == 111:
+                runner_empty_pause.set()
+                await runner_proceed.wait()
 
-            # Enqueue message exactly as runner finishes turn 1
+        with patch("handlers.ai_integration.generate_response", side_effect=fake_generate_response), \
+             patch("handlers._drain_runner_before_cleanup_hook", side_effect=cleanup_hook):
+            await handlers._start_telegram_topic_auto_start(111, bot, state, topic)
+            initial_runner = handlers.user_processing_tasks[111]
+
+            # Wait until runner finishes Turn 1, determines no work, and pauses before cleanup
+            await runner_empty_pause.wait()
+            self.assertIs(handlers.user_processing_tasks.get(111), initial_runner)
+            self.assertFalse(initial_runner.done())
+
+            # Enqueue user message exactly during this pause
             msg = MagicMock()
             msg.from_user = SimpleNamespace(id=111, username="bob", full_name="Bob")
             msg.chat = SimpleNamespace(id=111)
             msg.text = "Вопрос в окне B"
             await handlers.handle_ai_chat(msg, state, bot)
+
+            # Allow initial runner to proceed with cleanup and handoff
+            runner_proceed.set()
+            await initial_runner
 
             while handlers._has_user_turn_work(111) or (111 in handlers.user_processing_tasks and not handlers.user_processing_tasks[111].done()):
                 task = handlers.user_processing_tasks.get(111)

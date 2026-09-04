@@ -2125,6 +2125,9 @@ def _has_user_turn_work(user_id: int) -> bool:
     )
 
 
+_drain_runner_before_cleanup_hook = None
+
+
 def _schedule_telegram_drain_runner_locked(
     user_id: int,
     bot: Bot,
@@ -2175,6 +2178,10 @@ def _schedule_telegram_drain_runner_locked(
                     )
                     break
         finally:
+            if _drain_runner_before_cleanup_hook is not None:
+                hook_res = _drain_runner_before_cleanup_hook(user_id)
+                if asyncio.iscoroutine(hook_res):
+                    await hook_res
             async with _get_user_scheduling_lock(user_id):
                 if user_processing_tasks.get(user_id) is this_task:
                     user_processing_tasks.pop(user_id, None)
@@ -5926,6 +5933,7 @@ async def ask_delete_history(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("delete_history_confirm"))
 async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
     token = callback.data.split(":", 1)[1] if ":" in callback.data else ""
 
     async with user_locks.setdefault(callback.from_user.id, asyncio.Lock()):
@@ -5933,7 +5941,7 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
         expected_token = data.get("reset_token")
 
         if not expected_token or expected_token != token:
-            await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
+            await callback.message.answer("Подтверждение устарело или уже использовано.")
             return
 
         expected_dialogue_id = data.get("reset_dialogue_id")
@@ -5943,7 +5951,7 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id)
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
-                await callback.answer("Состояние диалога изменилось. Действие отменено.", show_alert=True)
+                await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
                 return
 
             ai_config = await session.get(AIConfig, 1)
@@ -16742,6 +16750,7 @@ async def admin_payment_stats(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("reset_topic_keep"))
 async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
     token = callback.data.split(":", 1)[1] if ":" in callback.data else ""
 
     text_to_send = "✅ Память очищена."
@@ -16753,7 +16762,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
         expected_token = data.get("reset_token")
 
         if not expected_token or expected_token != token:
-            await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
+            await callback.message.answer("Подтверждение устарело или уже использовано.")
             return
 
         expected_dialogue_id = data.get("reset_dialogue_id")
@@ -16763,7 +16772,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id, options=[selectinload(User.current_topic)])
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
-                await callback.answer("Состояние диалога изменилось. Действие отменено.", show_alert=True)
+                await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
                 return
 
             ai_config = await session.get(AIConfig, 1)
@@ -16915,6 +16924,7 @@ async def export_date_to_input(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("reset_topic_to_main"))
 async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
     token = callback.data.split(":", 1)[1] if ":" in callback.data else ""
 
     async with user_locks.setdefault(callback.from_user.id, asyncio.Lock()):
@@ -16922,7 +16932,7 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
         expected_token = data.get("reset_token")
 
         if not expected_token or expected_token != token:
-            await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
+            await callback.message.answer("Подтверждение устарело или уже использовано.")
             return
 
         expected_dialogue_id = data.get("reset_dialogue_id")
@@ -16932,7 +16942,7 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id)
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
-                await callback.answer("Состояние диалога изменилось. Действие отменено.", show_alert=True)
+                await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
                 return
 
             user.current_topic_id = None
