@@ -17,6 +17,8 @@ import keyboards as tg_kb
 from database import Base, Content, Topic, User
 import max_messenger_bot.legacy as max_legacy
 import max_messenger_bot.storage as max_storage
+from max_messenger_bot import app as max_app
+from max_messenger_bot.services import settings as max_settings
 from max_messenger_bot.app import MaxBotApplication
 from max_messenger_bot.keyboards import inline_keyboard, main_menu_row
 from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
@@ -41,6 +43,8 @@ async def db_session(tmp_path, monkeypatch):
     monkeypatch.setattr(max_storage, "async_session_maker", sessions)
     monkeypatch.setattr(max_common, "async_session_maker", sessions)
     monkeypatch.setattr(max_topics, "async_session_maker", sessions)
+    monkeypatch.setattr(max_settings, "async_session_maker", sessions)
+    monkeypatch.setattr(max_app, "async_session_maker", sessions)
 
     handlers.user_message_buffers.clear()
     handlers.user_processing_tasks.clear()
@@ -62,14 +66,37 @@ async def db_session(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_max_admin_absent_from_global_commands():
-    # Verify set_commands payload in create_web_app logic
-    commands = [
-        {"name": "start", "description": "Запустить бота"},
-        {"name": "help", "description": "Справка"},
-        {"name": "reset", "description": "Очистить память диалога"},
-    ]
-    command_names = [c["name"] for c in commands]
+    from max_messenger_bot.app import build_max_global_commands
+
+    all_enabled = build_max_global_commands(
+        topics_enabled=True,
+        subscriptions_enabled=True,
+        referral_enabled=True,
+    )
+    command_names = [c["name"] for c in all_enabled]
     assert "admin" not in command_names
+    assert "start" in command_names
+    assert "help" in command_names
+    assert "topics" in command_names
+    assert "new_dialogue" in command_names
+    assert "settings" in command_names
+    assert "subscription" in command_names
+    assert "ref" in command_names
+
+    disabled = build_max_global_commands(
+        topics_enabled=False,
+        subscriptions_enabled=False,
+        referral_enabled=False,
+    )
+    disabled_names = [c["name"] for c in disabled]
+    assert "admin" not in disabled_names
+    assert "topics" not in disabled_names
+    assert "subscription" not in disabled_names
+    assert "ref" not in disabled_names
+    assert "start" in disabled_names
+    assert "help" in disabled_names
+    assert "new_dialogue" in disabled_names
+    assert "settings" in disabled_names
 
 
 @pytest.mark.asyncio
@@ -244,6 +271,35 @@ async def test_max_content_deep_link_same_renderer(db_session):
 
 
 @pytest.mark.asyncio
+async def test_max_start_menu_canonical_route(db_session):
+    async with db_session() as session:
+        session.add(User(id=123, first_name="Test User", is_admin=False))
+        session.add(
+            Content(
+                key="menu",
+                text_content="Пользовательское меню\n[Темы](btn:svc:topics)",
+                is_visible=False,  # Canonical menu is accessible even if is_visible is False
+            )
+        )
+        await session.commit()
+
+    mock_client = SimpleNamespace(send_message=AsyncMock())
+
+    # Deep link ?start=menu
+    await max_common.show_start_screen(mock_client, chat_id=123, user_id=123, start_payload="menu")
+
+    assert mock_client.send_message.call_count == 1
+    call_kwargs = mock_client.send_message.call_args.kwargs
+    assert "Пользовательское меню" in call_kwargs["text"]
+    assert "Главное меню:" not in call_kwargs["text"]
+    buttons = call_kwargs["attachments"][0]["payload"]["buttons"]
+    button_texts = [b["text"] for row in buttons for b in row]
+    assert "Темы" in button_texts
+    # Must NOT have automatic "⬅️ В меню" self-loop
+    assert "⬅️ В меню" not in button_texts
+
+
+@pytest.mark.asyncio
 async def test_max_reset_topic_static_parser_behavior(db_session):
     async with db_session() as session:
         session.add(User(id=555, first_name="User", current_topic_id=1))
@@ -272,7 +328,7 @@ async def test_max_reset_topic_static_parser_behavior(db_session):
 
 
 @pytest.mark.asyncio
-async def test_max_cancel_test_and_onboarding_no_dynamic_menu(db_session):
+async def test_max_cancel_test_no_dynamic_menu(db_session):
     mock_client = SimpleNamespace(send_message=AsyncMock(), answer_callback=AsyncMock())
     app = MaxBotApplication(client=mock_client)
 
@@ -292,6 +348,38 @@ async def test_max_cancel_test_and_onboarding_no_dynamic_menu(db_session):
     assert "❌ Тестирование прервано." in call["text"]
     buttons = call["attachments"][0]["payload"]["buttons"]
     assert buttons[0][0]["text"] == "⬅️ В меню"
+
+
+@pytest.mark.asyncio
+async def test_max_onboarding_completion_no_dynamic_menu(db_session):
+    async with db_session() as session:
+        session.add(User(id=777, first_name="Onboarding User", is_admin=False))
+        await session.commit()
+
+    mock_client = SimpleNamespace(send_message=AsyncMock(), answer_callback=AsyncMock())
+    app = MaxBotApplication(client=mock_client)
+
+    # Set user in onboarding state
+    await app.states.set(user_id=777, chat_id=777, state="onboarding_gender", data={"is_onboarding": True, "name": "Onboarding User"})
+
+    callback = IncomingCallback(
+        raw={},
+        callback_id="cb_gender",
+        payload="gender_male",
+        chat_id=777,
+        message_id="m777",
+        sender=Sender(user_id=777, username="user", first_name="Onboarding User", last_name=None),
+    )
+    await app.handle_callback(callback)
+
+    # Verify callback answered and confirmation message sent with static "⬅️ В меню" row
+    mock_client.answer_callback.assert_called_with("cb_gender", notification="Пол сохранён")
+    mock_client.send_message.assert_called_once()
+    call_kwargs = mock_client.send_message.call_args.kwargs
+    assert "Отлично!" in call_kwargs["text"]
+    buttons = call_kwargs["attachments"][0]["payload"]["buttons"]
+    assert buttons[0][0]["text"] == "⬅️ В меню"
+    assert buttons[0][0]["payload"] == "main_menu"
 
 
 @pytest.mark.asyncio
@@ -701,3 +789,226 @@ async def test_telegram_legacy_action_btn_fallback(db_session):
     inline_kb = call1[1].get("reply_markup")
     assert inline_kb is not None
     assert inline_kb.inline_keyboard[0][0].text == "Legacy Кнопка"
+
+
+@pytest.mark.asyncio
+async def test_telegram_long_text_split_and_inline_keyboard_on_last_chunk(db_session):
+    async with db_session() as session:
+        session.add(User(id=2010, first_name="TG User", is_admin=False))
+        # Text with >4000 characters and buttons at the end
+        long_paragraph = "Это длинный текст параграфа для проверки разбиения. " * 120
+        full_text = f"{long_paragraph}\n\n[Выбрать тему](btn:svc:topics)"
+        session.add(
+            Content(
+                key="long_page",
+                text_content=full_text,
+                is_visible=True,
+            )
+        )
+        await session.commit()
+
+    mock_bot = SimpleNamespace(send_message=AsyncMock())
+    rendered = await handlers.render_static_content_telegram(
+        mock_bot,
+        chat_id=2010,
+        user_id=2010,
+        content_key="long_page",
+    )
+    assert rendered is True
+
+    # 1. First chunk: text with reply_markup=None
+    # 2. Last chunk: text with reply_markup=inline_kb
+    # 3. Third message: NAVIGATION_MENU_HINT with main_client_keyboard
+    assert mock_bot.send_message.call_count >= 3
+    chunk1_call = mock_bot.send_message.call_args_list[0]
+    chunk1_markup = chunk1_call[1].get("reply_markup")
+    assert chunk1_markup is None
+
+    last_chunk_call = mock_bot.send_message.call_args_list[-2]
+    last_chunk_markup = last_chunk_call[1].get("reply_markup")
+    assert isinstance(last_chunk_markup, handlers.InlineKeyboardMarkup)
+    assert last_chunk_markup.inline_keyboard[0][0].text == "Выбрать тему"
+
+    hint_call = mock_bot.send_message.call_args_list[-1]
+    assert (hint_call[0][1] if len(hint_call[0]) > 1 else hint_call[1].get("text")) == handlers.NAVIGATION_MENU_HINT
+    assert hint_call[1].get("reply_markup") is not None
+
+
+@pytest.mark.asyncio
+async def test_telegram_eleven_media_batches_10_and_1(db_session):
+    from database import ContentMedia
+    async with db_session() as session:
+        session.add(User(id=2011, first_name="TG User", is_admin=False))
+        content = Content(
+            key="multi_media_page",
+            text_content="Описание галереи",
+            is_visible=True,
+            content_order="media_top",
+        )
+        session.add(content)
+        await session.flush()
+        for idx in range(11):
+            session.add(
+                ContentMedia(
+                    content_key="multi_media_page",
+                    file_id=f"file_id_{idx}",
+                    file_type="photo",
+                )
+            )
+        await session.commit()
+
+    mock_bot = SimpleNamespace(
+        send_message=AsyncMock(),
+        send_media_group=AsyncMock(),
+        send_photo=AsyncMock(),
+    )
+    rendered = await handlers.render_static_content_telegram(
+        mock_bot,
+        chat_id=2011,
+        user_id=2011,
+        content_key="multi_media_page",
+    )
+    assert rendered is True
+
+    # First batch (10 items) via send_media_group
+    mock_bot.send_media_group.assert_called_once()
+    media_arg = mock_bot.send_media_group.call_args.kwargs["media"]
+    assert len(media_arg) == 10
+
+    # 11th item sent via send_photo
+    mock_bot.send_photo.assert_called_once()
+    photo_arg = mock_bot.send_photo.call_args[0][1] if len(mock_bot.send_photo.call_args[0]) > 1 else mock_bot.send_photo.call_args[1].get("photo")
+    assert photo_arg == "file_id_10"
+
+    # Text message sent with main_client_keyboard
+    mock_bot.send_message.assert_called_once()
+    text_call = mock_bot.send_message.call_args
+    assert "Описание галереи" in (text_call[0][1] if len(text_call[0]) > 1 else text_call[1].get("text"))
+    assert text_call[1].get("reply_markup") is not None
+
+
+@pytest.mark.asyncio
+async def test_telegram_media_only_multi_media_restores_reply_keyboard(db_session):
+    from database import ContentMedia
+    async with db_session() as session:
+        session.add(User(id=2012, first_name="TG User", is_admin=False))
+        content = Content(
+            key="media_only_page",
+            text_content="",
+            is_visible=True,
+            content_order="media_top",
+        )
+        session.add(content)
+        await session.flush()
+        for idx in range(3):
+            session.add(
+                ContentMedia(
+                    content_key="media_only_page",
+                    file_id=f"photo_{idx}",
+                    file_type="photo",
+                )
+            )
+        await session.commit()
+
+    mock_bot = SimpleNamespace(
+        send_message=AsyncMock(),
+        send_media_group=AsyncMock(),
+        send_photo=AsyncMock(),
+    )
+    rendered = await handlers.render_static_content_telegram(
+        mock_bot,
+        chat_id=2012,
+        user_id=2012,
+        content_key="media_only_page",
+    )
+    assert rendered is True
+
+    # Media group sent
+    mock_bot.send_media_group.assert_called_once()
+    assert len(mock_bot.send_media_group.call_args.kwargs["media"]) == 3
+
+    # NAVIGATION_MENU_HINT sent with reply keyboard to restore Telegram navigation
+    mock_bot.send_message.assert_called_once()
+    hint_call = mock_bot.send_message.call_args
+    assert (hint_call[0][1] if len(hint_call[0]) > 1 else hint_call[1].get("text")) == handlers.NAVIGATION_MENU_HINT
+    assert hint_call[1].get("reply_markup") is not None
+
+
+@pytest.mark.asyncio
+async def test_telegram_duplicate_action_buttons_collision_and_label_resolution(db_session):
+    async with db_session() as session:
+        session.add(User(id=2013, first_name="TG User", is_admin=False, current_dialogue_id=1))
+        session.add(
+            Content(
+                key="duplicate_buttons_page",
+                text_content="Выберите опцию:\n[Первый](btn:same_action) | [Второй](btn:same_action)",
+                is_visible=True,
+            )
+        )
+        await session.commit()
+
+    mock_bot = SimpleNamespace(send_message=AsyncMock())
+    rendered = await handlers.render_static_content_telegram(
+        mock_bot,
+        chat_id=2013,
+        user_id=2013,
+        content_key="duplicate_buttons_page",
+    )
+    assert rendered is True
+
+    from response_buttons import build_action_callback_data
+
+    # Check rendered markup has distinct indexed callback_data
+    msg1_call = mock_bot.send_message.call_args_list[0]
+    markup = msg1_call[1].get("reply_markup")
+    assert isinstance(markup, handlers.InlineKeyboardMarkup)
+    row0 = markup.inline_keyboard[0]
+    assert len(row0) == 2
+    btn0 = row0[0]
+    btn1 = row0[1]
+    assert btn0.text == "Первый"
+    assert btn0.callback_data == build_action_callback_data("same_action", 0)
+    assert btn1.text == "Второй"
+    assert btn1.callback_data == build_action_callback_data("same_action", 1)
+    assert btn0.callback_data != btn1.callback_data
+
+    # Verify clicking each button resolves its own visible label correctly in _prepare_ai_button_submission
+    mock_state = AsyncMock()
+
+    # Click btn0
+    cb0 = SimpleNamespace(
+        data=btn0.callback_data,
+        from_user=SimpleNamespace(id=2013),
+        message=SimpleNamespace(
+            message_id=201,
+            chat=SimpleNamespace(id=2013),
+            answer=AsyncMock(),
+            edit_reply_markup=AsyncMock(),
+            reply_markup=markup,
+        ),
+        answer=AsyncMock(),
+    )
+    with patch("handlers.process_buffered_messages", new_callable=AsyncMock) as mock_process:
+        await handlers.process_response_button(cb0, mock_state, mock_bot)
+        assert 2013 in handlers.user_message_buffers
+        assert '"Первый"' in handlers.user_message_buffers[2013][0]
+        handlers.user_message_buffers.clear()
+
+    # Click btn1
+    cb1 = SimpleNamespace(
+        data=btn1.callback_data,
+        from_user=SimpleNamespace(id=2013),
+        message=SimpleNamespace(
+            message_id=202,
+            chat=SimpleNamespace(id=2013),
+            answer=AsyncMock(),
+            edit_reply_markup=AsyncMock(),
+            reply_markup=markup,
+        ),
+        answer=AsyncMock(),
+    )
+    with patch("handlers.process_buffered_messages", new_callable=AsyncMock) as mock_process:
+        await handlers.process_response_button(cb1, mock_state, mock_bot)
+        assert 2013 in handlers.user_message_buffers
+        assert '"Второй"' in handlers.user_message_buffers[2013][0]
+        handlers.user_message_buffers.clear()

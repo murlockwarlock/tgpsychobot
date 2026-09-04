@@ -30,7 +30,7 @@ from .services import admin_collections as admin_collections_service
 from .services import admin_topic_media as admin_topic_media_service
 from .services import common, settings as settings_service, subscriptions as subscriptions_service, tests as tests_service, topics as topics_service
 from .settings import get_settings, validate_webhook_runtime_settings
-from .keyboards import build_main_menu, inline_keyboard, main_menu_row
+from .keyboards import inline_keyboard, main_menu_row
 from .identity import is_max_user_id
 from .storage import StateStore, init_storage
 
@@ -1899,6 +1899,27 @@ async def polling_loop(bot_app: MaxBotApplication, client: MaxApiClient, backgro
             await asyncio.sleep(3)
 
 
+def build_max_global_commands(
+    *,
+    topics_enabled: bool = True,
+    subscriptions_enabled: bool = True,
+    referral_enabled: bool = False,
+) -> list[dict[str, str]]:
+    commands = [
+        {"name": "start", "description": "Запустить / Перезапустить бота"},
+        {"name": "help", "description": "Помощь"},
+    ]
+    if topics_enabled:
+        commands.append({"name": "topics", "description": "Выбрать тему"})
+    commands.append({"name": "new_dialogue", "description": "Новый диалог"})
+    commands.append({"name": "settings", "description": "Настройки"})
+    if subscriptions_enabled:
+        commands.append({"name": "subscription", "description": "Подписка"})
+    if referral_enabled:
+        commands.append({"name": "ref", "description": "🤝 Пригласить друзей"})
+    return commands
+
+
 async def create_web_app() -> web.Application:
     settings = get_settings()
     validate_webhook_runtime_settings(settings)
@@ -1933,18 +1954,11 @@ async def create_web_app() -> web.Application:
     except Exception:
         max_log.exception("Failed to load SubscriptionConfig on startup to set commands")
 
-    commands = [
-        {"name": "start", "description": "Запустить / Перезапустить бота"},
-        {"name": "help", "description": "Помощь"},
-    ]
-    if topics_enabled:
-        commands.append({"name": "topics", "description": "Выбрать тему"})
-    commands.append({"name": "new_dialogue", "description": "Новый диалог"})
-    commands.append({"name": "settings", "description": "Настройки"})
-    if subscriptions_enabled:
-        commands.append({"name": "subscription", "description": "Подписка"})
-    if referral_enabled:
-        commands.append({"name": "ref", "description": "🤝 Пригласить друзей"})
+    commands = build_max_global_commands(
+        topics_enabled=topics_enabled,
+        subscriptions_enabled=subscriptions_enabled,
+        referral_enabled=referral_enabled,
+    )
 
     try:
         await client.set_commands(commands)

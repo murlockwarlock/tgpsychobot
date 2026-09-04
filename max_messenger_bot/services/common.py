@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from ..ai import AIServiceError, generate_image, get_ai_response, edit_image
 from ..api import MaxApiClient
 from ..formatting import markdown_to_html, split_text
-from ..keyboards import build_main_menu, callback_button, disclaimer_keyboard, inline_keyboard, link_button, main_menu_row, response_buttons_keyboard
+from ..keyboards import callback_button, disclaimer_keyboard, inline_keyboard, link_button, main_menu_row, response_buttons_keyboard
 from ..logging_utils import get_bot_logger
 from ..legacy import (
     AIConfig,
@@ -460,6 +460,9 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
             )
 
     if start_payload:
+        if start_payload == "menu":
+            await show_menu(client, chat_id, user_id=user_id)
+            return
         if start_payload == "sub":
             from .subscriptions import show_subscription_info
 

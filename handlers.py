@@ -2126,77 +2126,118 @@ async def render_static_content_telegram(
 
     raw_text = content_obj.text_content or ""
     clean_text, parsed_rows = extract_response_buttons(raw_text)
+    clean_text = clean_text.strip() if clean_text else ""
 
     inline_kb = None
     if parsed_rows:
-        builder = InlineKeyboardBuilder()
-        for row in parsed_rows:
-            row_buttons = []
-            for btn in row:
-                if btn.kind == "url":
-                    row_buttons.append(InlineKeyboardButton(text=btn.text, url=btn.value))
-                else:
-                    row_buttons.append(InlineKeyboardButton(text=btn.text, callback_data=build_action_callback_data(btn.value)))
-            builder.row(*row_buttons)
-        inline_kb = builder.as_markup()
+        inline_kb = _telegram_response_buttons_markup(parsed_rows)
     elif content_obj.action_btn_text and content_obj.action_btn_payload:
-        inline_kb = kb.action_button_keyboard(content_obj.action_btn_text, "start_action" if is_start else "content_action")
+        inline_kb = kb.action_button_keyboard(
+            content_obj.action_btn_text,
+            "start_action" if is_start else "content_action",
+        )
 
-    media = content_obj.media
-    order = content_obj.content_order or 'media_top'
-    markup_to_send = inline_kb if inline_kb else main_kb
+    media = list(content_obj.media or [])
+    order = content_obj.content_order or "media_top"
 
-    async def send_text_func(markup):
-        text_to_send = clean_text if clean_text else ("\u200b" if inline_kb else "")
-        if text_to_send:
-            await bot.send_message(chat_id, text_to_send, reply_markup=markup, parse_mode="HTML")
-            return True
-        return False
+    # Single media with short text and media_top: send combined caption
+    if media and len(media) == 1 and clean_text and len(clean_text) < 1000 and order == "media_top":
+        item = media[0]
+        caption_markup = inline_kb if inline_kb else main_kb
+        if item.file_type == "photo":
+            await bot.send_photo(chat_id, item.file_id, caption=clean_text, reply_markup=caption_markup, parse_mode="HTML")
+        elif item.file_type == "video":
+            await bot.send_video(chat_id, item.file_id, caption=clean_text, reply_markup=caption_markup, parse_mode="HTML")
+        if inline_kb:
+            await asyncio.sleep(0.3)
+            await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+        return True
 
-    async def send_media_func(markup):
-        if media:
-            if len(media) == 1 and len(clean_text or "") < 1000 and order == 'media_top' and clean_text:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await bot.send_photo(chat_id, item.file_id, caption=clean_text, reply_markup=markup, parse_mode="HTML")
-                elif item.file_type == 'video':
-                    await bot.send_video(chat_id, item.file_id, caption=clean_text, reply_markup=markup, parse_mode="HTML")
-                return True
-            if len(media) == 1:
-                item = media[0]
-                if item.file_type == 'photo':
-                    await bot.send_photo(chat_id, item.file_id, reply_markup=markup)
-                elif item.file_type == 'video':
-                    await bot.send_video(chat_id, item.file_id, reply_markup=markup)
-                return True
-            media_group = []
-            for item in media:
-                media_to_add = InputMediaPhoto(media=item.file_id) if item.file_type == 'photo' else InputMediaVideo(media=item.file_id)
-                media_group.append(media_to_add)
-            if media_group:
+    text_chunks = split_html_text(clean_text, 4000) if clean_text else []
+
+    async def _send_media_batch(markup=None):
+        if not media:
+            return
+        if len(media) == 1:
+            item = media[0]
+            if item.file_type == "photo":
+                await bot.send_photo(chat_id, item.file_id, reply_markup=markup)
+            elif item.file_type == "video":
+                await bot.send_video(chat_id, item.file_id, reply_markup=markup)
+            return
+        for i in range(0, len(media), 10):
+            chunk = media[i:i + 10]
+            if len(chunk) == 1:
+                item = chunk[0]
+                if item.file_type == "photo":
+                    await bot.send_photo(chat_id, item.file_id)
+                elif item.file_type == "video":
+                    await bot.send_video(chat_id, item.file_id)
+            else:
+                media_group = [
+                    InputMediaPhoto(media=item.file_id) if item.file_type == "photo" else InputMediaVideo(media=item.file_id)
+                    for item in chunk
+                ]
                 await bot.send_media_group(chat_id, media=media_group)
-                return False
-        return False
-
-    sent_combined = False
-    if media and len(media) == 1 and len(clean_text or "") < 1000 and order == 'media_top':
-        sent_combined = await send_media_func(markup_to_send)
-
-    if not sent_combined:
-        if order == 'media_top':
-            await send_media_func(main_kb if not inline_kb else None)
-            if media:
+            if i + 10 < len(media):
                 await asyncio.sleep(0.2)
-            await send_text_func(markup_to_send)
+
+    async def _send_text_chunks(last_markup=None):
+        if not text_chunks:
+            if last_markup:
+                await bot.send_message(chat_id, "\u200b", reply_markup=last_markup)
+            return
+        for index, chunk in enumerate(text_chunks):
+            chunk_markup = last_markup if index == len(text_chunks) - 1 else None
+            await _safe_send_html(
+                lambda text, pm, m=chunk_markup: bot.send_message(
+                    chat_id, text, parse_mode=pm, reply_markup=m
+                ),
+                chunk,
+            )
+            if index < len(text_chunks) - 1:
+                await asyncio.sleep(0.2)
+
+    if order == "media_top":
+        if media:
+            if not text_chunks and not inline_kb:
+                if len(media) == 1:
+                    await _send_media_batch(main_kb)
+                else:
+                    await _send_media_batch(None)
+                    await asyncio.sleep(0.3)
+                    await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+                return True
+            await _send_media_batch(None)
+            await asyncio.sleep(0.2)
+
+        if inline_kb:
+            await _send_text_chunks(inline_kb)
+            await asyncio.sleep(0.3)
+            await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
         else:
-            await send_text_func(markup_to_send)
+            await _send_text_chunks(main_kb)
+    else:  # text_top
+        if inline_kb:
+            await _send_text_chunks(inline_kb)
             if media:
                 await asyncio.sleep(0.2)
-            await send_media_func(main_kb if not inline_kb else None)
-
-    if inline_kb:
-        await asyncio.sleep(0.3)
-        await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+                await _send_media_batch(None)
+            await asyncio.sleep(0.3)
+            await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+        else:
+            if media:
+                if text_chunks:
+                    await _send_text_chunks(None)
+                    await asyncio.sleep(0.2)
+                if len(media) == 1:
+                    await _send_media_batch(main_kb)
+                else:
+                    await _send_media_batch(None)
+                    await asyncio.sleep(0.3)
+                    await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+            else:
+                await _send_text_chunks(main_kb)
 
     return True
 
