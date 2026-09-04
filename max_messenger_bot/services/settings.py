@@ -66,6 +66,7 @@ async def start_change_gender(client: MaxApiClient, states: StateStore, chat_id:
         data.update(resume_data)
     if initial_prompt:
         data["initial_prompt"] = initial_prompt
+    if not is_settings or (resume_data and resume_data.get("is_onboarding")):
         data["is_onboarding"] = True
     await states.set(user_id, chat_id, "awaiting_gender", data)
     await client.send_message(chat_id=chat_id, text="Выберите ваш пол:", attachments=gender_keyboard())

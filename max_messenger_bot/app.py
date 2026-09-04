@@ -91,6 +91,7 @@ class MaxBotApplication:
         self.states = StateStore()
         self.background_tasks: set[asyncio.Task[None]] = set()
         self._user_locks: dict[int, asyncio.Lock] = {}
+        self.user_tasks: dict[int, asyncio.Task[None]] = {}
         self._processed_updates: set[str] = set()
         self._processed_updates_list: list[str] = []
 
@@ -102,6 +103,8 @@ class MaxBotApplication:
                 await coro
 
         task = asyncio.create_task(runner())
+        self.user_tasks[user_id] = task
+        task.add_done_callback(lambda t: self.user_tasks.pop(user_id, None) if self.user_tasks.get(user_id) is t else None)
         _track_task(self.background_tasks, task)
 
     async def handle_update(self, update: dict[str, Any]) -> None:
@@ -158,6 +161,21 @@ class MaxBotApplication:
         except Exception:
             log.exception("Failed to notify user about update failure update_type=%s", update_type)
 
+    async def _handle_start_command(self, chat_id: int, user_id: int, start_payload: str | None) -> None:
+        if start_payload and start_payload.startswith("topic_"):
+            try:
+                topic_id = int(start_payload.split("_", 1)[1])
+            except ValueError:
+                topic_id = None
+            if topic_id is not None:
+                await common.show_start_screen(self.client, chat_id, user_id, start_payload=None, states=self.states, skip_content=True)
+                self.spawn_user_task(
+                    user_id,
+                    topics_service.select_topic(self.client, chat_id, user_id, topic_id, self.states),
+                )
+                return
+        await common.show_start_screen(self.client, chat_id, user_id, start_payload, self.states)
+
     async def handle_message(self, message: IncomingMessage, force_start: bool = False) -> None:
         log.info(
             "Incoming message user_id=%s chat_id=%s force_start=%s text=%s",
@@ -173,7 +191,7 @@ class MaxBotApplication:
             public_name=message.sender.public_name,
         )
         if force_start:
-            await common.show_start_screen(self.client, message.chat_id, message.sender.user_id, message.start_payload, self.states)
+            await self._handle_start_command(message.chat_id, message.sender.user_id, message.start_payload)
             return
 
         text = (message.text or "").strip()
@@ -531,7 +549,7 @@ class MaxBotApplication:
 
         if text.startswith("/start"):
             payload = text.split(" ", 1)[1].strip() if " " in text else None
-            await common.show_start_screen(self.client, message.chat_id, message.sender.user_id, payload, self.states)
+            await self._handle_start_command(message.chat_id, message.sender.user_id, payload)
             return
         if text == "/help":
             await common.show_help(self.client, message.chat_id, message.sender.user_id)
@@ -556,7 +574,7 @@ class MaxBotApplication:
             await settings_service.show_settings(self.client, message.chat_id, message.sender.user_id)
             return
         if text == "/new_dialogue" or text == "🗑️ Сбросить диалог":
-            await common.request_reset_dialogue(self.client, message.chat_id, message.sender.user_id)
+            await common.request_reset_dialogue(self.client, self.states, message.chat_id, message.sender.user_id)
             return
         if text == "/topics":
             await topics_service.show_topics(self.client, message.chat_id, message.sender.user_id)
@@ -690,6 +708,7 @@ class MaxBotApplication:
             await common.show_menu(self.client, chat_id, user_id=user_id)
             return
         if data == "topic_start_dialogue":
+            await self.client.answer_callback(callback.callback_id)
             await self.client.send_message(chat_id=chat_id, text="✍️ Напишите ваш первый вопрос, и я отвечу.")
             return
         if data == "noop":
@@ -721,7 +740,7 @@ class MaxBotApplication:
                 await common.render_static_content(self.client, chat_id, user_id, "start_message", is_start=True)
                 return
             if action in ("new_dialogue", "svc:reset"):
-                await common.request_reset_dialogue(self.client, chat_id, user_id)
+                await common.request_reset_dialogue(self.client, self.states, chat_id, user_id)
                 return
             if action == "svc:continue":
                 await self.client.send_message(chat_id=chat_id, text="Введите ваше сообщение для начала/продолжения диалога:")
@@ -810,13 +829,21 @@ class MaxBotApplication:
         if data.startswith("confirm_reset_dialogue:"):
             await self.client.answer_callback(callback.callback_id)
             parts = data.split(":")
-            expected_dialogue_id = int(parts[1])
-            expected_topic_id = int(parts[2])
-            self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, chat_id, user_id, expected_dialogue_id, expected_topic_id))
+            if len(parts) == 4:
+                token = parts[1]
+                expected_dialogue_id = int(parts[2])
+                expected_topic_id = int(parts[3])
+                self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, token, expected_dialogue_id, expected_topic_id))
+            elif len(parts) == 3:
+                expected_dialogue_id = int(parts[1])
+                expected_topic_id = int(parts[2])
+                self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, "", expected_dialogue_id, expected_topic_id))
             return
-        if data == "cancel_reset_dialogue":
+        if data.startswith("cancel_reset_dialogue"):
             await self.client.answer_callback(callback.callback_id)
-            await common.cancel_reset_dialogue(self.client, chat_id)
+            parts = data.split(":")
+            token = parts[1] if len(parts) > 1 else None
+            self.spawn_user_task(user_id, common.cancel_reset_dialogue(self.client, self.states, chat_id, user_id, token))
             return
         if data in {"show_subscription_info_from_chat", "back_to_sub_info", "sub_info"}:
             await subscriptions_service.show_subscription_info(self.client, chat_id, user_id)

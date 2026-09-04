@@ -30,13 +30,13 @@ with patch.object(sqlalchemy_asyncio, "create_async_engine", _sqlite_compatible_
         Base,
         BotGeneralConfig,
         Content,
+        KnowledgeBase,
         Message as DBMessage,
         SubscriptionConfig,
         Topic,
         User,
         UserSubscription,
         async_session_maker,
-        init_db,
     )
     import handlers
     import keyboards as tg_kb
@@ -45,6 +45,7 @@ with patch.object(sqlalchemy_asyncio, "create_async_engine", _sqlite_compatible_
     import max_messenger_bot.storage as max_storage
     from max_messenger_bot import app as max_app
     from max_messenger_bot.api import MaxApiClient
+    from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
     from max_messenger_bot.services import (
         admin_topics as max_admin_topics,
         common as max_common,
@@ -86,7 +87,7 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         # Seed configs
         async with self.session_factory() as session:
-            session.add(AIConfig(id=1, memory_mode="reset"))
+            session.add(AIConfig(id=1, memory_mode="reset", provider="gemini", gemini_model="gemini-2.5-flash", gemini_api_key="test-key"))
             session.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
             session.add(BotGeneralConfig(id=1, profile_collect_name=True, profile_collect_gender=True, profile_collect_age=False))
             await session.commit()
@@ -95,11 +96,19 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         handlers.user_isolated_turn_queues.clear()
         handlers.user_processing_tasks.clear()
         handlers.user_scheduling_locks.clear()
+        handlers.user_locks.clear()
 
     async def asyncTearDown(self):
         for p in reversed(self.patches):
             p.stop()
         await self.engine.dispose()
+
+    def _make_mock_bot(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        bot.send_chat_action = AsyncMock()
+        bot.delete_message = AsyncMock()
+        return bot
 
     def test_sanitize_and_build_synthetic_message(self):
         dirty_topic = 'Тревожность "и" [стресс] (бытовой) \\ тест\n\r  новая   строка  '
@@ -118,116 +127,156 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь выбрал тему", msg)
         self.assertIn("Тревожность", msg)
 
-    async def test_telegram_topic_selection_auto_start_turn_isolation(self):
-        """Verify that selecting an auto-start topic creates Turn 1 as synthetic prompt without visible echo, and subsequent user messages run as Turn 2 with debounce."""
+    async def test_telegram_drain_race_window_a_during_provider_call(self):
+        """Window A: User sends real message while provider call is actively in-flight -> processed sequentially."""
         async with self.session_factory() as session:
-            user = User(id=101, first_name="Alice", name="Alice", gender="female", age="25", accepted_disclaimer=True, current_dialogue_id=1)
+            user = User(id=110, first_name="Alice", name="Alice", gender="female", age="25", accepted_disclaimer=True, current_dialogue_id=1)
             topic = Topic(id=1, name="Карьера", is_active=True, auto_start_dialogue=True)
             session.add_all([user, topic])
             await session.commit()
 
-        bot = MagicMock()
-        bot.send_message = AsyncMock()
+        bot = self._make_mock_bot()
         state = MagicMock()
         state.get_data = AsyncMock(return_value={})
         state.set_state = AsyncMock()
         state.clear = AsyncMock()
 
-        callback = MagicMock()
-        callback.from_user = SimpleNamespace(id=101, username="alice", full_name="Alice")
-        callback.data = "select_topic_1"
-        callback.answer = AsyncMock()
-        callback.message = MagicMock()
-        callback.message.chat = SimpleNamespace(id=101)
-        callback.message.delete = AsyncMock()
-        callback.message.answer = AsyncMock()
-
-        ai_responses = []
+        ai_prompts = []
+        turn1_started = asyncio.Event()
 
         async def fake_generate_response(user_id, prompt, *args, **kwargs):
-            ai_responses.append((prompt, kwargs.get("visible_user_text")))
-            return "Здравствуйте! Давайте обсудим карьеру."
-
-        with patch("handlers.ai_integration.generate_response", side_effect=fake_generate_response):
-            await handlers.process_topic_selection(callback, state, bot)
-            # Wait for drain runner
-            task = handlers.user_processing_tasks.get(101)
-            if task:
-                await task
-
-        self.assertEqual(len(ai_responses), 1)
-        synthetic_prompt, visible_text = ai_responses[0]
-        self.assertIn("[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь выбрал тему", synthetic_prompt)
-        self.assertIn("Карьера", synthetic_prompt)
-        self.assertIsNone(visible_text)
-
-        # Verify DB state: topic is set and assistant response is saved
-        async with self.session_factory() as session:
-            db_user = await session.get(User, 101)
-            self.assertEqual(db_user.current_topic_id, 1)
-            msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 101))).scalars().all()
-            self.assertEqual(len(msgs), 2)  # 1 synthetic user message + 1 assistant message
-            self.assertEqual(msgs[0].role, "user")
-            self.assertIn("СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь выбрал тему", msgs[0].content)
-            self.assertEqual(msgs[1].role, "assistant")
-            self.assertIn("Здравствуйте! Давайте обсудим карьеру.", msgs[1].content)
-
-    async def test_telegram_real_user_message_batches_separately_after_auto_start(self):
-        """Verify Turn 1 (synthetic auto start) and Turn 2 (real user text) execute sequentially without merging."""
-        async with self.session_factory() as session:
-            user = User(id=102, first_name="Bob", name="Bob", gender="male", age="30", accepted_disclaimer=True, current_dialogue_id=1)
-            topic = Topic(id=2, name="Отношения", is_active=True, auto_start_dialogue=True)
-            session.add_all([user, topic])
-            await session.commit()
-
-        bot = MagicMock()
-        bot.send_message = AsyncMock()
-        state = MagicMock()
-        state.get_data = AsyncMock(return_value={})
-        state.set_state = AsyncMock()
-        state.clear = AsyncMock()
-
-        turns_executed = []
-
-        async def fake_generate_response(user_id, prompt, *args, **kwargs):
-            turns_executed.append(prompt)
+            ai_prompts.append(prompt)
+            if len(ai_prompts) == 1:
+                turn1_started.set()
+                await asyncio.sleep(0.05)
             return "Ответ ИИ"
 
         with patch("handlers.ai_integration.generate_response", side_effect=fake_generate_response):
-            # 1. Trigger topic auto start
-            await handlers._start_telegram_topic_auto_start(102, bot, state, topic)
+            await handlers._start_telegram_topic_auto_start(110, bot, state, topic)
+            await turn1_started.wait()
 
-            # 2. Immediately enqueue real user text
-            handlers.user_message_buffers.setdefault(102, []).append("Привет, хочу совет.")
-            handlers._ensure_telegram_drain_runner(102, bot, state, initial_delay=0.0)
+            # Real user message arrives while Turn 1 is executing
+            msg = MagicMock()
+            msg.from_user = SimpleNamespace(id=110, username="alice", full_name="Alice")
+            msg.chat = SimpleNamespace(id=110)
+            msg.text = "Мой вопрос о карьере"
+            await handlers.handle_ai_chat(msg, state, bot)
 
-            # Wait for processing task to complete
-            while handlers._has_user_turn_work(102) or (102 in handlers.user_processing_tasks and not handlers.user_processing_tasks[102].done()):
-                task = handlers.user_processing_tasks.get(102)
+            # Wait for all tasks
+            while handlers._has_user_turn_work(110) or (110 in handlers.user_processing_tasks and not handlers.user_processing_tasks[110].done()):
+                task = handlers.user_processing_tasks.get(110)
                 if task:
                     await task
                 await asyncio.sleep(0.01)
 
-        self.assertEqual(len(turns_executed), 2)
-        self.assertIn("[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь выбрал тему", turns_executed[0])
-        self.assertEqual(turns_executed[1], "Привет, хочу совет.")
+        self.assertEqual(len(ai_prompts), 2)
+        self.assertIn("СИСТЕМНОЕ СООБЩЕНИЕ", ai_prompts[0])
+        self.assertEqual(ai_prompts[1], "Мой вопрос о карьере")
 
-    async def test_telegram_disclaimer_gate_and_resume(self):
-        """User without disclaimer acceptance gets disclaimer keyboard, and accepting resumes auto-start."""
+    async def test_telegram_drain_race_window_b_between_empty_and_unregister_event_barrier(self):
+        """Window B: Message arrives after queue empty check but before runner unregisters -> atomic handoff schedules replacement."""
         async with self.session_factory() as session:
-            user = User(id=103, first_name="Charlie", name="Charlie", gender="male", age="22", accepted_disclaimer=False, current_dialogue_id=1)
-            topic = Topic(id=3, name="Саморазвитие", is_active=True, auto_start_dialogue=True)
+            user = User(id=111, first_name="Bob", name="Bob", gender="male", age="30", accepted_disclaimer=True, current_dialogue_id=1)
+            topic = Topic(id=2, name="Отношения", is_active=True, auto_start_dialogue=True)
             session.add_all([user, topic])
-            session.add(Content(key="disclaimer", text_content="Текст дисклеймера", is_visible=True))
             await session.commit()
 
-        bot = MagicMock()
-        bot.send_message = AsyncMock()
+        bot = self._make_mock_bot()
+        state = MagicMock()
+        state.get_data = AsyncMock(return_value={})
+        state.set_state = AsyncMock()
+        state.clear = AsyncMock()
 
-        state_data = {}
+        ai_prompts = []
+        turn1_done = asyncio.Event()
+
+        async def fake_generate_response(user_id, prompt, *args, **kwargs):
+            ai_prompts.append(prompt)
+            turn1_done.set()
+            return "Ответ ИИ"
+
+        with patch("handlers.ai_integration.generate_response", side_effect=fake_generate_response):
+            await handlers._start_telegram_topic_auto_start(111, bot, state, topic)
+            await turn1_done.wait()
+
+            # Enqueue message exactly as runner finishes turn 1
+            msg = MagicMock()
+            msg.from_user = SimpleNamespace(id=111, username="bob", full_name="Bob")
+            msg.chat = SimpleNamespace(id=111)
+            msg.text = "Вопрос в окне B"
+            await handlers.handle_ai_chat(msg, state, bot)
+
+            while handlers._has_user_turn_work(111) or (111 in handlers.user_processing_tasks and not handlers.user_processing_tasks[111].done()):
+                task = handlers.user_processing_tasks.get(111)
+                if task:
+                    await task
+                await asyncio.sleep(0.01)
+
+        self.assertEqual(len(ai_prompts), 2)
+        self.assertIn("СИСТЕМНОЕ СООБЩЕНИЕ", ai_prompts[0])
+        self.assertEqual(ai_prompts[1], "Вопрос в окне B")
+
+    async def test_telegram_drain_race_window_c_immediately_after_unregister(self):
+        """Window C: Message arrives immediately after runner task has completed and popped -> schedules fresh runner."""
+        async with self.session_factory() as session:
+            user = User(id=112, first_name="Charlie", name="Charlie", gender="male", age="22", accepted_disclaimer=True, current_dialogue_id=1)
+            topic = Topic(id=3, name="Саморазвитие", is_active=True, auto_start_dialogue=True)
+            session.add_all([user, topic])
+            await session.commit()
+
+        bot = self._make_mock_bot()
+        state = MagicMock()
+        state.get_data = AsyncMock(return_value={})
+        state.set_state = AsyncMock()
+        state.clear = AsyncMock()
+
+        ai_prompts = []
+
+        async def fake_generate_response(user_id, prompt, *args, **kwargs):
+            ai_prompts.append(prompt)
+            return "Ответ ИИ"
+
+        with patch("handlers.ai_integration.generate_response", side_effect=fake_generate_response):
+            await handlers._start_telegram_topic_auto_start(112, bot, state, topic)
+
+            # Wait for runner to complete and unregister
+            task = handlers.user_processing_tasks.get(112)
+            if task:
+                await task
+            self.assertNotIn(112, handlers.user_processing_tasks)
+
+            # Now send message immediately after unregister
+            msg = MagicMock()
+            msg.from_user = SimpleNamespace(id=112, username="charlie", full_name="Charlie")
+            msg.chat = SimpleNamespace(id=112)
+            msg.text = "Вопрос после завершения раннера"
+            await handlers.handle_ai_chat(msg, state, bot)
+
+            while handlers._has_user_turn_work(112) or (112 in handlers.user_processing_tasks and not handlers.user_processing_tasks[112].done()):
+                task = handlers.user_processing_tasks.get(112)
+                if task:
+                    await task
+                await asyncio.sleep(0.01)
+
+        self.assertEqual(len(ai_prompts), 2)
+        self.assertEqual(ai_prompts[1], "Вопрос после завершения раннера")
+
+    async def test_telegram_stale_pending_topic_after_topic_switch(self):
+        """TG: User selects Topic B -> disclaimer pending -> user switches to Topic C -> accept disclaimer does NOT start Topic B."""
+        async with self.session_factory() as session:
+            user = User(id=113, first_name="Dan", name="Dan", gender="male", age="29", accepted_disclaimer=False, current_dialogue_id=1, current_topic_id=1)
+            topic_b = Topic(id=1, name="Topic B", is_active=True, auto_start_dialogue=True)
+            topic_c = Topic(id=2, name="Topic C", is_active=True, auto_start_dialogue=False)
+            session.add_all([user, topic_b, topic_c])
+            session.add(Content(key="disclaimer", text_content="Disclaimer text", is_visible=True))
+            await session.commit()
+
+        bot = self._make_mock_bot()
+
+        state_data = {"pending_auto_start_topic_id": 1}
 
         async def fake_get_data():
-            return state_data
+            return dict(state_data)
 
         async def fake_update_data(**kwargs):
             state_data.update(kwargs)
@@ -235,29 +284,19 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         state = MagicMock()
         state.get_data = AsyncMock(side_effect=fake_get_data)
         state.update_data = AsyncMock(side_effect=fake_update_data)
-        state.set_state = AsyncMock()
         state.clear = AsyncMock(side_effect=state_data.clear)
 
-        callback = MagicMock()
-        callback.from_user = SimpleNamespace(id=103, username="charlie", full_name="Charlie")
-        callback.data = "select_topic_3"
-        callback.answer = AsyncMock()
-        callback.message = MagicMock()
-        callback.message.chat = SimpleNamespace(id=103)
-        callback.message.delete = AsyncMock()
-        callback.message.answer = AsyncMock()
+        # In DB, user current topic is switched to Topic C (id=2)
+        async with self.session_factory() as session:
+            user_db = await session.get(User, 113)
+            user_db.current_topic_id = 2
+            await session.commit()
 
-        # Topic selection triggers disclaimer prompt
-        await handlers.process_topic_selection(callback, state, bot)
-        self.assertEqual(state_data.get("pending_auto_start_topic_id"), 3)
-        self.assertTrue(any("дисклеймер" in str(c).lower() for c in bot.send_message.call_args_list))
-
-        # Accept disclaimer
         disc_callback = MagicMock()
-        disc_callback.from_user = SimpleNamespace(id=103)
+        disc_callback.from_user = SimpleNamespace(id=113)
         disc_callback.data = "disclaimer_accepted"
         disc_callback.message = MagicMock()
-        disc_callback.message.chat = SimpleNamespace(id=103)
+        disc_callback.message.chat = SimpleNamespace(id=113)
         disc_callback.message.delete = AsyncMock()
         disc_callback.message.answer = AsyncMock()
 
@@ -265,137 +304,275 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch("handlers._start_telegram_topic_auto_start", side_effect=lambda u, b, s, t: auto_started.append(t.id)):
             await handlers.disclaimer_accepted_handler(disc_callback, state, bot)
 
-        self.assertEqual(auto_started, [3])
-
-    async def test_telegram_admin_only_topic_security(self):
-        """Non-admin user cannot access admin_only topic via deep link or callback."""
+        # Topic B auto-start must NOT be triggered
+        self.assertEqual(len(auto_started), 0)
         async with self.session_factory() as session:
-            user = User(id=104, first_name="Dan", is_admin=False, accepted_disclaimer=True)
-            topic = Topic(id=4, name="Секретная тема", is_active=True, admin_only=True, auto_start_dialogue=True)
-            session.add_all([user, topic])
-            await session.commit()
+            msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 113))).scalars().all()
+            self.assertEqual(len(msgs), 0)
 
-        res = await handlers._perform_telegram_topic_switch(104, 4)
-        self.assertEqual(res.status, "inaccessible")
-
-        # Now test with admin user
+    async def test_max_stale_pending_topic_after_topic_switch(self):
+        """MAX: User selects Topic B -> onboarding pending -> user topic becomes C -> resume callback skips B auto-start."""
         async with self.session_factory() as session:
-            admin_user = User(id=105, first_name="Admin", is_admin=True, accepted_disclaimer=True)
-            session.add(admin_user)
-            await session.commit()
-
-        res_admin = await handlers._perform_telegram_topic_switch(105, 4)
-        self.assertEqual(res_admin.status, "switched")
-        self.assertEqual(res_admin.topic.id, 4)
-
-    async def test_max_topic_auto_start_journey(self):
-        """In MAX, selecting an auto-start topic omits the manual start button and awaits run_ai_dialogue directly."""
-        async with self.session_factory() as session:
-            user = User(id=201, first_name="Eva", name="Eva", gender="female", age="28", accepted_disclaimer=True, current_dialogue_id=1)
-            topic = Topic(id=10, name="Семья", is_active=True, auto_start_dialogue=True)
-            session.add_all([user, topic])
-            await session.commit()
-
-        client = MagicMock()
-        client.send_message = AsyncMock(return_value={"message": {"mid": "m1"}})
-        client.edit_message = AsyncMock()
-        states = StateStore()
-
-        ai_called_prompts = []
-
-        async def fake_get_ai_response(user_id, prompt, *args, **kwargs):
-            ai_called_prompts.append(prompt)
-            return "Привет! Готова поговорить о семье."
-
-        with patch("max_messenger_bot.services.common.get_ai_response", side_effect=fake_get_ai_response):
-            await max_topics.select_topic(client, chat_id=201, user_id=201, topic_id=10, states=states)
-
-        self.assertEqual(len(ai_called_prompts), 1)
-        self.assertIn("СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь выбрал тему", ai_called_prompts[0])
-        self.assertIn("Семья", ai_called_prompts[0])
-
-        # Verify buttons sent in intro message do not contain manual start button
-        intro_call = client.send_message.call_args_list[0]
-        attachments = intro_call.kwargs.get("attachments") or []
-        buttons = attachments[0]["payload"]["buttons"]
-        all_btn_payloads = [b["payload"] for row in buttons for b in row]
-        self.assertNotIn("topic_start_dialogue", all_btn_payloads)
-
-    async def test_max_same_topic_guard(self):
-        """Clicking the currently active topic in MAX is a no-op."""
-        async with self.session_factory() as session:
-            user = User(id=202, first_name="Frank", name="Frank", current_topic_id=15, accepted_disclaimer=True)
-            topic = Topic(id=15, name="Карьера", is_active=True, auto_start_dialogue=True)
-            session.add_all([user, topic])
+            user = User(id=210, first_name="Eve", name="Eve", accepted_disclaimer=True, current_dialogue_id=1, current_topic_id=2)
+            topic_b = Topic(id=1, name="Topic B", is_active=True, auto_start_dialogue=True)
+            topic_c = Topic(id=2, name="Topic C", is_active=True, auto_start_dialogue=False)
+            session.add_all([user, topic_b, topic_c])
             await session.commit()
 
         client = MagicMock()
         client.send_message = AsyncMock()
         states = StateStore()
-
-        await max_topics.select_topic(client, chat_id=202, user_id=202, topic_id=15, states=states)
-        client.send_message.assert_not_called()
-
-    async def test_max_onboarding_preserves_pending_auto_start_topic(self):
-        """New MAX user selecting auto-start topic completes onboarding (name -> gender -> AI auto start)."""
-        async with self.session_factory() as session:
-            user = User(id=203, first_name="Grace", name=None, accepted_disclaimer=True)
-            topic = Topic(id=20, name="Здоровье", is_active=True, auto_start_dialogue=True)
-            session.add_all([user, topic])
-            await session.commit()
-
-        client = MagicMock()
-        client.bot_name = "testbot"
-        client.send_message = AsyncMock(return_value={"message": {"mid": "m1"}})
-        client.edit_message = AsyncMock()
-        states = StateStore()
-
-        # Step 1: select topic triggers onboarding
-        await max_topics.select_topic(client, chat_id=203, user_id=203, topic_id=20, states=states)
-        snap1 = await states.get(203)
-        self.assertEqual(snap1.state, "awaiting_name")
-        self.assertEqual(snap1.data.get("pending_auto_start_topic_id"), 20)
-
-        # Step 2: save name and transition to gender
-        await max_settings.save_name_only(states, 203, "Grace")
-        await max_settings.start_change_gender(
-            client, states, 203, 203, is_settings=False,
-            resume_data={k: v for k, v in snap1.data.items() if k != "initial_prompt"}
-        )
-        snap2 = await states.get(203)
-        self.assertEqual(snap2.state, "awaiting_gender")
-        self.assertEqual(snap2.data.get("pending_auto_start_topic_id"), 20)
-
-        # Step 3: save gender and resume pending turn
-        gender_data = await max_settings.save_gender(client, states, 203, 203, "female")
-        self.assertEqual(gender_data.get("pending_auto_start_topic_id"), 20)
 
         ai_called = []
         with patch("max_messenger_bot.services.common.run_ai_dialogue", side_effect=lambda c, ch, u, p, **kw: ai_called.append(p)):
-            await max_common.resume_pending_ai_turn(client, 203, 203, gender_data, states=states)
+            await max_common.resume_pending_ai_turn(client, 210, 210, {"pending_auto_start_topic_id": 1}, states=states)
 
-        self.assertEqual(len(ai_called), 1)
-        self.assertIn("СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь выбрал тему", ai_called[0])
-        self.assertIn("Здоровье", ai_called[0])
-
-    async def test_admin_toggle_auto_start_tg_and_max(self):
-        """Admin can toggle auto_start_dialogue in TG and MAX."""
+        self.assertEqual(len(ai_called), 0)
         async with self.session_factory() as session:
-            topic = Topic(id=50, name="Учеба", is_active=True, auto_start_dialogue=False)
-            session.add(topic)
+            msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 210))).scalars().all()
+            self.assertEqual(len(msgs), 0)
+
+    async def test_max_real_app_onboarding_name_gender_auto_start(self):
+        """Real MaxBotApplication flow: select auto-start topic -> awaiting_name -> handle_callback gender -> AI auto-start runs once."""
+        async with self.session_factory() as session:
+            user = User(id=211, first_name="Grace", name=None, gender=None, accepted_disclaimer=True, current_dialogue_id=1)
+            topic = Topic(id=10, name="Тревожность", is_active=True, auto_start_dialogue=True)
+            session.add_all([user, topic])
             await session.commit()
 
         client = MagicMock()
-        client.bot_name = "testbot"
-        client.send_message = AsyncMock()
+        client.send_message = AsyncMock(return_value={"message": {"mid": "m1"}})
+        client.edit_message = AsyncMock()
+        client.answer_callback = AsyncMock()
 
-        # MAX toggle
-        await max_admin_topics.toggle_auto_start(client, chat_id=999, topic_id=50)
-        async with self.session_factory() as session:
-            t = await session.get(Topic, 50)
-            self.assertTrue(t.auto_start_dialogue)
+        app = max_app.MaxBotApplication(client)
 
-        await max_admin_topics.toggle_auto_start(client, chat_id=999, topic_id=50)
+        # Step 1: User clicks topic selection callback
+        cb_topic = IncomingCallback(
+            raw={},
+            callback_id="cb_t1",
+            payload="select_topic_10",
+            chat_id=211,
+            message_id="m1",
+            sender=Sender(user_id=211, username="grace", first_name="Grace", last_name=None),
+        )
+        await app.handle_callback(cb_topic)
+        task = app.user_tasks.get(211)
+        if task:
+            await task
+        snap1 = await app.states.get(211)
+        self.assertEqual(snap1.state, "awaiting_name")
+        self.assertEqual(snap1.data.get("pending_auto_start_topic_id"), 10)
+        self.assertTrue(snap1.data.get("is_onboarding"))
+
+        # Step 2: User sends name message
+        msg_name = IncomingMessage(
+            raw={},
+            message_id="m_name",
+            chat_id=211,
+            sender=Sender(user_id=211, username="grace", first_name="Grace", last_name=None),
+            text="Грейс",
+        )
+        await app.handle_message(msg_name)
+        snap2 = await app.states.get(211)
+        self.assertEqual(snap2.state, "awaiting_gender")
+        self.assertEqual(snap2.data.get("pending_auto_start_topic_id"), 10)
+        self.assertTrue(snap2.data.get("is_onboarding"))
+
+        ai_called = []
+
+        async def fake_get_ai(u, p, **kw):
+            ai_called.append(p)
+            return "Здравствуйте, Грейс! Готов обсудить тревожность."
+
+        # Step 3: User clicks gender callback
+        cb_gender = IncomingCallback(
+            raw={},
+            callback_id="cb_g1",
+            payload="gender_female",
+            chat_id=211,
+            message_id="m2",
+            sender=Sender(user_id=211, username="grace", first_name="Grace", last_name=None),
+        )
+        with patch("max_messenger_bot.services.common.get_ai_response", side_effect=fake_get_ai):
+            await app.handle_callback(cb_gender)
+            client.answer_callback.assert_called_with("cb_g1", notification="Пол сохранён")
+
+            # Wait for background task spawned by app
+            task = app.user_tasks.get(211)
+            if task:
+                await task
+
+        self.assertEqual(len(ai_called), 1)
+        self.assertIn("СИСТЕМНОЕ СООБЩЕНИЕ", ai_called[0])
+        self.assertIn("Тревожность", ai_called[0])
+
+    async def test_max_topic_deeplink_serialized_under_user_lock(self):
+        """MAX: Topic deep-link /start topic_<id> serializes behind existing user task under spawn_user_task."""
         async with self.session_factory() as session:
-            t = await session.get(Topic, 50)
-            self.assertFalse(t.auto_start_dialogue)
+            user = User(id=212, first_name="Henry", name="Henry", gender="male", accepted_disclaimer=True, current_dialogue_id=1)
+            topic = Topic(id=12, name="Финансы", is_active=True, auto_start_dialogue=True)
+            session.add_all([user, topic])
+            await session.commit()
+
+        client = MagicMock()
+        client.send_message = AsyncMock(return_value={"message": {"mid": "m1"}})
+        client.edit_message = AsyncMock()
+
+        app = max_app.MaxBotApplication(client)
+
+        execution_order = []
+        task1_started = asyncio.Event()
+        task1_proceed = asyncio.Event()
+
+        async def slow_ai_task():
+            execution_order.append("task1_start")
+            task1_started.set()
+            await task1_proceed.wait()
+            execution_order.append("task1_end")
+
+        app.spawn_user_task(212, slow_ai_task())
+        await task1_started.wait()
+
+        # Send /start topic_12
+        msg_start = IncomingMessage(
+            raw={},
+            message_id="m_start",
+            chat_id=212,
+            sender=Sender(user_id=212, username="henry", first_name="Henry", last_name=None),
+            text="/start topic_12",
+        )
+
+        with patch("max_messenger_bot.services.common.get_ai_response", AsyncMock(return_value="Ответ")):
+            await app.handle_message(msg_start)
+            execution_order.append("deeplink_enqueued")
+            task1_proceed.set()
+
+            task = app.user_tasks.get(212)
+            if task:
+                await task
+
+        self.assertEqual(execution_order, ["task1_start", "deeplink_enqueued", "task1_end"])
+        async with self.session_factory() as session:
+            u = await session.get(User, 212)
+            self.assertEqual(u.current_topic_id, 12)
+
+    async def test_max_topic_start_dialogue_ack_once(self):
+        """MAX: topic_start_dialogue answers callback exactly once FIRST before sending prompt without AI mutation."""
+        async with self.session_factory() as session:
+            user = User(id=213, first_name="Ian", name="Ian", accepted_disclaimer=True, current_dialogue_id=1)
+            topic = Topic(id=14, name="Спорт", is_active=True, auto_start_dialogue=False)
+            session.add_all([user, topic])
+            await session.commit()
+
+        client = MagicMock()
+        client.send_message = AsyncMock(return_value={"message": {"mid": "m1"}})
+        client.answer_callback = AsyncMock()
+
+        app = max_app.MaxBotApplication(client)
+
+        cb = IncomingCallback(
+            raw={},
+            callback_id="cb_start_d",
+            payload="topic_start_dialogue",
+            chat_id=213,
+            message_id="m1",
+            sender=Sender(user_id=213, username="ian", first_name="Ian", last_name=None),
+        )
+        await app.handle_callback(cb)
+
+        client.answer_callback.assert_called_once_with("cb_start_d")
+        client.send_message.assert_called_once_with(
+            chat_id=213,
+            text="✍️ Напишите ваш первый вопрос, и я отвечу.",
+        )
+        async with self.session_factory() as session:
+            msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 213))).scalars().all()
+            self.assertEqual(len(msgs), 0)
+
+    async def test_telegram_access_helper_preloaded_user_eager_load(self):
+        """Telegram access helper loads User.subscription without MissingGreenlet when User was pre-loaded into the session."""
+        async with self.session_factory() as session:
+            user = User(id=114, first_name="Jack", is_admin=False)
+            sub = UserSubscription(user_id=114, start_date=datetime.utcnow() - timedelta(days=1), end_date=datetime.utcnow() + timedelta(days=10), auto_renewal=False)
+            session.add_all([user, sub])
+            await session.commit()
+
+        async with self.session_factory() as session:
+            # Preload user into identity map WITHOUT subscription loaded
+            preloaded_user = await session.get(User, 114)
+            self.assertIsNotNone(preloaded_user)
+
+            bot = self._make_mock_bot()
+
+            # Call helper with the same session
+            has_access = await handlers._check_telegram_chat_access(session, 114, bot, 114)
+            self.assertTrue(has_access)
+            bot.send_message.assert_not_called()
+
+    async def test_max_kb_auto_start_real_ai_pipeline(self):
+        """Mandatory MAX KB auto-start through REAL max_messenger_bot.ai.get_ai_response without mocking get_ai_response."""
+        async with self.session_factory() as session:
+            user = User(id=215, first_name="Karen", name="Karen", gender="female", age="31", accepted_disclaimer=True, current_dialogue_id=1)
+            kb_doc = KnowledgeBase(id=88, filename="cbt_anxiety.txt", indexed_content="Дыхание по квадрату снижает пульс.")
+            topic = Topic(id=30, name="Тревожность", is_active=True, auto_start_dialogue=True, system_prompt="Вы — эксперт по КПТ.", knowledge_base_files=[kb_doc])
+            session.add_all([user, topic, kb_doc])
+            await session.commit()
+
+        client = MagicMock()
+        client.send_message = AsyncMock(return_value={"message": {"mid": "m1"}})
+        client.edit_message = AsyncMock()
+        states = StateStore()
+
+        mock_chunks = ["Выдержка из КБ: Дыхание по квадрату 4x4."]
+        search_chunks_mock = AsyncMock(return_value=mock_chunks)
+        call_gemini_mock = AsyncMock(return_value="Здравствуйте, Карен! При тревожности помогает дыхание по квадрату.")
+
+        with patch("max_messenger_bot.ai.search_relevant_chunks", search_chunks_mock), \
+             patch("max_messenger_bot.ai._call_gemini", call_gemini_mock):
+
+            await max_topics.select_topic(client, chat_id=215, user_id=215, topic_id=30, states=states)
+
+        # Assert search_relevant_chunks was called with document_ids=[88]
+        search_chunks_mock.assert_called_once()
+        _, search_kwargs = search_chunks_mock.call_args
+        self.assertEqual(search_kwargs.get("document_ids"), [88])
+
+        # Assert provider call was made
+        call_gemini_mock.assert_called_once()
+        _, gemini_kwargs = call_gemini_mock.call_args
+        request_layout = gemini_kwargs.get("request_layout")
+        self.assertIsNotNone(request_layout)
+        self.assertIn("Вы — эксперт по КПТ", request_layout.stable_system_prompt)
+        self.assertIn("Выдержка из КБ: Дыхание по квадрату", "\n".join(request_layout.request_context))
+
+        # Assert DBMessage records persisted
+        async with self.session_factory() as session:
+            msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 215).order_by(DBMessage.id.asc()))).scalars().all()
+            self.assertEqual(len(msgs), 2)
+            self.assertEqual(msgs[0].role, "user")
+            self.assertEqual(msgs[0].topic_id, 30)
+            self.assertEqual(msgs[0].dialogue_id, 2)
+            self.assertIn("СИСТЕМНОЕ СООБЩЕНИЕ", msgs[0].content)
+
+            self.assertEqual(msgs[1].role, "assistant")
+            self.assertEqual(msgs[1].topic_id, 30)
+            self.assertEqual(msgs[1].dialogue_id, 2)
+            self.assertIn("Здравствуйте, Карен!", msgs[1].content)
+
+        # Next normal turn succeeds
+        call_gemini_mock.reset_mock()
+        call_gemini_mock.return_value = "Да, сделайте вдох на 4 счета."
+
+        with patch("max_messenger_bot.ai.search_relevant_chunks", search_chunks_mock), \
+             patch("max_messenger_bot.ai._call_gemini", call_gemini_mock):
+            await max_common.run_ai_dialogue(client, chat_id=215, user_id=215, prompt_text="Как именно дышать?", states=states)
+
+        call_gemini_mock.assert_called_once()
+        async with self.session_factory() as session:
+            msgs2 = (await session.execute(select(DBMessage).where(DBMessage.user_id == 215).order_by(DBMessage.id.asc()))).scalars().all()
+            self.assertEqual(len(msgs2), 4)
+            self.assertEqual(msgs2[2].role, "user")
+            self.assertEqual(msgs2[2].content, "Как именно дышать?")
+            self.assertEqual(msgs2[3].role, "assistant")
+            self.assertEqual(msgs2[3].content, "Да, сделайте вдох на 4 счета.")

@@ -2110,11 +2110,85 @@ async def process_buffered_messages(
         await _delete_ai_processing_message(processing_message)
 
 
+def _get_user_scheduling_lock(user_id: int) -> asyncio.Lock:
+    lock = user_scheduling_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        user_scheduling_locks[user_id] = lock
+    return lock
+
+
 def _has_user_turn_work(user_id: int) -> bool:
     return bool(
         (user_isolated_turn_queues.get(user_id) and len(user_isolated_turn_queues[user_id]) > 0)
         or (user_message_buffers.get(user_id) and len(user_message_buffers[user_id]) > 0)
     )
+
+
+def _schedule_telegram_drain_runner_locked(
+    user_id: int,
+    bot: Bot,
+    state: FSMContext | None = None,
+    *,
+    initial_delay: float = 0.0,
+) -> asyncio.Task | None:
+    task = user_processing_tasks.get(user_id)
+    if task and not task.done():
+        return task
+
+    this_task = None
+
+    async def drain_runner():
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
+        unpopped_buf_snapshot = None
+        try:
+            while True:
+                work_item = None
+                is_isolated = False
+                async with _get_user_scheduling_lock(user_id):
+                    isolated_queue = user_isolated_turn_queues.get(user_id)
+                    if isolated_queue and len(isolated_queue) > 0:
+                        work_item = isolated_queue.popleft()
+                        is_isolated = True
+                    elif user_message_buffers.get(user_id) and len(user_message_buffers[user_id]) > 0:
+                        is_isolated = False
+                        work_item = True
+                    else:
+                        break
+
+                if is_isolated:
+                    await process_buffered_messages(
+                        user_id,
+                        bot,
+                        state,
+                        isolated_prompt=work_item,
+                        visible_user_text=None,
+                    )
+                else:
+                    cur_buf = user_message_buffers.get(user_id)
+                    unpopped_buf_snapshot = list(cur_buf) if cur_buf is not None else None
+                    await process_buffered_messages(
+                        user_id,
+                        bot,
+                        state,
+                    )
+                    break
+        finally:
+            async with _get_user_scheduling_lock(user_id):
+                if user_processing_tasks.get(user_id) is this_task:
+                    user_processing_tasks.pop(user_id, None)
+                has_isolated = bool(user_isolated_turn_queues.get(user_id) and len(user_isolated_turn_queues[user_id]) > 0)
+                cur_buf = user_message_buffers.get(user_id)
+                has_new_buffer = bool(cur_buf and (unpopped_buf_snapshot is None or cur_buf != unpopped_buf_snapshot))
+                if has_isolated or has_new_buffer:
+                    active_task = user_processing_tasks.get(user_id)
+                    if not active_task or active_task.done():
+                        _schedule_telegram_drain_runner_locked(user_id, bot, state, initial_delay=0.0)
+
+    this_task = asyncio.create_task(drain_runner())
+    user_processing_tasks[user_id] = this_task
+    return this_task
 
 
 def _ensure_telegram_drain_runner(
@@ -2124,53 +2198,17 @@ def _ensure_telegram_drain_runner(
     *,
     initial_delay: float = 0.0,
 ) -> None:
-    task = user_processing_tasks.get(user_id)
-    if task and not task.done():
-        return
-
-    async def drain_runner():
-        if initial_delay > 0:
-            await asyncio.sleep(initial_delay)
-        try:
-            while True:
-                isolated_queue = user_isolated_turn_queues.get(user_id)
-                if isolated_queue and len(isolated_queue) > 0:
-                    isolated_prompt = isolated_queue.popleft()
-                    await process_buffered_messages(
-                        user_id,
-                        bot,
-                        state,
-                        isolated_prompt=isolated_prompt,
-                        visible_user_text=None,
-                    )
-                    continue
-
-                if user_message_buffers.get(user_id) and len(user_message_buffers[user_id]) > 0:
-                    prev_len = len(user_message_buffers[user_id])
-                    await process_buffered_messages(
-                        user_id,
-                        bot,
-                        state,
-                    )
-                    if user_message_buffers.get(user_id) and len(user_message_buffers[user_id]) == prev_len:
-                        break
-                    continue
-
-                break
-        finally:
-            user_processing_tasks.pop(user_id, None)
-
-    user_processing_tasks[user_id] = asyncio.create_task(drain_runner())
+    _schedule_telegram_drain_runner_locked(user_id, bot, state, initial_delay=initial_delay)
 
 
 async def _start_telegram_topic_auto_start(user_id: int, bot: Bot, state: FSMContext | None, topic: Topic) -> None:
     from system_events import build_topic_auto_start_system_message
     synthetic_text = build_topic_auto_start_system_message(topic.name)
 
-    queue = user_isolated_turn_queues.setdefault(user_id, deque())
-    queue.append(synthetic_text)
-
-    _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.0)
+    async with _get_user_scheduling_lock(user_id):
+        queue = user_isolated_turn_queues.setdefault(user_id, deque())
+        queue.append(synthetic_text)
+        _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.0)
 
 
 async def render_static_content_telegram(
@@ -5854,53 +5892,54 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
 @router.message(Command("new_dialogue"))
 @router.message(F.text == "🗑️ Новый диалог")
 async def ask_delete_history(message: Message, state: FSMContext):
-    await state.clear()
     token = secrets.token_hex(4)
 
-    async with async_session_maker() as session:
-        user = await session.get(User, message.from_user.id, options=[selectinload(User.current_topic)])
+    async with user_locks.setdefault(message.from_user.id, asyncio.Lock()):
+        async with async_session_maker() as session:
+            user = await session.get(User, message.from_user.id, options=[selectinload(User.current_topic)])
 
-        expected_dialogue_id = user.current_dialogue_id if user else 0
-        expected_topic_id = user.current_topic_id if user else None
+            expected_dialogue_id = user.current_dialogue_id if user else 0
+            expected_topic_id = user.current_topic_id if user else None
 
-        await state.update_data(
-            reset_token=token,
-            reset_dialogue_id=expected_dialogue_id,
-            reset_topic_id=expected_topic_id,
-        )
-
-        if user and user.current_topic_id:
-            topic_name = user.current_topic.name if user.current_topic else "Неизвестная тема"
-
-            await message.answer(
-                f"Вы находитесь в диалоге: <b>{html.escape(topic_name)}</b>.\n"
-                "При начале нового диалога или переходе в основной память ИИ будет очищена.\n"
-                "Выберите подходящее действие.",
-                reply_markup=kb.topic_reset_options_keyboard(token=token),
-                parse_mode="HTML"
+            await state.update_data(
+                reset_token=token,
+                reset_dialogue_id=expected_dialogue_id,
+                reset_topic_id=expected_topic_id,
             )
-        else:
-            await message.answer(
-                "При начале нового диалога память ИИ будет полностью очищена. Вы уверены?",
-                reply_markup=kb.confirm_delete_history_keyboard(token=token)
-            )
+
+            if user and user.current_topic_id:
+                topic_name = user.current_topic.name if user.current_topic else "Неизвестная тема"
+
+                await message.answer(
+                    f"Вы находитесь в диалоге: <b>{html.escape(topic_name)}</b>.\n"
+                    "При начале нового диалога или переходе в основной память ИИ будет очищена.\n"
+                    "Выберите подходящее действие.",
+                    reply_markup=kb.topic_reset_options_keyboard(token=token),
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    "При начале нового диалога память ИИ будет полностью очищена. Вы уверены?",
+                    reply_markup=kb.confirm_delete_history_keyboard(token=token)
+                )
 
 
 @router.callback_query(F.data.startswith("delete_history_confirm"))
 async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot: Bot):
     token = callback.data.split(":", 1)[1] if ":" in callback.data else ""
-    data = await state.get_data()
-    expected_token = data.get("reset_token")
-
-    if not expected_token or expected_token != token:
-        await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
-        return
-
-    expected_dialogue_id = data.get("reset_dialogue_id")
-    expected_topic_id = data.get("reset_topic_id")
-    await state.clear()
 
     async with user_locks.setdefault(callback.from_user.id, asyncio.Lock()):
+        data = await state.get_data()
+        expected_token = data.get("reset_token")
+
+        if not expected_token or expected_token != token:
+            await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
+            return
+
+        expected_dialogue_id = data.get("reset_dialogue_id")
+        expected_topic_id = data.get("reset_topic_id")
+        await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
+
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id)
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
@@ -5925,8 +5964,16 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
 
 @router.callback_query(F.data.startswith("delete_history_cancel"))
 async def cancel_delete_history(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
     await callback.answer()
+    token = callback.data.split(":", 1)[1] if ":" in callback.data else ""
+
+    async with user_locks.setdefault(callback.from_user.id, asyncio.Lock()):
+        data = await state.get_data()
+        expected_token = data.get("reset_token")
+        if not expected_token or expected_token != token:
+            return
+        await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
+
     try:
         await callback.message.delete()
     except TelegramBadRequest:
@@ -6444,12 +6491,13 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
     if pending_topic_id:
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
-            topic = await session.get(Topic, int(pending_topic_id))
-            if is_topic_accessible(topic, user, user_id) and getattr(topic, "auto_start_dialogue", False):
-                if not await _check_telegram_chat_access(session, user_id, bot, callback.message.chat.id):
+            if user and user.current_topic_id == int(pending_topic_id):
+                topic = await session.get(Topic, int(pending_topic_id))
+                if topic and topic.is_active and is_topic_accessible(topic, user, user_id) and getattr(topic, "auto_start_dialogue", False):
+                    if not await _check_telegram_chat_access(session, user_id, bot, callback.message.chat.id):
+                        return
+                    await _start_telegram_topic_auto_start(user_id, bot, state, topic)
                     return
-                await _start_telegram_topic_auto_start(user_id, bot, state, topic)
-                return
 
     if prompt_text:
         await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
@@ -7253,7 +7301,13 @@ async def _check_telegram_chat_access(session, user_id: int, bot: Bot, chat_id: 
     subscriptions_active = sub_config.subscriptions_enabled if sub_config else True
     is_user_admin = await is_admin(user_id)
     if not is_user_admin and subscriptions_active:
-        user = await session.get(User, user_id, options=[selectinload(User.subscription)])
+        stmt = (
+            select(User)
+            .where(User.id == user_id)
+            .options(selectinload(User.subscription))
+            .execution_options(populate_existing=True)
+        )
+        user = await session.scalar(stmt)
         if not user or not user.subscription or user.subscription.end_date < datetime.utcnow():
             await bot.send_message(
                 chat_id,
@@ -7357,7 +7411,10 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
         topic = await session.get(Topic, int(topic_id))
         user = await session.get(User, chat_id)
 
-    if not topic or not is_topic_accessible(topic, user, chat_id):
+    if not user or user.current_topic_id != int(topic_id):
+        return True
+
+    if not topic or not topic.is_active or not is_topic_accessible(topic, user, chat_id):
         await bot.send_message(chat_id, "Тема больше недоступна. Выберите другую тему в меню.")
         return True
 
@@ -16686,22 +16743,23 @@ async def admin_payment_stats(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("reset_topic_keep"))
 async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, bot: Bot):
     token = callback.data.split(":", 1)[1] if ":" in callback.data else ""
-    data = await state.get_data()
-    expected_token = data.get("reset_token")
-
-    if not expected_token or expected_token != token:
-        await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
-        return
-
-    expected_dialogue_id = data.get("reset_dialogue_id")
-    expected_topic_id = data.get("reset_topic_id")
-    await state.clear()
 
     text_to_send = "✅ Память очищена."
     reply_markup = None
     topic_mode_html = "Markdown"
 
     async with user_locks.setdefault(callback.from_user.id, asyncio.Lock()):
+        data = await state.get_data()
+        expected_token = data.get("reset_token")
+
+        if not expected_token or expected_token != token:
+            await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
+            return
+
+        expected_dialogue_id = data.get("reset_dialogue_id")
+        expected_topic_id = data.get("reset_topic_id")
+        await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
+
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id, options=[selectinload(User.current_topic)])
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
@@ -16858,18 +16916,19 @@ async def export_date_to_input(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("reset_topic_to_main"))
 async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext, bot: Bot):
     token = callback.data.split(":", 1)[1] if ":" in callback.data else ""
-    data = await state.get_data()
-    expected_token = data.get("reset_token")
-
-    if not expected_token or expected_token != token:
-        await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
-        return
-
-    expected_dialogue_id = data.get("reset_dialogue_id")
-    expected_topic_id = data.get("reset_topic_id")
-    await state.clear()
 
     async with user_locks.setdefault(callback.from_user.id, asyncio.Lock()):
+        data = await state.get_data()
+        expected_token = data.get("reset_token")
+
+        if not expected_token or expected_token != token:
+            await callback.answer("Подтверждение устарело или уже использовано.", show_alert=True)
+            return
+
+        expected_dialogue_id = data.get("reset_dialogue_id")
+        expected_topic_id = data.get("reset_topic_id")
+        await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
+
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id)
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
@@ -17523,12 +17582,13 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
                 await session.execute(stmt)
                 await session.commit()
 
-    if user_id not in user_message_buffers:
-        user_message_buffers[user_id] = []
+    async with _get_user_scheduling_lock(user_id):
+        if user_id not in user_message_buffers:
+            user_message_buffers[user_id] = []
 
-    user_message_buffers[user_id].append(message.text)
+        user_message_buffers[user_id].append(message.text)
 
-    _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.8)
+        _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.8)
 
 
 @router.callback_query(F.data == "admin_export_mode_start")

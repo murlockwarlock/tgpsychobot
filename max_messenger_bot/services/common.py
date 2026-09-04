@@ -358,7 +358,7 @@ async def show_help(client: MaxApiClient, chat_id: int, user_id: int) -> None:
     await client.send_message(chat_id=chat_id, text=text)
 
 
-async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, start_payload: str | None = None, states: StateStore | None = None) -> None:
+async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, start_payload: str | None = None, states: StateStore | None = None, *, skip_content: bool = False) -> None:
     referrer_notification: tuple[int, int] | None = None
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.current_topic), selectinload(User.subscription)])
@@ -467,6 +467,9 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                 referrer_id,
             )
 
+    if skip_content:
+        return
+
     if start_payload:
         if start_payload == "menu":
             await show_menu(client, chat_id, user_id=user_id)
@@ -480,11 +483,6 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
             from .tests import start_test
 
             await start_test(client, chat_id, user_id, states)
-            return
-        if start_payload.startswith("topic_"):
-            from .topics import select_topic
-
-            await select_topic(client, chat_id, user_id, int(start_payload.split("_", 1)[1]), states=states)
             return
         rendered = await render_static_content(client, chat_id, user_id, start_payload)
         if rendered:
@@ -512,7 +510,7 @@ async def reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> No
     await client.send_message(chat_id=chat_id, text="✅ Память очищена.", attachments=inline_keyboard([main_menu_row()]))
 
 
-async def request_reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> None:
+async def request_reset_dialogue(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.current_topic)])
         if not user:
@@ -520,6 +518,19 @@ async def request_reset_dialogue(client: MaxApiClient, chat_id: int, user_id: in
         dialogue_id = user.current_dialogue_id or 1
         topic_id = user.current_topic_id
         topic_name = user.current_topic.name if user.current_topic else None
+
+    import secrets
+    token = secrets.token_hex(4)
+    await states.set(
+        user_id,
+        chat_id,
+        "confirm_reset",
+        {
+            "reset_token": token,
+            "reset_dialogue_id": dialogue_id,
+            "reset_topic_id": topic_id or 0,
+        },
+    )
 
     from ..keyboards import reset_confirmation_keyboard
     if topic_name:
@@ -529,14 +540,35 @@ async def request_reset_dialogue(client: MaxApiClient, chat_id: int, user_id: in
         )
     else:
         text = "Вы уверены, что хотите сбросить диалог и очистить контекст?"
-    await client.send_message(chat_id=chat_id, text=text, attachments=reset_confirmation_keyboard(dialogue_id, topic_id))
+    await client.send_message(chat_id=chat_id, text=text, attachments=reset_confirmation_keyboard(token, dialogue_id, topic_id))
 
 
-async def cancel_reset_dialogue(client: MaxApiClient, chat_id: int) -> None:
+async def cancel_reset_dialogue(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, token: str | None = None) -> None:
+    snapshot = await states.get(user_id)
+    if snapshot and snapshot.state == "confirm_reset":
+        stored_token = snapshot.data.get("reset_token")
+        if token is None or stored_token == token:
+            await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="Ок. Продолжаем текущий диалог.", attachments=inline_keyboard([main_menu_row()]))
 
 
-async def execute_dialogue_reset(client: MaxApiClient, chat_id: int, user_id: int, expected_dialogue_id: int, expected_topic_id: int) -> None:
+async def execute_dialogue_reset(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    token: str,
+    expected_dialogue_id: int,
+    expected_topic_id: int,
+) -> None:
+    snapshot = await states.get(user_id)
+    if not snapshot or snapshot.state != "confirm_reset":
+        return
+    stored_token = snapshot.data.get("reset_token")
+    if stored_token != token:
+        return
+    await states.clear(user_id)
+
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
@@ -586,11 +618,12 @@ async def ensure_access_before_chat(client: MaxApiClient, chat_id: int, user: Us
 
 
 async def begin_onboarding(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, initial_prompt: str | None = None, resume_data: dict | None = None) -> None:
-    data = {}
+    data = {"is_onboarding": True}
     if resume_data:
         data.update(resume_data)
     if initial_prompt:
         data["initial_prompt"] = initial_prompt
+    data["is_onboarding"] = True
     await states.set(user_id, chat_id, "awaiting_name", data)
     await client.send_message(chat_id=chat_id, text="Прежде чем начнём, как мне к вам обращаться?")
 
@@ -906,9 +939,11 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
 
     pending_topic_id = data.get("pending_auto_start_topic_id")
     if pending_topic_id:
+        if user.current_topic_id != int(pending_topic_id):
+            return
         async with async_session_maker() as session:
             topic = await session.get(Topic, int(pending_topic_id))
-        if not topic or not topic.is_active or (topic.admin_only and not user.is_admin):
+        if not topic or not topic.is_active or (topic.admin_only and not user.is_admin) or not getattr(topic, "auto_start_dialogue", False):
             await client.send_message(chat_id=chat_id, text="Тема недоступна.")
             return
         if not user.accepted_disclaimer and states is not None:

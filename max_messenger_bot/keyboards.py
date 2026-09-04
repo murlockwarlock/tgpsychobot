@@ -568,12 +568,12 @@ def admin_topic_editor_keyboard(topic, topic_url: str | None = None) -> list[dic
     return inline_keyboard(rows)
 
 
-def reset_confirmation_keyboard(dialogue_id: int, topic_id: int | None = None) -> list[dict]:
+def reset_confirmation_keyboard(token: str, dialogue_id: int, topic_id: int | None = None) -> list[dict]:
     t_id = topic_id if topic_id is not None else 0
     return inline_keyboard(
         [
-            [callback_button("🗑️ Да, сбросить диалог", f"confirm_reset_dialogue:{dialogue_id}:{t_id}")],
-            [callback_button("❌ Отмена", "cancel_reset_dialogue")],
+            [callback_button("🗑️ Да, сбросить диалог", f"confirm_reset_dialogue:{token}:{dialogue_id}:{t_id}")],
+            [callback_button("❌ Отмена", f"cancel_reset_dialogue:{token}")],
         ]
     )
 
