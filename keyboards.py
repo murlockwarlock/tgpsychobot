@@ -574,18 +574,23 @@ def fixed_pagination_rows(page: int, total_pages: int, callback_for_page) -> lis
         ],
     ]
 
-def confirm_delete_history_keyboard():
+def confirm_delete_history_keyboard(token: str = ""):
     builder = InlineKeyboardBuilder()
-    builder.button(text="🗑️ Да, удалить", callback_data="delete_history_confirm")
-    builder.button(text="❌ Отмена", callback_data="delete_history_cancel")
+    confirm_data = f"delete_history_confirm:{token}" if token else "delete_history_confirm"
+    cancel_data = f"delete_history_cancel:{token}" if token else "delete_history_cancel"
+    builder.button(text="🗑️ Да, удалить", callback_data=confirm_data)
+    builder.button(text="❌ Отмена", callback_data=cancel_data)
     return builder.as_markup()
 
 
-def topic_reset_options_keyboard():
+def topic_reset_options_keyboard(token: str = ""):
     builder = InlineKeyboardBuilder()
-    builder.button(text="Начать новый диалог в данной теме", callback_data="reset_topic_keep")
-    builder.button(text="Перейти в основной диалог", callback_data="reset_topic_to_main")
-    builder.button(text="Отмена", callback_data="delete_history_cancel")
+    keep_data = f"reset_topic_keep:{token}" if token else "reset_topic_keep"
+    to_main_data = f"reset_topic_to_main:{token}" if token else "reset_topic_to_main"
+    cancel_data = f"delete_history_cancel:{token}" if token else "delete_history_cancel"
+    builder.button(text="Начать новый диалог в данной теме", callback_data=keep_data)
+    builder.button(text="Перейти в основной диалог", callback_data=to_main_data)
+    builder.button(text="Отмена", callback_data=cancel_data)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -695,18 +700,20 @@ def topics_admin_list_keyboard(topics: list, page: int, total_pages: int, config
     return builder.as_markup()
 
 
-def edit_topic_keyboard(topic_id: int, is_active: bool, in_menu: bool = False, in_list: bool = True, admin_only: bool = False):
+def edit_topic_keyboard(topic_id: int, is_active: bool, in_menu: bool = False, in_list: bool = True, admin_only: bool = False, auto_start: bool = False):
     builder = InlineKeyboardBuilder()
     status_text = "⚪️ Сделать неактивной" if is_active else "🟢 Сделать активной"
     admin_only_text = "🔒 Только для админов: ВКЛ" if admin_only else "🔓 Только для админов: ВЫКЛ"
     menu_text = "❌ Убрать из меню" if in_menu else "✅ Показать в меню"
     list_text = "❌ Убрать из списка" if in_list else "✅ Показать в списке"
+    auto_start_text = "▶️ Начинать диалог сразу: ВКЛ" if auto_start else "⏸️ Начинать диалог сразу: ВЫКЛ"
 
     builder.button(text="✏️ Название", callback_data=f"edit_topic_name_{topic_id}")
     builder.button(text=status_text, callback_data=f"toggle_topic_activity_{topic_id}")
     builder.button(text=admin_only_text, callback_data=f"toggle_topic_admin_only_{topic_id}")
     builder.button(text=menu_text, callback_data=f"toggle_topic_display_menu_{topic_id}")
     builder.button(text=list_text, callback_data=f"toggle_topic_display_list_{topic_id}")
+    builder.button(text=auto_start_text, callback_data=f"toggle_topic_auto_start_{topic_id}")
 
     builder.button(text="📝 Системный промпт", callback_data=f"edit_topic_prompt_{topic_id}")
     builder.button(text="🎲 Случайные фразы", callback_data=f"topic_random_phrases_{topic_id}")

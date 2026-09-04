@@ -292,6 +292,15 @@ async def toggle_list(client: MaxApiClient, chat_id: int, topic_id: int) -> None
     await show_topic_editor(client, chat_id, topic_id)
 
 
+async def toggle_auto_start(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, topic_id)
+        if topic:
+            topic.auto_start_dialogue = not getattr(topic, "auto_start_dialogue", False)
+            await session.commit()
+    await show_topic_editor(client, chat_id, topic_id)
+
+
 async def delete_topic(client: MaxApiClient, chat_id: int, topic_id: int) -> None:
     async with async_session_maker() as session:
         async with session.begin():

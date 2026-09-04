@@ -277,6 +277,14 @@ async def render_static_content(
     if is_menu and not formatted_text and not media_attachments and not parsed_rows:
         formatted_text = "Раздел меню пока не настроен."
 
+    if (is_start or content_key == "start_message") and media_attachments:
+        await client.send_message(
+            chat_id=chat_id,
+            text=formatted_text,
+            attachments=media_attachments + (kb_attachment or []),
+        )
+        return True
+
     if media_attachments and order == "media_top":
         if formatted_text or kb_attachment:
             await client.send_message(
@@ -476,7 +484,7 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
         if start_payload.startswith("topic_"):
             from .topics import select_topic
 
-            await select_topic(client, chat_id, user_id, int(start_payload.split("_", 1)[1]))
+            await select_topic(client, chat_id, user_id, int(start_payload.split("_", 1)[1]), states=states)
             return
         rendered = await render_static_content(client, chat_id, user_id, start_payload)
         if rendered:
@@ -501,6 +509,53 @@ async def reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> No
                 )
             )
             await session.commit()
+    await client.send_message(chat_id=chat_id, text="✅ Память очищена.", attachments=inline_keyboard([main_menu_row()]))
+
+
+async def request_reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> None:
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id, options=[selectinload(User.current_topic)])
+        if not user:
+            return
+        dialogue_id = user.current_dialogue_id or 1
+        topic_id = user.current_topic_id
+        topic_name = user.current_topic.name if user.current_topic else None
+
+    from ..keyboards import reset_confirmation_keyboard
+    if topic_name:
+        text = (
+            f"Вы находитесь в теме «{html.escape(topic_name)}».\n\n"
+            "Сбросить диалог и очистить контекст?"
+        )
+    else:
+        text = "Вы уверены, что хотите сбросить диалог и очистить контекст?"
+    await client.send_message(chat_id=chat_id, text=text, attachments=reset_confirmation_keyboard(dialogue_id, topic_id))
+
+
+async def cancel_reset_dialogue(client: MaxApiClient, chat_id: int) -> None:
+    await client.send_message(chat_id=chat_id, text="Ок. Продолжаем текущий диалог.", attachments=inline_keyboard([main_menu_row()]))
+
+
+async def execute_dialogue_reset(client: MaxApiClient, chat_id: int, user_id: int, expected_dialogue_id: int, expected_topic_id: int) -> None:
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return
+        current_d_id = user.current_dialogue_id or 1
+        current_t_id = user.current_topic_id or 0
+        if current_d_id != expected_dialogue_id or current_t_id != expected_topic_id:
+            await client.send_message(chat_id=chat_id, text="Состояние диалога изменилось. Действие отменено.")
+            return
+
+        config = await session.get(AIConfig, 1)
+        await start_new_dialogue(session, user, user.current_topic_id or 0, normalize_memory_mode(config))
+        await session.execute(
+            delete(DBMessage).where(
+                DBMessage.user_id == user_id,
+                DBMessage.dialogue_id == user.current_dialogue_id - 1,
+            )
+        )
+        await session.commit()
     await client.send_message(chat_id=chat_id, text="✅ Память очищена.", attachments=inline_keyboard([main_menu_row()]))
 
 
@@ -530,8 +585,13 @@ async def ensure_access_before_chat(client: MaxApiClient, chat_id: int, user: Us
     return True
 
 
-async def begin_onboarding(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, initial_prompt: str) -> None:
-    await states.set(user_id, chat_id, "awaiting_name", {"initial_prompt": initial_prompt})
+async def begin_onboarding(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, initial_prompt: str | None = None, resume_data: dict | None = None) -> None:
+    data = {}
+    if resume_data:
+        data.update(resume_data)
+    if initial_prompt:
+        data["initial_prompt"] = initial_prompt
+    await states.set(user_id, chat_id, "awaiting_name", data)
     await client.send_message(chat_id=chat_id, text="Прежде чем начнём, как мне к вам обращаться?")
 
 
@@ -815,12 +875,17 @@ async def run_ai_dialogue_with_voice(client: MaxApiClient, chat_id: int, user_id
         await run_ai_dialogue(client, chat_id, user_id, transcription)
 
 
-async def maybe_require_disclaimer(client: MaxApiClient, states: StateStore, chat_id: int, user: User, pending_prompt: str) -> bool:
+async def maybe_require_disclaimer(client: MaxApiClient, states: StateStore, chat_id: int, user: User, pending_prompt: str | None = None, resume_data: dict | None = None) -> bool:
     if user.accepted_disclaimer:
         return False
     disclaimer = await get_content("disclaimer")
     if disclaimer and disclaimer.is_visible:
-        await states.set(user.id, chat_id, "awaiting_disclaimer_acceptance", {"initial_prompt": pending_prompt})
+        data = {}
+        if resume_data:
+            data.update(resume_data)
+        if pending_prompt:
+            data["initial_prompt"] = pending_prompt
+        await states.set(user.id, chat_id, "awaiting_disclaimer_acceptance", data)
         await client.send_message(
             chat_id=chat_id,
             text=disclaimer.text_content or "Примите дисклеймер для продолжения.",
@@ -831,3 +896,36 @@ async def maybe_require_disclaimer(client: MaxApiClient, states: StateStore, cha
         await session.execute(update(User).where(User.id == user.id).values(accepted_disclaimer=True))
         await session.commit()
     return False
+
+
+async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: int, data: dict, states: StateStore | None = None) -> None:
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id, options=[selectinload(User.subscription)])
+    if not user:
+        return
+
+    pending_topic_id = data.get("pending_auto_start_topic_id")
+    if pending_topic_id:
+        async with async_session_maker() as session:
+            topic = await session.get(Topic, int(pending_topic_id))
+        if not topic or not topic.is_active or (topic.admin_only and not user.is_admin):
+            await client.send_message(chat_id=chat_id, text="Тема недоступна.")
+            return
+        if not user.accepted_disclaimer and states is not None:
+            if await maybe_require_disclaimer(client, states, chat_id, user, resume_data={"pending_auto_start_topic_id": pending_topic_id}):
+                return
+        if not await ensure_access_before_chat(client, chat_id, user):
+            return
+        from system_events import build_topic_auto_start_system_message
+        synthetic_text = build_topic_auto_start_system_message(topic.name)
+        await run_ai_dialogue(client, chat_id, user_id, synthetic_text, states=states)
+        return
+
+    initial_prompt = data.get("initial_prompt")
+    if initial_prompt:
+        if not user.accepted_disclaimer and states is not None:
+            if await maybe_require_disclaimer(client, states, chat_id, user, pending_prompt=initial_prompt):
+                return
+        if not await ensure_access_before_chat(client, chat_id, user):
+            return
+        await run_ai_dialogue(client, chat_id, user_id, initial_prompt, states=states)

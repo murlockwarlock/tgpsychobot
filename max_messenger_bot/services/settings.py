@@ -60,8 +60,10 @@ async def process_new_name(client: MaxApiClient, states: StateStore, chat_id: in
     await client.send_message(chat_id=chat_id, text=_settings_text(user, f"✅ Имя изменено на <b>{html.escape(user_name)}</b>"), attachments=settings_keyboard(user))
 
 
-async def start_change_gender(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, *, is_settings: bool = True, initial_prompt: str | None = None) -> None:
+async def start_change_gender(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, *, is_settings: bool = True, initial_prompt: str | None = None, resume_data: dict | None = None) -> None:
     data = {"is_settings": is_settings}
+    if resume_data:
+        data.update(resume_data)
     if initial_prompt:
         data["initial_prompt"] = initial_prompt
         data["is_onboarding"] = True

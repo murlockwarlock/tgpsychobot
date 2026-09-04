@@ -243,6 +243,7 @@ class Topic(Base):
     start_button_text = Column(String, nullable=True)
     start_button_payload = Column(Text, nullable=True)
     system_prompt_updated_at = Column(DateTime, nullable=True)
+    auto_start_dialogue = Column(Boolean, default=False, nullable=False)
 
     knowledge_base_files = relationship("KnowledgeBase", secondary=topic_knowledgebase_association,
                                         back_populates="topics")
@@ -1025,6 +1026,10 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_image_edit BOOLEAN DEFAULT FALSE NOT NULL"))
 
             _migrate_ai_config_models(sync_conn)
+
+            topic_columns = [c['name'] for c in insp.get_columns('topics')]
+            if 'auto_start_dialogue' not in topic_columns:
+                sync_conn.execute(text("ALTER TABLE topics ADD COLUMN auto_start_dialogue BOOLEAN DEFAULT FALSE NOT NULL"))
 
             test_session_columns = [c['name'] for c in insp.get_columns('test_sessions')]
             if 'formula_results' not in test_session_columns:
