@@ -1220,6 +1220,7 @@ async def init_db():
         # Seed default content sections for new bots (won't overwrite existing)
         default_content = [
             Content(key="start_message", button_title=None, is_visible=True, text_content="Приветствие не настроено.", content_order="text_top", sort_order=0),
+            Content(key="menu",          button_title=None, is_visible=True, text_content="Раздел меню пока не настроен.", content_order="text_top", sort_order=0),
             Content(key="about_me",      button_title="Об авторе",   is_visible=True,  text_content="", content_order="media_top", sort_order=1),
             Content(key="about",         button_title="О методе",    is_visible=True,  text_content="", content_order="media_top", sort_order=2),
             Content(key="disclaimer",    button_title="Дисклеймер",  is_visible=False, text_content="", content_order="text_top",  sort_order=3),

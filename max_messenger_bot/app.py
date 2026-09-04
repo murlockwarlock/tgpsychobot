@@ -30,7 +30,7 @@ from .services import admin_collections as admin_collections_service
 from .services import admin_topic_media as admin_topic_media_service
 from .services import common, settings as settings_service, subscriptions as subscriptions_service, tests as tests_service, topics as topics_service
 from .settings import get_settings, validate_webhook_runtime_settings
-from .keyboards import build_main_menu
+from .keyboards import inline_keyboard, main_menu_row
 from .identity import is_max_user_id
 from .storage import StateStore, init_storage
 
@@ -589,44 +589,7 @@ class MaxBotApplication:
             content = await session.scalar(select(Content).where(Content.button_title == text, Content.is_visible == True).limit(1))
             user = await session.get(User, message.sender.user_id, options=[selectinload(User.subscription)])
         if content:
-            from .keyboards import inline_keyboard, main_menu_row
-            import asyncio
-            from .formatting import translate_telegram_links_to_max
-            content_attachments = await common.get_content_attachments(content.key)
-            nav = inline_keyboard([main_menu_row()])
-            order = content.content_order or "media_top"
-            content_text = translate_telegram_links_to_max(content.text_content) or "Раздел пока пуст."
-
-            if content_attachments and order == "media_top":
-                await self.client.send_message(
-                    chat_id=message.chat_id,
-                    text="",
-                    attachments=content_attachments,
-                )
-                await asyncio.sleep(0.2)
-                await self.client.send_message(
-                    chat_id=message.chat_id,
-                    text=content_text,
-                    attachments=nav,
-                )
-            elif content_attachments and order == "text_top":
-                await self.client.send_message(
-                    chat_id=message.chat_id,
-                    text=content_text,
-                    attachments=nav,
-                )
-                await asyncio.sleep(0.2)
-                await self.client.send_message(
-                    chat_id=message.chat_id,
-                    text="",
-                    attachments=content_attachments,
-                )
-            else:
-                await self.client.send_message(
-                    chat_id=message.chat_id,
-                    text=content_text,
-                    attachments=(content_attachments or []) + nav,
-                )
+            await common.render_static_content(self.client, message.chat_id, message.sender.user_id, content.key)
             return
 
         if not user:
@@ -719,7 +682,8 @@ class MaxBotApplication:
         chat_id = callback.chat_id
 
         if data == "main_menu":
-            await common.send_main_menu(self.client, chat_id, user_id=user_id)
+            await self.client.answer_callback(callback.callback_id)
+            await common.show_menu(self.client, chat_id, user_id=user_id)
             return
         if data == "topic_start_dialogue":
             await self.client.send_message(chat_id=chat_id, text="✍️ Напишите ваш первый вопрос, и я отвечу.")
@@ -730,26 +694,43 @@ class MaxBotApplication:
         if data.startswith("ai_btn:"):
             action = data.split(":", 1)[1]
             await self.client.answer_callback(callback.callback_id)
+            if action in ("main_menu", "svc:menu"):
+                await common.show_menu(self.client, chat_id, user_id=user_id)
+                return
+            if action in ("topics", "svc:topics"):
+                await topics_service.show_topics(self.client, chat_id, user_id)
+                return
+            if (action.startswith("topic_") and action[6:].isdigit()) or (action.startswith("svc:topic:") and action[10:].isdigit()):
+                topic_id = int(action[10:] if action.startswith("svc:topic:") else action[6:])
+                await topics_service.select_topic(self.client, chat_id, user_id, topic_id)
+                return
+            if action in ("subscription", "svc:subscription"):
+                await subscriptions_service.show_subscription_info(self.client, chat_id, user_id)
+                return
+            if action in ("referral", "svc:referral"):
+                await subscriptions_service.show_referral_info(self.client, chat_id, user_id)
+                return
+            if action == "svc:settings":
+                await settings_service.show_settings(self.client, chat_id, user_id)
+                return
+            if action == "svc:start":
+                await common.render_static_content(self.client, chat_id, user_id, "start_message", is_start=True)
+                return
+            if action in ("new_dialogue", "svc:reset"):
+                await common.reset_dialogue(self.client, chat_id, user_id)
+                return
+            if action == "svc:continue":
+                await self.client.send_message(chat_id=chat_id, text="Введите ваше сообщение для начала/продолжения диалога:")
+                return
+            if action.startswith("svc:content:"):
+                content_key = action[12:]
+                await common.render_static_content(self.client, chat_id, user_id, content_key)
+                return
             if action == "start_test":
                 await tests_service.start_test(self.client, chat_id, user_id, self.states)
                 return
-            if action == "topics":
-                await topics_service.show_topics(self.client, chat_id, user_id)
-                return
-            if action.startswith("topic_") and action[6:].isdigit():
-                await topics_service.select_topic(self.client, chat_id, user_id, int(action[6:]))
-                return
-            if action == "new_dialogue":
-                await common.reset_dialogue(self.client, chat_id, user_id)
-                return
-            if action == "main_menu":
-                await common.send_main_menu(self.client, chat_id, user_id=user_id)
-                return
-            if action == "subscription":
-                await subscriptions_service.show_subscription_info(self.client, chat_id, user_id)
-                return
-            if action == "referral":
-                await subscriptions_service.show_referral_info(self.client, chat_id, user_id)
+            if action.startswith("svc:"):
+                max_log.warning("Unknown service action in MAX: %s", action)
                 return
 
             async with async_session_maker() as session:
@@ -765,7 +746,7 @@ class MaxBotApplication:
             await self.client.send_message(
                 chat_id=chat_id,
                 text="❌ Тестирование прервано.",
-                attachments=await build_main_menu(user_id)
+                attachments=inline_keyboard([main_menu_row()]),
             )
             return
         if data == "admin_panel":
@@ -788,11 +769,10 @@ class MaxBotApplication:
             await self.client.answer_callback(callback.callback_id, notification="Пол сохранён")
             if state_data.get("is_onboarding"):
                 # Onboarding complete — show main menu and continue with initial prompt
-                main_menu_kb = await build_main_menu(user_id)
                 await self.client.send_message(
                     chat_id=chat_id,
                     text="✅ Отлично! Теперь можете начать диалог. Используйте меню ниже или просто напишите сообщение.",
-                    attachments=main_menu_kb,
+                    attachments=inline_keyboard([main_menu_row()]),
                 )
                 initial_prompt = state_data.get("initial_prompt")
                 if initial_prompt:
@@ -1919,6 +1899,27 @@ async def polling_loop(bot_app: MaxBotApplication, client: MaxApiClient, backgro
             await asyncio.sleep(3)
 
 
+def build_max_global_commands(
+    *,
+    topics_enabled: bool = True,
+    subscriptions_enabled: bool = True,
+    referral_enabled: bool = False,
+) -> list[dict[str, str]]:
+    commands = [
+        {"name": "start", "description": "Запустить / Перезапустить бота"},
+        {"name": "help", "description": "Помощь"},
+    ]
+    if topics_enabled:
+        commands.append({"name": "topics", "description": "Выбрать тему"})
+    commands.append({"name": "new_dialogue", "description": "Новый диалог"})
+    commands.append({"name": "settings", "description": "Настройки"})
+    if subscriptions_enabled:
+        commands.append({"name": "subscription", "description": "Подписка"})
+    if referral_enabled:
+        commands.append({"name": "ref", "description": "🤝 Пригласить друзей"})
+    return commands
+
+
 async def create_web_app() -> web.Application:
     settings = get_settings()
     validate_webhook_runtime_settings(settings)
@@ -1953,20 +1954,11 @@ async def create_web_app() -> web.Application:
     except Exception:
         max_log.exception("Failed to load SubscriptionConfig on startup to set commands")
 
-    commands = [
-        {"name": "start", "description": "Запустить / Перезапустить бота"},
-        {"name": "help", "description": "Помощь"},
-    ]
-    if topics_enabled:
-        commands.append({"name": "topics", "description": "Выбрать тему"})
-    commands.append({"name": "new_dialogue", "description": "Новый диалог"})
-    commands.append({"name": "settings", "description": "Настройки"})
-    if subscriptions_enabled:
-        commands.append({"name": "subscription", "description": "Подписка"})
-    if referral_enabled:
-        commands.append({"name": "ref", "description": "🤝 Пригласить друзей"})
-    
-    commands.append({"name": "admin", "description": "Админ-панель"})
+    commands = build_max_global_commands(
+        topics_enabled=topics_enabled,
+        subscriptions_enabled=subscriptions_enabled,
+        referral_enabled=referral_enabled,
+    )
 
     try:
         await client.set_commands(commands)

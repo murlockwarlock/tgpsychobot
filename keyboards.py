@@ -464,12 +464,16 @@ async def content_management_keyboard():
         if start_msg:
             builder.button(text="✏️ Приветствие (/start)", callback_data="edit_content_start_message")
 
+        menu_msg = await session.get(Content, "menu")
+        if menu_msg:
+            builder.button(text="✏️ Меню", callback_data="edit_content_menu")
+
         disclaimer_msg = await session.get(Content, "disclaimer")
         if disclaimer_msg:
             status = "✅" if disclaimer_msg.is_visible else "❌"
             builder.button(text=f"✏️ Дисклеймер {status}", callback_data="edit_content_disclaimer")
 
-        test_only_keys = ("test_button", "test_intro", "test_results", "secret_test_outro")
+        test_only_keys = ("test_button", "test_intro", "test_results", "secret_test_outro", "menu")
         stmt = (
             select(Content)
             .where(Content.button_title != None, Content.key.notin_(test_only_keys))

@@ -219,3 +219,36 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
         }
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_seeds_menu_content_and_preserves_custom_text(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'menu-content-init.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        # First run: fresh DB -> Content("menu") is seeded with neutral placeholder
+        await database.init_db()
+
+        async with sessions() as session:
+            menu_content = await session.get(database.Content, "menu")
+            assert menu_content is not None
+            assert menu_content.text_content == "Раздел меню пока не настроен."
+
+            # Update Content("menu") with custom text
+            menu_content.text_content = "Пользовательское меню\n[Темы](btn:svc:topics)"
+            await session.commit()
+
+        # Second run: re-running init_db must NEVER overwrite custom text
+        await database.init_db()
+
+        async with sessions() as session:
+            reloaded_menu = await session.get(database.Content, "menu")
+            assert reloaded_menu is not None
+            assert reloaded_menu.text_content == "Пользовательское меню\n[Темы](btn:svc:topics)"
+    finally:
+        await engine.dispose()
