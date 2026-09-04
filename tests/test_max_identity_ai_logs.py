@@ -623,3 +623,55 @@ async def test_init_db_adds_ai_log_context_columns_to_legacy_schema(tmp_path, mo
         )
     finally:
         await test_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_max_chat_response_with_topic_kb_retrieves_chunks(monkeypatch):
+    user = _max_user()
+    topic = SimpleNamespace(
+        id=42,
+        name="Аурика",
+        system_prompt=None,
+        instruction=None,
+        use_common_instruction=True,
+        knowledge_base_files=[SimpleNamespace(id=101), SimpleNamespace(id=102)],
+    )
+    user.current_topic_id = 42
+    user.current_topic = topic
+    session = _MaxAISession(user, _max_config())
+    mock_search = AsyncMock(return_value=["Чанк из базы знаний 1", "Чанк 2"])
+
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(max_ai, "search_relevant_chunks", mock_search)
+    monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="Ответ с контекстом КБ"))
+
+    result = await max_ai.get_ai_response(user.id, "привет")
+
+    assert result == "Ответ с контекстом КБ"
+    mock_search.assert_awaited_once_with("привет", n_results=3, document_ids=[101, 102])
+
+
+@pytest.mark.asyncio
+async def test_max_chat_response_with_general_kb_retrieves_chunks(monkeypatch):
+    user = _max_user()
+    user.active_topic_id = None
+    session = _MaxAISession(user, _max_config())
+    mock_search = AsyncMock(return_value=["Общий чанк"])
+
+    async def _execute_general_kb(stmt):
+        sql = str(stmt)
+        if "knowledge_base" in sql.lower():
+            return _Result(rows=[(201, "guide.pdf", "текст документа")])
+        return _Result(rows=[])
+
+    session.execute = _execute_general_kb
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(max_ai, "search_relevant_chunks", mock_search)
+    monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="Ответ общий КБ"))
+
+    result = await max_ai.get_ai_response(user.id, "вопрос")
+
+    assert result == "Ответ общий КБ"
+    mock_search.assert_awaited_once_with("вопрос", n_results=3, document_ids=[201])

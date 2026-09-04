@@ -27,6 +27,7 @@ from user_metadata import extract_service_data
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
 from result_history import ai_history_role_filter, select_ai_history_messages
 from error_reporting import classify_ai_error, exception_summary
+from vector_store import search_relevant_chunks
 from provider_models import (
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     PROVIDER_CLAUDE,

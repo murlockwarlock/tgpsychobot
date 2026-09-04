@@ -225,7 +225,7 @@ from scheduler import (
     _serialize_yookassa_payment,
 )
 from subscription_dates import extend_subscription_end_date
-from subscription_retry_policy import can_retry_manually
+from subscription_retry_policy import can_retry_manually, can_retry_now, get_next_retry_at
 from subscription_context import active_subscription_flag, should_include_subscription_status
 from topic_management import delete_topic_with_dependencies
 from bot_commands import refresh_commands_for_user
@@ -7660,7 +7660,7 @@ async def admin_edit_topic_name_process(message: Message, state: FSMContext, bot
             action_text = f"✅ Название темы обновлено на «{new_name}»."
 
             if message_id_to_edit:
-                await _update_topic_edit_menu(bot, message.chat.id, message_id_to_edit, topic_id)
+                await _show_edit_topic_menu(bot, message.chat.id, message_id_to_edit, topic_id)
 
             temp_msg = await message.answer(action_text)
             asyncio.create_task(delete_message_after_delay(temp_msg, 3))

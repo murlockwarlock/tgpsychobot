@@ -8,6 +8,7 @@ import base64
 import asyncio
 import json
 import uuid
+import html
 import httpx
 import re
 from typing import Any, Iterable
@@ -44,6 +45,7 @@ from error_reporting import (
 from vector_store import search_relevant_chunks
 from user_metadata import extract_service_data
 from provider_models import (
+    DEFAULT_KIE_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
