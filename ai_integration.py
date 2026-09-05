@@ -1592,9 +1592,13 @@ async def get_ai_response(
         available_media_text = ""
         media_instruction_block = ""
         _, media_files = await load_available_media(session, active_topic_id)
-        if media_files:
+        effective_media_files = [
+            m for m in (media_files or [])
+            if getattr(m, 'file_name', None) and str(m.file_name).strip()
+        ]
+        if effective_media_files:
             categories = {}
-            for m in media_files:
+            for m in effective_media_files:
                 cat = m.category or ''
                 if cat not in categories:
                     categories[cat] = []

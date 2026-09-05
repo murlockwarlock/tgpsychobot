@@ -17068,7 +17068,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             service_prompt_template = getattr(ai_config, 'service_prompt_block', None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
             service_prompt_block = render_prompt_block(
                 service_prompt_template,
-                available_media_text="[список передан в служебном контексте]",
+                available_media_text="",
+                media_instruction_block="",
                 test_context_injection="[контекст теста передан в служебном контексте]",
                 short_response_instruction="[режим длины передан в служебном контексте]",
             )
