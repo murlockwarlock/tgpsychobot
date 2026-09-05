@@ -112,6 +112,7 @@ async def show_content_editor(
         "• <code>[Меню](btn:svc:menu)</code> — открыть Меню\n"
         "• <code>[Выбрать тему](btn:svc:topics)</code> — список тем\n"
         "• <code>[Тема](btn:svc:topic:1)</code> — переключить тему\n"
+        "• <code>[Основной диалог](btn:svc:topic:main)</code> — основной диалог\n"
         "• <code>[Подписка](btn:svc:subscription)</code> — подписка\n"
         "• <code>[Рефералы](btn:svc:referral)</code> — реферальная программа\n"
         "• <code>[Настройки](btn:svc:settings)</code> — настройки\n"

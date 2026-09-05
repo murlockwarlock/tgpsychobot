@@ -27,6 +27,12 @@ _ACTION_CALLBACK_ID_RE = re.compile(
     rf"([0-9a-f]{{{ACTION_CALLBACK_ID_WIDTH}}})$"
 )
 
+MAIN_TOPIC_ACTIONS = frozenset({
+    "svc:topic:main",
+    "svc:topic:0",
+    "svc:reset_topic",
+})
+
 
 @dataclass(frozen=True)
 class ResponseButton:
