@@ -174,6 +174,7 @@ from automation_engine import apply_service_data_blocks, build_runtime_automatio
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
 from response_buttons import (
+    MAIN_TOPIC_ACTIONS,
     ResponseButton,
     build_action_callback_data,
     extract_response_buttons,
@@ -2361,7 +2362,11 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
     callback_data = callback.data or ""
     action, _button_index = split_action_callback_data(callback_data)
     user_id = callback.from_user.id
-    delegates_topic_callback = (action.startswith("topic_") and action[6:].isdigit()) or (action.startswith("svc:topic:") and action[10:].isdigit())
+    is_main_topic_action = action in MAIN_TOPIC_ACTIONS
+    delegates_topic_callback = not is_main_topic_action and (
+        (action.startswith("topic_") and action[6:].isdigit() and int(action[6:]) > 0)
+        or (action.startswith("svc:topic:") and action[10:].isdigit() and int(action[10:]) > 0)
+    )
     accepted, button_text = await _prepare_ai_button_submission(
         callback,
         bot,
@@ -2381,6 +2386,9 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
             answer=callback.message.answer,
         )
         await select_topic_menu(message_proxy)
+        return
+    if is_main_topic_action:
+        await _perform_telegram_topic_reset_to_main(user_id, bot)
         return
     if delegates_topic_callback:
         topic_id_str = action[10:] if action.startswith("svc:topic:") else action[6:]
@@ -5110,6 +5118,7 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
         "• <code>[Меню](btn:svc:menu)</code> — открыть Меню\n"
         "• <code>[Выбрать тему](btn:svc:topics)</code> — список тем\n"
         "• <code>[Тема](btn:svc:topic:1)</code> — переключить тему\n"
+        "• <code>[Основной диалог](btn:svc:topic:main)</code> — основной диалог\n"
         "• <code>[Подписка](btn:svc:subscription)</code> — подписка\n"
         "• <code>[Рефералы](btn:svc:referral)</code> — реферальная программа\n"
         "• <code>[Настройки](btn:svc:settings)</code> — настройки\n"
@@ -7345,10 +7354,10 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                 return TopicSwitchResult("already_current", topic=topic)
 
             if user:
-                user.current_topic_id = topic_id
                 ai_config = await session.get(AIConfig, 1)
                 memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
                 restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
+                user.current_topic_id = topic_id
                 await session.commit()
                 return TopicSwitchResult("switched", topic=topic, restored=restored, memory_mode=memory_mode)
             return TopicSwitchResult("inaccessible")
@@ -7359,12 +7368,21 @@ async def _apply_topic_switch(session, user, topic_key: int, memory_mode: str) -
     if is_global_memory_mode(memory_mode):
         return True
     if is_topic_memory_mode(memory_mode):
-        state_rec = await session.get(UserTopicState, (user.id, topic_key))
+        prev_key = user.current_topic_id if user.current_topic_id is not None else 0
+        saved_prev = await session.get(UserTopicState, (user.id, prev_key))
+        if saved_prev:
+            saved_prev.dialogue_id = user.current_dialogue_id
+        else:
+            session.add(UserTopicState(user_id=user.id, topic_id=prev_key, dialogue_id=user.current_dialogue_id))
+
+        target_key = topic_key if topic_key is not None else 0
+        state_rec = await session.get(UserTopicState, (user.id, target_key))
         if state_rec:
             user.current_dialogue_id = state_rec.dialogue_id
             return True
         user.current_dialogue_id += 1
-        session.add(UserTopicState(user_id=user.id, topic_id=topic_key, dialogue_id=user.current_dialogue_id))
+        session.add(UserTopicState(user_id=user.id, topic_id=target_key, dialogue_id=user.current_dialogue_id))
+        return False
     else:
         user.current_dialogue_id += 1
     return False
@@ -7680,25 +7698,31 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
         await _start_telegram_topic_auto_start(callback.from_user.id, bot, state, switch_res.topic)
 
 
+async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot) -> None:
+    async with user_locks.setdefault(user_id, asyncio.Lock()):
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user:
+                return
+            if user.current_topic_id is not None:
+                ai_config = await session.get(AIConfig, 1)
+                memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
+                await _apply_topic_switch(session, user, 0, memory_mode)
+                user.current_topic_id = None
+                await session.commit()
+
+    await render_static_content_telegram(bot, user_id, user_id, "start_message", is_start=True)
+    await bot.send_message(user_id, "✅ Тема сброшена. Мы вернулись в общий режим диалога.")
+
+
 @router.callback_query(F.data == "reset_topic")
 async def process_topic_reset(callback: CallbackQuery, bot: Bot):
     await callback.answer()
-    async with async_session_maker() as session:
-        user = await session.get(User, callback.from_user.id)
-        if user:
-            user.current_topic_id = None
-            ai_config = await session.get(AIConfig, 1)
-            memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
-            await _apply_topic_switch(session, user, 0, memory_mode)
-            await session.commit()
-
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
-
-    await render_static_content_telegram(bot, callback.from_user.id, callback.from_user.id, "start_message", is_start=True)
-    await bot.send_message(callback.from_user.id, "✅ Тема сброшена. Мы вернулись в общий режим диалога.")
+    await _perform_telegram_topic_reset_to_main(callback.from_user.id, bot)
 
 
 @router.callback_query(F.data == "topic_select_cancel")
@@ -16409,10 +16433,10 @@ async def handle_direct_topic_button(message: Message, topic_id: int, topic_name
         restored = False
         user = await session.get(User, message.from_user.id)
         if user:
-            user.current_topic_id = topic_id
             ai_config = await session.get(AIConfig, 1)
             memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
             restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
+            user.current_topic_id = topic_id
             await session.commit()
 
         topic = await session.get(Topic, topic_id)
@@ -16942,10 +16966,10 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
                 await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
                 return
 
-            user.current_topic_id = None
             ai_config = await session.get(AIConfig, 1)
             memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
             await _apply_topic_switch(session, user, 0, memory_mode)
+            user.current_topic_id = None
 
             await session.commit()
 

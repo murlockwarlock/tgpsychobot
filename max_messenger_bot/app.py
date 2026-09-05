@@ -32,6 +32,7 @@ from .services import common, settings as settings_service, subscriptions as sub
 from .settings import get_settings, validate_webhook_runtime_settings
 from .keyboards import inline_keyboard, main_menu_row
 from .identity import is_max_user_id
+from response_buttons import MAIN_TOPIC_ACTIONS, split_action_callback_data
 from .storage import StateStore, init_storage
 
 
@@ -715,7 +716,7 @@ class MaxBotApplication:
             await self.client.answer_callback(callback.callback_id)
             return
         if data.startswith("ai_btn:"):
-            action = data.split(":", 1)[1]
+            action, _ = split_action_callback_data(data)
             await self.client.answer_callback(callback.callback_id)
             if action in ("main_menu", "svc:menu"):
                 await common.show_menu(self.client, chat_id, user_id=user_id)
@@ -723,7 +724,10 @@ class MaxBotApplication:
             if action in ("topics", "svc:topics"):
                 await topics_service.show_topics(self.client, chat_id, user_id)
                 return
-            if (action.startswith("topic_") and action[6:].isdigit()) or (action.startswith("svc:topic:") and action[10:].isdigit()):
+            if action in MAIN_TOPIC_ACTIONS:
+                self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id))
+                return
+            if (action.startswith("topic_") and action[6:].isdigit() and int(action[6:]) > 0) or (action.startswith("svc:topic:") and action[10:].isdigit() and int(action[10:]) > 0):
                 topic_id = int(action[10:] if action.startswith("svc:topic:") else action[6:])
                 self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, topic_id, self.states))
                 return
@@ -824,7 +828,7 @@ class MaxBotApplication:
             return
         if data == "reset_topic":
             await self.client.answer_callback(callback.callback_id)
-            await topics_service.reset_topic(self.client, chat_id, user_id)
+            self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id))
             return
         if data.startswith("confirm_reset_dialogue:"):
             await self.client.answer_callback(callback.callback_id)

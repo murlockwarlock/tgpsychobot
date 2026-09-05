@@ -82,29 +82,34 @@ async def apply_memory_mode_topic_switch(session, user, topic_id: int, memory_mo
     if memory_mode == MEMORY_MODE_GLOBAL:
         return False
 
-    # Save current topic's dialogue state before switching.
+    # Save current topic's dialogue state before switching (key 0 for main dialogue).
     current_topic_id = getattr(user, "current_topic_id", None)
-    if current_topic_id is not None:
-        saved = await session.get(UserTopicState, (user.id, current_topic_id))
-        if saved:
-            saved.dialogue_id = user.current_dialogue_id
-        else:
-            session.add(UserTopicState(
-                user_id=user.id,
-                topic_id=current_topic_id,
-                dialogue_id=user.current_dialogue_id,
-            ))
+    current_key = current_topic_id if current_topic_id is not None else 0
+    saved = await session.get(UserTopicState, (user.id, current_key))
+    if saved:
+        saved.dialogue_id = user.current_dialogue_id
+    else:
+        session.add(UserTopicState(
+            user_id=user.id,
+            topic_id=current_key,
+            dialogue_id=user.current_dialogue_id,
+        ))
 
     if memory_mode == MEMORY_MODE_RESET:
         user.current_dialogue_id = (user.current_dialogue_id or 1) + 1
         return False
 
-    # MEMORY_MODE_TOPIC: restore previous dialogue state for this topic if available.
-    if topic_id:
-        saved = await session.get(UserTopicState, (user.id, topic_id))
-        if saved:
-            user.current_dialogue_id = saved.dialogue_id
-            return True
+    # MEMORY_MODE_TOPIC: restore previous dialogue state for this topic if available (key 0 for main dialogue).
+    target_key = topic_id if topic_id is not None else 0
+    saved_target = await session.get(UserTopicState, (user.id, target_key))
+    if saved_target:
+        user.current_dialogue_id = saved_target.dialogue_id
+        return True
 
     user.current_dialogue_id = (user.current_dialogue_id or 1) + 1
+    session.add(UserTopicState(
+        user_id=user.id,
+        topic_id=target_key,
+        dialogue_id=user.current_dialogue_id,
+    ))
     return False

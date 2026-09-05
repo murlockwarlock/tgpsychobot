@@ -116,7 +116,8 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int) -> None:
         config = await session.get(AIConfig, 1)
     if not user:
         return
-    await _apply_topic_switch(user, 0, normalize_memory_mode(config))
+    if user.current_topic_id is not None:
+        await _apply_topic_switch(user, 0, normalize_memory_mode(config))
     from .common import render_static_content
     await render_static_content(client, chat_id, user_id, "start_message", is_start=True)
     await client.send_message(chat_id=chat_id, text="✅ Тема сброшена.", attachments=inline_keyboard([main_menu_row()]))
