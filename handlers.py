@@ -7354,10 +7354,10 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                 return TopicSwitchResult("already_current", topic=topic)
 
             if user:
-                user.current_topic_id = topic_id
                 ai_config = await session.get(AIConfig, 1)
                 memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
                 restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
+                user.current_topic_id = topic_id
                 await session.commit()
                 return TopicSwitchResult("switched", topic=topic, restored=restored, memory_mode=memory_mode)
             return TopicSwitchResult("inaccessible")
@@ -7368,12 +7368,21 @@ async def _apply_topic_switch(session, user, topic_key: int, memory_mode: str) -
     if is_global_memory_mode(memory_mode):
         return True
     if is_topic_memory_mode(memory_mode):
-        state_rec = await session.get(UserTopicState, (user.id, topic_key))
+        prev_key = user.current_topic_id if user.current_topic_id is not None else 0
+        saved_prev = await session.get(UserTopicState, (user.id, prev_key))
+        if saved_prev:
+            saved_prev.dialogue_id = user.current_dialogue_id
+        else:
+            session.add(UserTopicState(user_id=user.id, topic_id=prev_key, dialogue_id=user.current_dialogue_id))
+
+        target_key = topic_key if topic_key is not None else 0
+        state_rec = await session.get(UserTopicState, (user.id, target_key))
         if state_rec:
             user.current_dialogue_id = state_rec.dialogue_id
             return True
         user.current_dialogue_id += 1
-        session.add(UserTopicState(user_id=user.id, topic_id=topic_key, dialogue_id=user.current_dialogue_id))
+        session.add(UserTopicState(user_id=user.id, topic_id=target_key, dialogue_id=user.current_dialogue_id))
+        return False
     else:
         user.current_dialogue_id += 1
     return False
@@ -7696,10 +7705,10 @@ async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot) -> None:
             if not user:
                 return
             if user.current_topic_id is not None:
-                user.current_topic_id = None
                 ai_config = await session.get(AIConfig, 1)
                 memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
                 await _apply_topic_switch(session, user, 0, memory_mode)
+                user.current_topic_id = None
                 await session.commit()
 
     await render_static_content_telegram(bot, user_id, user_id, "start_message", is_start=True)
@@ -16424,10 +16433,10 @@ async def handle_direct_topic_button(message: Message, topic_id: int, topic_name
         restored = False
         user = await session.get(User, message.from_user.id)
         if user:
-            user.current_topic_id = topic_id
             ai_config = await session.get(AIConfig, 1)
             memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
             restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
+            user.current_topic_id = topic_id
             await session.commit()
 
         topic = await session.get(Topic, topic_id)
@@ -16957,10 +16966,10 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
                 await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
                 return
 
-            user.current_topic_id = None
             ai_config = await session.get(AIConfig, 1)
             memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
             await _apply_topic_switch(session, user, 0, memory_mode)
+            user.current_topic_id = None
 
             await session.commit()
 

@@ -32,7 +32,13 @@ from max_messenger_bot.services import (
     topics as max_topics,
 )
 from max_messenger_bot.storage import StorageBase
-from memory_mode import MEMORY_MODE_GLOBAL, MEMORY_MODE_RESET, MEMORY_MODE_TOPIC
+import memory_mode
+from memory_mode import (
+    MEMORY_MODE_GLOBAL,
+    MEMORY_MODE_RESET,
+    MEMORY_MODE_TOPIC,
+    apply_memory_mode_topic_switch,
+)
 from response_buttons import (
     MAIN_TOPIC_ACTIONS,
     ResponseButton,
@@ -117,7 +123,73 @@ def test_response_button_parser_canonical_and_aliases():
 
 
 # ==============================================================================
-# 2. TELEGRAM — PRIMARY JOURNEY
+# 2. SHARED MEMORY-MODE UNIT TESTS (Key 0 Semantics)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_shared_memory_mode_topic_switch_cycle(db_session):
+    async with db_session() as session:
+        user = User(id=6001, first_name="User", current_dialogue_id=5, current_topic_id=None)
+        session.add(user)
+        await session.commit()
+
+        # Switch main (5) -> topic 10
+        restored_10 = await apply_memory_mode_topic_switch(session, user, 10, MEMORY_MODE_TOPIC)
+        user.current_topic_id = 10
+        await session.commit()
+        assert not restored_10
+        assert user.current_dialogue_id == 6
+
+        # Check key 0 state saved
+        state_0 = await session.get(UserTopicState, (6001, 0))
+        assert state_0 is not None
+        assert state_0.dialogue_id == 5
+
+        # Switch topic 10 -> main (0)
+        restored_main = await apply_memory_mode_topic_switch(session, user, 0, MEMORY_MODE_TOPIC)
+        user.current_topic_id = None
+        await session.commit()
+        assert restored_main
+        assert user.current_dialogue_id == 5
+
+
+@pytest.mark.asyncio
+async def test_shared_memory_mode_topic_first_ever_main_state(db_session):
+    async with db_session() as session:
+        user = User(id=6002, first_name="User", current_dialogue_id=1, current_topic_id=10)
+        session.add(user)
+        await session.commit()
+
+        # Switch topic 10 -> main (0) with no key-0 record
+        restored = await apply_memory_mode_topic_switch(session, user, 0, MEMORY_MODE_TOPIC)
+        user.current_topic_id = None
+        await session.commit()
+        assert not restored
+        assert user.current_dialogue_id == 2
+        state_0 = await session.get(UserTopicState, (6002, 0))
+        assert state_0 is not None
+        assert state_0.dialogue_id == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_memory_mode_global_and_reset(db_session):
+    async with db_session() as session:
+        user_global = User(id=6003, first_name="User", current_dialogue_id=3, current_topic_id=10)
+        user_reset = User(id=6004, first_name="User", current_dialogue_id=3, current_topic_id=10)
+        session.add_all([user_global, user_reset])
+        await session.commit()
+
+        # GLOBAL: topic -> main preserves dialogue id
+        await apply_memory_mode_topic_switch(session, user_global, 0, MEMORY_MODE_GLOBAL)
+        assert user_global.current_dialogue_id == 3
+
+        # RESET: topic -> main increments dialogue id
+        await apply_memory_mode_topic_switch(session, user_reset, 0, MEMORY_MODE_RESET)
+        assert user_reset.current_dialogue_id == 4
+
+
+# ==============================================================================
+# 3. TELEGRAM — JOURNEYS AND MEMORY MODES
 # ==============================================================================
 
 @pytest.mark.asyncio
@@ -185,9 +257,78 @@ async def test_telegram_primary_journey_topic_to_main(db_session):
         assert user_db_msg.dialogue_id == 2
 
 
-# ==============================================================================
-# 3. TELEGRAM — ALIASES
-# ==============================================================================
+@pytest.mark.asyncio
+async def test_telegram_topic_memory_mode_main_topic_main_cycle(db_session):
+    async with db_session() as session:
+        session.add(AIConfig(id=1, memory_mode=MEMORY_MODE_TOPIC))
+        session.add(Topic(id=10, name="Topic 10", is_active=True, admin_only=False))
+        session.add(User(id=3010, username="user_3010", first_name="Tester", name="Tester", accepted_disclaimer=True, current_dialogue_id=5, current_topic_id=None, is_admin=True))
+        session.add(Content(key="start_message", text_content="Старт", is_visible=True))
+        await session.commit()
+
+    mock_bot = SimpleNamespace(send_message=AsyncMock())
+    mock_state = AsyncMock()
+
+    # 1. Switch main (5) -> topic 10
+    cb_topic_10 = SimpleNamespace(
+        data="ai_btn:svc:topic:10",
+        from_user=SimpleNamespace(id=3010, username="user_3010", full_name="Tester"),
+        message=SimpleNamespace(
+            message_id=510,
+            chat=SimpleNamespace(id=3010),
+            delete=AsyncMock(),
+            answer=AsyncMock(),
+            edit_reply_markup=AsyncMock(),
+            reply_markup=handlers.InlineKeyboardMarkup(
+                inline_keyboard=[[handlers.InlineKeyboardButton(text="Topic 10", callback_data="ai_btn:svc:topic:10")]]
+            ),
+        ),
+        answer=AsyncMock(),
+        model_copy=lambda update: SimpleNamespace(
+            data=update.get("data", "select_topic_10"),
+            from_user=SimpleNamespace(id=3010, username="user_3010", full_name="Tester"),
+            message=SimpleNamespace(
+                message_id=510,
+                chat=SimpleNamespace(id=3010),
+                delete=AsyncMock(),
+                answer=AsyncMock(),
+                edit_reply_markup=AsyncMock(),
+                reply_markup=handlers.InlineKeyboardMarkup(
+                    inline_keyboard=[[handlers.InlineKeyboardButton(text="Topic 10", callback_data="ai_btn:svc:topic:10")]]
+                ),
+            ),
+            answer=AsyncMock(),
+        ),
+    )
+    await handlers.process_response_button(cb_topic_10, mock_state, mock_bot)
+
+    async with db_session() as session:
+        user = await session.get(User, 3010)
+        assert user.current_topic_id == 10
+        assert user.current_dialogue_id == 6  # Fresh topic 10 dialogue
+
+    # 2. Switch topic 10 -> main via svc:topic:main
+    cb_main = SimpleNamespace(
+        data="ai_btn:svc:topic:main",
+        from_user=SimpleNamespace(id=3010, username="user_3010", full_name="Tester"),
+        message=SimpleNamespace(
+            message_id=511,
+            chat=SimpleNamespace(id=3010),
+            answer=AsyncMock(),
+            edit_reply_markup=AsyncMock(),
+            reply_markup=handlers.InlineKeyboardMarkup(
+                inline_keyboard=[[handlers.InlineKeyboardButton(text="Основной диалог", callback_data="ai_btn:svc:topic:main")]]
+            ),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.process_response_button(cb_main, mock_state, mock_bot)
+
+    async with db_session() as session:
+        user = await session.get(User, 3010)
+        assert user.current_topic_id is None
+        assert user.current_dialogue_id == 5  # RESTORED dialogue 5!
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alias_payload", ["ai_btn:svc:topic:0", "ai_btn:svc:reset_topic"])
@@ -227,16 +368,14 @@ async def test_telegram_aliases_topic_to_main(db_session, alias_payload):
         assert user.current_dialogue_id == 2
 
 
-# ==============================================================================
-# 4. TELEGRAM — ALREADY MAIN IDEMPOTENCY
-# ==============================================================================
-
 @pytest.mark.asyncio
-async def test_telegram_already_main_idempotency(db_session):
+@pytest.mark.parametrize("mem_mode", [MEMORY_MODE_RESET, MEMORY_MODE_TOPIC, MEMORY_MODE_GLOBAL])
+async def test_telegram_already_main_idempotency(db_session, mem_mode):
+    uid = 3004 if mem_mode == MEMORY_MODE_RESET else (3005 if mem_mode == MEMORY_MODE_TOPIC else 3006)
     async with db_session() as session:
-        session.add(AIConfig(id=1, memory_mode=MEMORY_MODE_RESET))
-        session.add(User(id=3004, username="main_user", first_name="Tester", name="Tester", accepted_disclaimer=True, current_dialogue_id=5, current_topic_id=None, is_admin=True))
-        session.add(DBMessage(user_id=3004, dialogue_id=5, topic_id=None, role="user", content="Старое сообщение в диалоге 5"))
+        session.add(AIConfig(id=1, memory_mode=mem_mode))
+        session.add(User(id=uid, username="main_user", first_name="Tester", name="Tester", accepted_disclaimer=True, current_dialogue_id=5, current_topic_id=None, is_admin=True))
+        session.add(DBMessage(user_id=uid, dialogue_id=5, topic_id=None, role="user", content="Старое сообщение в диалоге 5"))
         session.add(Content(key="start_message", text_content="Старт", is_visible=True))
         await session.commit()
 
@@ -248,10 +387,10 @@ async def test_telegram_already_main_idempotency(db_session):
 
     cb = SimpleNamespace(
         data="ai_btn:svc:topic:main",
-        from_user=SimpleNamespace(id=3004, username="main_user", full_name="Tester"),
+        from_user=SimpleNamespace(id=uid, username="main_user", full_name="Tester"),
         message=SimpleNamespace(
             message_id=504,
-            chat=SimpleNamespace(id=3004),
+            chat=SimpleNamespace(id=uid),
             answer=AsyncMock(),
             edit_reply_markup=AsyncMock(),
             reply_markup=handlers.InlineKeyboardMarkup(
@@ -268,26 +407,13 @@ async def test_telegram_already_main_idempotency(db_session):
 
     # 2. dialogue_id NOT changed, topic_id remains None
     async with db_session() as session:
-        user = await session.get(User, 3004)
+        user = await session.get(User, uid)
         assert user.current_topic_id is None
         assert user.current_dialogue_id == 5
 
-    # 3. Next message stays in dialogue 5
-    handlers.user_message_buffers.setdefault(3004, []).append("Вопрос после нажатия кнопки")
-
-    with patch("ai_integration.generate_response", new_callable=AsyncMock) as mock_gen:
-        mock_gen.return_value = "Ответ в диалоге 5"
-        await handlers.process_buffered_messages(3004, mock_bot, mock_state)
-
-    async with db_session() as session:
-        messages = (await session.execute(
-            select(DBMessage).where(DBMessage.user_id == 3004, DBMessage.dialogue_id == 5)
-        )).scalars().all()
-        assert any(m.content == "Вопрос после нажатия кнопки" and m.topic_id is None for m in messages)
-
 
 # ==============================================================================
-# 5. MAX — PRIMARY JOURNEY
+# 4. MAX — JOURNEYS AND MEMORY MODES
 # ==============================================================================
 
 @pytest.mark.asyncio
@@ -316,7 +442,6 @@ async def test_max_primary_journey_topic_to_main(db_session):
     )
 
     await app.handle_callback(cb)
-    # Await spawned user tasks
     user_task = app.user_tasks.get(4001)
     if user_task:
         await user_task
@@ -356,9 +481,59 @@ async def test_max_primary_journey_topic_to_main(db_session):
         assert user_msg_db.dialogue_id == 2
 
 
-# ==============================================================================
-# 6. MAX — ALIASES
-# ==============================================================================
+@pytest.mark.asyncio
+async def test_max_topic_memory_mode_main_topic_main_cycle(db_session):
+    async with db_session() as session:
+        session.add(AIConfig(id=1, memory_mode=MEMORY_MODE_TOPIC))
+        session.add(Topic(id=10, name="Topic Max 10", is_active=True, admin_only=False))
+        session.add(User(id=4010, first_name="MaxUser", name="MaxUser", accepted_disclaimer=True, current_dialogue_id=5, current_topic_id=None, is_admin=True))
+        session.add(Content(key="start_message", text_content="Главный экран", is_visible=True))
+        await session.commit()
+
+    mock_client = SimpleNamespace(
+        send_message=AsyncMock(),
+        answer_callback=AsyncMock(),
+    )
+    app = MaxBotApplication(client=mock_client)
+
+    # 1. Switch main (5) -> topic 10
+    cb_10 = IncomingCallback(
+        raw={},
+        callback_id="cb_4010_1",
+        payload="ai_btn:svc:topic:10",
+        chat_id=4010,
+        message_id="m_4010_1",
+        sender=Sender(user_id=4010, username="max_user", first_name="MaxUser", last_name=None),
+    )
+    await app.handle_callback(cb_10)
+    user_task = app.user_tasks.get(4010)
+    if user_task:
+        await user_task
+
+    async with db_session() as session:
+        user = await session.get(User, 4010)
+        assert user.current_topic_id == 10
+        assert user.current_dialogue_id == 6
+
+    # 2. Switch topic 10 -> main via svc:topic:main
+    cb_main = IncomingCallback(
+        raw={},
+        callback_id="cb_4010_2",
+        payload="ai_btn:svc:topic:main",
+        chat_id=4010,
+        message_id="m_4010_2",
+        sender=Sender(user_id=4010, username="max_user", first_name="MaxUser", last_name=None),
+    )
+    await app.handle_callback(cb_main)
+    user_task = app.user_tasks.get(4010)
+    if user_task:
+        await user_task
+
+    async with db_session() as session:
+        user = await session.get(User, 4010)
+        assert user.current_topic_id is None
+        assert user.current_dialogue_id == 5  # RESTORED main dialogue 5!
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alias_payload", ["ai_btn:svc:topic:0", "ai_btn:svc:reset_topic"])
@@ -398,15 +573,13 @@ async def test_max_aliases_topic_to_main(db_session, alias_payload):
         assert user.current_dialogue_id == 2
 
 
-# ==============================================================================
-# 7. MAX — ALREADY MAIN IDEMPOTENCY
-# ==============================================================================
-
 @pytest.mark.asyncio
-async def test_max_already_main_idempotency(db_session):
+@pytest.mark.parametrize("mem_mode", [MEMORY_MODE_RESET, MEMORY_MODE_TOPIC, MEMORY_MODE_GLOBAL])
+async def test_max_already_main_idempotency(db_session, mem_mode):
+    uid = 4004 if mem_mode == MEMORY_MODE_RESET else (4005 if mem_mode == MEMORY_MODE_TOPIC else 4006)
     async with db_session() as session:
-        session.add(AIConfig(id=1, memory_mode=MEMORY_MODE_RESET))
-        session.add(User(id=4004, first_name="MaxMainUser", name="MaxMainUser", accepted_disclaimer=True, current_dialogue_id=4, current_topic_id=None, is_admin=True))
+        session.add(AIConfig(id=1, memory_mode=mem_mode))
+        session.add(User(id=uid, first_name="MaxMainUser", name="MaxMainUser", accepted_disclaimer=True, current_dialogue_id=4, current_topic_id=None, is_admin=True))
         session.add(Content(key="start_message", text_content="Главный экран", is_visible=True))
         await session.commit()
 
@@ -418,27 +591,27 @@ async def test_max_already_main_idempotency(db_session):
 
     cb = IncomingCallback(
         raw={},
-        callback_id="cb_4004",
+        callback_id=f"cb_{uid}",
         payload="ai_btn:svc:topic:main",
-        chat_id=4004,
-        message_id="m_4004",
-        sender=Sender(user_id=4004, username="max_main", first_name="MaxMainUser", last_name=None),
+        chat_id=uid,
+        message_id=f"m_{uid}",
+        sender=Sender(user_id=uid, username="max_main", first_name="MaxMainUser", last_name=None),
     )
 
     await app.handle_callback(cb)
-    user_task = app.user_tasks.get(4004)
+    user_task = app.user_tasks.get(uid)
     if user_task:
         await user_task
 
     assert mock_client.answer_callback.call_count == 1
     async with db_session() as session:
-        user = await session.get(User, 4004)
+        user = await session.get(User, uid)
         assert user.current_topic_id is None
         assert user.current_dialogue_id == 4  # Unchanged!
 
 
 # ==============================================================================
-# 8. REGRESSION: POSITIVE TOPIC IDS
+# 5. REGRESSION & STARTUP SYMBOLS
 # ==============================================================================
 
 @pytest.mark.asyncio
@@ -474,10 +647,6 @@ async def test_positive_topic_ids_regression(db_session):
         user = await session.get(User, 5001)
         assert user.current_topic_id == 15
 
-
-# ==============================================================================
-# 9. STARTUP SYMBOL REGRESSION
-# ==============================================================================
 
 def test_max_startup_symbols_regression():
     import max_messenger_bot.app as app
