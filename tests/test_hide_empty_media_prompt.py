@@ -128,6 +128,56 @@ def test_render_prompt_block_legacy_template_with_media_keeps_media_block():
     assert "SHOW_IMG" in rendered
 
 
+def test_render_prompt_block_legacy_template_with_suffix_preserves_suffix_when_media_empty():
+    """Test A: Known legacy block + empty media -> media block absent, following custom instruction remains."""
+    suffix = "КРИТИЧЕСКОЕ ПРАВИЛО ПОСЛЕ MEDIA: сохранить меня"
+    template_with_suffix = f"{LEGACY_SERVICE_PROMPT_TEMPLATE}\n\n{suffix}"
+    rendered = render_prompt_block(
+        template_with_suffix,
+        available_media_text="",
+        media_instruction_block="",
+    )
+    assert "ДОСТУПНЫЙ МЕДИА-КОНТЕНТ" not in rendered
+    assert "ПРАВИЛА ИСПОЛЬЗОВАНИЯ МЕДИА-ТЕГОВ" not in rendered
+    assert suffix in rendered
+    assert "GEN_IMG" in rendered
+
+
+def test_render_prompt_block_nonstandard_media_block_missing_terminator_does_not_truncate_suffix():
+    """Test B: Custom/nonstandard media block missing terminator -> must NOT truncate suffix through EOF."""
+    suffix = "КРИТИЧЕСКОЕ ПРАВИЛО ПОСЛЕ MEDIA: сохранить меня"
+    custom_template = (
+        "ТЕХНИЧЕСКИЕ ПРАВИЛА ОФОРМЛЕНИЯ:\n1. Markdown.\n\n"
+        "🎵 ДОСТУПНЫЙ МЕДИА-КОНТЕНТ В ЭТОЙ ТЕМЕ:\n"
+        "{available_media_text}\n\n"
+        "ПРАВИЛА КАСТОМНЫЕ:\n1. Нестандартные правила без терминатора\n\n"
+        f"{suffix}"
+    )
+    rendered = render_prompt_block(
+        custom_template,
+        available_media_text="",
+        media_instruction_block="",
+    )
+    assert suffix in rendered
+    assert "ТЕХНИЧЕСКИЕ ПРАВИЛА ОФОРМЛЕНИЯ" in rendered
+
+
+def test_render_prompt_block_legacy_template_with_suffix_keeps_media_and_suffix_when_media_exists():
+    """Test C: Known legacy block + actual media -> media block, files, SHOW_IMG rules, and suffix all present."""
+    suffix = "КРИТИЧЕСКОЕ ПРАВИЛО ПОСЛЕ MEDIA: сохранить меня"
+    template_with_suffix = f"{LEGACY_SERVICE_PROMPT_TEMPLATE}\n\n{suffix}"
+    media_text = "Доступные медиа-файлы в этой теме:\n  - [PHOTO] tarot_fool.jpg — Шут\n"
+    rendered = render_prompt_block(
+        template_with_suffix,
+        available_media_text=media_text,
+    )
+    assert "ДОСТУПНЫЙ МЕДИА-КОНТЕНТ" in rendered
+    assert "tarot_fool.jpg" in rendered
+    assert "SHOW_IMG" in rendered
+    assert "ПРАВИЛА ИСПОЛЬЗОВАНИЯ МЕДИА-ТЕГОВ" in rendered
+    assert suffix in rendered
+
+
 # ═══════════════════════════════════════════════════════════════
 #  2. Integration Tests: AI Request Context & Payload
 # ═══════════════════════════════════════════════════════════════

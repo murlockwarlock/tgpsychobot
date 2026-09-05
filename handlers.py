@@ -17070,8 +17070,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 service_prompt_template,
                 available_media_text="",
                 media_instruction_block="",
-                test_context_injection="",
-                short_response_instruction="",
+                test_context_injection="[контекст теста передан в служебном контексте]",
+                short_response_instruction="[режим длины передан в служебном контексте]",
             )
             stable_vision_prompt = ai_integration.neutralize_stable_prompt(system_prompt_text)
             if not stable_vision_prompt:
