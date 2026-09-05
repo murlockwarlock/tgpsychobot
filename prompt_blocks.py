@@ -1,3 +1,4 @@
+import re
 import textwrap
 
 
@@ -65,6 +66,13 @@ GEN_IMG: [подробный промпт на АНГЛИЙСКОМ языке]
 """).strip()
 
 
+_LEGACY_MEDIA_BLOCK_REGEX = re.compile(
+    r"(?:\r?\n)*[ \t]*(?:🎵?[ \t]*ДОСТУПНЫЙ МЕДИА-КОНТЕНТ|ПРАВИЛА ИСПОЛЬЗОВАНИЯ МЕДИА-ТЕГОВ:).*?"
+    r"(?:[Нн]е выдумывай категории и имена файлов[^\n]*|\Z)",
+    re.DOTALL,
+)
+
+
 def build_media_instruction_block(available_media_text: str | None) -> str:
     if not available_media_text or not available_media_text.strip():
         return ""
@@ -76,6 +84,12 @@ def build_media_instruction_block(available_media_text: str | None) -> str:
 
 def render_prompt_block(template: str, **values: str) -> str:
     rendered = template or ""
+    available_media_text = values.get("available_media_text") or ""
+    media_instruction_block = values.get("media_instruction_block") or ""
+    if not available_media_text.strip() and not media_instruction_block.strip():
+        if "ДОСТУПНЫЙ МЕДИА-КОНТЕНТ" in rendered or "ПРАВИЛА ИСПОЛЬЗОВАНИЯ МЕДИА-ТЕГОВ" in rendered:
+            rendered = _LEGACY_MEDIA_BLOCK_REGEX.sub("", rendered)
+
     for key, value in values.items():
         rendered = rendered.replace(f"{{{key}}}", value or "")
     return rendered.strip()
