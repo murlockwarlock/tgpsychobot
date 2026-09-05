@@ -473,3 +473,13 @@ async def test_positive_topic_ids_regression(db_session):
     async with db_session() as session:
         user = await session.get(User, 5001)
         assert user.current_topic_id == 15
+
+
+# ==============================================================================
+# 9. STARTUP SYMBOL REGRESSION
+# ==============================================================================
+
+def test_max_startup_symbols_regression():
+    import max_messenger_bot.app as app
+    assert callable(app.get_settings)
+    assert callable(app.validate_webhook_runtime_settings)
