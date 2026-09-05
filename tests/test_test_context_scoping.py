@@ -462,3 +462,286 @@ async def test_regression_7_max_regression_no_stale_test_context(scoping_db):
     max_text = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
     assert "[КОНТЕКСТ ТЕСТА]" not in max_text
     assert "Ответ MAX" not in max_text
+
+
+@pytest.mark.asyncio
+async def test_regression_8_max_global_topic_switch_preserves_dialogue_and_reset_clears(scoping_db):
+    """MAX GLOBAL mode journey:
+
+    - Dialogue 5 in Topic A has ordinary history + test_result.
+    - Switching active topic to Topic B without changing dialogue_id preserves Dialogue 5 context.
+    - Explicit reset to Dialogue 6 removes old Dialogue 5 user/assistant history and test_result.
+    """
+    async with scoping_db() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.memory_mode = MEMORY_MODE_GLOBAL
+
+        user = User(
+            id=201,
+            first_name="Виктор",
+            current_dialogue_id=5,
+            current_topic_id=1,
+        )
+        session.add(user)
+        session.add(Topic(id=1, name="Тема A"))
+        session.add(Topic(id=2, name="Тема B"))
+
+        session.add(
+            DBMessage(
+                user_id=201,
+                dialogue_id=5,
+                topic_id=1,
+                role="user",
+                content="Вопрос в теме A",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        session.add(
+            DBMessage(
+                user_id=201,
+                dialogue_id=5,
+                topic_id=1,
+                role="assistant",
+                content="Ответ в теме A",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        session.add(
+            DBMessage(
+                user_id=201,
+                dialogue_id=5,
+                topic_id=1,
+                role=TEST_RESULT_ROLE,
+                content="Тест в теме A: 100 баллов",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        await session.commit()
+
+    # Switch active topic to Topic B WITHOUT changing dialogue_id (GLOBAL mode)
+    async with scoping_db() as session:
+        user = await session.get(User, 201)
+        user.current_topic_id = 2
+        await session.commit()
+
+    _CapturedCompletionClient.calls.clear()
+    reply = await max_ai.get_ai_response(201, "Привет в теме B")
+    assert reply == "Здравствуйте! Чем могу помочь?"
+
+    assert len(_CapturedCompletionClient.calls) == 1
+    payload_text = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "Вопрос в теме A" in payload_text
+    assert "Ответ в теме A" in payload_text
+    assert "Тест в теме A: 100 баллов" in payload_text
+    assert "[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]" in payload_text
+
+    # Explicit dialogue reset to dialogue 6
+    async with scoping_db() as session:
+        user = await session.get(User, 201)
+        user.current_dialogue_id = 6
+        await session.commit()
+
+    _CapturedCompletionClient.calls.clear()
+    reply = await max_ai.get_ai_response(201, "Привет после сброса")
+    assert reply == "Здравствуйте! Чем могу помочь?"
+
+    assert len(_CapturedCompletionClient.calls) == 1
+    reset_payload_text = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "Вопрос в теме A" not in reset_payload_text
+    assert "Ответ в теме A" not in reset_payload_text
+    assert "Тест в теме A: 100 баллов" not in reset_payload_text
+    assert "[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]" not in reset_payload_text
+
+
+@pytest.mark.asyncio
+async def test_regression_9_max_topic_restored_topic_gets_only_its_saved_dialogue(scoping_db):
+    """MAX TOPIC mode journey:
+
+    - Topic A in dialogue 5 has A history + A test_result.
+    - Topic B in dialogue 6 has B history + B test_result.
+    - Active topic B / dialogue 6 receives only B content.
+    - Restored topic A / dialogue 5 receives only A content.
+    """
+    async with scoping_db() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.memory_mode = MEMORY_MODE_TOPIC
+
+        user = User(
+            id=202,
+            first_name="Светлана",
+            current_dialogue_id=6,
+            current_topic_id=20,
+        )
+        session.add(user)
+        session.add(Topic(id=10, name="Тема A"))
+        session.add(Topic(id=20, name="Тема B"))
+
+        # Topic A / dialogue 5
+        session.add(
+            DBMessage(
+                user_id=202,
+                dialogue_id=5,
+                topic_id=10,
+                role="user",
+                content="Сообщение темы A",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        session.add(
+            DBMessage(
+                user_id=202,
+                dialogue_id=5,
+                topic_id=10,
+                role="assistant",
+                content="Ответ темы A",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        session.add(
+            DBMessage(
+                user_id=202,
+                dialogue_id=5,
+                topic_id=10,
+                role=TEST_RESULT_ROLE,
+                content="Тест темы A: пройден успешно",
+                timestamp=datetime.utcnow(),
+            )
+        )
+
+        # Topic B / dialogue 6
+        session.add(
+            DBMessage(
+                user_id=202,
+                dialogue_id=6,
+                topic_id=20,
+                role="user",
+                content="Сообщение темы B",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        session.add(
+            DBMessage(
+                user_id=202,
+                dialogue_id=6,
+                topic_id=20,
+                role="assistant",
+                content="Ответ темы B",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        session.add(
+            DBMessage(
+                user_id=202,
+                dialogue_id=6,
+                topic_id=20,
+                role=TEST_RESULT_ROLE,
+                content="Тест темы B: завершен успешно",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        await session.commit()
+
+    # Active: Topic B / dialogue 6
+    _CapturedCompletionClient.calls.clear()
+    reply = await max_ai.get_ai_response(202, "Запрос в теме B")
+    assert reply == "Здравствуйте! Чем могу помочь?"
+
+    assert len(_CapturedCompletionClient.calls) == 1
+    b_payload = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "Сообщение темы B" in b_payload
+    assert "Ответ темы B" in b_payload
+    assert "Тест темы B: завершен успешно" in b_payload
+    assert "Сообщение темы A" not in b_payload
+    assert "Ответ темы A" not in b_payload
+    assert "Тест темы A: пройден успешно" not in b_payload
+
+    # Restore: Topic A / dialogue 5
+    async with scoping_db() as session:
+        user = await session.get(User, 202)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 5
+        await session.commit()
+
+    _CapturedCompletionClient.calls.clear()
+    reply = await max_ai.get_ai_response(202, "Запрос в теме A")
+    assert reply == "Здравствуйте! Чем могу помочь?"
+
+    assert len(_CapturedCompletionClient.calls) == 1
+    a_payload = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "Сообщение темы A" in a_payload
+    assert "Ответ темы A" in a_payload
+    assert "Тест темы A: пройден успешно" in a_payload
+    assert "Сообщение темы B" not in a_payload
+    assert "Ответ темы B" not in a_payload
+    assert "Тест темы B: завершен успешно" not in a_payload
+
+
+@pytest.mark.asyncio
+async def test_regression_10_max_topic_explicit_reset_inside_same_topic_clears_old_dialogue(scoping_db):
+    """MAX TOPIC mode explicit reset journey:
+
+    - Topic A in dialogue 5 has ordinary history + test_result.
+    - Reset to Topic A in dialogue 6.
+    - All old dialogue 5 content is absent even though topic_id (Topic A) is unchanged.
+    """
+    async with scoping_db() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.memory_mode = MEMORY_MODE_TOPIC
+
+        user = User(
+            id=203,
+            first_name="Игорь",
+            current_dialogue_id=5,
+            current_topic_id=10,
+        )
+        session.add(user)
+        session.add(Topic(id=10, name="Тема A"))
+
+        session.add(
+            DBMessage(
+                user_id=203,
+                dialogue_id=5,
+                topic_id=10,
+                role="user",
+                content="Старый вопрос в теме A",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        session.add(
+            DBMessage(
+                user_id=203,
+                dialogue_id=5,
+                topic_id=10,
+                role="assistant",
+                content="Старый ответ в теме A",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        session.add(
+            DBMessage(
+                user_id=203,
+                dialogue_id=5,
+                topic_id=10,
+                role=TEST_RESULT_ROLE,
+                content="Старый тест в теме A: 55",
+                timestamp=datetime.utcnow(),
+            )
+        )
+        await session.commit()
+
+    # Reset dialogue inside same Topic A to dialogue 6
+    async with scoping_db() as session:
+        user = await session.get(User, 203)
+        user.current_dialogue_id = 6
+        await session.commit()
+
+    _CapturedCompletionClient.calls.clear()
+    reply = await max_ai.get_ai_response(203, "Новый вопрос в теме A")
+    assert reply == "Здравствуйте! Чем могу помочь?"
+
+    assert len(_CapturedCompletionClient.calls) == 1
+    reset_payload = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "Старый вопрос в теме A" not in reset_payload
+    assert "Старый ответ в теме A" not in reset_payload
+    assert "Старый тест в теме A: 55" not in reset_payload
+    assert "[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]" not in reset_payload
