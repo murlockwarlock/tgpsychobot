@@ -22,7 +22,7 @@ import time
 from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic, TestConfig, TestSession,
                      UserSubscription, KnowledgeBase, SubscriptionConfig, AILog)
 from media_scope import load_available_media
-from memory_mode import get_memory_mode, is_global_memory_mode
+from memory_mode import get_memory_mode, is_global_memory_mode, test_session_matches_active_scope
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
     DEFAULT_SHORT_RESPONSE_INSTRUCTION,
@@ -1638,30 +1638,6 @@ async def get_ai_response(
             active_topic.system_prompt if active_topic else None
         )
 
-        test_results_txt = ""
-        secret_answers_txt = ""
-
-        test_session = await session.get(TestSession, user_id)
-        if test_session and test_session.is_finished:
-            if test_session.answers:
-                test_results_txt = test_session.answers
-            if test_session.secret_answers:
-                secret_answers_txt = test_session.secret_answers
-
-        test_context_injection = ""
-        if include_test_context and (test_results_txt or secret_answers_txt):
-            test_config = await session.get(TestConfig, 1)
-            secret_test_enabled = bool(
-                getattr(test_config, "secret_test_enabled", True)
-                if test_config is not None
-                else True
-            )
-            test_context_injection = build_test_context_injection(
-                test_results_txt,
-                secret_answers_txt,
-                secret_test_enabled=secret_test_enabled,
-            )
-
         subscription_config = await session.get(SubscriptionConfig, 1)
 
         # Only configured/topic prompt text belongs in the stable cache prefix.
@@ -1715,8 +1691,29 @@ async def get_ai_response(
             limit_recent,
         )
 
-        if has_persisted_test_context:
-            test_context_injection = ""
+        test_context_injection = ""
+        if include_test_context and not has_persisted_test_context:
+            test_session = await session.get(TestSession, user_id)
+            if test_session_matches_active_scope(
+                test_session,
+                active_dialogue_id,
+                active_topic_id,
+                memory_mode,
+            ):
+                test_results_txt = test_session.answers if test_session and test_session.answers else ""
+                secret_answers_txt = test_session.secret_answers if test_session and test_session.secret_answers else ""
+                if test_results_txt or secret_answers_txt:
+                    test_config = await session.get(TestConfig, 1)
+                    secret_test_enabled = bool(
+                        getattr(test_config, "secret_test_enabled", True)
+                        if test_config is not None
+                        else True
+                    )
+                    test_context_injection = build_test_context_injection(
+                        test_results_txt,
+                        secret_answers_txt,
+                        secret_test_enabled=secret_test_enabled,
+                    )
         service_prompt_template = getattr(ai_config, 'service_prompt_block', None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
         service_prompt_block = render_prompt_block(
             service_prompt_template,

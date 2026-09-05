@@ -17,13 +17,55 @@ def build_history_scope(message_cls, user_id: int, dialogue_id, topic_id, memory
     """Return a SQLAlchemy WHERE condition for history queries based on memory mode."""
     from sqlalchemy import and_
     if memory_mode == MEMORY_MODE_GLOBAL:
-        return message_cls.user_id == user_id
+        return and_(message_cls.user_id == user_id, message_cls.dialogue_id == (dialogue_id or 1))
     if memory_mode == MEMORY_MODE_TOPIC:
         if topic_id is not None:
-            return and_(message_cls.user_id == user_id, message_cls.topic_id == topic_id)
-        return message_cls.user_id == user_id
+            return and_(
+                message_cls.user_id == user_id,
+                message_cls.dialogue_id == (dialogue_id or 1),
+                message_cls.topic_id == topic_id,
+            )
+        return and_(
+            message_cls.user_id == user_id,
+            message_cls.dialogue_id == (dialogue_id or 1),
+            message_cls.topic_id.is_(None),
+        )
     # MEMORY_MODE_RESET: scope by dialogue
     return and_(message_cls.user_id == user_id, message_cls.dialogue_id == (dialogue_id or 1))
+
+
+def test_session_matches_active_scope(
+    test_session,
+    active_dialogue_id: int | None,
+    active_topic_id: int | None,
+    memory_mode: str,
+) -> bool:
+    """Check whether a finished TestSession belongs to the active dialogue/topic memory scope.
+
+    Rules:
+    1. test_session must exist and have is_finished == True.
+    2. invocation_dialogue_id must be set and equal active_dialogue_id (null cannot prove scope).
+    3. MEMORY_MODE_GLOBAL: dialogue match is sufficient.
+    4. MEMORY_MODE_RESET / MEMORY_MODE_TOPIC: invocation_topic_id must match active_topic_id
+       (treating None and 0 as equivalent for main dialogue).
+    """
+    if not test_session or not getattr(test_session, "is_finished", False):
+        return False
+
+    session_dialogue_id = getattr(test_session, "invocation_dialogue_id", None)
+    if session_dialogue_id is None or active_dialogue_id is None:
+        return False
+
+    if session_dialogue_id != active_dialogue_id:
+        return False
+
+    if memory_mode == MEMORY_MODE_GLOBAL:
+        return True
+
+    # MEMORY_MODE_RESET and MEMORY_MODE_TOPIC require topic match.
+    session_topic_id = getattr(test_session, "invocation_topic_id", None) or None
+    target_topic_id = active_topic_id or None
+    return session_topic_id == target_topic_id
 
 
 def get_memory_mode(ai_config) -> str:

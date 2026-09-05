@@ -1,5 +1,11 @@
-from pathlib import Path
+from types import SimpleNamespace
 
+import memory_mode
+from memory_mode import (
+    MEMORY_MODE_GLOBAL,
+    MEMORY_MODE_RESET,
+    MEMORY_MODE_TOPIC,
+)
 from prompt_blocks import build_test_context_injection, render_prompt_block
 
 
@@ -31,8 +37,28 @@ def test_empty_test_context_stays_empty():
     assert build_test_context_injection(None, None) == ""
 
 
-def test_finished_test_context_is_not_limited_to_general_dialogue():
-    source = Path("ai_integration.py").read_text(encoding="utf-8")
+def test_finished_test_context_matches_active_topic_and_dialogue_scope():
+    session = SimpleNamespace(
+        is_finished=True,
+        invocation_dialogue_id=2,
+        invocation_topic_id=10,
+    )
 
-    assert "include_test_context and (test_results_txt or secret_answers_txt)" in source
-    assert "active_topic_id is None and (test_results_txt" not in source
+    # In TOPIC or RESET mode, matching dialogue & topic is valid
+    assert memory_mode.test_session_matches_active_scope(session, active_dialogue_id=2, active_topic_id=10, memory_mode=MEMORY_MODE_TOPIC) is True
+    assert memory_mode.test_session_matches_active_scope(session, active_dialogue_id=2, active_topic_id=10, memory_mode=MEMORY_MODE_RESET) is True
+
+    # Different topic in TOPIC/RESET mode does not match
+    assert memory_mode.test_session_matches_active_scope(session, active_dialogue_id=2, active_topic_id=20, memory_mode=MEMORY_MODE_TOPIC) is False
+    assert memory_mode.test_session_matches_active_scope(session, active_dialogue_id=2, active_topic_id=None, memory_mode=MEMORY_MODE_RESET) is False
+
+    # Different dialogue never matches in any mode
+    assert memory_mode.test_session_matches_active_scope(session, active_dialogue_id=3, active_topic_id=10, memory_mode=MEMORY_MODE_TOPIC) is False
+    assert memory_mode.test_session_matches_active_scope(session, active_dialogue_id=3, active_topic_id=10, memory_mode=MEMORY_MODE_GLOBAL) is False
+
+    # In GLOBAL mode, same dialogue across different topics matches
+    assert memory_mode.test_session_matches_active_scope(session, active_dialogue_id=2, active_topic_id=20, memory_mode=MEMORY_MODE_GLOBAL) is True
+
+    # Unfinished or missing scope does not match
+    assert memory_mode.test_session_matches_active_scope(SimpleNamespace(is_finished=False, invocation_dialogue_id=2, invocation_topic_id=10), 2, 10, MEMORY_MODE_TOPIC) is False
+    assert memory_mode.test_session_matches_active_scope(SimpleNamespace(is_finished=True, invocation_dialogue_id=None, invocation_topic_id=10), 2, 10, MEMORY_MODE_TOPIC) is False
