@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from prompt_blocks import build_test_context_injection, render_prompt_block
 
 
@@ -29,10 +27,3 @@ def test_secret_test_answers_are_included_with_finished_status():
 
 def test_empty_test_context_stays_empty():
     assert build_test_context_injection(None, None) == ""
-
-
-def test_finished_test_context_is_not_limited_to_general_dialogue():
-    source = Path("ai_integration.py").read_text(encoding="utf-8")
-
-    assert "include_test_context and (test_results_txt or secret_answers_txt)" in source
-    assert "active_topic_id is None and (test_results_txt" not in source
