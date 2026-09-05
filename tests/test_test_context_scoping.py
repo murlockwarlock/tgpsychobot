@@ -368,13 +368,12 @@ async def test_regression_5_stale_finished_testsession_without_message_not_injec
 
 
 @pytest.mark.asyncio
-async def test_regression_6_legacy_matching_fallback_and_null_dialogue(scoping_db):
-    """Legacy TestSession fallback:
+async def test_regression_6_isolated_testsession_without_message_never_injected(scoping_db):
+    """TestSession without a persisted DBMessage(role="test_result") is NEVER injected
 
-    - Matching invocation_dialogue_id and topic injects [КОНТЕКСТ ТЕСТА] once
-    - Null invocation_dialogue_id does NOT inject because scope cannot be proven
+    at runtime, regardless of invocation_dialogue_id matching or null.
     """
-    # Matching scope
+    # Matching dialogue_id on TestSession, but no persisted test_result message
     async with scoping_db() as session:
         user = User(
             id=106,
@@ -398,10 +397,10 @@ async def test_regression_6_legacy_matching_fallback_and_null_dialogue(scoping_d
     await ai_integration.generate_response(106, "привет")
     assert len(_CapturedCompletionClient.calls) == 1
     sent_text = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
-    assert "[КОНТЕКСТ ТЕСТА]" in sent_text
-    assert "Легаси ответ" in sent_text
+    assert "[КОНТЕКСТ ТЕСТА]" not in sent_text
+    assert "Легаси ответ" not in sent_text
 
-    # Null invocation_dialogue_id case
+    # Null invocation_dialogue_id on TestSession
     async with scoping_db() as session:
         user_null = User(
             id=107,
@@ -427,6 +426,150 @@ async def test_regression_6_legacy_matching_fallback_and_null_dialogue(scoping_d
     null_text = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
     assert "[КОНТЕКСТ ТЕСТА]" not in null_text
     assert "Ответ без диалога" not in null_text
+
+
+@pytest.mark.asyncio
+async def test_regression_11_telegram_test_result_obeys_normal_history_window_selection(scoping_db):
+    """Telegram: test_result lifetime equals ordinary configured history lifetime.
+
+    - Outside selected first and recent window: test_result is not sent to AI.
+    - Inside selected window: test_result is sent exactly once.
+    """
+    async with scoping_db() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.context_limit_first = 1
+        cfg.context_limit_recent = 1
+
+        # User 110: test_result placed in the MIDDLE of a long conversation
+        user_outside = User(id=110, first_name="Пётр", current_dialogue_id=1)
+        session.add(user_outside)
+
+        # Pair 1 (First window):
+        session.add(DBMessage(user_id=110, dialogue_id=1, role="user", content="1. Первое сообщение", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=110, dialogue_id=1, role="assistant", content="1. Первый ответ", timestamp=datetime.utcnow()))
+
+        # Pair 2 (Middle - outside window): contains test_result
+        session.add(DBMessage(user_id=110, dialogue_id=1, role=TEST_RESULT_ROLE, content="Тест в середине истории: 77", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=110, dialogue_id=1, role="user", content="2. Второй вопрос", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=110, dialogue_id=1, role="assistant", content="2. Второй ответ", timestamp=datetime.utcnow()))
+
+        # Pair 3 (Middle - outside window):
+        session.add(DBMessage(user_id=110, dialogue_id=1, role="user", content="3. Третий вопрос", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=110, dialogue_id=1, role="assistant", content="3. Третий ответ", timestamp=datetime.utcnow()))
+
+        # Pair 4 (Recent window):
+        session.add(DBMessage(user_id=110, dialogue_id=1, role="user", content="4. Четвертый вопрос", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=110, dialogue_id=1, role="assistant", content="4. Четвертый ответ", timestamp=datetime.utcnow()))
+
+        # User 111: test_result placed inside the FIRST window
+        user_inside = User(id=111, first_name="Наталья", current_dialogue_id=1)
+        session.add(user_inside)
+
+        # Pair 1 (First window): contains test_result
+        session.add(DBMessage(user_id=111, dialogue_id=1, role=TEST_RESULT_ROLE, content="Тест в первом окне: 88", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=111, dialogue_id=1, role="user", content="1. Вопрос один", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=111, dialogue_id=1, role="assistant", content="1. Ответ один", timestamp=datetime.utcnow()))
+
+        # Pair 2 (Middle):
+        session.add(DBMessage(user_id=111, dialogue_id=1, role="user", content="2. Вопрос два", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=111, dialogue_id=1, role="assistant", content="2. Ответ два", timestamp=datetime.utcnow()))
+
+        # Pair 3 (Recent window):
+        session.add(DBMessage(user_id=111, dialogue_id=1, role="user", content="3. Вопрос три", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=111, dialogue_id=1, role="assistant", content="3. Ответ три", timestamp=datetime.utcnow()))
+
+        await session.commit()
+
+    # Case A: outside window
+    _CapturedCompletionClient.calls.clear()
+    await ai_integration.generate_response(110, "5. Пятый вопрос")
+    assert len(_CapturedCompletionClient.calls) == 1
+    outside_payload = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "1. Первое сообщение" in outside_payload
+    assert "4. Четвертый вопрос" in outside_payload
+    assert "Тест в середине истории: 77" not in outside_payload
+    assert "[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]" not in outside_payload
+
+    # Case B: inside window
+    _CapturedCompletionClient.calls.clear()
+    await ai_integration.generate_response(111, "4. Вопрос четыре")
+    assert len(_CapturedCompletionClient.calls) == 1
+    inside_payload = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "Тест в первом окне: 88" in inside_payload
+    assert "[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]" in inside_payload
+    assert inside_payload.count("Тест в первом окне: 88") == 1
+
+
+@pytest.mark.asyncio
+async def test_regression_12_max_test_result_obeys_normal_history_window_selection(scoping_db):
+    """MAX: test_result lifetime equals ordinary configured history lifetime.
+
+    - Outside selected first and recent window: test_result is not sent to AI.
+    - Inside selected window: test_result is sent exactly once.
+    """
+    async with scoping_db() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.context_limit_first = 1
+        cfg.context_limit_recent = 1
+
+        # User 210: test_result in the middle (outside window)
+        user_outside = User(id=210, first_name="Константин", current_dialogue_id=1)
+        session.add(user_outside)
+
+        # Pair 1 (First window)
+        session.add(DBMessage(user_id=210, dialogue_id=1, role="user", content="MAX 1. Первое сообщение", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=210, dialogue_id=1, role="assistant", content="MAX 1. Первый ответ", timestamp=datetime.utcnow()))
+
+        # Pair 2 (Middle - outside window)
+        session.add(DBMessage(user_id=210, dialogue_id=1, role=TEST_RESULT_ROLE, content="MAX тест в середине: 99", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=210, dialogue_id=1, role="user", content="MAX 2. Второй вопрос", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=210, dialogue_id=1, role="assistant", content="MAX 2. Второй ответ", timestamp=datetime.utcnow()))
+
+        # Pair 3 (Middle - outside window)
+        session.add(DBMessage(user_id=210, dialogue_id=1, role="user", content="MAX 3. Третий вопрос", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=210, dialogue_id=1, role="assistant", content="MAX 3. Третий ответ", timestamp=datetime.utcnow()))
+
+        # Pair 4 (Recent window)
+        session.add(DBMessage(user_id=210, dialogue_id=1, role="user", content="MAX 4. Четвертый вопрос", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=210, dialogue_id=1, role="assistant", content="MAX 4. Четвертый ответ", timestamp=datetime.utcnow()))
+
+        # User 211: test_result inside first window
+        user_inside = User(id=211, first_name="Марина", current_dialogue_id=1)
+        session.add(user_inside)
+
+        # Pair 1 (First window): contains test_result
+        session.add(DBMessage(user_id=211, dialogue_id=1, role=TEST_RESULT_ROLE, content="MAX тест в первом окне: 100", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=211, dialogue_id=1, role="user", content="MAX 1. Вопрос один", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=211, dialogue_id=1, role="assistant", content="MAX 1. Ответ один", timestamp=datetime.utcnow()))
+
+        # Pair 2 (Middle)
+        session.add(DBMessage(user_id=211, dialogue_id=1, role="user", content="MAX 2. Вопрос два", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=211, dialogue_id=1, role="assistant", content="MAX 2. Ответ два", timestamp=datetime.utcnow()))
+
+        # Pair 3 (Recent window)
+        session.add(DBMessage(user_id=211, dialogue_id=1, role="user", content="MAX 3. Вопрос три", timestamp=datetime.utcnow()))
+        session.add(DBMessage(user_id=211, dialogue_id=1, role="assistant", content="MAX 3. Ответ три", timestamp=datetime.utcnow()))
+
+        await session.commit()
+
+    # Case A: outside window
+    _CapturedCompletionClient.calls.clear()
+    await max_ai.get_ai_response(210, "MAX 5. Пятый вопрос")
+    assert len(_CapturedCompletionClient.calls) == 1
+    outside_payload = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "MAX 1. Первое сообщение" in outside_payload
+    assert "MAX 4. Четвертый вопрос" in outside_payload
+    assert "MAX тест в середине: 99" not in outside_payload
+    assert "[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]" not in outside_payload
+
+    # Case B: inside window
+    _CapturedCompletionClient.calls.clear()
+    await max_ai.get_ai_response(211, "MAX 4. Вопрос четыре")
+    assert len(_CapturedCompletionClient.calls) == 1
+    inside_payload = json.dumps(_CapturedCompletionClient.calls[0], ensure_ascii=False)
+    assert "MAX тест в первом окне: 100" in inside_payload
+    assert "[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]" in inside_payload
+    assert inside_payload.count("MAX тест в первом окне: 100") == 1
 
 
 @pytest.mark.asyncio
