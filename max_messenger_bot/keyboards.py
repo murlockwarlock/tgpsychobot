@@ -7,6 +7,7 @@ from response_buttons import ResponseButton
 
 from .legacy import Content, SubscriptionConfig, SubscriptionPlan, TestConfig, Topic, async_session_maker
 from .identity import max_client_list_label
+from .time_utils import format_msk
 
 
 def callback_button(text: str, payload: str) -> dict:
@@ -372,6 +373,7 @@ def admin_client_profile_keyboard(user_id: int) -> list[dict]:
         [
             [callback_button("📜 История диалога", f"client_history_{user_id}_0")],
             [callback_button("📥 Скачать историю", f"download_history_{user_id}"), callback_button("🗑️ Удалить историю", f"admin_delete_history_{user_id}")],
+            [callback_button("🤖 Логи запросов ИИ", f"admin_user_ai_logs_{user_id}_0_all_all")],
             [callback_button("💳 Платежи", f"client_payment_info_{user_id}"), callback_button("🔄 Сбросить подписку", f"admin_reset_sub_{user_id}")],
             [callback_button("🔄 Сбросить промокоды", f"reset_user_promos_{user_id}")],
             [callback_button("🗑️ Сбросить аккаунт", f"admin_reset_account_{user_id}")],
@@ -890,6 +892,7 @@ def admin_ai_settings_keyboard(current_provider: str) -> list[dict]:
     rows.append([callback_button("📥 Скачать системный промпт", "admin_ai_download_system_prompt")])
     rows.append([callback_button("📎 Общий блок для всех промптов", "admin_ai_global_prompt_appendix")])
     rows.append([callback_button("📥 Скачать общий блок", "admin_ai_download_global_prompt_appendix")])
+    rows.append([callback_button("📜 Логи запросов ИИ", "admin_ai_logs_0_all_all")])
     rows.append([callback_button("⬅️ В админ-панель", "admin_panel")])
     return inline_keyboard(rows)
 
@@ -1049,3 +1052,122 @@ def admin_promo_assign_keyboard(promo_id: int, plans: list, assigned_plan_ids: s
         rows.append([callback_button(f"{marker}{plan.name}", f"admin_promo_assign_toggle_{promo_id}_{plan.id}")])
     rows.append([callback_button("⬅️ К промокоду", f"admin_edit_promo_{promo_id}")])
     return inline_keyboard(rows)
+
+
+def _truncate_ai_log_model(value: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    if limit == 1:
+        return "…"
+    return value[:limit - 1] + "…"
+
+
+def format_ai_log_button(log, max_length: int = 60) -> str:
+    marker = "↪️ " if getattr(log, "request_type", "chat") == "followup" else ""
+    timestamp = format_msk(log.created_at, "%d.%m %H:%M") if log.created_at else "--.-- --:--"
+    provider = str(log.provider or "—")
+    model = str(log.model or "—")
+    latency = f" ({log.latency_ms / 1000:.1f}s)" if log.latency_ms else ""
+    fixed = f"{marker}{timestamp} | "
+    provider_prefix = f"{provider}: "
+    model_limit = max_length - len(fixed) - len(provider_prefix) - len(latency)
+    if model_limit < 1:
+        provider_limit = max(1, max_length - len(fixed) - len(": ") - len(latency) - 1)
+        provider = _truncate_ai_log_model(provider, provider_limit)
+        provider_prefix = f"{provider}: "
+        model_limit = max(1, max_length - len(fixed) - len(provider_prefix) - len(latency))
+    return f"{fixed}{provider_prefix}{_truncate_ai_log_model(model, model_limit)}{latency}"
+
+
+def admin_ai_logs_keyboard(
+    logs: list,
+    page: int,
+    total_pages: int,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+) -> list[dict]:
+    period = period if period in {"today", "7d", "30d", "all"} else "all"
+    request_type = request_type if request_type in {"all", "chat", "followup"} else "all"
+    rows: list[list[dict]] = []
+
+    for log in logs:
+        cb = f"admin_ai_log_{log.id}_{page}_{filter_user_id or 0}_{period}_{request_type}"
+        rows.append([callback_button(format_ai_log_button(log), cb)])
+
+    nav_row: list[dict] = []
+    if page > 0:
+        prev_cb = (
+            f"admin_user_ai_logs_{filter_user_id}_{page - 1}_{period}_{request_type}"
+            if filter_user_id
+            else f"admin_ai_logs_{page - 1}_{period}_{request_type}"
+        )
+        nav_row.append(callback_button("◀️", prev_cb))
+    nav_row.append(callback_button(f"{page + 1}/{total_pages}", "noop"))
+    if page < total_pages - 1:
+        next_cb = (
+            f"admin_user_ai_logs_{filter_user_id}_{page + 1}_{period}_{request_type}"
+            if filter_user_id
+            else f"admin_ai_logs_{page + 1}_{period}_{request_type}"
+        )
+        nav_row.append(callback_button("▶️", next_cb))
+    if nav_row:
+        rows.append(nav_row)
+
+    period_labels = (("Сегодня", "today"), ("7 дней", "7d"), ("30 дней", "30d"), ("Все", "all"))
+    period_row = []
+    for label, val in period_labels:
+        active_prefix = "· " if val == period else ""
+        active_suffix = " ·" if val == period else ""
+        cb = (
+            f"admin_user_ai_logs_{filter_user_id}_0_{val}_{request_type}"
+            if filter_user_id
+            else f"admin_ai_logs_0_{val}_{request_type}"
+        )
+        period_row.append(callback_button(f"{active_prefix}{label}{active_suffix}", cb))
+    rows.append(period_row)
+
+    type_labels = (("Все типы", "all"), ("Обычные", "chat"), ("Догоняющие", "followup"))
+    type_row = []
+    for label, val in type_labels:
+        active_prefix = "· " if val == request_type else ""
+        active_suffix = " ·" if val == request_type else ""
+        cb = (
+            f"admin_user_ai_logs_{filter_user_id}_0_{period}_{val}"
+            if filter_user_id
+            else f"admin_ai_logs_0_{period}_{val}"
+        )
+        type_row.append(callback_button(f"{active_prefix}{label}{active_suffix}", cb))
+    rows.append(type_row)
+
+    rows.append([callback_button(
+        "📦 Скачать пакет логов",
+        f"export_ai_logs_{filter_user_id or 0}_{period}_{request_type}",
+    )])
+
+    back_cb = f"view_client_{filter_user_id}" if filter_user_id else "admin_ai_settings"
+    rows.append([callback_button("⬅️ Назад", back_cb)])
+
+    return inline_keyboard(rows)
+
+
+def admin_ai_log_detail_keyboard(
+    log_id: int,
+    page: int = 0,
+    filter_user_id: int | None = None,
+    period: str = "all",
+    request_type: str = "all",
+) -> list[dict]:
+    back_cb = (
+        f"admin_user_ai_logs_{filter_user_id}_{page}_{period}_{request_type}"
+        if filter_user_id
+        else f"admin_ai_logs_{page}_{period}_{request_type}"
+    )
+    return inline_keyboard(
+        [
+            [callback_button("📄 Скачать .txt файл лога", f"admin_ai_log_file_{log_id}")],
+            [callback_button("⬅️ Назад к логам", back_cb)],
+        ]
+    )

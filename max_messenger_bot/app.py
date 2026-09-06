@@ -13,6 +13,7 @@ from .logging_utils import configure_logging, get_bot_logger, get_max_logger
 from .models import IncomingCallback, IncomingMessage, canonical_media_type, parse_callback, parse_message
 from .services import admin as admin_service
 from .services import admin_ai as admin_ai_service
+from .services import admin_ai_logs as admin_ai_logs_service
 from .services import admin_admins as admin_admins_service
 from .services import admin_billing as admin_billing_service
 from .services import admin_buttons as admin_buttons_service
@@ -974,6 +975,93 @@ class MaxBotApplication:
                 return
             if data in {"admin_ai_cancel_system_prompt", "admin_ai_cancel_global_prompt_appendix"}:
                 await admin_ai_service.cancel_prompt_input(self.client, self.states, chat_id, user_id)
+                return
+            if data.startswith("admin_ai_log_file_"):
+                await self.client.answer_callback(callback.callback_id)
+                try:
+                    log_id = int(data.rsplit("_", 1)[1])
+                except (ValueError, IndexError):
+                    log.warning("Malformed admin_ai_log_file callback payload: %s", data)
+                    return
+                await admin_ai_logs_service.download_ai_log_file(self.client, chat_id, log_id)
+                return
+            if data.startswith("admin_ai_log_"):
+                await self.client.answer_callback(callback.callback_id)
+                parts = data.split("_")
+                try:
+                    log_id = int(parts[3])
+                    page = int(parts[4]) if len(parts) > 4 else 0
+                    filter_user_id = int(parts[5]) if len(parts) > 5 and int(parts[5]) else None
+                    period = parts[6] if len(parts) > 6 else "all"
+                    request_type = parts[7] if len(parts) > 7 else "all"
+                except (ValueError, IndexError):
+                    log.warning("Malformed admin_ai_log detail callback payload: %s", data)
+                    return
+                await admin_ai_logs_service.show_ai_log_detail(
+                    self.client,
+                    chat_id,
+                    log_id,
+                    page=page,
+                    filter_user_id=filter_user_id,
+                    period=period,
+                    request_type=request_type,
+                )
+                return
+            if data.startswith("admin_user_ai_logs_"):
+                await self.client.answer_callback(callback.callback_id)
+                parts = data.split("_")
+                try:
+                    target_user_id = int(parts[4])
+                    page = int(parts[5]) if len(parts) > 5 else 0
+                    period = parts[6] if len(parts) > 6 else "all"
+                    request_type = parts[7] if len(parts) > 7 else "all"
+                except (ValueError, IndexError):
+                    log.warning("Malformed admin_user_ai_logs callback payload: %s", data)
+                    return
+                await admin_ai_logs_service.show_ai_logs_list(
+                    self.client,
+                    chat_id,
+                    page=page,
+                    filter_user_id=target_user_id,
+                    period=period,
+                    request_type=request_type,
+                )
+                return
+            if data.startswith("admin_ai_logs_"):
+                await self.client.answer_callback(callback.callback_id)
+                parts = data.split("_")
+                try:
+                    page = int(parts[3]) if len(parts) > 3 else 0
+                    period = parts[4] if len(parts) > 4 else "all"
+                    request_type = parts[5] if len(parts) > 5 else "all"
+                except (ValueError, IndexError):
+                    log.warning("Malformed admin_ai_logs callback payload: %s", data)
+                    return
+                await admin_ai_logs_service.show_ai_logs_list(
+                    self.client,
+                    chat_id,
+                    page=page,
+                    period=period,
+                    request_type=request_type,
+                )
+                return
+            if data.startswith("export_ai_logs_"):
+                await self.client.answer_callback(callback.callback_id)
+                parts = data.split("_")
+                try:
+                    filter_user_id = int(parts[3]) if len(parts) > 3 and int(parts[3]) else None
+                    period = parts[4] if len(parts) > 4 else "all"
+                    request_type = parts[5] if len(parts) > 5 else "all"
+                except (ValueError, IndexError):
+                    log.warning("Malformed export_ai_logs callback payload: %s", data)
+                    return
+                await admin_ai_logs_service.export_ai_logs_package(
+                    self.client,
+                    chat_id,
+                    filter_user_id=filter_user_id,
+                    period=period,
+                    request_type=request_type,
+                )
                 return
             if data == "admin_clients":
                 await admin_clients_service.list_clients(self.client, chat_id, 0)
