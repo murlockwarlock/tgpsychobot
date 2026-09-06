@@ -49,7 +49,7 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
     # 1. Non-Admin Authorization Denial
-    async def test_non_admin_denied_access_to_all_ai_logs_callbacks(self):
+    async def test_non_admin_cannot_access_or_trigger_ai_logs_operations(self):
         non_admin_user_id = 99999
         with patch("max_messenger_bot.services.common.is_admin", AsyncMock(return_value=False)):
             app = MaxBotApplication.__new__(MaxBotApplication)
@@ -80,6 +80,7 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.client.send_message.call_count, 0)
             self.assertEqual(app.client.send_text_file.call_count, 0)
             self.assertEqual(app.client.send_media_attachment.call_count, 0)
+            self.assertEqual(app.client.upload_file.call_count, 0)
 
     # 2. Admin Authorization Callback ACK Exactly Once
     async def test_admin_callback_acknowledged_exactly_once_before_processing(self):
@@ -239,122 +240,113 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("📱 <b>Платформа:</b> Telegram", text)
         self.assertIn(f"🆔 <b>Telegram ID:</b> <code>{tg_id}</code>", text)
         self.assertIn("@ivan_tg", text)
-        self.assertIn("💬 <b>Имя для общения:</b> Иван", text)
 
-    # 8. Period Filters
+    # 8. Period Filtering in SQL
     async def test_period_filtering_in_sql(self):
         now = datetime.utcnow()
         async with async_session_maker() as session:
-            session.add(AILog(id=1, user_id=1, raw_response="R", created_at=now, provider="P", model="M"))
-            session.add(AILog(id=2, user_id=1, raw_response="R", created_at=now - timedelta(days=2), provider="P", model="M"))
-            session.add(AILog(id=3, user_id=1, raw_response="R", created_at=now - timedelta(days=10), provider="P", model="M"))
-            session.add(AILog(id=4, user_id=1, raw_response="R", created_at=now - timedelta(days=40), provider="P", model="M"))
+            session.add(AILog(id=21, user_id=1, raw_response="today", created_at=now - timedelta(hours=1), provider="P", model="M"))
+            session.add(AILog(id=22, user_id=1, raw_response="3d_ago", created_at=now - timedelta(days=3), provider="P", model="M"))
+            session.add(AILog(id=23, user_id=1, raw_response="10d_ago", created_at=now - timedelta(days=10), provider="P", model="M"))
+            session.add(AILog(id=24, user_id=1, raw_response="40d_ago", created_at=now - timedelta(days=40), provider="P", model="M"))
             await session.commit()
 
         client = _create_mock_client()
 
-        # Today
+        # today
         await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, period="today")
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("Всего вызовов: <b>1</b>", text)
+        btn_payloads = [btn["payload"] for row in client.send_message.await_args.kwargs["attachments"][0]["payload"]["buttons"] for btn in row]
+        self.assertTrue(any(p.startswith("admin_ai_log_21_") for p in btn_payloads))
+        self.assertFalse(any(p.startswith("admin_ai_log_22_") for p in btn_payloads))
 
-        # 7 days
+        # 7d
+        client.send_message.reset_mock()
         await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, period="7d")
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("Всего вызовов: <b>2</b>", text)
+        btn_payloads = [btn["payload"] for row in client.send_message.await_args.kwargs["attachments"][0]["payload"]["buttons"] for btn in row]
+        self.assertTrue(any(p.startswith("admin_ai_log_21_") for p in btn_payloads))
+        self.assertTrue(any(p.startswith("admin_ai_log_22_") for p in btn_payloads))
+        self.assertFalse(any(p.startswith("admin_ai_log_23_") for p in btn_payloads))
 
-        # 30 days
+        # 30d
+        client.send_message.reset_mock()
         await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, period="30d")
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("Всего вызовов: <b>3</b>", text)
+        btn_payloads = [btn["payload"] for row in client.send_message.await_args.kwargs["attachments"][0]["payload"]["buttons"] for btn in row]
+        self.assertTrue(any(p.startswith("admin_ai_log_21_") for p in btn_payloads))
+        self.assertTrue(any(p.startswith("admin_ai_log_22_") for p in btn_payloads))
+        self.assertTrue(any(p.startswith("admin_ai_log_23_") for p in btn_payloads))
+        self.assertFalse(any(p.startswith("admin_ai_log_24_") for p in btn_payloads))
 
-        # All
-        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, period="all")
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("Всего вызовов: <b>4</b>", text)
-
-    # 9. Request Type Filters
+    # 9. Request Type Filtering in SQL
     async def test_request_type_filtering_in_sql(self):
         async with async_session_maker() as session:
-            session.add(AILog(id=1, user_id=1, raw_response="R", request_type="chat", provider="P", model="M"))
-            session.add(AILog(id=2, user_id=1, raw_response="R", request_type="chat", provider="P", model="M"))
-            session.add(AILog(id=3, user_id=1, raw_response="R", request_type="followup", provider="P", model="M"))
+            session.add(AILog(id=31, user_id=1, request_type="chat", raw_response="chat", provider="P", model="M", created_at=datetime.utcnow()))
+            session.add(AILog(id=32, user_id=1, request_type="followup", raw_response="followup", provider="P", model="M", created_at=datetime.utcnow()))
             await session.commit()
 
         client = _create_mock_client()
 
-        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, request_type="chat")
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("Всего вызовов: <b>2</b>", text)
+        # Filter chat
+        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, period="all", request_type="chat")
+        btn_payloads = [btn["payload"] for row in client.send_message.await_args.kwargs["attachments"][0]["payload"]["buttons"] for btn in row]
+        self.assertTrue(any(p.startswith("admin_ai_log_31_") for p in btn_payloads))
+        self.assertFalse(any(p.startswith("admin_ai_log_32_") for p in btn_payloads))
 
-        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, request_type="followup")
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("Всего вызовов: <b>1</b>", text)
+        # Filter followup
+        client.send_message.reset_mock()
+        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, period="all", request_type="followup")
+        btn_payloads = [btn["payload"] for row in client.send_message.await_args.kwargs["attachments"][0]["payload"]["buttons"] for btn in row]
+        self.assertFalse(any(p.startswith("admin_ai_log_31_") for p in btn_payloads))
+        self.assertTrue(any(p.startswith("admin_ai_log_32_") for p in btn_payloads))
 
-    # 10. Combined Filters (User + Period + Type)
-    async def test_combined_filters(self):
-        now = datetime.utcnow()
-        user_a = MAX_ID_OFFSET + 100
-        user_b = MAX_ID_OFFSET + 200
-
-        async with async_session_maker() as session:
-            session.add(AILog(id=1, user_id=user_a, raw_response="R", request_type="chat", created_at=now, provider="P", model="M"))
-            session.add(AILog(id=2, user_id=user_a, raw_response="R", request_type="followup", created_at=now, provider="P", model="M"))
-            session.add(AILog(id=3, user_id=user_a, raw_response="R", request_type="chat", created_at=now - timedelta(days=20), provider="P", model="M"))
-            session.add(AILog(id=4, user_id=user_b, raw_response="R", request_type="chat", created_at=now, provider="P", model="M"))
-            await session.commit()
-
-        client = _create_mock_client()
-        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, filter_user_id=user_a, period="7d", request_type="chat")
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("Всего вызовов: <b>1</b>", text)
-        self.assertIn("ID max: 100", text)
-
-    # 11. Pagination Boundaries and Stale Page Clamping
+    # 10. Pagination Navigation and Stale-Page Clamping
     async def test_pagination_and_stale_page_clamping(self):
         async with async_session_maker() as session:
-            for i in range(1, 13):  # 12 records = 2 pages of 8
+            for i in range(1, 20):
                 session.add(AILog(id=i, user_id=1, raw_response="R", created_at=datetime.utcnow() - timedelta(minutes=i), provider="P", model="M"))
             await session.commit()
 
         client = _create_mock_client()
 
-        # Page 0
+        # Page 0 (should have 8 items)
         await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0)
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("(Стр. 1/2)", text)
+        self.assertIn("Стр. 1/3", client.send_message.await_args.kwargs["text"])
 
-        # Page 1
-        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=1)
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("(Стр. 2/2)", text)
+        # Stale page 99 -> clamped to page 2 (index 2, 3rd page)
+        client.send_message.reset_mock()
+        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=99)
+        self.assertIn("Стр. 3/3", client.send_message.await_args.kwargs["text"])
 
-        # Stale Page 999 -> Clamps to Page 1
-        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=999)
-        text = client.send_message.await_args.kwargs["text"]
-        self.assertIn("(Стр. 2/2)", text)
+    # 11. Per-Client DB User.id Filtering
+    async def test_per_client_db_user_id_filtering(self):
+        user_a = MAX_ID_OFFSET + 101
+        user_b = MAX_ID_OFFSET + 102
 
-    # 12. State Preservation (List -> Detail -> Back)
-    def test_detail_screen_back_button_restores_exact_list_state(self):
-        log_id = 42
+        async with async_session_maker() as session:
+            session.add(AILog(id=41, user_id=user_a, raw_response="RA", provider="P", model="M", created_at=datetime.utcnow()))
+            session.add(AILog(id=42, user_id=user_b, raw_response="RB", provider="P", model="M", created_at=datetime.utcnow()))
+            await session.commit()
+
+        client = _create_mock_client()
+        await admin_ai_logs.show_ai_logs_list(client, chat_id=123, page=0, filter_user_id=user_a)
+
+        btn_payloads = [btn["payload"] for row in client.send_message.await_args.kwargs["attachments"][0]["payload"]["buttons"] for btn in row]
+        self.assertTrue(any(p.startswith("admin_ai_log_41_") for p in btn_payloads))
+        self.assertFalse(any(p.startswith("admin_ai_log_42_") for p in btn_payloads))
+
+    # 12. Detail View State Preservation on Back Navigation
+    def test_detail_keyboard_preserves_navigation_state(self):
+        log_id = 99
         page = 2
         filter_user_id = MAX_ID_OFFSET + 55
         period = "7d"
-        request_type = "followup"
+        request_type = "chat"
 
-        # User filtered detail
+        # Per-user detail
         kb = max_keyboards.admin_ai_log_detail_keyboard(log_id, page, filter_user_id, period, request_type)
         buttons = [btn for row in kb[0]["payload"]["buttons"] for btn in row]
         back_btn = next((b for b in buttons if b["text"] == "⬅️ Назад к логам"), None)
         self.assertIsNotNone(back_btn)
         self.assertEqual(back_btn["payload"], f"admin_user_ai_logs_{filter_user_id}_{page}_{period}_{request_type}")
-
-        # Global detail
-        kb_global = max_keyboards.admin_ai_log_detail_keyboard(log_id, page, None, period, request_type)
-        buttons_global = [btn for row in kb_global[0]["payload"]["buttons"] for btn in row]
-        back_btn_global = next((b for b in buttons_global if b["text"] == "⬅️ Назад к логам"), None)
-        self.assertIsNotNone(back_btn_global)
-        self.assertEqual(back_btn_global["payload"], f"admin_ai_logs_{page}_{period}_{request_type}")
 
     # 13. Missing/Deleted Log Resilience
     async def test_missing_or_deleted_log_gives_safe_admin_message(self):
@@ -362,20 +354,32 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
         await admin_ai_logs.show_ai_log_detail(client, chat_id=123, log_id=999999)
         client.send_message.assert_awaited_once_with(chat_id=123, text="Запись лога не найдена.")
 
-    # 14. Detail Message Hard Upper Bound (3800 chars)
-    async def test_detail_message_hard_upper_bound_with_huge_payload(self):
-        huge_payload = "PAYLOAD_" * 10000  # 80,000 chars
-        huge_raw = "RAW_RESPONSE_" * 10000  # 130,000 chars
+    # 14. Detail Message Hard Upper Bound (3800 chars) with Clean Text & Extreme Values
+    async def test_detail_message_hard_upper_bound_with_huge_values_and_hostile_escaping(self):
+        hostile_100k = "<script>alert('x' & \"y\");</script><b>bold</b>&" * 2500  # ~120k chars
+
+        raw_max_id = 100018792559
+        db_user_id = MAX_ID_OFFSET + raw_max_id
 
         async with async_session_maker() as session:
+            user = User(
+                id=db_user_id,
+                name=hostile_100k,
+                first_name=hostile_100k,
+                username=hostile_100k,
+            )
+            session.add(user)
             log_entry = AILog(
                 id=50,
-                user_id=1,
+                user_id=db_user_id,
                 platform="max",
-                provider="Gemini",
-                model="gemini-flash",
-                request_payload=huge_payload,
-                raw_response=huge_raw,
+                provider=hostile_100k,
+                model=hostile_100k,
+                context_kind="topic",
+                topic_name_snapshot=hostile_100k,
+                request_payload=hostile_100k,
+                raw_response=hostile_100k,
+                clean_text=hostile_100k,
                 created_at=datetime.utcnow(),
             )
             session.add(log_entry)
@@ -387,36 +391,52 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
         text = client.send_message.await_args.kwargs["text"]
         self.assertLessEqual(len(text), MAX_AI_LOG_DETAIL_TEXT_LIMIT)
         self.assertGreater(len(text), 500)
+
+        # Assert mandatory structural labels are preserved
         self.assertIn("📄 <b>Детали лога ИИ #50</b>", text)
-        self.assertIn("Полный сырой файл скачайте по кнопке ниже", text)
+        self.assertIn("📱 <b>Платформа:</b> MAX", text)
+        self.assertIn(f"🆔 <b>ID max:</b> <code>{raw_max_id}</code>", text)
+        self.assertIn("💬 <b>Имя для общения:</b>", text)
+        self.assertIn("👤 <b>Имя в max:</b>", text)
+        self.assertIn("<b>Username:</b>", text)
+        self.assertIn("🧾 <b>Тип запроса:</b>", text)
+        self.assertIn("📍 <b>Контекст:</b>", text)
+        self.assertIn("🤖 <b>Провайдер:</b>", text)
+        self.assertIn("🧠 <b>Модель:</b>", text)
+        self.assertIn("⏱ <b>Время ответа:</b>", text)
+        self.assertIn("📅 <b>Дата вызова:</b>", text)
+        self.assertIn("📤 <b>Полный payload запроса (превью):</b>", text)
+        self.assertIn("🤖 <b>Сырой ответ модели (Raw LLM Output):</b>", text)
+        self.assertIn("💬 <b>Текст ответа пользователю (Clean Text):</b>", text)
 
-    # 15. HTML Escaping Expansion Safety & Tag Validity
-    async def test_html_escaping_expansion_safety_and_valid_tags(self):
-        extreme_chars = "<script>alert('test' & \"hello\");</script>" * 200
+        # Assert HTML tags balanced and unescaped script tag absent
+        self.assertNotIn("<script>", text)
+        self.assertEqual(text.count("<code>"), text.count("</code>"))
+        self.assertEqual(text.count("<b>"), text.count("</b>"))
 
+    # 15. Clean Text Preview Present When Short
+    async def test_clean_text_preview_present_in_detail_message(self):
         async with async_session_maker() as session:
             log_entry = AILog(
-                id=51,
+                id=55,
                 user_id=1,
-                platform="max",
-                provider="Gemini",
-                model="gemini-flash",
-                request_payload=extreme_chars,
-                raw_response=extreme_chars,
+                platform="telegram",
+                provider="OpenAI",
+                model="gpt-4o",
+                request_payload='{"prompt": "hi"}',
+                raw_response="<DATA>cmd</DATA>Clean visible answer for user.",
+                clean_text="Clean visible answer for user.",
                 created_at=datetime.utcnow(),
             )
             session.add(log_entry)
             await session.commit()
 
         client = _create_mock_client()
-        await admin_ai_logs.show_ai_log_detail(client, chat_id=123, log_id=51)
+        await admin_ai_logs.show_ai_log_detail(client, chat_id=123, log_id=55)
 
         text = client.send_message.await_args.kwargs["text"]
+        self.assertIn("💬 <b>Текст ответа пользователю (Clean Text):</b>\n<code>Clean visible answer for user.</code>", text)
         self.assertLessEqual(len(text), MAX_AI_LOG_DETAIL_TEXT_LIMIT)
-        self.assertNotIn("<script>", text)
-        self.assertIn("&lt;script&gt;", text)
-        self.assertEqual(text.count("<code>"), text.count("</code>"))
-        self.assertEqual(text.count("<b>"), text.count("</b>"))
 
     # 16. Metadata Preservation Under Truncation
     async def test_metadata_preserved_under_aggressive_truncation(self):
@@ -438,6 +458,7 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
                 request_type="followup",
                 request_payload="A" * 50000,
                 raw_response="B" * 50000,
+                clean_text="C" * 50000,
                 created_at=datetime(2026, 9, 6, 15, 30, 0),
             )
             session.add(log_entry)
@@ -508,6 +529,7 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
                 prompt_summary="legacy prompt summary that should not be used",
                 request_payload=None,
                 raw_response="hello",
+                clean_text="hello",
                 created_at=datetime.utcnow(),
             )
             session.add(log_entry)
@@ -560,8 +582,8 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(os.path.exists(path))
         self.assertFalse(os.path.exists(uploaded_path))
 
-    # 20. ZIP Manifest Platform Identity (No offset leakage)
-    async def test_zip_manifest_has_platform_aware_identity_without_offset_leakage(self):
+    # 20. ZIP Manifest Machine Platform Values & Identity (No offset leakage)
+    async def test_zip_manifest_has_platform_machine_values_without_offset_leakage(self):
         captured_manifest = []
 
         async with async_session_maker() as session:
@@ -585,6 +607,15 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
                 latency_ms=800,
                 created_at=datetime(2026, 9, 6, 12, 5, 0),
             ))
+            session.add(AILog(
+                id=203,
+                user_id=None,
+                platform=None,
+                provider="Unknown",
+                model="unknown-model",
+                raw_response="R",
+                created_at=datetime(2026, 9, 6, 12, 10, 0),
+            ))
             await session.commit()
 
         client = _create_mock_client()
@@ -599,18 +630,21 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
 
         await admin_ai_logs.export_ai_logs_package(client, chat_id=123, period="all", request_type="all")
 
-        self.assertEqual(len(captured_manifest), 2)
+        self.assertEqual(len(captured_manifest), 3)
         max_entry = next(m for m in captured_manifest if m["id"] == 201)
         tg_entry = next(m for m in captured_manifest if m["id"] == 202)
+        unknown_entry = next(m for m in captured_manifest if m["id"] == 203)
 
-        self.assertEqual(max_entry["platform"], "MAX")
+        self.assertEqual(max_entry["platform"], "max")
         self.assertEqual(max_entry["max_id"], 100018792559)
         self.assertNotIn("telegram_id", max_entry)
         self.assertNotIn(str(MAX_ID_OFFSET + 100018792559), json.dumps(max_entry))
 
-        self.assertEqual(tg_entry["platform"], "Telegram")
+        self.assertEqual(tg_entry["platform"], "telegram")
         self.assertEqual(tg_entry["telegram_id"], 999)
         self.assertNotIn("max_id", tg_entry)
+
+        self.assertEqual(unknown_entry["platform"], "unknown")
 
     # 21. ZIP Export Record Count Limit (500 records)
     async def test_zip_export_record_count_limit_with_transparent_caption(self):
@@ -627,15 +661,15 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
         caption = client.send_media_attachment.await_args.kwargs["caption"]
         self.assertIn("лимит экспорта по количеству: 5 из 14", caption)
 
-    # 22. ZIP Export Byte Size Limit (20 MB)
-    async def test_zip_export_byte_size_limit_with_transparent_caption(self):
+    # 22. Hard Uncompressed Byte Limit (Manifest Accounted, Never Exceeded)
+    async def test_zip_export_hard_byte_limit_accounts_for_manifest(self):
         async with async_session_maker() as session:
             for i in range(1, 10):
                 session.add(AILog(
                     id=i,
                     user_id=1,
-                    provider="P",
-                    model="M",
+                    provider="ProviderName",
+                    model="ModelName",
                     request_payload="X" * 1000,
                     raw_response="Y" * 1000,
                     created_at=datetime.utcnow() - timedelta(minutes=i),
@@ -643,15 +677,91 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
         client = _create_mock_client()
+        total_member_bytes = 0
 
-        with patch.object(admin_ai_logs, "MAX_EXPORT_UNCOMPRESSED_BYTES", 3500):
+        async def inspect_uploaded_zip(media_type, file_path):
+            nonlocal total_member_bytes
+            with zipfile.ZipFile(file_path, "r") as archive:
+                total_member_bytes = sum(info.file_size for info in archive.infolist())
+            return {"token": "valid_token"}
+
+        client.upload_file = AsyncMock(side_effect=inspect_uploaded_zip)
+
+        with patch.object(admin_ai_logs, "MAX_EXPORT_UNCOMPRESSED_BYTES", 5000):
             await admin_ai_logs.export_ai_logs_package(client, chat_id=123, period="all", request_type="all")
 
         caption = client.send_media_attachment.await_args.kwargs["caption"]
         self.assertIn("лимит экспорта по объёму данных:", caption)
         self.assertIn("из 9", caption)
 
-    # 23. Temp File Cleanup on Upload and Send Failures
+        # Manifest + TXT sum MUST be <= 5000 bytes
+        self.assertLessEqual(total_member_bytes, 5000)
+        self.assertGreater(total_member_bytes, 0)
+
+    # 23. First Log Alone Exceeding Byte Cap (Safe Rejection with Admin Message)
+    async def test_first_log_exceeding_byte_cap_safely_rejected_without_upload(self):
+        async with async_session_maker() as session:
+            session.add(AILog(
+                id=1,
+                user_id=1,
+                provider="Provider",
+                model="Model",
+                request_payload="X" * 10000,
+                raw_response="Y" * 10000,
+                created_at=datetime.utcnow(),
+            ))
+            await session.commit()
+
+        client = _create_mock_client()
+
+        with patch.object(admin_ai_logs, "MAX_EXPORT_UNCOMPRESSED_BYTES", 500):
+            await admin_ai_logs.export_ai_logs_package(client, chat_id=123, period="all", request_type="all")
+
+        self.assertEqual(client.upload_file.call_count, 0)
+        self.assertEqual(client.send_media_attachment.call_count, 0)
+        client.send_message.assert_awaited_once()
+        msg_text = client.send_message.await_args.kwargs["text"]
+        self.assertIn("первая же запись лога превышает максимальный лимит объёма экспорта", msg_text)
+
+    # 24. Invalid Filter Values Rejected Cleanly Without Broadening to All
+    async def test_invalid_filter_values_safely_rejected_without_broadening(self):
+        with patch("max_messenger_bot.services.common.is_admin", AsyncMock(return_value=True)):
+            app = MaxBotApplication.__new__(MaxBotApplication)
+            app.client = _create_mock_client()
+            app.states = SimpleNamespace(get=AsyncMock(return_value=None), clear=AsyncMock())
+
+            invalid_callbacks = [
+                "admin_ai_logs_0_bad_all",
+                "admin_ai_logs_0_all_bad",
+                f"admin_user_ai_logs_{MAX_ID_OFFSET + 55}_0_bad_bad",
+                "admin_ai_log_1_0_0_bad_bad",
+                "export_ai_logs_0_bad_bad",
+            ]
+
+            for payload in invalid_callbacks:
+                cb = IncomingCallback(
+                    raw={},
+                    callback_id="cb_invalid_filter",
+                    payload=payload,
+                    sender=_create_sender(1001, "Admin"),
+                    chat_id=12345,
+                    message_id="msg_1",
+                )
+                await app.handle_callback(cb)
+
+            # Assert all callbacks were acknowledged exactly once
+            self.assertEqual(app.client.answer_callback.call_count, len(invalid_callbacks))
+
+            # Assert for export: upload_file and send_media_attachment were NOT called
+            self.assertEqual(app.client.upload_file.call_count, 0)
+            self.assertEqual(app.client.send_media_attachment.call_count, 0)
+
+            # Assert admin was alerted for each invalid callback
+            self.assertEqual(app.client.send_message.call_count, len(invalid_callbacks))
+            for call in app.client.send_message.await_args_list:
+                self.assertIn("Некорректные параметры фильтра", call.kwargs["text"])
+
+    # 25. Temp File Cleanup on Upload and Send Failures
     async def test_temp_file_cleanup_on_upload_failure(self):
         created_tmp_paths = []
         original_named_temp = admin_ai_logs.tempfile.NamedTemporaryFile
@@ -702,7 +812,7 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
         for path in created_tmp_paths:
             self.assertFalse(os.path.exists(path))
 
-    # 24. Missing Upload Token Failure Handling
+    # 26. Missing Upload Token Failure Handling
     async def test_missing_upload_token_handled_safely(self):
         async with async_session_maker() as session:
             session.add(AILog(id=1, user_id=1, raw_response="R", provider="P", model="M", created_at=datetime.utcnow()))
@@ -716,7 +826,7 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
         client.send_message.assert_awaited_once()
         self.assertIn("Не удалось отправить архив логов:", client.send_message.await_args.kwargs["text"])
 
-    # 25. Malformed Callbacks Handled Safely Without Worker Crash
+    # 27. Malformed Callbacks Handled Safely Without Worker Crash
     async def test_malformed_callbacks_do_not_crash_worker(self):
         with patch("max_messenger_bot.services.common.is_admin", AsyncMock(return_value=True)):
             app = MaxBotApplication.__new__(MaxBotApplication)

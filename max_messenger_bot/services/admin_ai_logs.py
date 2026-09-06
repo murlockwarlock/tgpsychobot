@@ -26,6 +26,9 @@ MAX_AI_LOG_DETAIL_TEXT_LIMIT = 3800
 MAX_EXPORT_LOGS_LIMIT = 500
 MAX_EXPORT_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
 
+VALID_PERIODS = frozenset({"all", "today", "7d", "30d"})
+VALID_REQUEST_TYPES = frozenset({"all", "chat", "followup"})
+
 AI_LOG_PERIOD_LABELS = {
     "all": "всё время",
     "today": "сегодня",
@@ -38,6 +41,10 @@ AI_LOG_TYPE_LABELS = {
     "chat": "обычные запросы",
     "followup": "догоняющие",
 }
+
+
+def validate_filters(period: str, request_type: str) -> bool:
+    return period in VALID_PERIODS and request_type in VALID_REQUEST_TYPES
 
 
 def _ai_log_platform(log_entry: AILog) -> str | None:
@@ -143,33 +150,43 @@ def _safe_truncate_escaped(raw_text: str, max_escaped_len: int, truncation_suffi
 
 def _format_bounded_detail_text(log_entry: AILog, user: User | None) -> str:
     platform = _ai_log_platform(log_entry)
+
+    def _esc_meta(val: str | None, max_len: int = 60, default: str = "не указан") -> str:
+        if not val:
+            return html.escape(default)
+        return _safe_truncate_escaped(str(val), max_len, "…")
+
     if platform == "max":
         max_id = raw_max_user_id(log_entry.user_id) if log_entry.user_id is not None else "не указан"
+        comm_name = _esc_meta(user.name if user else None, 60, "Не указано")
+        pub_name = _esc_meta(max_public_name(user) if user else None, 60, "Не указано")
+        u_name = _esc_meta(max_username(user) if user else None, 60, "не указан")
         identity_lines = [
             "📱 <b>Платформа:</b> MAX",
             f"🆔 <b>ID max:</b> <code>{max_id}</code>",
-            f"💬 <b>Имя для общения:</b> {html.escape(user.name if user and user.name else 'Не указано')}",
-            f"👤 <b>Имя в max:</b> {html.escape(max_public_name(user) if user else 'Не указано')}",
-            f"<b>Username:</b> {html.escape(max_username(user) if user else 'не указан')}",
+            f"💬 <b>Имя для общения:</b> {comm_name}",
+            f"👤 <b>Имя в max:</b> {pub_name}",
+            f"<b>Username:</b> {u_name}",
         ]
         if user and user.tg_user_id:
             identity_lines.append(f"🔗 <b>Telegram ID:</b> <code>{user.tg_user_id}</code>")
     elif platform == "telegram":
         if user:
             uname = f"@{user.username}" if user.username else (user.first_name or user.name or "")
-            user_info = f"<b>{html.escape(uname)}</b> (ID: {log_entry.user_id})"
+            user_info = f"<b>{_esc_meta(uname, 60, '')}</b> (ID: {log_entry.user_id})"
         else:
             user_info = f"ID: {log_entry.user_id}"
+        comm_name = _esc_meta(user.name if user else None, 60, "Не указано")
         identity_lines = [
             "📱 <b>Платформа:</b> Telegram",
             f"👤 <b>Пользователь:</b> {user_info}",
             f"🆔 <b>Telegram ID:</b> <code>{log_entry.user_id if log_entry.user_id is not None else 'не указан'}</code>",
-            f"💬 <b>Имя для общения:</b> {html.escape(user.name if user and user.name else 'Не указано')}",
+            f"💬 <b>Имя для общения:</b> {comm_name}",
         ]
     else:
         if user:
             uname = f"@{user.username}" if user.username else (user.first_name or user.name or "")
-            user_info = f"<b>{html.escape(uname)}</b> (ID: {log_entry.user_id})"
+            user_info = f"<b>{_esc_meta(uname, 60, '')}</b> (ID: {log_entry.user_id})"
         else:
             user_info = f"ID: {log_entry.user_id}"
         identity_lines = [
@@ -178,42 +195,67 @@ def _format_bounded_detail_text(log_entry: AILog, user: User | None) -> str:
             f"🆔 <b>ID:</b> <code>{log_entry.user_id if log_entry.user_id is not None else 'не указан'}</code>",
         ]
         if user and user.name:
-            identity_lines.append(f"💬 <b>Имя для общения:</b> {html.escape(user.name)}")
+            identity_lines.append(f"💬 <b>Имя для общения:</b> {_esc_meta(user.name, 60, '')}")
 
     lat_text = f"{log_entry.latency_ms / 1000:.2f} сек" if log_entry.latency_ms else "не измерялось"
     dt_str = format_msk(log_entry.created_at, "%d-%m-%Y %H:%M:%S МСК")
     log_type = getattr(log_entry, "request_type", "chat") or "chat"
 
+    context_str = _esc_meta(ai_log_context_label(log_entry), 80, "—")
+    provider_str = _esc_meta(log_entry.provider, 50, "—")
+    model_str = _esc_meta(log_entry.model, 60, "—")
+    type_str = _esc_meta(AI_LOG_TYPE_LABELS.get(log_type, log_type), 40, log_type)
+
     header_text = (
         f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
         + "\n".join(identity_lines)
         + "\n"
-        f"🧾 <b>Тип запроса:</b> {html.escape(AI_LOG_TYPE_LABELS.get(log_type, log_type))}\n"
-        f"📍 <b>Контекст:</b> {html.escape(ai_log_context_label(log_entry))}\n"
-        f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider or '—')}</b>\n"
-        f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model or '—')}</code>\n"
+        f"🧾 <b>Тип запроса:</b> {type_str}\n"
+        f"📍 <b>Контекст:</b> {context_str}\n"
+        f"🤖 <b>Провайдер:</b> <b>{provider_str}</b>\n"
+        f"🧠 <b>Модель:</b> <code>{model_str}</code>\n"
         f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
         f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
     )
 
     section1_prefix = "📤 <b>Полный payload запроса (превью):</b>\n<code>"
     section1_suffix = "</code>\n\n"
-    section2_prefix = "📥 <b>Сырой ответ модели (Raw LLM Output):</b>\n<code>"
-    section2_suffix = "</code>"
+    section2_prefix = "🤖 <b>Сырой ответ модели (Raw LLM Output):</b>\n<code>"
+    section2_suffix = "</code>\n\n"
+    section3_prefix = "💬 <b>Текст ответа пользователю (Clean Text):</b>\n<code>"
+    section3_suffix = "</code>"
 
-    overhead = len(header_text) + len(section1_prefix) + len(section1_suffix) + len(section2_prefix) + len(section2_suffix)
-    available_budget = max(200, MAX_AI_LOG_DETAIL_TEXT_LIMIT - overhead)
-
-    payload_budget = min(1000, max(100, int(available_budget * 0.35)))
-    raw_budget = max(100, available_budget - payload_budget)
+    overhead = (
+        len(header_text)
+        + len(section1_prefix) + len(section1_suffix)
+        + len(section2_prefix) + len(section2_suffix)
+        + len(section3_prefix) + len(section3_suffix)
+    )
+    available_budget = max(90, MAX_AI_LOG_DETAIL_TEXT_LIMIT - overhead)
 
     raw_payload = log_entry.request_payload
+    raw_response = log_entry.raw_response or ""
+    clean_text = log_entry.clean_text or ""
+
     if not raw_payload:
         payload_preview = "не зафиксирован"
+        payload_cost = len(payload_preview)
     else:
-        payload_preview = _safe_truncate_escaped(raw_payload, payload_budget, "...")
+        max_p = min(700, max(30, int(available_budget * 0.25)))
+        payload_preview = _safe_truncate_escaped(raw_payload, max_p, "...")
+        payload_cost = len(payload_preview)
 
-    raw_response = log_entry.raw_response or ""
+    rem_after_payload = max(60, available_budget - payload_cost)
+
+    clean_escaped = html.escape(clean_text)
+    max_c = min(900, max(30, int(rem_after_payload * 0.35)))
+    if len(clean_escaped) <= max_c:
+        clean_preview = clean_escaped
+    else:
+        clean_preview = _safe_truncate_escaped(clean_text, max_c, "...")
+    clean_cost = len(clean_preview)
+
+    raw_budget = max(30, rem_after_payload - clean_cost)
     raw_preview = _safe_truncate_escaped(
         raw_response,
         raw_budget,
@@ -228,11 +270,14 @@ def _format_bounded_detail_text(log_entry: AILog, user: User | None) -> str:
         + section2_prefix
         + raw_preview
         + section2_suffix
+        + section3_prefix
+        + clean_preview
+        + section3_suffix
     )
 
     if len(final_text) > MAX_AI_LOG_DETAIL_TEXT_LIMIT:
-        diff = len(final_text) - MAX_AI_LOG_DETAIL_TEXT_LIMIT
-        tighter_raw_budget = max(50, raw_budget - diff)
+        excess = len(final_text) - MAX_AI_LOG_DETAIL_TEXT_LIMIT
+        tighter_raw_budget = max(10, raw_budget - excess)
         raw_preview = _safe_truncate_escaped(
             raw_response,
             tighter_raw_budget,
@@ -246,7 +291,26 @@ def _format_bounded_detail_text(log_entry: AILog, user: User | None) -> str:
             + section2_prefix
             + raw_preview
             + section2_suffix
+            + section3_prefix
+            + clean_preview
+            + section3_suffix
         )
+        if len(final_text) > MAX_AI_LOG_DETAIL_TEXT_LIMIT:
+            excess = len(final_text) - MAX_AI_LOG_DETAIL_TEXT_LIMIT
+            tighter_clean_budget = max(10, clean_cost - excess)
+            clean_preview = _safe_truncate_escaped(clean_text, tighter_clean_budget, "...")
+            final_text = (
+                header_text
+                + section1_prefix
+                + payload_preview
+                + section1_suffix
+                + section2_prefix
+                + raw_preview
+                + section2_suffix
+                + section3_prefix
+                + clean_preview
+                + section3_suffix
+            )
 
     return final_text
 
@@ -259,8 +323,9 @@ async def show_ai_logs_list(
     period: str = "all",
     request_type: str = "all",
 ) -> None:
-    period = period if period in AI_LOG_PERIOD_LABELS else "all"
-    request_type = request_type if request_type in AI_LOG_TYPE_LABELS else "all"
+    if period not in VALID_PERIODS or request_type not in VALID_REQUEST_TYPES:
+        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}'")
+
     async with async_session_maker() as session:
         query = _apply_ai_log_filters(
             select(AILog),
@@ -318,8 +383,9 @@ async def show_ai_log_detail(
     period: str = "all",
     request_type: str = "all",
 ) -> None:
-    period = period if period in AI_LOG_PERIOD_LABELS else "all"
-    request_type = request_type if request_type in AI_LOG_TYPE_LABELS else "all"
+    if period not in VALID_PERIODS or request_type not in VALID_REQUEST_TYPES:
+        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}'")
+
     async with async_session_maker() as session:
         log_entry = await session.get(AILog, log_id)
         if not log_entry:
@@ -369,8 +435,9 @@ async def export_ai_logs_package(
     period: str = "all",
     request_type: str = "all",
 ) -> None:
-    period = period if period in AI_LOG_PERIOD_LABELS else "all"
-    request_type = request_type if request_type in AI_LOG_TYPE_LABELS else "all"
+    if period not in VALID_PERIODS or request_type not in VALID_REQUEST_TYPES:
+        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}'")
+
     async with async_session_maker() as session:
         base_query = _apply_ai_log_filters(
             select(AILog),
@@ -393,30 +460,22 @@ async def export_ai_logs_package(
             tmp_path = tmp_file.name
 
         included_logs = []
-        total_uncompressed_bytes = 0
+        total_txt_bytes = 0
         byte_limit_reached = False
+        manifest = []
 
         with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            manifest = []
             for log_entry in logs:
                 safe_provider = re.sub(r"[^A-Za-z0-9_.-]+", "_", log_entry.provider or "provider")[:32]
                 filename = f"ai_log_{log_entry.id}_{safe_provider}.txt"
                 content_str = _build_ai_log_file_content(log_entry)
                 content_bytes = content_str.encode("utf-8")
 
-                if total_uncompressed_bytes + len(content_bytes) > MAX_EXPORT_UNCOMPRESSED_BYTES and included_logs:
-                    byte_limit_reached = True
-                    break
-
-                archive.writestr(filename, content_bytes)
-                total_uncompressed_bytes += len(content_bytes)
-                included_logs.append(log_entry)
-
                 platform = _ai_log_platform(log_entry)
                 entry_data = {
                     "id": log_entry.id,
                     "created_at": log_entry.created_at.isoformat() if log_entry.created_at else None,
-                    "platform": _ai_log_platform_label(log_entry),
+                    "platform": platform or "unknown",
                     "provider": log_entry.provider,
                     "model": log_entry.model,
                     "latency_ms": log_entry.latency_ms,
@@ -427,10 +486,32 @@ async def export_ai_logs_package(
                 elif platform == "telegram":
                     entry_data["telegram_id"] = log_entry.user_id
 
-                manifest.append(entry_data)
+                candidate_manifest = manifest + [entry_data]
+                candidate_manifest_bytes = json.dumps(candidate_manifest, ensure_ascii=False, indent=2).encode("utf-8")
+                candidate_total_uncompressed = total_txt_bytes + len(content_bytes) + len(candidate_manifest_bytes)
 
-            manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
-            archive.writestr("manifest.json", manifest_bytes)
+                if candidate_total_uncompressed > MAX_EXPORT_UNCOMPRESSED_BYTES:
+                    byte_limit_reached = True
+                    break
+
+                archive.writestr(filename, content_bytes)
+                total_txt_bytes += len(content_bytes)
+                manifest.append(entry_data)
+                included_logs.append(log_entry)
+
+            if included_logs:
+                manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+                archive.writestr("manifest.json", manifest_bytes)
+
+        if not included_logs:
+            if byte_limit_reached:
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Не удалось сформировать архив: первая же запись лога превышает максимальный лимит объёма экспорта (20 МБ). Вы можете скачать эту запись отдельно через просмотр лога.",
+                )
+            else:
+                await client.send_message(chat_id=chat_id, text="По выбранному фильтру логов нет.")
+            return
 
         upload_res = await client.upload_file("file", tmp_path)
         token = upload_res.get("token") or upload_res.get("fileId") or upload_res.get("id")
