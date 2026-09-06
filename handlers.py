@@ -1730,6 +1730,22 @@ class ScopedAIKickoff:
     is_hidden: bool = True
 
 
+async def _telegram_scoped_kickoff_is_current(
+    user_id: int,
+    expected_dialogue_id: int,
+    expected_topic_id: int | None,
+) -> bool:
+    """Validate that the user's current (dialogue_id, topic_id) scope matches the expected kickoff scope."""
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return False
+        return (
+            user.current_dialogue_id == expected_dialogue_id
+            and user.current_topic_id == expected_topic_id
+        )
+
+
 async def process_buffered_messages(
     user_id: int,
     bot: Bot,
@@ -1759,10 +1775,8 @@ async def process_buffered_messages(
 
     # Pre-call validation for scoped hidden kickoff
     if scoped_kickoff is not None:
-        async with async_session_maker() as session:
-            user = await session.get(User, user_id)
-            if not user or user.current_dialogue_id != scoped_kickoff.expected_dialogue_id or user.current_topic_id != scoped_kickoff.expected_topic_id:
-                return
+        if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+            return
 
     async def keep_typing_loop():
         try:
@@ -1796,18 +1810,22 @@ async def process_buffered_messages(
 
         # Post-call validation for scoped hidden kickoff
         if scoped_kickoff is not None:
-            async with async_session_maker() as session:
-                user = await session.get(User, user_id)
-                if not user or user.current_dialogue_id != scoped_kickoff.expected_dialogue_id or user.current_topic_id != scoped_kickoff.expected_topic_id:
-                    return
+            if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+                return
 
         should_start_test, directive_clean_text = extract_test_start_directive(response_text)
         if should_start_test:
+            if scoped_kickoff is not None:
+                if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+                    return
             directive_clean_text, _, _, _, _, _ = await handle_ai_media_content(
                 bot,
                 user_id,
                 directive_clean_text,
             )
+            if scoped_kickoff is not None:
+                if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+                    return
             if directive_clean_text:
                 html_response = markdown_to_html(directive_clean_text)
                 for chunk in split_html_text(html_response):
@@ -1816,6 +1834,9 @@ async def process_buffered_messages(
                         chunk,
                     )
 
+            if scoped_kickoff is not None:
+                if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+                    return
             async with async_session_maker() as session:
                 user = await session.get(User, user_id)
                 if user:
@@ -1843,10 +1864,17 @@ async def process_buffered_messages(
             await _start_test_from_ai_directive(bot, user_id, state)
             return
 
+        if scoped_kickoff is not None:
+            if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+                return
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_text)
         clean_text, response_button_rows = extract_response_buttons(clean_text)
         presentation = await _prepare_telegram_response_buttons(user_id, response_button_rows)
         response_text_markup = _telegram_response_text_markup(presentation)
+
+        if scoped_kickoff is not None:
+            if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+                return
 
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
@@ -2045,7 +2073,9 @@ async def process_buffered_messages(
                             [back_media.file_id for _ in cards],
                             context="process_buffered_messages.hidden_choice_spread",
                         )
-                    await bot.send_message(chat_id=user_id, text="Выбери карту, которая тебе откликается:", reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]))
+            if scoped_kickoff is not None:
+                if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+                    return
 
             if user:
                 target_dialogue_id = scoped_kickoff.expected_dialogue_id if scoped_kickoff else user.current_dialogue_id
@@ -2471,7 +2501,7 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         await select_topic_menu(message_proxy)
         return
     if is_main_topic_action:
-        await _perform_telegram_topic_reset_to_main(user_id, bot)
+        await _perform_telegram_topic_reset_to_main(user_id, bot, state)
         return
     if delegates_topic_callback:
         topic_id_str = action[10:] if action.startswith("svc:topic:") else action[6:]
@@ -6634,6 +6664,17 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
     if await _send_pending_topic_intro(data, bot, callback.from_user.id, state=state):
         return
 
+    if pending_kind == "main_resume":
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if user and user.current_topic_id is None and (pending_dialogue_id is None or user.current_dialogue_id == int(pending_dialogue_id)):
+                if not await _check_telegram_chat_access(session, user_id, bot, callback.message.chat.id):
+                    return
+                from system_events import build_main_dialogue_resume_system_message
+                synthetic_prompt = build_main_dialogue_resume_system_message()
+                await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, user.current_dialogue_id, None)
+                return
+
     if pending_topic_id:
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
@@ -7969,6 +8010,13 @@ async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot, state: F
             if disclaimer_content.get('is_visible', True):
                 if state:
                     await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                    await state.update_data(
+                        pending_auto_start_topic_id=None,
+                        pending_auto_start_dialogue_id=dialogue_id,
+                        pending_auto_start_kind="main_resume",
+                    )
+                text_to_send_disc = disclaimer_content.get('text') or "Текст дисклеймера не задан."
+                await bot.send_message(user_id, text_to_send_disc, reply_markup=kb.confirm_disclaimer_keyboard())
                 return
             else:
                 await session_acc.execute(update(User).where(User.id == user_id).values(accepted_disclaimer=True))

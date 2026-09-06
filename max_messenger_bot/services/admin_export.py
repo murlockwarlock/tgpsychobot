@@ -9,7 +9,7 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 
 from ..api import MaxApiClient
 from ..identity import is_max_user_id, max_communication_name, max_username, raw_max_user_id
@@ -65,7 +65,7 @@ async def show_export_clients(
             await session.execute(
                 select(User)
                 .where(User.id >= MAX_ID_OFFSET)
-                .outerjoin(DBMessage, User.id == DBMessage.user_id)
+                .outerjoin(DBMessage, and_(User.id == DBMessage.user_id, non_technical_role_filter(DBMessage)))
                 .group_by(User.id)
                 .order_by(func.max(DBMessage.timestamp).desc().nulls_last(), User.created_at.desc())
                 .offset(page * PAGE_SIZE)

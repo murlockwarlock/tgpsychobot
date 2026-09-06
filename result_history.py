@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from database import Message, TestAttempt
 from response_buttons import extract_response_buttons
@@ -39,7 +39,10 @@ def is_technical_role(role: str | None) -> bool:
 
 def non_technical_role_filter(message_model=Message):
     """Filter out internal technical message roles (e.g. topic_welcome) while preserving conversational/legacy roles."""
-    return ~message_model.role.in_(TECHNICAL_ROLES)
+    return or_(
+        message_model.role.is_(None),
+        ~message_model.role.in_(TECHNICAL_ROLES),
+    )
 
 
 def visible_history_role_filter(message_model=Message):

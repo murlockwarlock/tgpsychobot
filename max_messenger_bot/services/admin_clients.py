@@ -10,7 +10,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import aliased, selectinload
 
 from ..api import MaxApiClient

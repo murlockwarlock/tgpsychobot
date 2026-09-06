@@ -1198,3 +1198,570 @@ async def test_journey_12_in_flight_stale_navigation_drop_tg(db_session, monkeyp
             select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "assistant")
         )).scalars().all()
         assert len(msgs) == 0
+
+
+# ==============================================================================
+# REMEDIATION REGRESSIONS (PR #14)
+# ==============================================================================
+
+async def drain_max_app(app: MaxBotApplication, user_id: int):
+    while user_id in app.user_tasks and not app.user_tasks[user_id].done():
+        await app.user_tasks[user_id]
+
+
+def make_incoming_callback(chat_id: int, user_id: int, payload: str, callback_id: str = "cb1", message_id: str | None = "42") -> IncomingCallback:
+    sender = Sender(user_id=user_id, username="testuser", first_name="Иван", last_name=None)
+    return IncomingCallback(
+        raw={},
+        callback_id=callback_id,
+        payload=payload,
+        chat_id=chat_id,
+        message_id=message_id,
+        sender=sender,
+    )
+
+
+@pytest.mark.asyncio
+async def test_remediation_1_max_list_clients_executes_without_name_error(db_session):
+    """Regression 1: max_admin_clients.list_clients executes against DB without NameError for and_."""
+    client = AsyncMock()
+    max_uid1 = 1_000_000_000_001
+    max_uid2 = 1_000_000_000_002
+
+    async with db_session() as session:
+        session.add(User(id=max_uid1, username="client1", first_name="Client1", name="Client1", current_dialogue_id=1))
+        session.add(User(id=max_uid2, username="client2", first_name="Client2", name="Client2", current_dialogue_id=1))
+        session.add(DBMessage(user_id=max_uid1, role="user", content="Привет", dialogue_id=1, topic_id=None))
+        await session.commit()
+
+    # Must execute cleanly without NameError
+    await max_admin_clients.list_clients(client, chat_id=999, page=0)
+    client.send_message.assert_awaited_once()
+    assert "Список клиентов" in client.send_message.call_args[1]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    "svc:topic:main",
+    "svc:topic:0",
+    "svc:reset_topic",
+    "reset_topic",
+])
+async def test_remediation_2_real_max_app_main_callbacks_pass_states(db_session, monkeypatch, payload):
+    """Regression 2: Real MaxBotApplication.handle_callback passes StateStore to reset_topic."""
+    await seed_env(db_session, auto_start=True)
+    client = AsyncMock()
+    app = MaxBotApplication(client)
+
+    captured_prompt = None
+
+    async def fake_get_ai(user_id, prompt_text, **kwargs):
+        nonlocal captured_prompt
+        captured_prompt = prompt_text
+        return "MAX AI ответ при возврате в основной диалог"
+
+    monkeypatch.setattr(max_common, "get_ai_response", fake_get_ai)
+
+    # Start user in topic 10
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 1
+        await session.commit()
+
+    cb = make_incoming_callback(chat_id=1001, user_id=1001, payload=payload)
+
+    await app.handle_callback(cb)
+    await drain_max_app(app, 1001)
+
+    # 1. Callback ACKed
+    client.answer_callback.assert_awaited()
+
+    # 2. State transition committed
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id is None
+
+    # 3. Exactly one confirmation sent
+    confirm_calls = [c for c in client.send_message.call_args_list if "Мы вернулись в общий режим диалога" in str(c)]
+    assert len(confirm_calls) == 1
+
+    # 4. Kickoff executed once
+    assert captured_prompt is not None
+    assert "Пользователь вернулся в общий режим диалога" in captured_prompt
+
+
+@pytest.mark.asyncio
+async def test_remediation_3_max_main_disclaimer_gates_and_continuation(db_session, monkeypatch):
+    """Regression 3: MAX main resume with visible unaccepted disclaimer persists pending and executes kickoff after accept."""
+    await seed_env(db_session, auto_start=True)
+    client = AsyncMock()
+    app = MaxBotApplication(client)
+    states = app.states
+
+    # User in topic 10, disclaimer visible and not accepted
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 1
+        user.accepted_disclaimer = False
+        session.add(Content(key="disclaimer", is_visible=True, text_content="MAX Правила и условия использования."))
+        await session.commit()
+
+    provider_called = False
+
+    async def fake_get_ai(user_id, prompt_text, **kwargs):
+        nonlocal provider_called
+        provider_called = True
+        return "MAX Ответ после согласия с правилами"
+
+    monkeypatch.setattr(max_common, "get_ai_response", fake_get_ai)
+
+    # 1. User clicks main dialogue
+    cb_main = make_incoming_callback(chat_id=1001, user_id=1001, payload="svc:topic:main", callback_id="cb_disc_1")
+    await app.handle_callback(cb_main)
+    await drain_max_app(app, 1001)
+
+    # Transition committed to DB
+    expected_main_dialogue_id = None
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id is None
+        expected_main_dialogue_id = user.current_dialogue_id
+
+    # Confirmation sent
+    confirm_calls = [c for c in client.send_message.call_args_list if "Мы вернулись в общий режим диалога" in str(c)]
+    assert len(confirm_calls) == 1
+
+    # Disclaimer UI sent
+    disc_calls = [c for c in client.send_message.call_args_list if "MAX Правила и условия" in str(c)]
+    assert len(disc_calls) == 1
+
+    # Provider NOT called yet
+    assert not provider_called
+
+    # Pending state in states store
+    state_rec = await states.get(1001)
+    assert state_rec is not None
+    assert state_rec.state == "awaiting_disclaimer_acceptance"
+    assert state_rec.data.get("pending_auto_start_kind") == "main_resume"
+    assert state_rec.data.get("pending_auto_start_dialogue_id") == expected_main_dialogue_id
+    assert state_rec.data.get("pending_auto_start_topic_id") is None
+
+    # 2. User accepts disclaimer
+    client.send_message.reset_mock()
+    cb_accept = make_incoming_callback(chat_id=1001, user_id=1001, payload="disclaimer_accepted", callback_id="cb_disc_2")
+    await app.handle_callback(cb_accept)
+    await drain_max_app(app, 1001)
+
+    # Kickoff executed once
+    assert provider_called
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.accepted_disclaimer is True
+        ai_msgs = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "assistant")
+        )).scalars().all()
+        assert len(ai_msgs) == 1
+        assert ai_msgs[0].content == "MAX Ответ после согласия с правилами"
+        assert ai_msgs[0].topic_id is None
+        assert ai_msgs[0].dialogue_id == expected_main_dialogue_id
+
+
+@pytest.mark.asyncio
+async def test_remediation_4_tg_main_disclaimer_continuation(db_session, monkeypatch):
+    """Regression 4: TG main resume with visible unaccepted disclaimer persists pending and executes kickoff after accept."""
+    await seed_env(db_session, auto_start=True)
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    # User in topic 10, disclaimer visible and unaccepted
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 1
+        user.accepted_disclaimer = False
+        session.add(Content(key="disclaimer", is_visible=True, text_content="TG Правила и условия диалога."))
+        await session.commit()
+
+    captured_prompt = None
+
+    async def fake_generate_response(user_id, prompt_text, *args, **kwargs):
+        nonlocal captured_prompt
+        captured_prompt = prompt_text
+        return "TG Ответ в основном диалоге после принятия дисклеймера"
+
+    monkeypatch.setattr("handlers.ai_integration.generate_response", fake_generate_response)
+    monkeypatch.setattr("ai_integration.generate_response", fake_generate_response)
+
+    # 1. User clicks main dialogue button
+    cb_main = SimpleNamespace(
+        id="cb_tg_main",
+        data="ai_btn:svc:topic:main",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=99,
+            chat=SimpleNamespace(id=1001, type="private"),
+            answer=AsyncMock(),
+            edit_reply_markup=AsyncMock(),
+            reply_markup=handlers.InlineKeyboardMarkup(
+                inline_keyboard=[[handlers.InlineKeyboardButton(text="Основной диалог", callback_data="ai_btn:svc:topic:main")]]
+            ),
+        ),
+        answer=AsyncMock(),
+    )
+
+    await handlers.process_response_button(cb_main, state, bot)
+    await drain_tg_runner(1001)
+
+    # Transition committed
+    expected_main_dialogue_id = None
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id is None
+        expected_main_dialogue_id = user.current_dialogue_id
+
+    # Confirmation + disclaimer UI sent
+    sent_texts = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
+    assert any("Мы вернулись в общий режим диалога" in t for t in sent_texts)
+    assert any("TG Правила и условия диалога." in t for t in sent_texts)
+
+    # Provider NOT called yet
+    assert captured_prompt is None
+
+    # Pending state in FSM
+    fsm_data = await state.get_data()
+    assert fsm_data.get("pending_auto_start_kind") == "main_resume"
+    assert fsm_data.get("pending_auto_start_dialogue_id") == expected_main_dialogue_id
+    assert fsm_data.get("pending_auto_start_topic_id") is None
+
+    # 2. User accepts disclaimer
+    bot.send_message.reset_mock()
+    cb_accept = SimpleNamespace(
+        id="cb_tg_acc",
+        data="disclaimer_accepted",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=100,
+            chat=SimpleNamespace(id=1001, type="private"),
+            delete=AsyncMock(),
+            answer=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.disclaimer_accepted_handler(cb_accept, state, bot)
+    await drain_tg_runner(1001)
+
+    # Hidden kickoff executed once
+    assert captured_prompt is not None
+    assert "Пользователь вернулся в общий режим диалога" in captured_prompt
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.accepted_disclaimer is True
+        ai_msgs = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "assistant")
+        )).scalars().all()
+        assert len(ai_msgs) == 1
+        assert ai_msgs[0].content == "TG Ответ в основном диалоге после принятия дисклеймера"
+        assert ai_msgs[0].topic_id is None
+        assert ai_msgs[0].dialogue_id == expected_main_dialogue_id
+
+    # 3. Next normal user message continues same main dialogue
+    msg = SimpleNamespace(
+        message_id=101,
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        chat=SimpleNamespace(id=1001, type="private"),
+        text="Продолжаем разговор в основном диалоге",
+        answer=AsyncMock(),
+        delete=AsyncMock(),
+    )
+    await handlers.handle_ai_chat(msg, state, bot)
+    await drain_tg_runner(1001)
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id is None
+        assert user.current_dialogue_id == expected_main_dialogue_id
+        user_msgs = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "user")
+        )).scalars().all()
+        assert len(user_msgs) == 1
+        assert user_msgs[0].dialogue_id == expected_main_dialogue_id
+        assert user_msgs[0].topic_id is None
+
+
+@pytest.mark.asyncio
+async def test_remediation_5_stale_main_pending_dropped_tg_and_max(db_session, monkeypatch):
+    """Regression 5: Stale main resume pending kickoff is dropped if user changed scope before accepting disclaimer."""
+    await seed_env(db_session, auto_start=True)
+
+    # --- TG variant ---
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 1
+        user.accepted_disclaimer = False
+        session.add(Content(key="disclaimer", is_visible=True, text_content="Правила"))
+        await session.commit()
+
+    ai_calls_tg = 0
+
+    async def fake_ai_tg(user_id, prompt_text, *args, **kwargs):
+        nonlocal ai_calls_tg
+        ai_calls_tg += 1
+        return "Ответ"
+
+    monkeypatch.setattr("handlers.ai_integration.generate_response", fake_ai_tg)
+    monkeypatch.setattr("ai_integration.generate_response", fake_ai_tg)
+
+    # Click main -> pending set
+    cb_main = SimpleNamespace(
+        id="cb_m",
+        data="ai_btn:svc:topic:main",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=99,
+            chat=SimpleNamespace(id=1001, type="private"),
+            answer=AsyncMock(),
+            edit_reply_markup=AsyncMock(),
+            reply_markup=handlers.InlineKeyboardMarkup(
+                inline_keyboard=[[handlers.InlineKeyboardButton(text="Основной диалог", callback_data="ai_btn:svc:topic:main")]]
+            ),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.process_response_button(cb_main, state, bot)
+    await drain_tg_runner(1001)
+
+    # User changes scope to Topic 20 in DB before accepting
+    async with db_session() as session:
+        topic20 = Topic(id=20, name="Тема 20", is_active=True, show_in_list=True, admin_only=False)
+        session.add(topic20)
+        user = await session.get(User, 1001)
+        user.current_topic_id = 20
+        user.current_dialogue_id = 5
+        await session.commit()
+
+    # Now accepts old disclaimer
+    cb_acc = SimpleNamespace(
+        id="cb_acc",
+        data="disclaimer_accepted",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=100,
+            chat=SimpleNamespace(id=1001, type="private"),
+            delete=AsyncMock(),
+            answer=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.disclaimer_accepted_handler(cb_acc, state, bot)
+    await drain_tg_runner(1001)
+
+    # Main kickoff was dropped!
+    assert ai_calls_tg == 0
+
+    # --- MAX variant ---
+    client = AsyncMock()
+    app = MaxBotApplication(client)
+
+    max_uid = 1_000_000_000_001
+    async with db_session() as session:
+        session.add(User(id=max_uid, username="max_stale", first_name="Max", name="Max", current_dialogue_id=1, current_topic_id=10, accepted_disclaimer=False))
+        await session.commit()
+
+    ai_calls_max = 0
+
+    async def fake_ai_max(user_id, prompt_text, **kwargs):
+        nonlocal ai_calls_max
+        ai_calls_max += 1
+        return "MAX Ответ"
+
+    monkeypatch.setattr(max_common, "get_ai_response", fake_ai_max)
+
+    cb_max = make_incoming_callback(chat_id=max_uid, user_id=max_uid, payload="svc:topic:main", callback_id="cb_max_1")
+    await app.handle_callback(cb_max)
+    await drain_max_app(app, max_uid)
+
+    # Scope changed to Topic 20 before accepting
+    async with db_session() as session:
+        user = await session.get(User, max_uid)
+        user.current_topic_id = 20
+        user.current_dialogue_id = 6
+        await session.commit()
+
+    cb_acc_max = make_incoming_callback(chat_id=max_uid, user_id=max_uid, payload="disclaimer_accepted", callback_id="cb_max_2")
+    await app.handle_callback(cb_acc_max)
+    await drain_max_app(app, max_uid)
+
+    # Main kickoff dropped in MAX too
+    assert ai_calls_max == 0
+
+
+@pytest.mark.asyncio
+async def test_remediation_6_and_7_topic_welcome_activity_isolation_ordering(db_session):
+    """Regressions 6 & 7: topic_welcome does not affect MAX normal client list or export-selection client list ordering."""
+    from datetime import datetime
+    client = AsyncMock()
+    states = StateStore()
+
+    max_uid_a = 1_000_000_000_001  # Recent topic_welcome only
+    max_uid_b = 1_000_000_000_002  # Older real user/assistant conversation
+    max_uid_c = 1_000_000_000_003  # No messages at all
+
+    async with db_session() as session:
+        session.add(User(id=max_uid_a, username="user_a", first_name="UserA", name="UserA", current_dialogue_id=1, created_at=datetime(2026, 9, 1, 10, 0, 0)))
+        session.add(User(id=max_uid_b, username="user_b", first_name="UserB", name="UserB", current_dialogue_id=1, created_at=datetime(2026, 9, 1, 10, 0, 0)))
+        session.add(User(id=max_uid_c, username="user_c", first_name="UserC", name="UserC", current_dialogue_id=1, created_at=datetime(2026, 9, 1, 10, 0, 0)))
+
+        # User A has recent topic_welcome (timestamp = Sept 6)
+        session.add(DBMessage(
+            user_id=max_uid_a,
+            role="topic_welcome",
+            content="[TOPIC_WELCOME]",
+            dialogue_id=1,
+            topic_id=10,
+            timestamp=datetime(2026, 9, 6, 12, 0, 0),
+        ))
+
+        # User B has older real conversation (timestamp = Sept 3)
+        session.add(DBMessage(
+            user_id=max_uid_b,
+            role="user",
+            content="Привет бот",
+            dialogue_id=1,
+            topic_id=None,
+            timestamp=datetime(2026, 9, 3, 12, 0, 0),
+        ))
+        await session.commit()
+
+    # 1. Normal MAX client list (Regression 6)
+    await max_admin_clients.list_clients(client, chat_id=999, page=0)
+    client.send_message.assert_awaited_once()
+    keyboard_att = client.send_message.call_args[1]["attachments"]
+    buttons = keyboard_att[0]["payload"]["buttons"]
+    client_button_payloads = [btn["payload"] for row in buttons for btn in row if btn.get("payload", "").startswith("view_client_")]
+
+    # User B (with real conversation) MUST be first, before User A and User C
+    assert client_button_payloads[0] == f"view_client_{max_uid_b}"
+    assert f"view_client_{max_uid_a}" in client_button_payloads
+    assert f"view_client_{max_uid_c}" in client_button_payloads
+
+    # 2. MAX export-selection client list (Regression 7)
+    client.send_message.reset_mock()
+    await max_admin_export.show_export_clients(client, states=states, chat_id=999, user_id=999, page=0)
+    client.send_message.assert_awaited_once()
+    export_keyboard_att = client.send_message.call_args[1]["attachments"]
+    export_buttons = export_keyboard_att[0]["payload"]["buttons"]
+    export_button_payloads = [btn["payload"] for row in export_buttons for btn in row if btn.get("payload", "").startswith("toggle_export_")]
+
+    # User B MUST be first in export selection as well
+    assert export_button_payloads[0] == f"toggle_export_{max_uid_b}_0"
+    assert f"toggle_export_{max_uid_a}_0" in export_button_payloads
+    assert f"toggle_export_{max_uid_c}_0" in export_button_payloads
+
+
+@pytest.mark.asyncio
+async def test_remediation_8_tg_post_provider_processing_race_drops_stale_response(db_session, monkeypatch):
+    """Regression 8: TG navigation after provider return but before final assistant persistence drops stale response."""
+    await seed_env(db_session, auto_start=True)
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    # Start user in Topic 10, dialogue 1
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 1
+        await session.commit()
+
+    async def fake_generate_response(user_id, prompt_text, *args, **kwargs):
+        return "AI ответ для Топика 10 перед навигацией"
+
+    monkeypatch.setattr("handlers.ai_integration.generate_response", fake_generate_response)
+    monkeypatch.setattr("ai_integration.generate_response", fake_generate_response)
+
+    # We hook _telegram_scoped_kickoff_is_current to simulate user navigating to Topic 20
+    # exactly during post-provider response processing, before assistant persistence
+    orig_scope_validator = handlers._telegram_scoped_kickoff_is_current
+    validation_call_count = 0
+
+    async def hooked_scope_validator(user_id, expected_dialogue_id, expected_topic_id):
+        nonlocal validation_call_count
+        validation_call_count += 1
+        if validation_call_count == 2:
+            # During post-provider processing, user switches to Topic 20 in DB
+            async with db_session() as session:
+                topic20 = Topic(id=20, name="Тема 20", is_active=True, show_in_list=True, admin_only=False)
+                session.add(topic20)
+                user = await session.get(User, user_id)
+                user.current_topic_id = 20
+                user.current_dialogue_id = 2
+                await session.commit()
+        return await orig_scope_validator(user_id, expected_dialogue_id, expected_topic_id)
+
+    monkeypatch.setattr(handlers, "_telegram_scoped_kickoff_is_current", hooked_scope_validator)
+
+    # Launch hidden kickoff for Topic 10
+    await handlers._start_telegram_hidden_kickoff(
+        user_id=1001,
+        bot=bot,
+        state=state,
+        synthetic_prompt="[СИСТЕМНОЕ СООБЩЕНИЕ: тест расы]",
+        dialogue_id=1,
+        topic_id=10,
+    )
+    await drain_tg_runner(1001)
+
+    # 1. Stale AI response was dropped: not sent to chat
+    sent_stale = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list if "AI ответ для Топика 10" in (call.args[1] if len(call.args) > 1 else call.kwargs.get("text", ""))]
+    assert len(sent_stale) == 0
+
+    # 2. Not persisted in DB
+    async with db_session() as session:
+        msgs = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "assistant")
+        )).scalars().all()
+        assert len(msgs) == 0
+
+    # 3. Topic 20 remains usable; next ordinary message in Topic 20 works
+    async def fake_normal_ai(user_id, prompt_text, *args, **kwargs):
+        return "Нормальный ответ в теме 20"
+
+    monkeypatch.setattr("handlers.ai_integration.generate_response", fake_normal_ai)
+    monkeypatch.setattr("ai_integration.generate_response", fake_normal_ai)
+    monkeypatch.setattr(handlers, "_telegram_scoped_kickoff_is_current", orig_scope_validator)
+
+    msg = SimpleNamespace(
+        message_id=200,
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        chat=SimpleNamespace(id=1001, type="private"),
+        text="Привет в теме 20",
+        answer=AsyncMock(),
+        delete=AsyncMock(),
+    )
+    await handlers.handle_ai_chat(msg, state, bot)
+    await drain_tg_runner(1001)
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id == 20
+        assert user.current_dialogue_id == 2
+        user_msgs = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "user")
+        )).scalars().all()
+        assert len(user_msgs) == 1
+        assert user_msgs[0].topic_id == 20
+        assert user_msgs[0].dialogue_id == 2
+
+        ai_msgs = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "assistant")
+        )).scalars().all()
+        assert len(ai_msgs) == 1
+        assert ai_msgs[0].content == "Нормальный ответ в теме 20"
+        assert ai_msgs[0].topic_id == 20
+        assert ai_msgs[0].dialogue_id == 2

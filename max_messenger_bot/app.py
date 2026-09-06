@@ -715,8 +715,10 @@ class MaxBotApplication:
         if data == "noop":
             await self.client.answer_callback(callback.callback_id)
             return
-        if data.startswith("ai_btn:"):
+        if data.startswith("ai_btn:") or data.startswith("action:") or data.startswith("svc:"):
             action, _ = split_action_callback_data(data)
+            if action.startswith("action:"):
+                action = action[7:]
             await self.client.answer_callback(callback.callback_id)
             if action in ("main_menu", "svc:menu"):
                 await common.show_menu(self.client, chat_id, user_id=user_id)
@@ -725,7 +727,7 @@ class MaxBotApplication:
                 await topics_service.show_topics(self.client, chat_id, user_id)
                 return
             if action in MAIN_TOPIC_ACTIONS:
-                self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id))
+                self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
                 return
             if (action.startswith("topic_") and action[6:].isdigit() and int(action[6:]) > 0) or (action.startswith("svc:topic:") and action[10:].isdigit() and int(action[10:]) > 0):
                 topic_id = int(action[10:] if action.startswith("svc:topic:") else action[6:])
@@ -828,7 +830,7 @@ class MaxBotApplication:
             return
         if data == "reset_topic":
             await self.client.answer_callback(callback.callback_id)
-            self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id))
+            self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
             return
         if data.startswith("confirm_reset_dialogue:"):
             await self.client.answer_callback(callback.callback_id)
