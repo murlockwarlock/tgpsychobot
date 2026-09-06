@@ -93,6 +93,37 @@ async def record_topic_welcome_shown(
     return marker
 
 
+async def resolve_topic_entry_state(
+    session,
+    user_id: int,
+    dialogue_id: int,
+    topic_id: int,
+) -> bool:
+    """Resolve whether topic welcome was already shown in (dialogue_id, topic_id) scope.
+
+    Returns True if welcome was already shown (resume), False if first entry (show welcome).
+    For legacy dialogues lacking topic_welcome marker but containing conversational history
+    (user, assistant, or test_result), treats as resume and lazily records the marker.
+    """
+    if await is_topic_welcome_shown(session, user_id, dialogue_id, topic_id):
+        return True
+
+    has_history = await session.scalar(
+        select(Message.id).where(
+            Message.user_id == user_id,
+            Message.dialogue_id == dialogue_id,
+            Message.topic_id == topic_id,
+            Message.role.in_(VISIBLE_HISTORY_ROLES),
+        ).limit(1)
+    ) is not None
+
+    if has_history:
+        await record_topic_welcome_shown(session, user_id, dialogue_id, topic_id, content="legacy_resume")
+        return True
+
+    return False
+
+
 def select_ai_history_messages(
     messages: list[Any],
     limit_first: int,

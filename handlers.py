@@ -191,6 +191,7 @@ from result_history import (
     is_topic_welcome_shown,
     non_technical_role_filter,
     record_topic_welcome_shown,
+    resolve_topic_entry_state,
     save_test_attempt,
     save_test_history_message,
 )
@@ -1813,30 +1814,35 @@ async def process_buffered_messages(
             if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
                 return
 
-        should_start_test, directive_clean_text = extract_test_start_directive(response_text)
-        if should_start_test:
+        async def _check_scope_guard() -> bool:
             if scoped_kickoff is not None:
                 if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
-                    return
+                    return False
+            return True
+
+        should_start_test, directive_clean_text = extract_test_start_directive(response_text)
+        if should_start_test:
+            if not await _check_scope_guard():
+                return
             directive_clean_text, _, _, _, _, _ = await handle_ai_media_content(
                 bot,
                 user_id,
                 directive_clean_text,
             )
-            if scoped_kickoff is not None:
-                if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
-                    return
+            if not await _check_scope_guard():
+                return
             if directive_clean_text:
                 html_response = markdown_to_html(directive_clean_text)
                 for chunk in split_html_text(html_response):
+                    if not await _check_scope_guard():
+                        return
                     await _safe_send_html(
                         lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm),
                         chunk,
                     )
 
-            if scoped_kickoff is not None:
-                if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
-                    return
+            if not await _check_scope_guard():
+                return
             async with async_session_maker() as session:
                 user = await session.get(User, user_id)
                 if user:
@@ -1861,20 +1867,20 @@ async def process_buffered_messages(
                     ))
                     await session.commit()
 
+            if not await _check_scope_guard():
+                return
             await _start_test_from_ai_directive(bot, user_id, state)
             return
 
-        if scoped_kickoff is not None:
-            if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
-                return
+        if not await _check_scope_guard():
+            return
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_text)
         clean_text, response_button_rows = extract_response_buttons(clean_text)
         presentation = await _prepare_telegram_response_buttons(user_id, response_button_rows)
         response_text_markup = _telegram_response_text_markup(presentation)
 
-        if scoped_kickoff is not None:
-            if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
-                return
+        if not await _check_scope_guard():
+            return
 
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
@@ -1882,14 +1888,18 @@ async def process_buffered_messages(
             media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
             before_show_imgs, after_show_imgs = _split_show_img_positions(show_imgs)
             sent_show_img_names: set[str] = set()
-            await send_show_images(
-                bot,
-                user_id,
-                session,
-                media_scope,
-                before_show_imgs,
-                sent_show_img_names,
-            )
+
+            if before_show_imgs:
+                if not await _check_scope_guard():
+                    return
+                await send_show_images(
+                    bot,
+                    user_id,
+                    session,
+                    media_scope,
+                    before_show_imgs,
+                    sent_show_img_names,
+                )
 
             # --- 1. Текст AI (сначала предисловие) ---
 
@@ -1900,6 +1910,8 @@ async def process_buffered_messages(
                     html_text = markdown_to_html(text_part)
                     chunks = split_html_text(html_text)
                     for index, chunk in enumerate(chunks):
+                        if not await _check_scope_guard():
+                            return
                         chunk_markup = response_text_markup if index == len(chunks) - 1 else None
                         await _safe_send_html(
                             lambda text, pm, markup=chunk_markup: bot.send_message(
@@ -1909,11 +1921,17 @@ async def process_buffered_messages(
                         )
                     response_buttons_sent = bool(text_part and response_text_markup)
                 if image_prompt:
+                    if not await _check_scope_guard():
+                        return
                     upload_task = _start_chat_action_loop(bot, user_id, "upload_photo")
                     try:
                         image_data = await ai_integration.generate_image(image_prompt)
+                        if not await _check_scope_guard():
+                            return
                         await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(image_data, filename="gen.png"), caption="✨ Готово!")
                     except Exception as e:
+                        if not await _check_scope_guard():
+                            return
                         gen_provider, gen_model = _resolve_ai_provider_model(ai_config, "image_generation")
                         await _report_ai_failure(
                             bot,
@@ -1926,10 +1944,13 @@ async def process_buffered_messages(
                             extra={"prompt_len": len(image_prompt)},
                             exception=e,
                         )
-                        await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
+                        if await _check_scope_guard():
+                            await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
                     finally:
                         upload_task.cancel()
                 if response_text_markup and not response_buttons_sent:
+                    if not await _check_scope_guard():
+                        return
                     await bot.send_message(
                         chat_id=user_id,
                         text="Выберите действие:",
@@ -1940,6 +1961,8 @@ async def process_buffered_messages(
                     html_response = markdown_to_html(clean_text)
                     chunks = split_html_text(html_response)
                     for index, chunk in enumerate(chunks):
+                        if not await _check_scope_guard():
+                            return
                         chunk_markup = response_text_markup if index == len(chunks) - 1 else None
                         await _safe_send_html(
                             lambda text, pm, markup=chunk_markup: bot.send_message(
@@ -1948,20 +1971,25 @@ async def process_buffered_messages(
                             chunk,
                         )
                 elif response_text_markup:
+                    if not await _check_scope_guard():
+                        return
                     await bot.send_message(
                         chat_id=user_id,
                         text="Выберите действие:",
                         reply_markup=response_text_markup,
                     )
 
-            await send_show_images(
-                bot,
-                user_id,
-                session,
-                media_scope,
-                after_show_imgs,
-                sent_show_img_names,
-            )
+            if after_show_imgs:
+                if not await _check_scope_guard():
+                    return
+                await send_show_images(
+                    bot,
+                    user_id,
+                    session,
+                    media_scope,
+                    after_show_imgs,
+                    sent_show_img_names,
+                )
 
             # --- 2. Медиа (карты, аудио) после текста ---
 
@@ -1973,6 +2001,8 @@ async def process_buffered_messages(
                 ).order_by(MediaLibrary.id).limit(1)
                 media = await session.scalar(stmt)
                 if media:
+                    if not await _check_scope_guard():
+                        return
                     await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=media.description, parse_mode='HTML')
 
             drawn_cards_info = []
@@ -1989,6 +2019,8 @@ async def process_buffered_messages(
                 r_cards = res.scalars().all()
                 all_random_cards.extend(r_cards)
             if all_random_cards:
+                if not await _check_scope_guard():
+                    return
                 if len(all_random_cards) == 1:
                     await send_photo_or_document(
                         bot,
@@ -2023,6 +2055,8 @@ async def process_buffered_messages(
                 res = await session.execute(stmt)
                 cards = res.scalars().all()
                 if cards:
+                    if not await _check_scope_guard():
+                        return
                     if rounds > 1:
                         await _save_card_spread_state(user_id, _new_card_spread_state(
                             category=cat, topic_id=topic_id, rounds=rounds,
@@ -2053,6 +2087,8 @@ async def process_buffered_messages(
                 res = await session.execute(stmt)
                 cards = res.scalars().all()
                 if cards:
+                    if not await _check_scope_guard():
+                        return
                     if rounds > 1:
                         await _save_card_spread_state(user_id, _new_card_spread_state(
                             category=cat_stripped, topic_id=topic_id, rounds=rounds,
@@ -2073,9 +2109,8 @@ async def process_buffered_messages(
                             [back_media.file_id for _ in cards],
                             context="process_buffered_messages.hidden_choice_spread",
                         )
-            if scoped_kickoff is not None:
-                if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
-                    return
+            if not await _check_scope_guard():
+                return
 
             if user:
                 target_dialogue_id = scoped_kickoff.expected_dialogue_id if scoped_kickoff else user.current_dialogue_id
@@ -2106,6 +2141,8 @@ async def process_buffered_messages(
         if drawn_cards_info:
             typing_task_interp = None
             try:
+                if not await _check_scope_guard():
+                    return
                 cards_text = "; ".join(drawn_cards_info)
                 typing_task_interp = asyncio.create_task(keep_typing_loop())
                 interpretation = await ai_integration.generate_response(
@@ -2114,9 +2151,13 @@ async def process_buffered_messages(
                     bot=bot,
                 )
                 await _cancel_task(typing_task_interp)
+                if not await _check_scope_guard():
+                    return
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
                 if clean_interpretation:
                     await _send_generated_response(bot, user_id, clean_interpretation)
+                    if not await _check_scope_guard():
+                        return
                     async with async_session_maker() as s2:
                         u2 = await s2.get(User, user_id)
                         s2.add(DBMessage(user_id=user_id, role='assistant', content=interpretation, dialogue_id=u2.current_dialogue_id, topic_id=u2.current_topic_id))
@@ -3433,82 +3474,17 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 try:
                     topic_id = int(args.split("_")[1])
                     switch_res = await _perform_telegram_topic_switch(message.from_user.id, topic_id)
-                    if switch_res.status == "inaccessible":
-                        await message.answer("Тема больше недоступна. Выберите другую тему в меню.")
-                        return
-
                     if bonus_messages:
                         await send_bonus_messages()
 
-                    if switch_res.status == "already_current":
-                        return
-
-                    if await _request_profile_onboarding_if_needed(
-                        message,
-                        state,
-                        user,
-                        topic_intro_after=topic_id,
-                        topic_intro_dialogue_id=switch_res.dialogue_id,
-                        topic_intro_welcome_needed=not switch_res.welcome_shown,
-                        topic_intro_restored=switch_res.restored,
-                        topic_intro_memory_mode=switch_res.memory_mode,
-                    ):
-                        return
-
-                    if not switch_res.welcome_shown:
-                        await _send_topic_intro(bot, message.chat.id, switch_res.topic, switch_res.restored, switch_res.memory_mode)
-                        async with async_session_maker() as s_mark:
-                            await record_topic_welcome_shown(s_mark, message.from_user.id, switch_res.dialogue_id, topic_id)
-                            await s_mark.commit()
-
-                        if switch_res.topic and getattr(switch_res.topic, "auto_start_dialogue", False):
-                            if user and not user.accepted_disclaimer:
-                                disclaimer_content = await get_content_from_db("disclaimer")
-                                if disclaimer_content.get('is_visible', True):
-                                    await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                                    await state.update_data(
-                                        pending_auto_start_topic_id=int(topic_id),
-                                        pending_auto_start_dialogue_id=switch_res.dialogue_id,
-                                        pending_auto_start_kind="first_entry",
-                                    )
-                                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                                    await bot.send_message(message.chat.id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
-                                    return
-                                else:
-                                    async with async_session_maker() as s_disc:
-                                        await s_disc.execute(update(User).where(User.id == message.from_user.id).values(accepted_disclaimer=True))
-                                        await s_disc.commit()
-
-                            async with async_session_maker() as session_acc:
-                                if not await _check_telegram_chat_access(session_acc, message.from_user.id, bot, message.chat.id):
-                                    return
-
-                            await _start_telegram_topic_auto_start(message.from_user.id, bot, state, switch_res.topic, switch_res.dialogue_id)
-                    else:
-                        if user and not user.accepted_disclaimer:
-                            disclaimer_content = await get_content_from_db("disclaimer")
-                            if disclaimer_content.get('is_visible', True):
-                                await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                                await state.update_data(
-                                    pending_auto_start_topic_id=int(topic_id),
-                                    pending_auto_start_dialogue_id=switch_res.dialogue_id,
-                                    pending_auto_start_kind="resume",
-                                )
-                                text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                                await bot.send_message(message.chat.id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
-                                return
-                            else:
-                                async with async_session_maker() as s_disc:
-                                    await s_disc.execute(update(User).where(User.id == message.from_user.id).values(accepted_disclaimer=True))
-                                    await s_disc.commit()
-
-                        async with async_session_maker() as session_acc:
-                            if not await _check_telegram_chat_access(session_acc, message.from_user.id, bot, message.chat.id):
-                                return
-
-                        from system_events import build_topic_resume_system_message
-                        synthetic_prompt = build_topic_resume_system_message(switch_res.topic.name)
-                        await _start_telegram_hidden_kickoff(message.from_user.id, bot, state, synthetic_prompt, switch_res.dialogue_id, topic_id)
+                    await _complete_telegram_topic_entry(
+                        user_id=message.from_user.id,
+                        chat_id=message.chat.id,
+                        switch_res=switch_res,
+                        bot=bot,
+                        state=state,
+                        message=message,
+                    )
                     return
                 except Exception as e:
                     logging.error(f"Error parsing topic deep link: {e}")
@@ -7553,7 +7529,7 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                 restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
                 user.current_topic_id = topic_id
                 dialogue_id = user.current_dialogue_id
-                welcome_shown = await is_topic_welcome_shown(session, user.id, dialogue_id, topic_id)
+                welcome_shown = await resolve_topic_entry_state(session, user.id, dialogue_id, topic_id)
                 await session.commit()
                 return TopicSwitchResult(
                     "switched",
@@ -7565,6 +7541,107 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                     topic_id=topic_id,
                 )
             return TopicSwitchResult("inaccessible")
+
+
+async def _complete_telegram_topic_entry(
+    user_id: int,
+    chat_id: int,
+    switch_res: TopicSwitchResult,
+    bot: Bot,
+    state: FSMContext,
+    message: Message | None = None,
+) -> None:
+    if switch_res.status == "inaccessible":
+        if message and hasattr(message, "answer"):
+            try:
+                await message.answer("Тема больше недоступна. Выберите другую тему в меню.")
+            except Exception:
+                await bot.send_message(chat_id, "Тема больше недоступна. Выберите другую тему в меню.")
+        else:
+            await bot.send_message(chat_id, "Тема больше недоступна. Выберите другую тему в меню.")
+        return
+
+    if switch_res.status == "already_current":
+        return
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+
+    if not user:
+        return
+
+    context_msg = message if (message and hasattr(message, "answer")) else SimpleNamespace(
+        from_user=SimpleNamespace(id=user_id),
+        chat=SimpleNamespace(id=chat_id),
+        answer=lambda text, **kw: bot.send_message(chat_id, text, **kw),
+    )
+
+    if await _request_profile_onboarding_if_needed(
+        context_msg,
+        state,
+        user,
+        topic_intro_after=switch_res.topic_id,
+        topic_intro_dialogue_id=switch_res.dialogue_id,
+        topic_intro_welcome_needed=not switch_res.welcome_shown,
+        topic_intro_restored=switch_res.restored,
+        topic_intro_memory_mode=switch_res.memory_mode,
+    ):
+        return
+
+    if not switch_res.welcome_shown:
+        await _send_topic_intro(bot, chat_id, switch_res.topic, switch_res.restored, switch_res.memory_mode)
+        async with async_session_maker() as s_mark:
+            await record_topic_welcome_shown(s_mark, user_id, switch_res.dialogue_id, switch_res.topic_id)
+            await s_mark.commit()
+
+        if switch_res.topic and getattr(switch_res.topic, "auto_start_dialogue", False):
+            if not user.accepted_disclaimer:
+                disclaimer_content = await get_content_from_db("disclaimer")
+                if disclaimer_content.get('is_visible', True):
+                    await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                    await state.update_data(
+                        pending_auto_start_topic_id=int(switch_res.topic_id),
+                        pending_auto_start_dialogue_id=switch_res.dialogue_id,
+                        pending_auto_start_kind="first_entry",
+                    )
+                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
+                    await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                    return
+                else:
+                    async with async_session_maker() as s_disc:
+                        await s_disc.execute(update(User).where(User.id == user_id).values(accepted_disclaimer=True))
+                        await s_disc.commit()
+
+            async with async_session_maker() as session_acc:
+                if not await _check_telegram_chat_access(session_acc, user_id, bot, chat_id):
+                    return
+
+            await _start_telegram_topic_auto_start(user_id, bot, state, switch_res.topic, switch_res.dialogue_id)
+    else:
+        if not user.accepted_disclaimer:
+            disclaimer_content = await get_content_from_db("disclaimer")
+            if disclaimer_content.get('is_visible', True):
+                await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                await state.update_data(
+                    pending_auto_start_topic_id=int(switch_res.topic_id),
+                    pending_auto_start_dialogue_id=switch_res.dialogue_id,
+                    pending_auto_start_kind="resume",
+                )
+                text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
+                await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                return
+            else:
+                async with async_session_maker() as s_disc:
+                    await s_disc.execute(update(User).where(User.id == user_id).values(accepted_disclaimer=True))
+                    await s_disc.commit()
+
+        async with async_session_maker() as session_acc:
+            if not await _check_telegram_chat_access(session_acc, user_id, bot, chat_id):
+                return
+
+        from system_events import build_topic_resume_system_message
+        synthetic_prompt = build_topic_resume_system_message(switch_res.topic.name)
+        await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, switch_res.dialogue_id, switch_res.topic_id)
 
 
 async def _apply_topic_switch(session, user, topic_key: int, memory_mode: str) -> bool:
@@ -7892,92 +7969,20 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
     await callback.answer()
     topic_id = int(callback.data.split("_")[-1])
 
-    switch_res = await _perform_telegram_topic_switch(callback.from_user.id, topic_id)
-    if switch_res.status == "inaccessible":
-        try:
-            await callback.message.delete()
-        except TelegramBadRequest:
-            pass
-        await callback.message.answer("Тема больше недоступна. Выберите другую тему в меню.")
-        return
-
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
 
-    if switch_res.status == "already_current":
-        return
-
-    async with async_session_maker() as session:
-        user = await session.get(User, callback.from_user.id)
-
-    if user and await _request_profile_onboarding_if_needed(
-        callback.message,
-        state,
-        user,
-        topic_intro_after=topic_id,
-        topic_intro_dialogue_id=switch_res.dialogue_id,
-        topic_intro_welcome_needed=not switch_res.welcome_shown,
-        topic_intro_restored=switch_res.restored,
-        topic_intro_memory_mode=switch_res.memory_mode,
-    ):
-        return
-
-    if not switch_res.welcome_shown:
-        await _send_topic_intro(bot, callback.from_user.id, switch_res.topic, switch_res.restored, switch_res.memory_mode)
-        async with async_session_maker() as s_mark:
-            await record_topic_welcome_shown(s_mark, callback.from_user.id, switch_res.dialogue_id, topic_id)
-            await s_mark.commit()
-
-        if switch_res.topic and getattr(switch_res.topic, "auto_start_dialogue", False):
-            if user and not user.accepted_disclaimer:
-                disclaimer_content = await get_content_from_db("disclaimer")
-                if disclaimer_content.get('is_visible', True):
-                    await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                    await state.update_data(
-                        pending_auto_start_topic_id=int(topic_id),
-                        pending_auto_start_dialogue_id=switch_res.dialogue_id,
-                        pending_auto_start_kind="first_entry",
-                    )
-                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                    await bot.send_message(callback.from_user.id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
-                    return
-                else:
-                    async with async_session_maker() as s_disc:
-                        await s_disc.execute(update(User).where(User.id == callback.from_user.id).values(accepted_disclaimer=True))
-                        await s_disc.commit()
-
-            async with async_session_maker() as session_acc:
-                if not await _check_telegram_chat_access(session_acc, callback.from_user.id, bot, callback.from_user.id):
-                    return
-
-            await _start_telegram_topic_auto_start(callback.from_user.id, bot, state, switch_res.topic, switch_res.dialogue_id)
-    else:
-        if user and not user.accepted_disclaimer:
-            disclaimer_content = await get_content_from_db("disclaimer")
-            if disclaimer_content.get('is_visible', True):
-                await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                await state.update_data(
-                    pending_auto_start_topic_id=int(topic_id),
-                    pending_auto_start_dialogue_id=switch_res.dialogue_id,
-                    pending_auto_start_kind="resume",
-                )
-                text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                await bot.send_message(callback.from_user.id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
-                return
-            else:
-                async with async_session_maker() as s_disc:
-                    await s_disc.execute(update(User).where(User.id == callback.from_user.id).values(accepted_disclaimer=True))
-                    await s_disc.commit()
-
-        async with async_session_maker() as session_acc:
-            if not await _check_telegram_chat_access(session_acc, callback.from_user.id, bot, callback.from_user.id):
-                return
-
-        from system_events import build_topic_resume_system_message
-        synthetic_prompt = build_topic_resume_system_message(switch_res.topic.name)
-        await _start_telegram_hidden_kickoff(callback.from_user.id, bot, state, synthetic_prompt, switch_res.dialogue_id, topic_id)
+    switch_res = await _perform_telegram_topic_switch(callback.from_user.id, topic_id)
+    await _complete_telegram_topic_entry(
+        user_id=callback.from_user.id,
+        chat_id=callback.message.chat.id if callback.message else callback.from_user.id,
+        switch_res=switch_res,
+        bot=bot,
+        state=state,
+        message=callback.message,
+    )
 
 
 async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot, state: FSMContext | None = None) -> None:
@@ -16742,33 +16747,15 @@ class TopicDirectButtonFilter(Filter):
 
 @router.message(TopicDirectButtonFilter())
 async def handle_direct_topic_button(message: Message, topic_id: int, topic_name: str, state: FSMContext, bot: Bot):
-    memory_mode = MEMORY_MODE_RESET
-    async with async_session_maker() as session:
-        restored = False
-        user = await session.get(User, message.from_user.id)
-        if user:
-            ai_config = await session.get(AIConfig, 1)
-            memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
-            restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
-            user.current_topic_id = topic_id
-            await session.commit()
-
-        topic = await session.get(Topic, topic_id)
-
-    if user and await _request_profile_onboarding_if_needed(
-        message,
-        state,
-        user,
-        topic_intro_after=topic_id,
-        topic_intro_restored=restored,
-        topic_intro_memory_mode=memory_mode,
-    ):
-        return
-
-    if topic:
-        await _send_topic_intro(bot, message.chat.id, topic, restored, memory_mode)
-    else:
-        await message.answer(_topic_switch_message(topic_name, restored, memory_mode), parse_mode="Markdown")
+    switch_res = await _perform_telegram_topic_switch(message.from_user.id, topic_id)
+    await _complete_telegram_topic_entry(
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        switch_res=switch_res,
+        bot=bot,
+        state=state,
+        message=message,
+    )
 
 
 @router.callback_query(F.data == "action_btn_click")

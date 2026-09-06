@@ -38,8 +38,10 @@ from max_messenger_bot import app as max_app
 from max_messenger_bot.app import MaxBotApplication
 from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
 from max_messenger_bot.services import (
+    admin as max_admin,
     admin_clients as max_admin_clients,
     admin_export as max_admin_export,
+    admin_mailing as max_admin_mailing,
     common as max_common,
     settings as max_settings,
     subscriptions as max_subscriptions,
@@ -59,6 +61,7 @@ from result_history import (
     is_topic_welcome_shown,
     non_technical_role_filter,
     record_topic_welcome_shown,
+    resolve_topic_entry_state,
     visible_history_role_filter,
 )
 from system_events import (
@@ -86,6 +89,8 @@ async def db_session(tmp_path, monkeypatch):
     monkeypatch.setattr(max_common, "async_session_maker", sessions)
     monkeypatch.setattr(max_topics, "async_session_maker", sessions)
     monkeypatch.setattr(max_settings, "async_session_maker", sessions)
+    monkeypatch.setattr(max_admin, "async_session_maker", sessions)
+    monkeypatch.setattr(max_admin_mailing, "async_session_maker", sessions)
     monkeypatch.setattr(max_admin_clients, "async_session_maker", sessions)
     monkeypatch.setattr(max_admin_export, "async_session_maker", sessions)
     monkeypatch.setattr(max_app, "async_session_maker", sessions)
@@ -1103,14 +1108,14 @@ async def test_journey_11_pre_call_stale_kickoff_drop_tg(db_session, monkeypatch
     monkeypatch.setattr("handlers.ai_integration.generate_response", fake_generate_response)
     monkeypatch.setattr("ai_integration.generate_response", fake_generate_response)
 
-    # User starts in topic 10, dialogue 1
+    # User in DB is in main menu (topic None, dialogue 2)
     async with db_session() as session:
         user = await session.get(User, 1001)
-        user.current_topic_id = 10
-        user.current_dialogue_id = 1
+        user.current_topic_id = None
+        user.current_dialogue_id = 2
         await session.commit()
 
-    # Enqueue kickoff with expected_topic_id = 10, dialogue_id = 1
+    # Enqueue kickoff with expected_topic_id = 10, dialogue_id = 1 (stale kickoff from prior scope)
     await handlers._start_telegram_hidden_kickoff(
         user_id=1001,
         bot=bot,
@@ -1119,13 +1124,6 @@ async def test_journey_11_pre_call_stale_kickoff_drop_tg(db_session, monkeypatch
         dialogue_id=1,
         topic_id=10,
     )
-
-    # But change user scope in DB to main (None) before runner executes provider call
-    async with db_session() as session:
-        user = await session.get(User, 1001)
-        user.current_topic_id = None
-        user.current_dialogue_id = 2
-        await session.commit()
 
     await drain_tg_runner(1001)
 
@@ -1667,7 +1665,7 @@ async def test_remediation_6_and_7_topic_welcome_activity_isolation_ordering(db_
 
 @pytest.mark.asyncio
 async def test_remediation_8_tg_post_provider_processing_race_drops_stale_response(db_session, monkeypatch):
-    """Regression 8: TG navigation after provider return but before final assistant persistence drops stale response."""
+    """Regression 8: TG navigation after provider return but before visible response delivery drops stale response."""
     await seed_env(db_session, auto_start=True)
     bot = make_mock_bot()
     state = make_mock_state()
@@ -1680,31 +1678,28 @@ async def test_remediation_8_tg_post_provider_processing_race_drops_stale_respon
         await session.commit()
 
     async def fake_generate_response(user_id, prompt_text, *args, **kwargs):
-        return "AI ответ для Топика 10 перед навигацией"
+        return "AI ответ для Топика 10 перед навигацией [SHOW_IMG:test_img]"
 
     monkeypatch.setattr("handlers.ai_integration.generate_response", fake_generate_response)
     monkeypatch.setattr("ai_integration.generate_response", fake_generate_response)
 
-    # We hook _telegram_scoped_kickoff_is_current to simulate user navigating to Topic 20
-    # exactly during post-provider response processing, before assistant persistence
-    orig_scope_validator = handlers._telegram_scoped_kickoff_is_current
-    validation_call_count = 0
+    # Provider returns successfully while user is still in Topic 10.
+    # Immediate post-provider validator check PASSES normally with real function.
+    # We hook a post-provider media preparation step to change DB scope to Topic 20 / dialogue 2.
+    orig_media_handler = handlers.handle_ai_media_content
 
-    async def hooked_scope_validator(user_id, expected_dialogue_id, expected_topic_id):
-        nonlocal validation_call_count
-        validation_call_count += 1
-        if validation_call_count == 2:
-            # During post-provider processing, user switches to Topic 20 in DB
-            async with db_session() as session:
-                topic20 = Topic(id=20, name="Тема 20", is_active=True, show_in_list=True, admin_only=False)
-                session.add(topic20)
-                user = await session.get(User, user_id)
-                user.current_topic_id = 20
-                user.current_dialogue_id = 2
-                await session.commit()
-        return await orig_scope_validator(user_id, expected_dialogue_id, expected_topic_id)
+    async def hooked_media_handler(bot_instance, uid, raw_text):
+        # User changes DB scope during post-provider processing
+        async with db_session() as session:
+            topic20 = Topic(id=20, name="Тема 20", is_active=True, show_in_list=True, admin_only=False)
+            session.add(topic20)
+            u = await session.get(User, uid)
+            u.current_topic_id = 20
+            u.current_dialogue_id = 2
+            await session.commit()
+        return await orig_media_handler(bot_instance, uid, raw_text)
 
-    monkeypatch.setattr(handlers, "_telegram_scoped_kickoff_is_current", hooked_scope_validator)
+    monkeypatch.setattr(handlers, "handle_ai_media_content", hooked_media_handler)
 
     # Launch hidden kickoff for Topic 10
     await handlers._start_telegram_hidden_kickoff(
@@ -1717,24 +1712,27 @@ async def test_remediation_8_tg_post_provider_processing_race_drops_stale_respon
     )
     await drain_tg_runner(1001)
 
-    # 1. Stale AI response was dropped: not sent to chat
+    # 1. Stale AI text was dropped: not sent to chat
     sent_stale = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list if "AI ответ для Топика 10" in (call.args[1] if len(call.args) > 1 else call.kwargs.get("text", ""))]
     assert len(sent_stale) == 0
 
-    # 2. Not persisted in DB
+    # 2. Stale media/photos not sent
+    assert bot.send_photo.call_count == 0
+
+    # 3. Not persisted in DB under Topic 10 or Topic 20
     async with db_session() as session:
         msgs = (await session.execute(
             select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "assistant")
         )).scalars().all()
         assert len(msgs) == 0
 
-    # 3. Topic 20 remains usable; next ordinary message in Topic 20 works
+    # 4. Topic 20 remains pristine; next ordinary message in Topic 20 works
     async def fake_normal_ai(user_id, prompt_text, *args, **kwargs):
         return "Нормальный ответ в теме 20"
 
     monkeypatch.setattr("handlers.ai_integration.generate_response", fake_normal_ai)
     monkeypatch.setattr("ai_integration.generate_response", fake_normal_ai)
-    monkeypatch.setattr(handlers, "_telegram_scoped_kickoff_is_current", orig_scope_validator)
+    monkeypatch.setattr(handlers, "handle_ai_media_content", orig_media_handler)
 
     msg = SimpleNamespace(
         message_id=200,
@@ -1765,3 +1763,384 @@ async def test_remediation_8_tg_post_provider_processing_race_drops_stale_respon
         assert ai_msgs[0].content == "Нормальный ответ в теме 20"
         assert ai_msgs[0].topic_id == 20
         assert ai_msgs[0].dialogue_id == 2
+
+
+@pytest.mark.asyncio
+async def test_journey_tg_direct_topic_button_full_lifecycle(db_session, monkeypatch):
+    """TG direct topic button:
+    A. direct topic button, first entry, auto_start=False -> welcome once, marker exists, no hidden AI kickoff.
+    B. leave topic -> return through SAME direct topic button -> saved dialogue restored where memory mode permits, no repeated welcome, immediate hidden resume kickoff.
+    C. auto_start=True first entry -> welcome once, first-entry hidden kickoff.
+    D. next ordinary message continues expected topic/dialogue.
+    """
+    await seed_env(db_session, memory_mode="topic", auto_start=False)
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    captured_prompt = None
+
+    async def fake_generate_response(user_id, prompt_text, *args, **kwargs):
+        nonlocal captured_prompt
+        captured_prompt = prompt_text
+        return "AI ответ по теме"
+
+    monkeypatch.setattr("handlers.ai_integration.generate_response", fake_generate_response)
+    monkeypatch.setattr("ai_integration.generate_response", fake_generate_response)
+
+    # Add second topic with auto_start=True
+    async with db_session() as session:
+        session.add(Topic(
+            id=20,
+            name="Тема 20 Автостарт",
+            start_message="Добро пожаловать в Тему 20!",
+            is_active=True,
+            show_in_main_menu=True,
+            show_in_list=True,
+            admin_only=False,
+            auto_start_dialogue=True,
+        ))
+        # Ensure Topic 10 has show_in_main_menu=True
+        topic10 = await session.get(Topic, 10)
+        topic10.show_in_main_menu = True
+        await session.commit()
+
+    # --- A. Direct topic button, first entry, auto_start=False ---
+    msg_topic10 = SimpleNamespace(
+        message_id=101,
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        chat=SimpleNamespace(id=1001, type="private"),
+        text="Психосоматика",
+        answer=AsyncMock(),
+        delete=AsyncMock(),
+    )
+    await handlers.handle_direct_topic_button(msg_topic10, 10, "Психосоматика", state, bot)
+    await drain_tg_runner(1001)
+
+    # Welcome sent once
+    sent_texts = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
+    assert any("Добро пожаловать в тему Психосоматика!" in t for t in sent_texts)
+    bot.send_message.reset_mock()
+
+    # Welcome marker recorded
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id == 10
+        topic10_dialogue_id = user.current_dialogue_id
+        is_shown = await is_topic_welcome_shown(session, 1001, topic10_dialogue_id, 10)
+        assert is_shown is True
+
+    # No hidden kickoff because auto_start=False
+    assert captured_prompt is None
+
+    # Send a message in Topic 10 to establish history
+    msg_user_in_10 = SimpleNamespace(
+        message_id=102,
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        chat=SimpleNamespace(id=1001, type="private"),
+        text="Вопрос в топике 10",
+        answer=AsyncMock(),
+        delete=AsyncMock(),
+    )
+    await handlers.handle_ai_chat(msg_user_in_10, state, bot)
+    await drain_tg_runner(1001)
+    bot.send_message.reset_mock()
+    captured_prompt = None
+
+    # --- B. Leave topic -> return through SAME direct topic button ---
+    cb_main = SimpleNamespace(
+        id="cb_m",
+        data="ai_btn:svc:topic:main",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=103,
+            chat=SimpleNamespace(id=1001, type="private"),
+            answer=AsyncMock(),
+            edit_reply_markup=AsyncMock(),
+            reply_markup=handlers.InlineKeyboardMarkup(
+                inline_keyboard=[[handlers.InlineKeyboardButton(text="Основной диалог", callback_data="ai_btn:svc:topic:main")]]
+            ),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.process_response_button(cb_main, state, bot)
+    await drain_tg_runner(1001)
+    bot.send_message.reset_mock()
+    captured_prompt = None
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id is None
+
+    # Return through direct topic button
+    msg_return_10 = SimpleNamespace(
+        message_id=104,
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        chat=SimpleNamespace(id=1001, type="private"),
+        text="Психосоматика",
+        answer=AsyncMock(),
+        delete=AsyncMock(),
+    )
+    await handlers.handle_direct_topic_button(msg_return_10, 10, "Психосоматика", state, bot)
+    await drain_tg_runner(1001)
+
+    # Assert: saved dialogue restored, no repeated welcome, immediate hidden resume kickoff
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id == 10
+        assert user.current_dialogue_id == topic10_dialogue_id
+
+    sent_texts_ret = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
+    assert not any("Добро пожаловать в тему" in t for t in sent_texts_ret)
+    assert captured_prompt is not None
+    assert "Пользователь вернулся к теме" in captured_prompt
+    bot.send_message.reset_mock()
+    captured_prompt = None
+
+    # --- C. auto_start=True first entry via direct topic button ---
+    msg_topic20 = SimpleNamespace(
+        message_id=105,
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        chat=SimpleNamespace(id=1001, type="private"),
+        text="Тема 20 Автостарт",
+        answer=AsyncMock(),
+        delete=AsyncMock(),
+    )
+    await handlers.handle_direct_topic_button(msg_topic20, 20, "Тема 20 Автостарт", state, bot)
+    await drain_tg_runner(1001)
+
+    # Welcome sent once and first-entry kickoff executed
+    sent_texts_20 = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
+    assert any("Добро пожаловать в Тему 20!" in t for t in sent_texts_20)
+    assert captured_prompt is not None
+    assert "Пользователь выбрал тему" in captured_prompt
+    bot.send_message.reset_mock()
+    captured_prompt = None
+
+    # --- D. Next ordinary message continues expected topic/dialogue ---
+    msg_next_in_20 = SimpleNamespace(
+        message_id=106,
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        chat=SimpleNamespace(id=1001, type="private"),
+        text="Вопрос в теме 20",
+        answer=AsyncMock(),
+        delete=AsyncMock(),
+    )
+    await handlers.handle_ai_chat(msg_next_in_20, state, bot)
+    await drain_tg_runner(1001)
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id == 20
+        user_msgs = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == "user", DBMessage.content == "Вопрос в теме 20")
+        )).scalars().all()
+        assert len(user_msgs) == 1
+        assert user_msgs[0].topic_id == 20
+        assert user_msgs[0].dialogue_id == user.current_dialogue_id
+
+
+@pytest.mark.asyncio
+async def test_journey_legacy_saved_topic_dialogue_tg_and_max(db_session, monkeypatch):
+    """Legacy pre-PR dialogues without topic_welcome marker:
+    - If exact scope has user/assistant/test_result history -> LEGACY RESUME (no welcome, immediate resume kickoff, marker lazily recorded).
+    - If scope has test_result only -> LEGACY RESUME.
+    - If scope has no conversation history -> FIRST ENTRY (welcome shown, marker recorded).
+    """
+    await seed_env(db_session, memory_mode="topic", auto_start=False)
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    captured_prompt_tg = None
+
+    async def fake_ai_tg(user_id, prompt_text, *args, **kwargs):
+        nonlocal captured_prompt_tg
+        captured_prompt_tg = prompt_text
+        return "TG AI ответ"
+
+    monkeypatch.setattr("handlers.ai_integration.generate_response", fake_ai_tg)
+    monkeypatch.setattr("ai_integration.generate_response", fake_ai_tg)
+
+    # 1. Setup legacy TG dialogue: user 1001 has topic 10 state at dialogue 5 with real messages but NO topic_welcome marker
+    async with db_session() as session:
+        session.add(UserTopicState(user_id=1001, topic_id=10, dialogue_id=5))
+        session.add(DBMessage(user_id=1001, role="user", content="Старое сообщение пользователя", dialogue_id=5, topic_id=10))
+        session.add(DBMessage(user_id=1001, role="assistant", content="Старый ответ ассистента", dialogue_id=5, topic_id=10))
+        await session.commit()
+
+    # User enters Topic 10 via select_topic callback
+    cb_topic = SimpleNamespace(
+        id="cb_leg_tg",
+        data="select_topic_10",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=99,
+            chat=SimpleNamespace(id=1001, type="private"),
+            delete=AsyncMock(),
+            answer=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.process_topic_selection(cb_topic, state, bot)
+    await drain_tg_runner(1001)
+
+    # Assert: NO welcome shown
+    sent_texts = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
+    assert not any("Добро пожаловать в тему" in t for t in sent_texts)
+
+    # Assert: Hidden resume kickoff executed
+    assert captured_prompt_tg is not None
+    assert "Пользователь вернулся к теме" in captured_prompt_tg
+
+    # Assert: topic_welcome marker was lazily recorded
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id == 10
+        assert user.current_dialogue_id == 5
+        marker = await session.scalar(
+            select(DBMessage).where(
+                DBMessage.user_id == 1001,
+                DBMessage.dialogue_id == 5,
+                DBMessage.topic_id == 10,
+                DBMessage.role == TOPIC_WELCOME_ROLE,
+            )
+        )
+        assert marker is not None
+        assert marker.content == "legacy_resume"
+
+    # 2. Setup legacy test_result-only scope: topic 30 at dialogue 7
+    bot.send_message.reset_mock()
+    captured_prompt_tg = None
+    async with db_session() as session:
+        session.add(Topic(id=30, name="Тема Тестов", start_message="Добро пожаловать в тесты!", is_active=True, show_in_list=True, admin_only=False))
+        session.add(UserTopicState(user_id=1001, topic_id=30, dialogue_id=7))
+        session.add(DBMessage(user_id=1001, role="test_result", content="Результаты теста", dialogue_id=7, topic_id=30))
+        await session.commit()
+
+    cb_test_topic = SimpleNamespace(
+        id="cb_leg_test",
+        data="select_topic_30",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=100,
+            chat=SimpleNamespace(id=1001, type="private"),
+            delete=AsyncMock(),
+            answer=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.process_topic_selection(cb_test_topic, state, bot)
+    await drain_tg_runner(1001)
+
+    # Assert: NO welcome shown for test_result-only legacy scope
+    sent_texts_test = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
+    assert not any("Добро пожаловать в тесты!" in t for t in sent_texts_test)
+    assert captured_prompt_tg is not None
+    assert "Пользователь вернулся к теме" in captured_prompt_tg
+
+    # 3. Setup legacy MAX dialogue
+    max_uid = 1_000_000_000_001
+    client = AsyncMock()
+    states = StateStore()
+
+    captured_prompt_max = None
+
+    async def fake_ai_max(user_id, prompt_text, **kwargs):
+        nonlocal captured_prompt_max
+        captured_prompt_max = prompt_text
+        return "MAX AI ответ"
+
+    monkeypatch.setattr(max_common, "get_ai_response", fake_ai_max)
+
+    async with db_session() as session:
+        session.add(User(id=max_uid, username="max_leg", first_name="Max", name="Max", current_dialogue_id=1, current_topic_id=None, accepted_disclaimer=True))
+        session.add(UserTopicState(user_id=max_uid, topic_id=10, dialogue_id=3))
+        session.add(DBMessage(user_id=max_uid, role="user", content="MAX старое сообщение", dialogue_id=3, topic_id=10))
+        session.add(DBMessage(user_id=max_uid, role="assistant", content="MAX старый ответ", dialogue_id=3, topic_id=10))
+        await session.commit()
+
+    await max_topics.select_topic(client, chat_id=max_uid, user_id=max_uid, topic_id=10, states=states)
+
+    # Assert: NO welcome sent in MAX
+    welcome_calls = [c for c in client.send_message.call_args_list if "Добро пожаловать в тему" in str(c)]
+    assert len(welcome_calls) == 0
+
+    # Assert: MAX hidden resume kickoff executed
+    assert captured_prompt_max is not None
+    assert "Пользователь вернулся к теме" in captured_prompt_max
+
+    # Assert: MAX marker lazily created
+    async with db_session() as session:
+        marker_max = await session.scalar(
+            select(DBMessage).where(
+                DBMessage.user_id == max_uid,
+                DBMessage.dialogue_id == 3,
+                DBMessage.topic_id == 10,
+                DBMessage.role == TOPIC_WELCOME_ROLE,
+            )
+        )
+        assert marker_max is not None
+        assert marker_max.content == "legacy_resume"
+
+
+@pytest.mark.asyncio
+async def test_mailing_and_stats_technical_role_isolation(db_session):
+    """Test that topic_welcome marker does not change mailing audience selection or total message stats:
+    1. Shared / TG background worker no_dialogue audience: user with only topic_welcome is still selected.
+    2. MAX admin mailing no_dialogue audience: user with only topic_welcome is still selected.
+    3. MAX admin show_stats total_messages: user + assistant + topic_welcome -> total_messages increases by 2, not 3.
+    """
+    from datetime import datetime
+    from database import Mailing
+    from max_messenger_bot.services import admin as max_admin, admin_mailing as max_admin_mailing
+
+    tg_user_id = 7001
+    max_user_id = 1_000_000_000_701
+
+    async with db_session() as session:
+        # User 1 (TG): has only topic_welcome marker
+        session.add(User(id=tg_user_id, username="tg_welcome_only", first_name="TG", name="TG", current_dialogue_id=1))
+        session.add(DBMessage(user_id=tg_user_id, role=TOPIC_WELCOME_ROLE, content="shown", dialogue_id=1, topic_id=10))
+
+        # User 2 (MAX): has only topic_welcome marker
+        session.add(User(id=max_user_id, username="max_welcome_only", first_name="MAX", name="MAX", current_dialogue_id=1))
+        session.add(DBMessage(user_id=max_user_id, role=TOPIC_WELCOME_ROLE, content="shown", dialogue_id=1, topic_id=10))
+
+        # User 3 (MAX): has 1 user message, 1 assistant message, and 1 topic_welcome marker
+        max_active_user_id = 1_000_000_000_702
+        session.add(User(id=max_active_user_id, username="max_active", first_name="MAX Active", name="MAX Active", current_dialogue_id=1))
+        session.add(DBMessage(user_id=max_active_user_id, role="user", content="Привет", dialogue_id=1, topic_id=10))
+        session.add(DBMessage(user_id=max_active_user_id, role="assistant", content="Здравствуйте", dialogue_id=1, topic_id=10))
+        session.add(DBMessage(user_id=max_active_user_id, role=TOPIC_WELCOME_ROLE, content="shown", dialogue_id=1, topic_id=10))
+
+        await session.commit()
+
+    # 1. TG / shared background worker no_dialogue audience query test
+    async with db_session() as session:
+        from background_worker import non_technical_role_filter as bg_non_tech
+        from sqlalchemy import func
+        subquery = select(DBMessage.user_id, func.count(DBMessage.id).label("msg_count")).where(
+            bg_non_tech(DBMessage)
+        ).group_by(
+            DBMessage.user_id).subquery()
+        target_users_stmt = select(User.id).outerjoin(subquery, User.id == subquery.c.user_id).where(
+            (subquery.c.msg_count == None) | (subquery.c.msg_count <= 1))
+        selected_tg_ids = (await session.execute(target_users_stmt)).scalars().all()
+
+        # User with only topic_welcome has 0 conversational messages, so must be selected!
+        assert tg_user_id in selected_tg_ids
+
+    # 2. MAX admin mailing no_dialogue recipient resolution
+    async with db_session() as session:
+        max_no_dialogue_recipients = await max_admin_mailing._get_recipient_ids(session, "no_dialogue", 999)
+        # User with only topic_welcome marker must be in "Кто не начал диалог"
+        assert max_user_id in max_no_dialogue_recipients
+        # User with real conversation must NOT be in "Кто не начал диалог"
+        assert max_active_user_id not in max_no_dialogue_recipients
+
+    # 3. MAX admin stats total_messages
+    client = AsyncMock()
+    await max_admin.show_stats(client, chat_id=999)
+    client.send_message.assert_awaited_once()
+    stats_text = client.send_message.call_args[1]["text"]
+    # Total messages for MAX users: max_user_id (0 non-technical) + max_active_user_id (2 non-technical: user + assistant) = 2
+    assert "<b>Сообщений всего:</b> 2" in stats_text

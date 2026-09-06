@@ -9,6 +9,7 @@ from ..keyboards import admin_panel_keyboard, admin_subscriptions_keyboard, call
 from ..legacy import Message as DBMessage, PromoCode, ReferralPaymentLog, SubscriptionConfig, SubscriptionPlan, Topic, User, UserSubscription, async_session_maker
 from ..models import MAX_ID_OFFSET
 from .subscription_access import effective_subscription_filters
+from result_history import non_technical_role_filter
 
 
 async def show_admin_panel(client: MaxApiClient, chat_id: int) -> None:
@@ -62,7 +63,10 @@ async def show_stats(client: MaxApiClient, chat_id: int) -> None:
             select(func.count()).select_from(User).where(User.id >= MAX_ID_OFFSET, User.created_at >= month_start)
         ) or 0
         total_messages = await session.scalar(
-            select(func.count()).select_from(DBMessage).where(DBMessage.user_id >= MAX_ID_OFFSET)
+            select(func.count()).select_from(DBMessage).where(
+                DBMessage.user_id >= MAX_ID_OFFSET,
+                non_technical_role_filter(DBMessage),
+            )
         ) or 0
         access_filters = effective_subscription_filters(User, now)
         active_subs = await session.scalar(

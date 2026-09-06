@@ -8,7 +8,7 @@ from ..keyboards import callback_button, inline_keyboard, main_menu_row, topics_
 from ..legacy import AIConfig, Content, Topic, User, UserTopicState, async_session_maker
 from ..storage import StateStore
 from memory_mode import apply_memory_mode_topic_switch, normalize_memory_mode
-from result_history import is_topic_welcome_shown, record_topic_welcome_shown
+from result_history import is_topic_welcome_shown, record_topic_welcome_shown, resolve_topic_entry_state
 
 
 async def show_topics(client: MaxApiClient, chat_id: int, user_id: int) -> None:
@@ -61,7 +61,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         restored = await apply_memory_mode_topic_switch(session, db_user, topic_id, current_memory_mode)
         db_user.current_topic_id = topic_id
         dialogue_id = db_user.current_dialogue_id
-        welcome_shown = await is_topic_welcome_shown(session, user_id, dialogue_id, topic_id)
+        welcome_shown = await resolve_topic_entry_state(session, user_id, dialogue_id, topic_id)
         await session.commit()
 
     if not welcome_shown:
