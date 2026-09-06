@@ -5786,10 +5786,7 @@ async def show_ai_log_detail(
     lat_text = f"{log_entry.latency_ms / 1000:.2f} сек" if log_entry.latency_ms else "не измерялось"
     dt_str = format_msk(log_entry.created_at, "%d-%m-%Y %H:%M:%S МСК")
     log_type = getattr(log_entry, "request_type", "chat") or "chat"
-    if _ai_log_platform(log_entry) == "max":
-        request_preview = log_entry.prompt_summary or "без текста"
-    else:
-        request_preview = log_entry.request_payload or log_entry.prompt_summary or "без текста"
+    request_preview = log_entry.request_payload or "не зафиксирован"
     prompt_str = html.escape(request_preview)
     if len(prompt_str) > 1200:
         prompt_str = prompt_str[:1200] + "..."
@@ -5828,12 +5825,7 @@ async def show_ai_log_detail(
 
 
 def _build_ai_log_file_content(log_entry: AILog) -> str:
-    platform = _ai_log_platform(log_entry)
-    request_preview = (
-        log_entry.prompt_summary or ""
-        if platform == "max"
-        else log_entry.request_payload or log_entry.prompt_summary or ""
-    )
+    request_preview = log_entry.request_payload or "не зафиксирован"
     return (
         f"========================================\n"
         f"AI LOG RECORD #{log_entry.id}\n"

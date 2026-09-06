@@ -431,7 +431,7 @@ async def test_max_ai_does_not_contain_media_instructions(db_session_factory, mo
 
     captured_layouts = []
 
-    async def mock_max_dispatch(config, request_layout):
+    async def mock_max_dispatch(config, request_layout, **kwargs):
         captured_layouts.append(request_layout)
         return "Ответ MAX"
 

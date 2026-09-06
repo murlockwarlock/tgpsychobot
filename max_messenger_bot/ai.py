@@ -44,6 +44,7 @@ from provider_models import (
 )
 from ai_request_context import (
     AIRequestLayout,
+    _capture_ai_request,
     build_anthropic_system,
     build_gemini_contents,
     build_gemini_system_parts,
@@ -96,13 +97,33 @@ def _resolve_log_model(ai_config: AIConfig, provider: str | None) -> str:
     provider_key = (provider or "").strip().lower()
     model_field = "claude_model" if provider_key in {"claude", "anthropic"} else f"{provider_key}_model"
     model = getattr(ai_config, model_field, None)
-    if model:
-        return str(model)
-    try:
-        model = get_default_model(provider_key, channel="chat")
-    except Exception:
-        model = None
+    if not model:
+        try:
+            model = get_default_model(provider_key, channel="chat")
+        except Exception:
+            model = None
+    if provider_key == "deepseek" and model:
+        model = normalize_deepseek_model(str(model))
     return str(model or "—")
+
+
+def _extract_effective_provider_and_model(
+    request_capture: dict | None,
+    default_provider: str,
+    default_model: str,
+) -> tuple[str, str]:
+    if not request_capture:
+        return default_provider, default_model
+    provider = request_capture.get("provider") or default_provider
+    payload = request_capture.get("payload")
+    if isinstance(payload, dict) and payload.get("model"):
+        return provider, str(payload["model"])
+    endpoint = str(request_capture.get("endpoint") or "")
+    if "/models/" in endpoint:
+        candidate = endpoint.split("/models/", 1)[1].split(":", 1)[0].split("?", 1)[0].strip()
+        if candidate:
+            return provider, candidate
+    return provider, default_model
 
 
 _CURRENT_AI_CONTEXT = object()
@@ -194,10 +215,12 @@ async def _call_openai(
     temperature: float,
     *,
     request_layout: AIRequestLayout | None = None,
+    request_capture: dict | None = None,
 ) -> str:
     target_model = model or "gpt-5.6-terra"
     ensure_model_available(PROVIDER_OPENAI, target_model)
-    client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
+    base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
     payload: dict = {
         "model": target_model,
         "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
@@ -205,6 +228,12 @@ async def _call_openai(
     }
     if not target_model.startswith("gpt-5.6"):
         payload["temperature"] = temperature
+    _capture_ai_request(
+        request_capture,
+        provider="OpenAI",
+        endpoint=f"{base_url.rstrip('/')}/chat/completions",
+        payload=payload,
+    )
     response = await client.chat.completions.create(**payload)
     return response.choices[0].message.content or ""
 
@@ -216,15 +245,26 @@ async def _call_deepseek(
     temperature: float,
     *,
     request_layout: AIRequestLayout | None = None,
+    request_capture: dict | None = None,
 ) -> str:
     normalized_model = normalize_deepseek_model(model)
     ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
-    client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    payload = {
+        "model": normalized_model,
+        "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
+        "max_tokens": 4096,
+        "temperature": temperature,
+    }
+    _capture_ai_request(
+        request_capture,
+        provider="Deepseek",
+        endpoint=f"{base_url.rstrip('/')}/chat/completions",
+        payload=payload,
+    )
     response = await client.chat.completions.create(
-        model=normalized_model,
-        messages=build_openai_chat_messages(request_layout or _legacy_layout(messages)),
-        max_tokens=4096,
-        temperature=temperature,
+        **payload,
     )
     return response.choices[0].message.content or ""
 
@@ -237,6 +277,7 @@ async def _call_claude(
     temperature: float,
     *,
     request_layout: AIRequestLayout | None = None,
+    request_capture: dict | None = None,
 ) -> str:
     target_model = model or "claude-sonnet-5"
     ensure_model_available(PROVIDER_CLAUDE, target_model)
@@ -256,6 +297,12 @@ async def _call_claude(
     }
     if not should_omit_claude_sampling(target_model):
         payload["temperature"] = temperature
+    _capture_ai_request(
+        request_capture,
+        provider="Claude",
+        endpoint="https://api.anthropic.com/v1/messages",
+        payload=payload,
+    )
     response = await client.messages.create(**payload)
     return response.content[0].text
 
@@ -279,6 +326,7 @@ async def _call_gemini(
     temperature: float,
     *,
     request_layout: AIRequestLayout | None = None,
+    request_capture: dict | None = None,
 ) -> str:
     import httpx
 
@@ -296,7 +344,14 @@ async def _call_gemini(
         },
         "generationConfig": generation_config,
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
+    url = f"{endpoint}?key={api_key}"
+    _capture_ai_request(
+        request_capture,
+        provider="Gemini",
+        endpoint=endpoint,
+        payload=payload,
+    )
     transport = _build_gemini_proxy_transport()
     async with httpx.AsyncClient(timeout=60.0, transport=transport) as client:
         response = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
@@ -690,6 +745,7 @@ async def _call_kie_text_chat(
     temperature: float,
     *,
     request_layout: AIRequestLayout | None = None,
+    request_capture: dict | None = None,
 ) -> str:
     """Call KIE text chat using the model's documented protocol."""
     ensure_model_available(PROVIDER_KIE, model, channel="chat")
@@ -700,6 +756,12 @@ async def _call_kie_text_chat(
         model,
         request_layout=layout,
         temperature=temperature,
+    )
+    _capture_ai_request(
+        request_capture,
+        provider="KIE",
+        endpoint=request.endpoint,
+        payload=request.payload,
     )
     try:
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
@@ -761,6 +823,8 @@ async def _dispatch_provider(
     ai_config: AIConfig,
     request_layout: AIRequestLayout | str,
     messages: list[dict] | None = None,
+    *,
+    request_capture: dict | None = None,
 ) -> str:
     provider, temperature = _resolve_provider(ai_config)
     layout = (
@@ -778,6 +842,7 @@ async def _dispatch_provider(
             [],
             temperature,
             request_layout=layout,
+            request_capture=request_capture,
         )
     elif provider in {"claude", "anthropic"}:
         if not ai_config.claude_api_key:
@@ -789,6 +854,7 @@ async def _dispatch_provider(
             layout.stable_system_prompt,
             temperature,
             request_layout=layout,
+            request_capture=request_capture,
         )
     elif provider == "gemini":
         if not ai_config.gemini_api_key:
@@ -800,6 +866,7 @@ async def _dispatch_provider(
             layout.stable_system_prompt,
             temperature,
             request_layout=layout,
+            request_capture=request_capture,
         )
     elif provider == "deepseek":
         if not ai_config.deepseek_api_key:
@@ -810,6 +877,7 @@ async def _dispatch_provider(
             [],
             temperature,
             request_layout=layout,
+            request_capture=request_capture,
         )
     elif provider == "kie":
         if not ai_config.kie_api_key:
@@ -823,6 +891,7 @@ async def _dispatch_provider(
             layout.stable_system_prompt,
             temperature,
             request_layout=layout,
+            request_capture=request_capture,
         )
     else:
         raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
@@ -958,10 +1027,18 @@ async def get_ai_response(
         )
         temperature = _resolve_temperature(ai_config)
         start_time = time.monotonic()
+        request_capture: dict = {}
         try:
-            result = await _dispatch_provider(ai_config, request_layout)
-            log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, active_topic_id)
+            result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture)
+            actual_provider, actual_model = _extract_effective_provider_and_model(
+                request_capture,
+                default_provider=actual_provider,
+                default_model=actual_model,
+            )
+            log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, actual_provider, active_topic_id)
         except (AIServiceError, Exception) as primary_err:
+            # Clear request_capture so failed attempt payload is not retained
+            request_capture.clear()
             # Try fallback provider if configured
             fb_provider = getattr(ai_config, "fallback_provider", None)
             fb_model = getattr(ai_config, "fallback_model", None)
@@ -980,41 +1057,51 @@ async def get_ai_response(
                             result = await _call_openai(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
+                                request_capture=request_capture,
                             )
                         elif fb_key in {"claude", "anthropic"}:
                             result = await _call_claude(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
+                                request_capture=request_capture,
                             )
                         elif fb_key == "gemini":
                             result = await _call_gemini(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
+                                request_capture=request_capture,
                             )
                         elif fb_key == "deepseek":
                             result = await _call_deepseek(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
+                                request_capture=request_capture,
                             )
                         elif fb_key == "kie":
                             result = await _call_kie_text_chat(
                                 fb_api_key, _get_kie_base_url(ai_config), fb_model, [],
                                 stable_system_prompt, temperature,
                                 request_layout=request_layout,
+                                request_capture=request_capture,
                             )
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
                         result = _validate_text_response(result, provider=fb_key)
-                        actual_provider = str(fb_provider)
-                        actual_model = str(fb_model)
+                        actual_provider, actual_model = _extract_effective_provider_and_model(
+                            request_capture,
+                            default_provider=str(fb_provider),
+                            default_model=str(fb_model),
+                        )
                         fallback_succeeded = True
-                        log.info("Fallback response generated user_id=%s provider=%s", user_id, fb_provider)
+                        log.info("Fallback response generated user_id=%s provider=%s", user_id, actual_provider)
                     except Exception as fb_err:
+                        request_capture.clear()
                         log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
                         raise AIServiceError(
                             f"Основной провайдер ({ai_config.provider}) и резервный ({fb_provider}) недоступны"
                         ) from fb_err
             if not fallback_succeeded:
+                request_capture.clear()
                 if isinstance(primary_err, AIServiceError):
                     log.exception("AI request failed user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
                     raise
@@ -1029,6 +1116,7 @@ async def get_ai_response(
             provider=actual_provider,
             model=actual_model,
             prompt_summary=user_prompt if user_prompt else None,
+            request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2) if request_capture else None,
             raw_response=result,
             clean_text=visible_text,
             latency_ms=latency_ms,
