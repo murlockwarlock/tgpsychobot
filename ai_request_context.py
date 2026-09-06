@@ -8,8 +8,100 @@ into the stable system prompt.
 
 from __future__ import annotations
 
+import copy
+import re
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Iterable
+
+_SENSITIVE_KEY_NAMES = {
+    "api_key",
+    "apikey",
+    "access_token",
+    "auth_token",
+    "authorization",
+    "proxy_auth",
+    "secret",
+    "secret_key",
+    "token",
+    "x-api-key",
+    "x_api_key",
+}
+
+_SENSITIVE_PARAM_PATTERN = re.compile(
+    r"(?i)(?:key|api_key|token|access_token|secret|password)=([^&]+)"
+)
+
+
+def sanitize_endpoint_url(url: str | None) -> str:
+    """Strip sensitive query parameters (e.g. ?key=...) from outbound endpoint URL."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.query:
+            return url
+        query_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        sanitized_pairs = []
+        for k, v in query_pairs:
+            lower_k = k.lower()
+            if lower_k in {"key", "api_key", "apikey", "token", "access_token", "secret", "password", "auth"}:
+                continue
+            sanitized_pairs.append((k, v))
+        new_query = urllib.parse.urlencode(sanitized_pairs)
+        return urllib.parse.urlunparse(parsed._replace(query=new_query))
+    except Exception:
+        return _SENSITIVE_PARAM_PATTERN.sub("", url)
+
+
+def _sanitize_payload_structure(obj: Any) -> Any:
+    """Recursively sanitize credential keys in dict/list payload structures without altering message text."""
+    if isinstance(obj, dict):
+        cleaned = {}
+        for k, v in obj.items():
+            key_lower = str(k).lower().replace("-", "_")
+            if key_lower in _SENSITIVE_KEY_NAMES:
+                cleaned[k] = "[REDACTED]"
+            else:
+                cleaned[k] = _sanitize_payload_structure(v)
+        return cleaned
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_payload_structure(item) for item in obj]
+    return obj
+
+
+def sanitize_ai_request_capture(
+    *,
+    provider: str,
+    endpoint: str,
+    payload: dict | list | Any,
+) -> dict[str, Any]:
+    return {
+        "provider": str(provider),
+        "endpoint": sanitize_endpoint_url(endpoint),
+        "payload": _sanitize_payload_structure(copy.deepcopy(payload)),
+    }
+
+
+def _capture_ai_request(
+    capture: dict | None,
+    *,
+    provider: str,
+    endpoint: str,
+    payload: dict | list | Any,
+) -> None:
+    """Record the exact provider request without credentials for the admin AI log."""
+    if capture is None:
+        return
+    capture.clear()
+    capture.update(
+        sanitize_ai_request_capture(
+            provider=provider,
+            endpoint=endpoint,
+            payload=payload,
+        )
+    )
+
 
 
 @dataclass(frozen=True)

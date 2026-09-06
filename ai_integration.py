@@ -68,6 +68,7 @@ from subscription_context import active_subscription_flag
 from ai_request_context import (
     AIRequestLayout,
     AIRequestMessage,
+    _capture_ai_request,
     build_anthropic_system,
     build_gemini_contents,
     build_gemini_system_parts,
@@ -98,18 +99,6 @@ def _validate_text_response(response_text: object, *, provider: str) -> str:
 
 
 _CURRENT_AI_CONTEXT = object()
-
-
-def _capture_ai_request(capture: dict | None, *, provider: str, endpoint: str, payload: dict) -> None:
-    """Record the exact provider request without credentials for the admin AI log."""
-    if capture is None:
-        return
-    capture.clear()
-    capture.update({
-        "provider": provider,
-        "endpoint": endpoint,
-        "payload": payload,
-    })
 
 
 _MISSING_CURRENT_CONTENT = object()

@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime
 from types import SimpleNamespace
@@ -18,6 +19,101 @@ from max_messenger_bot import ai as max_ai
 from max_messenger_bot import keyboards as max_keyboards
 from max_messenger_bot import models as max_models
 from max_messenger_bot.services import admin_clients, common
+
+
+class _MockOpenAIChatChoice:
+    def __init__(self, content="Mocked OpenAI response"):
+        self.message = SimpleNamespace(content=content)
+
+
+class _MockOpenAIChatCompletion:
+    def __init__(self, content="Mocked OpenAI response"):
+        self.choices = [_MockOpenAIChatChoice(content)]
+
+
+class _MockOpenAIClient:
+    calls = []
+    response_content = "Mocked OpenAI response"
+
+    def __init__(self, api_key=None, base_url=None, **kwargs):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.chat = SimpleNamespace(
+            completions=SimpleNamespace(create=self._create)
+        )
+
+    async def _create(self, **kwargs):
+        _MockOpenAIClient.calls.append({"kwargs": kwargs, "api_key": self.api_key, "base_url": self.base_url})
+        return _MockOpenAIChatCompletion(self.response_content)
+
+
+class _MockClaudeContentBlock:
+    def __init__(self, text="Mocked Claude response"):
+        self.text = text
+
+
+class _MockClaudeMessage:
+    def __init__(self, text="Mocked Claude response"):
+        self.content = [_MockClaudeContentBlock(text)]
+
+
+class _MockAnthropicClient:
+    calls = []
+    response_content = "Mocked Claude response"
+
+    def __init__(self, api_key=None, **kwargs):
+        self.api_key = api_key
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, **kwargs):
+        _MockAnthropicClient.calls.append({"kwargs": kwargs, "api_key": self.api_key})
+        return _MockClaudeMessage(self.response_content)
+
+
+class _MockHttpxResponse:
+    def __init__(self, status_code=200, json_data=None, text=""):
+        self.status_code = status_code
+        self._json_data = json_data
+        self.text = text
+
+    def json(self):
+        return self._json_data or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception(f"HTTP error {self.status_code}")
+
+
+class _MockHttpxClient:
+    calls = []
+    response_json = None
+    response_text = ""
+    status_code = 200
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def post(self, url, json=None, headers=None, **kwargs):
+        _MockHttpxClient.calls.append({"url": url, "json": json, "headers": headers, "kwargs": kwargs})
+        if self.status_code >= 400:
+            resp = _MockHttpxResponse(self.status_code, self.response_json or {}, self.text)
+            resp.raise_for_status()
+        if self.response_json is not None:
+            return _MockHttpxResponse(self.status_code, self.response_json, self.response_text)
+        default_gemini = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Mocked Gemini response"}]
+                }
+            }]
+        }
+        return _MockHttpxResponse(self.status_code, default_gemini, self.response_text)
 
 
 class _Result:
@@ -282,15 +378,20 @@ async def test_telegram_admin_max_profile_uses_raw_id_and_max_identity(monkeypat
 
 @pytest.mark.asyncio
 async def test_max_chat_response_creates_shared_ai_log(monkeypatch):
+    _MockHttpxClient.calls.clear()
+    _MockHttpxClient.response_json = None
+    _MockHttpxClient.status_code = 200
+    monkeypatch.setattr(max_ai.httpx, "AsyncClient", _MockHttpxClient)
     user = _max_user()
-    session = _MaxAISession(user, _max_config())
+    config = _max_config()
+    config.gemini_model = "gemini-3.7-flash"
+    session = _MaxAISession(user, config)
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
     monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
-    monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="MAX answer"))
 
     result = await max_ai.get_ai_response(user.id, "question")
 
-    assert result == "MAX answer"
+    assert result == "Mocked Gemini response"
     assert len(session.added) == 1
     log_entry = session.added[0]
     assert isinstance(log_entry, AILog)
@@ -299,7 +400,9 @@ async def test_max_chat_response_creates_shared_ai_log(monkeypatch):
     assert log_entry.context_kind == "main"
     assert log_entry.topic_id is None
     assert log_entry.topic_name_snapshot is None
-    assert "max-secret" not in (log_entry.request_payload or "")
+    assert log_entry.request_payload
+    assert "max-secret" not in log_entry.request_payload
+    assert "?key=" not in log_entry.request_payload
     assert session.commits == 1
 
 
@@ -747,3 +850,367 @@ async def test_max_chat_response_with_history_topic_relationship(monkeypatch):
     result = await max_ai.get_ai_response(user.id, "новый вопрос")
 
     assert result == "Ответ с историей"
+
+
+@pytest.mark.asyncio
+async def test_max_openai_request_payload_captured_and_sanitized(monkeypatch):
+    _MockOpenAIClient.calls.clear()
+    monkeypatch.setattr(max_ai, "AsyncOpenAI", _MockOpenAIClient)
+    user = _max_user()
+    config = _max_config()
+    config.provider = "OpenAI"
+    config.openai_api_key = "sk-live-openai-secret-token-12345"
+    config.openai_model = "gpt-5.6-terra"
+    session = _MaxAISession(user, config)
+
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+
+    result = await max_ai.get_ai_response(user.id, "Как дела?")
+
+    assert result == "Mocked OpenAI response"
+    assert len(session.added) == 1
+    log_entry = session.added[0]
+    assert log_entry.provider == "OpenAI"
+    assert log_entry.model == "gpt-5.6-terra"
+
+    # Assert payload exists first (strong assertion)
+    assert log_entry.request_payload
+    parsed = json.loads(log_entry.request_payload)
+    assert parsed["provider"] == "OpenAI"
+    assert parsed["endpoint"] == "https://api.openai.com/v1/chat/completions"
+    assert parsed["payload"]["model"] == "gpt-5.6-terra"
+    assert parsed["payload"]["max_completion_tokens"] == 4096
+    messages = parsed["payload"]["messages"]
+    assert any(m["role"] == "user" and m["content"] == "Как дела?" for m in messages)
+
+    # Sanitization
+    assert "sk-live-openai-secret-token-12345" not in log_entry.request_payload
+    assert "Bearer" not in log_entry.request_payload
+    assert "Authorization" not in log_entry.request_payload
+
+
+@pytest.mark.asyncio
+async def test_max_deepseek_topic_request_payload_complete_and_sanitized(monkeypatch):
+    _MockOpenAIClient.calls.clear()
+    monkeypatch.setattr(max_ai, "AsyncOpenAI", _MockOpenAIClient)
+
+    topic = SimpleNamespace(
+        id=15,
+        name="Психосоматика",
+        system_prompt="Специальный промпт темы",
+        instruction=None,
+        use_common_instruction=True,
+        knowledge_base_files=[],
+    )
+    user = _max_user(topic_id=15, topic=topic)
+    config = _max_config()
+    config.provider = "Deepseek"
+    config.deepseek_api_key = "sk-deepseek-super-secret-999"
+    config.deepseek_model = "deepseek-chat"
+    config.system_prompt = "Базовый системный промпт"
+    session = _MaxAISession(user, config)
+
+    history_msg1 = SimpleNamespace(
+        id=1, role="user", content="болит голова", topic_id=15, topic=topic, timestamp=datetime(2026, 9, 1, 10, 0)
+    )
+    history_msg2 = SimpleNamespace(
+        id=2, role="assistant", content="расскажите подробнее", topic_id=15, topic=topic, timestamp=datetime(2026, 9, 1, 10, 1)
+    )
+
+    async def _execute_mock(stmt):
+        sql = str(stmt)
+        if "messages" in sql.lower():
+            return _Result(rows=[history_msg1, history_msg2])
+        return _Result(rows=[])
+
+    session.execute = _execute_mock
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value="СЛУЖЕБНЫЙ_КОНТЕКСТ_ТЕСТ"))
+
+    result = await max_ai.get_ai_response(user.id, "болит висок")
+
+    assert result == "Mocked OpenAI response"
+    assert len(session.added) == 1
+    log_entry = session.added[0]
+    assert log_entry.provider == "Deepseek"
+    assert log_entry.model == "deepseek-chat"
+    assert log_entry.context_kind == "topic"
+    assert log_entry.topic_id == 15
+
+    # Assert payload exists first
+    assert log_entry.request_payload
+    parsed = json.loads(log_entry.request_payload)
+    assert parsed["provider"] == "Deepseek"
+    assert parsed["endpoint"] == "https://api.deepseek.com/chat/completions"
+    assert parsed["payload"]["model"] == "deepseek-v4-flash"
+
+    messages = parsed["payload"]["messages"]
+    # 1. Effective system/topic prompt
+    assert any(m["role"] == "system" and "Специальный промпт темы" in m["content"] for m in messages)
+    # 2. Topic/runtime context
+    assert any(m["role"] == "system" and "СЛУЖЕБНЫЙ_КОНТЕКСТ_ТЕСТ" in m["content"] for m in messages)
+    assert any(m["role"] == "system" and "ДАННЫЕ КЛИЕНТА:" in m["content"] for m in messages)
+    # 3. Conversation history
+    assert any(m["role"] == "user" and m["content"] == "болит голова" for m in messages)
+    assert any(m["role"] == "assistant" and m["content"] == "расскажите подробнее" for m in messages)
+    # 4. Current user prompt
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["content"] == "болит висок"
+
+    # Sanitization
+    assert "sk-deepseek-super-secret-999" not in log_entry.request_payload
+
+
+@pytest.mark.asyncio
+async def test_max_claude_request_payload_shape_and_sanitized(monkeypatch):
+    _MockAnthropicClient.calls.clear()
+    monkeypatch.setattr(max_ai.anthropic, "AsyncAnthropic", _MockAnthropicClient)
+    user = _max_user()
+    config = _max_config()
+    config.provider = "Claude"
+    config.claude_api_key = "sk-ant-api03-claude-secret-key-xyz"
+    config.claude_model = "claude-sonnet-5"
+    config.system_prompt = "Ты мудрый терапевт"
+    session = _MaxAISession(user, config)
+
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+
+    result = await max_ai.get_ai_response(user.id, "Вопрос к Клоду")
+
+    assert result == "Mocked Claude response"
+    assert len(session.added) == 1
+    log_entry = session.added[0]
+    assert log_entry.provider == "Claude"
+    assert log_entry.model == "claude-sonnet-5"
+
+    # Assert payload exists first
+    assert log_entry.request_payload
+    parsed = json.loads(log_entry.request_payload)
+    assert parsed["provider"] == "Claude"
+    assert parsed["endpoint"] == "https://api.anthropic.com/v1/messages"
+    assert parsed["payload"]["model"] == "claude-sonnet-5"
+    assert parsed["payload"]["max_tokens"] == 4096
+    assert isinstance(parsed["payload"]["system"], list)
+    assert any("Ты мудрый терапевт" in block.get("text", "") for block in parsed["payload"]["system"])
+    assert parsed["payload"]["messages"][-1] == {"role": "user", "content": "Вопрос к Клоду"}
+
+    # Sanitization
+    assert "sk-ant-api03-claude-secret-key-xyz" not in log_entry.request_payload
+
+
+@pytest.mark.asyncio
+async def test_max_gemini_request_payload_endpoint_and_sanitized(monkeypatch):
+    _MockHttpxClient.calls.clear()
+    _MockHttpxClient.response_json = None
+    _MockHttpxClient.status_code = 200
+    monkeypatch.setattr(max_ai.httpx, "AsyncClient", _MockHttpxClient)
+    user = _max_user()
+    config = _max_config()
+    config.provider = "Gemini"
+    config.gemini_api_key = "AIzaSyD-gemini-confidential-key-789"
+    config.gemini_model = "gemini-3.7-flash"
+    session = _MaxAISession(user, config)
+
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+
+    result = await max_ai.get_ai_response(user.id, "Вопрос к Gemini")
+
+    assert result == "Mocked Gemini response"
+    assert len(session.added) == 1
+    log_entry = session.added[0]
+    assert log_entry.provider == "Gemini"
+    assert log_entry.model == "gemini-3.7-flash"
+
+    # Assert payload exists first
+    assert log_entry.request_payload
+    parsed = json.loads(log_entry.request_payload)
+    assert parsed["provider"] == "Gemini"
+    assert parsed["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
+    # Prove no ?key= query parameter in endpoint and whole request_payload
+    assert "?key=" not in parsed["endpoint"]
+    assert "&key=" not in parsed["endpoint"]
+    assert "?key=" not in log_entry.request_payload
+    assert "AIzaSyD-gemini-confidential-key-789" not in log_entry.request_payload
+
+    # Prove actual payload structure
+    assert "contents" in parsed["payload"]
+    assert "systemInstruction" in parsed["payload"]
+    assert "generationConfig" in parsed["payload"]
+    contents = parsed["payload"]["contents"]
+    assert any(part.get("text") == "Вопрос к Gemini" for c in contents for part in c.get("parts", []))
+
+
+@pytest.mark.asyncio
+async def test_max_kie_request_payload_matches_outbound_and_sanitized(monkeypatch):
+    _MockHttpxClient.calls.clear()
+    _MockHttpxClient.response_json = {
+        "code": 200,
+        "data": {
+            "choices": [{
+                "message": {"content": "Mocked KIE response"}
+            }]
+        }
+    }
+    _MockHttpxClient.status_code = 200
+    monkeypatch.setattr(max_ai.httpx, "AsyncClient", _MockHttpxClient)
+    user = _max_user()
+    config = _max_config()
+    config.provider = "KIE"
+    config.kie_api_key = "kie-secret-api-key-55555"
+    config.kie_model = "gemini-3-flash"
+    session = _MaxAISession(user, config)
+
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+
+    result = await max_ai.get_ai_response(user.id, "Вопрос к KIE")
+
+    assert result == "Mocked KIE response"
+    assert len(session.added) == 1
+    log_entry = session.added[0]
+    assert log_entry.provider == "KIE"
+    assert log_entry.model == "gemini-3-flash"
+
+    # Assert payload exists first
+    assert log_entry.request_payload
+    parsed = json.loads(log_entry.request_payload)
+    assert parsed["provider"] == "KIE"
+    assert "kie-secret-api-key-55555" not in log_entry.request_payload
+    assert "Bearer" not in log_entry.request_payload
+    assert "Authorization" not in log_entry.request_payload
+
+    # Assert matches outbound request passed to HTTP client
+    assert len(_MockHttpxClient.calls) == 1
+    http_call = _MockHttpxClient.calls[0]
+    assert parsed["endpoint"] == http_call["url"]
+    assert parsed["payload"] == http_call["json"]
+
+
+@pytest.mark.asyncio
+async def test_max_fallback_orchestration_persists_fallback_payload_only(monkeypatch):
+    _MockHttpxClient.calls.clear()
+    _MockOpenAIClient.calls.clear()
+
+    # Primary Gemini will fail
+    class _FailingGeminiClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            raise Exception("Gemini service unavailable 503")
+
+    monkeypatch.setattr(max_ai.httpx, "AsyncClient", _FailingGeminiClient)
+    monkeypatch.setattr(max_ai, "AsyncOpenAI", _MockOpenAIClient)
+
+    user = _max_user()
+    config = _max_config()
+    config.provider = "Gemini"
+    config.gemini_api_key = "primary-gemini-secret-key-111"
+    config.gemini_model = "gemini-3.7-flash"
+    config.allow_fallback = True
+    config.fallback_provider = "OpenAI"
+    config.fallback_model = "gpt-5.6-terra"
+    config.openai_api_key = "fallback-openai-secret-key-222"
+    session = _MaxAISession(user, config)
+
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+
+    result = await max_ai.get_ai_response(user.id, "Вопрос для фолбэка")
+
+    assert result == "Mocked OpenAI response"
+    assert len(session.added) == 1
+    log_entry = session.added[0]
+
+    # 1. Final provider and model correspond to fallback
+    assert log_entry.provider == "OpenAI"
+    assert log_entry.model == "gpt-5.6-terra"
+
+    # 2. Assert payload exists first
+    assert log_entry.request_payload
+    parsed = json.loads(log_entry.request_payload)
+
+    # 3. Final request_payload is fallback request, not primary request
+    assert parsed["provider"] == "OpenAI"
+    assert parsed["endpoint"] == "https://api.openai.com/v1/chat/completions"
+    assert parsed["payload"]["model"] == "gpt-5.6-terra"
+    assert "gemini" not in parsed["endpoint"].lower()
+    assert "gemini" not in parsed["provider"].lower()
+
+    # 4. Sanitization
+    assert "primary-gemini-secret-key-111" not in log_entry.request_payload
+    assert "fallback-openai-secret-key-222" not in log_entry.request_payload
+
+
+@pytest.mark.asyncio
+async def test_max_ai_log_detail_and_export_with_populated_request_payload(monkeypatch):
+    user = _max_user()
+    sample_payload = {
+        "provider": "OpenAI",
+        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "payload": {
+            "model": "gpt-5.6-terra",
+            "messages": [
+                {"role": "system", "content": "Системный промпт"},
+                {"role": "user", "content": "Привет, бот"},
+            ],
+        },
+    }
+    payload_str = json.dumps(sample_payload, ensure_ascii=False, indent=2)
+    log_entry = AILog(
+        id=25,
+        user_id=user.id,
+        provider="OpenAI",
+        model="gpt-5.6-terra",
+        prompt_summary="Привет, бот",
+        request_payload=payload_str,
+        raw_response="Ответ модели",
+        clean_text="Ответ модели",
+        created_at=datetime(2026, 9, 6, 12, 0),
+        platform="max",
+        context_kind="main",
+    )
+    session = _DetailSession(log_entry, user)
+    event = SimpleNamespace(answer=AsyncMock())
+    monkeypatch.setattr(handlers, "async_session_maker", lambda: _SessionContext(session))
+
+    await handlers.show_ai_log_detail(event, log_entry.id)
+
+    text_value = event.answer.await_args.args[0]
+    assert "Полный payload запроса (превью):" in text_value
+    assert "gpt-5.6-terra" in text_value
+    assert "Привет, бот" in text_value
+
+    file_content = handlers._build_ai_log_file_content(log_entry)
+    assert "[1] FULL REQUEST PAYLOAD:" in file_content
+    assert payload_str in file_content
+    assert "User ID: 100018792559" in file_content
+
+
+def test_ai_log_unpopulated_request_payload_displays_unrecorded():
+    log_entry = AILog(
+        id=26,
+        user_id=123,
+        provider="OpenAI",
+        model="gpt-5.6-terra",
+        prompt_summary="только саммари без payload",
+        request_payload=None,
+        raw_response="Ответ",
+        clean_text="Ответ",
+        created_at=datetime(2026, 9, 6, 12, 0),
+        platform="max",
+        context_kind="main",
+    )
+    file_content = handlers._build_ai_log_file_content(log_entry)
+    assert "[1] FULL REQUEST PAYLOAD:\n----------------------------------------\nне зафиксирован\n" in file_content
+    assert "только саммари без payload" not in file_content.split("[2] RAW RESPONSE")[0]
+
