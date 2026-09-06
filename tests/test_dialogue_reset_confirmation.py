@@ -574,13 +574,16 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 312).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs), 3)
-            self.assertEqual(msgs[1].content, "Новый вопрос в теме отношения")
+            self.assertEqual(len(msgs), 4)
+            self.assertEqual(msgs[1].role, "topic_welcome")
             self.assertEqual(msgs[1].dialogue_id, 2)
             self.assertEqual(msgs[1].topic_id, 20)
-            self.assertEqual(msgs[2].content, "Ответ по теме отношения")
+            self.assertEqual(msgs[2].content, "Новый вопрос в теме отношения")
             self.assertEqual(msgs[2].dialogue_id, 2)
             self.assertEqual(msgs[2].topic_id, 20)
+            self.assertEqual(msgs[3].content, "Ответ по теме отношения")
+            self.assertEqual(msgs[3].dialogue_id, 2)
+            self.assertEqual(msgs[3].topic_id, 20)
 
     async def test_telegram_journey_d_topic_reset_to_main(self):
         """Journey D: In Topic B -> Reset to Main -> Topic None -> next message responds in main mode."""
@@ -619,32 +622,42 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
         cb_main.message = MagicMock()
         cb_main.message.delete = AsyncMock()
 
-        await handlers.process_reset_topic_to_main(cb_main, state, bot)
-        cb_main.answer.assert_called_once_with()
-
-        async with self.session_factory() as session:
-            u = await session.get(User, 313)
-            self.assertIsNone(u.current_topic_id)
-
-        # User sends next message
-        msg_next = MagicMock()
-        msg_next.from_user = SimpleNamespace(id=313, username="dmitry", full_name="Dmitry")
-        msg_next.chat = SimpleNamespace(id=313)
-        msg_next.text = "Вопрос в основном режиме"
-
         with patch("handlers.ai_integration.generate_response", AsyncMock(return_value="Ответ в основном режиме")):
+            await handlers.process_reset_topic_to_main(cb_main, state, bot)
+            cb_main.answer.assert_called_once_with()
+
+            while handlers._has_user_turn_work(313) or (313 in handlers.user_processing_tasks and not handlers.user_processing_tasks[313].done()):
+                task = handlers.user_processing_tasks.get(313)
+                if task:
+                    await task
+                await asyncio.sleep(0.01)
+
+            async with self.session_factory() as session:
+                u = await session.get(User, 313)
+                self.assertIsNone(u.current_topic_id)
+
+            # User sends next message
+            msg_next = MagicMock()
+            msg_next.from_user = SimpleNamespace(id=313, username="dmitry", full_name="Dmitry")
+            msg_next.chat = SimpleNamespace(id=313)
+            msg_next.text = "Вопрос в основном режиме"
+
             await handlers.handle_ai_chat(msg_next, state, bot)
-            task = handlers.user_processing_tasks.get(313)
-            if task:
-                await task
+            while handlers._has_user_turn_work(313) or (313 in handlers.user_processing_tasks and not handlers.user_processing_tasks[313].done()):
+                task = handlers.user_processing_tasks.get(313)
+                if task:
+                    await task
+                await asyncio.sleep(0.01)
 
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 313).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs), 3)
-            self.assertEqual(msgs[1].content, "Вопрос в основном режиме")
+            self.assertEqual(len(msgs), 4)
+            self.assertEqual(msgs[1].role, "assistant")
             self.assertIsNone(msgs[1].topic_id)
-            self.assertEqual(msgs[2].content, "Ответ в основном режиме")
+            self.assertEqual(msgs[2].content, "Вопрос в основном режиме")
             self.assertIsNone(msgs[2].topic_id)
+            self.assertEqual(msgs[3].content, "Ответ в основном режиме")
+            self.assertIsNone(msgs[3].topic_id)
 
     async def test_max_cancel_invalidates_future_confirm(self):
         """MAX: Cancel clears confirm_reset state; subsequent confirm callback no-ops with zero DB mutation."""

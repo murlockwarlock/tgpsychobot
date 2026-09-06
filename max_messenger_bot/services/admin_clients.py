@@ -21,7 +21,7 @@ from ..legacy import Message as DBMessage, RobokassaPayment, Topic, User, UserSu
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 from ..time_utils import format_msk
-from result_history import TEST_RESULT_ROLE
+from result_history import TEST_RESULT_ROLE, non_technical_role_filter
 from client_search import normalize_client_search_query
 from .subscription_access import load_active_subscription
 
@@ -57,7 +57,7 @@ async def list_clients(client: MaxApiClient, chat_id: int, page: int = 0) -> Non
             await session.execute(
                 select(User)
                 .where(User.id >= MAX_ID_OFFSET)
-                .outerjoin(DBMessage, User.id == DBMessage.user_id)
+                .outerjoin(DBMessage, and_(User.id == DBMessage.user_id, non_technical_role_filter(DBMessage)))
                 .group_by(User.id)
                 .order_by(func.max(DBMessage.timestamp).desc().nulls_last(), User.created_at.desc())
                 .offset(page * PAGE_SIZE)
@@ -115,7 +115,7 @@ async def show_client_history(client: MaxApiClient, chat_id: int, target_user_id
         messages = (
             await session.execute(
                 select(DBMessage)
-                .where(DBMessage.user_id == target_user_id)
+                .where(DBMessage.user_id == target_user_id, non_technical_role_filter(DBMessage))
                 .order_by(DBMessage.timestamp.asc())
             )
         ).scalars().all()
@@ -260,7 +260,9 @@ async def run_single_export(
         topics = (await session.execute(select(Topic))).scalars().all()
         topic_map = {t.id: t.name for t in topics}
         messages = (await session.execute(
-            select(DBMessage).where(DBMessage.user_id == target_user_id).order_by(DBMessage.timestamp.asc())
+            select(DBMessage)
+            .where(DBMessage.user_id == target_user_id, non_technical_role_filter(DBMessage))
+            .order_by(DBMessage.timestamp.asc())
         )).scalars().all()
 
     if not messages:

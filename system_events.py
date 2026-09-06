@@ -22,3 +22,14 @@ def build_topic_auto_start_system_message(topic_name: str | None) -> str:
     """Build canonical hidden event message for topic auto-start."""
     sanitized_name = sanitize_synthetic_text_fragment(topic_name)
     return f'[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь выбрал тему "{sanitized_name}"]'
+
+
+def build_topic_resume_system_message(topic_name: str | None) -> str:
+    """Build canonical hidden event message for topic resume."""
+    sanitized_name = sanitize_synthetic_text_fragment(topic_name)
+    return f'[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь вернулся к теме "{sanitized_name}"]'
+
+
+def build_main_dialogue_resume_system_message() -> str:
+    """Build canonical hidden event message for main dialogue return/resume."""
+    return '[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь вернулся в общий режим диалога]'

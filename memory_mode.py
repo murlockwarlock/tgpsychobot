@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 MEMORY_MODE_RESET = "reset"
 MEMORY_MODE_TOPIC = "topic"
 MEMORY_MODE_GLOBAL = "global"
@@ -7,6 +9,18 @@ MEMORY_MODE_VALUES = {
     MEMORY_MODE_TOPIC,
     MEMORY_MODE_GLOBAL,
 }
+
+
+@dataclass(frozen=True)
+class TopicTransitionResult:
+    status: str  # "switched", "already_current", "inaccessible"
+    kind: str    # "first_entry", "resumed", "to_main"
+    dialogue_id: int
+    topic_id: int | None
+    memory_mode: str
+    restored: bool = False
+    welcome_needed: bool = False
+
 
 
 def normalize_memory_mode(ai_config) -> str:

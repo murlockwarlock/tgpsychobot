@@ -183,10 +183,14 @@ from response_buttons import (
 )
 from result_history import (
     TEST_RESULT_ROLE,
+    TOPIC_WELCOME_ROLE,
     attach_secret_answers,
     attempt_to_dict,
     build_test_attempt_pages,
     conversation_role_filter,
+    is_topic_welcome_shown,
+    non_technical_role_filter,
+    record_topic_welcome_shown,
     save_test_attempt,
     save_test_history_message,
 )
@@ -1717,6 +1721,15 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
     await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
 
 
+@dataclass(frozen=True)
+class ScopedAIKickoff:
+    user_id: int
+    expected_dialogue_id: int
+    expected_topic_id: int | None
+    synthetic_prompt: str
+    is_hidden: bool = True
+
+
 async def process_buffered_messages(
     user_id: int,
     bot: Bot,
@@ -1724,8 +1737,13 @@ async def process_buffered_messages(
     *,
     visible_user_text: str | None = None,
     isolated_prompt: str | None = None,
+    scoped_kickoff: ScopedAIKickoff | None = None,
 ):
-    if isolated_prompt is not None:
+    if scoped_kickoff is not None:
+        full_text = scoped_kickoff.synthetic_prompt
+        history_user_text = None
+        user_ai_context_content = None
+    elif isolated_prompt is not None:
         full_text = isolated_prompt
         history_user_text = visible_user_text if visible_user_text is not None else isolated_prompt
         user_ai_context_content = isolated_prompt if visible_user_text is not None else None
@@ -1738,6 +1756,13 @@ async def process_buffered_messages(
         full_text = "\n".join(messages)
         history_user_text = visible_user_text if visible_user_text is not None else full_text
         user_ai_context_content = full_text if visible_user_text is not None else None
+
+    # Pre-call validation for scoped hidden kickoff
+    if scoped_kickoff is not None:
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user or user.current_dialogue_id != scoped_kickoff.expected_dialogue_id or user.current_topic_id != scoped_kickoff.expected_topic_id:
+                return
 
     async def keep_typing_loop():
         try:
@@ -1769,6 +1794,13 @@ async def process_buffered_messages(
         )
         ai_context_content = response_capture.get("raw_response") or response_text
 
+        # Post-call validation for scoped hidden kickoff
+        if scoped_kickoff is not None:
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                if not user or user.current_dialogue_id != scoped_kickoff.expected_dialogue_id or user.current_topic_id != scoped_kickoff.expected_topic_id:
+                    return
+
         should_start_test, directive_clean_text = extract_test_start_directive(response_text)
         if should_start_test:
             directive_clean_text, _, _, _, _, _ = await handle_ai_media_content(
@@ -1787,21 +1819,24 @@ async def process_buffered_messages(
             async with async_session_maker() as session:
                 user = await session.get(User, user_id)
                 if user:
-                    session.add(DBMessage(
-                        user_id=user.id,
-                        role='user',
-                        content=history_user_text,
-                        ai_context_content=user_ai_context_content,
-                        dialogue_id=user.current_dialogue_id,
-                        topic_id=user.current_topic_id,
-                    ))
+                    target_dialogue_id = scoped_kickoff.expected_dialogue_id if scoped_kickoff else user.current_dialogue_id
+                    target_topic_id = scoped_kickoff.expected_topic_id if scoped_kickoff else user.current_topic_id
+                    if not (scoped_kickoff and scoped_kickoff.is_hidden):
+                        session.add(DBMessage(
+                            user_id=user.id,
+                            role='user',
+                            content=history_user_text,
+                            ai_context_content=user_ai_context_content,
+                            dialogue_id=target_dialogue_id,
+                            topic_id=target_topic_id,
+                        ))
                     session.add(DBMessage(
                         user_id=user.id,
                         role='assistant',
                         content=directive_clean_text,
                         ai_context_content=ai_context_content,
-                        dialogue_id=user.current_dialogue_id,
-                        topic_id=user.current_topic_id,
+                        dialogue_id=target_dialogue_id,
+                        topic_id=target_topic_id,
                     ))
                     await session.commit()
 
@@ -1815,7 +1850,7 @@ async def process_buffered_messages(
 
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
-            topic_id = user.current_topic_id if user else None
+            topic_id = scoped_kickoff.expected_topic_id if scoped_kickoff else (user.current_topic_id if user else None)
             media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
             before_show_imgs, after_show_imgs = _split_show_img_positions(show_imgs)
             sent_show_img_names: set[str] = set()
@@ -2013,26 +2048,29 @@ async def process_buffered_messages(
                     await bot.send_message(chat_id=user_id, text="Выбери карту, которая тебе откликается:", reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]))
 
             if user:
-                session.add(DBMessage(
-                    user_id=user.id,
-                    role='user',
-                    content=history_user_text,
-                    ai_context_content=user_ai_context_content,
-                    dialogue_id=user.current_dialogue_id,
-                    topic_id=user.current_topic_id,
-                ))
+                target_dialogue_id = scoped_kickoff.expected_dialogue_id if scoped_kickoff else user.current_dialogue_id
+                target_topic_id = scoped_kickoff.expected_topic_id if scoped_kickoff else user.current_topic_id
+                if not (scoped_kickoff and scoped_kickoff.is_hidden):
+                    session.add(DBMessage(
+                        user_id=user.id,
+                        role='user',
+                        content=history_user_text,
+                        ai_context_content=user_ai_context_content,
+                        dialogue_id=target_dialogue_id,
+                        topic_id=target_topic_id,
+                    ))
                 session.add(DBMessage(
                     user_id=user.id,
                     role='assistant',
                     content=response_text,
                     ai_context_content=ai_context_content,
-                    dialogue_id=user.current_dialogue_id,
-                    topic_id=user.current_topic_id,
+                    dialogue_id=target_dialogue_id,
+                    topic_id=target_topic_id,
                 ))
                 if drawn_cards_info:
                     cards_text = "; ".join(drawn_cards_info)
                     card_system_msg = f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]"
-                    session.add(DBMessage(user_id=user.id, role='user', content=card_system_msg, dialogue_id=user.current_dialogue_id, topic_id=user.current_topic_id))
+                    session.add(DBMessage(user_id=user.id, role='user', content=card_system_msg, dialogue_id=target_dialogue_id, topic_id=target_topic_id))
                 await session.commit()
 
         if drawn_cards_info:
@@ -2161,13 +2199,23 @@ def _schedule_telegram_drain_runner_locked(
                         break
 
                 if is_isolated:
-                    await process_buffered_messages(
-                        user_id,
-                        bot,
-                        state,
-                        isolated_prompt=work_item,
-                        visible_user_text=None,
-                    )
+                    if isinstance(work_item, ScopedAIKickoff):
+                        await process_buffered_messages(
+                            user_id,
+                            bot,
+                            state,
+                            isolated_prompt=work_item.synthetic_prompt,
+                            visible_user_text=None,
+                            scoped_kickoff=work_item,
+                        )
+                    else:
+                        await process_buffered_messages(
+                            user_id,
+                            bot,
+                            state,
+                            isolated_prompt=work_item,
+                            visible_user_text=None,
+                        )
                 else:
                     await process_buffered_messages(
                         user_id,
@@ -2206,14 +2254,49 @@ def _ensure_telegram_drain_runner(
     _schedule_telegram_drain_runner_locked(user_id, bot, state, initial_delay=initial_delay)
 
 
-async def _start_telegram_topic_auto_start(user_id: int, bot: Bot, state: FSMContext | None, topic: Topic) -> None:
-    from system_events import build_topic_auto_start_system_message
-    synthetic_text = build_topic_auto_start_system_message(topic.name)
-
+async def _start_telegram_hidden_kickoff(
+    user_id: int,
+    bot: Bot,
+    state: FSMContext | None,
+    synthetic_prompt: str,
+    dialogue_id: int,
+    topic_id: int | None,
+) -> None:
+    kickoff = ScopedAIKickoff(
+        user_id=user_id,
+        expected_dialogue_id=dialogue_id,
+        expected_topic_id=topic_id,
+        synthetic_prompt=synthetic_prompt,
+        is_hidden=True,
+    )
     async with _get_user_scheduling_lock(user_id):
         queue = user_isolated_turn_queues.setdefault(user_id, deque())
-        queue.append(synthetic_text)
+        queue.append(kickoff)
         _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.0)
+
+
+async def _start_telegram_topic_auto_start(
+    user_id: int,
+    bot: Bot,
+    state: FSMContext | None,
+    topic: Topic,
+    dialogue_id: int | None = None,
+) -> None:
+    from system_events import build_topic_auto_start_system_message
+    synthetic_text = build_topic_auto_start_system_message(topic.name)
+    effective_dialogue_id = dialogue_id
+    if effective_dialogue_id is None:
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            effective_dialogue_id = user.current_dialogue_id if user else 1
+    await _start_telegram_hidden_kickoff(
+        user_id=user_id,
+        bot=bot,
+        state=state,
+        synthetic_prompt=synthetic_text,
+        dialogue_id=effective_dialogue_id,
+        topic_id=topic.id,
+    )
 
 
 async def render_static_content_telegram(
@@ -3335,19 +3418,52 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                         state,
                         user,
                         topic_intro_after=topic_id,
+                        topic_intro_dialogue_id=switch_res.dialogue_id,
+                        topic_intro_welcome_needed=not switch_res.welcome_shown,
                         topic_intro_restored=switch_res.restored,
                         topic_intro_memory_mode=switch_res.memory_mode,
                     ):
                         return
 
-                    await _send_topic_intro(bot, message.chat.id, switch_res.topic, switch_res.restored, switch_res.memory_mode)
+                    if not switch_res.welcome_shown:
+                        await _send_topic_intro(bot, message.chat.id, switch_res.topic, switch_res.restored, switch_res.memory_mode)
+                        async with async_session_maker() as s_mark:
+                            await record_topic_welcome_shown(s_mark, message.from_user.id, switch_res.dialogue_id, topic_id)
+                            await s_mark.commit()
 
-                    if switch_res.topic and getattr(switch_res.topic, "auto_start_dialogue", False):
+                        if switch_res.topic and getattr(switch_res.topic, "auto_start_dialogue", False):
+                            if user and not user.accepted_disclaimer:
+                                disclaimer_content = await get_content_from_db("disclaimer")
+                                if disclaimer_content.get('is_visible', True):
+                                    await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                                    await state.update_data(
+                                        pending_auto_start_topic_id=int(topic_id),
+                                        pending_auto_start_dialogue_id=switch_res.dialogue_id,
+                                        pending_auto_start_kind="first_entry",
+                                    )
+                                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
+                                    await bot.send_message(message.chat.id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                                    return
+                                else:
+                                    async with async_session_maker() as s_disc:
+                                        await s_disc.execute(update(User).where(User.id == message.from_user.id).values(accepted_disclaimer=True))
+                                        await s_disc.commit()
+
+                            async with async_session_maker() as session_acc:
+                                if not await _check_telegram_chat_access(session_acc, message.from_user.id, bot, message.chat.id):
+                                    return
+
+                            await _start_telegram_topic_auto_start(message.from_user.id, bot, state, switch_res.topic, switch_res.dialogue_id)
+                    else:
                         if user and not user.accepted_disclaimer:
                             disclaimer_content = await get_content_from_db("disclaimer")
                             if disclaimer_content.get('is_visible', True):
                                 await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                                await state.update_data(pending_auto_start_topic_id=int(topic_id))
+                                await state.update_data(
+                                    pending_auto_start_topic_id=int(topic_id),
+                                    pending_auto_start_dialogue_id=switch_res.dialogue_id,
+                                    pending_auto_start_kind="resume",
+                                )
                                 text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                                 await bot.send_message(message.chat.id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
                                 return
@@ -3360,7 +3476,9 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                             if not await _check_telegram_chat_access(session_acc, message.from_user.id, bot, message.chat.id):
                                 return
 
-                        await _start_telegram_topic_auto_start(message.from_user.id, bot, state, switch_res.topic)
+                        from system_events import build_topic_resume_system_message
+                        synthetic_prompt = build_topic_resume_system_message(switch_res.topic.name)
+                        await _start_telegram_hidden_kickoff(message.from_user.id, bot, state, synthetic_prompt, switch_res.dialogue_id, topic_id)
                     return
                 except Exception as e:
                     logging.error(f"Error parsing topic deep link: {e}")
@@ -3700,7 +3818,10 @@ async def admin_clients_list(callback: CallbackQuery, state: FSMContext):
     PAGE_SIZE = 10
 
     async with async_session_maker() as session:
-        base_query = select(User).outerjoin(DBMessage, User.id == DBMessage.user_id)
+        base_query = select(User).outerjoin(
+            DBMessage,
+            and_(User.id == DBMessage.user_id, non_technical_role_filter(DBMessage)),
+        )
 
         if search_query:
             search_filter = or_(
@@ -3711,8 +3832,14 @@ async def admin_clients_list(callback: CallbackQuery, state: FSMContext):
             )
             base_query = base_query.where(search_filter)
 
-        count_stmt = select(func.count(func.distinct(User.id))).select_from(User).outerjoin(DBMessage,
-                                                                                            User.id == DBMessage.user_id)
+        count_stmt = (
+            select(func.count(func.distinct(User.id)))
+            .select_from(User)
+            .outerjoin(
+                DBMessage,
+                and_(User.id == DBMessage.user_id, non_technical_role_filter(DBMessage)),
+            )
+        )
         if search_query:
             count_stmt = count_stmt.where(search_filter)
 
@@ -5790,7 +5917,10 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
         topics_res = await session.execute(select(Topic))
         topic_map = {t.id: t.name for t in topics_res.scalars().all()}
 
-        query = select(DBMessage).where(DBMessage.user_id == user_id)
+        query = select(DBMessage).where(
+            DBMessage.user_id == user_id,
+            non_technical_role_filter(DBMessage),
+        )
         if not for_admin_view:
             query = query.where(DBMessage.dialogue_id == target_user.current_dialogue_id)
 
@@ -6497,6 +6627,8 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
         return
 
     pending_topic_id = data.get("pending_auto_start_topic_id")
+    pending_dialogue_id = data.get("pending_auto_start_dialogue_id")
+    pending_kind = data.get("pending_auto_start_kind", "first_entry")
     await state.clear()
 
     if await _send_pending_topic_intro(data, bot, callback.from_user.id, state=state):
@@ -6505,13 +6637,19 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
     if pending_topic_id:
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
-            if user and user.current_topic_id == int(pending_topic_id):
+            if user and user.current_topic_id == int(pending_topic_id) and (pending_dialogue_id is None or user.current_dialogue_id == pending_dialogue_id):
                 topic = await session.get(Topic, int(pending_topic_id))
-                if topic and topic.is_active and is_topic_accessible(topic, user, user_id) and getattr(topic, "auto_start_dialogue", False):
+                if topic and topic.is_active and is_topic_accessible(topic, user, user_id):
                     if not await _check_telegram_chat_access(session, user_id, bot, callback.message.chat.id):
                         return
-                    await _start_telegram_topic_auto_start(user_id, bot, state, topic)
-                    return
+                    if pending_kind == "resume":
+                        from system_events import build_topic_resume_system_message
+                        synthetic_prompt = build_topic_resume_system_message(topic.name)
+                        await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(pending_topic_id))
+                        return
+                    elif getattr(topic, "auto_start_dialogue", False):
+                        await _start_telegram_topic_auto_start(user_id, bot, state, topic, user.current_dialogue_id)
+                        return
 
     if prompt_text:
         await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
@@ -7038,7 +7176,10 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
         topics_res = await session.execute(select(Topic))
         topic_map = {t.id: t.name for t in topics_res.scalars().all()}
 
-        msg_stmt = select(DBMessage).where(DBMessage.user_id == user.id)
+        msg_stmt = select(DBMessage).where(
+            DBMessage.user_id == user.id,
+            non_technical_role_filter(DBMessage),
+        )
         if selected_topic_id == 0:
             msg_stmt = msg_stmt.where(DBMessage.topic_id.is_(None))
         elif selected_topic_id is not None:
@@ -7335,11 +7476,23 @@ async def _check_telegram_chat_access(session, user_id: int, bot: Bot, chat_id: 
 
 
 class TopicSwitchResult:
-    def __init__(self, status: str, topic: Topic | None = None, restored: bool = False, memory_mode: str = MEMORY_MODE_RESET):
+    def __init__(
+        self,
+        status: str,
+        topic: Topic | None = None,
+        restored: bool = False,
+        memory_mode: str = MEMORY_MODE_RESET,
+        welcome_shown: bool = False,
+        dialogue_id: int = 1,
+        topic_id: int | None = None,
+    ):
         self.status = status  # "switched", "already_current", "inaccessible"
         self.topic = topic
         self.restored = restored
         self.memory_mode = memory_mode
+        self.welcome_shown = welcome_shown
+        self.dialogue_id = dialogue_id
+        self.topic_id = topic_id
 
 
 async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSwitchResult:
@@ -7351,15 +7504,25 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                 return TopicSwitchResult("inaccessible")
 
             if user and user.current_topic_id == topic_id:
-                return TopicSwitchResult("already_current", topic=topic)
+                return TopicSwitchResult("already_current", topic=topic, dialogue_id=user.current_dialogue_id, topic_id=topic_id)
 
             if user:
                 ai_config = await session.get(AIConfig, 1)
                 memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
                 restored = await _apply_topic_switch(session, user, topic_id, memory_mode)
                 user.current_topic_id = topic_id
+                dialogue_id = user.current_dialogue_id
+                welcome_shown = await is_topic_welcome_shown(session, user.id, dialogue_id, topic_id)
                 await session.commit()
-                return TopicSwitchResult("switched", topic=topic, restored=restored, memory_mode=memory_mode)
+                return TopicSwitchResult(
+                    "switched",
+                    topic=topic,
+                    restored=restored,
+                    memory_mode=memory_mode,
+                    welcome_shown=welcome_shown,
+                    dialogue_id=dialogue_id,
+                    topic_id=topic_id,
+                )
             return TopicSwitchResult("inaccessible")
 
 
@@ -7427,6 +7590,8 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
     if not topic_id:
         return False
 
+    expected_dialogue_id = data.get("topic_intro_dialogue_id")
+    welcome_needed = data.get("topic_intro_welcome_needed", True)
     restored = bool(data.get("topic_intro_restored", False))
     memory_mode = data.get("topic_intro_memory_mode") or MEMORY_MODE_RESET
 
@@ -7436,20 +7601,55 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
 
     if not user or user.current_topic_id != int(topic_id):
         return True
+    if expected_dialogue_id is not None and user.current_dialogue_id != expected_dialogue_id:
+        return True
 
     if not topic or not topic.is_active or not is_topic_accessible(topic, user, chat_id):
         await bot.send_message(chat_id, "Тема больше недоступна. Выберите другую тему в меню.")
         return True
 
-    await _send_topic_intro(bot, chat_id, topic, restored, memory_mode)
+    if welcome_needed:
+        await _send_topic_intro(bot, chat_id, topic, restored, memory_mode)
+        async with async_session_maker() as s_mark:
+            await record_topic_welcome_shown(s_mark, chat_id, user.current_dialogue_id, int(topic_id))
+            await s_mark.commit()
 
-    if topic and getattr(topic, "auto_start_dialogue", False):
+        if topic and getattr(topic, "auto_start_dialogue", False):
+            if user and not user.accepted_disclaimer:
+                disclaimer_content = await get_content_from_db("disclaimer")
+                if disclaimer_content.get('is_visible', True):
+                    if state:
+                        await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                        await state.update_data(
+                            pending_auto_start_topic_id=int(topic_id),
+                            pending_auto_start_dialogue_id=user.current_dialogue_id,
+                            pending_auto_start_kind="first_entry",
+                        )
+                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
+                    await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                    return True
+                else:
+                    async with async_session_maker() as s_disc:
+                        stmt = update(User).where(User.id == chat_id).values(accepted_disclaimer=True)
+                        await s_disc.execute(stmt)
+                        await s_disc.commit()
+
+            async with async_session_maker() as session_acc:
+                if not await _check_telegram_chat_access(session_acc, chat_id, bot, chat_id):
+                    return True
+
+            await _start_telegram_topic_auto_start(chat_id, bot, state, topic, user.current_dialogue_id)
+    else:
         if user and not user.accepted_disclaimer:
             disclaimer_content = await get_content_from_db("disclaimer")
             if disclaimer_content.get('is_visible', True):
                 if state:
                     await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                    await state.update_data(pending_auto_start_topic_id=int(topic_id))
+                    await state.update_data(
+                        pending_auto_start_topic_id=int(topic_id),
+                        pending_auto_start_dialogue_id=user.current_dialogue_id,
+                        pending_auto_start_kind="resume",
+                    )
                 text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
                 return True
@@ -7459,11 +7659,13 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                     await s_disc.execute(stmt)
                     await s_disc.commit()
 
-        async with async_session_maker() as session:
-            if not await _check_telegram_chat_access(session, chat_id, bot, chat_id):
+        async with async_session_maker() as session_acc:
+            if not await _check_telegram_chat_access(session_acc, chat_id, bot, chat_id):
                 return True
 
-        await _start_telegram_topic_auto_start(chat_id, bot, state, topic)
+        from system_events import build_topic_resume_system_message
+        synthetic_prompt = build_topic_resume_system_message(topic.name)
+        await _start_telegram_hidden_kickoff(chat_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(topic_id))
 
     return True
 
@@ -7553,6 +7755,8 @@ async def _request_profile_onboarding_if_needed(
     *,
     initial_prompt: str | None = None,
     topic_intro_after: int | None = None,
+    topic_intro_dialogue_id: int | None = None,
+    topic_intro_welcome_needed: bool = True,
     topic_intro_restored: bool = False,
     topic_intro_memory_mode: str = MEMORY_MODE_RESET,
     resume_start: bool = False,
@@ -7579,6 +7783,8 @@ async def _request_profile_onboarding_if_needed(
     if topic_intro_after is not None:
         state_data.update({
             "topic_intro_after_onboarding": topic_intro_after,
+            "topic_intro_dialogue_id": topic_intro_dialogue_id,
+            "topic_intro_welcome_needed": topic_intro_welcome_needed,
             "topic_intro_restored": topic_intro_restored,
             "topic_intro_memory_mode": topic_intro_memory_mode,
         })
@@ -7670,19 +7876,52 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
         state,
         user,
         topic_intro_after=topic_id,
+        topic_intro_dialogue_id=switch_res.dialogue_id,
+        topic_intro_welcome_needed=not switch_res.welcome_shown,
         topic_intro_restored=switch_res.restored,
         topic_intro_memory_mode=switch_res.memory_mode,
     ):
         return
 
-    await _send_topic_intro(bot, callback.from_user.id, switch_res.topic, switch_res.restored, switch_res.memory_mode)
+    if not switch_res.welcome_shown:
+        await _send_topic_intro(bot, callback.from_user.id, switch_res.topic, switch_res.restored, switch_res.memory_mode)
+        async with async_session_maker() as s_mark:
+            await record_topic_welcome_shown(s_mark, callback.from_user.id, switch_res.dialogue_id, topic_id)
+            await s_mark.commit()
 
-    if switch_res.topic and getattr(switch_res.topic, "auto_start_dialogue", False):
+        if switch_res.topic and getattr(switch_res.topic, "auto_start_dialogue", False):
+            if user and not user.accepted_disclaimer:
+                disclaimer_content = await get_content_from_db("disclaimer")
+                if disclaimer_content.get('is_visible', True):
+                    await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                    await state.update_data(
+                        pending_auto_start_topic_id=int(topic_id),
+                        pending_auto_start_dialogue_id=switch_res.dialogue_id,
+                        pending_auto_start_kind="first_entry",
+                    )
+                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
+                    await bot.send_message(callback.from_user.id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                    return
+                else:
+                    async with async_session_maker() as s_disc:
+                        await s_disc.execute(update(User).where(User.id == callback.from_user.id).values(accepted_disclaimer=True))
+                        await s_disc.commit()
+
+            async with async_session_maker() as session_acc:
+                if not await _check_telegram_chat_access(session_acc, callback.from_user.id, bot, callback.from_user.id):
+                    return
+
+            await _start_telegram_topic_auto_start(callback.from_user.id, bot, state, switch_res.topic, switch_res.dialogue_id)
+    else:
         if user and not user.accepted_disclaimer:
             disclaimer_content = await get_content_from_db("disclaimer")
             if disclaimer_content.get('is_visible', True):
                 await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                await state.update_data(pending_auto_start_topic_id=int(topic_id))
+                await state.update_data(
+                    pending_auto_start_topic_id=int(topic_id),
+                    pending_auto_start_dialogue_id=switch_res.dialogue_id,
+                    pending_auto_start_kind="resume",
+                )
                 text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await bot.send_message(callback.from_user.id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
                 return
@@ -7695,34 +7934,61 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
             if not await _check_telegram_chat_access(session_acc, callback.from_user.id, bot, callback.from_user.id):
                 return
 
-        await _start_telegram_topic_auto_start(callback.from_user.id, bot, state, switch_res.topic)
+        from system_events import build_topic_resume_system_message
+        synthetic_prompt = build_topic_resume_system_message(switch_res.topic.name)
+        await _start_telegram_hidden_kickoff(callback.from_user.id, bot, state, synthetic_prompt, switch_res.dialogue_id, topic_id)
 
 
-async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot) -> None:
+async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot, state: FSMContext | None = None) -> None:
+    switched = False
+    dialogue_id = 1
     async with user_locks.setdefault(user_id, asyncio.Lock()):
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
-            if not user:
+            if not user or user.current_topic_id is None:
                 return
-            if user.current_topic_id is not None:
-                ai_config = await session.get(AIConfig, 1)
-                memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
-                await _apply_topic_switch(session, user, 0, memory_mode)
-                user.current_topic_id = None
-                await session.commit()
+            ai_config = await session.get(AIConfig, 1)
+            memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
+            await _apply_topic_switch(session, user, 0, memory_mode)
+            user.current_topic_id = None
+            dialogue_id = user.current_dialogue_id
+            switched = True
+            await session.commit()
 
-    await render_static_content_telegram(bot, user_id, user_id, "start_message", is_start=True)
-    await bot.send_message(user_id, "✅ Тема сброшена. Мы вернулись в общий режим диалога.")
+    if not switched:
+        return
+
+    await bot.send_message(user_id, "✅ Мы вернулись в общий режим диалога.")
+
+    async with async_session_maker() as session_acc:
+        user = await session_acc.get(User, user_id)
+        if not user:
+            return
+        if not user.accepted_disclaimer:
+            disclaimer_content = await get_content_from_db("disclaimer")
+            if disclaimer_content.get('is_visible', True):
+                if state:
+                    await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                return
+            else:
+                await session_acc.execute(update(User).where(User.id == user_id).values(accepted_disclaimer=True))
+                await session_acc.commit()
+        if not await _check_telegram_chat_access(session_acc, user_id, bot, user_id):
+            return
+
+    from system_events import build_main_dialogue_resume_system_message
+    synthetic_prompt = build_main_dialogue_resume_system_message()
+    await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, dialogue_id, None)
 
 
 @router.callback_query(F.data == "reset_topic")
-async def process_topic_reset(callback: CallbackQuery, bot: Bot):
+async def process_topic_reset(callback: CallbackQuery, bot: Bot, state: FSMContext | None = None):
     await callback.answer()
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
-    await _perform_telegram_topic_reset_to_main(callback.from_user.id, bot)
+    await _perform_telegram_topic_reset_to_main(callback.from_user.id, bot, state)
 
 
 @router.callback_query(F.data == "topic_select_cancel")
@@ -16777,6 +17043,9 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
     text_to_send = "✅ Память очищена."
     reply_markup = None
     topic_mode_html = "Markdown"
+    topic = None
+    dialogue_id = 1
+    topic_id = None
 
     async with user_locks.setdefault(callback.from_user.id, asyncio.Lock()):
         data = await state.get_data()
@@ -16801,6 +17070,9 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
             await _new_dialogue_update_state(session, user, user.current_topic_id or 0, memory_mode)
 
             topic = user.current_topic
+            topic_id = user.current_topic_id
+            dialogue_id = user.current_dialogue_id
+
             if topic:
                 text_to_send = f"✅ Диалог в теме «{topic.name}» перезапущен. Память очищена."
                 if topic.start_message:
@@ -16817,12 +17089,42 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
     except TelegramBadRequest:
         pass
 
-    await bot.send_message(
-        callback.from_user.id,
-        text_to_send,
-        parse_mode=topic_mode_html,
-        reply_markup=reply_markup
-    )
+    if topic and topic_id is not None:
+        await bot.send_message(
+            callback.from_user.id,
+            text_to_send,
+            parse_mode=topic_mode_html,
+            reply_markup=reply_markup
+        )
+        async with async_session_maker() as s_mark:
+            await record_topic_welcome_shown(s_mark, callback.from_user.id, dialogue_id, topic_id)
+            await s_mark.commit()
+
+        if getattr(topic, "auto_start_dialogue", False):
+            async with async_session_maker() as session_acc:
+                user = await session_acc.get(User, callback.from_user.id)
+                if user and not user.accepted_disclaimer:
+                    disclaimer_content = await get_content_from_db("disclaimer")
+                    if disclaimer_content.get('is_visible', True):
+                        await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                        await state.update_data(
+                            pending_auto_start_topic_id=int(topic_id),
+                            pending_auto_start_dialogue_id=dialogue_id,
+                            pending_auto_start_kind="first_entry",
+                        )
+                        text_to_send_disc = disclaimer_content.get('text') or "Текст дисклеймера не задан."
+                        await bot.send_message(callback.from_user.id, text_to_send_disc, reply_markup=kb.confirm_disclaimer_keyboard())
+                        return
+                    else:
+                        await session_acc.execute(update(User).where(User.id == callback.from_user.id).values(accepted_disclaimer=True))
+                        await session_acc.commit()
+
+                if not await _check_telegram_chat_access(session_acc, callback.from_user.id, bot, callback.from_user.id):
+                    return
+
+            await _start_telegram_topic_auto_start(callback.from_user.id, bot, state, topic, dialogue_id)
+    else:
+        await bot.send_message(callback.from_user.id, text_to_send)
 
 
 @router.callback_query(F.data == "admin_export_all_confirm")
@@ -16966,23 +17268,12 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
                 await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
                 return
 
-            ai_config = await session.get(AIConfig, 1)
-            memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
-            await _apply_topic_switch(session, user, 0, memory_mode)
-            user.current_topic_id = None
-
-            await session.commit()
-
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
 
-    await render_static_content_telegram(bot, callback.from_user.id, callback.from_user.id, "start_message", is_start=True)
-    text = "✅ Вы вернулись в основной режим. Память очищена."
-    if is_global_memory_mode(memory_mode):
-        text = "✅ Вы вернулись в основной режим. Контекст диалога сохранен."
-    await bot.send_message(callback.from_user.id, text)
+    await _perform_telegram_topic_reset_to_main(callback.from_user.id, bot, state)
 
 
 @router.message(F.document, Command("upload_random"))
@@ -17947,7 +18238,10 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
             topic_map = {t.id: t.name for t in topics_res.scalars().all()}
 
             def build_msg_stmt(user_id):
-                stmt = select(DBMessage).where(DBMessage.user_id == user_id)
+                stmt = select(DBMessage).where(
+                    DBMessage.user_id == user_id,
+                    non_technical_role_filter(DBMessage),
+                )
                 if export_topic_id == 0:
                     stmt = stmt.where(DBMessage.topic_id.is_(None))
                 elif export_topic_id is not None:

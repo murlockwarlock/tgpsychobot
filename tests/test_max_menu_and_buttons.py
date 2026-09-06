@@ -322,16 +322,12 @@ async def test_max_reset_topic_static_parser_behavior(db_session):
     mock_client = SimpleNamespace(send_message=AsyncMock())
     await max_topics.reset_topic(mock_client, chat_id=555, user_id=555)
 
-    # 1. render_static_content for start_message (parsed buttons, no raw markdown)
-    # 2. "✅ Тема сброшена." with "⬅️ В меню"
-    assert mock_client.send_message.call_count == 2
-    first_call = mock_client.send_message.call_args_list[0].kwargs
-    assert "Приветствие" in first_call["text"]
-    assert "[Темы]" not in first_call["text"]
-
-    second_call = mock_client.send_message.call_args_list[1].kwargs
-    assert "✅ Тема сброшена." in second_call["text"]
-    assert second_call["attachments"][0]["payload"]["buttons"][0][0]["text"] == "⬅️ В меню"
+    # Return to Main UX (Plan v1.2):
+    # Exactly "✅ Мы вернулись в общий режим диалога." with "⬅️ В меню" button
+    assert mock_client.send_message.call_count == 1
+    call = mock_client.send_message.call_args_list[0].kwargs
+    assert "✅ Мы вернулись в общий режим диалога." in call["text"]
+    assert call["attachments"][0]["payload"]["buttons"][0][0]["text"] == "⬅️ В меню"
 
 
 @pytest.mark.asyncio
