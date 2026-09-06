@@ -13,12 +13,11 @@ from database import (async_session_maker, IndexingQueue, KnowledgeBase, Mailing
                       UserSubscription, Message as DBMessage)
 from file_parser import parse_file
 from mailing_utils import get_mailing_audience_label, send_mailing_content
+from result_history import non_technical_role_filter
 from time_helpers import utc_now
 from vector_store import delete_document_vectors, update_vector_index
 import keyboards as kb
 from error_reporting import notify_admins_about_error
-
-
 class DailyLimitError(Exception):
     pass
 
@@ -346,7 +345,9 @@ async def process_mailings(bot: Bot):
                     elif audience == "self":
                         target_users_stmt = select(User.id).where(User.id == mailing.creator_id)
                     elif audience == "no_dialogue":
-                        subquery = select(DBMessage.user_id, func.count(DBMessage.id).label("msg_count")).group_by(
+                        subquery = select(DBMessage.user_id, func.count(DBMessage.id).label("msg_count")).where(
+                            non_technical_role_filter(DBMessage)
+                        ).group_by(
                             DBMessage.user_id).subquery()
                         target_users_stmt = select(User.id).outerjoin(subquery, User.id == subquery.c.user_id).where(
                             (subquery.c.msg_count == None) | (subquery.c.msg_count <= 1))

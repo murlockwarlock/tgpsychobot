@@ -32,6 +32,7 @@ from ..time_utils import utc_now
 from .subscription_access import load_active_subscription
 from memory_mode import normalize_memory_mode, start_new_dialogue
 from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
+from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
 
 
@@ -569,8 +570,11 @@ async def execute_dialogue_reset(
         return
     await states.clear(user_id)
 
+    topic = None
+    topic_id = None
+    new_dialogue_id = 1
     async with async_session_maker() as session:
-        user = await session.get(User, user_id)
+        user = await session.get(User, user_id, options=[selectinload(User.current_topic)])
         if not user:
             return
         current_d_id = user.current_dialogue_id or 1
@@ -581,6 +585,9 @@ async def execute_dialogue_reset(
 
         config = await session.get(AIConfig, 1)
         await start_new_dialogue(session, user, user.current_topic_id or 0, normalize_memory_mode(config))
+        new_dialogue_id = user.current_dialogue_id
+        topic = user.current_topic
+        topic_id = user.current_topic_id
         await session.execute(
             delete(DBMessage).where(
                 DBMessage.user_id == user_id,
@@ -588,7 +595,80 @@ async def execute_dialogue_reset(
             )
         )
         await session.commit()
-    await client.send_message(chat_id=chat_id, text="✅ Память очищена.", attachments=inline_keyboard([main_menu_row()]))
+
+    if topic and topic_id:
+        from ..formatting import translate_telegram_links_to_max
+        if topic.start_message:
+            text = translate_telegram_links_to_max(topic.start_message)
+        else:
+            text = f"✅ Диалог в теме «{topic.name}» перезапущен. Память очищена."
+
+        auto_start = getattr(topic, "auto_start_dialogue", False)
+        if auto_start:
+            attachments = inline_keyboard([main_menu_row()])
+        else:
+            attachments = inline_keyboard([[
+                callback_button("💬 Начать диалог", "topic_start_dialogue"),
+            ], main_menu_row()])
+
+        await client.send_message(
+            chat_id=chat_id,
+            text=text,
+            attachments=attachments,
+        )
+
+        async with async_session_maker() as s_mark:
+            await record_topic_welcome_shown(s_mark, user_id, new_dialogue_id, topic_id)
+            await s_mark.commit()
+
+        if auto_start:
+            async with async_session_maker() as session:
+                fresh_user = await session.get(User, user_id, options=[selectinload(User.subscription)])
+
+            if fresh_user and not fresh_user.name:
+                await begin_onboarding(
+                    client,
+                    states,
+                    chat_id,
+                    user_id,
+                    resume_data={
+                        "pending_auto_start_topic_id": topic_id,
+                        "pending_auto_start_dialogue_id": new_dialogue_id,
+                        "pending_auto_start_kind": "first_entry",
+                    },
+                )
+                return
+
+            if fresh_user:
+                if await maybe_require_disclaimer(
+                    client,
+                    states,
+                    chat_id,
+                    fresh_user,
+                    resume_data={
+                        "pending_auto_start_topic_id": topic_id,
+                        "pending_auto_start_dialogue_id": new_dialogue_id,
+                        "pending_auto_start_kind": "first_entry",
+                    },
+                ):
+                    return
+
+            if fresh_user and not await ensure_access_before_chat(client, chat_id, fresh_user):
+                return
+
+            from system_events import build_topic_auto_start_system_message
+            synthetic_text = build_topic_auto_start_system_message(topic.name)
+            await run_hidden_ai_kickoff(
+                client,
+                chat_id,
+                user_id,
+                synthetic_text,
+                expected_dialogue_id=new_dialogue_id,
+                expected_topic_id=topic_id,
+                states=states,
+            )
+    else:
+        await client.send_message(chat_id=chat_id, text="✅ Память очищена.", attachments=inline_keyboard([main_menu_row()]))
 
 
 async def ensure_access_before_chat(client: MaxApiClient, chat_id: int, user: User) -> bool:
@@ -645,18 +725,20 @@ async def save_user_message(user_id: int, prompt_text: str) -> None:
         await session.commit()
 
 
-async def save_ai_message(user_id: int, response_text: str) -> None:
+async def save_ai_message(user_id: int, response_text: str, dialogue_id: int | None = None, topic_id: int | None = None) -> None:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
             return
+        target_dialogue_id = dialogue_id if dialogue_id is not None else user.current_dialogue_id
+        target_topic_id = topic_id if topic_id is not None else user.current_topic_id
         session.add(
             DBMessage(
                 user_id=user_id,
                 role="assistant",
                 content=response_text,
-                dialogue_id=user.current_dialogue_id,
-                topic_id=user.current_topic_id,
+                dialogue_id=target_dialogue_id,
+                topic_id=target_topic_id,
             )
         )
         await session.commit()
@@ -750,6 +832,164 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
         chunks = split_text(html_text)
         await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
         log.info("AI dialogue completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
+    except AIServiceError as exc:
+        log.exception("AIServiceError: %s", exc)
+        if thinking_message_id:
+            await client.edit_message(thinking_message_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
+        else:
+            await client.send_message(chat_id=chat_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
+    except Exception:
+        log.exception("Unexpected bot dialogue failure user_id=%s chat_id=%s", user_id, chat_id)
+        if thinking_message_id:
+            await client.edit_message(thinking_message_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+        else:
+            await client.send_message(chat_id=chat_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+
+
+async def run_hidden_ai_kickoff(
+    client: MaxApiClient,
+    chat_id: int,
+    user_id: int,
+    synthetic_prompt: str,
+    expected_dialogue_id: int | None = None,
+    expected_topic_id: int | None = None,
+    states: StateStore | None = None,
+) -> None:
+    log.info(
+        "Hidden AI kickoff requested user_id=%s chat_id=%s expected_d=%s expected_t=%s",
+        user_id,
+        chat_id,
+        expected_dialogue_id,
+        expected_topic_id,
+    )
+    # Pre-call validation
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return
+        if expected_dialogue_id is not None and user.current_dialogue_id != expected_dialogue_id:
+            log.info("Pre-call drop: dialogue_id mismatch (user=%s, expected=%s)", user.current_dialogue_id, expected_dialogue_id)
+            return
+        if expected_topic_id is not None and user.current_topic_id != expected_topic_id:
+            log.info("Pre-call drop: topic_id mismatch (user=%s, expected=%s)", user.current_topic_id, expected_topic_id)
+            return
+        if expected_topic_id is None and user.current_topic_id is not None:
+            log.info("Pre-call drop: expected main (None) but user.current_topic_id=%s", user.current_topic_id)
+            return
+
+    thinking = await client.send_message(chat_id=chat_id, text="🤖 Думаю...")
+    thinking_message_id = ((thinking.get("message") or {}).get("mid") if isinstance(thinking, dict) else None)
+
+    topic_phrase = None
+    if expected_topic_id:
+        topic_phrase = await get_random_message_by_topic(expected_topic_id)
+    final_prompt = synthetic_prompt
+    if topic_phrase:
+        final_prompt = f"{synthetic_prompt}\n\nКонтекст для ответа: {topic_phrase}"
+
+    try:
+        response_text = await get_ai_response(user_id, final_prompt)
+        if not response_text or not response_text.strip():
+            raise AIServiceError("ИИ вернул пустой ответ")
+
+        # Post-call validation
+        async with async_session_maker() as session:
+            db_user = await session.get(User, user_id)
+            if not db_user:
+                return
+            if expected_dialogue_id is not None and db_user.current_dialogue_id != expected_dialogue_id:
+                log.info("Post-call drop: dialogue_id mismatch (user=%s, expected=%s)", db_user.current_dialogue_id, expected_dialogue_id)
+                if thinking_message_id:
+                    try:
+                        await client.delete_message(thinking_message_id)
+                    except Exception:
+                        pass
+                return
+            if expected_topic_id is not None and db_user.current_topic_id != expected_topic_id:
+                log.info("Post-call drop: topic_id mismatch (user=%s, expected=%s)", db_user.current_topic_id, expected_topic_id)
+                if thinking_message_id:
+                    try:
+                        await client.delete_message(thinking_message_id)
+                    except Exception:
+                        pass
+                return
+            if expected_topic_id is None and db_user.current_topic_id is not None:
+                log.info("Post-call drop: expected main (None) but user.current_topic_id=%s", db_user.current_topic_id)
+                if thinking_message_id:
+                    try:
+                        await client.delete_message(thinking_message_id)
+                    except Exception:
+                        pass
+                return
+
+        should_start_test, response_without_test_directive = extract_test_start_directive(response_text)
+        await save_ai_message(user_id, response_without_test_directive, dialogue_id=expected_dialogue_id, topic_id=expected_topic_id)
+
+        if should_start_test:
+            clean_text = response_without_test_directive
+            if clean_text:
+                await client.edit_message(thinking_message_id, text=markdown_to_html(clean_text))
+            elif thinking_message_id:
+                await client.edit_message(thinking_message_id, text="Запускаю тест.")
+            from .tests import start_test
+
+            await start_test(client, chat_id, user_id, states)
+            return
+
+        clean_response_text, response_buttons = extract_response_buttons(response_without_test_directive)
+
+        # Check for image generation directive GEN_IMG: [...] or [IMG: ...]
+        img_match = re.search(r"GEN_IMG:\s*\[(.*?)\]|\[IMG:\s*(.*?)\]", clean_response_text, re.DOTALL)
+        if img_match:
+            img_prompt = (img_match.group(1) or img_match.group(2) or "").strip()
+            clean_text = re.sub(r"GEN_IMG:\s*\[.*?\]|\[IMG:\s*.*?\]", "", clean_response_text, flags=re.DOTALL).strip()
+            buttons_sent = False
+            if thinking_message_id and clean_text:
+                await client.edit_message(
+                    thinking_message_id,
+                    text=markdown_to_html(clean_text),
+                    attachments=_response_buttons_keyboard(response_buttons),
+                )
+                thinking_message_id = None
+                buttons_sent = bool(response_buttons)
+            elif clean_text:
+                await client.send_message(
+                    chat_id=chat_id,
+                    text=markdown_to_html(clean_text),
+                    attachments=_response_buttons_keyboard(response_buttons),
+                )
+                buttons_sent = bool(response_buttons)
+            try:
+                img_bytes = await generate_image(img_prompt)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(img_bytes)
+                    tmp_path = tmp.name
+                try:
+                    result = await client.upload_file("image", tmp_path)
+                    token = result.get("token") or result.get("fileId")
+                    if token:
+                        await client.send_media_attachment(chat_id=chat_id, media_type="image", token=token)
+                    else:
+                        await client.send_message(chat_id=chat_id, text="⚠️ Изображение сгенерировано, но не удалось отправить.")
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
+            except Exception as img_exc:
+                log.exception("Image generation failed user_id=%s: %s", user_id, img_exc)
+                await client.send_message(chat_id=chat_id, text="⚠️ Не удалось создать изображение. Попробуйте позже.")
+            if response_buttons and not buttons_sent:
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Выберите действие:",
+                    attachments=_response_buttons_keyboard(response_buttons),
+                )
+            return
+
+        if not clean_response_text and response_buttons:
+            clean_response_text = "Выберите действие:"
+        html_text = markdown_to_html(clean_response_text)
+        chunks = split_text(html_text)
+        await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
+        log.info("Hidden AI kickoff completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)
         if thinking_message_id:
@@ -937,23 +1177,68 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
     if not user:
         return
 
+    pending_kind = data.get("pending_auto_start_kind")
     pending_topic_id = data.get("pending_auto_start_topic_id")
-    if pending_topic_id:
-        if user.current_topic_id != int(pending_topic_id):
+    pending_dialogue_id = data.get("pending_auto_start_dialogue_id")
+
+    if pending_kind == "main_resume" or (pending_kind is None and pending_topic_id is None and "pending_auto_start_dialogue_id" in data):
+        if user.current_topic_id is not None:
             return
-        async with async_session_maker() as session:
-            topic = await session.get(Topic, int(pending_topic_id))
-        if not topic or not topic.is_active or (topic.admin_only and not user.is_admin) or not getattr(topic, "auto_start_dialogue", False):
-            await client.send_message(chat_id=chat_id, text="Тема недоступна.")
+        if pending_dialogue_id is not None and user.current_dialogue_id != int(pending_dialogue_id):
             return
         if not user.accepted_disclaimer and states is not None:
-            if await maybe_require_disclaimer(client, states, chat_id, user, resume_data={"pending_auto_start_topic_id": pending_topic_id}):
+            if await maybe_require_disclaimer(client, states, chat_id, user, resume_data=data):
                 return
         if not await ensure_access_before_chat(client, chat_id, user):
             return
-        from system_events import build_topic_auto_start_system_message
-        synthetic_text = build_topic_auto_start_system_message(topic.name)
-        await run_ai_dialogue(client, chat_id, user_id, synthetic_text, states=states)
+        from system_events import build_main_dialogue_resume_system_message
+        synthetic_text = build_main_dialogue_resume_system_message()
+        await run_hidden_ai_kickoff(
+            client,
+            chat_id,
+            user_id,
+            synthetic_text,
+            expected_dialogue_id=user.current_dialogue_id,
+            expected_topic_id=None,
+            states=states,
+        )
+        return
+
+    if pending_topic_id is not None:
+        topic_id_int = int(pending_topic_id)
+        if user.current_topic_id != topic_id_int:
+            return
+        if pending_dialogue_id is not None and user.current_dialogue_id != int(pending_dialogue_id):
+            return
+        async with async_session_maker() as session:
+            topic = await session.get(Topic, topic_id_int)
+        if not topic or not topic.is_active or (topic.admin_only and not user.is_admin):
+            await client.send_message(chat_id=chat_id, text="Тема недоступна.")
+            return
+        if pending_kind == "first_entry" and not getattr(topic, "auto_start_dialogue", False):
+            return
+        if not user.accepted_disclaimer and states is not None:
+            if await maybe_require_disclaimer(client, states, chat_id, user, resume_data=data):
+                return
+        if not await ensure_access_before_chat(client, chat_id, user):
+            return
+
+        if pending_kind == "resume":
+            from system_events import build_topic_resume_system_message
+            synthetic_text = build_topic_resume_system_message(topic.name)
+        else:
+            from system_events import build_topic_auto_start_system_message
+            synthetic_text = build_topic_auto_start_system_message(topic.name)
+
+        await run_hidden_ai_kickoff(
+            client,
+            chat_id,
+            user_id,
+            synthetic_text,
+            expected_dialogue_id=user.current_dialogue_id,
+            expected_topic_id=topic_id_int,
+            states=states,
+        )
         return
 
     initial_prompt = data.get("initial_prompt")

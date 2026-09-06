@@ -9,7 +9,7 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 
 from ..api import MaxApiClient
 from ..identity import is_max_user_id, max_communication_name, max_username, raw_max_user_id
@@ -18,7 +18,8 @@ from ..legacy import Message as DBMessage, User, async_session_maker
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 from ..time_utils import format_msk
-from result_history import TEST_RESULT_ROLE
+from result_history import TEST_RESULT_ROLE, non_technical_role_filter
+
 
 
 PAGE_SIZE = 10
@@ -64,7 +65,7 @@ async def show_export_clients(
             await session.execute(
                 select(User)
                 .where(User.id >= MAX_ID_OFFSET)
-                .outerjoin(DBMessage, User.id == DBMessage.user_id)
+                .outerjoin(DBMessage, and_(User.id == DBMessage.user_id, non_technical_role_filter(DBMessage)))
                 .group_by(User.id)
                 .order_by(func.max(DBMessage.timestamp).desc().nulls_last(), User.created_at.desc())
                 .offset(page * PAGE_SIZE)
@@ -341,7 +342,7 @@ async def run_mass_export(
 
         messages_by_user: dict[int, list[DBMessage]] = {uid: [] for uid in user_ids}
         if user_ids:
-            msg_stmt = select(DBMessage).where(DBMessage.user_id.in_(user_ids))
+            msg_stmt = select(DBMessage).where(DBMessage.user_id.in_(user_ids), non_technical_role_filter(DBMessage))
             if date_from:
                 msg_stmt = msg_stmt.where(DBMessage.timestamp >= date_from)
             if date_to:
@@ -350,7 +351,7 @@ async def run_mass_export(
             for message in messages:
                 messages_by_user.setdefault(message.user_id, []).append(message)
 
-        topic_rows = (await session.execute(select(DBMessage.topic_id).distinct())).scalars().all()
+        topic_rows = (await session.execute(select(DBMessage.topic_id).where(non_technical_role_filter(DBMessage)).distinct())).scalars().all()
         topic_ids = [tid for tid in topic_rows if tid is not None]
         topic_map: dict[int, str] = {}
         if topic_ids:

@@ -22,6 +22,7 @@ from ..models import MAX_ID_OFFSET, REUSABLE_ATTACHMENT_TYPES, IncomingMessage, 
 from ..storage import StateStore
 from ..time_utils import utc_now
 from .subscription_access import effective_subscription_filters
+from result_history import non_technical_role_filter
 
 
 PAGE_SIZE = 10
@@ -295,7 +296,10 @@ async def _get_recipient_ids(session, audience: str, user_id: int) -> list[int]:
         return list((await session.execute(stmt)).scalars().all())
 
     if audience == "no_dialogue":
-        subquery = select(DBMessage.id).where(DBMessage.user_id == User.id)
+        subquery = select(DBMessage.id).where(
+            DBMessage.user_id == User.id,
+            non_technical_role_filter(DBMessage),
+        )
         return list((await session.execute(stmt.where(not_(exists(subquery))))).scalars().all())
 
     if audience == "no_subscription":

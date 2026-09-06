@@ -130,7 +130,7 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_drain_race_window_a_during_provider_call(self):
         """Window A: User sends real message while provider call is actively in-flight -> processed sequentially."""
         async with self.session_factory() as session:
-            user = User(id=110, first_name="Alice", name="Alice", gender="female", age="25", accepted_disclaimer=True, current_dialogue_id=1)
+            user = User(id=110, first_name="Alice", name="Alice", gender="female", age="25", accepted_disclaimer=True, current_dialogue_id=1, current_topic_id=1)
             topic = Topic(id=1, name="Карьера", is_active=True, auto_start_dialogue=True)
             session.add_all([user, topic])
             await session.commit()
@@ -176,7 +176,7 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_drain_race_window_b_between_empty_and_unregister_event_barrier(self):
         """Window B: Message arrives after queue empty check but before runner unregisters -> atomic handoff schedules replacement."""
         async with self.session_factory() as session:
-            user = User(id=111, first_name="Bob", name="Bob", gender="male", age="30", accepted_disclaimer=True, current_dialogue_id=1)
+            user = User(id=111, first_name="Bob", name="Bob", gender="male", age="30", accepted_disclaimer=True, current_dialogue_id=1, current_topic_id=2)
             topic = Topic(id=2, name="Отношения", is_active=True, auto_start_dialogue=True)
             session.add_all([user, topic])
             await session.commit()
@@ -234,7 +234,7 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_drain_race_window_c_immediately_after_unregister(self):
         """Window C: Message arrives immediately after runner task has completed and popped -> schedules fresh runner."""
         async with self.session_factory() as session:
-            user = User(id=112, first_name="Charlie", name="Charlie", gender="male", age="22", accepted_disclaimer=True, current_dialogue_id=1)
+            user = User(id=112, first_name="Charlie", name="Charlie", gender="male", age="22", accepted_disclaimer=True, current_dialogue_id=1, current_topic_id=3)
             topic = Topic(id=3, name="Саморазвитие", is_active=True, auto_start_dialogue=True)
             session.add_all([user, topic])
             await session.commit()
@@ -643,10 +643,10 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 215).order_by(DBMessage.id.asc()))).scalars().all()
             self.assertEqual(len(msgs), 2)
-            self.assertEqual(msgs[0].role, "user")
+            self.assertEqual(msgs[0].role, "topic_welcome")
             self.assertEqual(msgs[0].topic_id, 30)
             self.assertEqual(msgs[0].dialogue_id, 2)
-            self.assertIn("СИСТЕМНОЕ СООБЩЕНИЕ", msgs[0].content)
+            self.assertEqual(msgs[0].content, "shown")
 
             self.assertEqual(msgs[1].role, "assistant")
             self.assertEqual(msgs[1].topic_id, 30)

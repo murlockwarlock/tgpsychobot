@@ -238,7 +238,7 @@ async def test_telegram_primary_journey_topic_to_main(db_session):
     # 3. Assert start/main interface and confirmation rendered
     assert mock_bot.send_message.call_count >= 1
     sent_texts = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in mock_bot.send_message.call_args_list]
-    assert any("✅ Тема сброшена. Мы вернулись в общий режим диалога." in t for t in sent_texts)
+    assert any("✅ Мы вернулись в общий режим диалога." in t for t in sent_texts)
 
     # 4. Next ordinary user message
     handlers.user_message_buffers.setdefault(3001, []).append("Новый вопрос в основном диалоге")

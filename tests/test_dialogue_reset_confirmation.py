@@ -574,13 +574,16 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 312).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs), 3)
-            self.assertEqual(msgs[1].content, "Новый вопрос в теме отношения")
+            self.assertEqual(len(msgs), 4)
+            self.assertEqual(msgs[1].role, "topic_welcome")
             self.assertEqual(msgs[1].dialogue_id, 2)
             self.assertEqual(msgs[1].topic_id, 20)
-            self.assertEqual(msgs[2].content, "Ответ по теме отношения")
+            self.assertEqual(msgs[2].content, "Новый вопрос в теме отношения")
             self.assertEqual(msgs[2].dialogue_id, 2)
             self.assertEqual(msgs[2].topic_id, 20)
+            self.assertEqual(msgs[3].content, "Ответ по теме отношения")
+            self.assertEqual(msgs[3].dialogue_id, 2)
+            self.assertEqual(msgs[3].topic_id, 20)
 
     async def test_telegram_journey_d_topic_reset_to_main(self):
         """Journey D: In Topic B -> Reset to Main -> Topic None -> next message responds in main mode."""
@@ -619,32 +622,42 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
         cb_main.message = MagicMock()
         cb_main.message.delete = AsyncMock()
 
-        await handlers.process_reset_topic_to_main(cb_main, state, bot)
-        cb_main.answer.assert_called_once_with()
-
-        async with self.session_factory() as session:
-            u = await session.get(User, 313)
-            self.assertIsNone(u.current_topic_id)
-
-        # User sends next message
-        msg_next = MagicMock()
-        msg_next.from_user = SimpleNamespace(id=313, username="dmitry", full_name="Dmitry")
-        msg_next.chat = SimpleNamespace(id=313)
-        msg_next.text = "Вопрос в основном режиме"
-
         with patch("handlers.ai_integration.generate_response", AsyncMock(return_value="Ответ в основном режиме")):
+            await handlers.process_reset_topic_to_main(cb_main, state, bot)
+            cb_main.answer.assert_called_once_with()
+
+            while handlers._has_user_turn_work(313) or (313 in handlers.user_processing_tasks and not handlers.user_processing_tasks[313].done()):
+                task = handlers.user_processing_tasks.get(313)
+                if task:
+                    await task
+                await asyncio.sleep(0.01)
+
+            async with self.session_factory() as session:
+                u = await session.get(User, 313)
+                self.assertIsNone(u.current_topic_id)
+
+            # User sends next message
+            msg_next = MagicMock()
+            msg_next.from_user = SimpleNamespace(id=313, username="dmitry", full_name="Dmitry")
+            msg_next.chat = SimpleNamespace(id=313)
+            msg_next.text = "Вопрос в основном режиме"
+
             await handlers.handle_ai_chat(msg_next, state, bot)
-            task = handlers.user_processing_tasks.get(313)
-            if task:
-                await task
+            while handlers._has_user_turn_work(313) or (313 in handlers.user_processing_tasks and not handlers.user_processing_tasks[313].done()):
+                task = handlers.user_processing_tasks.get(313)
+                if task:
+                    await task
+                await asyncio.sleep(0.01)
 
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 313).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs), 3)
-            self.assertEqual(msgs[1].content, "Вопрос в основном режиме")
+            self.assertEqual(len(msgs), 4)
+            self.assertEqual(msgs[1].role, "assistant")
             self.assertIsNone(msgs[1].topic_id)
-            self.assertEqual(msgs[2].content, "Ответ в основном режиме")
+            self.assertEqual(msgs[2].content, "Вопрос в основном режиме")
             self.assertIsNone(msgs[2].topic_id)
+            self.assertEqual(msgs[3].content, "Ответ в основном режиме")
+            self.assertIsNone(msgs[3].topic_id)
 
     async def test_max_cancel_invalidates_future_confirm(self):
         """MAX: Cancel clears confirm_reset state; subsequent confirm callback no-ops with zero DB mutation."""
@@ -894,3 +907,94 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(msgs[0].dialogue_id, 2)
             self.assertEqual(msgs[0].content, "Новый вопрос в новом диалоге")
             self.assertEqual(msgs[1].dialogue_id, 2)
+
+    async def test_telegram_reset_topic_to_main_blocked_delete_race_does_not_reset_new_topic(self):
+        """Atomic transition prevents post-delete stale transition from resetting subsequent Topic B scope."""
+        async with self.session_factory() as session:
+            topic_a = Topic(id=50, name="Topic A", is_active=True)
+            topic_b = Topic(id=60, name="Topic B", is_active=True)
+            user = User(id=307, name="Alice", gender="female", age="25", accepted_disclaimer=True, current_dialogue_id=5, current_topic_id=50)
+            session.add_all([topic_a, topic_b, user])
+            await session.commit()
+
+        state_data = {
+            "reset_token": "token_a5",
+            "reset_dialogue_id": 5,
+            "reset_topic_id": 50,
+        }
+
+        async def fake_get_data():
+            return dict(state_data)
+
+        async def fake_update_data(**kwargs):
+            state_data.update(kwargs)
+
+        state = MagicMock()
+        state.get_data = AsyncMock(side_effect=fake_get_data)
+        state.update_data = AsyncMock(side_effect=fake_update_data)
+        state.set_state = AsyncMock()
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+
+        delete_entered = asyncio.Event()
+        delete_proceed = asyncio.Event()
+
+        async def slow_delete():
+            delete_entered.set()
+            await delete_proceed.wait()
+
+        cb = MagicMock()
+        cb.from_user = SimpleNamespace(id=307)
+        cb.data = "reset_topic_to_main:token_a5"
+        cb.answer = AsyncMock()
+        cb.message = MagicMock()
+        cb.message.answer = AsyncMock()
+        cb.message.delete = AsyncMock(side_effect=slow_delete)
+
+        # 1. Start process_reset_topic_to_main task in background
+        reset_task = asyncio.create_task(handlers.process_reset_topic_to_main(cb, state, bot))
+
+        # Wait until delete is entered (atomic validation + Topic A transition already ran)
+        await delete_entered.wait()
+
+        # 2. While delete is blocked, user is navigated to Topic B / dialogue 6
+        async with self.session_factory() as session:
+            u = await session.get(User, 307)
+            u.current_topic_id = 60
+            u.current_dialogue_id = 6
+            await session.commit()
+
+        # 3. Resume delete and let process_reset_topic_to_main finish
+        delete_proceed.set()
+        await reset_task
+
+        # 4. Verification:
+        async with self.session_factory() as session:
+            u_final = await session.get(User, 307)
+            # Final scope MUST remain Topic B / dialogue 6 (not reset to main None!)
+            self.assertEqual(u_final.current_topic_id, 60)
+            self.assertEqual(u_final.current_dialogue_id, 6)
+
+        # Ensure no main kickoff is queued/running for the stale action against Topic B
+        # Next normal user message works in B/6
+        msg = MagicMock()
+        msg.from_user = SimpleNamespace(id=307, username="alice", full_name="Alice")
+        msg.chat = SimpleNamespace(id=307)
+        msg.text = "Сообщение в теме B"
+        with patch("handlers.ai_integration.generate_response", AsyncMock(return_value="Ответ в B")):
+            await handlers.handle_ai_chat(msg, state, bot)
+            while handlers._has_user_turn_work(307) or (307 in handlers.user_processing_tasks and not handlers.user_processing_tasks[307].done()):
+                task = handlers.user_processing_tasks.get(307)
+                if task:
+                    await task
+                await asyncio.sleep(0.01)
+
+        async with self.session_factory() as session:
+            db_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 307).order_by(DBMessage.id.asc()))).scalars().all()
+            self.assertGreaterEqual(len(db_msgs), 2)
+            self.assertEqual(db_msgs[-2].content, "Сообщение в теме B")
+            self.assertEqual(db_msgs[-2].topic_id, 60)
+            self.assertEqual(db_msgs[-2].dialogue_id, 6)
+            self.assertEqual(db_msgs[-1].topic_id, 60)
+            self.assertEqual(db_msgs[-1].dialogue_id, 6)

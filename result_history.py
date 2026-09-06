@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from database import Message, TestAttempt
 from response_buttons import extract_response_buttons
@@ -17,7 +17,10 @@ from user_metadata import extract_data_blocks, extract_service_data
 
 
 TEST_RESULT_ROLE = "test_result"
+TOPIC_WELCOME_ROLE = "topic_welcome"
+TECHNICAL_ROLES = (TOPIC_WELCOME_ROLE,)
 CONVERSATION_ROLES = ("user", "assistant")
+VISIBLE_HISTORY_ROLES = (*CONVERSATION_ROLES, TEST_RESULT_ROLE)
 AI_HISTORY_ROLES = (*CONVERSATION_ROLES, TEST_RESULT_ROLE)
 
 
@@ -30,6 +33,23 @@ class AIHistoryMessage:
     source_role: str = "user"
 
 
+def is_technical_role(role: str | None) -> bool:
+    return role in TECHNICAL_ROLES
+
+
+def non_technical_role_filter(message_model=Message):
+    """Filter out internal technical message roles (e.g. topic_welcome) while preserving conversational/legacy roles."""
+    return or_(
+        message_model.role.is_(None),
+        ~message_model.role.in_(TECHNICAL_ROLES),
+    )
+
+
+def visible_history_role_filter(message_model=Message):
+    """Filter messages for human-visible history, exports, and conversational activity."""
+    return non_technical_role_filter(message_model)
+
+
 def conversation_role_filter(message_model=Message):
     return message_model.role.in_(CONVERSATION_ROLES)
 
@@ -38,11 +58,78 @@ def ai_history_role_filter(message_model=Message):
     return message_model.role.in_(AI_HISTORY_ROLES)
 
 
+async def is_topic_welcome_shown(session, user_id: int, dialogue_id: int, topic_id: int) -> bool:
+    """Return True if the topic welcome was already shown in the given (dialogue_id, topic_id) scope."""
+    stmt = (
+        select(Message.id)
+        .where(
+            Message.user_id == user_id,
+            Message.dialogue_id == dialogue_id,
+            Message.topic_id == topic_id,
+            Message.role == TOPIC_WELCOME_ROLE,
+        )
+        .limit(1)
+    )
+    return (await session.scalar(stmt)) is not None
+
+
+async def record_topic_welcome_shown(
+    session,
+    user_id: int,
+    dialogue_id: int,
+    topic_id: int,
+    content: str = "shown",
+) -> Message:
+    """Persist a technical marker recording that the topic welcome has been sent."""
+    marker = Message(
+        user_id=user_id,
+        dialogue_id=dialogue_id,
+        topic_id=topic_id,
+        role=TOPIC_WELCOME_ROLE,
+        content=content,
+        timestamp=datetime.utcnow(),
+    )
+    session.add(marker)
+    return marker
+
+
+async def resolve_topic_entry_state(
+    session,
+    user_id: int,
+    dialogue_id: int,
+    topic_id: int,
+) -> bool:
+    """Resolve whether topic welcome was already shown in (dialogue_id, topic_id) scope.
+
+    Returns True if welcome was already shown (resume), False if first entry (show welcome).
+    For legacy dialogues lacking topic_welcome marker but containing conversational history
+    (user, assistant, or test_result), treats as resume and lazily records the marker.
+    """
+    if await is_topic_welcome_shown(session, user_id, dialogue_id, topic_id):
+        return True
+
+    has_history = await session.scalar(
+        select(Message.id).where(
+            Message.user_id == user_id,
+            Message.dialogue_id == dialogue_id,
+            Message.topic_id == topic_id,
+            Message.role.in_(VISIBLE_HISTORY_ROLES),
+        ).limit(1)
+    ) is not None
+
+    if has_history:
+        await record_topic_welcome_shown(session, user_id, dialogue_id, topic_id, content="legacy_resume")
+        return True
+
+    return False
+
+
 def select_ai_history_messages(
     messages: list[Any],
     limit_first: int,
     limit_recent: int,
 ) -> list[Any]:
+
     normalized: list[Any] = []
     for message in messages:
         if message.role == TEST_RESULT_ROLE:
