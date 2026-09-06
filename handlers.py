@@ -1788,6 +1788,12 @@ async def process_buffered_messages(
         except asyncio.CancelledError:
             pass
 
+    async def _check_scope_guard() -> bool:
+        if scoped_kickoff is not None:
+            if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
+                return False
+        return True
+
     typing_task = asyncio.create_task(keep_typing_loop())
     processing_message = None
     ai_config = None
@@ -1811,15 +1817,8 @@ async def process_buffered_messages(
         ai_context_content = response_capture.get("raw_response") or response_text
 
         # Post-call validation for scoped hidden kickoff
-        if scoped_kickoff is not None:
-            if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
-                return
-
-        async def _check_scope_guard() -> bool:
-            if scoped_kickoff is not None:
-                if not await _telegram_scoped_kickoff_is_current(user_id, scoped_kickoff.expected_dialogue_id, scoped_kickoff.expected_topic_id):
-                    return False
-            return True
+        if not await _check_scope_guard():
+            return
 
         should_start_test, directive_clean_text = extract_test_start_directive(response_text)
         if should_start_test:
@@ -2207,6 +2206,8 @@ async def process_buffered_messages(
             extra={"prompt_len": len(full_text)},
             exception=e,
         )
+        if not await _check_scope_guard():
+            return
         await bot.send_message(
             chat_id=user_id,
             text="Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут.",
@@ -2225,6 +2226,8 @@ async def process_buffered_messages(
             extra={"prompt_len": len(full_text)},
             exception=e,
         )
+        if not await _check_scope_guard():
+            return
         await bot.send_message(
             chat_id=user_id,
             text="Произошла ошибка при обработке сообщения.",

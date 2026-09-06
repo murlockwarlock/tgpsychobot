@@ -2259,3 +2259,125 @@ async def test_choice_img_hidden_real_process_buffered_messages_and_stale_drop(d
     # But selection prompt was NOT sent because scope check failed!
     prompt_msgs_race = [call for call in bot.send_message.mock_calls if "Выбери карту, которая тебе откликается:" in str(call)]
     assert len(prompt_msgs_race) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_cls,error_text_needle",
+    [
+        (handlers.AIServiceError, "Упс..."),
+        (RuntimeError, "Произошла ошибка"),
+    ],
+)
+async def test_stale_hidden_kickoff_error_ui_suppression_and_normal_failure_preservation(
+    db_session, monkeypatch, error_cls, error_text_needle
+):
+    """
+    1. AIServiceError/Generic Exception during stale kickoff:
+       -> Scope changes in DB while provider is in-flight
+       -> Error message is NOT sent into new scope
+       -> No DB messages persisted
+       -> Final scope remains Topic B / dialogue 2
+       -> Next normal user message in Topic B works normally
+    2. Ordinary user turn failure:
+       -> Normal user message with error still receives visible error message
+    """
+    await seed_env(db_session, auto_start=True)
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    # Seed topic 10 and topic 20
+    async with db_session() as session:
+        t10 = await session.get(Topic, 10)
+        if not t10:
+            session.add(Topic(id=10, name="Topic 10", is_active=True))
+        t20 = await session.get(Topic, 20)
+        if not t20:
+            session.add(Topic(id=20, name="Topic 20", is_active=True))
+
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 1
+        await session.commit()
+
+    provider_entered = asyncio.Event()
+    provider_proceed = asyncio.Event()
+
+    async def blocking_generate_response(*args, **kwargs):
+        provider_entered.set()
+        await provider_proceed.wait()
+        if error_cls is handlers.AIServiceError:
+            raise handlers.AIServiceError("Provider failure")
+        else:
+            raise error_cls("Generic failure")
+
+    monkeypatch.setattr("handlers.ai_integration.generate_response", blocking_generate_response)
+    monkeypatch.setattr("ai_integration.generate_response", blocking_generate_response)
+
+    # 1. Start hidden kickoff against Topic 10 / dialogue 1
+    kickoff = handlers.ScopedAIKickoff(
+        user_id=1001,
+        expected_dialogue_id=1,
+        expected_topic_id=10,
+        synthetic_prompt="[kickoff prompt]",
+        is_hidden=True,
+    )
+    task = asyncio.create_task(handlers.process_buffered_messages(1001, bot, state, scoped_kickoff=kickoff))
+
+    await provider_entered.wait()
+
+    # While blocked: switch DB state to Topic 20 / dialogue 2
+    async with db_session() as session:
+        u = await session.get(User, 1001)
+        u.current_topic_id = 20
+        u.current_dialogue_id = 2
+        await session.commit()
+
+    # Release provider to raise exception
+    provider_proceed.set()
+    await task
+
+    # Assertions for stale kickoff failure:
+    # No visible error message sent to user
+    sent_err_stale = [call for call in bot.send_message.mock_calls if error_text_needle in str(call)]
+    assert len(sent_err_stale) == 0
+
+    # User in DB remains Topic 20 / dialogue 2
+    async with db_session() as session:
+        u_check = await session.get(User, 1001)
+        assert u_check.current_topic_id == 20
+        assert u_check.current_dialogue_id == 2
+        # No assistant/user messages from stale kickoff persisted
+        msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 1001).order_by(DBMessage.id.asc()))).scalars().all()
+        assert len(msgs) == 0
+
+    # Next normal message in Topic 20 works normally
+    handlers.user_message_buffers.setdefault(1001, []).append("Вопрос в теме 20")
+    monkeypatch.setattr("handlers.ai_integration.generate_response", AsyncMock(return_value="Ответ в теме 20"))
+    await handlers.process_buffered_messages(1001, bot, state)
+
+    async with db_session() as session:
+        u_after = await session.get(User, 1001)
+        assert u_after.current_topic_id == 20
+        assert u_after.current_dialogue_id == 2
+        msgs_after = (await session.execute(select(DBMessage).where(DBMessage.user_id == 1001).order_by(DBMessage.id.asc()))).scalars().all()
+        assert len(msgs_after) >= 2
+        assert msgs_after[-2].content == "Вопрос в теме 20"
+        assert msgs_after[-2].topic_id == 20
+        assert msgs_after[-2].dialogue_id == 2
+        assert msgs_after[-1].content == "Ответ в теме 20"
+        assert msgs_after[-1].topic_id == 20
+        assert msgs_after[-1].dialogue_id == 2
+
+    # 2. Ordinary user message turn failure: visible error IS sent
+    bot.reset_mock()
+    handlers.user_message_buffers.setdefault(1001, []).append("Обычное сообщение с ошибкой")
+    if error_cls is handlers.AIServiceError:
+        monkeypatch.setattr("handlers.ai_integration.generate_response", AsyncMock(side_effect=handlers.AIServiceError("Provider failure")))
+    else:
+        monkeypatch.setattr("handlers.ai_integration.generate_response", AsyncMock(side_effect=error_cls("Generic failure")))
+
+    await handlers.process_buffered_messages(1001, bot, state)
+
+    sent_err_normal = [call for call in bot.send_message.mock_calls if error_text_needle in str(call)]
+    assert len(sent_err_normal) == 1
