@@ -1109,7 +1109,10 @@ async def get_ai_response(
                 raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}") from primary_err
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
-        visible_text, _, _ = extract_service_data(result)
+        visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+        if invalid_data_blocks:
+            log.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+
         ai_log = AILog(
             user_id=user_id,
             request_type="chat",
@@ -1127,12 +1130,29 @@ async def get_ai_response(
             topic_id=active_topic_id,
             topic_name=active_topic.name if active_topic else None,
         )
-        try:
-            session.add(ai_log)
-            await session.commit()
-        except Exception:
-            log.exception("Could not save shared AI log for user %s", user_id)
-        return result
+        session.add(ai_log)
+
+        if service_blocks:
+            try:
+                await apply_service_data_blocks(
+                    session,
+                    user=user,
+                    dialogue_id=active_dialogue_id,
+                    topic_id=active_topic_id,
+                    blocks=service_blocks,
+                )
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                log.exception("Could not save shared AI log / service data for user %s: %s", user_id, exc)
+                raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
+        else:
+            try:
+                await session.commit()
+            except Exception:
+                log.exception("Could not save shared AI log for user %s", user_id)
+
+        return visible_text
 
 
 async def get_ai_response_direct(
@@ -1193,15 +1213,20 @@ async def get_ai_response_direct(
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             if user:
-                await apply_service_data_blocks(
-                    session,
-                    user=user,
-                    dialogue_id=active_dialogue_id,
-                    topic_id=active_topic_id,
-                    blocks=service_blocks,
-                )
-                await session.commit()
-    return visible_text or result
+                try:
+                    await apply_service_data_blocks(
+                        session,
+                        user=user,
+                        dialogue_id=active_dialogue_id,
+                        topic_id=active_topic_id,
+                        blocks=service_blocks,
+                    )
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    log.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
+                    raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
+    return visible_text
 
 
 # ---------------------------------------------------------------------------
@@ -1450,11 +1475,13 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         runtime_parts = [_build_client_runtime_context(user)]
         if getattr(user, "response_length", "normal") == "short":
             runtime_parts.append("Отвечай кратко, по делу, без длинных вступлений.")
+        active_dialogue_id = user.current_dialogue_id
+        active_topic_id = user.current_topic_id
         scenario_context = await build_runtime_automation_context(
             session,
             user_id=user.id,
-            dialogue_id=user.current_dialogue_id,
-            topic_id=user.current_topic_id,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
         )
         request_layout = AIRequestLayout(
             stable_system_prompt=system_prompt,
@@ -1468,23 +1495,46 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для vision не задан")
-        return await _analyze_gemini(api_key, config.vision_model or "gemini-3.7-flash", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
-    if provider in {"Claude", "Anthropic"}:
+        raw_result = await _analyze_gemini(api_key, config.vision_model or "gemini-3.7-flash", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+    elif provider in {"Claude", "Anthropic"}:
         api_key = config.claude_api_key
         if not api_key:
             raise AIServiceError("API ключ Claude для vision не задан")
-        return await _analyze_claude(api_key, config.vision_model or "claude-sonnet-5", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
-    if provider == "KIE":
+        raw_result = await _analyze_claude(api_key, config.vision_model or "claude-sonnet-5", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+    elif provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
         model = config.vision_model or "gemini-3-flash"
-        return await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
-    # Default: OpenAI
-    api_key = config.openai_api_key
-    if not api_key:
-        raise AIServiceError("API ключ OpenAI для vision не задан")
-    return await _analyze_openai(api_key, config.vision_model or "gpt-5.6-terra", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+    else:
+        # Default: OpenAI
+        api_key = config.openai_api_key
+        if not api_key:
+            raise AIServiceError("API ключ OpenAI для vision не задан")
+        raw_result = await _analyze_openai(api_key, config.vision_model or "gpt-5.6-terra", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+
+    visible_text, service_blocks, invalid_data_blocks = extract_service_data(raw_result)
+    if invalid_data_blocks:
+        log.warning("Vision AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+    if service_blocks:
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if user:
+                try:
+                    await apply_service_data_blocks(
+                        session,
+                        user=user,
+                        dialogue_id=active_dialogue_id,
+                        topic_id=active_topic_id,
+                        blocks=service_blocks,
+                    )
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    log.exception("Could not save vision service data for user %s: %s", user_id, exc)
+                    raise AIServiceError(f"Ошибка сохранения метаданных анализа изображения: {exc}") from exc
+    return visible_text
 
 
 # ---------------------------------------------------------------------------

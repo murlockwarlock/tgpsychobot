@@ -54,6 +54,9 @@ class _SessionContext:
     async def execute(self, statement):
         return _Rows([])
 
+    def add(self, item):
+        pass
+
     async def commit(self):
         self.committed = True
 
