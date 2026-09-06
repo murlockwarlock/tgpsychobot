@@ -25,12 +25,16 @@ from database import (
     Base,
     BotGeneralConfig,
     Content,
+    MediaCollection,
+    MediaLibrary,
     Message as DBMessage,
     SubscriptionConfig,
     Topic,
     User,
     UserSubscription,
     UserTopicState,
+    media_collection_items,
+    topic_collection_association,
 )
 import max_messenger_bot.legacy as max_legacy
 import max_messenger_bot.storage as max_storage
@@ -2144,3 +2148,114 @@ async def test_mailing_and_stats_technical_role_isolation(db_session):
     stats_text = client.send_message.call_args[1]["text"]
     # Total messages for MAX users: max_user_id (0 non-technical) + max_active_user_id (2 non-technical: user + assistant) = 2
     assert "<b>Сообщений всего:</b> 2" in stats_text
+
+
+@pytest.mark.asyncio
+async def test_choice_img_hidden_real_process_buffered_messages_and_stale_drop(db_session, monkeypatch):
+    """
+    A. Normal AI response with [CHOICE_IMG_HIDDEN: cards | 2]:
+       -> send_card_album sends back cards
+       -> selection prompt 'Выбери карту, которая тебе откликается:' sent
+       -> card_selection_keyboard contains the actual card IDs
+    B. Hidden scoped kickoff with scope change between album delivery and selection prompt:
+       -> album sent
+       -> scope check fails
+       -> selection prompt NOT sent into new scope
+    """
+    await seed_env(db_session, auto_start=True)
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    # Seed media library with back card and 2 cards in category "cards"
+    async with db_session() as session:
+        collection = MediaCollection(name="Test Cards")
+        session.add(collection)
+        await session.flush()
+        cards = [
+            MediaLibrary(id=200, category="cards", file_name="_back", file_id="file_back_123", media_type="photo"),
+            MediaLibrary(id=201, category="cards", file_name="card1", file_id="file_card_201", media_type="photo"),
+            MediaLibrary(id=202, category="cards", file_name="card2", file_id="file_card_202", media_type="photo"),
+        ]
+        session.add_all(cards)
+        await session.flush()
+        await session.execute(
+            topic_collection_association.insert().values(topic_id=10, collection_id=collection.id)
+        )
+        await session.execute(
+            media_collection_items.insert(),
+            [{"collection_id": collection.id, "media_id": c.id} for c in cards],
+        )
+        await session.commit()
+
+    # A. Normal AI response
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 1
+        await session.commit()
+
+    monkeypatch.setattr(
+        "handlers.ai_integration.generate_response",
+        AsyncMock(return_value="Вот расклад:\n[CHOICE_IMG_HIDDEN: cards | 2]"),
+    )
+
+    sent_albums = []
+    async def mock_send_card_album(b, cid, file_ids, **kwargs):
+        sent_albums.append((cid, file_ids))
+
+    monkeypatch.setattr("handlers.send_card_album", mock_send_card_album)
+
+    # Put a message in user_message_buffers to simulate normal turn
+    handlers.user_message_buffers.setdefault(1001, []).append("Покажи карты")
+    await handlers.process_buffered_messages(1001, bot, state)
+
+    # Verify album sent with back card file_id
+    assert len(sent_albums) == 1
+    assert sent_albums[0][1] == ["file_back_123", "file_back_123"]
+
+    # Verify selection prompt message sent with card IDs in reply_markup
+    prompt_msgs = [call for call in bot.send_message.mock_calls if "Выбери карту, которая тебе откликается:" in str(call)]
+    assert len(prompt_msgs) == 1
+    # Check that inline keyboard contains buttons with callback_data containing card ids 201 and 202
+    call_args, call_kwargs = prompt_msgs[0][1], prompt_msgs[0][2] if len(prompt_msgs[0]) > 2 else prompt_msgs[0].kwargs
+    kb = call_kwargs.get("reply_markup")
+    assert kb is not None
+    inline_kbs = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    assert any("201" in data for data in inline_kbs)
+    assert any("202" in data for data in inline_kbs)
+
+    # B. Hidden scoped kickoff: album completes, scope changes before selection prompt -> prompt dropped
+    bot.reset_mock()
+    sent_albums.clear()
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 1
+        await session.commit()
+
+    async def race_send_card_album(b, cid, file_ids, **kwargs):
+        sent_albums.append((cid, file_ids))
+        # Switch user scope in DB to main right after album completes before selection prompt
+        async with db_session() as s:
+            u = await s.get(User, 1001)
+            u.current_topic_id = None
+            u.current_dialogue_id = 2
+            await s.commit()
+
+    monkeypatch.setattr("handlers.send_card_album", race_send_card_album)
+
+    kickoff = handlers.ScopedAIKickoff(
+        user_id=1001,
+        expected_dialogue_id=1,
+        expected_topic_id=10,
+        synthetic_prompt="[СИСТЕМНОЕ СООБЩЕНИЕ: kickoff]",
+        is_hidden=True,
+    )
+    await handlers.process_buffered_messages(1001, bot, state, scoped_kickoff=kickoff)
+
+    # Album was sent
+    assert len(sent_albums) == 1
+    # But selection prompt was NOT sent because scope check failed!
+    prompt_msgs_race = [call for call in bot.send_message.mock_calls if "Выбери карту, которая тебе откликается:" in str(call)]
+    assert len(prompt_msgs_race) == 0

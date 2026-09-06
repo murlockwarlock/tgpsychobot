@@ -28,6 +28,7 @@ from aiogram.filters import CommandStart, Command, StateFilter, Filter, CommandO
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select, func, update, delete, or_, and_, cast, String, desc
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile
@@ -2069,7 +2070,13 @@ async def process_buffered_messages(
                         [c.file_id for c in cards],
                         context="process_buffered_messages.choice_spread",
                     )
-                    await bot.send_message(chat_id=user_id, text="Выбери карту, которая тебе откликается:", reply_markup=keyboards.card_selection_keyboard(cat, [c.id for c in cards]))
+                    if not await _check_scope_guard():
+                        return
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text="Выбери карту, которая тебе откликается:",
+                        reply_markup=keyboards.card_selection_keyboard(cat, [c.id for c in cards]),
+                    )
 
             for match in choices_hidden:
                 cat_stripped = match[0].strip()
@@ -2109,6 +2116,13 @@ async def process_buffered_messages(
                             [back_media.file_id for _ in cards],
                             context="process_buffered_messages.hidden_choice_spread",
                         )
+                    if not await _check_scope_guard():
+                        return
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text="Выбери карту, которая тебе откликается:",
+                        reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]),
+                    )
             if not await _check_scope_guard():
                 return
 
@@ -7985,32 +7999,33 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
     )
 
 
-async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot, state: FSMContext | None = None) -> None:
-    switched = False
-    dialogue_id = 1
-    async with user_locks.setdefault(user_id, asyncio.Lock()):
-        async with async_session_maker() as session:
-            user = await session.get(User, user_id)
-            if not user or user.current_topic_id is None:
-                return
-            ai_config = await session.get(AIConfig, 1)
-            memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
-            await _apply_topic_switch(session, user, 0, memory_mode)
-            user.current_topic_id = None
-            dialogue_id = user.current_dialogue_id
-            switched = True
-            await session.commit()
+async def _transition_to_main_db_locked(session: AsyncSession, user: User) -> int:
+    ai_config = await session.get(AIConfig, 1)
+    memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
+    await _apply_topic_switch(session, user, 0, memory_mode)
+    user.current_topic_id = None
+    dialogue_id = user.current_dialogue_id
+    await session.commit()
+    return dialogue_id
 
-    if not switched:
-        return
+
+async def _complete_telegram_main_continuation(
+    user_id: int,
+    dialogue_id: int,
+    bot: Bot,
+    state: FSMContext | None = None,
+) -> None:
+    async with async_session_maker() as session_acc:
+        user = await session_acc.get(User, user_id)
+        if not user or user.current_topic_id is not None or user.current_dialogue_id != dialogue_id:
+            return
+
+        accepted_disclaimer = user.accepted_disclaimer
 
     await bot.send_message(user_id, "✅ Мы вернулись в общий режим диалога.")
 
-    async with async_session_maker() as session_acc:
-        user = await session_acc.get(User, user_id)
-        if not user:
-            return
-        if not user.accepted_disclaimer:
+    if not accepted_disclaimer:
+        async with async_session_maker() as session_acc:
             disclaimer_content = await get_content_from_db("disclaimer")
             if disclaimer_content.get('is_visible', True):
                 if state:
@@ -8026,12 +8041,29 @@ async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot, state: F
             else:
                 await session_acc.execute(update(User).where(User.id == user_id).values(accepted_disclaimer=True))
                 await session_acc.commit()
+
+    async with async_session_maker() as session_acc:
         if not await _check_telegram_chat_access(session_acc, user_id, bot, user_id):
             return
 
     from system_events import build_main_dialogue_resume_system_message
     synthetic_prompt = build_main_dialogue_resume_system_message()
     await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, dialogue_id, None)
+
+
+async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot, state: FSMContext | None = None) -> None:
+    dialogue_id = None
+    async with user_locks.setdefault(user_id, asyncio.Lock()):
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user or user.current_topic_id is None:
+                return
+            dialogue_id = await _transition_to_main_db_locked(session, user)
+
+    if dialogue_id is None:
+        return
+
+    await _complete_telegram_main_continuation(user_id, dialogue_id, bot, state)
 
 
 @router.callback_query(F.data == "reset_topic")
@@ -17284,31 +17316,44 @@ async def export_date_to_input(message: Message, state: FSMContext):
 async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
     token = callback.data.split(":", 1)[1] if ":" in callback.data else ""
+    user_id = callback.from_user.id
 
-    async with user_locks.setdefault(callback.from_user.id, asyncio.Lock()):
+    status = "ok"
+    dialogue_id = None
+
+    async with user_locks.setdefault(user_id, asyncio.Lock()):
         data = await state.get_data()
         expected_token = data.get("reset_token")
 
         if not expected_token or expected_token != token:
-            await callback.message.answer("Подтверждение устарело или уже использовано.")
-            return
+            status = "stale_token"
+        else:
+            expected_dialogue_id = data.get("reset_dialogue_id")
+            expected_topic_id = data.get("reset_topic_id")
+            await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
 
-        expected_dialogue_id = data.get("reset_dialogue_id")
-        expected_topic_id = data.get("reset_topic_id")
-        await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                if not user or user.current_topic_id is None or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
+                    status = "scope_mismatch"
+                else:
+                    dialogue_id = await _transition_to_main_db_locked(session, user)
 
-        async with async_session_maker() as session:
-            user = await session.get(User, callback.from_user.id)
-            if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
-                await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
-                return
+    if status == "stale_token":
+        await callback.message.answer("Подтверждение устарело или уже использовано.")
+        return
+
+    if status == "scope_mismatch":
+        await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
+        return
 
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
 
-    await _perform_telegram_topic_reset_to_main(callback.from_user.id, bot, state)
+    if dialogue_id is not None:
+        await _complete_telegram_main_continuation(user_id, dialogue_id, bot, state)
 
 
 @router.message(F.document, Command("upload_random"))
