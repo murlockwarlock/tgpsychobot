@@ -934,7 +934,7 @@ async def test_max_deepseek_topic_request_payload_complete_and_sanitized(monkeyp
     assert len(session.added) == 1
     log_entry = session.added[0]
     assert log_entry.provider == "Deepseek"
-    assert log_entry.model == "deepseek-chat"
+    assert log_entry.model == "deepseek-v4-flash"
     assert log_entry.context_kind == "topic"
     assert log_entry.topic_id == 15
 
@@ -1149,6 +1149,69 @@ async def test_max_fallback_orchestration_persists_fallback_payload_only(monkeyp
     # 4. Sanitization
     assert "primary-gemini-secret-key-111" not in log_entry.request_payload
     assert "fallback-openai-secret-key-222" not in log_entry.request_payload
+
+
+@pytest.mark.asyncio
+async def test_max_deepseek_fallback_legacy_alias_persists_normalized_model_and_payload(monkeypatch):
+    _MockHttpxClient.calls.clear()
+    _MockOpenAIClient.calls.clear()
+
+    # Primary Gemini will fail
+    class _FailingGeminiClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            raise Exception("Gemini service unavailable 503")
+
+    monkeypatch.setattr(max_ai.httpx, "AsyncClient", _FailingGeminiClient)
+    monkeypatch.setattr(max_ai, "AsyncOpenAI", _MockOpenAIClient)
+
+    user = _max_user()
+    config = _max_config()
+    config.provider = "Gemini"
+    config.gemini_api_key = "primary-gemini-secret-key-111"
+    config.gemini_model = "gemini-3.7-flash"
+    config.allow_fallback = True
+    config.fallback_provider = "Deepseek"
+    config.fallback_model = "deepseek-chat"  # legacy alias
+    config.deepseek_api_key = "fallback-deepseek-secret-key-333"
+    session = _MaxAISession(user, config)
+
+    monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
+    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+
+    result = await max_ai.get_ai_response(user.id, "Вопрос для DeepSeek фолбэка")
+
+    assert result == "Mocked OpenAI response"
+    assert len(session.added) == 1
+    log_entry = session.added[0]
+
+    # 1. Final provider and model correspond to DeepSeek fallback
+    assert log_entry.provider == "Deepseek"
+    assert log_entry.model == "deepseek-v4-flash"
+
+    # 2. Assert payload exists first
+    assert log_entry.request_payload
+    parsed = json.loads(log_entry.request_payload)
+
+    # 3. Final request_payload is DeepSeek fallback request with normalized model
+    assert parsed["provider"] == "Deepseek"
+    assert parsed["endpoint"] == "https://api.deepseek.com/chat/completions"
+    assert parsed["payload"]["model"] == log_entry.model
+    assert parsed["payload"]["model"] == "deepseek-v4-flash"
+    assert "gemini" not in parsed["endpoint"].lower()
+    assert "gemini" not in parsed["provider"].lower()
+
+    # 4. Sanitization
+    assert "primary-gemini-secret-key-111" not in log_entry.request_payload
+    assert "fallback-deepseek-secret-key-333" not in log_entry.request_payload
 
 
 @pytest.mark.asyncio

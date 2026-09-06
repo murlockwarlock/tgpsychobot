@@ -97,13 +97,33 @@ def _resolve_log_model(ai_config: AIConfig, provider: str | None) -> str:
     provider_key = (provider or "").strip().lower()
     model_field = "claude_model" if provider_key in {"claude", "anthropic"} else f"{provider_key}_model"
     model = getattr(ai_config, model_field, None)
-    if model:
-        return str(model)
-    try:
-        model = get_default_model(provider_key, channel="chat")
-    except Exception:
-        model = None
+    if not model:
+        try:
+            model = get_default_model(provider_key, channel="chat")
+        except Exception:
+            model = None
+    if provider_key == "deepseek" and model:
+        model = normalize_deepseek_model(str(model))
     return str(model or "—")
+
+
+def _extract_effective_provider_and_model(
+    request_capture: dict | None,
+    default_provider: str,
+    default_model: str,
+) -> tuple[str, str]:
+    if not request_capture:
+        return default_provider, default_model
+    provider = request_capture.get("provider") or default_provider
+    payload = request_capture.get("payload")
+    if isinstance(payload, dict) and payload.get("model"):
+        return provider, str(payload["model"])
+    endpoint = str(request_capture.get("endpoint") or "")
+    if "/models/" in endpoint:
+        candidate = endpoint.split("/models/", 1)[1].split(":", 1)[0].split("?", 1)[0].strip()
+        if candidate:
+            return provider, candidate
+    return provider, default_model
 
 
 _CURRENT_AI_CONTEXT = object()
@@ -1009,14 +1029,13 @@ async def get_ai_response(
         start_time = time.monotonic()
         request_capture: dict = {}
         try:
-            try:
-                result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture)
-            except TypeError as type_err:
-                if "request_capture" in str(type_err):
-                    result = await _dispatch_provider(ai_config, request_layout)
-                else:
-                    raise
-            log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, active_topic_id)
+            result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture)
+            actual_provider, actual_model = _extract_effective_provider_and_model(
+                request_capture,
+                default_provider=actual_provider,
+                default_model=actual_model,
+            )
+            log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, actual_provider, active_topic_id)
         except (AIServiceError, Exception) as primary_err:
             # Clear request_capture so failed attempt payload is not retained
             request_capture.clear()
@@ -1068,10 +1087,13 @@ async def get_ai_response(
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
                         result = _validate_text_response(result, provider=fb_key)
-                        actual_provider = str(fb_provider)
-                        actual_model = str(fb_model)
+                        actual_provider, actual_model = _extract_effective_provider_and_model(
+                            request_capture,
+                            default_provider=str(fb_provider),
+                            default_model=str(fb_model),
+                        )
                         fallback_succeeded = True
-                        log.info("Fallback response generated user_id=%s provider=%s", user_id, fb_provider)
+                        log.info("Fallback response generated user_id=%s provider=%s", user_id, actual_provider)
                     except Exception as fb_err:
                         request_capture.clear()
                         log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
