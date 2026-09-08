@@ -1129,6 +1129,9 @@ async def init_db():
             if 'is_enabled' not in mailing_columns:
                 sync_conn.execute(text("ALTER TABLE mailings ADD COLUMN is_enabled BOOLEAN DEFAULT TRUE NOT NULL"))
 
+            AutomationDialogueState.__table__.create(sync_conn, checkfirst=True)
+            UserAIActivity.__table__.create(sync_conn, checkfirst=True)
+
         await conn.run_sync(_check_and_migrate)
 
     async with async_session_maker() as session:
@@ -1264,6 +1267,36 @@ class AutomationConversationState(Base):
     current_step = Column(String, nullable=True)
     current_state_json = Column(Text, default='{}', nullable=False)
     metadata_json = Column(Text, default='{}', nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class AutomationDialogueState(Base):
+    """Global algorithm metadata scoped to one user and dialogue across all topics."""
+
+    __tablename__ = 'automation_dialogue_states'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'dialogue_id', name='uq_automation_dialogue_states_user_dialogue'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    dialogue_id = Column(Integer, nullable=False, default=1)
+    metadata_json = Column(Text, default='{}', nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class UserAIActivity(Base):
+    """Tracks the last outbound user-driven AI activity per user and scope."""
+
+    __tablename__ = 'user_ai_activities'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'scope_key', name='uq_user_ai_activities_user_scope'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    scope_key = Column(String, nullable=False)
+    last_request_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

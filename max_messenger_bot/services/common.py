@@ -656,8 +656,16 @@ async def execute_dialogue_reset(
             if fresh_user and not await ensure_access_before_chat(client, chat_id, fresh_user):
                 return
 
-            from system_events import build_topic_auto_start_system_message
+            from system_events import build_topic_auto_start_system_message, record_navigation_system_event
             synthetic_text = build_topic_auto_start_system_message(topic.name)
+            async with async_session_maker() as session:
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=user_id,
+                    dialogue_id=new_dialogue_id,
+                    topic_id=topic_id,
+                    text=synthetic_text,
+                )
             await run_hidden_ai_kickoff(
                 client,
                 chat_id,
@@ -666,6 +674,7 @@ async def execute_dialogue_reset(
                 expected_dialogue_id=new_dialogue_id,
                 expected_topic_id=topic_id,
                 states=states,
+                exclude_message_id=nav_msg.id,
             )
     else:
         await client.send_message(chat_id=chat_id, text="✅ Память очищена.", attachments=inline_keyboard([main_menu_row()]))
@@ -708,21 +717,22 @@ async def begin_onboarding(client: MaxApiClient, states: StateStore, chat_id: in
     await client.send_message(chat_id=chat_id, text="Прежде чем начнём, как мне к вам обращаться?")
 
 
-async def save_user_message(user_id: int, prompt_text: str) -> None:
+async def save_user_message(user_id: int, prompt_text: str) -> DBMessage | None:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
-            return
-        session.add(
-            DBMessage(
-                user_id=user_id,
-                role="user",
-                content=prompt_text,
-                dialogue_id=user.current_dialogue_id,
-                topic_id=user.current_topic_id,
-            )
+            return None
+        msg = DBMessage(
+            user_id=user_id,
+            role="user",
+            content=prompt_text,
+            dialogue_id=user.current_dialogue_id,
+            topic_id=user.current_topic_id,
         )
+        session.add(msg)
         await session.commit()
+        await session.refresh(msg)
+        return msg
 
 
 async def save_ai_message(user_id: int, response_text: str, dialogue_id: int | None = None, topic_id: int | None = None) -> None:
@@ -746,7 +756,8 @@ async def save_ai_message(user_id: int, response_text: str, dialogue_id: int | N
 
 async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prompt_text: str, states: StateStore | None = None) -> None:
     log.info("AI dialogue requested user_id=%s chat_id=%s", user_id, chat_id)
-    await save_user_message(user_id, prompt_text)
+    user_msg = await save_user_message(user_id, prompt_text)
+    exclude_message_id = user_msg.id if user_msg else None
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Думаю...")
     thinking_message_id = ((thinking.get("message") or {}).get("mid") if isinstance(thinking, dict) else None)
 
@@ -760,7 +771,7 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
         final_prompt = f"{prompt_text}\n\nКонтекст для ответа: {topic_phrase}"
 
     try:
-        response_text = await get_ai_response(user_id, final_prompt)
+        response_text = await get_ai_response(user_id, final_prompt, exclude_message_id=exclude_message_id)
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ")
 
@@ -854,6 +865,7 @@ async def run_hidden_ai_kickoff(
     expected_dialogue_id: int | None = None,
     expected_topic_id: int | None = None,
     states: StateStore | None = None,
+    exclude_message_id: int | None = None,
 ) -> None:
     log.info(
         "Hidden AI kickoff requested user_id=%s chat_id=%s expected_d=%s expected_t=%s",
@@ -888,7 +900,7 @@ async def run_hidden_ai_kickoff(
         final_prompt = f"{synthetic_prompt}\n\nКонтекст для ответа: {topic_phrase}"
 
     try:
-        response_text = await get_ai_response(user_id, final_prompt)
+        response_text = await get_ai_response(user_id, final_prompt, exclude_message_id=exclude_message_id)
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ")
 
@@ -1191,8 +1203,16 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
                 return
         if not await ensure_access_before_chat(client, chat_id, user):
             return
-        from system_events import build_main_dialogue_resume_system_message
+        from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
         synthetic_text = build_main_dialogue_resume_system_message()
+        async with async_session_maker() as session:
+            nav_msg = await record_navigation_system_event(
+                session,
+                user_id=user_id,
+                dialogue_id=user.current_dialogue_id,
+                topic_id=None,
+                text=synthetic_text,
+            )
         await run_hidden_ai_kickoff(
             client,
             chat_id,
@@ -1201,6 +1221,7 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
             expected_dialogue_id=user.current_dialogue_id,
             expected_topic_id=None,
             states=states,
+            exclude_message_id=nav_msg.id,
         )
         return
 
@@ -1224,11 +1245,20 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
             return
 
         if pending_kind == "resume":
-            from system_events import build_topic_resume_system_message
+            from system_events import build_topic_resume_system_message, record_navigation_system_event
             synthetic_text = build_topic_resume_system_message(topic.name)
         else:
-            from system_events import build_topic_auto_start_system_message
+            from system_events import build_topic_auto_start_system_message, record_navigation_system_event
             synthetic_text = build_topic_auto_start_system_message(topic.name)
+
+        async with async_session_maker() as session:
+            nav_msg = await record_navigation_system_event(
+                session,
+                user_id=user_id,
+                dialogue_id=user.current_dialogue_id,
+                topic_id=topic_id_int,
+                text=synthetic_text,
+            )
 
         await run_hidden_ai_kickoff(
             client,
@@ -1238,6 +1268,7 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
             expected_dialogue_id=user.current_dialogue_id,
             expected_topic_id=topic_id_int,
             states=states,
+            exclude_message_id=nav_msg.id,
         )
         return
 

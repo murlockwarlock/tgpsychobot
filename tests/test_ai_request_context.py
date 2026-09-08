@@ -420,10 +420,12 @@ async def test_real_get_ai_response_preserves_deepseek_golden_prefix(monkeypatch
     assert len(_CompletionClient.calls) == 2
     payloads = _CompletionClient.calls
     expected_stable = "STABLE CONFIGURED TOPIC PROMPT\n\nSHARED BLOCK\n\nSERVICE BLOCK"
-    for user, session, payload in zip(users, sessions, payloads):
+    target_sessions = [s for s in sessions if s.added]
+    for user, session, payload in zip(users, target_sessions, payloads):
         messages = payload["messages"]
         expected_dynamic = (
             f"ДАННЫЕ КЛИЕНТА:\nИМЯ: {user.name}\nПОЛ: {user.gender}\nВОЗРАСТ: {user.age}"
+            "\n\nВРЕМЕННОЙ КОНТЕКСТ:\nminutes_since_last_visit: 0\nminutes_since_last_message: 0"
             "\n\nCURRENT_STATE STATE_X METADATA META_X"
         )
         assert messages[:2] == [

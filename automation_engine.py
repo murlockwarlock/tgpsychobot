@@ -10,12 +10,15 @@ from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import (
+    AIConfig,
     AutomationConversationState,
+    AutomationDialogueState,
     AutomationEvent,
     AutomationMetadataRecord,
     AutomationStepTransition,
     User,
 )
+from memory_mode import MEMORY_MODE_GLOBAL, get_memory_mode
 from user_metadata import (
     ServiceDataBlock,
     append_metadata_records,
@@ -87,27 +90,115 @@ async def get_conversation_automation_state(
     )
 
 
+async def get_dialogue_automation_state(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    dialogue_id: int,
+) -> AutomationDialogueState | None:
+    return await session.scalar(
+        select(AutomationDialogueState).where(
+            AutomationDialogueState.user_id == user_id,
+            AutomationDialogueState.dialogue_id == dialogue_id,
+        )
+    )
+
+
+async def get_or_lazy_init_dialogue_automation_state(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    dialogue_id: int,
+    active_topic_id: int | None = None,
+) -> AutomationDialogueState:
+    """Return existing AutomationDialogueState or lazily initialize it using the Zero-Conflict algorithm."""
+    existing = await get_dialogue_automation_state(
+        session,
+        user_id=user_id,
+        dialogue_id=dialogue_id,
+    )
+    if existing is not None:
+        return existing
+
+    # Zero-Conflict Lazy Init:
+    # 1. Check active topic within this dialogue
+    scope_active_topic = active_topic_id or 0
+    active_state = await session.scalar(
+        select(AutomationConversationState).where(
+            AutomationConversationState.user_id == user_id,
+            AutomationConversationState.dialogue_id == dialogue_id,
+            AutomationConversationState.topic_id == scope_active_topic,
+        )
+    )
+    seed_dict: dict[str, Any] = {}
+    if active_state and _load_object(active_state.metadata_json):
+        seed_dict = _load_object(active_state.metadata_json)
+    else:
+        # 2. Find all topics in THIS dialogue with non-empty metadata
+        topic_states = (await session.execute(
+            select(AutomationConversationState).where(
+                AutomationConversationState.user_id == user_id,
+                AutomationConversationState.dialogue_id == dialogue_id,
+            )
+        )).scalars().all()
+        non_empty = [
+            m for s in topic_states
+            if (m := _load_object(s.metadata_json))
+        ]
+        if len(non_empty) == 1:
+            seed_dict = non_empty[0]
+        else:
+            # 0 or >1 (conflict): seed with {}
+            seed_dict = {}
+
+    row = AutomationDialogueState(
+        user_id=user_id,
+        dialogue_id=dialogue_id,
+        metadata_json=_dump_object(seed_dict),
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
 async def build_runtime_automation_context(
     session: AsyncSession,
     *,
     user_id: int,
     dialogue_id: int,
     topic_id: int | None,
+    memory_mode: str | None = None,
 ) -> str:
     """Return dynamic state as a separate runtime message for the LLM."""
+    if memory_mode is None:
+        ai_conf = await session.get(AIConfig, 1)
+        mode = get_memory_mode(ai_conf) if ai_conf else "reset"
+    else:
+        mode = memory_mode
+
     row = await get_conversation_automation_state(
         session,
         user_id=user_id,
         dialogue_id=dialogue_id,
         topic_id=topic_id,
     )
-    if row is None:
-        payload = {"current_state": {}, "metadata": {}}
+    current_state = _load_object(getattr(row, "current_state_json", None)) if row is not None else {}
+
+    if mode == MEMORY_MODE_GLOBAL:
+        dialogue_state = await get_or_lazy_init_dialogue_automation_state(
+            session,
+            user_id=user_id,
+            dialogue_id=dialogue_id,
+            active_topic_id=topic_id,
+        )
+        metadata = _load_object(getattr(dialogue_state, "metadata_json", None)) if dialogue_state is not None else {}
     else:
-        payload = {
-            "current_state": _load_object(row.current_state_json),
-            "metadata": _load_object(row.metadata_json),
-        }
+        metadata = _load_object(getattr(row, "metadata_json", None)) if row is not None else {}
+
+    payload = {
+        "current_state": current_state,
+        "metadata": metadata,
+    }
     return (
         "СЛУЖЕБНЫЕ ДАННЫЕ ТЕКУЩЕГО ДИАЛОГА. Не показывай их пользователю:\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -121,6 +212,7 @@ async def apply_service_data_blocks(
     dialogue_id: int,
     topic_id: int | None,
     blocks: Iterable[ServiceDataBlock],
+    memory_mode: str | None = None,
 ) -> AutomationApplyResult:
     """Atomically persist a model response in the current dialogue scope."""
     blocks = list(blocks)
@@ -136,6 +228,12 @@ async def apply_service_data_blocks(
     structured_blocks = [block for block in blocks if not block.legacy]
     if not structured_blocks:
         return AutomationApplyResult(False, None, None, ())
+
+    if memory_mode is None:
+        ai_conf = await session.get(AIConfig, 1)
+        mode = get_memory_mode(ai_conf) if ai_conf else "reset"
+    else:
+        mode = memory_mode
 
     scope_topic_id = topic_id or 0
     scope_dialogue_id = dialogue_id or 1
@@ -155,7 +253,19 @@ async def apply_service_data_blocks(
 
     previous_step = row.current_step
     current_state = _load_object(row.current_state_json)
-    current_metadata = _load_object(row.metadata_json)
+
+    if mode == MEMORY_MODE_GLOBAL:
+        dialogue_state = await get_or_lazy_init_dialogue_automation_state(
+            session,
+            user_id=user.id,
+            dialogue_id=scope_dialogue_id,
+            active_topic_id=scope_topic_id,
+        )
+        current_metadata = _load_object(dialogue_state.metadata_json)
+    else:
+        dialogue_state = None
+        current_metadata = _load_object(row.metadata_json)
+
     event_names: list[str] = []
 
     for block in structured_blocks:
@@ -186,8 +296,12 @@ async def apply_service_data_blocks(
 
     current_step = _step_from_state(current_state)
     row.current_state_json = _dump_object(current_state)
-    row.metadata_json = _dump_object(current_metadata)
     row.current_step = current_step
+
+    if mode == MEMORY_MODE_GLOBAL and dialogue_state is not None:
+        dialogue_state.metadata_json = _dump_object(current_metadata)
+    else:
+        row.metadata_json = _dump_object(current_metadata)
 
     state_changed = bool(current_step and current_step != previous_step)
     if state_changed:

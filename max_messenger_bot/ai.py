@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+from datetime import datetime
 import uuid
 
 import anthropic
@@ -20,12 +21,18 @@ from sqlalchemy.orm import selectinload
 import gemini_image
 
 from ai_log_context import apply_ai_log_context
+from ai_request_builder import (
+    ActivityTracker,
+    build_conversational_request_layout,
+    build_isolated_request_layout,
+    get_user_ai_activity_gaps,
+)
 from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, async_session_maker
 from .legacy import AILog
 from .logging_utils import configure_logging, get_ai_logger
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context
 from user_metadata import extract_service_data
-from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
+from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, get_memory_mode, normalize_memory_mode
 from result_history import ai_history_role_filter, select_ai_history_messages
 from error_reporting import classify_ai_error, exception_summary
 from vector_store import search_relevant_chunks
@@ -825,6 +832,7 @@ async def _dispatch_provider(
     messages: list[dict] | None = None,
     *,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     provider, temperature = _resolve_provider(ai_config)
     layout = (
@@ -832,6 +840,9 @@ async def _dispatch_provider(
         if isinstance(request_layout, AIRequestLayout)
         else _legacy_layout(messages, request_layout)
     )
+
+    if activity_tracker is not None:
+        await activity_tracker.mark_outbound_attempt_once()
 
     if provider == "openai":
         if not ai_config.openai_api_key:
@@ -925,11 +936,20 @@ async def get_ai_response(
     *,
     topic_id_override: int | None | object = _CURRENT_AI_CONTEXT,
     dialogue_id_override: int | None = None,
+    exclude_message_id: int | None = None,
+    track_user_activity: bool = True,
+    activity_tracker: ActivityTracker | None = None,
+    minutes_since_last_visit: int | None = None,
+    minutes_since_last_message: int | None = None,
+    request_type: str = "chat",
 ) -> str:
     async with async_session_maker() as session:
         user = await session.scalar(
             select(User)
-            .options(selectinload(User.current_topic).selectinload(Topic.knowledge_base_files))
+            .options(
+                selectinload(User.current_topic).selectinload(Topic.knowledge_base_files),
+                selectinload(User.subscription),
+            )
             .where(User.id == user_id)
         )
         if not user:
@@ -956,11 +976,6 @@ async def get_ai_response(
         actual_model = _resolve_log_model(ai_config, actual_provider)
 
         stable_system_prompt = _build_user_system_prompt(user, ai_config, active_topic)
-        shared_instructions = tuple(
-            block
-            for block in ((getattr(ai_config, "shared_prompt_block", None) or "").strip(),)
-            if block
-        )
 
         relevant_chunks = []
         if active_topic:
@@ -983,53 +998,61 @@ async def get_ai_response(
 
         context = "\n\n".join(relevant_chunks)
 
-        current_memory_mode = normalize_memory_mode(ai_config)
-        history_scope = _build_max_history_scope(user, current_memory_mode, active_topic_id, active_dialogue_id)
-        history_rows = (
-            await session.execute(
-                select(DBMessage)
-                .options(selectinload(DBMessage.topic))
-                .where(history_scope, ai_history_role_filter(DBMessage))
-                .order_by(DBMessage.timestamp.asc())
+        if minutes_since_last_visit is None or minutes_since_last_message is None:
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(
+                session,
+                user_id=user.id,
+                topic_id=active_topic_id,
             )
-        ).scalars().all()
+            if minutes_since_last_visit is None:
+                minutes_since_last_visit = gap_visit
+            if minutes_since_last_message is None:
+                minutes_since_last_message = gap_msg
 
-        limit_first = getattr(ai_config, "context_limit_first", 2) or 2
-        limit_recent = getattr(ai_config, "context_limit_recent", 10) or 10
+        if activity_tracker is None:
+            activity_tracker = ActivityTracker(
+                async_session_maker,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                request_time=datetime.utcnow(),
+                track_user_activity=track_user_activity,
+            )
 
-        history_rows = select_ai_history_messages(history_rows, limit_first, limit_recent)
-        history_messages = [
-            {"role": row.role, "content": row.content}
-            for row in history_rows
-            if row.content
-        ]
-        if history_messages and history_messages[-1]["role"] == "user" and history_messages[-1]["content"] == user_prompt:
-            history_messages.pop()
-
-        runtime_parts = [_build_client_runtime_context(user)]
-        if getattr(user, "response_length", "normal") == "short":
-            runtime_parts.append("Отвечай кратко, по делу, без длинных вступлений.")
         scenario_context = await build_runtime_automation_context(
             session,
             user_id=user.id,
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
+            memory_mode=get_memory_mode(ai_config),
         )
-        request_context = (context,) if context else ()
-        request_layout = AIRequestLayout(
-            stable_system_prompt=stable_system_prompt,
-            shared_instructions=shared_instructions,
-            runtime_context=tuple(runtime_parts),
-            scenario_context=(scenario_context,) if scenario_context else (),
-            request_context=request_context,
-            history=normalize_request_messages(history_messages),
+
+        request_layout = await build_conversational_request_layout(
+            session,
+            user=user,
+            ai_config=ai_config,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
             current_user_content=user_prompt,
+            exclude_message_id=exclude_message_id,
+            stable_system_prompt=stable_system_prompt,
+            minutes_since_last_visit=minutes_since_last_visit,
+            minutes_since_last_message=minutes_since_last_message,
+            knowledge_context=context,
+            scenario_context=scenario_context,
         )
         temperature = _resolve_temperature(ai_config)
         start_time = time.monotonic()
         request_capture: dict = {}
         try:
-            result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture)
+            try:
+                result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture, activity_tracker=activity_tracker)
+            except TypeError as te:
+                if "activity_tracker" in str(te):
+                    if activity_tracker is not None:
+                        await activity_tracker.mark_outbound_attempt_once()
+                    result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture)
+                else:
+                    raise
             actual_provider, actual_model = _extract_effective_provider_and_model(
                 request_capture,
                 default_provider=actual_provider,
@@ -1053,6 +1076,8 @@ async def get_ai_response(
                 if fb_api_key:
                     log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
                     try:
+                        if activity_tracker is not None:
+                            await activity_tracker.mark_outbound_attempt_once()
                         if fb_key == "openai":
                             result = await _call_openai(
                                 fb_api_key, fb_model, [], temperature,
@@ -1115,7 +1140,7 @@ async def get_ai_response(
 
         ai_log = AILog(
             user_id=user_id,
-            request_type="chat",
+            request_type=(request_type or "chat").strip().lower(),
             provider=actual_provider,
             model=actual_model,
             prompt_summary=user_prompt if user_prompt else None,
@@ -1162,6 +1187,10 @@ async def get_ai_response_direct(
     *,
     dialogue_id: int | None = None,
     topic_id: int | None = None,
+    track_user_activity: bool = False,
+    activity_tracker: ActivityTracker | None = None,
+    minutes_since_last_visit: int | None = None,
+    minutes_since_last_message: int | None = None,
 ) -> str:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -1172,61 +1201,71 @@ async def get_ai_response_direct(
             raise AIServiceError("AIConfig не найден")
         active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
         active_topic_id = topic_id if topic_id is not None else user.current_topic_id
-        runtime_context = await build_runtime_automation_context(
+
+        if minutes_since_last_visit is None or minutes_since_last_message is None:
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(session, user_id=user.id, topic_id=active_topic_id)
+            if minutes_since_last_visit is None:
+                minutes_since_last_visit = gap_visit
+            if minutes_since_last_message is None:
+                minutes_since_last_message = gap_msg
+
+        if activity_tracker is None and track_user_activity:
+            activity_tracker = ActivityTracker(
+                async_session_maker,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                request_time=datetime.utcnow(),
+                track_user_activity=True,
+            )
+
+        request_layout = await build_isolated_request_layout(
             session,
-            user_id=user.id,
+            user=user,
+            ai_config=ai_config,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
+            minutes_since_last_visit=minutes_since_last_visit,
+            minutes_since_last_message=minutes_since_last_message,
         )
 
-    base_system = neutralize_stable_prompt(
-        system_prompt or ai_config.system_prompt or "Ты полезный ИИ-помощник."
-    )
-    runtime_parts = [_build_client_runtime_context(user)]
-    if getattr(user, "response_length", "normal") == "short":
-        runtime_parts.append("Отвечай кратко, по делу, без длинных вступлений.")
-    request_layout = AIRequestLayout(
-        stable_system_prompt=base_system,
-        shared_instructions=tuple(
-            block
-            for block in ((getattr(ai_config, "shared_prompt_block", None) or "").strip(),)
-            if block
-        ),
-        runtime_context=tuple(runtime_parts),
-        scenario_context=(runtime_context,) if runtime_context and runtime_context.strip() else (),
-        current_user_content=user_prompt,
-    )
-    try:
-        result = await _dispatch_provider(ai_config, request_layout)
-        log.info("AI direct response generated user_id=%s provider=%s", user_id, ai_config.provider)
-    except AIServiceError:
-        log.exception("AI direct request failed user_id=%s provider=%s", user_id, ai_config.provider)
-        raise
-    except Exception as exc:
-        log.exception("Unexpected AI direct request failure user_id=%s provider=%s", user_id, ai_config.provider)
-        raise AIServiceError(f"Ошибка при прямом обращении к AI-провайдеру: {exc}") from exc
+        try:
+            try:
+                result = await _dispatch_provider(ai_config, request_layout, activity_tracker=activity_tracker)
+            except TypeError as te:
+                if "activity_tracker" in str(te):
+                    if activity_tracker is not None:
+                        await activity_tracker.mark_outbound_attempt_once()
+                    result = await _dispatch_provider(ai_config, request_layout)
+                else:
+                    raise
+            log.info("AI direct response generated user_id=%s provider=%s", user_id, ai_config.provider)
+        except AIServiceError:
+            log.exception("AI direct request failed user_id=%s provider=%s", user_id, ai_config.provider)
+            raise
+        except Exception as exc:
+            log.exception("Unexpected AI direct request failure user_id=%s provider=%s", user_id, ai_config.provider)
+            raise AIServiceError(f"Ошибка при прямом обращении к AI-провайдеру: {exc}") from exc
 
-    visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
-    if invalid_data_blocks:
-        log.warning("Direct AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
-    if service_blocks:
-        async with async_session_maker() as session:
-            user = await session.get(User, user_id)
-            if user:
-                try:
-                    await apply_service_data_blocks(
-                        session,
-                        user=user,
-                        dialogue_id=active_dialogue_id,
-                        topic_id=active_topic_id,
-                        blocks=service_blocks,
-                    )
-                    await session.commit()
-                except Exception as exc:
-                    await session.rollback()
-                    log.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
-                    raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
-    return visible_text
+        visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+        if invalid_data_blocks:
+            log.warning("Direct AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+        if service_blocks:
+            try:
+                await apply_service_data_blocks(
+                    session,
+                    user=user,
+                    dialogue_id=active_dialogue_id,
+                    topic_id=active_topic_id,
+                    blocks=service_blocks,
+                )
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                log.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
+                raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
+        return visible_text
 
 
 # ---------------------------------------------------------------------------

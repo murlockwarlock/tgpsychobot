@@ -13,17 +13,20 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
 from database import (
+    AIConfig,
     AutomationAction,
     AutomationActionExecution,
     AutomationMessageDelivery,
     AutomationCondition,
     AutomationConversationState,
+    AutomationDialogueState,
     AutomationEvent,
     AutomationHandler,
     User,
     async_session_maker,
     get_all_admin_ids,
 )
+from memory_mode import MEMORY_MODE_GLOBAL, get_memory_mode
 from user_metadata import append_metadata_records, merge_metadata
 
 
@@ -195,6 +198,22 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
         payload = _render_metadata_value(configured, event=event, user=user)
         if not payload:
             payload = _load_object(event.metadata_json)
+        ai_conf = await session.get(AIConfig, 1)
+        is_global = get_memory_mode(ai_conf) == MEMORY_MODE_GLOBAL if ai_conf else False
+        if is_global and payload:
+            diag_state = await session.scalar(
+                select(AutomationDialogueState).where(
+                    AutomationDialogueState.user_id == event.user_id,
+                    AutomationDialogueState.dialogue_id == event.dialogue_id,
+                )
+            )
+            if diag_state is not None:
+                current = _load_object(diag_state.metadata_json)
+                diag_state.metadata_json = json.dumps(
+                    merge_metadata(current, payload),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
         state_row = await session.scalar(
             select(AutomationConversationState).where(
                 AutomationConversationState.user_id == event.user_id,
@@ -209,6 +228,7 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        if payload:
             user.metadata_json = append_metadata_records(
                 user.metadata_json,
                 [{"data": payload, "raw_json": json.dumps(payload, ensure_ascii=False)}],

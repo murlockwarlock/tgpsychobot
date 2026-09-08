@@ -12,6 +12,7 @@ from ..keyboards import case_study_keyboard, final_test_keyboard, response_butto
 from ..legacy import CaseStudy, Content, Message as DBMessage, SecretTestQuestion, TestConfig, TestQuestion, TestSession, User, async_session_maker
 from ..logging_utils import get_ai_logger, get_bot_logger
 from ..storage import StateStore
+from ai_request_builder import get_user_ai_activity_gaps
 from response_buttons import extract_response_buttons
 from result_history import attach_secret_answers, save_test_attempt, save_test_history_message
 from universal_tests import (
@@ -324,6 +325,9 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
 
     preliminary = None
     try:
+        async with async_session_maker() as session:
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(session, user_id=user_id, topic_id=topic_id)
+
         if getattr(test_config, "separate_result_prompt_enabled", False) and getattr(test_config, "result_system_prompt", None):
             preliminary = await get_ai_response_direct(
                 user_id,
@@ -333,6 +337,9 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
                 "знаменатели или нормы, которых нет во входных данных.",
                 dialogue_id=dialogue_id,
                 topic_id=topic_id,
+                track_user_activity=False,
+                minutes_since_last_visit=gap_visit,
+                minutes_since_last_message=gap_msg,
             )
         profile_name = getattr(user, "name", None) or getattr(user, "first_name", None) or None
         final_prompt = build_result_handoff_prompt(prompt_payload, preliminary, profile_name)
@@ -341,6 +348,9 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
             final_prompt,
             topic_id_override=topic_id,
             dialogue_id_override=dialogue_id,
+            track_user_activity=True,
+            minutes_since_last_visit=gap_visit,
+            minutes_since_last_message=gap_msg,
         )
     except Exception:
         ai_log.exception("Universal Max test final interpretation failed user_id=%s", user_id)

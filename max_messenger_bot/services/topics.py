@@ -130,8 +130,16 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
             if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
                 return
 
-            from system_events import build_topic_auto_start_system_message
+            from system_events import build_topic_auto_start_system_message, record_navigation_system_event
             synthetic_text = build_topic_auto_start_system_message(topic.name)
+            async with async_session_maker() as session:
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=user_id,
+                    dialogue_id=dialogue_id,
+                    topic_id=topic_id,
+                    text=synthetic_text,
+                )
             await common.run_hidden_ai_kickoff(
                 client,
                 chat_id,
@@ -140,6 +148,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
                 expected_dialogue_id=dialogue_id,
                 expected_topic_id=topic_id,
                 states=states,
+                exclude_message_id=nav_msg.id,
             )
     else:
         from . import common
@@ -178,8 +187,16 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
             return
 
-        from system_events import build_topic_resume_system_message
+        from system_events import build_topic_resume_system_message, record_navigation_system_event
         synthetic_text = build_topic_resume_system_message(topic.name)
+        async with async_session_maker() as session:
+            nav_msg = await record_navigation_system_event(
+                session,
+                user_id=user_id,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
+                text=synthetic_text,
+            )
         await common.run_hidden_ai_kickoff(
             client,
             chat_id,
@@ -188,6 +205,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
             expected_dialogue_id=dialogue_id,
             expected_topic_id=topic_id,
             states=states,
+            exclude_message_id=nav_msg.id,
         )
 
 
@@ -245,8 +263,16 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
     if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
         return
 
-    from system_events import build_main_dialogue_resume_system_message
+    from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
     synthetic_text = build_main_dialogue_resume_system_message()
+    async with async_session_maker() as session:
+        nav_msg = await record_navigation_system_event(
+            session,
+            user_id=user_id,
+            dialogue_id=dialogue_id,
+            topic_id=None,
+            text=synthetic_text,
+        )
     await common.run_hidden_ai_kickoff(
         client,
         chat_id,
@@ -255,4 +281,5 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
         expected_dialogue_id=dialogue_id,
         expected_topic_id=None,
         states=states,
+        exclude_message_id=nav_msg.id,
     )
