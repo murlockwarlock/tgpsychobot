@@ -123,3 +123,47 @@ async def test_payment_webhook_check_skips_apps_without_public_route():
     issues = await monitor.check_payment_webhooks({}, object())
 
     assert issues == []
+
+
+def test_get_candidate_alert_tokens_prioritizes_preferred_pm2_bot(monkeypatch):
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new")
+    monkeypatch.delenv("PSYCHOBOTS_ALERT_BOT_TOKEN", raising=False)
+
+    apps = [
+        {"name": "tg_someonelikeyouai04_bot_legacy", "token": "token_someone04"},
+        {"name": "tg_autobusbusbot_new", "token": "token_autobus"},
+        {"name": "tg_veraveda777_bot_legacy", "token": "token_veraveda"},
+    ]
+
+    tokens = monitor.get_candidate_alert_tokens(apps)
+
+    assert tokens == ["token_autobus", "token_someone04", "token_veraveda"]
+
+
+def test_get_candidate_alert_tokens_supports_direct_token_override(monkeypatch):
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_TOKEN", "direct_alert_token")
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new")
+
+    apps = [
+        {"name": "tg_autobusbusbot_new", "token": "token_autobus"},
+        {"name": "tg_someonelikeyouai04_bot_legacy", "token": "token_someone04"},
+    ]
+
+    tokens = monitor.get_candidate_alert_tokens(apps)
+
+    assert tokens == ["direct_alert_token", "token_autobus", "token_someone04"]
+
+
+def test_get_candidate_alert_tokens_fallback_when_preferred_not_found(monkeypatch):
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "non_existent_bot")
+    monkeypatch.delenv("PSYCHOBOTS_ALERT_BOT_TOKEN", raising=False)
+
+    apps = [
+        {"name": "tg_someonelikeyouai04_bot_legacy", "token": "token_someone04"},
+        {"name": "tg_veraveda777_bot_legacy", "token": "token_veraveda"},
+    ]
+
+    tokens = monitor.get_candidate_alert_tokens(apps)
+
+    assert tokens == ["token_someone04", "token_veraveda"]
+

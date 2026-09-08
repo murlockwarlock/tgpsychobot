@@ -290,6 +290,7 @@ const apps = [
     cwd: "/root/telegram_bots/newbots",
     env: {
       "MAX_BOT_TOKEN": process.env.MAX_SE13639182_BOT_TOKEN || "",
+      "BOT_TOKEN": process.env.TELEGRAM_VERAVEDA777_BOT_TOKEN || "",
       "DATABASE_URL": process.env.MAX_SE13639182_BOT_DATABASE_URL || "",
       "OWNER_IDS": "100263465646,100005511792,100178646155",
       "MAX_USE_POLLING": "1",
@@ -308,6 +309,7 @@ const apps = [
     cwd: "/root/telegram_bots/newbots",
     env: {
       "MAX_BOT_TOKEN": process.env.MAX_ID519010411655_BOT_TOKEN || "",
+      "BOT_TOKEN": process.env.TELEGRAM_YOURSELF_WAY_BOT_TOKEN || "",
       "DATABASE_URL": process.env.MAX_ID519010411655_BOT_DATABASE_URL || "",
       "OWNER_IDS": "100263465646,100005511792,100178646155",
       "MAX_USE_POLLING": "1",

@@ -123,6 +123,20 @@ def test_ecosystem_preserves_registry_legacy_log_paths():
         assert f"out_file: `${{PM2_LOG_DIR}}/{log_stem}-out.log`" in block
 
 
+def test_ecosystem_max_apps_bind_telegram_bot_token():
+    ecosystem = (ROOT / "ecosystem.config.js").read_text(encoding="utf-8")
+
+    start_veda = ecosystem.index('name: "max_se13639182_bot_legacy"')
+    end_veda = ecosystem.find("\n  },", start_veda)
+    block_veda = ecosystem[start_veda:end_veda if end_veda >= 0 else None]
+    assert '"BOT_TOKEN": process.env.TELEGRAM_VERAVEDA777_BOT_TOKEN || ""' in block_veda
+
+    start_yw = ecosystem.index('name: "max_id519010411655_bot_new"')
+    end_yw = ecosystem.find("\n  },", start_yw)
+    block_yw = ecosystem[start_yw:end_yw if end_yw >= 0 else None]
+    assert '"BOT_TOKEN": process.env.TELEGRAM_YOURSELF_WAY_BOT_TOKEN || ""' in block_yw
+
+
 def _production_migration_fixture():
     registry = verifier.load_registry(REGISTRY_PATH)
     entries = verifier.managed_instances(registry)

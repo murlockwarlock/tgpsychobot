@@ -16,6 +16,8 @@ import aiohttp
 STATE_FILE = os.environ.get("PSYCHOBOTS_MONITOR_STATE", "/tmp/psychobots_monitor_state.json")
 REPEAT_ALERT_SECONDS = int(os.environ.get("PSYCHOBOTS_MONITOR_REPEAT_SECONDS", str(6 * 60 * 60)))
 LOG_READ_LIMIT = int(os.environ.get("PSYCHOBOTS_MONITOR_LOG_READ_LIMIT", str(250_000)))
+ALERT_BOT_PM2_NAME = os.environ.get("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new").strip()
+ALERT_BOT_TOKEN = os.environ.get("PSYCHOBOTS_ALERT_BOT_TOKEN", "").strip()
 NL_CHECK_ENABLED = os.environ.get("PSYCHOBOTS_CHECK_NL", "1").strip().lower() not in {
     "0",
     "false",
@@ -348,9 +350,37 @@ def should_alert(issues: list[str], state: dict) -> bool:
     return True
 
 
+def get_candidate_alert_tokens(apps: list[dict]) -> list[str]:
+    preferred_name = os.environ.get("PSYCHOBOTS_ALERT_BOT_PM2_NAME", ALERT_BOT_PM2_NAME).strip()
+    direct_token = os.environ.get("PSYCHOBOTS_ALERT_BOT_TOKEN", ALERT_BOT_TOKEN).strip()
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    if direct_token:
+        tokens.append(direct_token)
+        seen.add(direct_token)
+
+    if preferred_name:
+        for app in apps:
+            if app.get("name") == preferred_name:
+                token = app.get("token")
+                if token and token not in seen:
+                    tokens.append(token)
+                    seen.add(token)
+
+    for app in apps:
+        token = app.get("token")
+        if token and token not in seen:
+            tokens.append(token)
+            seen.add(token)
+
+    return tokens
+
+
 async def send_alert(apps: list[dict], text: str) -> None:
     recipients = sorted({owner_id for app in apps for owner_id in app["owner_ids"]})
-    tokens = [app["token"] for app in apps]
+    tokens = get_candidate_alert_tokens(apps)
     if not recipients or not tokens:
         print("No notification recipients or bot tokens found")
         return
