@@ -245,7 +245,7 @@ class MaxDataServiceParityTests(unittest.IsolatedAsyncioTestCase):
             session.add(Topic(id=88, name="Тема 88"))
             await session.commit()
 
-        async def _mock_dispatch_mutating_scope(ai_config, layout, request_capture=None):
+        async def _mock_dispatch_mutating_scope(ai_config, layout, request_capture=None, *args, **kwargs):
             async with self.sessions() as s:
                 u = await s.get(User, self.user_id)
                 u.current_dialogue_id = 99
@@ -301,7 +301,7 @@ class MaxDataServiceParityTests(unittest.IsolatedAsyncioTestCase):
 
         captured_layouts = []
 
-        async def _capture_turn2(config, layout, request_capture=None):
+        async def _capture_turn2(config, layout, request_capture=None, *args, **kwargs):
             captured_layouts.append(layout)
             return "Ответ 2."
 

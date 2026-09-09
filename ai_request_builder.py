@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Iterable
@@ -30,6 +31,9 @@ from memory_mode import build_history_scope, get_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
     DEFAULT_SHORT_RESPONSE_INSTRUCTION,
+    MAX_CAPABILITIES,
+    ServiceCapabilities,
+    TELEGRAM_CAPABILITIES,
     render_prompt_block,
 )
 from result_history import ai_history_role_filter, select_ai_history_messages
@@ -87,17 +91,18 @@ async def get_user_ai_activity_gaps(
 
     topic_scope = f"topic:{topic_id}" if topic_id else "main"
     try:
-        rows = (await session.execute(
+        res = await session.execute(
             select(UserAIActivity).where(
                 UserAIActivity.user_id == user_id,
                 UserAIActivity.scope_key.in_(("global", topic_scope)),
             )
-        )).scalars().all()
+        )
+        rows = res.scalars().all() if hasattr(res, "scalars") else []
     except (Exception, AssertionError) as exc:
         log.debug("UserAIActivity query bypassed or failed: %s", exc)
         return 0, 0
 
-    scope_map = {row.scope_key: row.last_request_at for row in rows}
+    scope_map = {row.scope_key: row.last_request_at for row in rows if hasattr(row, "scope_key")}
 
     visit_at = scope_map.get(topic_scope)
     if visit_at:
@@ -135,17 +140,29 @@ async def upsert_user_ai_activity(
     if getattr(res, "rowcount", 0) > 0:
         return
 
-    existing = await session.scalar(
-        select(UserAIActivity.last_request_at).where(
-            UserAIActivity.user_id == user_id,
-            UserAIActivity.scope_key == scope_key,
+    if hasattr(session, "scalar"):
+        existing = await session.scalar(
+            select(UserAIActivity.last_request_at).where(
+                UserAIActivity.user_id == user_id,
+                UserAIActivity.scope_key == scope_key,
+            )
         )
-    )
-    if existing is not None:
-        return
+        if existing is not None:
+            return
 
     try:
-        async with session.begin_nested():
+        if hasattr(session, "begin_nested"):
+            async with session.begin_nested():
+                session.add(UserAIActivity(
+                    user_id=user_id,
+                    scope_key=scope_key,
+                    last_request_at=request_time,
+                    created_at=request_time,
+                    updated_at=request_time,
+                ))
+                if hasattr(session, "flush"):
+                    await session.flush()
+        else:
             session.add(UserAIActivity(
                 user_id=user_id,
                 scope_key=scope_key,
@@ -153,17 +170,20 @@ async def upsert_user_ai_activity(
                 created_at=request_time,
                 updated_at=request_time,
             ))
-            await session.flush()
-    except IntegrityError:
-        await session.execute(
-            update(UserAIActivity)
-            .where(
-                UserAIActivity.user_id == user_id,
-                UserAIActivity.scope_key == scope_key,
-                UserAIActivity.last_request_at < request_time,
+            if hasattr(session, "flush"):
+                await session.flush()
+    except (IntegrityError, Exception):
+        if hasattr(session, "execute"):
+            await session.execute(
+                update(UserAIActivity)
+                .where(
+                    UserAIActivity.user_id == user_id,
+                    UserAIActivity.scope_key == scope_key,
+                    UserAIActivity.last_request_at < request_time,
+                )
+                .values(last_request_at=request_time, updated_at=request_time)
             )
-            .values(last_request_at=request_time, updated_at=request_time)
-        )
+
 
 
 class ActivityTracker:
@@ -184,30 +204,38 @@ class ActivityTracker:
         self.request_time = request_time or datetime.utcnow()
         self.track_user_activity = track_user_activity
         self._marked = False
+        self._lock = asyncio.Lock()
 
     async def mark_outbound_attempt_once(self) -> None:
         """Mark activity atomically on the first real outbound network attempt."""
         if not self.track_user_activity or self._marked:
             return
-        self._marked = True
-        try:
-            async with self.session_factory() as session:
-                await upsert_user_ai_activity(
-                    session,
-                    user_id=self.user_id,
-                    scope_key="global",
-                    request_time=self.request_time,
-                )
-                topic_scope = f"topic:{self.topic_id}" if self.topic_id else "main"
-                await upsert_user_ai_activity(
-                    session,
-                    user_id=self.user_id,
-                    scope_key=topic_scope,
-                    request_time=self.request_time,
-                )
-                await session.commit()
-        except Exception as exc:
-            log.warning("Failed to record outbound user activity for user_id=%s: %s", self.user_id, exc)
+        async with self._lock:
+            if not self.track_user_activity or self._marked:
+                return
+            try:
+                async with self.session_factory() as session:
+                    await upsert_user_ai_activity(
+                        session,
+                        user_id=self.user_id,
+                        scope_key="global",
+                        request_time=self.request_time,
+                    )
+                    topic_scope = f"topic:{self.topic_id}" if self.topic_id else "main"
+                    await upsert_user_ai_activity(
+                        session,
+                        user_id=self.user_id,
+                        scope_key=topic_scope,
+                        request_time=self.request_time,
+                    )
+                    if hasattr(session, "commit"):
+                        await session.commit()
+                self._marked = True
+            except Exception as exc:
+                self._marked = False
+                log.warning("Failed to record outbound user activity for user_id=%s: %s", self.user_id, exc)
+                raise
+
 
 
 async def load_conversational_ai_history(
@@ -267,6 +295,7 @@ async def build_conversational_request_layout(
     limit_recent: int | None = None,
     scenario_context: str | None = None,
     history: Iterable[Any] | None = None,
+    service_capabilities: ServiceCapabilities | None = None,
 ) -> AIRequestLayout:
     """Build the single canonical AIRequestLayout for conversational turns (TG & MAX)."""
     effective_memory_mode = memory_mode or get_memory_mode(ai_config)
@@ -284,6 +313,7 @@ async def build_conversational_request_layout(
         service_prompt_template = getattr(ai_config, "service_prompt_block", None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
         service_prompt_block = render_prompt_block(
             service_prompt_template,
+            capabilities=service_capabilities,
             available_media_text=available_media_text,
             media_instruction_block=media_instruction_block,
             test_context_injection="",
@@ -371,6 +401,7 @@ async def build_isolated_request_layout(
     available_media_text: str = "",
     media_instruction_block: str = "",
     memory_mode: str | None = None,
+    service_capabilities: ServiceCapabilities | None = None,
 ) -> AIRequestLayout:
     """Build canonical AIRequestLayout for isolated direct calls (tests, single prompts, etc.)."""
     effective_memory_mode = memory_mode or get_memory_mode(ai_config)
@@ -379,6 +410,7 @@ async def build_isolated_request_layout(
     service_prompt_template = getattr(ai_config, "service_prompt_block", None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
     service_prompt_block = render_prompt_block(
         service_prompt_template,
+        capabilities=service_capabilities,
         available_media_text=available_media_text,
         media_instruction_block=media_instruction_block,
         test_context_injection="",

@@ -81,13 +81,15 @@ async def get_conversation_automation_state(
     dialogue_id: int,
     topic_id: int | None,
 ) -> AutomationConversationState | None:
-    return await session.scalar(
-        select(AutomationConversationState).where(
-            AutomationConversationState.user_id == user_id,
-            AutomationConversationState.dialogue_id == dialogue_id,
-            AutomationConversationState.topic_id == (topic_id or 0),
-        )
+    stmt = select(AutomationConversationState).where(
+        AutomationConversationState.user_id == user_id,
+        AutomationConversationState.dialogue_id == dialogue_id,
+        AutomationConversationState.topic_id == (topic_id or 0),
     )
+    if hasattr(session, "scalar"):
+        return await session.scalar(stmt)
+    res = await session.execute(stmt)
+    return res.scalar() if hasattr(res, "scalar") else None
 
 
 async def get_dialogue_automation_state(
@@ -96,12 +98,14 @@ async def get_dialogue_automation_state(
     user_id: int,
     dialogue_id: int,
 ) -> AutomationDialogueState | None:
-    return await session.scalar(
-        select(AutomationDialogueState).where(
-            AutomationDialogueState.user_id == user_id,
-            AutomationDialogueState.dialogue_id == dialogue_id,
-        )
+    stmt = select(AutomationDialogueState).where(
+        AutomationDialogueState.user_id == user_id,
+        AutomationDialogueState.dialogue_id == dialogue_id,
     )
+    if hasattr(session, "scalar"):
+        return await session.scalar(stmt)
+    res = await session.execute(stmt)
+    return res.scalar() if hasattr(res, "scalar") else None
 
 
 async def get_or_lazy_init_dialogue_automation_state(

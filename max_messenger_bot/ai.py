@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 import gemini_image
 
+from prompt_blocks import MAX_CAPABILITIES
 from ai_log_context import apply_ai_log_context
 from ai_request_builder import (
     ActivityTracker,
@@ -223,6 +224,7 @@ async def _call_openai(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     target_model = model or "gpt-5.6-terra"
     ensure_model_available(PROVIDER_OPENAI, target_model)
@@ -241,6 +243,11 @@ async def _call_openai(
         endpoint=f"{base_url.rstrip('/')}/chat/completions",
         payload=payload,
     )
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.chat.completions.create(**payload)
     return response.choices[0].message.content or ""
 
@@ -253,6 +260,7 @@ async def _call_deepseek(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     normalized_model = normalize_deepseek_model(model)
     ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
@@ -270,6 +278,11 @@ async def _call_deepseek(
         endpoint=f"{base_url.rstrip('/')}/chat/completions",
         payload=payload,
     )
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.chat.completions.create(
         **payload,
     )
@@ -285,6 +298,7 @@ async def _call_claude(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     target_model = model or "claude-sonnet-5"
     ensure_model_available(PROVIDER_CLAUDE, target_model)
@@ -310,6 +324,11 @@ async def _call_claude(
         endpoint="https://api.anthropic.com/v1/messages",
         payload=payload,
     )
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.messages.create(**payload)
     return response.content[0].text
 
@@ -334,6 +353,7 @@ async def _call_gemini(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     import httpx
 
@@ -360,6 +380,11 @@ async def _call_gemini(
         payload=payload,
     )
     transport = _build_gemini_proxy_transport()
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     async with httpx.AsyncClient(timeout=60.0, transport=transport) as client:
         response = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
         response.raise_for_status()
@@ -566,6 +591,7 @@ async def _call_kie_multimodal(
     channel: str = "chat",
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_KIE, target_model, channel=channel)
@@ -584,6 +610,11 @@ async def _call_kie_multimodal(
             "stream": False,
         }
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                log.warning("Failed to mark activity before outbound call: %s", act_err)
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(
                 f"{_kie_model_base_url(base_url, target_model)}/chat/completions",
@@ -753,6 +784,7 @@ async def _call_kie_text_chat(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     """Call KIE text chat using the model's documented protocol."""
     ensure_model_available(PROVIDER_KIE, model, channel="chat")
@@ -771,6 +803,11 @@ async def _call_kie_text_chat(
         payload=request.payload,
     )
     try:
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                log.warning("Failed to mark activity before outbound call: %s", act_err)
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(
                 request.endpoint,
@@ -841,9 +878,6 @@ async def _dispatch_provider(
         else _legacy_layout(messages, request_layout)
     )
 
-    if activity_tracker is not None:
-        await activity_tracker.mark_outbound_attempt_once()
-
     if provider == "openai":
         if not ai_config.openai_api_key:
             raise AIServiceError("OpenAI API key не задан")
@@ -854,18 +888,21 @@ async def _dispatch_provider(
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     elif provider in {"claude", "anthropic"}:
-        if not ai_config.claude_api_key:
+        claude_key = getattr(ai_config, "claude_api_key", None) or getattr(ai_config, "anthropic_api_key", None)
+        if not claude_key:
             raise AIServiceError("Claude API key не задан")
         result = await _call_claude(
-            ai_config.claude_api_key,
+            claude_key,
             ai_config.claude_model,
             [],
             layout.stable_system_prompt,
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     elif provider == "gemini":
         if not ai_config.gemini_api_key:
@@ -878,6 +915,7 @@ async def _dispatch_provider(
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     elif provider == "deepseek":
         if not ai_config.deepseek_api_key:
@@ -889,6 +927,7 @@ async def _dispatch_provider(
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     elif provider == "kie":
         if not ai_config.kie_api_key:
@@ -903,6 +942,7 @@ async def _dispatch_provider(
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     else:
         raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
@@ -1039,20 +1079,18 @@ async def get_ai_response(
             minutes_since_last_message=minutes_since_last_message,
             knowledge_context=context,
             scenario_context=scenario_context,
+            service_capabilities=MAX_CAPABILITIES,
         )
         temperature = _resolve_temperature(ai_config)
         start_time = time.monotonic()
         request_capture: dict = {}
         try:
-            try:
-                result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture, activity_tracker=activity_tracker)
-            except TypeError as te:
-                if "activity_tracker" in str(te):
-                    if activity_tracker is not None:
-                        await activity_tracker.mark_outbound_attempt_once()
-                    result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture)
-                else:
-                    raise
+            result = await _dispatch_provider(
+                ai_config,
+                request_layout,
+                request_capture=request_capture,
+                activity_tracker=activity_tracker,
+            )
             actual_provider, actual_model = _extract_effective_provider_and_model(
                 request_capture,
                 default_provider=actual_provider,
@@ -1070,37 +1108,44 @@ async def get_ai_response(
             if allow_fallback and fb_provider and fb_model:
                 fb_key = fb_provider.strip().lower()
                 if fb_key in {"claude", "anthropic"}:
-                    fb_api_key = ai_config.claude_api_key
+                    fb_api_key = getattr(ai_config, "claude_api_key", None) or getattr(ai_config, "anthropic_api_key", None)
                 else:
                     fb_api_key = getattr(ai_config, f"{fb_key}_api_key", None)
                 if fb_api_key:
                     log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
                     try:
                         if activity_tracker is not None:
-                            await activity_tracker.mark_outbound_attempt_once()
+                            try:
+                                await activity_tracker.mark_outbound_attempt_once()
+                            except Exception as act_err:
+                                log.warning("Failed to mark activity before fallback outbound call: %s", act_err)
                         if fb_key == "openai":
                             result = await _call_openai(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         elif fb_key in {"claude", "anthropic"}:
                             result = await _call_claude(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         elif fb_key == "gemini":
                             result = await _call_gemini(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         elif fb_key == "deepseek":
                             result = await _call_deepseek(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         elif fb_key == "kie":
                             result = await _call_kie_text_chat(
@@ -1108,6 +1153,7 @@ async def get_ai_response(
                                 stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
@@ -1231,15 +1277,7 @@ async def get_ai_response_direct(
         )
 
         try:
-            try:
-                result = await _dispatch_provider(ai_config, request_layout, activity_tracker=activity_tracker)
-            except TypeError as te:
-                if "activity_tracker" in str(te):
-                    if activity_tracker is not None:
-                        await activity_tracker.mark_outbound_attempt_once()
-                    result = await _dispatch_provider(ai_config, request_layout)
-                else:
-                    raise
+            result = await _dispatch_provider(ai_config, request_layout, activity_tracker=activity_tracker)
             log.info("AI direct response generated user_id=%s provider=%s", user_id, ai_config.provider)
         except AIServiceError:
             log.exception("AI direct request failed user_id=%s provider=%s", user_id, ai_config.provider)
@@ -1359,7 +1397,7 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
 # Image Analysis (Vision)
 # ---------------------------------------------------------------------------
 
-async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
     import httpx
 
     b64_data = base64.b64encode(image_bytes).decode()
@@ -1388,6 +1426,11 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
         },
         "generationConfig": generation_config,
     }
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     async with httpx.AsyncClient(timeout=60.0, transport=_build_gemini_proxy_transport()) as http:
         resp = await http.post(url, json=payload, headers={"Content-Type": "application/json"})
         resp.raise_for_status()
@@ -1398,7 +1441,7 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
     return candidates[0]["content"]["parts"][0]["text"]
 
 
-async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
     target_model = model or "gpt-5.6-terra"
     ensure_model_available(PROVIDER_OPENAI, target_model, channel="vision")
     b64_data = base64.b64encode(image_bytes).decode()
@@ -1419,11 +1462,16 @@ async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_p
     }
     if not target_model.startswith("gpt-5.6"):
         payload["temperature"] = temperature
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.chat.completions.create(**payload)
     return response.choices[0].message.content or ""
 
 
-async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
     target_model = model or "claude-sonnet-5"
     ensure_model_available(PROVIDER_CLAUDE, target_model, channel="vision")
     b64_data = base64.b64encode(image_bytes).decode()
@@ -1450,11 +1498,16 @@ async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_p
     }
     if not should_omit_claude_sampling(target_model):
         payload["temperature"] = temperature
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.messages.create(**payload)
     return response.content[0].text
 
 
-async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
+async def analyze_image(user_id: int, image_bytes: bytes, prompt: str, *, activity_tracker: ActivityTracker | None = None) -> str:
     """Analyze image with the configured vision provider."""
     async with async_session_maker() as session:
         user = await session.scalar(
@@ -1530,16 +1583,25 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
             history=normalize_request_messages(history_list),
         )
 
+        if activity_tracker is None:
+            activity_tracker = ActivityTracker(
+                async_session_maker,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                request_time=datetime.utcnow(),
+                track_user_activity=True,
+            )
+
     if provider == "Gemini":
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для vision не задан")
-        raw_result = await _analyze_gemini(api_key, config.vision_model or "gemini-3.7-flash", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_gemini(api_key, config.vision_model or "gemini-3.7-flash", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout, activity_tracker=activity_tracker)
     elif provider in {"Claude", "Anthropic"}:
         api_key = config.claude_api_key
         if not api_key:
             raise AIServiceError("API ключ Claude для vision не задан")
-        raw_result = await _analyze_claude(api_key, config.vision_model or "claude-sonnet-5", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_claude(api_key, config.vision_model or "claude-sonnet-5", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout, activity_tracker=activity_tracker)
     elif provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
@@ -1551,7 +1613,7 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
         api_key = config.openai_api_key
         if not api_key:
             raise AIServiceError("API ключ OpenAI для vision не задан")
-        raw_result = await _analyze_openai(api_key, config.vision_model or "gpt-5.6-terra", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_openai(api_key, config.vision_model or "gpt-5.6-terra", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout, activity_tracker=activity_tracker)
 
     visible_text, service_blocks, invalid_data_blocks = extract_service_data(raw_result)
     if invalid_data_blocks:

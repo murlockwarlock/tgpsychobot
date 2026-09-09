@@ -82,13 +82,66 @@ def build_media_instruction_block(available_media_text: str | None) -> str:
     return "\n\n" + render_prompt_block(DEFAULT_MEDIA_RULES_TEMPLATE, available_media_text=text)
 
 
-def render_prompt_block(template: str, **values: str) -> str:
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ServiceCapabilities:
+    supports_data: bool = True
+    supports_image_generation: bool = True
+    supports_media_collections: bool = False
+    supports_send_audio: bool = False
+    supports_card_spreads: bool = False
+
+
+TELEGRAM_CAPABILITIES = ServiceCapabilities(
+    supports_data=True,
+    supports_image_generation=True,
+    supports_media_collections=True,
+    supports_send_audio=True,
+    supports_card_spreads=True,
+)
+
+MAX_CAPABILITIES = ServiceCapabilities(
+    supports_data=True,
+    supports_image_generation=True,
+    supports_media_collections=False,
+    supports_send_audio=False,
+    supports_card_spreads=False,
+)
+
+_IMAGE_GEN_BLOCK_REGEX = re.compile(
+    r"(?:\r?\n)*[ \t]*📷?[ \t]*ВИЗУАЛИЗАЦИЯ\s*\(ГЕНЕРАЦИЯ\):.*?"
+    r"GEN_IMG:[^\n]*",
+    re.DOTALL,
+)
+
+
+def render_prompt_block(
+    template: str,
+    *,
+    capabilities: ServiceCapabilities | None = None,
+    **values: str,
+) -> str:
+    caps = capabilities or TELEGRAM_CAPABILITIES
     rendered = template or ""
+
     available_media_text = values.get("available_media_text") or ""
     media_instruction_block = values.get("media_instruction_block") or ""
-    if not available_media_text.strip() and not media_instruction_block.strip():
+
+    if not caps.supports_media_collections:
+        available_media_text = ""
+        media_instruction_block = ""
+        values["available_media_text"] = ""
+        values["media_instruction_block"] = ""
         if "ДОСТУПНЫЙ МЕДИА-КОНТЕНТ" in rendered or "ПРАВИЛА ИСПОЛЬЗОВАНИЯ МЕДИА-ТЕГОВ" in rendered:
             rendered = _LEGACY_MEDIA_BLOCK_REGEX.sub("", rendered)
+    elif not available_media_text.strip() and not media_instruction_block.strip():
+        if "ДОСТУПНЫЙ МЕДИА-КОНТЕНТ" in rendered or "ПРАВИЛА ИСПОЛЬЗОВАНИЯ МЕДИА-ТЕГОВ" in rendered:
+            rendered = _LEGACY_MEDIA_BLOCK_REGEX.sub("", rendered)
+
+    if not caps.supports_image_generation:
+        rendered = _IMAGE_GEN_BLOCK_REGEX.sub("", rendered)
 
     for key, value in values.items():
         rendered = rendered.replace(f"{{{key}}}", value or "")

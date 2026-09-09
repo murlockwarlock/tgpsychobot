@@ -2380,6 +2380,8 @@ async def _start_telegram_topic_auto_start(
     state: FSMContext | None,
     topic: Topic,
     dialogue_id: int | None = None,
+    *,
+    navigation_message_id: int | None = None,
 ) -> None:
     from system_events import build_topic_auto_start_system_message, record_navigation_system_event
     synthetic_text = build_topic_auto_start_system_message(topic.name)
@@ -2388,14 +2390,17 @@ async def _start_telegram_topic_auto_start(
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             effective_dialogue_id = user.current_dialogue_id if user else 1
-    async with async_session_maker() as session:
-        nav_msg = await record_navigation_system_event(
-            session,
-            user_id=user_id,
-            dialogue_id=effective_dialogue_id,
-            topic_id=topic.id,
-            text=synthetic_text,
-        )
+    if navigation_message_id is None:
+        async with async_session_maker() as session:
+            nav_msg = await record_navigation_system_event(
+                session,
+                user_id=user_id,
+                dialogue_id=effective_dialogue_id,
+                topic_id=topic.id,
+                text=synthetic_text,
+            )
+            await session.commit()
+            navigation_message_id = nav_msg.id
     await _start_telegram_hidden_kickoff(
         user_id=user_id,
         bot=bot,
@@ -2403,7 +2408,7 @@ async def _start_telegram_topic_auto_start(
         synthetic_prompt=synthetic_text,
         dialogue_id=effective_dialogue_id,
         topic_id=topic.id,
-        navigation_message_id=nav_msg.id,
+        navigation_message_id=navigation_message_id,
     )
 
 
@@ -6677,16 +6682,20 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
                     return
                 from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
                 synthetic_prompt = build_main_dialogue_resume_system_message()
-                nav_msg = await record_navigation_system_event(
-                    session,
-                    user_id=user_id,
-                    dialogue_id=user.current_dialogue_id,
-                    topic_id=None,
-                    text=synthetic_prompt,
-                )
+                nav_msg_id = data.get("pending_auto_start_message_id")
+                if not nav_msg_id:
+                    nav_msg = await record_navigation_system_event(
+                        session,
+                        user_id=user_id,
+                        dialogue_id=user.current_dialogue_id,
+                        topic_id=None,
+                        text=synthetic_prompt,
+                    )
+                    await session.commit()
+                    nav_msg_id = nav_msg.id
                 await _start_telegram_hidden_kickoff(
                     user_id, bot, state, synthetic_prompt, user.current_dialogue_id, None,
-                    navigation_message_id=nav_msg.id,
+                    navigation_message_id=nav_msg_id,
                 )
                 return
 
@@ -6701,20 +6710,27 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
                     if pending_kind == "resume":
                         from system_events import build_topic_resume_system_message, record_navigation_system_event
                         synthetic_prompt = build_topic_resume_system_message(topic.name)
-                        nav_msg = await record_navigation_system_event(
-                            session,
-                            user_id=user_id,
-                            dialogue_id=user.current_dialogue_id,
-                            topic_id=int(pending_topic_id),
-                            text=synthetic_prompt,
-                        )
+                        nav_msg_id = data.get("pending_auto_start_message_id")
+                        if not nav_msg_id:
+                            nav_msg = await record_navigation_system_event(
+                                session,
+                                user_id=user_id,
+                                dialogue_id=user.current_dialogue_id,
+                                topic_id=int(pending_topic_id),
+                                text=synthetic_prompt,
+                            )
+                            await session.commit()
+                            nav_msg_id = nav_msg.id
                         await _start_telegram_hidden_kickoff(
                             user_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(pending_topic_id),
-                            navigation_message_id=nav_msg.id,
+                            navigation_message_id=nav_msg_id,
                         )
                         return
                     elif getattr(topic, "auto_start_dialogue", False):
-                        await _start_telegram_topic_auto_start(user_id, bot, state, topic, user.current_dialogue_id)
+                        await _start_telegram_topic_auto_start(
+                            user_id, bot, state, topic, user.current_dialogue_id,
+                            navigation_message_id=data.get("pending_auto_start_message_id"),
+                        )
                         return
 
     if prompt_text:
@@ -7551,6 +7567,8 @@ class TopicSwitchResult:
         welcome_shown: bool = False,
         dialogue_id: int = 1,
         topic_id: int | None = None,
+        navigation_message_id: int | None = None,
+        synthetic_prompt: str | None = None,
     ):
         self.status = status  # "switched", "already_current", "inaccessible"
         self.topic = topic
@@ -7559,6 +7577,8 @@ class TopicSwitchResult:
         self.welcome_shown = welcome_shown
         self.dialogue_id = dialogue_id
         self.topic_id = topic_id
+        self.navigation_message_id = navigation_message_id
+        self.synthetic_prompt = synthetic_prompt
 
 
 async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSwitchResult:
@@ -7579,6 +7599,24 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                 user.current_topic_id = topic_id
                 dialogue_id = user.current_dialogue_id
                 welcome_shown = await resolve_topic_entry_state(session, user.id, dialogue_id, topic_id)
+
+                from system_events import (
+                    build_topic_auto_start_system_message,
+                    build_topic_resume_system_message,
+                    record_navigation_system_event,
+                )
+                synthetic_prompt = (
+                    build_topic_resume_system_message(topic.name)
+                    if welcome_shown
+                    else build_topic_auto_start_system_message(topic.name)
+                )
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=user.id,
+                    dialogue_id=dialogue_id,
+                    topic_id=topic_id,
+                    text=synthetic_prompt,
+                )
                 await session.commit()
                 return TopicSwitchResult(
                     "switched",
@@ -7588,6 +7626,8 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                     welcome_shown=welcome_shown,
                     dialogue_id=dialogue_id,
                     topic_id=topic_id,
+                    navigation_message_id=nav_msg.id,
+                    synthetic_prompt=synthetic_prompt,
                 )
             return TopicSwitchResult("inaccessible")
 
@@ -7634,6 +7674,7 @@ async def _complete_telegram_topic_entry(
         topic_intro_welcome_needed=not switch_res.welcome_shown,
         topic_intro_restored=switch_res.restored,
         topic_intro_memory_mode=switch_res.memory_mode,
+        topic_intro_navigation_message_id=switch_res.navigation_message_id,
     ):
         return
 
@@ -7652,6 +7693,7 @@ async def _complete_telegram_topic_entry(
                         pending_auto_start_topic_id=int(switch_res.topic_id),
                         pending_auto_start_dialogue_id=switch_res.dialogue_id,
                         pending_auto_start_kind="first_entry",
+                        pending_auto_start_message_id=switch_res.navigation_message_id,
                     )
                     text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                     await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -7665,7 +7707,10 @@ async def _complete_telegram_topic_entry(
                 if not await _check_telegram_chat_access(session_acc, user_id, bot, chat_id):
                     return
 
-            await _start_telegram_topic_auto_start(user_id, bot, state, switch_res.topic, switch_res.dialogue_id)
+            await _start_telegram_topic_auto_start(
+                user_id, bot, state, switch_res.topic, switch_res.dialogue_id,
+                navigation_message_id=switch_res.navigation_message_id,
+            )
     else:
         if not user.accepted_disclaimer:
             disclaimer_content = await get_content_from_db("disclaimer")
@@ -7675,6 +7720,7 @@ async def _complete_telegram_topic_entry(
                     pending_auto_start_topic_id=int(switch_res.topic_id),
                     pending_auto_start_dialogue_id=switch_res.dialogue_id,
                     pending_auto_start_kind="resume",
+                    pending_auto_start_message_id=switch_res.navigation_message_id,
                 )
                 text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -7688,19 +7734,11 @@ async def _complete_telegram_topic_entry(
             if not await _check_telegram_chat_access(session_acc, user_id, bot, chat_id):
                 return
 
-        from system_events import build_topic_resume_system_message, record_navigation_system_event
-        synthetic_prompt = build_topic_resume_system_message(switch_res.topic.name)
-        async with async_session_maker() as session:
-            nav_msg = await record_navigation_system_event(
-                session,
-                user_id=user_id,
-                dialogue_id=switch_res.dialogue_id,
-                topic_id=switch_res.topic_id,
-                text=synthetic_prompt,
-            )
+        from system_events import build_topic_resume_system_message
+        synthetic_prompt = switch_res.synthetic_prompt or build_topic_resume_system_message(switch_res.topic.name)
         await _start_telegram_hidden_kickoff(
             user_id, bot, state, synthetic_prompt, switch_res.dialogue_id, switch_res.topic_id,
-            navigation_message_id=nav_msg.id,
+            navigation_message_id=switch_res.navigation_message_id,
         )
 
 
@@ -7802,6 +7840,7 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                             pending_auto_start_topic_id=int(topic_id),
                             pending_auto_start_dialogue_id=user.current_dialogue_id,
                             pending_auto_start_kind="first_entry",
+                            pending_auto_start_message_id=data.get("topic_intro_navigation_message_id"),
                         )
                     text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                     await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -7816,7 +7855,10 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                 if not await _check_telegram_chat_access(session_acc, chat_id, bot, chat_id):
                     return True
 
-            await _start_telegram_topic_auto_start(chat_id, bot, state, topic, user.current_dialogue_id)
+            await _start_telegram_topic_auto_start(
+                chat_id, bot, state, topic, user.current_dialogue_id,
+                navigation_message_id=data.get("topic_intro_navigation_message_id"),
+            )
     else:
         if user and not user.accepted_disclaimer:
             disclaimer_content = await get_content_from_db("disclaimer")
@@ -7827,6 +7869,7 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                         pending_auto_start_topic_id=int(topic_id),
                         pending_auto_start_dialogue_id=user.current_dialogue_id,
                         pending_auto_start_kind="resume",
+                        pending_auto_start_message_id=data.get("topic_intro_navigation_message_id"),
                     )
                 text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -7843,17 +7886,21 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
 
         from system_events import build_topic_resume_system_message, record_navigation_system_event
         synthetic_prompt = build_topic_resume_system_message(topic.name)
-        async with async_session_maker() as session:
-            nav_msg = await record_navigation_system_event(
-                session,
-                user_id=chat_id,
-                dialogue_id=user.current_dialogue_id,
-                topic_id=int(topic_id),
-                text=synthetic_prompt,
-            )
+        nav_msg_id = data.get("topic_intro_navigation_message_id")
+        if not nav_msg_id:
+            async with async_session_maker() as session:
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=chat_id,
+                    dialogue_id=user.current_dialogue_id,
+                    topic_id=int(topic_id),
+                    text=synthetic_prompt,
+                )
+                await session.commit()
+                nav_msg_id = nav_msg.id
         await _start_telegram_hidden_kickoff(
             chat_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(topic_id),
-            navigation_message_id=nav_msg.id,
+            navigation_message_id=nav_msg_id,
         )
 
     return True
@@ -7948,6 +7995,7 @@ async def _request_profile_onboarding_if_needed(
     topic_intro_welcome_needed: bool = True,
     topic_intro_restored: bool = False,
     topic_intro_memory_mode: str = MEMORY_MODE_RESET,
+    topic_intro_navigation_message_id: int | None = None,
     resume_start: bool = False,
     resume_start_args: str | None = None,
     resume_start_new_user: bool = False,
@@ -7976,6 +8024,7 @@ async def _request_profile_onboarding_if_needed(
             "topic_intro_welcome_needed": topic_intro_welcome_needed,
             "topic_intro_restored": topic_intro_restored,
             "topic_intro_memory_mode": topic_intro_memory_mode,
+            "topic_intro_navigation_message_id": topic_intro_navigation_message_id,
         })
 
     await state.update_data(**state_data)
@@ -8056,14 +8105,24 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
     )
 
 
-async def _transition_to_main_db_locked(session: AsyncSession, user: User) -> int:
+async def _transition_to_main_db_locked(session: AsyncSession, user: User) -> tuple[int, int | None]:
     ai_config = await session.get(AIConfig, 1)
     memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
     await _apply_topic_switch(session, user, 0, memory_mode)
     user.current_topic_id = None
     dialogue_id = user.current_dialogue_id
+
+    from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
+    synthetic_prompt = build_main_dialogue_resume_system_message()
+    nav_msg = await record_navigation_system_event(
+        session,
+        user_id=user.id,
+        dialogue_id=dialogue_id,
+        topic_id=None,
+        text=synthetic_prompt,
+    )
     await session.commit()
-    return dialogue_id
+    return dialogue_id, (nav_msg.id if nav_msg else None)
 
 
 async def _complete_telegram_main_continuation(
@@ -8071,6 +8130,7 @@ async def _complete_telegram_main_continuation(
     dialogue_id: int,
     bot: Bot,
     state: FSMContext | None = None,
+    navigation_message_id: int | None = None,
 ) -> None:
     async with async_session_maker() as session_acc:
         user = await session_acc.get(User, user_id)
@@ -8091,6 +8151,7 @@ async def _complete_telegram_main_continuation(
                         pending_auto_start_topic_id=None,
                         pending_auto_start_dialogue_id=dialogue_id,
                         pending_auto_start_kind="main_resume",
+                        pending_auto_start_message_id=navigation_message_id,
                     )
                 text_to_send_disc = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await bot.send_message(user_id, text_to_send_disc, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -8105,33 +8166,39 @@ async def _complete_telegram_main_continuation(
 
     from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
     synthetic_prompt = build_main_dialogue_resume_system_message()
-    async with async_session_maker() as session:
-        nav_msg = await record_navigation_system_event(
-            session,
-            user_id=user_id,
-            dialogue_id=dialogue_id,
-            topic_id=None,
-            text=synthetic_prompt,
-        )
+    if navigation_message_id is None:
+        async with async_session_maker() as session:
+            nav_msg = await record_navigation_system_event(
+                session,
+                user_id=user_id,
+                dialogue_id=dialogue_id,
+                topic_id=None,
+                text=synthetic_prompt,
+            )
+            await session.commit()
+            navigation_message_id = nav_msg.id
     await _start_telegram_hidden_kickoff(
         user_id, bot, state, synthetic_prompt, dialogue_id, None,
-        navigation_message_id=nav_msg.id,
+        navigation_message_id=navigation_message_id,
     )
 
 
 async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot, state: FSMContext | None = None) -> None:
     dialogue_id = None
+    nav_msg_id = None
     async with user_locks.setdefault(user_id, asyncio.Lock()):
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             if not user or user.current_topic_id is None:
                 return
-            dialogue_id = await _transition_to_main_db_locked(session, user)
+            dialogue_id, nav_msg_id = await _transition_to_main_db_locked(session, user)
 
     if dialogue_id is None:
         return
 
-    await _complete_telegram_main_continuation(user_id, dialogue_id, bot, state)
+    await _complete_telegram_main_continuation(
+        user_id, dialogue_id, bot, state, navigation_message_id=nav_msg_id
+    )
 
 
 @router.callback_query(F.data == "reset_topic")
@@ -15893,7 +15960,10 @@ async def get_ai_response_direct(
         )]
 
         if activity_tracker is not None:
-            await activity_tracker.mark_outbound_attempt_once()
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                logging.warning("Failed to mark activity before outbound call: %s", act_err)
 
         if provider_key == 'gemini':
             response_text = await _call_gemini_api(
@@ -17248,6 +17318,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
             topic_id = user.current_topic_id
             dialogue_id = user.current_dialogue_id
 
+            nav_msg_id = None
             if topic:
                 text_to_send = f"✅ Диалог в теме «{topic.name}» перезапущен. Память очищена."
                 if topic.start_message:
@@ -17256,6 +17327,17 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
 
                 if topic.start_button_text and topic.start_button_payload:
                     reply_markup = kb.action_button_keyboard(topic.start_button_text, "topic_action")
+
+                from system_events import build_topic_auto_start_system_message, record_navigation_system_event
+                synthetic_prompt = build_topic_auto_start_system_message(topic.name)
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=user.id,
+                    dialogue_id=dialogue_id,
+                    topic_id=topic_id,
+                    text=synthetic_prompt,
+                )
+                nav_msg_id = nav_msg.id
 
             await session.commit()
 
@@ -17286,6 +17368,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
                             pending_auto_start_topic_id=int(topic_id),
                             pending_auto_start_dialogue_id=dialogue_id,
                             pending_auto_start_kind="first_entry",
+                            pending_auto_start_message_id=nav_msg_id,
                         )
                         text_to_send_disc = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                         await bot.send_message(callback.from_user.id, text_to_send_disc, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -17297,7 +17380,10 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
                 if not await _check_telegram_chat_access(session_acc, callback.from_user.id, bot, callback.from_user.id):
                     return
 
-            await _start_telegram_topic_auto_start(callback.from_user.id, bot, state, topic, dialogue_id)
+            await _start_telegram_topic_auto_start(
+                callback.from_user.id, bot, state, topic, dialogue_id,
+                navigation_message_id=nav_msg_id,
+            )
     else:
         await bot.send_message(callback.from_user.id, text_to_send)
 
@@ -17428,6 +17514,7 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
 
     status = "ok"
     dialogue_id = None
+    nav_msg_id = None
 
     async with user_locks.setdefault(user_id, asyncio.Lock()):
         data = await state.get_data()
@@ -17445,7 +17532,7 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
                 if not user or user.current_topic_id is None or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
                     status = "scope_mismatch"
                 else:
-                    dialogue_id = await _transition_to_main_db_locked(session, user)
+                    dialogue_id, nav_msg_id = await _transition_to_main_db_locked(session, user)
 
     if status == "stale_token":
         await callback.message.answer("Подтверждение устарело или уже использовано.")
@@ -17461,7 +17548,9 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
         pass
 
     if dialogue_id is not None:
-        await _complete_telegram_main_continuation(user_id, dialogue_id, bot, state)
+        await _complete_telegram_main_continuation(
+            user_id, dialogue_id, bot, state, navigation_message_id=nav_msg_id
+        )
 
 
 @router.message(F.document, Command("upload_random"))

@@ -594,6 +594,19 @@ async def execute_dialogue_reset(
                 DBMessage.dialogue_id == user.current_dialogue_id - 1,
             )
         )
+        navigation_message_id = None
+        synthetic_text = None
+        if topic and topic_id:
+            from system_events import build_topic_auto_start_system_message, record_navigation_system_event
+            synthetic_text = build_topic_auto_start_system_message(topic.name)
+            nav_msg = await record_navigation_system_event(
+                session,
+                user_id=user_id,
+                dialogue_id=new_dialogue_id,
+                topic_id=topic_id,
+                text=synthetic_text,
+            )
+            navigation_message_id = nav_msg.id
         await session.commit()
 
     if topic and topic_id:
@@ -635,6 +648,7 @@ async def execute_dialogue_reset(
                         "pending_auto_start_topic_id": topic_id,
                         "pending_auto_start_dialogue_id": new_dialogue_id,
                         "pending_auto_start_kind": "first_entry",
+                        "pending_auto_start_message_id": navigation_message_id,
                     },
                 )
                 return
@@ -649,6 +663,7 @@ async def execute_dialogue_reset(
                         "pending_auto_start_topic_id": topic_id,
                         "pending_auto_start_dialogue_id": new_dialogue_id,
                         "pending_auto_start_kind": "first_entry",
+                        "pending_auto_start_message_id": navigation_message_id,
                     },
                 ):
                     return
@@ -656,16 +671,6 @@ async def execute_dialogue_reset(
             if fresh_user and not await ensure_access_before_chat(client, chat_id, fresh_user):
                 return
 
-            from system_events import build_topic_auto_start_system_message, record_navigation_system_event
-            synthetic_text = build_topic_auto_start_system_message(topic.name)
-            async with async_session_maker() as session:
-                nav_msg = await record_navigation_system_event(
-                    session,
-                    user_id=user_id,
-                    dialogue_id=new_dialogue_id,
-                    topic_id=topic_id,
-                    text=synthetic_text,
-                )
             await run_hidden_ai_kickoff(
                 client,
                 chat_id,
@@ -674,7 +679,7 @@ async def execute_dialogue_reset(
                 expected_dialogue_id=new_dialogue_id,
                 expected_topic_id=topic_id,
                 states=states,
-                exclude_message_id=nav_msg.id,
+                exclude_message_id=navigation_message_id,
             )
     else:
         await client.send_message(chat_id=chat_id, text="✅ Память очищена.", attachments=inline_keyboard([main_menu_row()]))
@@ -1205,14 +1210,18 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
             return
         from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
         synthetic_text = build_main_dialogue_resume_system_message()
-        async with async_session_maker() as session:
-            nav_msg = await record_navigation_system_event(
-                session,
-                user_id=user_id,
-                dialogue_id=user.current_dialogue_id,
-                topic_id=None,
-                text=synthetic_text,
-            )
+        nav_msg_id = data.get("pending_auto_start_message_id")
+        if not nav_msg_id:
+            async with async_session_maker() as session:
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=user_id,
+                    dialogue_id=user.current_dialogue_id,
+                    topic_id=None,
+                    text=synthetic_text,
+                )
+                await session.commit()
+                nav_msg_id = nav_msg.id
         await run_hidden_ai_kickoff(
             client,
             chat_id,
@@ -1221,7 +1230,7 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
             expected_dialogue_id=user.current_dialogue_id,
             expected_topic_id=None,
             states=states,
-            exclude_message_id=nav_msg.id,
+            exclude_message_id=nav_msg_id,
         )
         return
 
@@ -1251,14 +1260,18 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
             from system_events import build_topic_auto_start_system_message, record_navigation_system_event
             synthetic_text = build_topic_auto_start_system_message(topic.name)
 
-        async with async_session_maker() as session:
-            nav_msg = await record_navigation_system_event(
-                session,
-                user_id=user_id,
-                dialogue_id=user.current_dialogue_id,
-                topic_id=topic_id_int,
-                text=synthetic_text,
-            )
+        nav_msg_id = data.get("pending_auto_start_message_id")
+        if not nav_msg_id:
+            async with async_session_maker() as session:
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=user_id,
+                    dialogue_id=user.current_dialogue_id,
+                    topic_id=topic_id_int,
+                    text=synthetic_text,
+                )
+                await session.commit()
+                nav_msg_id = nav_msg.id
 
         await run_hidden_ai_kickoff(
             client,
@@ -1268,7 +1281,7 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
             expected_dialogue_id=user.current_dialogue_id,
             expected_topic_id=topic_id_int,
             states=states,
-            exclude_message_id=nav_msg.id,
+            exclude_message_id=nav_msg_id,
         )
         return
 

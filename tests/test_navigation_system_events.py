@@ -10,6 +10,7 @@ os.environ.setdefault("BOT_TOKEN", "test")
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 from ai_request_builder import (
     build_conversational_request_layout,
@@ -21,6 +22,7 @@ from database import (
     Message as DBMessage,
     Topic,
     User,
+    UserAIActivity,
 )
 from result_history import (
     SYSTEM_EVENT_ROLE,
@@ -39,10 +41,16 @@ from system_events import (
 
 class NavigationSystemEventsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        self.engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        from max_messenger_bot.storage import StorageBase
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            await connection.run_sync(StorageBase.metadata.create_all)
 
         async with self.sessions() as session:
             self.user = User(
@@ -714,3 +722,153 @@ class NavigationSystemEventsTests(unittest.IsolatedAsyncioTestCase):
                 await session.scalars(select(DBMessage).where(DBMessage.user_id == 2001, DBMessage.role == "assistant"))
             ).all()
             self.assertEqual(len(assistant_msgs), 0)
+
+    # 85. MAX navigation: auto_start=False persists system_event in a fresh session without kickoff/activity
+    async def test_max_navigation_auto_start_false_persists_event_fresh_session(self):
+        from max_messenger_bot.services import topics as max_topics
+        from max_messenger_bot.storage import StateStore
+
+        async with self.sessions() as session:
+            topic = await session.get(Topic, 1)
+            topic.auto_start_dialogue = False
+            user = await session.get(User, 2001)
+            user.accepted_disclaimer = True
+            user.current_topic_id = None
+            user.current_dialogue_id = 1
+            await session.commit()
+
+        client = AsyncMock()
+        client.send_message = AsyncMock()
+        client.edit_message = AsyncMock()
+        states = StateStore()
+
+        with patch("max_messenger_bot.legacy.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.storage.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.services.topics.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.services.common.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.services.common.run_hidden_ai_kickoff") as mock_kickoff:
+            await max_topics.select_topic(client, chat_id=2001, user_id=2001, topic_id=1, states=states)
+            # Kickoff must not run
+            mock_kickoff.assert_not_called()
+
+        # FRESH session check
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            self.assertEqual(user.current_topic_id, 1)
+
+            msgs = (
+                await session.scalars(
+                    select(DBMessage)
+                    .where(DBMessage.user_id == 2001)
+                    .order_by(DBMessage.id.asc())
+                )
+            ).all()
+            # Must have persisted system_event and topic_welcome
+            sys_msgs = [m for m in msgs if m.role == SYSTEM_EVENT_ROLE]
+            self.assertEqual(len(sys_msgs), 1)
+            self.assertEqual(sys_msgs[0].topic_id, 1)
+            self.assertIn('Пользователь выбрал тему "Тревожность"', sys_msgs[0].content)
+
+            # No assistant messages
+            ast_msgs = [m for m in msgs if m.role == "assistant"]
+            self.assertEqual(len(ast_msgs), 0)
+
+            # No user AI activity was updated
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 2001))).all()
+            self.assertEqual(len(acts), 0)
+
+            # Subsequent history load must see the system event
+            history = await self._load_history(session, user_id=2001, dialogue_id=user.current_dialogue_id, topic_id=1)
+            self.assertTrue(any('Пользователь выбрал тему "Тревожность"' in m.content for m in history))
+
+    # 86. MAX navigation: already-active topic produces no new event
+    async def test_max_navigation_already_active_topic_no_new_event(self):
+        from max_messenger_bot.services import topics as max_topics
+        from max_messenger_bot.storage import StateStore
+
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            user.current_topic_id = 1
+            await session.commit()
+
+        client = AsyncMock()
+        states = StateStore()
+
+        with patch("max_messenger_bot.legacy.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.storage.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.services.topics.async_session_maker", self.sessions):
+            await max_topics.select_topic(client, chat_id=2001, user_id=2001, topic_id=1, states=states)
+
+        async with self.sessions() as session:
+            msgs = (
+                await session.scalars(
+                    select(DBMessage).where(DBMessage.user_id == 2001, DBMessage.role == SYSTEM_EVENT_ROLE)
+                )
+            ).all()
+            self.assertEqual(len(msgs), 0)
+
+    # 87. MAX navigation: reset_topic persists main resume system event in fresh session
+    async def test_max_navigation_reset_topic_persists_main_resume_fresh_session(self):
+        from max_messenger_bot.services import topics as max_topics
+        from max_messenger_bot.storage import StateStore
+
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            user.accepted_disclaimer = True
+            user.current_topic_id = 1
+            await session.commit()
+
+        client = AsyncMock()
+        client.send_message = AsyncMock()
+        client.edit_message = AsyncMock()
+        states = StateStore()
+
+        with patch("max_messenger_bot.legacy.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.storage.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.services.topics.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.services.common.async_session_maker", self.sessions), \
+             patch("max_messenger_bot.services.common.run_hidden_ai_kickoff", new_callable=AsyncMock) as mock_kickoff:
+            await max_topics.reset_topic(client, chat_id=2001, user_id=2001, states=states)
+
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            self.assertIsNone(user.current_topic_id)
+
+            msgs = (
+                await session.scalars(
+                    select(DBMessage)
+                    .where(DBMessage.user_id == 2001, DBMessage.role == SYSTEM_EVENT_ROLE)
+                    .order_by(DBMessage.id.asc())
+                )
+            ).all()
+            self.assertEqual(len(msgs), 1)
+            self.assertIsNone(msgs[0].topic_id)
+            self.assertIn("Пользователь вернулся в общий режим диалога", msgs[0].content)
+
+    # 88. Telegram navigation: _perform_telegram_topic_switch persists system event in same transaction
+    async def test_telegram_navigation_switch_persists_in_fresh_session(self):
+        import handlers
+
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            user.accepted_disclaimer = True
+            user.current_topic_id = None
+            user.current_dialogue_id = 1
+            await session.commit()
+
+        with patch("handlers.async_session_maker", self.sessions):
+            res = await handlers._perform_telegram_topic_switch(2001, 1)
+
+        self.assertEqual(res.status, "switched")
+        self.assertIsNotNone(res.navigation_message_id)
+
+        # Fresh session verification
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            self.assertEqual(user.current_topic_id, 1)
+
+            nav_msg = await session.get(DBMessage, res.navigation_message_id)
+            self.assertIsNotNone(nav_msg)
+            self.assertEqual(nav_msg.role, SYSTEM_EVENT_ROLE)
+            self.assertEqual(nav_msg.topic_id, 1)
+            self.assertIn('Пользователь выбрал тему "Тревожность"', nav_msg.content)

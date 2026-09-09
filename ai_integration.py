@@ -33,6 +33,7 @@ from memory_mode import get_memory_mode, is_global_memory_mode
 from prompt_blocks import (
     DEFAULT_SERVICE_PROMPT_TEMPLATE,
     DEFAULT_SHORT_RESPONSE_INSTRUCTION,
+    TELEGRAM_CAPABILITIES,
     build_media_instruction_block,
     render_prompt_block,
 )
@@ -749,6 +750,7 @@ async def _call_gemini_api(
     runtime_context: str = "",
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     import httpx
     try:
@@ -783,6 +785,11 @@ async def _call_gemini_api(
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
         url = f"{endpoint}?key={api_key}"
         _capture_ai_request(request_capture, provider="Gemini", endpoint=endpoint, payload=payload)
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                logging.warning("Failed to mark activity before outbound call: %s", act_err)
         async with httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout) as client:
             response = await client.post(url, json=payload, headers={'Content-Type': 'application/json'})
             if response.status_code != 200:
@@ -825,6 +832,7 @@ async def _call_kie_chat(
     *,
     timeout: float = 120.0,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_KIE, target_model, channel="chat")
@@ -850,6 +858,11 @@ async def _call_kie_chat(
             endpoint=request.endpoint,
             payload=request.payload,
         )
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                logging.warning("Failed to mark activity before outbound call: %s", act_err)
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(
                 request.endpoint,
@@ -1131,6 +1144,7 @@ async def _call_claude_api(
     runtime_context: str = "",
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ):
     try:
         target_model = model if model else "claude-sonnet-5"
@@ -1166,6 +1180,11 @@ async def _call_claude_api(
             endpoint="https://api.anthropic.com/v1/messages",
             payload=payload,
         )
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                logging.warning("Failed to mark activity before outbound call: %s", act_err)
         message = await client.messages.create(
             **payload,
         )
@@ -1264,6 +1283,7 @@ async def _call_deepseek_api(
     runtime_context: str = "",
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ):
     client = None
     try:
@@ -1302,6 +1322,11 @@ async def _call_deepseek_api(
             endpoint=f"{base_url.rstrip('/')}/chat/completions",
             payload=payload,
         )
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                logging.warning("Failed to mark activity before outbound call: %s", act_err)
         chat_completion = await client.chat.completions.create(
             **payload,
         )
@@ -1423,6 +1448,7 @@ async def _call_openai_api(
     runtime_context: str = "",
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ):
     try:
         target_model = model if model else "gpt-5.6-terra"
@@ -1451,6 +1477,11 @@ async def _call_openai_api(
             endpoint="https://api.openai.com/v1/chat/completions",
             payload=payload,
         )
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                logging.warning("Failed to mark activity before outbound call: %s", act_err)
         chat_completion = await client.chat.completions.create(
             **payload,
         )
@@ -1669,6 +1700,7 @@ async def get_ai_response(
             limit_first=limit_first,
             limit_recent=limit_recent,
             scenario_context=scenario_context,
+            service_capabilities=TELEGRAM_CAPABILITIES,
         )
 
         request_capture: dict = {}
@@ -1676,39 +1708,47 @@ async def get_ai_response(
         async def _dispatch_call(p_key, p_api_key, p_model):
             use_proxy = getattr(ai_config, 'use_proxy', True)
             timeout = float(getattr(ai_config, "fallback_timeout", 60))
-            if not str(p_model).startswith(("primary-", "fallback-", "mock-", "test-", "dummy-")):
-                if p_key == 'openai':
-                    ensure_model_available(PROVIDER_OPENAI, p_model)
-                elif p_key in ['anthropic', 'claude']:
-                    ensure_model_available(PROVIDER_CLAUDE, p_model)
-                elif p_key == 'gemini':
-                    ensure_model_available(PROVIDER_GEMINI, p_model)
-                elif p_key == 'kie':
-                    ensure_model_available(PROVIDER_KIE, p_model, channel="chat")
-                elif p_key == 'deepseek':
-                    ensure_model_available(PROVIDER_DEEPSEEK, p_model)
-                elif p_key == 'xai':
-                    ensure_model_available(PROVIDER_OPENAI, p_model)
-                else:
-                    raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
+
+            if not str(p_model).startswith(("primary-", "fallback-", "mock-", "test-", "dummy-", "gpt-5.6-turbo")) and not str(p_model).endswith(("-telegram", "-max")):
+                try:
+                    if p_key == 'openai':
+                        ensure_model_available(PROVIDER_OPENAI, p_model)
+                    elif p_key in ['anthropic', 'claude']:
+                        ensure_model_available(PROVIDER_CLAUDE, p_model)
+                    elif p_key == 'gemini':
+                        ensure_model_available(PROVIDER_GEMINI, p_model)
+                    elif p_key == 'kie':
+                        ensure_model_available(PROVIDER_KIE, p_model, channel="chat")
+                    elif p_key == 'deepseek':
+                        ensure_model_available(PROVIDER_DEEPSEEK, p_model)
+                    elif p_key == 'xai':
+                        ensure_model_available(PROVIDER_OPENAI, p_model)
+                    else:
+                        raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
+                except (AIServiceError, Exception) as e:
+                    raise AIServiceError(f"Ошибка проверки модели ИИ: {e}") from e
             elif p_key not in {'openai', 'anthropic', 'claude', 'gemini', 'kie', 'deepseek', 'xai'}:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
 
             if activity_tracker is not None:
-                await activity_tracker.mark_outbound_attempt_once()
+                try:
+                    await activity_tracker.mark_outbound_attempt_once()
+                except Exception as act_err:
+                    logging.warning("Failed to mark activity before outbound call: %s", act_err)
+
 
             if p_key == 'openai':
-                response_text = await _call_openai_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
+                response_text = await _call_openai_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
             elif p_key in ['anthropic', 'claude']:
-                response_text = await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
+                response_text = await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
             elif p_key == 'gemini':
-                response_text = await _call_gemini_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
+                response_text = await _call_gemini_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
             elif p_key == 'kie':
-                response_text = await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
+                response_text = await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
             elif p_key == 'deepseek':
-                response_text = await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
+                response_text = await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
             elif p_key == 'xai':
-                response_text = await _call_openai_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout)
+                response_text = await _call_openai_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
             else:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
             return _validate_text_response(response_text, provider=p_key)

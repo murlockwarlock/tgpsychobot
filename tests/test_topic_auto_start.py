@@ -642,16 +642,21 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         # Assert DBMessage records persisted
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 215).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs), 2)
-            self.assertEqual(msgs[0].role, "topic_welcome")
+            self.assertEqual(len(msgs), 3)
+            self.assertEqual(msgs[0].role, "system_event")
             self.assertEqual(msgs[0].topic_id, 30)
             self.assertEqual(msgs[0].dialogue_id, 2)
-            self.assertEqual(msgs[0].content, "shown")
+            self.assertIn("Пользователь выбрал тему", msgs[0].content)
 
-            self.assertEqual(msgs[1].role, "assistant")
+            self.assertEqual(msgs[1].role, "topic_welcome")
             self.assertEqual(msgs[1].topic_id, 30)
             self.assertEqual(msgs[1].dialogue_id, 2)
-            self.assertIn("Здравствуйте, Карен!", msgs[1].content)
+            self.assertEqual(msgs[1].content, "shown")
+
+            self.assertEqual(msgs[2].role, "assistant")
+            self.assertEqual(msgs[2].topic_id, 30)
+            self.assertEqual(msgs[2].dialogue_id, 2)
+            self.assertIn("Здравствуйте, Карен!", msgs[2].content)
 
         # Next normal turn succeeds
         call_gemini_mock.reset_mock()
@@ -664,8 +669,8 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         call_gemini_mock.assert_called_once()
         async with self.session_factory() as session:
             msgs2 = (await session.execute(select(DBMessage).where(DBMessage.user_id == 215).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs2), 4)
-            self.assertEqual(msgs2[2].role, "user")
-            self.assertEqual(msgs2[2].content, "Как именно дышать?")
-            self.assertEqual(msgs2[3].role, "assistant")
-            self.assertEqual(msgs2[3].content, "Да, сделайте вдох на 4 счета.")
+            self.assertEqual(len(msgs2), 5)
+            self.assertEqual(msgs2[3].role, "user")
+            self.assertEqual(msgs2[3].content, "Как именно дышать?")
+            self.assertEqual(msgs2[4].role, "assistant")
+            self.assertEqual(msgs2[4].content, "Да, сделайте вдох на 4 счета.")

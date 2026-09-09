@@ -612,3 +612,160 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
             await file_engine.dispose()
             if db_path.exists():
                 db_path.unlink()
+
+    # 125. ActivityTracker persistence failure retry
+    async def test_activity_tracker_persistence_failure_retries(self):
+        import ai_request_builder
+
+        tracker = ActivityTracker(self.sessions, user_id=3001, topic_id=10)
+        self.assertFalse(tracker._marked)
+
+        # Mock upsert_user_ai_activity to fail on first attempt
+        call_count = 0
+        orig_upsert = ai_request_builder.upsert_user_ai_activity
+
+        async def failing_upsert(session, user_id, scope_key, request_time):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("DB connection lost")
+            return await orig_upsert(session, user_id=user_id, scope_key=scope_key, request_time=request_time)
+
+        with patch("ai_request_builder.upsert_user_ai_activity", side_effect=failing_upsert):
+            # First attempt fails
+            with self.assertRaises(RuntimeError):
+                await tracker.mark_outbound_attempt_once()
+            # _marked must remain False so retry is allowed
+            self.assertFalse(tracker._marked)
+
+            # Second attempt succeeds
+            await tracker.mark_outbound_attempt_once()
+            self.assertTrue(tracker._marked)
+
+            # Third attempt is a no-op
+            await tracker.mark_outbound_attempt_once()
+            self.assertTrue(tracker._marked)
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 2)
+
+    # 126. MAX activity: missing API key produces no network call and no activity
+    async def test_max_activity_missing_key_no_activity(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.openai_api_key = ""
+            cfg.allow_fallback = False
+            await session.commit()
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create") as mock_call:
+            with self.assertRaises(Exception):
+                await max_ai.get_ai_response(
+                    3001,
+                    "Привет",
+                    track_user_activity=True,
+                )
+            mock_call.assert_not_called()
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 0)
+
+    # 127. MAX activity: local invalid model produces no network call and no activity
+    async def test_max_activity_invalid_model_no_activity(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.openai_api_key = "sk-valid"
+            cfg.openai_model = "unsupported-model-xyz"
+            cfg.allow_fallback = False
+            await session.commit()
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create") as mock_call:
+            with self.assertRaises(Exception):
+                await max_ai.get_ai_response(
+                    3001,
+                    "Привет",
+                    track_user_activity=True,
+                )
+            mock_call.assert_not_called()
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 0)
+
+    # 128. MAX activity: network timeout records activity
+    async def test_max_activity_network_timeout_records_activity(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = "sk-valid"
+            cfg.openai_model = "gpt-5.6-terra"
+            cfg.allow_fallback = False
+            await session.commit()
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=TimeoutError("Network timeout")):
+            with self.assertRaises(Exception):
+                await max_ai.get_ai_response(
+                    3001,
+                    "Привет",
+                    track_user_activity=True,
+                )
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertTrue(len(acts) >= 2)
+
+    # 129. MAX activity: fallback after local failure marks activity on fallback
+    async def test_max_activity_fallback_after_local_failure_marks_activity(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = ""  # Primary fails locally due to missing key
+            cfg.allow_fallback = True
+            cfg.fallback_provider = "Claude"
+            cfg.claude_api_key = "sk-claude-test"
+            cfg.fallback_model = "claude-sonnet-5"
+            await session.commit()
+
+        with patch("max_messenger_bot.ai._call_claude", new_callable=AsyncMock) as mock_claude:
+            mock_claude.return_value = "Ответ от Claude"
+            resp = await max_ai.get_ai_response(
+                3001,
+                "Привет",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp, "Ответ от Claude")
+            mock_claude.assert_called_once()
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 2)
+
+    # 130. MAX activity: fallback after network failure marks activity only once
+    async def test_max_activity_fallback_after_network_failure_marks_only_once(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = "sk-valid"
+            cfg.openai_model = "gpt-5.6-terra"
+            cfg.allow_fallback = True
+            cfg.fallback_provider = "Claude"
+            cfg.claude_api_key = "sk-claude-test"
+            cfg.fallback_model = "claude-sonnet-5"
+            await session.commit()
+
+        # Primary fails with network timeout inside _call_openai
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=TimeoutError("Primary network timeout")), \
+             patch("max_messenger_bot.ai._call_claude", new_callable=AsyncMock) as mock_claude:
+            mock_claude.return_value = "Ответ от Claude"
+            resp = await max_ai.get_ai_response(
+                3001,
+                "Привет",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp, "Ответ от Claude")
+            mock_claude.assert_called_once()
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 2)

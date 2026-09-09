@@ -420,7 +420,7 @@ async def test_real_get_ai_response_preserves_deepseek_golden_prefix(monkeypatch
     assert len(_CompletionClient.calls) == 2
     payloads = _CompletionClient.calls
     expected_stable = "STABLE CONFIGURED TOPIC PROMPT\n\nSHARED BLOCK\n\nSERVICE BLOCK"
-    target_sessions = [s for s in sessions if s.added]
+    target_sessions = [s for s in sessions if any(hasattr(item, "request_payload") for item in s.added)]
     for user, session, payload in zip(users, target_sessions, payloads):
         messages = payload["messages"]
         expected_dynamic = (
@@ -439,9 +439,10 @@ async def test_real_get_ai_response_preserves_deepseek_golden_prefix(monkeypatch
             for forbidden in ("Alice", "Boris", "CURRENT_STATE", "METADATA", "TEST", "RAG", "GLOBAL")
         )
 
-        captured = json.loads(session.added[-1].request_payload)
+        ai_log = [item for item in session.added if hasattr(item, "request_payload")][-1]
+        captured = json.loads(ai_log.request_payload)
         assert captured["payload"] == payload
-        assert "not-a-real-key" not in session.added[-1].request_payload
+        assert "not-a-real-key" not in ai_log.request_payload
 
     assert payloads[0]["messages"][0] == payloads[1]["messages"][0]
 
