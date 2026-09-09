@@ -103,6 +103,63 @@ def _capture_ai_request(
     )
 
 
+def extract_effective_provider_and_model(
+    request_capture: dict | None,
+    default_provider: str | None = None,
+    default_model: str | None = None,
+    *,
+    channel: str = "chat",
+) -> tuple[str, str]:
+    """Extract actual successful provider and model from request_capture.
+
+    Ties AILog.provider and AILog.model directly to the wire payload captured during
+    the successful outbound attempt.
+    """
+    actual_provider = (
+        request_capture.get("provider") if isinstance(request_capture, dict) else None
+    ) or default_provider or "OpenAI"
+
+    actual_model = None
+    if isinstance(request_capture, dict):
+        payload = request_capture.get("payload")
+        if isinstance(payload, dict) and payload.get("model"):
+            actual_model = str(payload["model"]).strip()
+        if not actual_model:
+            endpoint = str(request_capture.get("endpoint") or "")
+            if "/models/" in endpoint:
+                candidate = endpoint.split("/models/", 1)[1].split(":", 1)[0].split("?", 1)[0].strip()
+                if candidate:
+                    actual_model = candidate
+
+    if not actual_model:
+        if default_model and str(default_model).strip() and str(default_model).strip() != "Vision":
+            actual_model = str(default_model).strip()
+        else:
+            prov_lower = str(actual_provider).lower()
+            if channel == "vision":
+                if prov_lower in ("gemini", "google"):
+                    actual_model = "gemini-3.7-flash"
+                elif prov_lower == "claude":
+                    actual_model = "claude-sonnet-5"
+                elif prov_lower == "kie":
+                    actual_model = "gemini-3-flash"
+                else:
+                    actual_model = "gpt-5.6-terra"
+            else:
+                if prov_lower in ("gemini", "google"):
+                    actual_model = "gemini-3.7-flash"
+                elif prov_lower == "claude":
+                    actual_model = "claude-sonnet-5"
+                elif prov_lower == "kie":
+                    actual_model = "deepseek-v3"
+                elif prov_lower == "deepseek":
+                    actual_model = "deepseek-chat"
+                else:
+                    actual_model = "gpt-5.6-terra"
+
+    return str(actual_provider), str(actual_model)
+
+
 
 @dataclass(frozen=True)
 class AIRequestMessage:

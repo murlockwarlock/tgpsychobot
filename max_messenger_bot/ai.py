@@ -57,6 +57,7 @@ from ai_request_context import (
     build_gemini_contents,
     build_gemini_system_parts,
     build_openai_chat_messages,
+    extract_effective_provider_and_model,
     neutralize_stable_prompt,
     normalize_request_messages,
 )
@@ -120,18 +121,12 @@ def _extract_effective_provider_and_model(
     default_provider: str,
     default_model: str,
 ) -> tuple[str, str]:
-    if not request_capture:
-        return default_provider, default_model
-    provider = request_capture.get("provider") or default_provider
-    payload = request_capture.get("payload")
-    if isinstance(payload, dict) and payload.get("model"):
-        return provider, str(payload["model"])
-    endpoint = str(request_capture.get("endpoint") or "")
-    if "/models/" in endpoint:
-        candidate = endpoint.split("/models/", 1)[1].split(":", 1)[0].split("?", 1)[0].strip()
-        if candidate:
-            return provider, candidate
-    return provider, default_model
+    return extract_effective_provider_and_model(
+        request_capture,
+        default_provider=default_provider,
+        default_model=default_model,
+        channel="chat",
+    )
 
 
 _CURRENT_AI_CONTEXT = object()

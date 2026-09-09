@@ -615,3 +615,242 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(mock_ctx.call_count, 4)
 
+    # 13. KIE preferred transient failure -> fallback model succeeds -> AILog.model matches fallback request payload
+    async def test_telegram_vision_ailog_kie_fallback_model_matches_successful_attempt(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "KIE"
+            cfg.vision_model = "gemini-3-flash"
+            cfg.kie_api_key = "sk-test-kie-key"
+            await session.commit()
+
+        mock_bot = self._make_mock_bot()
+        mock_msg = self._make_mock_msg(caption="KIE фолбэк тест")
+
+        attempt_models = []
+        async def fake_kie_post(url, headers=None, json=None, **kwargs):
+            model_called = json.get("model") if json else None
+            attempt_models.append(model_called)
+            if model_called == "gemini-3-flash":
+                return MagicMock(status_code=503, json=lambda: {"error": {"message": "Server temporarily unavailable - 503"}})
+            return MagicMock(status_code=200, json=lambda: {"choices": [{"message": {"content": "Успешный ответ от KIE fallback"}}]})
+
+        with patch("ai_integration._upload_file_to_kie", new_callable=AsyncMock, return_value="https://files.kie.ai/test.jpg"), \
+             patch("httpx.AsyncClient.post", side_effect=fake_kie_post), \
+             patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+            await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+
+        self.assertIn("gemini-3-flash", attempt_models)
+        self.assertIn("gemini-2.5-flash", attempt_models)
+
+        async with self.sessions() as session:
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001))).all()
+            self.assertEqual(len(logs), 1)
+            ai_log = logs[0]
+            self.assertEqual(ai_log.provider, "KIE")
+            self.assertEqual(ai_log.model, "gemini-2.5-flash")
+            captured = json.loads(ai_log.request_payload)
+            self.assertEqual(captured["provider"], "KIE")
+            self.assertEqual(captured["payload"]["model"], "gemini-2.5-flash")
+
+    # 14. OpenAI vision_model=None -> default model used -> AILog.model matches request payload model
+    async def test_telegram_vision_ailog_openai_none_model_uses_actual_default(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = None
+            await session.commit()
+
+        mock_bot = self._make_mock_bot()
+        mock_msg = self._make_mock_msg(caption="OpenAI дефолтная модель тест")
+
+        captured_wire = []
+        async def fake_openai_create(**kwargs):
+            captured_wire.append(kwargs)
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "Успешный ответ от OpenAI default"
+            resp.choices = [choice]
+            return resp
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_openai_create), \
+             patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+            await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+
+        self.assertEqual(len(captured_wire), 1)
+        self.assertEqual(captured_wire[0]["model"], "gpt-5.6-terra")
+
+        async with self.sessions() as session:
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001))).all()
+            self.assertEqual(len(logs), 1)
+            ai_log = logs[0]
+            self.assertEqual(ai_log.provider, "OpenAI")
+            self.assertEqual(ai_log.model, "gpt-5.6-terra")
+            self.assertNotEqual(ai_log.model, "Vision")
+            captured = json.loads(ai_log.request_payload)
+            self.assertEqual(captured["provider"], "OpenAI")
+            self.assertEqual(captured["payload"]["model"], "gpt-5.6-terra")
+
+    # 15. Gemini vision_model=None -> actual default model logged from endpoint
+    async def test_telegram_vision_ailog_gemini_none_model_uses_actual_default_from_endpoint(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "Gemini"
+            cfg.vision_model = None
+            await session.commit()
+
+        mock_bot = self._make_mock_bot()
+        mock_msg = self._make_mock_msg(caption="Gemini дефолтная модель тест")
+
+        captured_urls = []
+        async def fake_gemini_post(url, headers=None, json=None, **kwargs):
+            captured_urls.append(url)
+            return MagicMock(status_code=200, json=lambda: {"candidates": [{"content": {"parts": [{"text": "Ответ Gemini default"}]}}]})
+
+        with patch("httpx.AsyncClient.post", side_effect=fake_gemini_post), \
+             patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+            await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+
+        self.assertEqual(len(captured_urls), 1)
+        self.assertIn("models/gemini-3.7-flash:generateContent", captured_urls[0])
+
+        async with self.sessions() as session:
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001))).all()
+            self.assertEqual(len(logs), 1)
+            ai_log = logs[0]
+            self.assertEqual(ai_log.provider, "Gemini")
+            self.assertEqual(ai_log.model, "gemini-3.7-flash")
+            self.assertNotEqual(ai_log.model, "Vision")
+            captured = json.loads(ai_log.request_payload)
+            self.assertEqual(captured["provider"], "Gemini")
+            self.assertIn("models/gemini-3.7-flash", captured["endpoint"])
+
+    # 16. Claude vision_model=None -> actual default model logged
+    async def test_telegram_vision_ailog_claude_none_model_uses_actual_default(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "Claude"
+            cfg.vision_model = None
+            await session.commit()
+
+        mock_bot = self._make_mock_bot()
+        mock_msg = self._make_mock_msg(caption="Claude дефолтная модель тест")
+
+        captured_claude = []
+        async def fake_claude_create(**kwargs):
+            captured_claude.append(kwargs)
+            return MagicMock(content=[MagicMock(type="text", text="Ответ Claude default")])
+
+        with patch("anthropic.resources.messages.AsyncMessages.create", side_effect=fake_claude_create), \
+             patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+            await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+
+        self.assertEqual(len(captured_claude), 1)
+        self.assertEqual(captured_claude[0]["model"], "claude-sonnet-5")
+
+        async with self.sessions() as session:
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001))).all()
+            self.assertEqual(len(logs), 1)
+            ai_log = logs[0]
+            self.assertEqual(ai_log.provider, "Claude")
+            self.assertEqual(ai_log.model, "claude-sonnet-5")
+            self.assertNotEqual(ai_log.model, "Vision")
+            captured = json.loads(ai_log.request_payload)
+            self.assertEqual(captured["provider"], "Claude")
+            self.assertEqual(captured["payload"]["model"], "claude-sonnet-5")
+
+    # 17. Stale scope during inference: user photo Message durably persisted, activity recorded, no visible text, no buttons, no assistant Message
+    async def test_telegram_vision_stale_scope_during_inference_skips_assistant_and_buttons(self):
+        mock_bot = self._make_mock_bot()
+        mock_msg = self._make_mock_msg(caption="Фото со сменой темы во время инференса")
+
+        call_made = False
+        async def fake_openai_create(**kwargs):
+            nonlocal call_made
+            call_made = True
+            async with self.sessions() as session:
+                u = await session.get(User, 7001)
+                u.current_topic_id = 2
+                u.current_dialogue_id = 2
+                await session.commit()
+
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "Разбор рисунка во время смены темы\n[BTN: Подробнее | act_details]"
+            resp.choices = [choice]
+            return resp
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_openai_create), \
+             patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+            await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+
+        self.assertTrue(call_made)
+
+        async with self.sessions() as session:
+            # Activity recorded because real outbound call happened
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 7001))).all()
+            self.assertEqual(len(acts), 2)
+            self.assertTrue(any(a.scope_key == "topic:1" for a in acts))
+            self.assertTrue(any(a.scope_key == "global" for a in acts))
+
+            # Inbound user photo Message remains durably persisted in original scope (topic 1, dialogue 1)
+            user_msgs = (await session.scalars(select(DBMessage).where(DBMessage.user_id == 7001, DBMessage.role == "user"))).all()
+            self.assertEqual(len(user_msgs), 1)
+            self.assertEqual(user_msgs[0].topic_id, 1)
+            self.assertEqual(user_msgs[0].dialogue_id, 1)
+
+            # NO assistant Message persisted in any scope
+            asst_msgs = (await session.scalars(select(DBMessage).where(DBMessage.user_id == 7001, DBMessage.role == "assistant"))).all()
+            self.assertEqual(len(asst_msgs), 0)
+
+            # AILog was persisted with request-time scope
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001))).all()
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0].topic_id, 1)
+
+        # NO visible assistant text or response buttons sent
+        for call_args in mock_msg.answer.call_args_list:
+            text_arg = call_args[0][0] if call_args[0] else call_args[1].get("text", "")
+            self.assertNotIn("Разбор рисунка во время смены темы", text_arg)
+            reply_markup = call_args[1].get("reply_markup")
+            self.assertIsNone(reply_markup)
+
+    # 18. Secondary generation race: AI response contains GEN_IMG, user switches topic during generate_image -> media and assistant suppressed
+    async def test_telegram_vision_stale_scope_during_secondary_gen_img_skips_media_and_assistant(self):
+        mock_bot = self._make_mock_bot()
+        mock_msg = self._make_mock_msg(caption="Фото с директивой генерации")
+
+        ai_response_text = "Вот подробный разбор вашего фото.\nGEN_IMG: a tranquil mountain lake"
+        async def fake_openai_create(**kwargs):
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = ai_response_text
+            resp.choices = [choice]
+            return resp
+
+        gen_called = False
+        async def fake_generate_image(prompt):
+            nonlocal gen_called
+            gen_called = True
+            # User switches topic in a separate session while generate_image is running
+            async with self.sessions() as session:
+                u = await session.get(User, 7001)
+                u.current_topic_id = 2
+                await session.commit()
+            return b"fake_png_generated_data"
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_openai_create), \
+             patch("ai_integration.generate_image", side_effect=fake_generate_image), \
+             patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+            await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+
+        self.assertTrue(gen_called)
+
+        # Generated photo must NOT have been sent
+        mock_msg.answer_photo.assert_not_called()
+
+        # Assistant DBMessage must NOT have been persisted
+        async with self.sessions() as session:
+            asst_msgs = (await session.scalars(select(DBMessage).where(DBMessage.user_id == 7001, DBMessage.role == "assistant"))).all()
+            self.assertEqual(len(asst_msgs), 0)
+

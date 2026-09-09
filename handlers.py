@@ -68,6 +68,7 @@ from ai_integration import (
 )
 from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error, sanitize_secret_values
 from media_scope import PHOTO_MEDIA_TYPES, TopicMediaScope, load_media_scope, photo_media_predicate
+from ai_request_context import extract_effective_provider_and_model
 from ai_request_builder import (
     ActivityTracker,
     build_conversational_request_layout,
@@ -17811,6 +17812,13 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         )
         latency_ms = int((time.monotonic() - started_at) * 1000)
 
+        actual_provider, actual_model = extract_effective_provider_and_model(
+            request_capture,
+            default_provider=vision_provider,
+            default_model=vision_model,
+            channel="vision",
+        )
+
         # =========================================================================
         # Transaction C: Atomic DATA + AILog persistence
         # =========================================================================
@@ -17823,8 +17831,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
 
             ai_log = AILog(
                 user_id=user_id,
-                provider=vision_provider,
-                model=vision_model,
+                provider=actual_provider,
+                model=actual_model,
                 prompt_summary=vision_user_prompt,
                 request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2),
                 raw_response=analysis_result,
@@ -17871,7 +17879,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             try:
                 debug_msg = (
                     f"🐛 <b>[AI DEBUG LOG]</b> #{ai_log.id}\n"
-                    f"🤖 <b>Провайдер:</b> {html.escape(vision_provider)} | <b>Модель:</b> {html.escape(vision_model)}\n"
+                    f"🤖 <b>Провайдер:</b> {html.escape(actual_provider)} | <b>Модель:</b> {html.escape(actual_model)}\n"
                     f"⏱ <b>Время ответа:</b> {latency_ms / 1000:.2f} сек\n"
                     f"👤 <b>Пользователь:</b> ID {user_id}\n\n"
                     f"📥 <b>Сырой ответ модели:</b>\n"
@@ -17886,7 +17894,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             typing_task.cancel()
 
         # =========================================================================
-        # Outer Conversational Layer: Scope check, send messages, persist assistant Message
+        # Outer Conversational Layer: Fresh scope checks, message sending, assistant DB persistence
         # =========================================================================
         edit_prompt, clean_text = _extract_ai_directive_payload(visible_text, "EDIT_IMG")
         gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
@@ -17903,59 +17911,120 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             except Exception:
                 pass
 
+        # Step A: Immediate fresh scope check after provider and before first visible response
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             if not user or user.current_dialogue_id != current_dialogue_id or user.current_topic_id != current_topic_id:
                 logging.warning(
-                    "Scope changed for user %s before assistant photo response persistence (expected %s/%s). Skipping assistant output.",
-                    user_id, current_dialogue_id, current_topic_id
+                    "Scope changed for user %s during inference (expected %s/%s, got %s/%s). Skipping assistant output.",
+                    user_id, current_dialogue_id, current_topic_id,
+                    getattr(user, "current_dialogue_id", None), getattr(user, "current_topic_id", None)
                 )
                 return
 
-            if formatted_html:
-                parts = split_html_text(formatted_html)
-                for index, part in enumerate(parts):
-                    part_markup = response_text_markup if index == len(parts) - 1 else None
-                    await _safe_send_html(
-                        lambda text, pm, reply_markup=part_markup: message.answer(
-                            text,
-                            parse_mode=pm,
-                            reply_markup=reply_markup,
-                        ),
-                        part,
-                    )
-            elif response_text_markup:
-                await message.answer("Выберите действие:", reply_markup=response_text_markup)
+        # Step B: Send initial visible text and buttons
+        if formatted_html:
+            parts = split_html_text(formatted_html)
+            for index, part in enumerate(parts):
+                part_markup = response_text_markup if index == len(parts) - 1 else None
+                await _safe_send_html(
+                    lambda text, pm, reply_markup=part_markup: message.answer(
+                        text,
+                        parse_mode=pm,
+                        reply_markup=reply_markup,
+                    ),
+                    part,
+                )
+        elif response_text_markup:
+            await message.answer("Выберите действие:", reply_markup=response_text_markup)
 
-            if edit_prompt:
+        # Step C: Long secondary image edit/generation with fresh post-generation scope check
+        if edit_prompt:
+            m_gen_status = None
+            try:
                 m_gen_status = await message.answer("🎨 Редактирую ваше фото...")
+            except Exception:
+                pass
+            try:
                 edited_data = await ai_integration.edit_image(edit_prompt, image_bytes)
-                if edited_data:
-                    upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
+            finally:
+                if m_gen_status:
                     try:
-                        await message.answer_photo(photo=BufferedInputFile(edited_data, filename="edited.png"), caption="✨ Результат редактирования:")
-                    finally:
-                        upload_task.cancel()
-                else:
-                    await message.answer("😔 К сожалению, не удалось отредактировать изображение. Возможно, сервис дал сбой или запрос был отклонен фильтрами безопасности.")
-                try:
-                    await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
-                except Exception:
-                    pass
+                        await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
+                    except Exception:
+                        pass
 
-            elif gen_prompt:
-                m_gen_status = await message.answer("🖼 Генерирую новое изображение...")
-                new_img = await ai_integration.generate_image(gen_prompt)
-                if new_img:
-                    upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
-                    try:
-                        await message.answer_photo(photo=BufferedInputFile(new_img, filename="generated.png"), caption="✨ Новая генерация:")
-                    finally:
-                        upload_task.cancel()
+            # Fresh scope check after long edit_image network call
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                scope_valid = bool(
+                    user
+                    and user.current_dialogue_id == current_dialogue_id
+                    and user.current_topic_id == current_topic_id
+                )
+            if not scope_valid:
+                logging.warning(
+                    "Scope changed for user %s during edit_image. Skipping photo delivery and assistant persistence.",
+                    user_id
+                )
+                return
+
+            if edited_data:
+                upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
                 try:
-                    await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
-                except Exception:
-                    pass
+                    await message.answer_photo(photo=BufferedInputFile(edited_data, filename="edited.png"), caption="✨ Результат редактирования:")
+                finally:
+                    upload_task.cancel()
+            else:
+                await message.answer("😔 К сожалению, не удалось отредактировать изображение. Возможно, сервис дал сбой или запрос был отклонен фильтрами безопасности.")
+
+        elif gen_prompt:
+            m_gen_status = None
+            try:
+                m_gen_status = await message.answer("🖼 Генерирую новое изображение...")
+            except Exception:
+                pass
+            try:
+                new_img = await ai_integration.generate_image(gen_prompt)
+            finally:
+                if m_gen_status:
+                    try:
+                        await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
+                    except Exception:
+                        pass
+
+            # Fresh scope check after long generate_image network call
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                scope_valid = bool(
+                    user
+                    and user.current_dialogue_id == current_dialogue_id
+                    and user.current_topic_id == current_topic_id
+                )
+            if not scope_valid:
+                logging.warning(
+                    "Scope changed for user %s during generate_image. Skipping photo delivery and assistant persistence.",
+                    user_id
+                )
+                return
+
+            if new_img:
+                upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
+                try:
+                    await message.answer_photo(photo=BufferedInputFile(new_img, filename="generated.png"), caption="✨ Новая генерация:")
+                finally:
+                    upload_task.cancel()
+
+        # Step D: Fresh scope verification immediately before assistant DB persistence
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user or user.current_dialogue_id != current_dialogue_id or user.current_topic_id != current_topic_id:
+                logging.warning(
+                    "Scope changed for user %s before assistant photo message persistence (expected %s/%s, got %s/%s). Skipping assistant DB message.",
+                    user_id, current_dialogue_id, current_topic_id,
+                    getattr(user, "current_dialogue_id", None), getattr(user, "current_topic_id", None)
+                )
+                return
 
             session.add(DBMessage(
                 user_id=user_id,
@@ -17966,6 +18035,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 topic_id=current_topic_id,
             ))
             await session.commit()
+
 
     except AIServiceError as e:
         if typing_task:
