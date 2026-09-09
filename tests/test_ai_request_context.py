@@ -344,11 +344,10 @@ async def test_cache_regression_stable_block_is_identical_across_users(monkeypat
 async def test_real_get_ai_response_preserves_deepseek_golden_prefix(monkeypatch):
     _CompletionClient.calls.clear()
     monkeypatch.setattr(ai_integration, "AsyncOpenAI", _CompletionClient)
-    monkeypatch.setattr(
-        ai_integration,
-        "build_runtime_automation_context",
-        AsyncMock(return_value="CURRENT_STATE STATE_X METADATA META_X"),
-    )
+    import automation_engine
+    mock_auto_ctx = AsyncMock(return_value="CURRENT_STATE STATE_X METADATA META_X")
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", mock_auto_ctx)
+    monkeypatch.setattr(ai_integration, "build_runtime_automation_context", mock_auto_ctx)
     monkeypatch.setattr(ai_integration, "active_subscription_flag", lambda *args: "")
 
     ai_config = SimpleNamespace(
@@ -463,6 +462,7 @@ class AIRequestContextTests(unittest.IsolatedAsyncioTestCase):
             '{"current_state":{"current_step":"photo"},"metadata":{"guide":"yoda"}}'
         )
         with (
+            patch("automation_engine.build_runtime_automation_context", AsyncMock(return_value=automation_context)),
             patch.object(ai_integration, "build_runtime_automation_context", AsyncMock(return_value=automation_context)),
             patch.object(ai_integration, "active_subscription_flag", return_value=""),
         ):

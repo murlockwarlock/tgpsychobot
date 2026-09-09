@@ -183,6 +183,31 @@ def _coerce_request_layout(
     )
 
 
+def _extract_vision_user_prompt(
+    user_prompt: str | None = None,
+    request_layout: AIRequestLayout | None = None,
+    prompt: str | None = None,
+) -> str:
+    if user_prompt and user_prompt.strip():
+        return user_prompt.strip()
+    if request_layout is not None and request_layout.current_user_content:
+        content = request_layout.current_user_content
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, (list, tuple)):
+            for item in content:
+                if isinstance(item, dict):
+                    text_val = item.get("text")
+                    if text_val and str(text_val).strip():
+                        return str(text_val).strip()
+                elif isinstance(item, str) and item.strip():
+                    return item.strip()
+    if prompt and prompt.strip():
+        if request_layout is None or prompt.strip() != (request_layout.stable_system_prompt or "").strip():
+            return prompt.strip()
+    return "Опиши это изображение подробно."
+
+
 def _build_async_transport_from_env(env_var_name: str, use_proxy: bool = True):
     if not use_proxy:
         return None
@@ -1224,12 +1249,16 @@ async def _call_claude_vision(
     *,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
+    effective_user_prompt: str | None = None,
 ) -> str:
     try:
         target_model = model if model else "claude-sonnet-5"
         ensure_model_available(PROVIDER_CLAUDE, target_model, channel="vision")
         client = anthropic.AsyncAnthropic(api_key=api_key)
-        user_instruction = "Проанализируй это изображение согласно системной инструкции."
+        user_instruction = effective_user_prompt or _extract_vision_user_prompt(
+            request_layout=request_layout,
+            prompt=prompt,
+        )
         layout = _coerce_request_layout(
             request_layout,
             history=history,
@@ -2352,14 +2381,20 @@ async def generate_openai_image(prompt: str) -> str:
 
 async def analyze_image_content(
     image_bytes: bytes,
-    prompt: str,
+    prompt: str = "",
     history: list = None,
     *,
+    user_prompt: str | None = None,
     request_context: str = "",
     request_capture: dict | None = None,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
 ) -> str:
+    effective_user_prompt = _extract_vision_user_prompt(
+        user_prompt=user_prompt,
+        request_layout=request_layout,
+        prompt=prompt,
+    )
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
@@ -2380,6 +2415,7 @@ async def analyze_image_content(
                 api_key, target_v_model, image_bytes, prompt, history=history, temperature=temperature,
                 request_context=request_context, request_capture=request_capture,
                 request_layout=request_layout, activity_tracker=activity_tracker,
+                effective_user_prompt=effective_user_prompt,
             )
         if provider == "Claude":
             target_v_model = v_model or "claude-sonnet-5"
@@ -2398,6 +2434,7 @@ async def analyze_image_content(
                 request_capture=request_capture,
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
+                effective_user_prompt=effective_user_prompt,
             )
         if provider == "KIE":
             api_key = getattr(config, "kie_api_key", None)
@@ -2429,6 +2466,7 @@ async def analyze_image_content(
                         request_capture=request_capture,
                         request_layout=request_layout,
                         activity_tracker=activity_tracker,
+                        effective_user_prompt=effective_user_prompt,
                     )
                 except AIServiceError as exc:
                     last_exc = exc
@@ -2446,21 +2484,6 @@ async def analyze_image_content(
             raise AIServiceError("API ключ для OpenAI (Vision) не установлен.")
 
         b64_img = base64.b64encode(image_bytes).decode('utf-8')
-        formatting_rules = (
-            "\n\nТЕХНИЧЕСКИЕ ПРАВИЛА ФОРМАТИРОВАНИЯ:\n"
-            "1. Markdown: Всегда используй стандартный Markdown. Никакого ручного HTML.\n"
-            "2. ПРАВИЛО ВЫДЕЛЕНИЯ ТЕКСТА: Используй жирный шрифт (**текст**) только для заголовков. "
-            "Никогда не выделяй жирным целые абзацы. Всегда закрывай теги **.\n"
-            "3. Списки: Для маркированных списков используй исключительно дефис '-'.\n"
-        )
-
-        vision_instructions = (
-            "You are a professional expert analyst. Analyze the provided image thoroughly. "
-            "If visualization is needed, add at the very end: "
-            "GEN_IMG: [Detailed English prompt].\n\n"
-            f"{formatting_rules}"
-        )
-
         layout = _coerce_request_layout(
             request_layout,
             history=history,
@@ -2468,7 +2491,7 @@ async def analyze_image_content(
             runtime_context=request_context,
             current_user_content=None,
         ).with_current_user_content([
-            {"type": "text", "text": vision_instructions},
+            {"type": "text", "text": effective_user_prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}", "detail": "high"}},
         ])
 
@@ -2499,6 +2522,7 @@ async def analyze_image_content(
             raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {exception_summary(e)}") from e
 
 
+
 async def _call_gemini_vision(
     api_key: str,
     model: str,
@@ -2511,6 +2535,7 @@ async def _call_gemini_vision(
     *,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
+    effective_user_prompt: str | None = None,
 ) -> str:
     import httpx
     import base64
@@ -2532,7 +2557,10 @@ async def _call_gemini_vision(
             ensure_model_available(PROVIDER_GEMINI, target_model, channel="vision")
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
 
-            user_instruction = "Проанализируй это изображение согласно системной инструкции выше."
+            user_instruction = effective_user_prompt or _extract_vision_user_prompt(
+                request_layout=request_layout,
+                prompt=prompt,
+            )
             layout = _coerce_request_layout(
                 request_layout,
                 history=history,
@@ -2614,6 +2642,7 @@ async def _call_kie_vision(
     *,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
+    effective_user_prompt: str | None = None,
 ) -> str:
     ensure_model_available(PROVIDER_KIE, model, channel="vision")
     try:
@@ -2625,7 +2654,10 @@ async def _call_kie_vision(
             "images",
         )
 
-        user_instruction = "Проанализируй это изображение согласно системной инструкции."
+        user_instruction = effective_user_prompt or _extract_vision_user_prompt(
+            request_layout=request_layout,
+            prompt=prompt,
+        )
         layout = _coerce_request_layout(
             request_layout,
             history=history,

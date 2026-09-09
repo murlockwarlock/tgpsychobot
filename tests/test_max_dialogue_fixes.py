@@ -677,9 +677,8 @@ class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
         
         with (
             patch.object(ai, "async_session_maker", return_value=session_context),
-            patch.object(
-                ai,
-                "build_runtime_automation_context",
+            patch(
+                "automation_engine.build_runtime_automation_context",
                 AsyncMock(return_value="current_state=photo metadata=vision-meta"),
             ),
             patch.object(ai, "_analyze_gemini", AsyncMock(return_value="analyzed result")) as gemini,

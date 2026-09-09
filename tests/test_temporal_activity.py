@@ -1236,12 +1236,24 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("[Изображение] Прошлое фото" in m["content"] for m in history_msgs))
         self.assertFalse(any("Разбери рисунок дерева" in m["content"] for m in history_msgs))
 
-        # Current image multimodal part present once at end
+        # Current image multimodal part present once at end with actual caption
         current_part = wire_messages[-1]
         self.assertEqual(current_part["role"], "user")
         self.assertIsInstance(current_part["content"], list)
-        self.assertIn("You are a professional expert analyst", current_part["content"][0]["text"])
+        self.assertEqual(current_part["content"][0]["text"], "Разбери рисунок дерева GEN_IMG: happy tree in forest")
         self.assertEqual(current_part["content"][1]["type"], "image_url")
+
+        # Caption occurs exactly once in the entire semantic request
+        all_text_contents = []
+        for m in wire_messages:
+            if isinstance(m["content"], str):
+                all_text_contents.append(m["content"])
+            elif isinstance(m["content"], list):
+                for p in m["content"]:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        all_text_contents.append(p.get("text", ""))
+        caption_occurrences = sum(c.count("Разбери рисунок дерева") for c in all_text_contents)
+        self.assertEqual(caption_occurrences, 1)
 
         # Activity recorded once
         async with self.sessions() as session:
@@ -1257,7 +1269,7 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
             for a in acts2:
                 self.assertEqual(a.last_request_at, first_timestamps[a.scope_key])
 
-        # 2. Local vision model validation failure: zero activity change
+        # 2. Local vision model validation failure: zero activity change, user photo Message remains durably persisted
         async with self.sessions() as session:
             for act in acts2:
                 await session.delete(act)
@@ -1274,5 +1286,7 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             acts_failed = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
             self.assertEqual(len(acts_failed), 0)
+            user_msgs = (await session.scalars(select(DBMessage).where(DBMessage.user_id == 3001, DBMessage.role == "user"))).all()
+            self.assertTrue(any("Разбери рисунок дерева" in m.content for m in user_msgs))
 
 

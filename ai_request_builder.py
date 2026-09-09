@@ -43,26 +43,6 @@ from subscription_context import active_subscription_flag
 log = logging.getLogger(__name__)
 
 
-def _resolve_build_runtime_automation_context():
-    import sys
-    import automation_engine
-    import unittest.mock
-    fn = automation_engine.build_runtime_automation_context
-    for mod_name in ("ai_integration", "max_messenger_bot.ai"):
-        if mod_name in sys.modules:
-            mod = sys.modules[mod_name]
-            custom = getattr(mod, "build_runtime_automation_context", None)
-            if custom is not None:
-                orig_func = getattr(automation_engine.build_runtime_automation_context, "__wrapped__", automation_engine.build_runtime_automation_context)
-                is_auto_mock = isinstance(automation_engine.build_runtime_automation_context, unittest.mock.Mock)
-                is_custom_mock = isinstance(custom, unittest.mock.Mock)
-                if is_auto_mock:
-                    return automation_engine.build_runtime_automation_context
-                elif is_custom_mock:
-                    return custom
-                elif custom is not orig_func:
-                    return custom
-    return fn
 
 
 def build_temporal_activity_context(
@@ -386,8 +366,7 @@ async def build_conversational_request_layout(
         runtime_parts.append(DEFAULT_SHORT_RESPONSE_INSTRUCTION)
 
     if scenario_context is None:
-        fn = _resolve_build_runtime_automation_context()
-        scenario_text = await fn(
+        scenario_text = await automation_engine.build_runtime_automation_context(
             session,
             user_id=user.id,
             dialogue_id=dialogue_id,
@@ -471,8 +450,7 @@ async def build_isolated_request_layout(
     if getattr(user, "response_length", "normal") == "short":
         runtime_parts.append(DEFAULT_SHORT_RESPONSE_INSTRUCTION)
 
-    fn = _resolve_build_runtime_automation_context()
-    scenario_text = await fn(
+    scenario_text = await automation_engine.build_runtime_automation_context(
         session,
         user_id=user.id,
         dialogue_id=dialogue_id,

@@ -319,7 +319,8 @@ async def test_max_temperature_zero_reaches_primary_and_fallback(monkeypatch):
     )
     session = _SessionContext(config=config, user=user)
     monkeypatch.setattr(ai, "async_session_maker", lambda: session)
-    monkeypatch.setattr(ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    import automation_engine
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     primary = AsyncMock(side_effect=ai.AIServiceError("primary failed"))
     fallback = AsyncMock(return_value="fallback answer")
     monkeypatch.setattr(ai, "_call_gemini", primary)

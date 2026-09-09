@@ -17647,6 +17647,9 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             pass
 
     try:
+        # =========================================================================
+        # Transaction A: Validate scope, persist current user photo message, commit
+        # =========================================================================
         async with async_session_maker() as session:
             user = await session.get(User, user_id, options=[
                 selectinload(User.subscription),
@@ -17678,42 +17681,74 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     )
                     return
 
-            typing_task = asyncio.create_task(keep_typing())
-            processing_msg = await message.answer("👀 Тщательно изучаю изображение...")
+            current_topic_id = user.current_topic_id
+            current_dialogue_id = user.current_dialogue_id
+
+            raw_caption = message.caption.strip() if message.caption else ""
+            vision_user_prompt = raw_caption if raw_caption else "Опиши это изображение подробно."
+
+            user_photo_msg = DBMessage(
+                user_id=user_id,
+                role='user',
+                content=f"[Фото для анализа] {raw_caption}".strip() if raw_caption else "[Фото для анализа]",
+                dialogue_id=current_dialogue_id,
+                topic_id=current_topic_id,
+            )
+            session.add(user_photo_msg)
+            await session.commit()
+            photo_msg_id = user_photo_msg.id
+
+        # =========================================================================
+        # External Preparation: download photo, start typing indicator
+        # =========================================================================
+        typing_task = asyncio.create_task(keep_typing())
+        processing_msg = await message.answer("👀 Тщательно изучаю изображение...")
+
+        photo = message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        file_content = await bot.download_file(file_info.file_path)
+        image_bytes = file_content.read()
+
+        # =========================================================================
+        # Transaction B: Read-only builder session (reload User & AIConfig, check stale-scope)
+        # =========================================================================
+        request_time = datetime.utcnow()
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id, options=[
+                selectinload(User.subscription),
+                selectinload(User.current_topic)
+            ])
+            if not user:
+                raise AIServiceError(f"User {user_id} not found")
+
+            # Stale scope guard: if scope changed between Transaction A commit and now, abort
+            if user.current_dialogue_id != current_dialogue_id or user.current_topic_id != current_topic_id:
+                logging.warning(
+                    "Scope changed for user %s before photo outbound (dialogue %s != %s, topic %s != %s)",
+                    user_id, current_dialogue_id, user.current_dialogue_id, current_topic_id, user.current_topic_id
+                )
+                if processing_msg:
+                    try:
+                        await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
+                    except Exception:
+                        pass
+                if typing_task:
+                    typing_task.cancel()
+                return
 
             ai_config = await session.get(AIConfig, 1)
-
-            current_topic_id = user.current_topic_id
+            sub_config = await session.get(SubscriptionConfig, 1)
 
             system_prompt_text = ai_integration._load_configured_system_prompt(
                 ai_config,
                 user.current_topic.system_prompt if user.current_topic else None
             )
-            request_time = datetime.utcnow()
             gap_visit, gap_msg = await get_user_ai_activity_gaps(
                 session,
                 user_id=user.id,
                 topic_id=current_topic_id,
                 now=request_time,
             )
-            activity_tracker = ActivityTracker(
-                async_session_maker,
-                user_id=user.id,
-                topic_id=current_topic_id,
-                request_time=request_time,
-                track_user_activity=True,
-            )
-
-            user_photo_msg = DBMessage(
-                user_id=user_id,
-                role='user',
-                content=f"[Фото для анализа] {message.caption}".strip() if message.caption else "[Фото для анализа]",
-                dialogue_id=user.current_dialogue_id,
-                topic_id=current_topic_id,
-            )
-            session.add(user_photo_msg)
-            await session.flush()
-            photo_msg_id = user_photo_msg.id
 
             stable_vision_prompt = ai_integration.neutralize_stable_prompt(system_prompt_text)
             if not stable_vision_prompt:
@@ -17734,9 +17769,9 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 session,
                 user=user,
                 ai_config=ai_config,
-                dialogue_id=user.current_dialogue_id,
+                dialogue_id=current_dialogue_id,
                 topic_id=current_topic_id,
-                current_user_content=None,
+                current_user_content=vision_user_prompt,
                 stable_system_prompt=stable_vision_prompt,
                 service_capabilities=TELEGRAM_CAPABILITIES,
                 modality_instructions=(photo_instructions,),
@@ -17748,80 +17783,134 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 minutes_since_last_visit=gap_visit,
                 minutes_since_last_message=gap_msg,
             )
-            history = list(request_layout.history)
+            vision_provider = getattr(ai_config, "vision_provider", "Vision") or "Vision"
+            vision_model = getattr(ai_config, "vision_model", "Vision") or "Vision"
+            topic_name = user.current_topic.name if user.current_topic else None
+            user_ai_debug = getattr(user, "ai_debug_enabled", False)
 
-            photo = message.photo[-1]
-            file_info = await bot.get_file(photo.file_id)
-            file_content = await bot.download_file(file_info.file_path)
-            image_bytes = file_content.read()
+        # =========================================================================
+        # External AI work: ActivityTracker (separate session), provider network call
+        # =========================================================================
+        activity_tracker = ActivityTracker(
+            async_session_maker,
+            user_id=user_id,
+            topic_id=current_topic_id,
+            request_time=request_time,
+            track_user_activity=True,
+        )
 
-            request_capture = {}
-            started_at = time.monotonic()
-            analysis_result = await ai_integration.analyze_image_content(
-                image_bytes,
-                stable_vision_prompt,
-                history=history,
-                request_capture=request_capture,
-                request_layout=request_layout,
-                activity_tracker=activity_tracker,
+        request_capture = {}
+        started_at = time.monotonic()
+        analysis_result = await ai_integration.analyze_image_content(
+            image_bytes,
+            stable_vision_prompt,
+            user_prompt=vision_user_prompt,
+            request_capture=request_capture,
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+
+        # =========================================================================
+        # Transaction C: Atomic DATA + AILog persistence
+        # =========================================================================
+        visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
+
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user:
+                raise AIServiceError(f"User {user_id} not found")
+
+            ai_log = AILog(
+                user_id=user_id,
+                provider=vision_provider,
+                model=vision_model,
+                prompt_summary=vision_user_prompt,
+                request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2),
+                raw_response=analysis_result,
+                clean_text=visible_text,
+                latency_ms=latency_ms,
             )
-            latency_ms = int((time.monotonic() - started_at) * 1000)
+            apply_ai_log_context(
+                ai_log,
+                platform="telegram",
+                topic_id=current_topic_id,
+                topic_name=topic_name,
+            )
+            session.add(ai_log)
 
-            visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
             if service_blocks:
-                await apply_service_data_blocks(
-                    session,
-                    user=user,
-                    dialogue_id=user.current_dialogue_id,
-                    topic_id=current_topic_id,
-                    blocks=service_blocks,
-                )
-                await session.commit()
-                from automation_events import process_pending_events
                 try:
-                    await process_pending_events(bot, user_id=user.id)
+                    await apply_service_data_blocks(
+                        session,
+                        user=user,
+                        dialogue_id=current_dialogue_id,
+                        topic_id=current_topic_id,
+                        blocks=service_blocks,
+                    )
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    logging.exception("Failed to commit service data and AILog for user %s: %s", user_id, exc)
+                    raise AIServiceError(f"Ошибка сохранения служебных данных ИИ: {exc}") from exc
+            else:
+                try:
+                    await session.commit()
                 except Exception:
-                    logging.exception("Immediate automation event processing failed in photo handler for user %s", user.id)
+                    logging.exception("Could not save vision AILog entry for user %s", user_id)
 
+        # Process automation events after successful DATA commit
+        if service_blocks:
+            from automation_events import process_pending_events
             try:
-                ai_log = AILog(
-                    user_id=user_id,
-                    provider=getattr(ai_config, "vision_provider", "Vision") or "Vision",
-                    model=getattr(ai_config, "vision_model", "Vision") or "Vision",
-                    prompt_summary="[Анализ изображения]",
-                    request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2),
-                    raw_response=analysis_result,
-                    clean_text=visible_text,
-                    latency_ms=latency_ms,
-                )
-                apply_ai_log_context(
-                    ai_log,
-                    platform="telegram",
-                    topic_id=current_topic_id,
-                    topic_name=user.current_topic.name if user.current_topic else None,
-                )
-                session.add(ai_log)
-                await session.commit()
+                await process_pending_events(bot, user_id=user_id)
             except Exception:
-                logging.exception("Could not save vision AILog entry for user %s", user_id)
+                logging.exception("Immediate automation event processing failed in photo handler for user %s", user_id)
 
-            if typing_task:
-                typing_task.cancel()
+        if bot is not None and user_ai_debug:
+            try:
+                debug_msg = (
+                    f"🐛 <b>[AI DEBUG LOG]</b> #{ai_log.id}\n"
+                    f"🤖 <b>Провайдер:</b> {html.escape(vision_provider)} | <b>Модель:</b> {html.escape(vision_model)}\n"
+                    f"⏱ <b>Время ответа:</b> {latency_ms / 1000:.2f} сек\n"
+                    f"👤 <b>Пользователь:</b> ID {user_id}\n\n"
+                    f"📥 <b>Сырой ответ модели:</b>\n"
+                    f"<code>{html.escape(analysis_result[:3500])}</code>"
+                )
+                await bot.send_message(chat_id=user_id, text=debug_msg, parse_mode="HTML")
+            except Exception as exc:
+                logging.warning("Could not send live AI debug message to user %s: %s", user_id, exc)
 
-            edit_prompt, clean_text = _extract_ai_directive_payload(visible_text, "EDIT_IMG")
-            gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
+        # Stop typing indicator
+        if typing_task:
+            typing_task.cancel()
 
-            clean_text, button_rows = extract_response_buttons(clean_text)
-            presentation = await _prepare_telegram_response_buttons(user_id, button_rows)
-            response_text_markup = _telegram_response_text_markup(presentation)
+        # =========================================================================
+        # Outer Conversational Layer: Scope check, send messages, persist assistant Message
+        # =========================================================================
+        edit_prompt, clean_text = _extract_ai_directive_payload(visible_text, "EDIT_IMG")
+        gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
 
-            formatted_html = markdown_to_html(clean_text)
+        clean_text, button_rows = extract_response_buttons(clean_text)
+        presentation = await _prepare_telegram_response_buttons(user_id, button_rows)
+        response_text_markup = _telegram_response_text_markup(presentation)
 
-            if processing_msg:
-                try:
-                    await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
-                except Exception:
-                    pass
+        formatted_html = markdown_to_html(clean_text)
+
+        if processing_msg:
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
+            except Exception:
+                pass
+
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user or user.current_dialogue_id != current_dialogue_id or user.current_topic_id != current_topic_id:
+                logging.warning(
+                    "Scope changed for user %s before assistant photo response persistence (expected %s/%s). Skipping assistant output.",
+                    user_id, current_dialogue_id, current_topic_id
+                )
+                return
 
             if formatted_html:
                 parts = split_html_text(formatted_html)
@@ -17867,12 +17956,13 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
                 except Exception:
                     pass
+
             session.add(DBMessage(
                 user_id=user_id,
                 role='assistant',
                 content=visible_text,
                 ai_context_content=analysis_result,
-                dialogue_id=user.current_dialogue_id,
+                dialogue_id=current_dialogue_id,
                 topic_id=current_topic_id,
             ))
             await session.commit()
