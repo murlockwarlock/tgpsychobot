@@ -194,7 +194,7 @@ class AIConfig(Base):
     max_voice_duration_sec = Column(Integer, default=180, nullable=False)
     transcription_provider = Column(String, default='OpenAI', nullable=False)
     vision_provider = Column(String, default='Gemini', nullable=False)
-    vision_model = Column(String, default='gemini-3.7-flash', nullable=True)
+    vision_model = Column(String, default='gemini-3.7-flash', nullable=False)
     image_generation_provider = Column(String, default='OpenAI', nullable=False)
     image_generation_model = Column(String, default='gpt-image-2', nullable=False)
     image_edit_provider = Column(String, default='KIE', nullable=False)

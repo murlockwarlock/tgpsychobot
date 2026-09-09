@@ -653,12 +653,12 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured["provider"], "KIE")
             self.assertEqual(captured["payload"]["model"], "gemini-2.5-flash")
 
-    # 14. OpenAI vision_model=None -> default model used -> AILog.model matches request payload model
-    async def test_telegram_vision_ailog_openai_none_model_uses_actual_default(self):
+    # 14. OpenAI vision_model="" (empty) -> default model used -> AILog.model matches request payload model
+    async def test_telegram_vision_ailog_openai_empty_model_uses_actual_default(self):
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
             cfg.vision_provider = "OpenAI"
-            cfg.vision_model = None
+            cfg.vision_model = ""  # Empty string in production schema
             await session.commit()
 
         mock_bot = self._make_mock_bot()
@@ -691,12 +691,12 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured["provider"], "OpenAI")
             self.assertEqual(captured["payload"]["model"], "gpt-5.6-terra")
 
-    # 15. Gemini vision_model=None -> actual default model logged from endpoint
-    async def test_telegram_vision_ailog_gemini_none_model_uses_actual_default_from_endpoint(self):
+    # 15. Gemini vision_model="" (empty) -> actual default model logged from endpoint
+    async def test_telegram_vision_ailog_gemini_empty_model_uses_actual_default_from_endpoint(self):
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
             cfg.vision_provider = "Gemini"
-            cfg.vision_model = None
+            cfg.vision_model = ""  # Empty string in production schema
             await session.commit()
 
         mock_bot = self._make_mock_bot()
@@ -725,12 +725,12 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured["provider"], "Gemini")
             self.assertIn("models/gemini-3.7-flash", captured["endpoint"])
 
-    # 16. Claude vision_model=None -> actual default model logged
-    async def test_telegram_vision_ailog_claude_none_model_uses_actual_default(self):
+    # 16. Claude vision_model="" (empty) -> actual default model logged
+    async def test_telegram_vision_ailog_claude_empty_model_uses_actual_default(self):
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
             cfg.vision_provider = "Claude"
-            cfg.vision_model = None
+            cfg.vision_model = ""  # Empty string in production schema
             await session.commit()
 
         mock_bot = self._make_mock_bot()
@@ -758,6 +758,80 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             captured = json.loads(ai_log.request_payload)
             self.assertEqual(captured["provider"], "Claude")
             self.assertEqual(captured["payload"]["model"], "claude-sonnet-5")
+
+    # 16b. Defensive in-memory None model handling across handler and resolver without schema modification
+    async def test_defensive_in_memory_none_model_resolver_and_handler(self):
+        from ai_request_context import extract_effective_provider_and_model
+
+        # Unit level: None, "", and "Vision" all resolve to canonical provider defaults
+        for missing_val in (None, "", "Vision"):
+            p, m = extract_effective_provider_and_model(None, default_provider="OpenAI", default_model=missing_val, channel="vision")
+            self.assertEqual(p, "OpenAI")
+            self.assertEqual(m, "gpt-5.6-terra")
+
+            p, m = extract_effective_provider_and_model(None, default_provider="Gemini", default_model=missing_val, channel="vision")
+            self.assertEqual(p, "Gemini")
+            self.assertEqual(m, "gemini-3.7-flash")
+
+            p, m = extract_effective_provider_and_model(None, default_provider="Claude", default_model=missing_val, channel="vision")
+            self.assertEqual(p, "Claude")
+            self.assertEqual(m, "claude-sonnet-5")
+
+            p, m = extract_effective_provider_and_model(None, default_provider="KIE", default_model=missing_val, channel="vision")
+            self.assertEqual(p, "KIE")
+            self.assertEqual(m, "gemini-3-flash")
+
+        # Handler level: in-memory mock config with vision_model=None
+        mock_bot = self._make_mock_bot()
+        mock_msg = self._make_mock_msg(caption="OpenAI in-memory None model тест")
+
+        # Intercept AIConfig load in handler to return object with vision_model=None
+        orig_session_maker = handlers.async_session_maker
+        class InterceptingSessionWrapper:
+            def __init__(self, real_session):
+                self._real = real_session
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+            async def get(self, entity, ident, **kwargs):
+                obj = await self._real.get(entity, ident, **kwargs)
+                if entity is AIConfig and obj is not None:
+                    # Return clone/proxy with in-memory vision_model=None
+                    proxy = SimpleNamespace(**{c.key: getattr(obj, c.key) for c in obj.__table__.columns})
+                    proxy.vision_provider = "OpenAI"
+                    proxy.vision_model = None
+                    proxy.current_topic = getattr(obj, "current_topic", None)
+                    return proxy
+                return obj
+
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def intercepting_maker():
+            async with orig_session_maker() as real_sess:
+                yield InterceptingSessionWrapper(real_sess)
+
+        handlers.async_session_maker = intercepting_maker
+        try:
+            async def fake_create(**kwargs):
+                resp = MagicMock()
+                choice = MagicMock()
+                choice.message.content = "Ответ от OpenAI с in-memory None моделью"
+                resp.choices = [choice]
+                return resp
+
+            with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create), \
+                 patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+                await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+        finally:
+            handlers.async_session_maker = orig_session_maker
+
+        async with self.sessions() as session:
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001))).all()
+            self.assertEqual(len(logs), 1)
+            ai_log = logs[0]
+            self.assertEqual(ai_log.provider, "OpenAI")
+            self.assertEqual(ai_log.model, "gpt-5.6-terra")
+            self.assertNotEqual(ai_log.model, "Vision")
 
     # 17. Stale scope during inference: user photo Message durably persisted, activity recorded, no visible text, no buttons, no assistant Message
     async def test_telegram_vision_stale_scope_during_inference_skips_assistant_and_buttons(self):
