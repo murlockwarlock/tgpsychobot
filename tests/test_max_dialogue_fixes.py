@@ -646,7 +646,8 @@ class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
         )
         
         class MockMsg:
-            def __init__(self, role, content):
+            def __init__(self, id, role, content):
+                self.id = id
                 self.role = role
                 self.content = content
                 self.timestamp = 100
@@ -654,9 +655,9 @@ class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
         user = SimpleNamespace(id=123, current_topic=None, current_dialogue_id=1, current_topic_id=None)
         
         history_rows = [
-            MockMsg("user", "Hello"),
-            MockMsg("assistant", "Hi there"),
-            MockMsg("user", "[Изображение] test caption"),  # Current message saved to DB beforehand
+            MockMsg(1, "user", "Hello"),
+            MockMsg(2, "assistant", "Hi there"),
+            MockMsg(3, "user", "[Изображение] test caption"),  # Current message saved to DB beforehand
         ]
         
         session = MagicMock()
@@ -683,7 +684,7 @@ class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(ai, "_analyze_gemini", AsyncMock(return_value="analyzed result")) as gemini,
         ):
-            res = await ai.analyze_image(123, b"image_data", "test caption")
+            res = await ai.analyze_image(123, b"image_data", "test caption", exclude_message_id=3)
             
         self.assertEqual(res, "analyzed result")
         

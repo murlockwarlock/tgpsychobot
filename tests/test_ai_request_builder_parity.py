@@ -426,3 +426,92 @@ class AIRequestBuilderParityTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("sensitive_key", capture["endpoint"])
             # Wire messages structure must match
             self.assertEqual(capture["payload"]["messages"], wire)
+
+    # 47. Image exclusion regression: message starting with "[Изображение]" retained when exclude_message_id=None
+    async def test_image_exclusion_retained_when_exclude_id_is_none(self):
+        async with self.sessions() as session:
+            img_msg = DBMessage(
+                id=901,
+                user_id=1001,
+                dialogue_id=1,
+                topic_id=5,
+                role="user",
+                content="[Изображение] Историческое фото",
+                timestamp=datetime(2026, 1, 1, 10, 0, 0),
+            )
+            session.add(img_msg)
+            await session.commit()
+
+            history = await load_conversational_ai_history(
+                session,
+                user_id=1001,
+                dialogue_id=1,
+                topic_id=5,
+                memory_mode="global",
+                exclude_message_id=None,
+            )
+            self.assertTrue(any(m.content == "[Изображение] Историческое фото" for m in history))
+
+    # 48. Image exclusion regression: only exact row X excluded when exclude_message_id=X
+    async def test_image_exclusion_filters_only_exact_id(self):
+        async with self.sessions() as session:
+            img_msg1 = DBMessage(
+                id=902,
+                user_id=1001,
+                dialogue_id=1,
+                topic_id=5,
+                role="user",
+                content="[Изображение] Первое фото",
+                timestamp=datetime(2026, 1, 1, 10, 0, 0),
+            )
+            img_msg2 = DBMessage(
+                id=903,
+                user_id=1001,
+                dialogue_id=1,
+                topic_id=5,
+                role="user",
+                content="[Изображение] Второе фото",
+                timestamp=datetime(2026, 1, 1, 10, 0, 1),
+            )
+            session.add_all([img_msg1, img_msg2])
+            await session.commit()
+
+            history = await load_conversational_ai_history(
+                session,
+                user_id=1001,
+                dialogue_id=1,
+                topic_id=5,
+                memory_mode="global",
+                exclude_message_id=903,
+            )
+            # 902 is retained, 903 is excluded
+            contents = [m.content for m in history]
+            self.assertIn("[Изображение] Первое фото", contents)
+            self.assertNotIn("[Изображение] Второе фото", contents)
+
+    # 49. Builder ownership regression: production callers do not pass preassembled shared_instructions or scenario_context
+    async def test_builder_ownership_invokes_renderers_once_without_precomputed_scenarios(self):
+        from unittest.mock import patch
+        import prompt_blocks
+        import automation_engine
+
+        with patch("ai_request_builder.render_service_prompt", wraps=prompt_blocks.render_service_prompt) as mock_render_service, \
+             patch("automation_engine.build_runtime_automation_context", wraps=automation_engine.build_runtime_automation_context) as mock_build_scenario:
+
+            async with self.sessions() as session:
+                user = await session.get(User, 1001)
+                cfg = await session.get(AIConfig, 1)
+
+                layout = await build_conversational_request_layout(
+                    session,
+                    user=user,
+                    ai_config=cfg,
+                    dialogue_id=1,
+                    topic_id=5,
+                    current_user_content="Тестовый вопрос",
+                )
+
+                self.assertEqual(mock_render_service.call_count, 1)
+                self.assertEqual(mock_build_scenario.call_count, 1)
+                self.assertIsNotNone(layout.scenario_context)
+                self.assertTrue(len(layout.shared_instructions) > 0)

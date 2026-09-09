@@ -35,6 +35,7 @@ from prompt_blocks import (
     DEFAULT_SHORT_RESPONSE_INSTRUCTION,
     TELEGRAM_CAPABILITIES,
     build_media_instruction_block,
+    format_available_media_text,
     render_prompt_block,
 )
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context
@@ -754,6 +755,8 @@ async def _call_gemini_api(
 ) -> str:
     import httpx
     try:
+        if not api_key:
+            raise AIServiceError("API key for Gemini is not configured.")
         target_model = model if model else "gemini-3.7-flash"
         ensure_model_available(PROVIDER_GEMINI, target_model)
 
@@ -836,6 +839,8 @@ async def _call_kie_chat(
 ) -> str:
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_KIE, target_model, channel="chat")
+    if not api_key:
+        raise AIServiceError("API key for KIE is not configured.")
     try:
         layout = _coerce_request_layout(
             request_layout,
@@ -950,6 +955,7 @@ async def _call_kie_multimodal(
     channel: str = "chat",
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_KIE, target_model, channel=channel)
@@ -970,6 +976,11 @@ async def _call_kie_multimodal(
         endpoint = f"{_kie_model_base_url(base_url, target_model)}/chat/completions"
         _capture_ai_request(request_capture, provider="KIE", endpoint=endpoint, payload=payload)
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                logging.warning("Failed to mark activity before outbound KIE multimodal call: %s", act_err)
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(
                 endpoint,
@@ -1147,6 +1158,8 @@ async def _call_claude_api(
     activity_tracker: ActivityTracker | None = None,
 ):
     try:
+        if not api_key:
+            raise AIServiceError("API key for Claude is not configured.")
         target_model = model if model else "claude-sonnet-5"
         ensure_model_available(PROVIDER_CLAUDE, target_model)
         client = anthropic.AsyncAnthropic(api_key=api_key, timeout=timeout)
@@ -1210,6 +1223,7 @@ async def _call_claude_vision(
     request_capture: dict | None = None,
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     try:
         target_model = model if model else "claude-sonnet-5"
@@ -1250,6 +1264,11 @@ async def _call_claude_vision(
             payload["temperature"] = temperature
 
         _capture_ai_request(request_capture, provider="Claude", endpoint="https://api.anthropic.com/v1/messages", payload=payload)
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                logging.warning("Failed to mark activity before outbound Claude vision call: %s", act_err)
         message = await client.messages.create(**payload)
 
         text_parts = []
@@ -1287,6 +1306,8 @@ async def _call_deepseek_api(
 ):
     client = None
     try:
+        if not api_key:
+            raise AIServiceError("API key for DeepSeek is not configured.")
         normalized_model = normalize_deepseek_model(model)
         ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
 
@@ -1451,6 +1472,8 @@ async def _call_openai_api(
     activity_tracker: ActivityTracker | None = None,
 ):
     try:
+        if not api_key:
+            raise AIServiceError("API key for OpenAI is not configured.")
         target_model = model if model else "gpt-5.6-terra"
         ensure_model_available(PROVIDER_OPENAI, target_model)
         client = AsyncOpenAI(api_key=api_key, timeout=timeout)
@@ -1557,29 +1580,8 @@ async def get_ai_response(
 
         temperature = _resolve_temperature(ai_config)
 
-        available_media_text = ""
-        media_instruction_block = ""
         _, media_files = await load_available_media(session, active_topic_id)
-        effective_media_files = [
-            m for m in (media_files or [])
-            if getattr(m, 'file_name', None) and str(m.file_name).strip()
-        ]
-        if effective_media_files:
-            categories = {}
-            for m in effective_media_files:
-                cat = m.category or ''
-                if cat not in categories:
-                    categories[cat] = []
-                categories[cat].append(m)
-            scope_label = "основном диалоге" if active_topic_id is None else "этой теме"
-            available_media_text = f"Доступные медиа-файлы в {scope_label}:\n"
-            for cat, files in categories.items():
-                if cat:
-                    available_media_text += f"\nКатегория (для тегов RANDOM_IMG/CHOICE_IMG): \"{cat}\"\n"
-                for m in files:
-                    desc_part = f" — {m.description}" if m.description and m.description.strip() else ""
-                    available_media_text += f"  - [{m.media_type.upper()}] {m.file_name}{desc_part}\n"
-            media_instruction_block = build_media_instruction_block(available_media_text)
+        available_media_text, media_instruction_block = format_available_media_text(media_files, active_topic_id)
 
         provider = ai_config.provider
         provider_key = provider.strip().lower() if provider else ""
@@ -1638,7 +1640,11 @@ async def get_ai_response(
 
         context = "\n\n".join(relevant_chunks)
 
-        request_time = datetime.utcnow()
+        request_time = (
+            activity_tracker.request_time
+            if activity_tracker is not None
+            else datetime.utcnow()
+        )
         if minutes_since_last_visit is None or minutes_since_last_message is None:
             gap_visit, gap_msg = await get_user_ai_activity_gaps(
                 session,
@@ -1660,14 +1666,6 @@ async def get_ai_response(
                 track_user_activity=track_user_activity,
             )
 
-        scenario_context = await build_runtime_automation_context(
-            session,
-            user_id=user.id,
-            dialogue_id=active_dialogue_id,
-            topic_id=active_topic_id,
-            memory_mode=get_memory_mode(ai_config),
-        )
-
         request_layout = await build_conversational_request_layout(
             session,
             user=user,
@@ -1688,7 +1686,6 @@ async def get_ai_response(
             memory_mode=get_memory_mode(ai_config),
             limit_first=limit_first,
             limit_recent=limit_recent,
-            scenario_context=scenario_context,
             service_capabilities=TELEGRAM_CAPABILITIES,
         )
 
@@ -2361,6 +2358,7 @@ async def analyze_image_content(
     request_context: str = "",
     request_capture: dict | None = None,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
@@ -2381,7 +2379,7 @@ async def analyze_image_content(
             return await _call_gemini_vision(
                 api_key, target_v_model, image_bytes, prompt, history=history, temperature=temperature,
                 request_context=request_context, request_capture=request_capture,
-                request_layout=request_layout,
+                request_layout=request_layout, activity_tracker=activity_tracker,
             )
         if provider == "Claude":
             target_v_model = v_model or "claude-sonnet-5"
@@ -2399,6 +2397,7 @@ async def analyze_image_content(
                 request_context=request_context,
                 request_capture=request_capture,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         if provider == "KIE":
             api_key = getattr(config, "kie_api_key", None)
@@ -2429,6 +2428,7 @@ async def analyze_image_content(
                         request_context=request_context,
                         request_capture=request_capture,
                         request_layout=request_layout,
+                        activity_tracker=activity_tracker,
                     )
                 except AIServiceError as exc:
                     last_exc = exc
@@ -2487,6 +2487,11 @@ async def analyze_image_content(
                 payload["temperature"] = temperature
 
             _capture_ai_request(request_capture, provider="OpenAI", endpoint=f"{base_url.rstrip('/')}/chat/completions", payload=payload)
+            if activity_tracker is not None:
+                try:
+                    await activity_tracker.mark_outbound_attempt_once()
+                except Exception as act_err:
+                    logging.warning("Failed to mark activity before outbound OpenAI vision call: %s", act_err)
             response = await client.chat.completions.create(**payload)
             return _extract_openai_chat_text(response, provider="OpenAI Vision")
         except Exception as e:
@@ -2505,6 +2510,7 @@ async def _call_gemini_vision(
     request_capture: dict | None = None,
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     import httpx
     import base64
@@ -2554,6 +2560,12 @@ async def _call_gemini_vision(
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
             _capture_ai_request(request_capture, provider="Gemini", endpoint=endpoint, payload=payload)
 
+            if activity_tracker is not None:
+                try:
+                    await activity_tracker.mark_outbound_attempt_once()
+                except Exception as act_err:
+                    logging.warning("Failed to mark activity before outbound Gemini vision call: %s", act_err)
+
             async with httpx.AsyncClient(transport=transport, trust_env=False, timeout=60.0) as client:
                 response = await client.post(url, json=payload, headers={'Content-Type': 'application/json'})
 
@@ -2601,6 +2613,7 @@ async def _call_kie_vision(
     request_capture: dict | None = None,
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     ensure_model_available(PROVIDER_KIE, model, channel="vision")
     try:
@@ -2634,6 +2647,7 @@ async def _call_kie_vision(
             request_capture=request_capture,
             channel="vision",
             request_layout=layout,
+            activity_tracker=activity_tracker,
         )
     except (InsufficientBalanceError, AIServiceError):
         raise

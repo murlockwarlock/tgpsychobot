@@ -1061,14 +1061,6 @@ async def get_ai_response(
                 track_user_activity=track_user_activity,
             )
 
-        scenario_context = await build_runtime_automation_context(
-            session,
-            user_id=user.id,
-            dialogue_id=active_dialogue_id,
-            topic_id=active_topic_id,
-            memory_mode=get_memory_mode(ai_config),
-        )
-
         request_layout = await build_conversational_request_layout(
             session,
             user=user,
@@ -1081,7 +1073,6 @@ async def get_ai_response(
             minutes_since_last_visit=minutes_since_last_visit,
             minutes_since_last_message=minutes_since_last_message,
             knowledge_context=context,
-            scenario_context=scenario_context,
             service_capabilities=MAX_CAPABILITIES,
         )
         temperature = _resolve_temperature(ai_config)
@@ -1566,13 +1557,7 @@ async def analyze_image(
             "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
         )
 
-        scenario_context = await build_runtime_automation_context(
-            session,
-            user_id=user.id,
-            dialogue_id=active_dialogue_id,
-            topic_id=active_topic_id,
-            memory_mode=get_memory_mode(config),
-        )
+        stable_system_prompt = _build_user_system_prompt(user, config, user.current_topic)
 
         request_layout = await build_conversational_request_layout(
             session,
@@ -1581,11 +1566,11 @@ async def analyze_image(
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
             exclude_message_id=exclude_message_id,
+            stable_system_prompt=stable_system_prompt,
             minutes_since_last_visit=gap_visit,
             minutes_since_last_message=gap_msg,
             service_capabilities=MAX_CAPABILITIES,
             modality_instructions=(photo_instructions,),
-            scenario_context=scenario_context,
         )
 
     if provider == "Gemini":

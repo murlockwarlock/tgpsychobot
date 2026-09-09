@@ -856,3 +856,423 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
             # Persisted time must be exactly t_req, not a drifted time
             self.assertEqual(row.last_request_at, t_req)
 
+    # 134. Upsert IntegrityError recovery timestamp verification
+    async def test_upsert_integrity_recovery_older_timestamp_raises(self):
+        from sqlalchemy.exc import IntegrityError
+        t_req = datetime(2026, 1, 1, 12, 0, 0)
+        t_older = datetime(2026, 1, 1, 11, 0, 0)
+
+        mock_session = MagicMock()
+        update_res_0 = MagicMock(rowcount=0)
+        mock_session.execute = AsyncMock(return_value=update_res_0)
+        mock_session.scalar = AsyncMock(side_effect=[None, t_older])
+        mock_session.begin_nested = MagicMock()
+        mock_nested = MagicMock()
+        mock_nested.__aenter__ = AsyncMock(return_value=mock_nested)
+        mock_nested.__aexit__ = AsyncMock(return_value=False)
+        mock_session.begin_nested.return_value = mock_nested
+        mock_session.flush = AsyncMock(side_effect=IntegrityError("duplicate key", params=None, orig=Exception("unique constraint")))
+
+        with self.assertRaises(IntegrityError):
+            await upsert_user_ai_activity(
+                mock_session,
+                user_id=3001,
+                scope_key="topic:10",
+                request_time=t_req,
+            )
+
+    async def test_upsert_integrity_recovery_same_or_newer_timestamp_succeeds(self):
+        from sqlalchemy.exc import IntegrityError
+        t_req = datetime(2026, 1, 1, 12, 0, 0)
+        t_newer = datetime(2026, 1, 1, 12, 5, 0)
+
+        mock_session = MagicMock()
+        update_res_0 = MagicMock(rowcount=0)
+        mock_session.execute = AsyncMock(return_value=update_res_0)
+        mock_session.scalar = AsyncMock(side_effect=[None, t_newer])
+        mock_session.begin_nested = MagicMock()
+        mock_nested = MagicMock()
+        mock_nested.__aenter__ = AsyncMock(return_value=mock_nested)
+        mock_nested.__aexit__ = AsyncMock(return_value=False)
+        mock_session.begin_nested.return_value = mock_nested
+        mock_session.flush = AsyncMock(side_effect=IntegrityError("duplicate key", params=None, orig=Exception("unique constraint")))
+
+        await upsert_user_ai_activity(
+            mock_session,
+            user_id=3001,
+            scope_key="topic:10",
+            request_time=t_req,
+        )
+
+    # 135. Tracked direct + invalid local model -> zero activity
+    async def test_telegram_direct_invalid_local_model_zero_activity(self):
+        import handlers
+        handlers.async_session_maker = self.sessions
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            for act in acts:
+                await session.delete(act)
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = "sk-test-valid"
+            cfg.openai_model = "completely-invalid-model-name"
+            await session.commit()
+
+        with self.assertRaises(Exception):
+            await handlers.get_ai_response_direct(
+                user_id=3001,
+                system_prompt="Системный",
+                user_prompt="Тест direct",
+                track_user_activity=True,
+            )
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 0)
+
+    # 136. Tracked direct + missing key/config -> zero activity
+    async def test_telegram_direct_missing_key_zero_activity(self):
+        import handlers
+        handlers.async_session_maker = self.sessions
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            for act in acts:
+                await session.delete(act)
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = ""
+            cfg.openai_model = "gpt-5.6-terra"
+            await session.commit()
+
+        with self.assertRaises(Exception):
+            await handlers.get_ai_response_direct(
+                user_id=3001,
+                system_prompt="Системный",
+                user_prompt="Тест direct",
+                track_user_activity=True,
+            )
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 0)
+
+    # 137. Tracked direct + real network timeout -> activity recorded
+    async def test_telegram_direct_network_timeout_records_activity(self):
+        import handlers
+        handlers.async_session_maker = self.sessions
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            for act in acts:
+                await session.delete(act)
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = "sk-test-valid"
+            cfg.openai_model = "gpt-5.6-terra"
+            await session.commit()
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=TimeoutError("Network timeout")):
+            with self.assertRaises(AIServiceError):
+                await handlers.get_ai_response_direct(
+                    user_id=3001,
+                    system_prompt="Системный",
+                    user_prompt="Тест direct timeout",
+                    track_user_activity=True,
+                )
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 2)
+
+    # 138. Tracked direct success -> activity once
+    async def test_telegram_direct_success_records_activity_once(self):
+        import handlers
+        handlers.async_session_maker = self.sessions
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            for act in acts:
+                await session.delete(act)
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = "sk-test-valid"
+            cfg.openai_model = "gpt-5.6-terra"
+            await session.commit()
+
+        async def fake_create(**kwargs):
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "Прямой ответ ИИ"
+            resp.choices = [choice]
+            return resp
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create):
+            resp = await handlers.get_ai_response_direct(
+                user_id=3001,
+                system_prompt="Системный",
+                user_prompt="Тест direct success",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp, "Прямой ответ ИИ")
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 2)
+
+    # 139. Universal test integration: preliminary direct + final handoff records activity once at single request_time
+    async def test_finish_test_generation_preliminary_plus_final_handoff_records_activity_once(self):
+        import handlers
+        from database import TestConfig, TestSession
+        handlers.async_session_maker = self.sessions
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            for act in acts:
+                await session.delete(act)
+
+            test_cfg = TestConfig(
+                id=1,
+                separate_result_prompt_enabled=True,
+                result_system_prompt="Предварительный системный промпт интерпретации.",
+                result_prompt_is_final=False,  # Preliminary direct + final handoff
+            )
+            test_sess = TestSession(
+                user_id=3001,
+                invocation_dialogue_id=1,
+                invocation_topic_id=10,
+                is_finished=False,
+            )
+            session.add_all([test_cfg, test_sess])
+            await session.commit()
+
+        mock_msg = MagicMock()
+        mock_msg.chat.id = 3001
+        mock_msg.answer = AsyncMock()
+        mock_msg.edit_text = AsyncMock()
+
+        direct_calls = []
+        handoff_calls = []
+
+        async def fake_direct(*args, **kwargs):
+            direct_calls.append(kwargs)
+            return "Предварительная интерпретация теста"
+
+        async def fake_get_ai_response(*args, **kwargs):
+            handoff_calls.append(kwargs)
+            return "Итоговая интерпретация теста"
+
+        with patch("handlers.get_ai_response_direct", side_effect=fake_direct) as p_direct, \
+             patch("handlers.get_ai_response", side_effect=fake_get_ai_response) as p_handoff:
+            await handlers.finish_test_generation(
+                message=mock_msg,
+                user_id=3001,
+                answers=[{"question": "Вопрос 1", "answer": "Да"}],
+                questions=["Вопрос 1"],
+            )
+
+        # Preliminary direct had track_user_activity=False and activity_tracker=None
+        self.assertEqual(len(direct_calls), 1)
+        self.assertFalse(direct_calls[0].get("track_user_activity"))
+        self.assertIsNone(direct_calls[0].get("activity_tracker"))
+
+        # Final handoff had track_user_activity=True and received the activity_tracker
+        self.assertEqual(len(handoff_calls), 1)
+        self.assertTrue(handoff_calls[0].get("track_user_activity"))
+        tracker = handoff_calls[0].get("activity_tracker")
+        self.assertIsNotNone(tracker)
+
+        # Mark outbound attempt as the handoff AI call would do
+        await tracker.mark_outbound_attempt_once()
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 2)
+            for act in acts:
+                self.assertEqual(act.last_request_at, tracker.request_time)
+
+    # 140. Universal test integration: direct is final records activity once at single request_time
+    async def test_finish_test_generation_direct_final_records_activity_once(self):
+        import handlers
+        from database import TestConfig, TestSession
+        handlers.async_session_maker = self.sessions
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            for act in acts:
+                await session.delete(act)
+
+            test_cfg = await session.get(TestConfig, 1)
+            if not test_cfg:
+                test_cfg = TestConfig(id=1)
+                session.add(test_cfg)
+            test_cfg.separate_result_prompt_enabled = True
+            test_cfg.result_system_prompt = "Финальный прямой промпт интерпретации."
+            test_cfg.result_prompt_is_final = True  # Direct is final
+
+            test_sess = await session.get(TestSession, 3001)
+            if not test_sess:
+                test_sess = TestSession(user_id=3001)
+                session.add(test_sess)
+            test_sess.invocation_dialogue_id = 1
+            test_sess.invocation_topic_id = 10
+            test_sess.is_finished = False
+            await session.commit()
+
+        mock_msg = MagicMock()
+        mock_msg.chat.id = 3001
+        mock_msg.answer = AsyncMock()
+        mock_msg.edit_text = AsyncMock()
+
+        direct_calls = []
+
+        async def fake_direct(*args, **kwargs):
+            direct_calls.append(kwargs)
+            tracker = kwargs.get("activity_tracker")
+            if tracker:
+                await tracker.mark_outbound_attempt_once()
+            return "Финальная прямая интерпретация"
+
+        with patch("handlers.get_ai_response_direct", side_effect=fake_direct), \
+             patch("handlers.get_ai_response") as mock_handoff:
+            await handlers.finish_test_generation(
+                message=mock_msg,
+                user_id=3001,
+                answers=[{"question": "Вопрос 1", "answer": "Да"}],
+                questions=["Вопрос 1"],
+            )
+
+        self.assertEqual(len(direct_calls), 1)
+        self.assertTrue(direct_calls[0].get("track_user_activity"))
+        tracker = direct_calls[0].get("activity_tracker")
+        self.assertIsNotNone(tracker)
+        mock_handoff.assert_not_called()
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 2)
+            for act in acts:
+                self.assertEqual(act.last_request_at, tracker.request_time)
+
+    # 141. Telegram real photo handler: canonical builder, activity updated, model validation failure 0 activity, standalone gen/edit
+    async def test_telegram_real_photo_handler_canonical_builder_and_activity(self):
+        import handlers
+        import io
+        from database import SubscriptionConfig
+        handlers.async_session_maker = self.sessions
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            for act in acts:
+                await session.delete(act)
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.openai_api_key = "sk-test-valid"
+
+            user = await session.get(User, 3001)
+            user.accepted_disclaimer = True
+
+            sub_cfg = await session.get(SubscriptionConfig, 1)
+            if not sub_cfg:
+                sub_cfg = SubscriptionConfig(id=1, subscriptions_enabled=False)
+                session.add(sub_cfg)
+            else:
+                sub_cfg.subscriptions_enabled = False
+
+            # Add previous historical message starting with "[Изображение]" to prove it is retained
+            hist_msg = DBMessage(
+                user_id=3001,
+                dialogue_id=1,
+                topic_id=10,
+                role="user",
+                content="[Изображение] Прошлое фото",
+                timestamp=datetime(2026, 1, 1, 10, 0, 0),
+            )
+            session.add(hist_msg)
+            await session.commit()
+
+        mock_bot = MagicMock()
+        mock_bot.send_chat_action = AsyncMock()
+        mock_bot.get_file = AsyncMock(return_value=MagicMock(file_path="photos/sample.jpg"))
+        mock_bot.download_file = AsyncMock(return_value=io.BytesIO(b"fake_image_bytes_tg"))
+        mock_bot.delete_message = AsyncMock()
+        mock_bot.send_message = AsyncMock()
+
+        mock_msg = MagicMock()
+        mock_msg.chat.id = 3001
+        mock_msg.from_user.id = 3001
+        mock_msg.from_user.username = "olga"
+        mock_msg.from_user.full_name = "Ольга"
+        mock_msg.caption = "Разбери рисунок дерева GEN_IMG: happy tree in forest"
+        mock_msg.photo = [MagicMock(file_id="tg_photo_1")]
+        mock_msg.answer = AsyncMock(return_value=MagicMock(message_id=555))
+        mock_msg.answer_photo = AsyncMock()
+
+        captured_calls = []
+        async def fake_create(**kwargs):
+            captured_calls.append(kwargs)
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "Анализ рисунка дерева завершен. GEN_IMG: happy tree in forest"
+            resp.choices = [choice]
+            return resp
+
+        # 1. Successful photo request: records activity once, uses canonical layout, excludes exact ID, retains history
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create), \
+             patch("ai_integration.generate_image", new_callable=AsyncMock, return_value=b"fake_gen_png") as mock_gen, \
+             patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+            await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+
+        self.assertEqual(len(captured_calls), 1)
+        wire_messages = captured_calls[0]["messages"]
+        all_sys = "\n\n".join(m["content"] for m in wire_messages if m["role"] == "system")
+
+        # Canonical builder components present
+        self.assertIn("Тема 10", all_sys)
+        self.assertIn("ВРЕМЕННОЙ КОНТЕКСТ:", all_sys)
+        self.assertIn("minutes_since_last_visit:", all_sys)
+        self.assertIn("ИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:", all_sys)
+
+        # Exact photo message ID excluded from history, but historical [Изображение] retained
+        history_msgs = [m for m in wire_messages if m["role"] != "system"][:-1]
+        self.assertTrue(any("[Изображение] Прошлое фото" in m["content"] for m in history_msgs))
+        self.assertFalse(any("Разбери рисунок дерева" in m["content"] for m in history_msgs))
+
+        # Current image multimodal part present once at end
+        current_part = wire_messages[-1]
+        self.assertEqual(current_part["role"], "user")
+        self.assertIsInstance(current_part["content"], list)
+        self.assertIn("You are a professional expert analyst", current_part["content"][0]["text"])
+        self.assertEqual(current_part["content"][1]["type"], "image_url")
+
+        # Activity recorded once
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 2)
+            first_timestamps = {a.scope_key: a.last_request_at for a in acts}
+
+        # Standalone generation occurred without adding second activity
+        mock_gen.assert_called_once()
+        async with self.sessions() as session:
+            acts2 = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts2), 2)
+            for a in acts2:
+                self.assertEqual(a.last_request_at, first_timestamps[a.scope_key])
+
+        # 2. Local vision model validation failure: zero activity change
+        async with self.sessions() as session:
+            for act in acts2:
+                await session.delete(act)
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_model = "unsupported-vision-model"
+            await session.commit()
+
+        captured_calls.clear()
+        with patch("handlers.is_admin", new_callable=AsyncMock, return_value=True):
+            await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
+
+        # Ensure no network call was made and no activity was recorded
+        self.assertEqual(len(captured_calls), 0)
+        async with self.sessions() as session:
+            acts_failed = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts_failed), 0)
+
+

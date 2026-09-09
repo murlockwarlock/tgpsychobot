@@ -284,3 +284,146 @@ class MaxVisionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 6001))).all()
             self.assertEqual(len(acts), 2)
+
+    async def test_max_vision_main_uses_aiconfig_system_prompt(self):
+        async with self.sessions() as session:
+            u = await session.get(User, 6001)
+            u.current_topic_id = None
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.system_prompt = "Системный промпт Main режима."
+            await session.commit()
+
+        captured = []
+        async def fake_create(**kwargs):
+            captured.append(kwargs)
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "OK"
+            resp.choices = [choice]
+            return resp
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create):
+            await max_ai.analyze_image(
+                user_id=6001,
+                image_bytes=b"fake_bytes",
+                prompt="Вопрос в Main",
+            )
+
+        self.assertEqual(len(captured), 1)
+        all_sys = "\n\n".join(m["content"] for m in captured[0]["messages"] if m["role"] == "system")
+        self.assertIn("Системный промпт Main режима.", all_sys)
+
+    async def test_max_vision_topic_without_system_prompt_uses_aiconfig_system_prompt(self):
+        async with self.sessions() as session:
+            topic_empty = Topic(id=2, name="Пустая тема", is_active=True, system_prompt=None)
+            session.add(topic_empty)
+            u = await session.get(User, 6001)
+            u.current_topic_id = 2
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.system_prompt = "Системный промпт из AIConfig для топика без промпта."
+            await session.commit()
+
+        captured = []
+        async def fake_create(**kwargs):
+            captured.append(kwargs)
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "OK"
+            resp.choices = [choice]
+            return resp
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create):
+            await max_ai.analyze_image(
+                user_id=6001,
+                image_bytes=b"fake_bytes",
+                prompt="Вопрос в топике без промпта",
+            )
+
+        self.assertEqual(len(captured), 1)
+        all_sys = "\n\n".join(m["content"] for m in captured[0]["messages"] if m["role"] == "system")
+        self.assertIn("Системный промпт из AIConfig для топика без промпта.", all_sys)
+
+    async def test_max_vision_topic_with_own_system_prompt_uses_topic_prompt(self):
+        async with self.sessions() as session:
+            topic_custom = Topic(id=3, name="Топик с промптом", is_active=True, system_prompt="Индивидуальный промпт топика 3.")
+            session.add(topic_custom)
+            u = await session.get(User, 6001)
+            u.current_topic_id = 3
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.system_prompt = "Общий промпт AIConfig который не должен использоваться."
+            await session.commit()
+
+        captured = []
+        async def fake_create(**kwargs):
+            captured.append(kwargs)
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "OK"
+            resp.choices = [choice]
+            return resp
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create):
+            await max_ai.analyze_image(
+                user_id=6001,
+                image_bytes=b"fake_bytes",
+                prompt="Вопрос в топике с промптом",
+            )
+
+        self.assertEqual(len(captured), 1)
+        all_sys = "\n\n".join(m["content"] for m in captured[0]["messages"] if m["role"] == "system")
+        self.assertIn("Индивидуальный промпт топика 3.", all_sys)
+        self.assertNotIn("Общий промпт AIConfig который не должен использоваться.", all_sys)
+
+    async def test_max_vision_prompt_mode_file_uses_configured_file_prompt_and_fallback(self):
+        async with self.sessions() as session:
+            u = await session.get(User, 6001)
+            u.current_topic_id = None
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.prompt_mode = "file"
+            cfg.prompt_filename = "custom_prompt.txt"
+            cfg.system_prompt = "Запасной промпт при отсутствии файла."
+            await session.commit()
+
+        captured = []
+        async def fake_create(**kwargs):
+            captured.append(kwargs)
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "OK"
+            resp.choices = [choice]
+            return resp
+
+        # 1. File exists and is read successfully
+        with patch("builtins.open", unittest.mock.mock_open(read_data="Промпт успешно прочитан из файла.")):
+            with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create):
+                await max_ai.analyze_image(
+                    user_id=6001,
+                    image_bytes=b"fake_bytes",
+                    prompt="Вопрос с prompt_mode=file",
+                )
+
+        self.assertEqual(len(captured), 1)
+        all_sys = "\n\n".join(m["content"] for m in captured[0]["messages"] if m["role"] == "system")
+        self.assertIn("Промпт успешно прочитан из файла.", all_sys)
+
+        # 2. File read raises exception -> falls back to ai_config.system_prompt
+        captured.clear()
+        with patch("builtins.open", side_effect=FileNotFoundError("File not found")):
+            with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create):
+                await max_ai.analyze_image(
+                    user_id=6001,
+                    image_bytes=b"fake_bytes",
+                    prompt="Вопрос с отсутствующим файлом",
+                )
+
+        self.assertEqual(len(captured), 1)
+        all_sys_fallback = "\n\n".join(m["content"] for m in captured[0]["messages"] if m["role"] == "system")
+        self.assertIn("Запасной промпт при отсутствии файла.", all_sys_fallback)

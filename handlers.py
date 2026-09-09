@@ -170,7 +170,13 @@ from mailing_utils import (
     render_mailing_text,
     send_mailing_content,
 )
-from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE, render_prompt_block
+from prompt_blocks import (
+    DEFAULT_SERVICE_PROMPT_TEMPLATE,
+    TELEGRAM_CAPABILITIES,
+    format_available_media_text,
+    render_prompt_block,
+)
+from media_scope import load_available_media
 from provider_models import (
     DEEPSEEK_DEFAULT_MODEL,
     DEEPSEEK_MODELS,
@@ -15340,14 +15346,25 @@ async def finish_test_generation(
 
     preliminary_interpretation = None
     try:
+        request_time = datetime.utcnow()
         async with async_session_maker() as session:
             gap_visit, gap_msg = await get_user_ai_activity_gaps(
                 session,
                 user_id=user_id,
                 topic_id=topic_id,
+                now=request_time,
             )
 
+        activity_tracker = ActivityTracker(
+            async_session_maker,
+            user_id=user_id,
+            topic_id=topic_id,
+            request_time=request_time,
+            track_user_activity=True,
+        )
+
         if separate_prompt_enabled:
+            direct_tracker = activity_tracker if result_prompt_is_final else None
             preliminary_interpretation = await get_ai_response_direct(
                 user_id,
                 result_system_prompt,
@@ -15355,6 +15372,7 @@ async def finish_test_generation(
                 dialogue_id=dialogue_id,
                 topic_id=topic_id,
                 track_user_activity=result_prompt_is_final,
+                activity_tracker=direct_tracker,
                 minutes_since_last_visit=gap_visit,
                 minutes_since_last_message=gap_msg,
             )
@@ -15371,6 +15389,7 @@ async def finish_test_generation(
                 dialogue_id_override=dialogue_id,
                 include_test_context=False,
                 track_user_activity=True,
+                activity_tracker=activity_tracker,
                 minutes_since_last_visit=gap_visit,
                 minutes_since_last_message=gap_msg,
             )
@@ -15921,17 +15940,27 @@ async def get_ai_response_direct(
         if provider_key in ['anthropic', 'claude'] and not model:
             model = ai_config.claude_model
 
+        if not api_key:
+            raise AIServiceError(f"API key for AI provider '{provider}' is not configured.")
+
         user = await session.get(User, user_id)
         if not user:
             return "Ошибка: Пользователь не найден."
         active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
         active_topic_id = topic_id if topic_id is not None else user.current_topic_id
 
+        request_time = (
+            activity_tracker.request_time
+            if activity_tracker is not None
+            else datetime.utcnow()
+        )
+
         if minutes_since_last_visit is None or minutes_since_last_message is None:
             gap_visit, gap_msg = await get_user_ai_activity_gaps(
                 session,
                 user_id=user.id,
                 topic_id=active_topic_id,
+                now=request_time,
             )
             if minutes_since_last_visit is None:
                 minutes_since_last_visit = gap_visit
@@ -15943,7 +15972,7 @@ async def get_ai_response_direct(
                 async_session_maker,
                 user_id=user.id,
                 topic_id=active_topic_id,
-                request_time=datetime.utcnow(),
+                request_time=request_time,
                 track_user_activity=True,
             )
 
@@ -15964,31 +15993,29 @@ async def get_ai_response_direct(
             content=user_prompt,
         )]
 
-        if activity_tracker is not None:
-            try:
-                await activity_tracker.mark_outbound_attempt_once()
-            except Exception as act_err:
-                logging.warning("Failed to mark activity before outbound call: %s", act_err)
-
         if provider_key == 'gemini':
             response_text = await _call_gemini_api(
                 api_key, model, fake_history, "", system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         elif provider_key == 'openai':
             response_text = await _call_openai_api(
                 api_key, model, fake_history, "", system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         elif provider_key in ['anthropic', 'claude']:
             response_text = await _call_claude_api(
                 api_key, model, fake_history, "", system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         elif provider_key == 'deepseek':
             response_text = await _call_deepseek_api(
                 api_key, model, fake_history, "", system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         elif provider_key == 'kie':
             response_text = await _call_kie_chat(
@@ -15999,6 +16026,7 @@ async def get_ai_response_direct(
                 "",
                 system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
@@ -17661,15 +17689,32 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 ai_config,
                 user.current_topic.system_prompt if user.current_topic else None
             )
-            shared_prompt_block = (getattr(ai_config, 'shared_prompt_block', "") or "").strip()
-            service_prompt_template = getattr(ai_config, 'service_prompt_block', None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
-            service_prompt_block = render_prompt_block(
-                service_prompt_template,
-                available_media_text="",
-                media_instruction_block="",
-                test_context_injection="[контекст теста передан в служебном контексте]",
-                short_response_instruction="[режим длины передан в служебном контексте]",
+            request_time = datetime.utcnow()
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(
+                session,
+                user_id=user.id,
+                topic_id=current_topic_id,
+                now=request_time,
             )
+            activity_tracker = ActivityTracker(
+                async_session_maker,
+                user_id=user.id,
+                topic_id=current_topic_id,
+                request_time=request_time,
+                track_user_activity=True,
+            )
+
+            user_photo_msg = DBMessage(
+                user_id=user_id,
+                role='user',
+                content=f"[Фото для анализа] {message.caption}".strip() if message.caption else "[Фото для анализа]",
+                dialogue_id=user.current_dialogue_id,
+                topic_id=current_topic_id,
+            )
+            session.add(user_photo_msg)
+            await session.flush()
+            photo_msg_id = user_photo_msg.id
+
             stable_vision_prompt = ai_integration.neutralize_stable_prompt(system_prompt_text)
             if not stable_vision_prompt:
                 stable_vision_prompt = "Ты — профессиональный эксперт. Проанализируй это изображение максимально подробно."
@@ -17680,16 +17725,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"
                 "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
             )
-            vision_shared_instructions = tuple(
-                part for part in (shared_prompt_block, service_prompt_block, photo_instructions) if part
-            )
+
+            _, media_files = await load_available_media(session, current_topic_id)
+            available_media_text, media_instruction_block = format_available_media_text(media_files, current_topic_id)
 
             memory_mode = get_memory_mode(ai_config)
-            gap_visit, gap_msg = await get_user_ai_activity_gaps(
-                session,
-                user_id=user.id,
-                topic_id=current_topic_id,
-            )
             request_layout = await build_conversational_request_layout(
                 session,
                 user=user,
@@ -17698,7 +17738,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 topic_id=current_topic_id,
                 current_user_content=None,
                 stable_system_prompt=stable_vision_prompt,
-                shared_instructions=vision_shared_instructions,
+                service_capabilities=TELEGRAM_CAPABILITIES,
+                modality_instructions=(photo_instructions,),
+                available_media_text=available_media_text,
+                media_instruction_block=media_instruction_block,
+                exclude_message_id=photo_msg_id,
                 subscription_config=sub_config,
                 memory_mode=memory_mode,
                 minutes_since_last_visit=gap_visit,
@@ -17719,6 +17763,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 history=history,
                 request_capture=request_capture,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
             latency_ms = int((time.monotonic() - started_at) * 1000)
 
@@ -17822,8 +17867,6 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
                 except Exception:
                     pass
-
-            session.add(DBMessage(user_id=user_id, role='user', content="[Фото для анализа]", dialogue_id=user.current_dialogue_id, topic_id=current_topic_id))
             session.add(DBMessage(
                 user_id=user_id,
                 role='assistant',

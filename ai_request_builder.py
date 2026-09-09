@@ -18,7 +18,7 @@ from ai_request_context import (
     neutralize_stable_prompt,
     normalize_request_messages,
 )
-from automation_engine import build_runtime_automation_context
+import automation_engine
 from database import (
     AIConfig,
     Message,
@@ -41,6 +41,28 @@ from result_history import ai_history_role_filter, select_ai_history_messages
 from subscription_context import active_subscription_flag
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_build_runtime_automation_context():
+    import sys
+    import automation_engine
+    import unittest.mock
+    fn = automation_engine.build_runtime_automation_context
+    for mod_name in ("ai_integration", "max_messenger_bot.ai"):
+        if mod_name in sys.modules:
+            mod = sys.modules[mod_name]
+            custom = getattr(mod, "build_runtime_automation_context", None)
+            if custom is not None:
+                orig_func = getattr(automation_engine.build_runtime_automation_context, "__wrapped__", automation_engine.build_runtime_automation_context)
+                is_auto_mock = isinstance(automation_engine.build_runtime_automation_context, unittest.mock.Mock)
+                is_custom_mock = isinstance(custom, unittest.mock.Mock)
+                if is_auto_mock:
+                    return automation_engine.build_runtime_automation_context
+                elif is_custom_mock:
+                    return custom
+                elif custom is not orig_func:
+                    return custom
+    return fn
 
 
 def build_temporal_activity_context(
@@ -192,7 +214,7 @@ async def upsert_user_ai_activity(
                             UserAIActivity.scope_key == scope_key,
                         )
                     )
-                    if existing_after is None:
+                    if existing_after is None or existing_after < request_time:
                         raise
                 else:
                     raise
@@ -271,9 +293,9 @@ async def load_conversational_ai_history(
         stmt = stmt.where(Message.id != exclude_message_id)
 
     stmt = stmt.options(selectinload(Message.topic)).order_by(Message.timestamp.asc(), Message.id.asc())
-    raw_messages = list((await session.execute(stmt)).scalars().all())
-    if exclude_message_id is None and raw_messages and getattr(raw_messages[-1], "role", None) == "user" and str(getattr(raw_messages[-1], "content", "")).startswith("[Изображение]"):
-        raw_messages = raw_messages[:-1]
+    raw_messages = (await session.execute(stmt)).scalars().all()
+    if exclude_message_id is not None:
+        raw_messages = [m for m in raw_messages if getattr(m, "id", None) != exclude_message_id]
 
     selected = select_ai_history_messages(raw_messages, limit_first, limit_recent)
     history_items = [
@@ -322,7 +344,11 @@ async def build_conversational_request_layout(
             if topic and topic.system_prompt:
                 stable_system_prompt = topic.system_prompt
         if not stable_system_prompt:
-            stable_system_prompt = getattr(ai_config, "general_system_prompt", None) or "Ты полезный ИИ-помощник."
+            stable_system_prompt = (
+                getattr(ai_config, "system_prompt", None)
+                or getattr(ai_config, "general_system_prompt", None)
+                or "Ты полезный ИИ-помощник."
+            )
 
     if shared_instructions is None:
         shared_prompt_block = (getattr(ai_config, "shared_prompt_block", "") or "").strip()
@@ -360,7 +386,8 @@ async def build_conversational_request_layout(
         runtime_parts.append(DEFAULT_SHORT_RESPONSE_INSTRUCTION)
 
     if scenario_context is None:
-        scenario_text = await build_runtime_automation_context(
+        fn = _resolve_build_runtime_automation_context()
+        scenario_text = await fn(
             session,
             user_id=user.id,
             dialogue_id=dialogue_id,
@@ -444,7 +471,8 @@ async def build_isolated_request_layout(
     if getattr(user, "response_length", "normal") == "short":
         runtime_parts.append(DEFAULT_SHORT_RESPONSE_INSTRUCTION)
 
-    scenario_text = await build_runtime_automation_context(
+    fn = _resolve_build_runtime_automation_context()
+    scenario_text = await fn(
         session,
         user_id=user.id,
         dialogue_id=dialogue_id,

@@ -174,10 +174,11 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ai_log = await session.scalar(select(AILog).order_by(AILog.id.desc()))
             self.assertIsNotNone(ai_log)
             logged_payload = json.loads(ai_log.request_payload)
+            self.assertEqual(logged_payload["provider"], "OpenAI")
+            self.assertNotIn("sk-", logged_payload.get("endpoint", ""))
             captured_body = logged_payload.get("payload", logged_payload)
             self.assertEqual(captured_body["model"], payload["model"])
-            self.assertEqual(len(captured_body["messages"]), len(payload["messages"]))
-            self.assertEqual(captured_body["messages"][0]["content"], messages[0]["content"])
+            self.assertEqual(captured_body["messages"], payload["messages"])
 
     async def test_max_normal_openai_payload_and_ailog(self):
         captured_payloads = []
@@ -229,6 +230,17 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[-1]["content"], "Как мне справиться со стрессом?")
         texts = [m["content"] for m in messages if m["role"] != "system"]
         self.assertTrue(any("[СИСТЕМНОЕ СОБЫТИЕ" in t for t in texts))
+
+        # Verify persisted MAX AILog matches outbound request payload
+        async with self.sessions() as session:
+            ai_log = await session.scalar(select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc()))
+            self.assertIsNotNone(ai_log)
+            logged_payload = json.loads(ai_log.request_payload)
+            self.assertEqual(logged_payload["provider"], "OpenAI")
+            self.assertNotIn("sk-", logged_payload.get("endpoint", ""))
+            captured_body = logged_payload.get("payload", logged_payload)
+            self.assertEqual(captured_body["model"], payload["model"])
+            self.assertEqual(captured_body["messages"], payload["messages"])
 
     async def test_max_vision_shared_builder_payload(self):
         captured_payloads = []
@@ -389,3 +401,217 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GEN_IMG", system_text)
         self.assertIn("<DATA>", system_text)
         self.assertIn("ВРЕМЕННОЙ КОНТЕКСТ:", system_text)
+
+    async def test_deepseek_platform_payload_parity_and_ailog(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "DeepSeek"
+            cfg.deepseek_api_key = "sk-deepseek-parity"
+            cfg.deepseek_model = "deepseek-v4-flash"
+            await session.commit()
+
+        captured_tg = []
+        captured_max = []
+
+        async def fake_create_tg(**kwargs):
+            captured_tg.append(kwargs)
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "Ответ DeepSeek TG"
+            resp.choices = [choice]
+            return resp
+
+        async def fake_create_max(**kwargs):
+            captured_max.append(kwargs)
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = "Ответ DeepSeek MAX"
+            resp.choices = [choice]
+            return resp
+
+        # TG actual get_ai_response
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create_tg):
+            resp_tg = await ai_integration.generate_response(
+                user_id=5001,
+                user_prompt="Как мне справиться со стрессом?",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp_tg, "Ответ DeepSeek TG")
+
+        # Verify persisted Telegram AILog for DeepSeek
+        async with self.sessions() as session:
+            tg_ai_log = await session.scalar(select(AILog).where(AILog.platform == "telegram").order_by(AILog.id.desc()))
+            self.assertIsNotNone(tg_ai_log)
+            self.assertEqual(tg_ai_log.provider, "DeepSeek")
+            self.assertEqual(tg_ai_log.model, "deepseek-v4-flash")
+            tg_log_data = json.loads(tg_ai_log.request_payload)
+            self.assertEqual(tg_log_data["provider"], "Deepseek")
+            self.assertNotIn("sk-", tg_log_data.get("endpoint", ""))
+            self.assertEqual(tg_log_data["payload"]["model"], "deepseek-v4-flash")
+            self.assertEqual(tg_log_data["payload"]["messages"], captured_tg[0]["messages"])
+
+        # MAX actual get_ai_response
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_create_max):
+            resp_max = await max_ai.get_ai_response(
+                5001,
+                "Как мне справиться со стрессом?",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp_max, "Ответ DeepSeek MAX")
+
+        # Verify persisted MAX AILog for DeepSeek
+        async with self.sessions() as session:
+            max_ai_log = await session.scalar(select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc()))
+            self.assertIsNotNone(max_ai_log)
+            self.assertIn(max_ai_log.provider, ("DeepSeek", "Deepseek"))
+            self.assertEqual(max_ai_log.model, "deepseek-v4-flash")
+            max_log_data = json.loads(max_ai_log.request_payload)
+            self.assertEqual(max_log_data["provider"], "Deepseek")
+            self.assertNotIn("sk-", max_log_data.get("endpoint", ""))
+            self.assertEqual(max_log_data["payload"]["model"], "deepseek-v4-flash")
+            self.assertEqual(max_log_data["payload"]["messages"], captured_max[0]["messages"])
+
+        # Compare normalized common semantic request between TG and MAX
+        payload_tg = captured_tg[0]
+        payload_max = captured_max[0]
+
+        self.assertEqual(payload_tg["model"], "deepseek-v4-flash")
+        self.assertEqual(payload_max["model"], "deepseek-v4-flash")
+
+        msgs_tg = payload_tg["messages"]
+        msgs_max = payload_max["messages"]
+
+        self.assertEqual(len(msgs_tg), len(msgs_max))
+        self.assertEqual([m["role"] for m in msgs_tg], [m["role"] for m in msgs_max])
+
+        all_sys_tg = "\n\n".join(m["content"] for m in msgs_tg if m["role"] == "system")
+        all_sys_max = "\n\n".join(m["content"] for m in msgs_max if m["role"] == "system")
+
+        for common_element in [
+            "Инструкция психолога.",
+            "Общий блок правил для всех платформ.",
+            "<DATA>",
+            "ДАННЫЕ КЛИЕНТА:",
+            "ИМЯ: Мария",
+            "ПОЛ: female",
+            "ВРЕМЕННОЙ КОНТЕКСТ:",
+            "minutes_since_last_visit:",
+            "minutes_since_last_message:",
+        ]:
+            self.assertIn(common_element, all_sys_tg)
+            self.assertIn(common_element, all_sys_max)
+
+        self.assertIn("GEN_IMG", all_sys_tg)
+        self.assertIn("GEN_IMG", all_sys_max)
+        self.assertNotIn("SEND_AUDIO", all_sys_max)
+
+        non_sys_tg = [m for m in msgs_tg if m["role"] != "system"]
+        non_sys_max = [m for m in msgs_max if m["role"] != "system"]
+        self.assertEqual(len(non_sys_tg), len(non_sys_max))
+        for m_tg, m_max in zip(non_sys_tg, non_sys_max):
+            self.assertEqual(m_tg["role"], m_max["role"])
+            self.assertEqual(m_tg["content"], m_max["content"])
+
+    async def test_kie_platform_payload_parity_and_ailog(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "KIE"
+            cfg.kie_api_key = "sk-kie-parity"
+            cfg.kie_model = "gemini-2.5-flash"
+            await session.commit()
+
+        captured_posts = []
+
+        async def fake_post(url, *args, **kwargs):
+            captured_posts.append({
+                "url": url,
+                "headers": kwargs.get("headers", {}),
+                "json": kwargs.get("json", {}),
+            })
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "choices": [{"message": {"content": "Ответ KIE Chat"}}]
+            }
+            return resp
+
+        # TG actual get_ai_response
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            resp_tg = await ai_integration.generate_response(
+                user_id=5001,
+                user_prompt="Как мне справиться со стрессом?",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp_tg, "Ответ KIE Chat")
+
+        # Verify persisted Telegram AILog for KIE
+        async with self.sessions() as session:
+            tg_ai_log = await session.scalar(select(AILog).where(AILog.platform == "telegram").order_by(AILog.id.desc()))
+            self.assertIsNotNone(tg_ai_log)
+            self.assertEqual(tg_ai_log.provider, "KIE")
+            self.assertEqual(tg_ai_log.model, "gemini-2.5-flash")
+            tg_log_data = json.loads(tg_ai_log.request_payload)
+            self.assertEqual(tg_log_data["provider"], "KIE")
+            self.assertNotIn("sk-", tg_log_data.get("endpoint", ""))
+            self.assertEqual(tg_log_data["payload"]["model"], "gemini-2.5-flash")
+            self.assertEqual(tg_log_data["payload"], captured_posts[0]["json"])
+
+        # MAX actual get_ai_response
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            resp_max = await max_ai.get_ai_response(
+                5001,
+                "Как мне справиться со стрессом?",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp_max, "Ответ KIE Chat")
+
+        # Verify persisted MAX AILog for KIE
+        async with self.sessions() as session:
+            max_ai_log = await session.scalar(select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc()))
+            self.assertIsNotNone(max_ai_log)
+            self.assertEqual(max_ai_log.provider, "KIE")
+            self.assertEqual(max_ai_log.model, "gemini-2.5-flash")
+            max_log_data = json.loads(max_ai_log.request_payload)
+            self.assertEqual(max_log_data["provider"], "KIE")
+            self.assertNotIn("sk-", max_log_data.get("endpoint", ""))
+            self.assertEqual(max_log_data["payload"]["model"], "gemini-2.5-flash")
+            self.assertEqual(max_log_data["payload"], captured_posts[1]["json"])
+
+        # Compare normalized common semantic request between TG and MAX
+        post_tg = captured_posts[0]["json"]
+        post_max = captured_posts[1]["json"]
+
+        self.assertEqual(post_tg["model"], "gemini-2.5-flash")
+        self.assertEqual(post_max["model"], "gemini-2.5-flash")
+
+        msgs_tg = post_tg["messages"]
+        msgs_max = post_max["messages"]
+
+        self.assertEqual(len(msgs_tg), len(msgs_max))
+        self.assertEqual([m["role"] for m in msgs_tg], [m["role"] for m in msgs_max])
+
+        all_sys_tg = "\n\n".join(m["content"] for m in msgs_tg if m["role"] == "system")
+        all_sys_max = "\n\n".join(m["content"] for m in msgs_max if m["role"] == "system")
+
+        for common_element in [
+            "Инструкция психолога.",
+            "Общий блок правил для всех платформ.",
+            "<DATA>",
+            "ДАННЫЕ КЛИЕНТА:",
+            "ИМЯ: Мария",
+            "ПОЛ: female",
+            "ВРЕМЕННОЙ КОНТЕКСТ:",
+            "minutes_since_last_visit:",
+            "minutes_since_last_message:",
+        ]:
+            self.assertIn(common_element, all_sys_tg)
+            self.assertIn(common_element, all_sys_max)
+
+        self.assertNotIn("SEND_AUDIO", all_sys_max)
+
+        non_sys_tg = [m for m in msgs_tg if m["role"] != "system"]
+        non_sys_max = [m for m in msgs_max if m["role"] != "system"]
+        self.assertEqual(len(non_sys_tg), len(non_sys_max))
+        for m_tg, m_max in zip(non_sys_tg, non_sys_max):
+            self.assertEqual(m_tg["role"], m_max["role"])
+            self.assertEqual(m_tg["content"], m_max["content"])

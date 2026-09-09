@@ -83,6 +83,33 @@ def build_media_instruction_block(available_media_text: str | None) -> str:
     return "\n\n" + render_prompt_block(DEFAULT_MEDIA_RULES_TEMPLATE, available_media_text=text)
 
 
+def format_available_media_text(media_files, topic_id: int | None = None) -> tuple[str, str]:
+    effective_media_files = [
+        m for m in (media_files or [])
+        if getattr(m, 'file_name', None) and str(m.file_name).strip()
+    ]
+    if not effective_media_files:
+        return "", ""
+    categories = {}
+    for m in effective_media_files:
+        cat = getattr(m, 'category', None) or ''
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(m)
+    scope_label = "основном диалоге" if topic_id is None else "этой теме"
+    available_media_text = f"Доступные медиа-файлы в {scope_label}:\n"
+    for cat, files in categories.items():
+        if cat:
+            available_media_text += f"\nКатегория (для тегов RANDOM_IMG/CHOICE_IMG): \"{cat}\"\n"
+        for m in files:
+            m_type = getattr(m, 'media_type', 'photo') or 'photo'
+            desc = getattr(m, 'description', None)
+            desc_part = f" — {desc}" if desc and desc.strip() else ""
+            available_media_text += f"  - [{m_type.upper()}] {m.file_name}{desc_part}\n"
+    media_instruction_block = build_media_instruction_block(available_media_text)
+    return available_media_text, media_instruction_block
+
+
 @dataclass(frozen=True)
 class ServiceCapabilities:
     supports_data: bool = True
