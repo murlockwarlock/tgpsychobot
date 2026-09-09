@@ -18,10 +18,11 @@ from user_metadata import extract_data_blocks, extract_service_data
 
 TEST_RESULT_ROLE = "test_result"
 TOPIC_WELCOME_ROLE = "topic_welcome"
-TECHNICAL_ROLES = (TOPIC_WELCOME_ROLE,)
+SYSTEM_EVENT_ROLE = "system_event"
+TECHNICAL_ROLES = (TOPIC_WELCOME_ROLE, SYSTEM_EVENT_ROLE)
 CONVERSATION_ROLES = ("user", "assistant")
 VISIBLE_HISTORY_ROLES = (*CONVERSATION_ROLES, TEST_RESULT_ROLE)
-AI_HISTORY_ROLES = (*CONVERSATION_ROLES, TEST_RESULT_ROLE)
+AI_HISTORY_ROLES = (*CONVERSATION_ROLES, TEST_RESULT_ROLE, SYSTEM_EVENT_ROLE)
 
 
 @dataclass(frozen=True)
@@ -128,17 +129,27 @@ def select_ai_history_messages(
     messages: list[Any],
     limit_first: int,
     limit_recent: int,
-) -> list[Any]:
+) -> list[AIHistoryMessage]:
+    """Select and turn-group conversational history without mutating persistent ORM rows."""
 
-    normalized: list[Any] = []
+    # 1. Read-only normalization into immutable AIHistoryMessage value objects
+    normalized: list[AIHistoryMessage] = []
     for message in messages:
         if message.role == TEST_RESULT_ROLE:
             normalized.append(AIHistoryMessage(
                 role="user",
-                content=f"[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]\n{message.content}",
+                content=f"[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]\n{getattr(message, 'content', '') or ''}",
                 topic_id=getattr(message, "topic_id", None),
                 topic=getattr(message, "topic", None),
                 source_role=TEST_RESULT_ROLE,
+            ))
+        elif message.role == SYSTEM_EVENT_ROLE:
+            normalized.append(AIHistoryMessage(
+                role="user",  # provider-facing role
+                content=getattr(message, "content", "") or "",
+                topic_id=getattr(message, "topic_id", None),
+                topic=getattr(message, "topic", None),
+                source_role=SYSTEM_EVENT_ROLE,  # technical role retained
             ))
         elif message.role == "assistant":
             raw = getattr(message, "content", None) or getattr(message, "ai_context_content", None) or ""
@@ -150,31 +161,57 @@ def select_ai_history_messages(
                 topic=getattr(message, "topic", None),
                 source_role="assistant",
             ))
-        elif message.role == "user" and getattr(message, "ai_context_content", None):
+        elif message.role == "user":
             normalized.append(AIHistoryMessage(
                 role="user",
-                content=message.ai_context_content,
+                content=getattr(message, "ai_context_content", None) or getattr(message, "content", "") or "",
                 topic_id=getattr(message, "topic_id", None),
                 topic=getattr(message, "topic", None),
                 source_role="user",
             ))
         else:
-            normalized.append(message)
+            normalized.append(AIHistoryMessage(
+                role=getattr(message, "role", "user"),
+                content=getattr(message, "content", "") or "",
+                topic_id=getattr(message, "topic_id", None),
+                topic=getattr(message, "topic", None),
+                source_role=getattr(message, "role", "user"),
+            ))
 
-    pairs: list[list[Any]] = []
-    current_pair: list[Any] = []
-    for message in normalized:
-        if message.role == "user" and any(item.role == "assistant" for item in current_pair):
-            pairs.append(current_pair)
-            current_pair = [message]
+    # 2. Turn grouping using source_role to identify logical boundaries
+    turns: list[list[AIHistoryMessage]] = []
+    current_turn: list[AIHistoryMessage] = []
+
+    for item in normalized:
+        is_system_event = item.source_role == SYSTEM_EVENT_ROLE
+
+        if is_system_event:
+            # Navigation event ALWAYS starts a new logical turn
+            if current_turn:
+                turns.append(current_turn)
+            current_turn = [item]
+        elif item.role == "assistant":
+            # Assistant reply attaches to the current turn
+            current_turn.append(item)
+        elif item.role == "user":
+            # User message closes turn if it already has assistant OR previous was standalone system_event
+            is_prev_system_event = bool(current_turn and current_turn[0].source_role == SYSTEM_EVENT_ROLE)
+            has_assistant = any(x.role == "assistant" for x in current_turn)
+
+            if current_turn and (has_assistant or is_prev_system_event):
+                turns.append(current_turn)
+                current_turn = [item]
+            else:
+                current_turn.append(item)
         else:
-            current_pair.append(message)
-    if current_pair:
-        pairs.append(current_pair)
+            current_turn.append(item)
 
-    if len(pairs) > limit_first + limit_recent:
-        pairs = pairs[:limit_first] + pairs[-limit_recent:]
-    return [message for pair in pairs for message in pair]
+    if current_turn:
+        turns.append(current_turn)
+
+    if len(turns) > limit_first + limit_recent:
+        turns = turns[:limit_first] + turns[-limit_recent:]
+    return [message for turn in turns for message in turn]
 
 
 def _json_list(raw: str | None) -> list[dict[str, Any]]:

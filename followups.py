@@ -15,7 +15,9 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import selectinload
 
 from database import (
+    AIConfig,
     AutomationConversationState,
+    AutomationDialogueState,
     AutomationEvent,
     FollowupCampaign,
     FollowupDelivery,
@@ -27,6 +29,7 @@ from database import (
     async_session_maker,
 )
 from automation_events import condition_value_matches, resolve_condition_path
+from memory_mode import MEMORY_MODE_GLOBAL, get_memory_mode
 from response_buttons import ResponseButton, extract_response_buttons
 from user_metadata import extract_service_data, load_metadata
 
@@ -324,10 +327,23 @@ async def check_campaign_eligibility(
         )
         if stop_event_name is not None:
             stop_event_names = (stop_event_name,)
+    ai_conf = await session.get(AIConfig, 1)
+    is_global = get_memory_mode(ai_conf) == MEMORY_MODE_GLOBAL if ai_conf else False
+    if is_global:
+        diag_state = await session.scalar(
+            select(AutomationDialogueState).where(
+                AutomationDialogueState.user_id == user_id,
+                AutomationDialogueState.dialogue_id == dialogue_id,
+            )
+        )
+        effective_metadata = load_metadata(diag_state.metadata_json if diag_state is not None else None)
+    else:
+        effective_metadata = load_metadata(state.metadata_json if state is not None else None)
+
     return evaluate_followup_eligibility(
         campaign,
         current_step=state.current_step if state is not None else None,
-        metadata=load_metadata(state.metadata_json if state is not None else None),
+        metadata=effective_metadata,
         stop_event_names=stop_event_names,
     )
 
@@ -429,6 +445,7 @@ async def prepare_followup_step(
                 dialogue_id_override=dialogue_id,
                 persist_service_data=False,
                 request_type="followup",
+                track_user_activity=False,
             )
             if not isinstance(text, str) or not text.strip():
                 raise FollowupStepExecutionError("AI вернул пустое догоняющее сообщение")

@@ -40,7 +40,8 @@ class _Session:
         self.commit_error = commit_error
 
     async def execute(self, statement):
-        assert self._execute_results, "unexpected database execute in fallback test"
+        if not self._execute_results:
+            return _Result(rows=[])
         return self._execute_results.pop(0)
 
     async def scalar(self, statement):

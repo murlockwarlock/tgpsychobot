@@ -574,16 +574,20 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 312).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs), 4)
-            self.assertEqual(msgs[1].role, "topic_welcome")
+            self.assertEqual(len(msgs), 5)
+            self.assertEqual(msgs[1].role, "system_event")
+            self.assertIn("Отношения", msgs[1].content)
             self.assertEqual(msgs[1].dialogue_id, 2)
             self.assertEqual(msgs[1].topic_id, 20)
-            self.assertEqual(msgs[2].content, "Новый вопрос в теме отношения")
+            self.assertEqual(msgs[2].role, "topic_welcome")
             self.assertEqual(msgs[2].dialogue_id, 2)
             self.assertEqual(msgs[2].topic_id, 20)
-            self.assertEqual(msgs[3].content, "Ответ по теме отношения")
+            self.assertEqual(msgs[3].content, "Новый вопрос в теме отношения")
             self.assertEqual(msgs[3].dialogue_id, 2)
             self.assertEqual(msgs[3].topic_id, 20)
+            self.assertEqual(msgs[4].content, "Ответ по теме отношения")
+            self.assertEqual(msgs[4].dialogue_id, 2)
+            self.assertEqual(msgs[4].topic_id, 20)
 
     async def test_telegram_journey_d_topic_reset_to_main(self):
         """Journey D: In Topic B -> Reset to Main -> Topic None -> next message responds in main mode."""
@@ -651,13 +655,16 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 313).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs), 4)
-            self.assertEqual(msgs[1].role, "assistant")
+            self.assertEqual(len(msgs), 5)
+            self.assertEqual(msgs[1].role, "system_event")
+            self.assertEqual(msgs[1].dialogue_id, 2)
             self.assertIsNone(msgs[1].topic_id)
-            self.assertEqual(msgs[2].content, "Вопрос в основном режиме")
+            self.assertEqual(msgs[2].role, "assistant")
             self.assertIsNone(msgs[2].topic_id)
-            self.assertEqual(msgs[3].content, "Ответ в основном режиме")
+            self.assertEqual(msgs[3].content, "Вопрос в основном режиме")
             self.assertIsNone(msgs[3].topic_id)
+            self.assertEqual(msgs[4].content, "Ответ в основном режиме")
+            self.assertIsNone(msgs[4].topic_id)
 
     async def test_max_cancel_invalidates_future_confirm(self):
         """MAX: Cancel clears confirm_reset state; subsequent confirm callback no-ops with zero DB mutation."""
@@ -998,3 +1005,22 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db_msgs[-2].dialogue_id, 6)
             self.assertEqual(db_msgs[-1].topic_id, 60)
             self.assertEqual(db_msgs[-1].dialogue_id, 6)
+
+    async def test_disclaimer_accepted_handler_acknowledges_callback_immediately(self):
+        cb = MagicMock()
+        cb.from_user = SimpleNamespace(id=307, username="alice", full_name="Alice")
+        cb.message = MagicMock()
+        cb.message.chat = SimpleNamespace(id=307)
+        cb.message.delete = AsyncMock()
+        cb.message.answer = AsyncMock()
+        cb.answer = AsyncMock()
+
+        state = AsyncMock()
+        state.get_data.return_value = {"profile_flow": False}
+        bot = AsyncMock()
+
+        with patch("handlers._check_telegram_chat_access", AsyncMock(return_value=False)):
+            await handlers.disclaimer_accepted_handler(cb, state, bot)
+
+        cb.answer.assert_awaited_once()
+

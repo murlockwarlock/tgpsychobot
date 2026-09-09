@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+from datetime import datetime
 import uuid
 
 import anthropic
@@ -19,13 +20,20 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 import gemini_image
 
+from prompt_blocks import MAX_CAPABILITIES
 from ai_log_context import apply_ai_log_context
+from ai_request_builder import (
+    ActivityTracker,
+    build_conversational_request_layout,
+    build_isolated_request_layout,
+    get_user_ai_activity_gaps,
+)
 from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, async_session_maker
 from .legacy import AILog
 from .logging_utils import configure_logging, get_ai_logger
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context
 from user_metadata import extract_service_data
-from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, normalize_memory_mode
+from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, get_memory_mode, normalize_memory_mode
 from result_history import ai_history_role_filter, select_ai_history_messages
 from error_reporting import classify_ai_error, exception_summary
 from vector_store import search_relevant_chunks
@@ -49,6 +57,7 @@ from ai_request_context import (
     build_gemini_contents,
     build_gemini_system_parts,
     build_openai_chat_messages,
+    extract_effective_provider_and_model,
     neutralize_stable_prompt,
     normalize_request_messages,
 )
@@ -112,18 +121,12 @@ def _extract_effective_provider_and_model(
     default_provider: str,
     default_model: str,
 ) -> tuple[str, str]:
-    if not request_capture:
-        return default_provider, default_model
-    provider = request_capture.get("provider") or default_provider
-    payload = request_capture.get("payload")
-    if isinstance(payload, dict) and payload.get("model"):
-        return provider, str(payload["model"])
-    endpoint = str(request_capture.get("endpoint") or "")
-    if "/models/" in endpoint:
-        candidate = endpoint.split("/models/", 1)[1].split(":", 1)[0].split("?", 1)[0].strip()
-        if candidate:
-            return provider, candidate
-    return provider, default_model
+    return extract_effective_provider_and_model(
+        request_capture,
+        default_provider=default_provider,
+        default_model=default_model,
+        channel="chat",
+    )
 
 
 _CURRENT_AI_CONTEXT = object()
@@ -216,6 +219,7 @@ async def _call_openai(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     target_model = model or "gpt-5.6-terra"
     ensure_model_available(PROVIDER_OPENAI, target_model)
@@ -234,6 +238,11 @@ async def _call_openai(
         endpoint=f"{base_url.rstrip('/')}/chat/completions",
         payload=payload,
     )
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.chat.completions.create(**payload)
     return response.choices[0].message.content or ""
 
@@ -246,6 +255,7 @@ async def _call_deepseek(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     normalized_model = normalize_deepseek_model(model)
     ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
@@ -263,6 +273,11 @@ async def _call_deepseek(
         endpoint=f"{base_url.rstrip('/')}/chat/completions",
         payload=payload,
     )
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.chat.completions.create(
         **payload,
     )
@@ -278,6 +293,7 @@ async def _call_claude(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     target_model = model or "claude-sonnet-5"
     ensure_model_available(PROVIDER_CLAUDE, target_model)
@@ -303,6 +319,11 @@ async def _call_claude(
         endpoint="https://api.anthropic.com/v1/messages",
         payload=payload,
     )
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.messages.create(**payload)
     return response.content[0].text
 
@@ -327,6 +348,7 @@ async def _call_gemini(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     import httpx
 
@@ -353,6 +375,11 @@ async def _call_gemini(
         payload=payload,
     )
     transport = _build_gemini_proxy_transport()
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     async with httpx.AsyncClient(timeout=60.0, transport=transport) as client:
         response = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
         response.raise_for_status()
@@ -559,6 +586,7 @@ async def _call_kie_multimodal(
     channel: str = "chat",
     *,
     request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_KIE, target_model, channel=channel)
@@ -577,6 +605,11 @@ async def _call_kie_multimodal(
             "stream": False,
         }
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                log.warning("Failed to mark activity before outbound call: %s", act_err)
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(
                 f"{_kie_model_base_url(base_url, target_model)}/chat/completions",
@@ -667,7 +700,7 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
         raise AIServiceError(f"Ошибка при транскрибации (KIE API): {exception_summary(e)}") from e
 
 
-async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, *, activity_tracker: ActivityTracker | None = None) -> str:
     ensure_model_available(PROVIDER_KIE, model, channel="vision")
     try:
         file_url = await _upload_file_to_kie(
@@ -690,6 +723,7 @@ async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model:
             temperature=temperature,
             channel="vision",
             request_layout=layout,
+            activity_tracker=activity_tracker,
         )
     except (InsufficientBalanceError, AIServiceError):
         raise
@@ -746,6 +780,7 @@ async def _call_kie_text_chat(
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     """Call KIE text chat using the model's documented protocol."""
     ensure_model_available(PROVIDER_KIE, model, channel="chat")
@@ -764,6 +799,11 @@ async def _call_kie_text_chat(
         payload=request.payload,
     )
     try:
+        if activity_tracker is not None:
+            try:
+                await activity_tracker.mark_outbound_attempt_once()
+            except Exception as act_err:
+                log.warning("Failed to mark activity before outbound call: %s", act_err)
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(
                 request.endpoint,
@@ -825,6 +865,7 @@ async def _dispatch_provider(
     messages: list[dict] | None = None,
     *,
     request_capture: dict | None = None,
+    activity_tracker: ActivityTracker | None = None,
 ) -> str:
     provider, temperature = _resolve_provider(ai_config)
     layout = (
@@ -843,18 +884,21 @@ async def _dispatch_provider(
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     elif provider in {"claude", "anthropic"}:
-        if not ai_config.claude_api_key:
+        claude_key = getattr(ai_config, "claude_api_key", None) or getattr(ai_config, "anthropic_api_key", None)
+        if not claude_key:
             raise AIServiceError("Claude API key не задан")
         result = await _call_claude(
-            ai_config.claude_api_key,
+            claude_key,
             ai_config.claude_model,
             [],
             layout.stable_system_prompt,
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     elif provider == "gemini":
         if not ai_config.gemini_api_key:
@@ -867,6 +911,7 @@ async def _dispatch_provider(
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     elif provider == "deepseek":
         if not ai_config.deepseek_api_key:
@@ -878,6 +923,7 @@ async def _dispatch_provider(
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     elif provider == "kie":
         if not ai_config.kie_api_key:
@@ -892,6 +938,7 @@ async def _dispatch_provider(
             temperature,
             request_layout=layout,
             request_capture=request_capture,
+            activity_tracker=activity_tracker,
         )
     else:
         raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
@@ -925,11 +972,20 @@ async def get_ai_response(
     *,
     topic_id_override: int | None | object = _CURRENT_AI_CONTEXT,
     dialogue_id_override: int | None = None,
+    exclude_message_id: int | None = None,
+    track_user_activity: bool = True,
+    activity_tracker: ActivityTracker | None = None,
+    minutes_since_last_visit: int | None = None,
+    minutes_since_last_message: int | None = None,
+    request_type: str = "chat",
 ) -> str:
     async with async_session_maker() as session:
         user = await session.scalar(
             select(User)
-            .options(selectinload(User.current_topic).selectinload(Topic.knowledge_base_files))
+            .options(
+                selectinload(User.current_topic).selectinload(Topic.knowledge_base_files),
+                selectinload(User.subscription),
+            )
             .where(User.id == user_id)
         )
         if not user:
@@ -956,11 +1012,6 @@ async def get_ai_response(
         actual_model = _resolve_log_model(ai_config, actual_provider)
 
         stable_system_prompt = _build_user_system_prompt(user, ai_config, active_topic)
-        shared_instructions = tuple(
-            block
-            for block in ((getattr(ai_config, "shared_prompt_block", None) or "").strip(),)
-            if block
-        )
 
         relevant_chunks = []
         if active_topic:
@@ -983,53 +1034,52 @@ async def get_ai_response(
 
         context = "\n\n".join(relevant_chunks)
 
-        current_memory_mode = normalize_memory_mode(ai_config)
-        history_scope = _build_max_history_scope(user, current_memory_mode, active_topic_id, active_dialogue_id)
-        history_rows = (
-            await session.execute(
-                select(DBMessage)
-                .options(selectinload(DBMessage.topic))
-                .where(history_scope, ai_history_role_filter(DBMessage))
-                .order_by(DBMessage.timestamp.asc())
+        request_time = activity_tracker.request_time if activity_tracker is not None else datetime.utcnow()
+        if minutes_since_last_visit is None or minutes_since_last_message is None:
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(
+                session,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                now=request_time,
             )
-        ).scalars().all()
+            if minutes_since_last_visit is None:
+                minutes_since_last_visit = gap_visit
+            if minutes_since_last_message is None:
+                minutes_since_last_message = gap_msg
 
-        limit_first = getattr(ai_config, "context_limit_first", 2) or 2
-        limit_recent = getattr(ai_config, "context_limit_recent", 10) or 10
+        if activity_tracker is None:
+            activity_tracker = ActivityTracker(
+                async_session_maker,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                request_time=request_time,
+                track_user_activity=track_user_activity,
+            )
 
-        history_rows = select_ai_history_messages(history_rows, limit_first, limit_recent)
-        history_messages = [
-            {"role": row.role, "content": row.content}
-            for row in history_rows
-            if row.content
-        ]
-        if history_messages and history_messages[-1]["role"] == "user" and history_messages[-1]["content"] == user_prompt:
-            history_messages.pop()
-
-        runtime_parts = [_build_client_runtime_context(user)]
-        if getattr(user, "response_length", "normal") == "short":
-            runtime_parts.append("Отвечай кратко, по делу, без длинных вступлений.")
-        scenario_context = await build_runtime_automation_context(
+        request_layout = await build_conversational_request_layout(
             session,
-            user_id=user.id,
+            user=user,
+            ai_config=ai_config,
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
-        )
-        request_context = (context,) if context else ()
-        request_layout = AIRequestLayout(
-            stable_system_prompt=stable_system_prompt,
-            shared_instructions=shared_instructions,
-            runtime_context=tuple(runtime_parts),
-            scenario_context=(scenario_context,) if scenario_context else (),
-            request_context=request_context,
-            history=normalize_request_messages(history_messages),
             current_user_content=user_prompt,
+            exclude_message_id=exclude_message_id,
+            stable_system_prompt=stable_system_prompt,
+            minutes_since_last_visit=minutes_since_last_visit,
+            minutes_since_last_message=minutes_since_last_message,
+            knowledge_context=context,
+            service_capabilities=MAX_CAPABILITIES,
         )
         temperature = _resolve_temperature(ai_config)
         start_time = time.monotonic()
         request_capture: dict = {}
         try:
-            result = await _dispatch_provider(ai_config, request_layout, request_capture=request_capture)
+            result = await _dispatch_provider(
+                ai_config,
+                request_layout,
+                request_capture=request_capture,
+                activity_tracker=activity_tracker,
+            )
             actual_provider, actual_model = _extract_effective_provider_and_model(
                 request_capture,
                 default_provider=actual_provider,
@@ -1047,7 +1097,7 @@ async def get_ai_response(
             if allow_fallback and fb_provider and fb_model:
                 fb_key = fb_provider.strip().lower()
                 if fb_key in {"claude", "anthropic"}:
-                    fb_api_key = ai_config.claude_api_key
+                    fb_api_key = getattr(ai_config, "claude_api_key", None) or getattr(ai_config, "anthropic_api_key", None)
                 else:
                     fb_api_key = getattr(ai_config, f"{fb_key}_api_key", None)
                 if fb_api_key:
@@ -1058,24 +1108,28 @@ async def get_ai_response(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         elif fb_key in {"claude", "anthropic"}:
                             result = await _call_claude(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         elif fb_key == "gemini":
                             result = await _call_gemini(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         elif fb_key == "deepseek":
                             result = await _call_deepseek(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         elif fb_key == "kie":
                             result = await _call_kie_text_chat(
@@ -1083,6 +1137,7 @@ async def get_ai_response(
                                 stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=request_capture,
+                                activity_tracker=activity_tracker,
                             )
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
@@ -1115,7 +1170,7 @@ async def get_ai_response(
 
         ai_log = AILog(
             user_id=user_id,
-            request_type="chat",
+            request_type=(request_type or "chat").strip().lower(),
             provider=actual_provider,
             model=actual_model,
             prompt_summary=user_prompt if user_prompt else None,
@@ -1162,6 +1217,10 @@ async def get_ai_response_direct(
     *,
     dialogue_id: int | None = None,
     topic_id: int | None = None,
+    track_user_activity: bool = False,
+    activity_tracker: ActivityTracker | None = None,
+    minutes_since_last_visit: int | None = None,
+    minutes_since_last_message: int | None = None,
 ) -> str:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -1172,61 +1231,70 @@ async def get_ai_response_direct(
             raise AIServiceError("AIConfig не найден")
         active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
         active_topic_id = topic_id if topic_id is not None else user.current_topic_id
-        runtime_context = await build_runtime_automation_context(
+
+        request_time = activity_tracker.request_time if activity_tracker is not None else datetime.utcnow()
+        if minutes_since_last_visit is None or minutes_since_last_message is None:
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(
+                session,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                now=request_time,
+            )
+            if minutes_since_last_visit is None:
+                minutes_since_last_visit = gap_visit
+            if minutes_since_last_message is None:
+                minutes_since_last_message = gap_msg
+
+        if activity_tracker is None and track_user_activity:
+            activity_tracker = ActivityTracker(
+                async_session_maker,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                request_time=request_time,
+                track_user_activity=True,
+            )
+
+        request_layout = await build_isolated_request_layout(
             session,
-            user_id=user.id,
+            user=user,
+            ai_config=ai_config,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
+            minutes_since_last_visit=minutes_since_last_visit,
+            minutes_since_last_message=minutes_since_last_message,
+            service_capabilities=MAX_CAPABILITIES,
         )
 
-    base_system = neutralize_stable_prompt(
-        system_prompt or ai_config.system_prompt or "Ты полезный ИИ-помощник."
-    )
-    runtime_parts = [_build_client_runtime_context(user)]
-    if getattr(user, "response_length", "normal") == "short":
-        runtime_parts.append("Отвечай кратко, по делу, без длинных вступлений.")
-    request_layout = AIRequestLayout(
-        stable_system_prompt=base_system,
-        shared_instructions=tuple(
-            block
-            for block in ((getattr(ai_config, "shared_prompt_block", None) or "").strip(),)
-            if block
-        ),
-        runtime_context=tuple(runtime_parts),
-        scenario_context=(runtime_context,) if runtime_context and runtime_context.strip() else (),
-        current_user_content=user_prompt,
-    )
-    try:
-        result = await _dispatch_provider(ai_config, request_layout)
-        log.info("AI direct response generated user_id=%s provider=%s", user_id, ai_config.provider)
-    except AIServiceError:
-        log.exception("AI direct request failed user_id=%s provider=%s", user_id, ai_config.provider)
-        raise
-    except Exception as exc:
-        log.exception("Unexpected AI direct request failure user_id=%s provider=%s", user_id, ai_config.provider)
-        raise AIServiceError(f"Ошибка при прямом обращении к AI-провайдеру: {exc}") from exc
+        try:
+            result = await _dispatch_provider(ai_config, request_layout, activity_tracker=activity_tracker)
+            log.info("AI direct response generated user_id=%s provider=%s", user_id, ai_config.provider)
+        except AIServiceError:
+            log.exception("AI direct request failed user_id=%s provider=%s", user_id, ai_config.provider)
+            raise
+        except Exception as exc:
+            log.exception("Unexpected AI direct request failure user_id=%s provider=%s", user_id, ai_config.provider)
+            raise AIServiceError(f"Ошибка при прямом обращении к AI-провайдеру: {exc}") from exc
 
-    visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
-    if invalid_data_blocks:
-        log.warning("Direct AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
-    if service_blocks:
-        async with async_session_maker() as session:
-            user = await session.get(User, user_id)
-            if user:
-                try:
-                    await apply_service_data_blocks(
-                        session,
-                        user=user,
-                        dialogue_id=active_dialogue_id,
-                        topic_id=active_topic_id,
-                        blocks=service_blocks,
-                    )
-                    await session.commit()
-                except Exception as exc:
-                    await session.rollback()
-                    log.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
-                    raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
-    return visible_text
+        visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+        if invalid_data_blocks:
+            log.warning("Direct AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+        if service_blocks:
+            try:
+                await apply_service_data_blocks(
+                    session,
+                    user=user,
+                    dialogue_id=active_dialogue_id,
+                    topic_id=active_topic_id,
+                    blocks=service_blocks,
+                )
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                log.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
+                raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
+        return visible_text
 
 
 # ---------------------------------------------------------------------------
@@ -1320,7 +1388,7 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
 # Image Analysis (Vision)
 # ---------------------------------------------------------------------------
 
-async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
     import httpx
 
     b64_data = base64.b64encode(image_bytes).decode()
@@ -1349,6 +1417,11 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
         },
         "generationConfig": generation_config,
     }
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     async with httpx.AsyncClient(timeout=60.0, transport=_build_gemini_proxy_transport()) as http:
         resp = await http.post(url, json=payload, headers={"Content-Type": "application/json"})
         resp.raise_for_status()
@@ -1359,7 +1432,7 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
     return candidates[0]["content"]["parts"][0]["text"]
 
 
-async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
     target_model = model or "gpt-5.6-terra"
     ensure_model_available(PROVIDER_OPENAI, target_model, channel="vision")
     b64_data = base64.b64encode(image_bytes).decode()
@@ -1380,11 +1453,16 @@ async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_p
     }
     if not target_model.startswith("gpt-5.6"):
         payload["temperature"] = temperature
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.chat.completions.create(**payload)
     return response.choices[0].message.content or ""
 
 
-async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
     target_model = model or "claude-sonnet-5"
     ensure_model_available(PROVIDER_CLAUDE, target_model, channel="vision")
     b64_data = base64.b64encode(image_bytes).decode()
@@ -1411,11 +1489,23 @@ async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_p
     }
     if not should_omit_claude_sampling(target_model):
         payload["temperature"] = temperature
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.messages.create(**payload)
     return response.content[0].text
 
 
-async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
+async def analyze_image(
+    user_id: int,
+    image_bytes: bytes,
+    prompt: str,
+    *,
+    activity_tracker: ActivityTracker | None = None,
+    exclude_message_id: int | None = None,
+) -> str:
     """Analyze image with the configured vision provider."""
     async with async_session_maker() as session:
         user = await session.scalar(
@@ -1434,85 +1524,114 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str) -> str:
 
         provider = (config.vision_provider or "Gemini").strip()
         temperature = _resolve_temperature(config)
-        
+
+        active_dialogue_id = user.current_dialogue_id
+        active_topic_id = user.current_topic_id
+
+        request_time = activity_tracker.request_time if activity_tracker is not None else datetime.utcnow()
+        gap_visit, gap_msg = await get_user_ai_activity_gaps(
+            session,
+            user_id=user.id,
+            topic_id=active_topic_id,
+            now=request_time,
+        )
+
+        if activity_tracker is None:
+            activity_tracker = ActivityTracker(
+                async_session_maker,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                request_time=request_time,
+                track_user_activity=True,
+            )
+
         photo_instructions = (
             "\n\nИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"
             "1. Если пользователь просит ИЗМЕНИТЬ это фото или 'сделать так же', добавь в конце: EDIT_IMG: <prompt on english>.\n"
             "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"
             "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
         )
-        system_prompt = _build_user_system_prompt(user, config)
-        shared_instructions = tuple(
-            block
-            for block in (
-                (getattr(config, "shared_prompt_block", None) or "").strip(),
-                photo_instructions.strip(),
-            )
-            if block
-        )
 
-        current_memory_mode = normalize_memory_mode(config)
-        history_scope = _build_max_history_scope(user, current_memory_mode)
-        history_rows = (
-            await session.execute(
-                select(DBMessage)
-                .options(selectinload(DBMessage.topic))
-                .where(history_scope, ai_history_role_filter(DBMessage))
-                .order_by(DBMessage.timestamp.asc())
-            )
-        ).scalars().all()
+        stable_system_prompt = _build_user_system_prompt(user, config, user.current_topic)
 
-        limit_first = getattr(config, "context_limit_first", 2) or 2
-        limit_recent = getattr(config, "context_limit_recent", 10) or 10
-
-        # Filter out the message we just saved before calling this function, which ends with role == 'user' and starts with "[Изображение]"
-        if history_rows and history_rows[-1].role == "user" and history_rows[-1].content.startswith("[Изображение]"):
-            history_rows = history_rows[:-1]
-
-        history_rows = select_ai_history_messages(history_rows, limit_first, limit_recent)
-
-        history_list = [{"role": row.role, "content": row.content} for row in history_rows if row.content]
-        runtime_parts = [_build_client_runtime_context(user)]
-        if getattr(user, "response_length", "normal") == "short":
-            runtime_parts.append("Отвечай кратко, по делу, без длинных вступлений.")
-        active_dialogue_id = user.current_dialogue_id
-        active_topic_id = user.current_topic_id
-        scenario_context = await build_runtime_automation_context(
+        request_layout = await build_conversational_request_layout(
             session,
-            user_id=user.id,
+            user=user,
+            ai_config=config,
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
-        )
-        request_layout = AIRequestLayout(
-            stable_system_prompt=system_prompt,
-            shared_instructions=shared_instructions,
-            runtime_context=tuple(runtime_parts),
-            scenario_context=(scenario_context,) if scenario_context else (),
-            history=normalize_request_messages(history_list),
+            exclude_message_id=exclude_message_id,
+            stable_system_prompt=stable_system_prompt,
+            minutes_since_last_visit=gap_visit,
+            minutes_since_last_message=gap_msg,
+            service_capabilities=MAX_CAPABILITIES,
+            modality_instructions=(photo_instructions,),
         )
 
     if provider == "Gemini":
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для vision не задан")
-        raw_result = await _analyze_gemini(api_key, config.vision_model or "gemini-3.7-flash", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_gemini(
+            api_key,
+            config.vision_model or "gemini-3.7-flash",
+            image_bytes,
+            request_layout.stable_system_prompt,
+            prompt,
+            temperature,
+            history=list(request_layout.history),
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
     elif provider in {"Claude", "Anthropic"}:
         api_key = config.claude_api_key
         if not api_key:
             raise AIServiceError("API ключ Claude для vision не задан")
-        raw_result = await _analyze_claude(api_key, config.vision_model or "claude-sonnet-5", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_claude(
+            api_key,
+            config.vision_model or "claude-sonnet-5",
+            image_bytes,
+            request_layout.stable_system_prompt,
+            prompt,
+            temperature,
+            history=list(request_layout.history),
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
     elif provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
         model = config.vision_model or "gemini-3-flash"
-        raw_result = await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_kie(
+            api_key,
+            _get_kie_base_url(config),
+            _get_kie_upload_base_url(config),
+            model,
+            image_bytes,
+            request_layout.stable_system_prompt,
+            prompt,
+            temperature,
+            history=list(request_layout.history),
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
     else:
         # Default: OpenAI
         api_key = config.openai_api_key
         if not api_key:
             raise AIServiceError("API ключ OpenAI для vision не задан")
-        raw_result = await _analyze_openai(api_key, config.vision_model or "gpt-5.6-terra", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_openai(
+            api_key,
+            config.vision_model or "gpt-5.6-terra",
+            image_bytes,
+            request_layout.stable_system_prompt,
+            prompt,
+            temperature,
+            history=list(request_layout.history),
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
 
     visible_text, service_blocks, invalid_data_blocks = extract_service_data(raw_result)
     if invalid_data_blocks:

@@ -62,7 +62,26 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         db_user.current_topic_id = topic_id
         dialogue_id = db_user.current_dialogue_id
         welcome_shown = await resolve_topic_entry_state(session, user_id, dialogue_id, topic_id)
+
+        from system_events import (
+            build_topic_auto_start_system_message,
+            build_topic_resume_system_message,
+            record_navigation_system_event,
+        )
+        synthetic_text = (
+            build_topic_resume_system_message(topic.name)
+            if welcome_shown
+            else build_topic_auto_start_system_message(topic.name)
+        )
+        nav_msg = await record_navigation_system_event(
+            session,
+            user_id=user_id,
+            dialogue_id=dialogue_id,
+            topic_id=topic_id,
+            text=synthetic_text,
+        )
         await session.commit()
+        navigation_message_id = nav_msg.id
 
     if not welcome_shown:
         from ..formatting import translate_telegram_links_to_max
@@ -109,6 +128,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
                             "pending_auto_start_topic_id": topic_id,
                             "pending_auto_start_dialogue_id": dialogue_id,
                             "pending_auto_start_kind": "first_entry",
+                            "pending_auto_start_message_id": navigation_message_id,
                         },
                     )
                 return
@@ -123,6 +143,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
                         "pending_auto_start_topic_id": topic_id,
                         "pending_auto_start_dialogue_id": dialogue_id,
                         "pending_auto_start_kind": "first_entry",
+                        "pending_auto_start_message_id": navigation_message_id,
                     },
                 ):
                     return
@@ -130,8 +151,6 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
             if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
                 return
 
-            from system_events import build_topic_auto_start_system_message
-            synthetic_text = build_topic_auto_start_system_message(topic.name)
             await common.run_hidden_ai_kickoff(
                 client,
                 chat_id,
@@ -140,6 +159,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
                 expected_dialogue_id=dialogue_id,
                 expected_topic_id=topic_id,
                 states=states,
+                exclude_message_id=navigation_message_id,
             )
     else:
         from . import common
@@ -157,6 +177,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
                         "pending_auto_start_topic_id": topic_id,
                         "pending_auto_start_dialogue_id": dialogue_id,
                         "pending_auto_start_kind": "resume",
+                        "pending_auto_start_message_id": navigation_message_id,
                     },
                 )
             return
@@ -171,6 +192,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
                     "pending_auto_start_topic_id": topic_id,
                     "pending_auto_start_dialogue_id": dialogue_id,
                     "pending_auto_start_kind": "resume",
+                    "pending_auto_start_message_id": navigation_message_id,
                 },
             ):
                 return
@@ -178,8 +200,6 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
             return
 
-        from system_events import build_topic_resume_system_message
-        synthetic_text = build_topic_resume_system_message(topic.name)
         await common.run_hidden_ai_kickoff(
             client,
             chat_id,
@@ -188,6 +208,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
             expected_dialogue_id=dialogue_id,
             expected_topic_id=topic_id,
             states=states,
+            exclude_message_id=navigation_message_id,
         )
 
 
@@ -201,7 +222,17 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
         await apply_memory_mode_topic_switch(session, user, 0, current_memory_mode)
         user.current_topic_id = None
         dialogue_id = user.current_dialogue_id
+        from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
+        synthetic_text = build_main_dialogue_resume_system_message()
+        nav_msg = await record_navigation_system_event(
+            session,
+            user_id=user_id,
+            dialogue_id=dialogue_id,
+            topic_id=None,
+            text=synthetic_text,
+        )
         await session.commit()
+        navigation_message_id = nav_msg.id
 
     await client.send_message(
         chat_id=chat_id,
@@ -224,6 +255,7 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
                     "pending_auto_start_topic_id": None,
                     "pending_auto_start_dialogue_id": dialogue_id,
                     "pending_auto_start_kind": "main_resume",
+                    "pending_auto_start_message_id": navigation_message_id,
                 },
             )
         return
@@ -238,6 +270,7 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
                 "pending_auto_start_topic_id": None,
                 "pending_auto_start_dialogue_id": dialogue_id,
                 "pending_auto_start_kind": "main_resume",
+                "pending_auto_start_message_id": navigation_message_id,
             },
         ):
             return
@@ -245,8 +278,6 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
     if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
         return
 
-    from system_events import build_main_dialogue_resume_system_message
-    synthetic_text = build_main_dialogue_resume_system_message()
     await common.run_hidden_ai_kickoff(
         client,
         chat_id,
@@ -255,4 +286,5 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
         expected_dialogue_id=dialogue_id,
         expected_topic_id=None,
         states=states,
+        exclude_message_id=navigation_message_id,
     )

@@ -3,6 +3,30 @@ from __future__ import annotations
 
 import re
 
+SYSTEM_EVENT_ROLE = "system_event"
+
+
+async def record_navigation_system_event(
+    session,
+    *,
+    user_id: int,
+    dialogue_id: int,
+    topic_id: int | None,
+    text: str,
+):
+    """Persist a navigation system event into messages table with role='system_event'."""
+    from database import Message
+    msg = Message(
+        user_id=user_id,
+        dialogue_id=dialogue_id,
+        topic_id=topic_id,
+        role=SYSTEM_EVENT_ROLE,
+        content=text,
+    )
+    session.add(msg)
+    await session.flush()
+    return msg
+
 
 def sanitize_synthetic_text_fragment(value: str | None) -> str:
     """Sanitize arbitrary text for inclusion in synthetic system events.

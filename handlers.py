@@ -16,6 +16,7 @@ from collections import OrderedDict, deque
 import secrets
 from dataclasses import dataclass
 from types import SimpleNamespace
+import inspect
 import ai_integration
 import keyboards
 from client_search import normalize_client_search_query
@@ -67,6 +68,13 @@ from ai_integration import (
 )
 from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error, sanitize_secret_values
 from media_scope import PHOTO_MEDIA_TYPES, TopicMediaScope, load_media_scope, photo_media_predicate
+from ai_request_context import extract_effective_provider_and_model
+from ai_request_builder import (
+    ActivityTracker,
+    build_conversational_request_layout,
+    build_isolated_request_layout,
+    get_user_ai_activity_gaps,
+)
 from provider_models import (
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
@@ -163,7 +171,13 @@ from mailing_utils import (
     render_mailing_text,
     send_mailing_content,
 )
-from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE, render_prompt_block
+from prompt_blocks import (
+    DEFAULT_SERVICE_PROMPT_TEMPLATE,
+    TELEGRAM_CAPABILITIES,
+    format_available_media_text,
+    render_prompt_block,
+)
+from media_scope import load_available_media
 from provider_models import (
     DEEPSEEK_DEFAULT_MODEL,
     DEEPSEEK_MODELS,
@@ -1730,6 +1744,7 @@ class ScopedAIKickoff:
     expected_topic_id: int | None
     synthetic_prompt: str
     is_hidden: bool = True
+    navigation_message_id: int | None = None
 
 
 async def _telegram_scoped_kickoff_is_current(
@@ -1807,12 +1822,14 @@ async def process_buffered_messages(
             general_config,
         )
 
+        exclude_message_id = scoped_kickoff.navigation_message_id if scoped_kickoff is not None else None
         response_capture = {}
         response_text = await ai_integration.generate_response(
             user_id,
             full_text,
             bot=bot,
             response_capture=response_capture,
+            exclude_message_id=exclude_message_id,
         )
         ai_context_content = response_capture.get("raw_response") or response_text
 
@@ -2349,6 +2366,7 @@ async def _start_telegram_hidden_kickoff(
     synthetic_prompt: str,
     dialogue_id: int,
     topic_id: int | None,
+    navigation_message_id: int | None = None,
 ) -> None:
     kickoff = ScopedAIKickoff(
         user_id=user_id,
@@ -2356,6 +2374,7 @@ async def _start_telegram_hidden_kickoff(
         expected_topic_id=topic_id,
         synthetic_prompt=synthetic_prompt,
         is_hidden=True,
+        navigation_message_id=navigation_message_id,
     )
     async with _get_user_scheduling_lock(user_id):
         queue = user_isolated_turn_queues.setdefault(user_id, deque())
@@ -2369,14 +2388,27 @@ async def _start_telegram_topic_auto_start(
     state: FSMContext | None,
     topic: Topic,
     dialogue_id: int | None = None,
+    *,
+    navigation_message_id: int | None = None,
 ) -> None:
-    from system_events import build_topic_auto_start_system_message
+    from system_events import build_topic_auto_start_system_message, record_navigation_system_event
     synthetic_text = build_topic_auto_start_system_message(topic.name)
     effective_dialogue_id = dialogue_id
     if effective_dialogue_id is None:
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             effective_dialogue_id = user.current_dialogue_id if user else 1
+    if navigation_message_id is None:
+        async with async_session_maker() as session:
+            nav_msg = await record_navigation_system_event(
+                session,
+                user_id=user_id,
+                dialogue_id=effective_dialogue_id,
+                topic_id=topic.id,
+                text=synthetic_text,
+            )
+            await session.commit()
+            navigation_message_id = nav_msg.id
     await _start_telegram_hidden_kickoff(
         user_id=user_id,
         bot=bot,
@@ -2384,6 +2416,7 @@ async def _start_telegram_topic_auto_start(
         synthetic_prompt=synthetic_text,
         dialogue_id=effective_dialogue_id,
         topic_id=topic.id,
+        navigation_message_id=navigation_message_id,
     )
 
 
@@ -6618,6 +6651,10 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
 
 @router.callback_query(F.data == "disclaimer_accepted", UserStates.awaiting_disclaimer_acceptance)
 async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if hasattr(callback, "answer"):
+        ans = callback.answer()
+        if inspect.isawaitable(ans):
+            await ans
     user_id = callback.from_user.id
 
     async with async_session_maker() as session:
@@ -6655,9 +6692,23 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
             if user and user.current_topic_id is None and (pending_dialogue_id is None or user.current_dialogue_id == int(pending_dialogue_id)):
                 if not await _check_telegram_chat_access(session, user_id, bot, callback.message.chat.id):
                     return
-                from system_events import build_main_dialogue_resume_system_message
+                from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
                 synthetic_prompt = build_main_dialogue_resume_system_message()
-                await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, user.current_dialogue_id, None)
+                nav_msg_id = data.get("pending_auto_start_message_id")
+                if not nav_msg_id:
+                    nav_msg = await record_navigation_system_event(
+                        session,
+                        user_id=user_id,
+                        dialogue_id=user.current_dialogue_id,
+                        topic_id=None,
+                        text=synthetic_prompt,
+                    )
+                    await session.commit()
+                    nav_msg_id = nav_msg.id
+                await _start_telegram_hidden_kickoff(
+                    user_id, bot, state, synthetic_prompt, user.current_dialogue_id, None,
+                    navigation_message_id=nav_msg_id,
+                )
                 return
 
     if pending_topic_id:
@@ -6669,12 +6720,29 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
                     if not await _check_telegram_chat_access(session, user_id, bot, callback.message.chat.id):
                         return
                     if pending_kind == "resume":
-                        from system_events import build_topic_resume_system_message
+                        from system_events import build_topic_resume_system_message, record_navigation_system_event
                         synthetic_prompt = build_topic_resume_system_message(topic.name)
-                        await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(pending_topic_id))
+                        nav_msg_id = data.get("pending_auto_start_message_id")
+                        if not nav_msg_id:
+                            nav_msg = await record_navigation_system_event(
+                                session,
+                                user_id=user_id,
+                                dialogue_id=user.current_dialogue_id,
+                                topic_id=int(pending_topic_id),
+                                text=synthetic_prompt,
+                            )
+                            await session.commit()
+                            nav_msg_id = nav_msg.id
+                        await _start_telegram_hidden_kickoff(
+                            user_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(pending_topic_id),
+                            navigation_message_id=nav_msg_id,
+                        )
                         return
                     elif getattr(topic, "auto_start_dialogue", False):
-                        await _start_telegram_topic_auto_start(user_id, bot, state, topic, user.current_dialogue_id)
+                        await _start_telegram_topic_auto_start(
+                            user_id, bot, state, topic, user.current_dialogue_id,
+                            navigation_message_id=data.get("pending_auto_start_message_id"),
+                        )
                         return
 
     if prompt_text:
@@ -7511,6 +7579,8 @@ class TopicSwitchResult:
         welcome_shown: bool = False,
         dialogue_id: int = 1,
         topic_id: int | None = None,
+        navigation_message_id: int | None = None,
+        synthetic_prompt: str | None = None,
     ):
         self.status = status  # "switched", "already_current", "inaccessible"
         self.topic = topic
@@ -7519,6 +7589,8 @@ class TopicSwitchResult:
         self.welcome_shown = welcome_shown
         self.dialogue_id = dialogue_id
         self.topic_id = topic_id
+        self.navigation_message_id = navigation_message_id
+        self.synthetic_prompt = synthetic_prompt
 
 
 async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSwitchResult:
@@ -7539,6 +7611,24 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                 user.current_topic_id = topic_id
                 dialogue_id = user.current_dialogue_id
                 welcome_shown = await resolve_topic_entry_state(session, user.id, dialogue_id, topic_id)
+
+                from system_events import (
+                    build_topic_auto_start_system_message,
+                    build_topic_resume_system_message,
+                    record_navigation_system_event,
+                )
+                synthetic_prompt = (
+                    build_topic_resume_system_message(topic.name)
+                    if welcome_shown
+                    else build_topic_auto_start_system_message(topic.name)
+                )
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=user.id,
+                    dialogue_id=dialogue_id,
+                    topic_id=topic_id,
+                    text=synthetic_prompt,
+                )
                 await session.commit()
                 return TopicSwitchResult(
                     "switched",
@@ -7548,6 +7638,8 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
                     welcome_shown=welcome_shown,
                     dialogue_id=dialogue_id,
                     topic_id=topic_id,
+                    navigation_message_id=nav_msg.id,
+                    synthetic_prompt=synthetic_prompt,
                 )
             return TopicSwitchResult("inaccessible")
 
@@ -7594,6 +7686,7 @@ async def _complete_telegram_topic_entry(
         topic_intro_welcome_needed=not switch_res.welcome_shown,
         topic_intro_restored=switch_res.restored,
         topic_intro_memory_mode=switch_res.memory_mode,
+        topic_intro_navigation_message_id=switch_res.navigation_message_id,
     ):
         return
 
@@ -7612,6 +7705,7 @@ async def _complete_telegram_topic_entry(
                         pending_auto_start_topic_id=int(switch_res.topic_id),
                         pending_auto_start_dialogue_id=switch_res.dialogue_id,
                         pending_auto_start_kind="first_entry",
+                        pending_auto_start_message_id=switch_res.navigation_message_id,
                     )
                     text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                     await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -7625,7 +7719,10 @@ async def _complete_telegram_topic_entry(
                 if not await _check_telegram_chat_access(session_acc, user_id, bot, chat_id):
                     return
 
-            await _start_telegram_topic_auto_start(user_id, bot, state, switch_res.topic, switch_res.dialogue_id)
+            await _start_telegram_topic_auto_start(
+                user_id, bot, state, switch_res.topic, switch_res.dialogue_id,
+                navigation_message_id=switch_res.navigation_message_id,
+            )
     else:
         if not user.accepted_disclaimer:
             disclaimer_content = await get_content_from_db("disclaimer")
@@ -7635,6 +7732,7 @@ async def _complete_telegram_topic_entry(
                     pending_auto_start_topic_id=int(switch_res.topic_id),
                     pending_auto_start_dialogue_id=switch_res.dialogue_id,
                     pending_auto_start_kind="resume",
+                    pending_auto_start_message_id=switch_res.navigation_message_id,
                 )
                 text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -7649,8 +7747,11 @@ async def _complete_telegram_topic_entry(
                 return
 
         from system_events import build_topic_resume_system_message
-        synthetic_prompt = build_topic_resume_system_message(switch_res.topic.name)
-        await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, switch_res.dialogue_id, switch_res.topic_id)
+        synthetic_prompt = switch_res.synthetic_prompt or build_topic_resume_system_message(switch_res.topic.name)
+        await _start_telegram_hidden_kickoff(
+            user_id, bot, state, synthetic_prompt, switch_res.dialogue_id, switch_res.topic_id,
+            navigation_message_id=switch_res.navigation_message_id,
+        )
 
 
 async def _apply_topic_switch(session, user, topic_key: int, memory_mode: str) -> bool:
@@ -7751,6 +7852,7 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                             pending_auto_start_topic_id=int(topic_id),
                             pending_auto_start_dialogue_id=user.current_dialogue_id,
                             pending_auto_start_kind="first_entry",
+                            pending_auto_start_message_id=data.get("topic_intro_navigation_message_id"),
                         )
                     text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                     await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -7765,7 +7867,10 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                 if not await _check_telegram_chat_access(session_acc, chat_id, bot, chat_id):
                     return True
 
-            await _start_telegram_topic_auto_start(chat_id, bot, state, topic, user.current_dialogue_id)
+            await _start_telegram_topic_auto_start(
+                chat_id, bot, state, topic, user.current_dialogue_id,
+                navigation_message_id=data.get("topic_intro_navigation_message_id"),
+            )
     else:
         if user and not user.accepted_disclaimer:
             disclaimer_content = await get_content_from_db("disclaimer")
@@ -7776,6 +7881,7 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                         pending_auto_start_topic_id=int(topic_id),
                         pending_auto_start_dialogue_id=user.current_dialogue_id,
                         pending_auto_start_kind="resume",
+                        pending_auto_start_message_id=data.get("topic_intro_navigation_message_id"),
                     )
                 text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -7790,9 +7896,24 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
             if not await _check_telegram_chat_access(session_acc, chat_id, bot, chat_id):
                 return True
 
-        from system_events import build_topic_resume_system_message
+        from system_events import build_topic_resume_system_message, record_navigation_system_event
         synthetic_prompt = build_topic_resume_system_message(topic.name)
-        await _start_telegram_hidden_kickoff(chat_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(topic_id))
+        nav_msg_id = data.get("topic_intro_navigation_message_id")
+        if not nav_msg_id:
+            async with async_session_maker() as session:
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=chat_id,
+                    dialogue_id=user.current_dialogue_id,
+                    topic_id=int(topic_id),
+                    text=synthetic_prompt,
+                )
+                await session.commit()
+                nav_msg_id = nav_msg.id
+        await _start_telegram_hidden_kickoff(
+            chat_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(topic_id),
+            navigation_message_id=nav_msg_id,
+        )
 
     return True
 
@@ -7886,6 +8007,7 @@ async def _request_profile_onboarding_if_needed(
     topic_intro_welcome_needed: bool = True,
     topic_intro_restored: bool = False,
     topic_intro_memory_mode: str = MEMORY_MODE_RESET,
+    topic_intro_navigation_message_id: int | None = None,
     resume_start: bool = False,
     resume_start_args: str | None = None,
     resume_start_new_user: bool = False,
@@ -7914,6 +8036,7 @@ async def _request_profile_onboarding_if_needed(
             "topic_intro_welcome_needed": topic_intro_welcome_needed,
             "topic_intro_restored": topic_intro_restored,
             "topic_intro_memory_mode": topic_intro_memory_mode,
+            "topic_intro_navigation_message_id": topic_intro_navigation_message_id,
         })
 
     await state.update_data(**state_data)
@@ -7994,14 +8117,24 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext, bo
     )
 
 
-async def _transition_to_main_db_locked(session: AsyncSession, user: User) -> int:
+async def _transition_to_main_db_locked(session: AsyncSession, user: User) -> tuple[int, int | None]:
     ai_config = await session.get(AIConfig, 1)
     memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
     await _apply_topic_switch(session, user, 0, memory_mode)
     user.current_topic_id = None
     dialogue_id = user.current_dialogue_id
+
+    from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
+    synthetic_prompt = build_main_dialogue_resume_system_message()
+    nav_msg = await record_navigation_system_event(
+        session,
+        user_id=user.id,
+        dialogue_id=dialogue_id,
+        topic_id=None,
+        text=synthetic_prompt,
+    )
     await session.commit()
-    return dialogue_id
+    return dialogue_id, (nav_msg.id if nav_msg else None)
 
 
 async def _complete_telegram_main_continuation(
@@ -8009,6 +8142,7 @@ async def _complete_telegram_main_continuation(
     dialogue_id: int,
     bot: Bot,
     state: FSMContext | None = None,
+    navigation_message_id: int | None = None,
 ) -> None:
     async with async_session_maker() as session_acc:
         user = await session_acc.get(User, user_id)
@@ -8029,6 +8163,7 @@ async def _complete_telegram_main_continuation(
                         pending_auto_start_topic_id=None,
                         pending_auto_start_dialogue_id=dialogue_id,
                         pending_auto_start_kind="main_resume",
+                        pending_auto_start_message_id=navigation_message_id,
                     )
                 text_to_send_disc = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                 await bot.send_message(user_id, text_to_send_disc, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -8041,24 +8176,41 @@ async def _complete_telegram_main_continuation(
         if not await _check_telegram_chat_access(session_acc, user_id, bot, user_id):
             return
 
-    from system_events import build_main_dialogue_resume_system_message
+    from system_events import build_main_dialogue_resume_system_message, record_navigation_system_event
     synthetic_prompt = build_main_dialogue_resume_system_message()
-    await _start_telegram_hidden_kickoff(user_id, bot, state, synthetic_prompt, dialogue_id, None)
+    if navigation_message_id is None:
+        async with async_session_maker() as session:
+            nav_msg = await record_navigation_system_event(
+                session,
+                user_id=user_id,
+                dialogue_id=dialogue_id,
+                topic_id=None,
+                text=synthetic_prompt,
+            )
+            await session.commit()
+            navigation_message_id = nav_msg.id
+    await _start_telegram_hidden_kickoff(
+        user_id, bot, state, synthetic_prompt, dialogue_id, None,
+        navigation_message_id=navigation_message_id,
+    )
 
 
 async def _perform_telegram_topic_reset_to_main(user_id: int, bot: Bot, state: FSMContext | None = None) -> None:
     dialogue_id = None
+    nav_msg_id = None
     async with user_locks.setdefault(user_id, asyncio.Lock()):
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             if not user or user.current_topic_id is None:
                 return
-            dialogue_id = await _transition_to_main_db_locked(session, user)
+            dialogue_id, nav_msg_id = await _transition_to_main_db_locked(session, user)
 
     if dialogue_id is None:
         return
 
-    await _complete_telegram_main_continuation(user_id, dialogue_id, bot, state)
+    await _complete_telegram_main_continuation(
+        user_id, dialogue_id, bot, state, navigation_message_id=nav_msg_id
+    )
 
 
 @router.callback_query(F.data == "reset_topic")
@@ -15195,13 +15347,35 @@ async def finish_test_generation(
 
     preliminary_interpretation = None
     try:
+        request_time = datetime.utcnow()
+        async with async_session_maker() as session:
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(
+                session,
+                user_id=user_id,
+                topic_id=topic_id,
+                now=request_time,
+            )
+
+        activity_tracker = ActivityTracker(
+            async_session_maker,
+            user_id=user_id,
+            topic_id=topic_id,
+            request_time=request_time,
+            track_user_activity=True,
+        )
+
         if separate_prompt_enabled:
+            direct_tracker = activity_tracker if result_prompt_is_final else None
             preliminary_interpretation = await get_ai_response_direct(
                 user_id,
                 result_system_prompt,
                 interpretation_prompt,
                 dialogue_id=dialogue_id,
                 topic_id=topic_id,
+                track_user_activity=result_prompt_is_final,
+                activity_tracker=direct_tracker,
+                minutes_since_last_visit=gap_visit,
+                minutes_since_last_message=gap_msg,
             )
         if preliminary_interpretation and result_prompt_is_final:
             interpretation_text = preliminary_interpretation
@@ -15215,6 +15389,10 @@ async def finish_test_generation(
                 topic_id_override=topic_id,
                 dialogue_id_override=dialogue_id,
                 include_test_context=False,
+                track_user_activity=True,
+                activity_tracker=activity_tracker,
+                minutes_since_last_visit=gap_visit,
+                minutes_since_last_message=gap_msg,
             )
     except Exception:
         logging.exception("Universal test interpretation failed")
@@ -15744,6 +15922,10 @@ async def get_ai_response_direct(
     *,
     dialogue_id: int | None = None,
     topic_id: int | None = None,
+    track_user_activity: bool = False,
+    activity_tracker: ActivityTracker | None = None,
+    minutes_since_last_visit: int | None = None,
+    minutes_since_last_message: int | None = None,
 ) -> str:
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
@@ -15759,53 +15941,82 @@ async def get_ai_response_direct(
         if provider_key in ['anthropic', 'claude'] and not model:
             model = ai_config.claude_model
 
+        if not api_key:
+            raise AIServiceError(f"API key for AI provider '{provider}' is not configured.")
+
         user = await session.get(User, user_id)
         if not user:
             return "Ошибка: Пользователь не найден."
         active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
         active_topic_id = topic_id if topic_id is not None else user.current_topic_id
-        runtime_context = await build_runtime_automation_context(
+
+        request_time = (
+            activity_tracker.request_time
+            if activity_tracker is not None
+            else datetime.utcnow()
+        )
+
+        if minutes_since_last_visit is None or minutes_since_last_message is None:
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(
+                session,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                now=request_time,
+            )
+            if minutes_since_last_visit is None:
+                minutes_since_last_visit = gap_visit
+            if minutes_since_last_message is None:
+                minutes_since_last_message = gap_msg
+
+        if activity_tracker is None and track_user_activity:
+            activity_tracker = ActivityTracker(
+                async_session_maker,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                request_time=request_time,
+                track_user_activity=True,
+            )
+
+        request_layout = await build_isolated_request_layout(
             session,
-            user_id=user.id,
+            user=user,
+            ai_config=ai_config,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
+            minutes_since_last_visit=minutes_since_last_visit,
+            minutes_since_last_message=minutes_since_last_message,
         )
+
         fake_history = [DBMessage(
             role='user',
             content=user_prompt,
         )]
-        request_layout = await ai_integration.build_ai_request_layout(
-            session,
-            user=user,
-            dialogue_id=active_dialogue_id,
-            topic_id=active_topic_id,
-            stable_system_prompt=system_prompt,
-            history=(),
-            current_user_content=user_prompt,
-            scenario_context=runtime_context,
-            load_subscription_config=False,
-            include_subscription_status=False,
-        )
 
         if provider_key == 'gemini':
             response_text = await _call_gemini_api(
                 api_key, model, fake_history, "", system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         elif provider_key == 'openai':
             response_text = await _call_openai_api(
                 api_key, model, fake_history, "", system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         elif provider_key in ['anthropic', 'claude']:
             response_text = await _call_claude_api(
                 api_key, model, fake_history, "", system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         elif provider_key == 'deepseek':
             response_text = await _call_deepseek_api(
                 api_key, model, fake_history, "", system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         elif provider_key == 'kie':
             response_text = await _call_kie_chat(
@@ -15816,6 +16027,7 @@ async def get_ai_response_direct(
                 "",
                 system_prompt,
                 request_layout=request_layout,
+                activity_tracker=activity_tracker,
             )
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
@@ -15827,14 +16039,19 @@ async def get_ai_response_direct(
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             if user:
-                await apply_service_data_blocks(
-                    session,
-                    user=user,
-                    dialogue_id=active_dialogue_id,
-                    topic_id=active_topic_id,
-                    blocks=service_blocks,
-                )
-                await session.commit()
+                try:
+                    await apply_service_data_blocks(
+                        session,
+                        user=user,
+                        dialogue_id=active_dialogue_id,
+                        topic_id=active_topic_id,
+                        blocks=service_blocks,
+                    )
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    logging.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
+                    raise
     return visible_text or response_text
 
 
@@ -17135,6 +17352,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
             topic_id = user.current_topic_id
             dialogue_id = user.current_dialogue_id
 
+            nav_msg_id = None
             if topic:
                 text_to_send = f"✅ Диалог в теме «{topic.name}» перезапущен. Память очищена."
                 if topic.start_message:
@@ -17143,6 +17361,17 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
 
                 if topic.start_button_text and topic.start_button_payload:
                     reply_markup = kb.action_button_keyboard(topic.start_button_text, "topic_action")
+
+                from system_events import build_topic_auto_start_system_message, record_navigation_system_event
+                synthetic_prompt = build_topic_auto_start_system_message(topic.name)
+                nav_msg = await record_navigation_system_event(
+                    session,
+                    user_id=user.id,
+                    dialogue_id=dialogue_id,
+                    topic_id=topic_id,
+                    text=synthetic_prompt,
+                )
+                nav_msg_id = nav_msg.id
 
             await session.commit()
 
@@ -17173,6 +17402,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
                             pending_auto_start_topic_id=int(topic_id),
                             pending_auto_start_dialogue_id=dialogue_id,
                             pending_auto_start_kind="first_entry",
+                            pending_auto_start_message_id=nav_msg_id,
                         )
                         text_to_send_disc = disclaimer_content.get('text') or "Текст дисклеймера не задан."
                         await bot.send_message(callback.from_user.id, text_to_send_disc, reply_markup=kb.confirm_disclaimer_keyboard())
@@ -17184,7 +17414,10 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
                 if not await _check_telegram_chat_access(session_acc, callback.from_user.id, bot, callback.from_user.id):
                     return
 
-            await _start_telegram_topic_auto_start(callback.from_user.id, bot, state, topic, dialogue_id)
+            await _start_telegram_topic_auto_start(
+                callback.from_user.id, bot, state, topic, dialogue_id,
+                navigation_message_id=nav_msg_id,
+            )
     else:
         await bot.send_message(callback.from_user.id, text_to_send)
 
@@ -17315,6 +17548,7 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
 
     status = "ok"
     dialogue_id = None
+    nav_msg_id = None
 
     async with user_locks.setdefault(user_id, asyncio.Lock()):
         data = await state.get_data()
@@ -17332,7 +17566,7 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
                 if not user or user.current_topic_id is None or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
                     status = "scope_mismatch"
                 else:
-                    dialogue_id = await _transition_to_main_db_locked(session, user)
+                    dialogue_id, nav_msg_id = await _transition_to_main_db_locked(session, user)
 
     if status == "stale_token":
         await callback.message.answer("Подтверждение устарело или уже использовано.")
@@ -17348,7 +17582,9 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
         pass
 
     if dialogue_id is not None:
-        await _complete_telegram_main_continuation(user_id, dialogue_id, bot, state)
+        await _complete_telegram_main_continuation(
+            user_id, dialogue_id, bot, state, navigation_message_id=nav_msg_id
+        )
 
 
 @router.message(F.document, Command("upload_random"))
@@ -17412,6 +17648,9 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             pass
 
     try:
+        # =========================================================================
+        # Transaction A: Validate scope, persist current user photo message, commit
+        # =========================================================================
         async with async_session_maker() as session:
             user = await session.get(User, user_id, options=[
                 selectinload(User.subscription),
@@ -17443,26 +17682,75 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     )
                     return
 
-            typing_task = asyncio.create_task(keep_typing())
-            processing_msg = await message.answer("👀 Тщательно изучаю изображение...")
+            current_topic_id = user.current_topic_id
+            current_dialogue_id = user.current_dialogue_id
+
+            raw_caption = message.caption.strip() if message.caption else ""
+            vision_user_prompt = raw_caption if raw_caption else "Опиши это изображение подробно."
+
+            user_photo_msg = DBMessage(
+                user_id=user_id,
+                role='user',
+                content=f"[Фото для анализа] {raw_caption}".strip() if raw_caption else "[Фото для анализа]",
+                dialogue_id=current_dialogue_id,
+                topic_id=current_topic_id,
+            )
+            session.add(user_photo_msg)
+            await session.commit()
+            photo_msg_id = user_photo_msg.id
+
+        # =========================================================================
+        # External Preparation: download photo, start typing indicator
+        # =========================================================================
+        typing_task = asyncio.create_task(keep_typing())
+        processing_msg = await message.answer("👀 Тщательно изучаю изображение...")
+
+        photo = message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        file_content = await bot.download_file(file_info.file_path)
+        image_bytes = file_content.read()
+
+        # =========================================================================
+        # Transaction B: Read-only builder session (reload User & AIConfig, check stale-scope)
+        # =========================================================================
+        request_time = datetime.utcnow()
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id, options=[
+                selectinload(User.subscription),
+                selectinload(User.current_topic)
+            ])
+            if not user:
+                raise AIServiceError(f"User {user_id} not found")
+
+            # Stale scope guard: if scope changed between Transaction A commit and now, abort
+            if user.current_dialogue_id != current_dialogue_id or user.current_topic_id != current_topic_id:
+                logging.warning(
+                    "Scope changed for user %s before photo outbound (dialogue %s != %s, topic %s != %s)",
+                    user_id, current_dialogue_id, user.current_dialogue_id, current_topic_id, user.current_topic_id
+                )
+                if processing_msg:
+                    try:
+                        await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
+                    except Exception:
+                        pass
+                if typing_task:
+                    typing_task.cancel()
+                return
 
             ai_config = await session.get(AIConfig, 1)
-
-            current_topic_id = user.current_topic_id
+            sub_config = await session.get(SubscriptionConfig, 1)
 
             system_prompt_text = ai_integration._load_configured_system_prompt(
                 ai_config,
                 user.current_topic.system_prompt if user.current_topic else None
             )
-            shared_prompt_block = (getattr(ai_config, 'shared_prompt_block', "") or "").strip()
-            service_prompt_template = getattr(ai_config, 'service_prompt_block', None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
-            service_prompt_block = render_prompt_block(
-                service_prompt_template,
-                available_media_text="",
-                media_instruction_block="",
-                test_context_injection="[контекст теста передан в служебном контексте]",
-                short_response_instruction="[режим длины передан в служебном контексте]",
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(
+                session,
+                user_id=user.id,
+                topic_id=current_topic_id,
+                now=request_time,
             )
+
             stable_vision_prompt = ai_integration.neutralize_stable_prompt(system_prompt_text)
             if not stable_vision_prompt:
                 stable_vision_prompt = "Ты — профессиональный эксперт. Проанализируй это изображение максимально подробно."
@@ -17473,171 +17761,281 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"
                 "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
             )
-            vision_shared_instructions = tuple(
-                part for part in (shared_prompt_block, service_prompt_block, photo_instructions) if part
-            )
+
+            _, media_files = await load_available_media(session, current_topic_id)
+            available_media_text, media_instruction_block = format_available_media_text(media_files, current_topic_id)
 
             memory_mode = get_memory_mode(ai_config)
-            stmt = select(DBMessage).where(
-                DBMessage.user_id == user.id,
-                DBMessage.dialogue_id == user.current_dialogue_id,
-                conversation_role_filter(DBMessage),
-            )
-            if not is_global_memory_mode(memory_mode):
-                stmt = stmt.where(DBMessage.topic_id == current_topic_id)
-            stmt = stmt.options(selectinload(DBMessage.topic)).order_by(DBMessage.timestamp.asc())
-            result = await session.execute(stmt)
-            history = ai_integration.select_ai_history_messages(
-                result.scalars().all(),
-                getattr(ai_config, "context_limit_first", 2) or 2,
-                getattr(ai_config, "context_limit_recent", 10) or 10,
-            )
-            history, global_memory_context = ai_integration._build_memory_aware_history(
-                history,
-                current_topic_id,
-                user.current_topic.name if user.current_topic else None,
-                memory_mode,
-            )
-            request_layout = await ai_integration.build_ai_request_layout(
+            request_layout = await build_conversational_request_layout(
                 session,
                 user=user,
-                dialogue_id=user.current_dialogue_id,
+                ai_config=ai_config,
+                dialogue_id=current_dialogue_id,
                 topic_id=current_topic_id,
+                current_user_content=vision_user_prompt,
                 stable_system_prompt=stable_vision_prompt,
-                shared_instructions=vision_shared_instructions,
-                history=history,
-                current_user_content=None,
+                service_capabilities=TELEGRAM_CAPABILITIES,
+                modality_instructions=(photo_instructions,),
+                available_media_text=available_media_text,
+                media_instruction_block=media_instruction_block,
+                exclude_message_id=photo_msg_id,
                 subscription_config=sub_config,
-                global_memory_context=global_memory_context,
+                memory_mode=memory_mode,
+                minutes_since_last_visit=gap_visit,
+                minutes_since_last_message=gap_msg,
             )
+            vision_provider = getattr(ai_config, "vision_provider", "Vision") or "Vision"
+            vision_model = getattr(ai_config, "vision_model", "Vision") or "Vision"
+            topic_name = user.current_topic.name if user.current_topic else None
+            user_ai_debug = getattr(user, "ai_debug_enabled", False)
 
-            photo = message.photo[-1]
-            file_info = await bot.get_file(photo.file_id)
-            file_content = await bot.download_file(file_info.file_path)
-            image_bytes = file_content.read()
+        # =========================================================================
+        # External AI work: ActivityTracker (separate session), provider network call
+        # =========================================================================
+        activity_tracker = ActivityTracker(
+            async_session_maker,
+            user_id=user_id,
+            topic_id=current_topic_id,
+            request_time=request_time,
+            track_user_activity=True,
+        )
 
-            request_capture = {}
-            started_at = time.monotonic()
-            analysis_result = await ai_integration.analyze_image_content(
-                image_bytes,
-                stable_vision_prompt,
-                history=history,
-                request_capture=request_capture,
-                request_layout=request_layout,
+        request_capture = {}
+        started_at = time.monotonic()
+        analysis_result = await ai_integration.analyze_image_content(
+            image_bytes,
+            stable_vision_prompt,
+            user_prompt=vision_user_prompt,
+            request_capture=request_capture,
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+
+        actual_provider, actual_model = extract_effective_provider_and_model(
+            request_capture,
+            default_provider=vision_provider,
+            default_model=vision_model,
+            channel="vision",
+        )
+
+        # =========================================================================
+        # Transaction C: Atomic DATA + AILog persistence
+        # =========================================================================
+        visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
+
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user:
+                raise AIServiceError(f"User {user_id} not found")
+
+            ai_log = AILog(
+                user_id=user_id,
+                provider=actual_provider,
+                model=actual_model,
+                prompt_summary=vision_user_prompt,
+                request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2),
+                raw_response=analysis_result,
+                clean_text=visible_text,
+                latency_ms=latency_ms,
             )
-            latency_ms = int((time.monotonic() - started_at) * 1000)
+            apply_ai_log_context(
+                ai_log,
+                platform="telegram",
+                topic_id=current_topic_id,
+                topic_name=topic_name,
+            )
+            session.add(ai_log)
 
-            visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
             if service_blocks:
-                await apply_service_data_blocks(
-                    session,
-                    user=user,
-                    dialogue_id=user.current_dialogue_id,
-                    topic_id=current_topic_id,
-                    blocks=service_blocks,
-                )
-                await session.commit()
-                from automation_events import process_pending_events
                 try:
-                    await process_pending_events(bot, user_id=user.id)
-                except Exception:
-                    logging.exception("Immediate automation event processing failed in photo handler for user %s", user.id)
-
-            try:
-                ai_log = AILog(
-                    user_id=user_id,
-                    provider=getattr(ai_config, "vision_provider", "Vision") or "Vision",
-                    model=getattr(ai_config, "vision_model", "Vision") or "Vision",
-                    prompt_summary="[Анализ изображения]",
-                    request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2),
-                    raw_response=analysis_result,
-                    clean_text=visible_text,
-                    latency_ms=latency_ms,
-                )
-                apply_ai_log_context(
-                    ai_log,
-                    platform="telegram",
-                    topic_id=current_topic_id,
-                    topic_name=user.current_topic.name if user.current_topic else None,
-                )
-                session.add(ai_log)
-                await session.commit()
-            except Exception:
-                logging.exception("Could not save vision AILog entry for user %s", user_id)
-
-            if typing_task:
-                typing_task.cancel()
-
-            edit_prompt, clean_text = _extract_ai_directive_payload(visible_text, "EDIT_IMG")
-            gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
-
-            clean_text, button_rows = extract_response_buttons(clean_text)
-            presentation = await _prepare_telegram_response_buttons(user_id, button_rows)
-            response_text_markup = _telegram_response_text_markup(presentation)
-
-            formatted_html = markdown_to_html(clean_text)
-
-            if processing_msg:
-                try:
-                    await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
-                except Exception:
-                    pass
-
-            if formatted_html:
-                parts = split_html_text(formatted_html)
-                for index, part in enumerate(parts):
-                    part_markup = response_text_markup if index == len(parts) - 1 else None
-                    await _safe_send_html(
-                        lambda text, pm, reply_markup=part_markup: message.answer(
-                            text,
-                            parse_mode=pm,
-                            reply_markup=reply_markup,
-                        ),
-                        part,
+                    await apply_service_data_blocks(
+                        session,
+                        user=user,
+                        dialogue_id=current_dialogue_id,
+                        topic_id=current_topic_id,
+                        blocks=service_blocks,
                     )
-            elif response_text_markup:
-                await message.answer("Выберите действие:", reply_markup=response_text_markup)
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    logging.exception("Failed to commit service data and AILog for user %s: %s", user_id, exc)
+                    raise AIServiceError(f"Ошибка сохранения служебных данных ИИ: {exc}") from exc
+            else:
+                try:
+                    await session.commit()
+                except Exception:
+                    logging.exception("Could not save vision AILog entry for user %s", user_id)
 
-            if edit_prompt:
+        # Process automation events after successful DATA commit
+        if service_blocks:
+            from automation_events import process_pending_events
+            try:
+                await process_pending_events(bot, user_id=user_id)
+            except Exception:
+                logging.exception("Immediate automation event processing failed in photo handler for user %s", user_id)
+
+        if bot is not None and user_ai_debug:
+            try:
+                debug_msg = (
+                    f"🐛 <b>[AI DEBUG LOG]</b> #{ai_log.id}\n"
+                    f"🤖 <b>Провайдер:</b> {html.escape(actual_provider)} | <b>Модель:</b> {html.escape(actual_model)}\n"
+                    f"⏱ <b>Время ответа:</b> {latency_ms / 1000:.2f} сек\n"
+                    f"👤 <b>Пользователь:</b> ID {user_id}\n\n"
+                    f"📥 <b>Сырой ответ модели:</b>\n"
+                    f"<code>{html.escape(analysis_result[:3500])}</code>"
+                )
+                await bot.send_message(chat_id=user_id, text=debug_msg, parse_mode="HTML")
+            except Exception as exc:
+                logging.warning("Could not send live AI debug message to user %s: %s", user_id, exc)
+
+        # Stop typing indicator
+        if typing_task:
+            typing_task.cancel()
+
+        # =========================================================================
+        # Outer Conversational Layer: Fresh scope checks, message sending, assistant DB persistence
+        # =========================================================================
+        edit_prompt, clean_text = _extract_ai_directive_payload(visible_text, "EDIT_IMG")
+        gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
+
+        clean_text, button_rows = extract_response_buttons(clean_text)
+        presentation = await _prepare_telegram_response_buttons(user_id, button_rows)
+        response_text_markup = _telegram_response_text_markup(presentation)
+
+        formatted_html = markdown_to_html(clean_text)
+
+        if processing_msg:
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
+            except Exception:
+                pass
+
+        # Step A: Immediate fresh scope check after provider and before first visible response
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user or user.current_dialogue_id != current_dialogue_id or user.current_topic_id != current_topic_id:
+                logging.warning(
+                    "Scope changed for user %s during inference (expected %s/%s, got %s/%s). Skipping assistant output.",
+                    user_id, current_dialogue_id, current_topic_id,
+                    getattr(user, "current_dialogue_id", None), getattr(user, "current_topic_id", None)
+                )
+                return
+
+        # Step B: Send initial visible text and buttons
+        if formatted_html:
+            parts = split_html_text(formatted_html)
+            for index, part in enumerate(parts):
+                part_markup = response_text_markup if index == len(parts) - 1 else None
+                await _safe_send_html(
+                    lambda text, pm, reply_markup=part_markup: message.answer(
+                        text,
+                        parse_mode=pm,
+                        reply_markup=reply_markup,
+                    ),
+                    part,
+                )
+        elif response_text_markup:
+            await message.answer("Выберите действие:", reply_markup=response_text_markup)
+
+        # Step C: Long secondary image edit/generation with fresh post-generation scope check
+        if edit_prompt:
+            m_gen_status = None
+            try:
                 m_gen_status = await message.answer("🎨 Редактирую ваше фото...")
+            except Exception:
+                pass
+            try:
                 edited_data = await ai_integration.edit_image(edit_prompt, image_bytes)
-                if edited_data:
-                    upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
+            finally:
+                if m_gen_status:
                     try:
-                        await message.answer_photo(photo=BufferedInputFile(edited_data, filename="edited.png"), caption="✨ Результат редактирования:")
-                    finally:
-                        upload_task.cancel()
-                else:
-                    await message.answer("😔 К сожалению, не удалось отредактировать изображение. Возможно, сервис дал сбой или запрос был отклонен фильтрами безопасности.")
-                try:
-                    await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
-                except Exception:
-                    pass
+                        await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
+                    except Exception:
+                        pass
 
-            elif gen_prompt:
+            # Fresh scope check after long edit_image network call
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                scope_valid = bool(
+                    user
+                    and user.current_dialogue_id == current_dialogue_id
+                    and user.current_topic_id == current_topic_id
+                )
+            if not scope_valid:
+                logging.warning(
+                    "Scope changed for user %s during edit_image. Skipping photo delivery and assistant persistence.",
+                    user_id
+                )
+                return
+
+            if edited_data:
+                upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
+                try:
+                    await message.answer_photo(photo=BufferedInputFile(edited_data, filename="edited.png"), caption="✨ Результат редактирования:")
+                finally:
+                    upload_task.cancel()
+            else:
+                await message.answer("😔 К сожалению, не удалось отредактировать изображение. Возможно, сервис дал сбой или запрос был отклонен фильтрами безопасности.")
+
+        elif gen_prompt:
+            m_gen_status = None
+            try:
                 m_gen_status = await message.answer("🖼 Генерирую новое изображение...")
+            except Exception:
+                pass
+            try:
                 new_img = await ai_integration.generate_image(gen_prompt)
-                if new_img:
-                    upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
+            finally:
+                if m_gen_status:
                     try:
-                        await message.answer_photo(photo=BufferedInputFile(new_img, filename="generated.png"), caption="✨ Новая генерация:")
-                    finally:
-                        upload_task.cancel()
-                try:
-                    await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
-                except Exception:
-                    pass
+                        await bot.delete_message(chat_id=message.chat.id, message_id=m_gen_status.message_id)
+                    except Exception:
+                        pass
 
-            session.add(DBMessage(user_id=user_id, role='user', content="[Фото для анализа]", dialogue_id=user.current_dialogue_id, topic_id=current_topic_id))
+            # Fresh scope check after long generate_image network call
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                scope_valid = bool(
+                    user
+                    and user.current_dialogue_id == current_dialogue_id
+                    and user.current_topic_id == current_topic_id
+                )
+            if not scope_valid:
+                logging.warning(
+                    "Scope changed for user %s during generate_image. Skipping photo delivery and assistant persistence.",
+                    user_id
+                )
+                return
+
+            if new_img:
+                upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
+                try:
+                    await message.answer_photo(photo=BufferedInputFile(new_img, filename="generated.png"), caption="✨ Новая генерация:")
+                finally:
+                    upload_task.cancel()
+
+        # Step D: Fresh scope verification immediately before assistant DB persistence
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+            if not user or user.current_dialogue_id != current_dialogue_id or user.current_topic_id != current_topic_id:
+                logging.warning(
+                    "Scope changed for user %s before assistant photo message persistence (expected %s/%s, got %s/%s). Skipping assistant DB message.",
+                    user_id, current_dialogue_id, current_topic_id,
+                    getattr(user, "current_dialogue_id", None), getattr(user, "current_topic_id", None)
+                )
+                return
+
             session.add(DBMessage(
                 user_id=user_id,
                 role='assistant',
                 content=visible_text,
                 ai_context_content=analysis_result,
-                dialogue_id=user.current_dialogue_id,
+                dialogue_id=current_dialogue_id,
                 topic_id=current_topic_id,
             ))
             await session.commit()
+
 
     except AIServiceError as e:
         if typing_task:

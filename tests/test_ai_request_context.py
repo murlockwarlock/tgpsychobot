@@ -344,11 +344,10 @@ async def test_cache_regression_stable_block_is_identical_across_users(monkeypat
 async def test_real_get_ai_response_preserves_deepseek_golden_prefix(monkeypatch):
     _CompletionClient.calls.clear()
     monkeypatch.setattr(ai_integration, "AsyncOpenAI", _CompletionClient)
-    monkeypatch.setattr(
-        ai_integration,
-        "build_runtime_automation_context",
-        AsyncMock(return_value="CURRENT_STATE STATE_X METADATA META_X"),
-    )
+    import automation_engine
+    mock_auto_ctx = AsyncMock(return_value="CURRENT_STATE STATE_X METADATA META_X")
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", mock_auto_ctx)
+    monkeypatch.setattr(ai_integration, "build_runtime_automation_context", mock_auto_ctx)
     monkeypatch.setattr(ai_integration, "active_subscription_flag", lambda *args: "")
 
     ai_config = SimpleNamespace(
@@ -420,10 +419,12 @@ async def test_real_get_ai_response_preserves_deepseek_golden_prefix(monkeypatch
     assert len(_CompletionClient.calls) == 2
     payloads = _CompletionClient.calls
     expected_stable = "STABLE CONFIGURED TOPIC PROMPT\n\nSHARED BLOCK\n\nSERVICE BLOCK"
-    for user, session, payload in zip(users, sessions, payloads):
+    target_sessions = [s for s in sessions if any(hasattr(item, "request_payload") for item in s.added)]
+    for user, session, payload in zip(users, target_sessions, payloads):
         messages = payload["messages"]
         expected_dynamic = (
             f"ДАННЫЕ КЛИЕНТА:\nИМЯ: {user.name}\nПОЛ: {user.gender}\nВОЗРАСТ: {user.age}"
+            "\n\nВРЕМЕННОЙ КОНТЕКСТ:\nminutes_since_last_visit: 0\nminutes_since_last_message: 0"
             "\n\nCURRENT_STATE STATE_X METADATA META_X"
         )
         assert messages[:2] == [
@@ -437,9 +438,10 @@ async def test_real_get_ai_response_preserves_deepseek_golden_prefix(monkeypatch
             for forbidden in ("Alice", "Boris", "CURRENT_STATE", "METADATA", "TEST", "RAG", "GLOBAL")
         )
 
-        captured = json.loads(session.added[-1].request_payload)
+        ai_log = [item for item in session.added if hasattr(item, "request_payload")][-1]
+        captured = json.loads(ai_log.request_payload)
         assert captured["payload"] == payload
-        assert "not-a-real-key" not in session.added[-1].request_payload
+        assert "not-a-real-key" not in ai_log.request_payload
 
     assert payloads[0]["messages"][0] == payloads[1]["messages"][0]
 
@@ -460,6 +462,7 @@ class AIRequestContextTests(unittest.IsolatedAsyncioTestCase):
             '{"current_state":{"current_step":"photo"},"metadata":{"guide":"yoda"}}'
         )
         with (
+            patch("automation_engine.build_runtime_automation_context", AsyncMock(return_value=automation_context)),
             patch.object(ai_integration, "build_runtime_automation_context", AsyncMock(return_value=automation_context)),
             patch.object(ai_integration, "active_subscription_flag", return_value=""),
         ):

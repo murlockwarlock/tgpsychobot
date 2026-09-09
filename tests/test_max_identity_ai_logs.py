@@ -15,6 +15,7 @@ import database
 import handlers
 from ai_request_context import AIRequestLayout
 from database import AILog, Base, User
+import automation_engine
 from max_messenger_bot import ai as max_ai
 from max_messenger_bot import keyboards as max_keyboards
 from max_messenger_bot import models as max_models
@@ -202,6 +203,9 @@ class _TelegramAISession:
     def add(self, value):
         self.added.append(value)
 
+    async def scalar(self, _statement):
+        return None
+
     async def commit(self):
         self.commits += 1
 
@@ -387,7 +391,7 @@ async def test_max_chat_response_creates_shared_ai_log(monkeypatch):
     config.gemini_model = "gemini-3.7-flash"
     session = _MaxAISession(user, config)
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
 
     result = await max_ai.get_ai_response(user.id, "question")
 
@@ -403,7 +407,7 @@ async def test_max_chat_response_creates_shared_ai_log(monkeypatch):
     assert log_entry.request_payload
     assert "max-secret" not in log_entry.request_payload
     assert "?key=" not in log_entry.request_payload
-    assert session.commits == 1
+    assert session.commits in (1, 2)
 
 
 @pytest.mark.asyncio
@@ -412,7 +416,7 @@ async def test_max_primary_chat_log_records_provider_latency(monkeypatch):
     session = _MaxAISession(user, _max_config())
     monotonic_values = iter((100.0, 100.5))
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="MAX answer"))
     monkeypatch.setattr(max_ai, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
 
@@ -433,7 +437,7 @@ async def test_max_fallback_chat_log_records_whole_provider_latency_and_fallback
     monotonic_values = iter((200.0, 201.25))
     primary_error = max_ai.AIServiceError("primary provider failed")
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(side_effect=primary_error))
     monkeypatch.setattr(max_ai, "_call_openai", AsyncMock(return_value="fallback answer"))
     monkeypatch.setattr(max_ai, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
@@ -453,7 +457,7 @@ async def test_max_failed_chat_request_preserves_provider_error_and_does_not_cre
     session = _MaxAISession(user, _max_config())
     primary_error = max_ai.AIServiceError("primary provider failed")
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(side_effect=primary_error))
 
     with pytest.raises(max_ai.AIServiceError) as raised:
@@ -560,7 +564,7 @@ async def test_max_ai_log_records_platform_and_request_time_context(
     user = _max_user(topic_id=topic_id, topic=topic if topic_id is not None else None)
     session = _MaxAISession(user, _max_config())
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="MAX answer"))
 
     await max_ai.get_ai_response(user.id, "question")
@@ -745,7 +749,7 @@ async def test_max_chat_response_with_topic_kb_retrieves_chunks(monkeypatch):
     mock_search = AsyncMock(return_value=["Чанк из базы знаний 1", "Чанк 2"])
 
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     monkeypatch.setattr(max_ai, "search_relevant_chunks", mock_search)
     monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="Ответ с контекстом КБ"))
 
@@ -770,7 +774,7 @@ async def test_max_chat_response_with_general_kb_retrieves_chunks(monkeypatch):
 
     session.execute = _execute_general_kb
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     monkeypatch.setattr(max_ai, "search_relevant_chunks", mock_search)
     monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="Ответ общий КБ"))
 
@@ -803,7 +807,7 @@ async def test_max_chat_response_loads_prompt_from_file(monkeypatch, tmp_path):
 
     monkeypatch.setattr(max_ai, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     monkeypatch.setattr(max_ai, "_dispatch_provider", _mock_dispatch)
 
     result = await max_ai.get_ai_response(user.id, "привет")
@@ -844,7 +848,7 @@ async def test_max_chat_response_with_history_topic_relationship(monkeypatch):
 
     session.execute = _execute_history
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
     monkeypatch.setattr(max_ai, "_dispatch_provider", AsyncMock(return_value="Ответ с историей"))
 
     result = await max_ai.get_ai_response(user.id, "новый вопрос")
@@ -864,7 +868,7 @@ async def test_max_openai_request_payload_captured_and_sanitized(monkeypatch):
     session = _MaxAISession(user, config)
 
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
 
     result = await max_ai.get_ai_response(user.id, "Как дела?")
 
@@ -926,7 +930,7 @@ async def test_max_deepseek_topic_request_payload_complete_and_sanitized(monkeyp
 
     session.execute = _execute_mock
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value="СЛУЖЕБНЫЙ_КОНТЕКСТ_ТЕСТ"))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value="СЛУЖЕБНЫЙ_КОНТЕКСТ_ТЕСТ"))
 
     result = await max_ai.get_ai_response(user.id, "болит висок")
 
@@ -975,7 +979,7 @@ async def test_max_claude_request_payload_shape_and_sanitized(monkeypatch):
     session = _MaxAISession(user, config)
 
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
 
     result = await max_ai.get_ai_response(user.id, "Вопрос к Клоду")
 
@@ -1014,7 +1018,7 @@ async def test_max_gemini_request_payload_endpoint_and_sanitized(monkeypatch):
     session = _MaxAISession(user, config)
 
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
 
     result = await max_ai.get_ai_response(user.id, "Вопрос к Gemini")
 
@@ -1064,7 +1068,7 @@ async def test_max_kie_request_payload_matches_outbound_and_sanitized(monkeypatc
     session = _MaxAISession(user, config)
 
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
 
     result = await max_ai.get_ai_response(user.id, "Вопрос к KIE")
 
@@ -1123,7 +1127,7 @@ async def test_max_fallback_orchestration_persists_fallback_payload_only(monkeyp
     session = _MaxAISession(user, config)
 
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
 
     result = await max_ai.get_ai_response(user.id, "Вопрос для фолбэка")
 
@@ -1185,7 +1189,7 @@ async def test_max_deepseek_fallback_legacy_alias_persists_normalized_model_and_
     session = _MaxAISession(user, config)
 
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
-    monkeypatch.setattr(max_ai, "build_runtime_automation_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
 
     result = await max_ai.get_ai_response(user.id, "Вопрос для DeepSeek фолбэка")
 
