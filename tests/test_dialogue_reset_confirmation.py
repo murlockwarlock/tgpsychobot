@@ -1005,3 +1005,22 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db_msgs[-2].dialogue_id, 6)
             self.assertEqual(db_msgs[-1].topic_id, 60)
             self.assertEqual(db_msgs[-1].dialogue_id, 6)
+
+    async def test_disclaimer_accepted_handler_acknowledges_callback_immediately(self):
+        cb = MagicMock()
+        cb.from_user = SimpleNamespace(id=307, username="alice", full_name="Alice")
+        cb.message = MagicMock()
+        cb.message.chat = SimpleNamespace(id=307)
+        cb.message.delete = AsyncMock()
+        cb.message.answer = AsyncMock()
+        cb.answer = AsyncMock()
+
+        state = AsyncMock()
+        state.get_data.return_value = {"profile_flow": False}
+        bot = AsyncMock()
+
+        with patch("handlers._check_telegram_chat_access", AsyncMock(return_value=False)):
+            await handlers.disclaimer_accepted_handler(cb, state, bot)
+
+        cb.answer.assert_awaited_once()
+

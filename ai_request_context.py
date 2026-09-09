@@ -111,6 +111,20 @@ class AIRequestMessage:
     role: str
     content: Any
 
+    def __getitem__(self, key: str) -> Any:
+        if key == "role":
+            return self.role
+        if key == "content":
+            return self.content
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key == "role":
+            return self.role
+        if key == "content":
+            return self.content
+        return default
+
 
 def _non_empty_text(value: Any) -> str:
     if not isinstance(value, str):

@@ -1,5 +1,6 @@
 import re
 import textwrap
+from dataclasses import dataclass
 
 
 DEFAULT_SHARED_PROMPT_BLOCK = ""
@@ -82,9 +83,6 @@ def build_media_instruction_block(available_media_text: str | None) -> str:
     return "\n\n" + render_prompt_block(DEFAULT_MEDIA_RULES_TEMPLATE, available_media_text=text)
 
 
-from dataclasses import dataclass
-
-
 @dataclass(frozen=True)
 class ServiceCapabilities:
     supports_data: bool = True
@@ -117,35 +115,163 @@ _IMAGE_GEN_BLOCK_REGEX = re.compile(
 )
 
 
-def render_prompt_block(
+def _is_heading(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if s.endswith(":") or s.startswith("#") or (s.startswith("**") and s.endswith("**")):
+        return True
+    cleaned = re.sub(r"[^\w\s]", "", s)
+    if cleaned and cleaned.isupper() and len(cleaned.split()) <= 6:
+        return True
+    return False
+
+
+def _sanitize_logical_units(text: str, unsupported_patterns: list[re.Pattern]) -> str:
+    if not unsupported_patterns or not text.strip():
+        return text
+
+    combined_pat = re.compile("|".join(f"(?:{p.pattern})" for p in unsupported_patterns), re.IGNORECASE)
+
+    paragraphs = re.split(r"\n\s*\n", text)
+    cleaned_paragraphs = []
+
+    list_marker_regex = re.compile(r"^(\s*(?:(\d+)[\.\)]|[-*+•])\s+)")
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        lines = para.splitlines()
+        has_list_items = any(list_marker_regex.match(line) for line in lines)
+
+        if not has_list_items:
+            if not combined_pat.search(para):
+                cleaned_paragraphs.append(para)
+            continue
+
+        heading_lines = []
+        items = []
+        curr_marker_match = None
+        curr_item_lines = []
+        in_items = False
+
+        for line in lines:
+            m = list_marker_regex.match(line)
+            if m:
+                in_items = True
+                if curr_item_lines:
+                    items.append(("\n".join(curr_item_lines), curr_marker_match))
+                    curr_item_lines = []
+                curr_marker_match = m
+                curr_item_lines.append(line)
+            elif in_items:
+                curr_item_lines.append(line)
+            else:
+                heading_lines.append(line)
+
+        if curr_item_lines:
+            items.append(("\n".join(curr_item_lines), curr_marker_match))
+
+        kept_items = []
+        for item_text, m in items:
+            if not combined_pat.search(item_text):
+                kept_items.append((item_text, m))
+
+        if not kept_items:
+            continue
+
+        renumbered_lines = []
+        if heading_lines:
+            renumbered_lines.extend(heading_lines)
+
+        is_numbered_list = all(m and m.group(2) for _, m in items)
+        num_counter = 1
+        for item_text, m in kept_items:
+            if is_numbered_list and m and m.group(2):
+                old_num_str = m.group(2)
+                prefix = m.group(1)
+                new_prefix = prefix.replace(old_num_str, str(num_counter), 1)
+                first_line, *rest = item_text.splitlines()
+                first_line = new_prefix + first_line[len(prefix):]
+                renumbered_lines.append("\n".join([first_line, *rest]))
+                num_counter += 1
+            else:
+                renumbered_lines.append(item_text)
+
+        cleaned_paragraphs.append("\n".join(renumbered_lines))
+
+    final_paras = []
+    for i, p in enumerate(cleaned_paragraphs):
+        p_stripped = p.strip()
+        if _is_heading(p_stripped):
+            if i == len(cleaned_paragraphs) - 1:
+                continue
+            next_p = cleaned_paragraphs[i + 1].strip()
+            if _is_heading(next_p):
+                continue
+        final_paras.append(p)
+
+    return "\n\n".join(final_paras).strip()
+
+
+def render_service_prompt(
     template: str,
     *,
     capabilities: ServiceCapabilities | None = None,
+    available_media_text: str = "",
+    media_instruction_block: str = "",
     **values: str,
 ) -> str:
     caps = capabilities or TELEGRAM_CAPABILITIES
     rendered = template or ""
 
-    available_media_text = values.get("available_media_text") or ""
-    media_instruction_block = values.get("media_instruction_block") or ""
+    all_values = {
+        "available_media_text": available_media_text or "",
+        "media_instruction_block": media_instruction_block or "",
+        **values,
+    }
 
     if not caps.supports_media_collections:
-        available_media_text = ""
-        media_instruction_block = ""
-        values["available_media_text"] = ""
-        values["media_instruction_block"] = ""
+        all_values["available_media_text"] = ""
+        all_values["media_instruction_block"] = ""
         if "ДОСТУПНЫЙ МЕДИА-КОНТЕНТ" in rendered or "ПРАВИЛА ИСПОЛЬЗОВАНИЯ МЕДИА-ТЕГОВ" in rendered:
             rendered = _LEGACY_MEDIA_BLOCK_REGEX.sub("", rendered)
-    elif not available_media_text.strip() and not media_instruction_block.strip():
+    elif not all_values["available_media_text"].strip() and not all_values["media_instruction_block"].strip():
         if "ДОСТУПНЫЙ МЕДИА-КОНТЕНТ" in rendered or "ПРАВИЛА ИСПОЛЬЗОВАНИЯ МЕДИА-ТЕГОВ" in rendered:
             rendered = _LEGACY_MEDIA_BLOCK_REGEX.sub("", rendered)
 
     if not caps.supports_image_generation:
         rendered = _IMAGE_GEN_BLOCK_REGEX.sub("", rendered)
 
-    for key, value in values.items():
+    for key, value in all_values.items():
         rendered = rendered.replace(f"{{{key}}}", value or "")
+
+    unsupported_patterns = []
+    if not caps.supports_send_audio:
+        unsupported_patterns.append(re.compile(r"\[SEND_AUDIO:[^\]]*\]|\bSEND_AUDIO\b"))
+    if not caps.supports_card_spreads:
+        unsupported_patterns.append(re.compile(
+            r"\[(?:RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG):[^\]]*\]"
+            r"|\b(?:RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG)\b"
+        ))
+    if not caps.supports_image_generation:
+        unsupported_patterns.append(re.compile(r"GEN_IMG:[^\n]*|\bGEN_IMG\b"))
+    if not caps.supports_data:
+        unsupported_patterns.append(re.compile(r"</?DATA>|\b<DATA>\b"))
+
+    rendered = _sanitize_logical_units(rendered, unsupported_patterns)
     return rendered.strip()
+
+
+def render_prompt_block(
+    template: str,
+    *,
+    capabilities: ServiceCapabilities | None = None,
+    **values: str,
+) -> str:
+    return render_service_prompt(template, capabilities=capabilities, **values)
 
 
 def build_test_context_injection(

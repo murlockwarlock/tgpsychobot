@@ -1038,12 +1038,13 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
 
     log.info("AI vision requested user_id=%s chat_id=%s", user_id, chat_id)
     prompt = caption or "Опиши это изображение подробно."
-    await save_user_message(user_id, f"[Изображение] {prompt}")
+    user_msg = await save_user_message(user_id, f"[Изображение] {prompt}")
+    user_msg_id = getattr(user_msg, "id", None) if user_msg else None
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Анализирую изображение...")
     thinking_message_id = ((thinking.get("message") or {}).get("mid") if isinstance(thinking, dict) else None)
 
     try:
-        response_text = await analyze_image(user_id, image_bytes, prompt)
+        response_text = await analyze_image(user_id, image_bytes, prompt, exclude_message_id=user_msg_id)
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ при анализе изображения")
 

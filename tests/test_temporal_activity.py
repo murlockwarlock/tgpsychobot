@@ -3,13 +3,21 @@ import json
 import os
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+def _mock_openai_completion(text: str):
+    mock_resp = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = text
+    mock_resp.choices = [mock_choice]
+    return mock_resp
+
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("BOT_TOKEN", "test")
 
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 import ai_integration
@@ -240,7 +248,7 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
     # 98. Provider network timeout updates activity: network started -> activity marked
     async def test_provider_network_timeout_updates_activity(self):
         tracker = ActivityTracker(self.sessions, user_id=3001, topic_id=10)
-        with patch("ai_integration._call_openai_api", side_effect=TimeoutError("Network timeout")):
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=TimeoutError("Network timeout")):
             with self.assertRaises(AIServiceError):
                 await ai_integration.get_ai_response(
                     user_id=3001,
@@ -291,8 +299,8 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
 
     # 102. Universal test preliminary does not update activity
     async def test_universal_test_preliminary_does_not_update_activity(self):
-        with patch("ai_integration._call_openai_api", new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = "Preliminary test analysis"
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = _mock_openai_completion("Preliminary test analysis")
             # In universal test, preliminary direct call passes track_user_activity=False
             await ai_integration.get_ai_response(
                 user_id=3001,
@@ -308,8 +316,8 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
 
     # 103. Universal test final handoff updates activity once
     async def test_universal_test_final_handoff_updates_activity_once(self):
-        with patch("ai_integration._call_openai_api", new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = "Final test summary"
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = _mock_openai_completion("Final test summary")
             await ai_integration.get_ai_response(
                 user_id=3001,
                 user_prompt="Final handoff prompt",
@@ -324,8 +332,8 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
 
     # 104. Universal test preliminary + final updates activity exactly once
     async def test_universal_test_preliminary_final_updates_activity_exactly_once(self):
-        with patch("ai_integration._call_openai_api", new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = "AI result"
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = _mock_openai_completion("AI result")
             # Preliminary: False
             await ai_integration.get_ai_response(
                 user_id=3001, user_prompt="Prelim", user_name="Ольга", user_gender="female", track_user_activity=False
@@ -360,8 +368,8 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
 
     # 106. Direct prompt configured as final result updates activity once
     async def test_direct_prompt_configured_as_final_result_updates_activity_once(self):
-        with patch("ai_integration._call_openai_api", new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = "Direct final answer"
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = _mock_openai_completion("Direct final answer")
             await ai_integration.get_ai_response(
                 user_id=3001, user_prompt="Direct prompt", user_name="Ольга", user_gender="female", track_user_activity=True
             )
@@ -532,8 +540,8 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
 
     # 119. Vision request counts: conversational photo request updates activity
     async def test_vision_request_counts(self):
-        with patch("ai_integration._call_openai_api", new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = "Vision description"
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = _mock_openai_completion("Vision description")
             await ai_integration.get_ai_response(
                 user_id=3001, user_prompt="Photo prompt", user_name="Ольга", user_gender="female",
                 track_user_activity=True
@@ -727,8 +735,8 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
             cfg.fallback_model = "claude-sonnet-5"
             await session.commit()
 
-        with patch("max_messenger_bot.ai._call_claude", new_callable=AsyncMock) as mock_claude:
-            mock_claude.return_value = "Ответ от Claude"
+        with patch("anthropic.resources.messages.AsyncMessages.create", new_callable=AsyncMock) as mock_claude:
+            mock_claude.return_value = MagicMock(content=[MagicMock(text="Ответ от Claude")])
             resp = await max_ai.get_ai_response(
                 3001,
                 "Привет",
@@ -769,3 +777,82 @@ class TemporalActivityTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
             self.assertEqual(len(acts), 2)
+
+    # 131. Non-Integrity insert/flush DB failure propagates, tracker remains unmarked, retry persists same request_time
+    async def test_non_integrity_db_failure_propagates_and_tracker_remains_unmarked(self):
+        from sqlalchemy.exc import OperationalError
+        fixed_time = datetime(2026, 1, 1, 12, 0, 0)
+        tracker = ActivityTracker(self.sessions, user_id=3001, topic_id=10, request_time=fixed_time)
+        self.assertFalse(tracker._marked)
+
+        # Force a non-Integrity DB error during session.flush inside upsert
+        with patch.object(
+            AsyncSession, "flush", side_effect=OperationalError("disk I/O error", params=None, orig=Exception("disk error"))
+        ):
+            with self.assertRaises(OperationalError):
+                await tracker.mark_outbound_attempt_once()
+            self.assertFalse(tracker._marked)
+
+        # Retry with healthy session succeeds and persists the identical request_time
+        await tracker.mark_outbound_attempt_once()
+        self.assertTrue(tracker._marked)
+
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(UserAIActivity).where(UserAIActivity.user_id == 3001, UserAIActivity.scope_key == "topic:10")
+            )
+            self.assertIsNotNone(row)
+            self.assertEqual(row.last_request_at, fixed_time)
+
+    # 132. Primary local failure + fallback invalid model -> zero activity
+    async def test_primary_local_failure_plus_fallback_invalid_model_records_zero_activity(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = ""  # Primary fails locally (missing key)
+            cfg.allow_fallback = True
+            cfg.fallback_provider = "Claude"
+            cfg.claude_api_key = "sk-claude-test"
+            cfg.fallback_model = "unsupported-model-x"  # Fallback fails local validation
+            await session.commit()
+
+        with self.assertRaises(Exception):
+            await max_ai.get_ai_response(
+                3001,
+                "Привет",
+                track_user_activity=True,
+            )
+
+        async with self.sessions() as session:
+            acts = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 3001))).all()
+            self.assertEqual(len(acts), 0)
+
+    # 133. Minute-boundary single request_time
+    async def test_minute_boundary_single_request_time(self):
+        # Set prior activity at 10:00:00
+        t_prev = datetime(2026, 1, 1, 10, 0, 0)
+        async with self.sessions() as session:
+            tracker_prev = ActivityTracker(self.sessions, user_id=3001, topic_id=10, request_time=t_prev)
+            await tracker_prev.mark_outbound_attempt_once()
+
+        # New request at 10:00:59.999999
+        t_req = datetime(2026, 1, 1, 10, 0, 59, 999999)
+        tracker_now = ActivityTracker(self.sessions, user_id=3001, topic_id=10, request_time=t_req)
+
+        async with self.sessions() as session:
+            # Gaps calculated using the exact tracker request_time
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(session, user_id=3001, topic_id=10, now=tracker_now.request_time)
+            # Both gaps must be 0 minutes
+            self.assertEqual(gap_visit, 0)
+            self.assertEqual(gap_msg, 0)
+
+        # Mark activity with tracker_now
+        await tracker_now.mark_outbound_attempt_once()
+
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(UserAIActivity).where(UserAIActivity.user_id == 3001, UserAIActivity.scope_key == "topic:10")
+            )
+            # Persisted time must be exactly t_req, not a drifted time
+            self.assertEqual(row.last_request_at, t_req)
+

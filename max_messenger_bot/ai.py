@@ -705,7 +705,7 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
         raise AIServiceError(f"Ошибка при транскрибации (KIE API): {exception_summary(e)}") from e
 
 
-async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None) -> str:
+async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, *, activity_tracker: ActivityTracker | None = None) -> str:
     ensure_model_available(PROVIDER_KIE, model, channel="vision")
     try:
         file_url = await _upload_file_to_kie(
@@ -728,6 +728,7 @@ async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model:
             temperature=temperature,
             channel="vision",
             request_layout=layout,
+            activity_tracker=activity_tracker,
         )
     except (InsufficientBalanceError, AIServiceError):
         raise
@@ -1038,11 +1039,13 @@ async def get_ai_response(
 
         context = "\n\n".join(relevant_chunks)
 
+        request_time = activity_tracker.request_time if activity_tracker is not None else datetime.utcnow()
         if minutes_since_last_visit is None or minutes_since_last_message is None:
             gap_visit, gap_msg = await get_user_ai_activity_gaps(
                 session,
                 user_id=user.id,
                 topic_id=active_topic_id,
+                now=request_time,
             )
             if minutes_since_last_visit is None:
                 minutes_since_last_visit = gap_visit
@@ -1054,7 +1057,7 @@ async def get_ai_response(
                 async_session_maker,
                 user_id=user.id,
                 topic_id=active_topic_id,
-                request_time=datetime.utcnow(),
+                request_time=request_time,
                 track_user_activity=track_user_activity,
             )
 
@@ -1114,11 +1117,6 @@ async def get_ai_response(
                 if fb_api_key:
                     log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
                     try:
-                        if activity_tracker is not None:
-                            try:
-                                await activity_tracker.mark_outbound_attempt_once()
-                            except Exception as act_err:
-                                log.warning("Failed to mark activity before fallback outbound call: %s", act_err)
                         if fb_key == "openai":
                             result = await _call_openai(
                                 fb_api_key, fb_model, [], temperature,
@@ -1248,8 +1246,14 @@ async def get_ai_response_direct(
         active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
         active_topic_id = topic_id if topic_id is not None else user.current_topic_id
 
+        request_time = activity_tracker.request_time if activity_tracker is not None else datetime.utcnow()
         if minutes_since_last_visit is None or minutes_since_last_message is None:
-            gap_visit, gap_msg = await get_user_ai_activity_gaps(session, user_id=user.id, topic_id=active_topic_id)
+            gap_visit, gap_msg = await get_user_ai_activity_gaps(
+                session,
+                user_id=user.id,
+                topic_id=active_topic_id,
+                now=request_time,
+            )
             if minutes_since_last_visit is None:
                 minutes_since_last_visit = gap_visit
             if minutes_since_last_message is None:
@@ -1260,7 +1264,7 @@ async def get_ai_response_direct(
                 async_session_maker,
                 user_id=user.id,
                 topic_id=active_topic_id,
-                request_time=datetime.utcnow(),
+                request_time=request_time,
                 track_user_activity=True,
             )
 
@@ -1274,6 +1278,7 @@ async def get_ai_response_direct(
             topic_id=active_topic_id,
             minutes_since_last_visit=minutes_since_last_visit,
             minutes_since_last_message=minutes_since_last_message,
+            service_capabilities=MAX_CAPABILITIES,
         )
 
         try:
@@ -1507,7 +1512,14 @@ async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_p
     return response.content[0].text
 
 
-async def analyze_image(user_id: int, image_bytes: bytes, prompt: str, *, activity_tracker: ActivityTracker | None = None) -> str:
+async def analyze_image(
+    user_id: int,
+    image_bytes: bytes,
+    prompt: str,
+    *,
+    activity_tracker: ActivityTracker | None = None,
+    exclude_message_id: int | None = None,
+) -> str:
     """Analyze image with the configured vision provider."""
     async with async_session_maker() as session:
         user = await session.scalar(
@@ -1526,61 +1538,16 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str, *, activi
 
         provider = (config.vision_provider or "Gemini").strip()
         temperature = _resolve_temperature(config)
-        
-        photo_instructions = (
-            "\n\nИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"
-            "1. Если пользователь просит ИЗМЕНИТЬ это фото или 'сделать так же', добавь в конце: EDIT_IMG: <prompt on english>.\n"
-            "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"
-            "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
-        )
-        system_prompt = _build_user_system_prompt(user, config)
-        shared_instructions = tuple(
-            block
-            for block in (
-                (getattr(config, "shared_prompt_block", None) or "").strip(),
-                photo_instructions.strip(),
-            )
-            if block
-        )
 
-        current_memory_mode = normalize_memory_mode(config)
-        history_scope = _build_max_history_scope(user, current_memory_mode)
-        history_rows = (
-            await session.execute(
-                select(DBMessage)
-                .options(selectinload(DBMessage.topic))
-                .where(history_scope, ai_history_role_filter(DBMessage))
-                .order_by(DBMessage.timestamp.asc())
-            )
-        ).scalars().all()
-
-        limit_first = getattr(config, "context_limit_first", 2) or 2
-        limit_recent = getattr(config, "context_limit_recent", 10) or 10
-
-        # Filter out the message we just saved before calling this function, which ends with role == 'user' and starts with "[Изображение]"
-        if history_rows and history_rows[-1].role == "user" and history_rows[-1].content.startswith("[Изображение]"):
-            history_rows = history_rows[:-1]
-
-        history_rows = select_ai_history_messages(history_rows, limit_first, limit_recent)
-
-        history_list = [{"role": row.role, "content": row.content} for row in history_rows if row.content]
-        runtime_parts = [_build_client_runtime_context(user)]
-        if getattr(user, "response_length", "normal") == "short":
-            runtime_parts.append("Отвечай кратко, по делу, без длинных вступлений.")
         active_dialogue_id = user.current_dialogue_id
         active_topic_id = user.current_topic_id
-        scenario_context = await build_runtime_automation_context(
+
+        request_time = activity_tracker.request_time if activity_tracker is not None else datetime.utcnow()
+        gap_visit, gap_msg = await get_user_ai_activity_gaps(
             session,
             user_id=user.id,
-            dialogue_id=active_dialogue_id,
             topic_id=active_topic_id,
-        )
-        request_layout = AIRequestLayout(
-            stable_system_prompt=system_prompt,
-            shared_instructions=shared_instructions,
-            runtime_context=tuple(runtime_parts),
-            scenario_context=(scenario_context,) if scenario_context else (),
-            history=normalize_request_messages(history_list),
+            now=request_time,
         )
 
         if activity_tracker is None:
@@ -1588,32 +1555,103 @@ async def analyze_image(user_id: int, image_bytes: bytes, prompt: str, *, activi
                 async_session_maker,
                 user_id=user.id,
                 topic_id=active_topic_id,
-                request_time=datetime.utcnow(),
+                request_time=request_time,
                 track_user_activity=True,
             )
+
+        photo_instructions = (
+            "\n\nИНСТРУКЦИЯ ПО АНАЛИЗУ ФОТО:\n"
+            "1. Если пользователь просит ИЗМЕНИТЬ это фото или 'сделать так же', добавь в конце: EDIT_IMG: <prompt on english>.\n"
+            "2. Если нужно создать НОВОЕ фото с нуля, добавь в конце: GEN_IMG: <prompt on english>.\n"
+            "3. ВАЖНО: Диалог уже начат. НЕ здоровайся, не представляйся и не используй вежливые вступления. Сразу переходи к сути разбора изображения."
+        )
+
+        scenario_context = await build_runtime_automation_context(
+            session,
+            user_id=user.id,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
+            memory_mode=get_memory_mode(config),
+        )
+
+        request_layout = await build_conversational_request_layout(
+            session,
+            user=user,
+            ai_config=config,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
+            exclude_message_id=exclude_message_id,
+            minutes_since_last_visit=gap_visit,
+            minutes_since_last_message=gap_msg,
+            service_capabilities=MAX_CAPABILITIES,
+            modality_instructions=(photo_instructions,),
+            scenario_context=scenario_context,
+        )
 
     if provider == "Gemini":
         api_key = config.gemini_api_key
         if not api_key:
             raise AIServiceError("API ключ Gemini для vision не задан")
-        raw_result = await _analyze_gemini(api_key, config.vision_model or "gemini-3.7-flash", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout, activity_tracker=activity_tracker)
+        raw_result = await _analyze_gemini(
+            api_key,
+            config.vision_model or "gemini-3.7-flash",
+            image_bytes,
+            request_layout.stable_system_prompt,
+            prompt,
+            temperature,
+            history=list(request_layout.history),
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
     elif provider in {"Claude", "Anthropic"}:
         api_key = config.claude_api_key
         if not api_key:
             raise AIServiceError("API ключ Claude для vision не задан")
-        raw_result = await _analyze_claude(api_key, config.vision_model or "claude-sonnet-5", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout, activity_tracker=activity_tracker)
+        raw_result = await _analyze_claude(
+            api_key,
+            config.vision_model or "claude-sonnet-5",
+            image_bytes,
+            request_layout.stable_system_prompt,
+            prompt,
+            temperature,
+            history=list(request_layout.history),
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
     elif provider == "KIE":
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
         model = config.vision_model or "gemini-3-flash"
-        raw_result = await _analyze_kie(api_key, _get_kie_base_url(config), _get_kie_upload_base_url(config), model, image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout)
+        raw_result = await _analyze_kie(
+            api_key,
+            _get_kie_base_url(config),
+            _get_kie_upload_base_url(config),
+            model,
+            image_bytes,
+            request_layout.stable_system_prompt,
+            prompt,
+            temperature,
+            history=list(request_layout.history),
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
     else:
         # Default: OpenAI
         api_key = config.openai_api_key
         if not api_key:
             raise AIServiceError("API ключ OpenAI для vision не задан")
-        raw_result = await _analyze_openai(api_key, config.vision_model or "gpt-5.6-terra", image_bytes, system_prompt, prompt, temperature, history=history_list, shared_instructions=shared_instructions, request_layout=request_layout, activity_tracker=activity_tracker)
+        raw_result = await _analyze_openai(
+            api_key,
+            config.vision_model or "gpt-5.6-terra",
+            image_bytes,
+            request_layout.stable_system_prompt,
+            prompt,
+            temperature,
+            history=list(request_layout.history),
+            request_layout=request_layout,
+            activity_tracker=activity_tracker,
+        )
 
     visible_text, service_blocks, invalid_data_blocks = extract_service_data(raw_result)
     if invalid_data_blocks:

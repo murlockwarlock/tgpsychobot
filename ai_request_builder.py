@@ -35,6 +35,7 @@ from prompt_blocks import (
     ServiceCapabilities,
     TELEGRAM_CAPABILITIES,
     render_prompt_block,
+    render_service_prompt,
 )
 from result_history import ai_history_role_filter, select_ai_history_messages
 from subscription_context import active_subscription_flag
@@ -172,9 +173,9 @@ async def upsert_user_ai_activity(
             ))
             if hasattr(session, "flush"):
                 await session.flush()
-    except (IntegrityError, Exception):
+    except IntegrityError:
         if hasattr(session, "execute"):
-            await session.execute(
+            res_up = await session.execute(
                 update(UserAIActivity)
                 .where(
                     UserAIActivity.user_id == user_id,
@@ -183,6 +184,18 @@ async def upsert_user_ai_activity(
                 )
                 .values(last_request_at=request_time, updated_at=request_time)
             )
+            if getattr(res_up, "rowcount", 0) <= 0:
+                if hasattr(session, "scalar"):
+                    existing_after = await session.scalar(
+                        select(UserAIActivity.last_request_at).where(
+                            UserAIActivity.user_id == user_id,
+                            UserAIActivity.scope_key == scope_key,
+                        )
+                    )
+                    if existing_after is None:
+                        raise
+                else:
+                    raise
 
 
 
@@ -258,7 +271,9 @@ async def load_conversational_ai_history(
         stmt = stmt.where(Message.id != exclude_message_id)
 
     stmt = stmt.options(selectinload(Message.topic)).order_by(Message.timestamp.asc(), Message.id.asc())
-    raw_messages = (await session.execute(stmt)).scalars().all()
+    raw_messages = list((await session.execute(stmt)).scalars().all())
+    if exclude_message_id is None and raw_messages and getattr(raw_messages[-1], "role", None) == "user" and str(getattr(raw_messages[-1], "content", "")).startswith("[Изображение]"):
+        raw_messages = raw_messages[:-1]
 
     selected = select_ai_history_messages(raw_messages, limit_first, limit_recent)
     history_items = [
@@ -295,6 +310,7 @@ async def build_conversational_request_layout(
     limit_recent: int | None = None,
     scenario_context: str | None = None,
     history: Iterable[Any] | None = None,
+    modality_instructions: Iterable[str] | None = None,
     service_capabilities: ServiceCapabilities | None = None,
 ) -> AIRequestLayout:
     """Build the single canonical AIRequestLayout for conversational turns (TG & MAX)."""
@@ -311,7 +327,7 @@ async def build_conversational_request_layout(
     if shared_instructions is None:
         shared_prompt_block = (getattr(ai_config, "shared_prompt_block", "") or "").strip()
         service_prompt_template = getattr(ai_config, "service_prompt_block", None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
-        service_prompt_block = render_prompt_block(
+        service_prompt_block = render_service_prompt(
             service_prompt_template,
             capabilities=service_capabilities,
             available_media_text=available_media_text,
@@ -319,10 +335,11 @@ async def build_conversational_request_layout(
             test_context_injection="",
             short_response_instruction="",
         )
-        shared_parts = [part for part in (shared_prompt_block, service_prompt_block) if part]
-        shared_instructions = tuple(shared_parts)
+        modality_parts = [part.strip() for part in (modality_instructions or ()) if part and str(part).strip()]
+        shared_parts = [part for part in (shared_prompt_block, service_prompt_block, *modality_parts) if part]
+        effective_shared_instructions = tuple(shared_parts)
     else:
-        shared_instructions = tuple(shared_instructions)
+        effective_shared_instructions = tuple(shared_instructions)
 
     if subscription_config is None and load_subscription_config and include_subscription_status:
         subscription_config = await session.get(SubscriptionConfig, 1)
@@ -378,7 +395,7 @@ async def build_conversational_request_layout(
 
     return AIRequestLayout(
         stable_system_prompt=neutralize_stable_prompt(stable_system_prompt),
-        shared_instructions=shared_instructions,
+        shared_instructions=effective_shared_instructions,
         runtime_context=tuple(runtime_parts),
         scenario_context=scenario_parts,
         request_context=tuple(request_parts),
@@ -408,7 +425,7 @@ async def build_isolated_request_layout(
 
     shared_prompt_block = (getattr(ai_config, "shared_prompt_block", "") or "").strip()
     service_prompt_template = getattr(ai_config, "service_prompt_block", None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
-    service_prompt_block = render_prompt_block(
+    service_prompt_block = render_service_prompt(
         service_prompt_template,
         capabilities=service_capabilities,
         available_media_text=available_media_text,

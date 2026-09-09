@@ -16,6 +16,7 @@ from collections import OrderedDict, deque
 import secrets
 from dataclasses import dataclass
 from types import SimpleNamespace
+import inspect
 import ai_integration
 import keyboards
 from client_search import normalize_client_search_query
@@ -6643,6 +6644,10 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
 
 @router.callback_query(F.data == "disclaimer_accepted", UserStates.awaiting_disclaimer_acceptance)
 async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if hasattr(callback, "answer"):
+        ans = callback.answer()
+        if inspect.isawaitable(ans):
+            await ans
     user_id = callback.from_user.id
 
     async with async_session_maker() as session:

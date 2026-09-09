@@ -1638,11 +1638,13 @@ async def get_ai_response(
 
         context = "\n\n".join(relevant_chunks)
 
+        request_time = datetime.utcnow()
         if minutes_since_last_visit is None or minutes_since_last_message is None:
             gap_visit, gap_msg = await get_user_ai_activity_gaps(
                 session,
                 user_id=user.id,
                 topic_id=active_topic_id,
+                now=request_time,
             )
             if minutes_since_last_visit is None:
                 minutes_since_last_visit = gap_visit
@@ -1654,21 +1656,9 @@ async def get_ai_response(
                 async_session_maker,
                 user_id=user.id,
                 topic_id=active_topic_id,
-                request_time=datetime.utcnow(),
+                request_time=request_time,
                 track_user_activity=track_user_activity,
             )
-
-        service_prompt_template = getattr(ai_config, 'service_prompt_block', None) or DEFAULT_SERVICE_PROMPT_TEMPLATE
-        service_prompt_block = render_prompt_block(
-            service_prompt_template,
-            available_media_text=available_media_text,
-            media_instruction_block=media_instruction_block,
-            test_context_injection="",
-            short_response_instruction="",
-        )
-        shared_instructions = tuple(
-            part for part in (shared_prompt_block, service_prompt_block) if part
-        )
 
         scenario_context = await build_runtime_automation_context(
             session,
@@ -1687,7 +1677,6 @@ async def get_ai_response(
             current_user_content=user_prompt,
             exclude_message_id=exclude_message_id,
             stable_system_prompt=formatted_body,
-            shared_instructions=shared_instructions,
             minutes_since_last_visit=minutes_since_last_visit,
             minutes_since_last_message=minutes_since_last_message,
             test_context="",
@@ -1729,12 +1718,6 @@ async def get_ai_response(
                     raise AIServiceError(f"Ошибка проверки модели ИИ: {e}") from e
             elif p_key not in {'openai', 'anthropic', 'claude', 'gemini', 'kie', 'deepseek', 'xai'}:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
-
-            if activity_tracker is not None:
-                try:
-                    await activity_tracker.mark_outbound_attempt_once()
-                except Exception as act_err:
-                    logging.warning("Failed to mark activity before outbound call: %s", act_err)
 
 
             if p_key == 'openai':
