@@ -57,6 +57,9 @@ async def test_telegram_handle_sub_retry_now_permanent_deactivate_flow(caplog):
         async def __aexit__(self, *args):
             return False
 
+        def add(self, obj):
+            pass
+
         async def get(self, model, ident, *args, **kwargs):
             if model.__name__ == "SubscriptionConfig":
                 return config
@@ -65,6 +68,11 @@ async def test_telegram_handle_sub_retry_now_permanent_deactivate_flow(caplog):
             return None
 
         async def scalar(self, stmt):
+            stmt_str = str(stmt).lower()
+            if "yookassarecurringattempt" in stmt_str or "yookassa_recurring_attempt" in stmt_str:
+                return None
+            if "yookassapayment" in stmt_str or "yookassa_payment" in stmt_str:
+                return None
             return user_sub
 
         async def commit(self):
@@ -81,12 +89,19 @@ async def test_telegram_handle_sub_retry_now_permanent_deactivate_flow(caplog):
     bot = SimpleNamespace(send_message=AsyncMock())
     state = AsyncMock()
 
-    deactivate_res = ('deactivate', None, None, 'invalid_request')
+    deactivate_res = YooKassaRecurringResult(
+        outcome='deactivate',
+        payment_id=None,
+        payment_status=None,
+        failure_reason='invalid_request',
+        attempt_started_at=now,
+        is_permanent_deactivate=True,
+    )
 
     with (
         patch.object(handlers, "async_session_maker", return_value=MockSession()),
         patch.object(handlers, "get_all_admin_ids", AsyncMock(return_value=[999001])),
-        patch.object(handlers, "process_recurring_payment", AsyncMock(return_value=deactivate_res)),
+        patch.object(handlers, "execute_or_replay_yookassa_recurring_attempt", AsyncMock(return_value=deactivate_res)),
         patch.object(handlers, "_send_subscription_info", AsyncMock()),
         patch.object(handlers.plog, "info") as mock_plog_info,
     ):

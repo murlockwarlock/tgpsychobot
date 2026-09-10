@@ -102,7 +102,7 @@ async def test_execute_yookassa_recurring_attempt_redacts_payment_method_id_in_l
 
     fake_payment = SimpleNamespace(id="yk-pay-1", status="succeeded")
 
-    with caplog.at_level(logging.INFO, logger="payments"):
+    with caplog.at_level(logging.INFO, logger="payment_events"):
         with patch("subscription_renewal.Payment.create", return_value=fake_payment):
             res = await execute_yookassa_recurring_attempt(sub, plan, 195.0, config, attempt_time)
 
@@ -169,7 +169,7 @@ async def test_execute_yookassa_recurring_attempt_unrelated_bad_request_is_integ
 
 
 @pytest.mark.asyncio
-async def test_execute_yookassa_recurring_attempt_unauthorized_is_provider_error():
+async def test_execute_yookassa_recurring_attempt_unauthorized_is_auth_error():
     sub = SimpleNamespace(
         id=10,
         user_id=12345678,
@@ -183,12 +183,12 @@ async def test_execute_yookassa_recurring_attempt_unauthorized_is_provider_error
     with patch("subscription_renewal.Payment.create", side_effect=UnauthorizedError({"code": "unauthorized"})):
         res = await execute_yookassa_recurring_attempt(sub, plan, 195.0, config, attempt_time)
 
-    assert res.outcome == "provider_error"
+    assert res.outcome == "auth_error"
     assert res.is_permanent_deactivate is False
 
 
 @pytest.mark.asyncio
-async def test_execute_yookassa_recurring_attempt_network_error_is_provider_error():
+async def test_execute_yookassa_recurring_attempt_network_error_is_unknown_outcome():
     sub = SimpleNamespace(
         id=10,
         user_id=12345678,
@@ -202,7 +202,7 @@ async def test_execute_yookassa_recurring_attempt_network_error_is_provider_erro
     with patch("subscription_renewal.Payment.create", side_effect=ConnectionResetError("Connection reset")):
         res = await execute_yookassa_recurring_attempt(sub, plan, 195.0, config, attempt_time)
 
-    assert res.outcome == "provider_error"
+    assert res.outcome == "unknown"
     assert res.is_permanent_deactivate is False
 
 

@@ -1131,6 +1131,15 @@ async def init_db():
 
             AutomationDialogueState.__table__.create(sync_conn, checkfirst=True)
             UserAIActivity.__table__.create(sync_conn, checkfirst=True)
+            YookassaRecurringAttempt.__table__.create(sync_conn, checkfirst=True)
+            try:
+                sync_conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_yookassa_attempt "
+                    "ON yookassa_recurring_attempts (subscription_id) "
+                    "WHERE status IN ('claimed', 'pending', 'unknown')"
+                ))
+            except Exception:
+                pass
 
         await conn.run_sync(_check_and_migrate)
 
@@ -1571,6 +1580,37 @@ class YookassaPayment(Base):
     is_recurring = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     processed_at = Column(DateTime, nullable=True)
+
+
+class YookassaRecurringAttempt(Base):
+    __tablename__ = 'yookassa_recurring_attempts'
+    __table_args__ = (
+        Index(
+            'idx_unresolved_yookassa_attempt',
+            'subscription_id',
+            unique=True,
+            postgresql_where=text("status IN ('claimed', 'pending', 'unknown')"),
+            sqlite_where=text("status IN ('claimed', 'pending', 'unknown')"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    subscription_id = Column(Integer, ForeignKey('user_subscriptions.id'), nullable=False, index=True)
+    user_id = Column(BigInteger, ForeignKey('users.id'), nullable=False, index=True)
+    plan_id = Column(Integer, ForeignKey('subscription_plans.id'), nullable=False)
+    idempotency_key = Column(String, nullable=False, unique=True, index=True)
+    amount = Column(Float, nullable=False)
+    payment_method_id = Column(String, nullable=False)
+    status = Column(String, nullable=False, default='claimed', index=True)
+    payment_id = Column(String, nullable=True, index=True)
+    attempt_started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_reconciled_at = Column(DateTime, nullable=True)
+    cancellation_reason = Column(String, nullable=True)
+    error_code = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    client_context = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class TopicMediaDeck(Base):

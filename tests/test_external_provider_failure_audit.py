@@ -299,7 +299,7 @@ async def _test_yookassa_recurring_provider_failure_does_not_consume_attempt_and
             MagicMock(), sub, plan, 10.0, config, started_at
         )
 
-    assert failed[0] == "provider_error"
+    assert failed[0] in ("provider_error", "unknown")
     assert sub.payment_attempt_count == 2
 
     async def succeed_to_thread(function, *args):

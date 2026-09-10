@@ -184,6 +184,7 @@ async def test_max_manual_retry_permanent_deactivate_handles_state_and_shows_pla
         auto_renewal=True,
         payment_attempt_count=0,
         last_payment_attempt=None,
+        payment_provider="Yookassa",
         payment_method_id="31d55000-000f-5000-9000-1e54ca65d0cf",
         plan=plan,
         discount_percent=0.0,
@@ -202,10 +203,21 @@ async def test_max_manual_retry_permanent_deactivate_handles_state_and_shows_pla
         async def __aexit__(self, *args):
             return False
 
+        def add(self, obj):
+            pass
+
         async def get(self, model, ident, *args, **kwargs):
             if model.__name__ == "User":
                 return user
             return SimpleNamespace(yookassa_shop_id="shop", yookassa_secret_key="secret")
+
+        async def scalar(self, stmt):
+            stmt_str = str(stmt).lower()
+            if "yookassarecurringattempt" in stmt_str or "yookassa_recurring_attempt" in stmt_str:
+                return None
+            if "yookassapayment" in stmt_str or "yookassa_payment" in stmt_str:
+                return None
+            return sub
 
         async def merge(self, obj):
             pass
@@ -229,6 +241,7 @@ async def test_max_manual_retry_permanent_deactivate_handles_state_and_shows_pla
         patch("max_messenger_bot.services.common.notify_telegram_admins", AsyncMock()),
         patch.object(max_subs, "utc_now", return_value=now),
         patch.object(max_subs, "execute_yookassa_recurring_attempt", AsyncMock(return_value=deactivate_res)),
+        patch.object(max_subs, "execute_or_replay_yookassa_recurring_attempt", AsyncMock(return_value=deactivate_res)),
         patch.object(max_subs, "show_plans", AsyncMock()) as mock_show_plans,
     ):
         await max_subs.handle_max_manual_retry(client, chat_id=100005511792, user_id=100005511792)
