@@ -771,6 +771,7 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                 )
                 is_new, updated_sub = res_fin[0], res_fin[1]
                 action = getattr(res_fin, "action", "success")
+                rec_details = getattr(res_fin, "reconciliation_details", {})
                 if not is_new:
                     await client.send_message(
                         chat_id=chat_id,
@@ -780,9 +781,26 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     return
 
                 if action == "manual_reconciliation_required":
+                    paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
+                    curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                    from .common import notify_telegram_admins
+                    user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                    await notify_telegram_admins(
+                        f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, MAX manual)\n\n"
+                        f"Пользователь: {user_ref}\n"
+                        f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                        f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                        f"Сумма: {rec_details.get('amount', final_price):.2f} руб\n"
+                        f"PayId: {res.payment_id}\n"
+                        f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                    )
                     await client.send_message(
                         chat_id=chat_id,
-                        text="⚠️ Оплата получена за ваш предыдущий тариф. Поскольку сейчас выбран другой тариф, платёж отправлен на проверку администратору. Срок действия текущей подписки не был изменён автоматически.",
+                        text=(
+                            f"⚠️ Мы получили оплату ({rec_details.get('amount', final_price):.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                            f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                            f"Срок действия текущей подписки не был изменён автоматически."
+                        ),
                     )
                     await show_subscription_info(client, chat_id, user_id)
                     return
@@ -807,7 +825,7 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
 
             elif res.outcome == "deactivate":
                 if res.payment_id:
-                    is_new, _, _ = await finalize_yookassa_payment_canceled(
+                    is_new, action, _ = await finalize_yookassa_payment_canceled(
                         session=session,
                         payment_id=res.payment_id,
                         cancellation_reason=res.failure_reason,
@@ -832,10 +850,19 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                         attempt=attempt,
                         logger=log,
                     )
+                    action = "deactivate"
                 if not is_new:
                     await client.send_message(
                         chat_id=chat_id,
                         text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                if action == "historical_canceled":
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
                     )
                     await show_subscription_info(client, chat_id, user_id)
                     return
@@ -973,6 +1000,14 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     await client.send_message(
                         chat_id=chat_id,
                         text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                if action == "historical_canceled":
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
                     )
                     await show_subscription_info(client, chat_id, user_id)
                     return

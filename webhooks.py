@@ -231,7 +231,14 @@ async def handle_yookassa_webhook(request: web.Request):
 
             if uid_int and is_recurring_payment:
                 try:
-                    if action == 'deactivate':
+                    if action == 'historical_canceled':
+                        plog.info(
+                            f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | Yookassa | {user_part} | {plan_part} | "
+                            f"PayId={payment_id} | Текущая подписка не затронута"
+                        )
+                        return web.Response(status=200)
+
+                    elif action == 'deactivate':
                         await send_msg_universal(
                             bot,
                             uid_int,
@@ -367,15 +374,16 @@ async def handle_yookassa_webhook(request: web.Request):
             if action == "manual_reconciliation_required":
                 paid_name = rec_details.get("paid_plan_name", plan_name_for_notif)
                 curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                charge_amount = rec_details.get("amount", plan_price_for_notif)
                 plog.warning(
                     f"РЕКУРРЕНТ_ТАРИФ_НЕСОВПАДЕНИЕ | payment_id={payment_id} | "
                     f"user_id={user_id} | paid_plan={paid_name} | current_plan={curr_name} | "
-                    f"amount={plan_price_for_notif:.2f} руб"
+                    f"amount={charge_amount:.2f} руб"
                 )
                 await send_msg_universal(
                     bot,
                     user_id,
-                    f"⚠️ Мы получили оплату ({plan_price_for_notif:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                    f"⚠️ Мы получили оплату ({charge_amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
                     f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
                     f"Срок действия текущей подписки не был изменён автоматически."
                 )
@@ -388,7 +396,7 @@ async def handle_yookassa_webhook(request: web.Request):
                                 f"Пользователь: {user_display}\n"
                                 f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
                                 f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
-                                f"Сумма: {plan_price_for_notif:.2f} руб\n"
+                                f"Сумма: {charge_amount:.2f} руб\n"
                                 f"PayId: {payment_id}\n"
                                 f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
                             )

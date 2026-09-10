@@ -884,33 +884,60 @@ def verify_yookassa_recurring_safety_schema(sync_conn) -> None:
         )).first()
         if not row or not row[0]:
             raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is missing in SQLite")
-        sql_def = row[0].upper()
-        if "UNIQUE" not in sql_def:
-            raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is not UNIQUE")
-        if "SUBSCRIPTION_ID" not in sql_def:
-            raise RuntimeError("Critical index idx_unresolved_yookassa_attempt does not index subscription_id")
-        for st in ("CLAIMED", "PENDING", "UNKNOWN"):
-            if st not in sql_def:
-                raise RuntimeError(f"Critical index idx_unresolved_yookassa_attempt missing predicate status {st}")
+        sql_def = row[0]
     elif dialect_name == "postgresql":
         row = sync_conn.execute(text(
             "SELECT indexdef FROM pg_indexes WHERE tablename = 'yookassa_recurring_attempts' AND indexname = 'idx_unresolved_yookassa_attempt'"
         )).first()
         if not row or not row[0]:
             raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is missing in PostgreSQL")
-        sql_def = row[0].upper()
-        if "UNIQUE" not in sql_def:
-            raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is not UNIQUE")
-        if "SUBSCRIPTION_ID" not in sql_def:
-            raise RuntimeError("Critical index idx_unresolved_yookassa_attempt does not index subscription_id")
-        for st in ("CLAIMED", "PENDING", "UNKNOWN"):
-            if st not in sql_def:
-                raise RuntimeError(f"Critical index idx_unresolved_yookassa_attempt missing predicate status {st}")
+        sql_def = row[0]
     else:
         indexes = insp.get_indexes('yookassa_recurring_attempts')
         idx_info = next((i for i in indexes if i['name'] == 'idx_unresolved_yookassa_attempt'), None)
         if not idx_info or not idx_info.get('unique') or 'subscription_id' not in idx_info.get('column_names', []):
             raise RuntimeError("Critical index idx_unresolved_yookassa_attempt verification failed")
+        return
+
+    import re
+    # 1. Structural check: Must be UNIQUE index
+    if not re.search(r'\bCREATE\s+UNIQUE\s+INDEX\b', sql_def, re.IGNORECASE):
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is not UNIQUE")
+
+    # 2. Structural check: Must index exactly subscription_id before WHERE
+    col_match = re.search(r'\(\s*["`]?subscription_id["`]?\s*\)\s+WHERE\b', sql_def, re.IGNORECASE)
+    if not col_match:
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt does not index subscription_id")
+
+    # 3. Structural check: Predicate after WHERE
+    where_match = re.search(r'\bWHERE\b', sql_def, re.IGNORECASE)
+    if not where_match:
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt missing WHERE clause")
+    where_clause = sql_def[where_match.end():].strip()
+
+    # Must NOT contain negation
+    if re.search(r'\bNOT\b', where_clause, re.IGNORECASE) or "!=" in where_clause or "<>" in where_clause:
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt contains negative predicate")
+
+    # Must reference 'status'
+    if not re.search(r'\bstatus\b', where_clause, re.IGNORECASE):
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt predicate must filter on status")
+
+    # Must use positive set membership (IN (...) or = ANY (...))
+    has_in = bool(re.search(r'\bIN\s*\(', where_clause, re.IGNORECASE))
+    has_any = bool(re.search(r'=\s*ANY\b', where_clause, re.IGNORECASE))
+    if not (has_in or has_any):
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt predicate does not use IN or = ANY")
+
+    # Extract literal states and verify exact match
+    quoted = re.findall(r"'([^']+)'", where_clause)
+    found_states = {s.lower() for s in quoted}
+    expected_states = {"claimed", "pending", "unknown"}
+    if found_states != expected_states:
+        raise RuntimeError(
+            f"Critical index idx_unresolved_yookassa_attempt predicate has invalid states: {found_states}, "
+            f"expected exactly {expected_states}"
+        )
 
 
 async def init_db():

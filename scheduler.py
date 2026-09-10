@@ -622,12 +622,18 @@ async def check_subscriptions(bot: Bot):
                         attempt=u_att,
                         logger=plog,
                     )
+                    action = "deactivate"
                 if is_new:
-                    await bot.send_message(
-                        u_att.user_id,
-                        "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nПродлите подписку вручную в меню.",
-                        reply_markup=subscribe_kb,
-                    )
+                    if action == "historical_canceled":
+                        plog.info(
+                            f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | reconciliation | [id={u_att.user_id}] | PayId={rec_result.payment_id or 'none'}"
+                        )
+                    else:
+                        await bot.send_message(
+                            u_att.user_id,
+                            "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nПродлите подписку вручную в меню.",
+                            reply_markup=subscribe_kb,
+                        )
             elif rec_result.outcome in ('declined', 'limit_exceeded'):
                 if rec_result.payment_id:
                     is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
@@ -652,6 +658,11 @@ async def check_subscriptions(bot: Bot):
                         attempt_started_at=u_att.attempt_started_at,
                         attempt=u_att,
                         logger=plog,
+                    )
+                    action = "declined"
+                if is_new and action == "historical_canceled":
+                    plog.info(
+                        f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | reconciliation | [id={u_att.user_id}] | PayId={rec_result.payment_id or 'none'}"
                     )
             elif rec_result.outcome == 'manual_review':
                 is_new_mr, _ = await transition_attempt_to_manual_review(
@@ -1115,10 +1126,11 @@ async def check_subscriptions(bot: Bot):
                             if is_new and action == "manual_reconciliation_required":
                                 paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
                                 curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                                charge_amount = rec_details.get("amount", final_price)
                                 await _send_deduplicated_notification(
                                     bot,
                                     sub.user_id,
-                                    f"⚠️ Мы получили оплату ({final_price:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                                    f"⚠️ Мы получили оплату ({charge_amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
                                     f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
                                     f"Срок действия текущей подписки не был изменён автоматически.",
                                     f"yk_cross_plan:{sub.id}:{res.payment_id}",
@@ -1135,7 +1147,7 @@ async def check_subscriptions(bot: Bot):
                                                 f"Пользователь: {user_ref}\n"
                                                 f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
                                                 f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
-                                                f"Сумма: {final_price:.2f} руб\n"
+                                                f"Сумма: {charge_amount:.2f} руб\n"
                                                 f"PayId: {res.payment_id}\n"
                                                 f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
                                             )
@@ -1190,7 +1202,14 @@ async def check_subscriptions(bot: Bot):
                                     attempt=att,
                                     logger=plog,
                                 )
+                                action = "deactivate"
                             if is_new:
+                                if action == "historical_canceled":
+                                    plog.info(
+                                        f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | scheduler | {user_ref} | {plan_to_charge.name} | "
+                                        f"PayId={res.payment_id or 'none'} | Текущая подписка не затронута"
+                                    )
+                                    continue
                                 plog.warning(f"АВТОПРОДЛ_ОТКЛ | {user_ref} | причина: deactivate | {plan_to_charge.name}")
                                 await bot.send_message(
                                     sub.user_id,
@@ -1354,6 +1373,12 @@ async def check_subscriptions(bot: Bot):
                                 )
                                 action = "declined"
                             if is_new:
+                                if action == "historical_canceled":
+                                    plog.info(
+                                        f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | scheduler | {user_ref} | {plan_to_charge.name} | "
+                                        f"PayId={res.payment_id or 'none'} | Текущая подписка не затронута"
+                                    )
+                                    continue
                                 if action == "unknown_cancellation":
                                     plog.warning(
                                         f"АВТОПРОДЛ_ПАУЗА_UNKNOWN | {user_ref} | PayId={res.payment_id or 'none'} | Reason={res.failure_reason or 'none'}"
