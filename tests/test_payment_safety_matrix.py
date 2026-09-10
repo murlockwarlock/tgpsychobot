@@ -1669,19 +1669,31 @@ async def test_transport_neutral_manual_review_transition(test_db):
 
 
 @pytest.mark.asyncio
-async def test_scheduler_local_config_precheck_trips_incident(test_db):
+async def test_scheduler_local_config_precheck_silent_breaker_and_continues_work(test_db):
     """
-    Scheduler local config pre-check:
-    If shop_id or secret_key is missing, trips circuit breaker, sends deduplicated admin alert,
-    and initiates zero new claims/POSTs.
+    Regression test:
+    When yookassa_shop_id or yookassa_secret_key is missing:
+    1. Zero YooKassa provider calls (mock_create not called)
+    2. Zero YooKassa Circuit Breaker admin messages sent (no 'shop_id или secret_key' alerts)
+    3. Scheduler continues processing unrelated non-YooKassa work (e.g. Robokassa recurring payments)
     """
     now = datetime.utcnow()
     async with test_db() as session:
         admin_u = User(id=99991, username="admin_owner2", is_admin=True)
         # Missing secret_key!
-        cfg = SubscriptionConfig(id=1, yookassa_shop_id="shop_without_key", yookassa_secret_key=None, notifications_enabled=True)
+        cfg = SubscriptionConfig(
+            id=1,
+            yookassa_shop_id="shop_without_key",
+            yookassa_secret_key=None,
+            notifications_enabled=True,
+            robokassa_merchant_login="robo_login",
+            robokassa_password_1="robo_pass1",
+            robokassa_password_2="robo_pass2",
+        )
         p = SubscriptionPlan(id=1106, name="Standard", price=195.0, duration_value=1, duration_unit="months")
-        sub = UserSubscription(
+
+        # 1. YooKassa subscription due for renewal
+        sub_yk = UserSubscription(
             id=1106,
             user_id=1106,
             plan_id=1106,
@@ -1691,7 +1703,22 @@ async def test_scheduler_local_config_precheck_trips_incident(test_db):
             payment_attempt_count=0,
             end_date=now - timedelta(minutes=5),
         )
-        session.add_all([admin_u, cfg, p, sub])
+        u_yk = User(id=1106, username="user_yk", first_name="UserYK")
+
+        # 2. Unrelated Robokassa subscription due for renewal
+        sub_rk = UserSubscription(
+            id=1107,
+            user_id=1107,
+            plan_id=1106,
+            auto_renewal=True,
+            payment_provider="Robokassa",
+            payment_method_id="1107",
+            payment_attempt_count=0,
+            end_date=now - timedelta(minutes=5),
+        )
+        u_rk = User(id=1107, username="user_rk", first_name="UserRK")
+
+        session.add_all([admin_u, cfg, p, u_yk, sub_yk, u_rk, sub_rk])
         await session.commit()
 
     import subscription_renewal
@@ -1701,24 +1728,38 @@ async def test_scheduler_local_config_precheck_trips_incident(test_db):
     with (
         patch("scheduler.process_birthday_mailings", AsyncMock()),
         patch("scheduler.async_session_maker", test_db),
-        patch("subscription_renewal.Payment.create") as mock_create,
+        patch("subscription_renewal.Payment.create") as mock_yk_create,
+        patch("scheduler.process_recurring_robokassa_payment", AsyncMock(return_value=True)) as mock_rk_exec,
     ):
         await check_subscriptions(bot)
 
-    # Zero calls to Payment.create
-    mock_create.assert_not_called()
+    # 1. Zero calls to YooKassa Payment.create
+    mock_yk_create.assert_not_called()
 
-    # Zero claims created in DB
+    # 2. Zero YooKassa claims created in DB
     async with test_db() as session:
-        attempts = (await session.execute(
+        yk_attempts = (await session.execute(
             select(YookassaRecurringAttempt).where(YookassaRecurringAttempt.subscription_id == 1106)
         )).scalars().all()
-        assert len(attempts) == 0
+        assert len(yk_attempts) == 0
 
-    # Admin notified of configuration incident
-    bot.send_message.assert_called()
-    alerts = [str(c) for c in bot.send_message.call_args_list]
-    assert any("shop_id или secret_key" in a for a in alerts)
+    # 3. Zero 'YooKassa Circuit Breaker' or 'shop_id или secret_key' alerts sent to admins
+    all_sent_texts = [str(c) for c in bot.send_message.call_args_list]
+    assert not any("Circuit Breaker" in t for t in all_sent_texts)
+    assert not any("shop_id или secret_key" in t for t in all_sent_texts)
+
+    # 4. Scheduler continued processing unrelated non-YooKassa work: Robokassa recurring payment was executed!
+    mock_rk_exec.assert_called_once()
+    async with test_db() as session:
+        updated_sub_rk = await session.get(UserSubscription, 1107)
+        assert updated_sub_rk.pending_robokassa_invoice_id is not None
+        assert updated_sub_rk.payment_attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_local_config_precheck_trips_incident(test_db):
+    """Backward-compatibility wrapper for test runner."""
+    await test_scheduler_local_config_precheck_silent_breaker_and_continues_work(test_db)
 
 
 @pytest.mark.asyncio

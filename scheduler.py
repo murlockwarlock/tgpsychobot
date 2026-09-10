@@ -482,15 +482,6 @@ async def check_subscriptions(bot: Bot):
             config and getattr(config, "yookassa_shop_id", None) and getattr(config, "yookassa_secret_key", None)
         )
         yookassa_incident_tripped = not has_yookassa_creds
-        if not has_yookassa_creds and should_send_auth_alert(now) and config and config.notifications_enabled:
-            for admin_id in all_admin_ids:
-                try:
-                    await bot.send_message(
-                        admin_id,
-                        "🚨 YooKassa Circuit Breaker: Отсутствуют shop_id или secret_key в настройках. Новые попытки списания в этом цикле пропущены."
-                    )
-                except Exception:
-                    pass
 
         # Reconcile unresolved YooKassa recurring attempts with bounded backoff
         unresolved_stmt = select(YookassaRecurringAttempt).where(
