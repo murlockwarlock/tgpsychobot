@@ -91,6 +91,7 @@ const apps = [
       "WEBHOOK_PATH_PREFIX": "/bot_legacy_1",
       "BASE_WEBHOOK_URL": "https://bots.psysoldatov.ru:8443",
       "TELEGRAM_DELIVERY_MODE": "polling",
+      "MAX_BOT_TOKEN": process.env.MAX_SE13639182_BOT_TOKEN || "",
     }
   },
   {
@@ -278,6 +279,7 @@ const apps = [
       "WEBHOOK_PATH_PREFIX": "/bot10",
       "BASE_WEBHOOK_URL": "https://bots.psysoldatov.ru:8443",
       "TELEGRAM_DELIVERY_MODE": "polling",
+      "MAX_BOT_TOKEN": process.env.MAX_ID519010411655_BOT_TOKEN || "",
     }
   },
   {

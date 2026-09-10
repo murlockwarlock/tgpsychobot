@@ -246,6 +246,7 @@ from scheduler import (
     _encode_log_json,
     _serialize_yookassa_payment,
 )
+from subscription_renewal import mask_payment_method_id
 from subscription_dates import extend_subscription_end_date
 from subscription_retry_policy import can_retry_manually, can_retry_now, get_next_retry_at
 from subscription_context import active_subscription_flag, should_include_subscription_status
@@ -10317,14 +10318,14 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     f"Повторное списание пока недоступно. Следующая попытка после {next_retry_str}.",
                 )
                 return
-            attempt_started_at = user_sub.last_payment_attempt or now
+            attempt_started_at = now
             plog.info(
                 "РУЧНОЙ_РЕТРАЙ_ОТПРАВКА | %s | Yookassa | attempts=%s | attempt_started_at=%s | amount=%.2f | payment_method_id=%s",
                 user_id,
                 user_sub.payment_attempt_count,
                 format_msk(attempt_started_at, '%d.%m.%Y %H:%M:%S МСК'),
                 final_price,
-                user_sub.payment_method_id,
+                mask_payment_method_id(user_sub.payment_method_id),
             )
             res, yk_payment_id, yk_payment_status, yk_failure_reason = await process_recurring_payment(
                 bot, user_sub, plan_to_charge, final_price, config, attempt_started_at
@@ -10394,16 +10395,18 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
             elif res == 'deactivate':
                 plog.warning(f"АВТОПРОДЛ_ОТКЛ | {user_ref} | причина: deactivate | {plan_to_charge.name}")
                 user_sub.auto_renewal = False
+                user_sub.payment_method_id = None
+                user_sub.last_payment_attempt = attempt_started_at
                 await session.commit()
                 await bot.send_message(user_id,
-                                       "Не удалось списать средства (YooKassa). Автопродление отключено.\n\nОформите подписку вручную.")
+                                       "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nОформите подписку вручную.")
                 cfg = await session.get(SubscriptionConfig, 1)
                 if cfg and cfg.notifications_enabled:
                     for admin_id in await get_all_admin_ids():
                         try:
                             await bot.send_message(
                                 admin_id,
-                                f"🚫 Автопродление отключено (отказ провайдера)\nПользователь: {user_ref}\nПровайдер: Yookassa"
+                                f"🚫 Автопродление отключено (карта недоступна в YooKassa)\nПользователь: {user_ref}\nПровайдер: Yookassa"
                             )
                         except Exception:
                             pass

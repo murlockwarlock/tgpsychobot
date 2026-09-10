@@ -41,6 +41,7 @@ from payment_failure_reasons import (
     format_yookassa_admin_reason_line,
     get_yookassa_cancellation_reason,
 )
+from subscription_renewal import execute_yookassa_recurring_attempt
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -399,109 +400,27 @@ async def _notify_yookassa_recurring_failure(
 async def process_recurring_payment(bot: Bot, sub: UserSubscription, plan: SubscriptionPlan,
                                     price_to_charge: float, config: SubscriptionConfig,
                                     attempt_started_at: datetime):
-    log.info(f"Attempting recurring payment for user {sub.user_id}, sub {sub.id} for plan {plan.name} ({price_to_charge} RUB)")
-    try:
-        if not config or not config.yookassa_shop_id or not config.yookassa_secret_key:
-            configuration_error = ValueError("YooKassa shop_id or secret_key is not configured")
-            await _notify_yookassa_recurring_failure(
-                bot, sub, plan, price_to_charge, config, configuration_error
-            )
-            return 'provider_error', None, None, None
-
-        Configuration.account_id = config.yookassa_shop_id
-        Configuration.secret_key = config.yookassa_secret_key
-
-        idempotence_key = hashlib.md5(
-            f"yk-recurring:{sub.user_id}:{sub.id}:{plan.id}:{price_to_charge:.2f}:{sub.payment_attempt_count}:{attempt_started_at.isoformat()}".encode()
-        ).hexdigest()
-
-        payload = {
-            "amount": {
-                "value": f"{price_to_charge:.2f}",
-                "currency": "RUB"
-            },
-            "capture": True,
-            "payment_method_id": sub.payment_method_id,
-            "description": f"Автопродление подписки на тариф «{plan.name}»",
-            "metadata": {
-                "user_id": str(sub.user_id),
-                "plan_id": str(plan.id),
-                "recurring": "true",
-            }
-        }
-        _plog_yookassa_tech(
-            "TECH_RECURRING_REQUEST",
-            Method="POST",
-            Endpoint="/v3/payments",
-            UserId=sub.user_id,
-            SubscriptionId=sub.id,
-            IdempotenceKey=idempotence_key,
-            Payload=_encode_log_json(payload),
-        )
-
-        payment = await asyncio.to_thread(Payment.create, payload, idempotence_key)
-        _plog_yookassa_tech(
-            "TECH_RECURRING_RESPONSE",
-            PaymentId=payment.id,
-            Status=payment.status,
-            Body=_encode_log_json(_serialize_yookassa_payment(payment)),
-        )
-
-        if payment.status == 'succeeded':
-            log.info(f"Successfully charged user {sub.user_id} for plan {plan.name}")
-            return True, payment.id, payment.status, None
-        if payment.status in ('pending', 'waiting_for_capture'):
-            log.info(f"Recurring payment for user {sub.user_id} is pending: {payment.id}")
-            return 'pending', payment.id, payment.status, None
-        else:
-            cancellation_reason = get_yookassa_cancellation_reason(payment)
-            log.warning(f"Payment for user {sub.user_id} was created but status is {payment.status}")
-            return False, payment.id, payment.status, cancellation_reason
-
-    except BadRequestError as e:
-        log.error(
-            "Failed to charge user %s. API BadRequestError: %s",
-            sub.user_id,
-            _sanitize_log_value(e),
-        )
-        await _notify_yookassa_recurring_failure(bot, sub, plan, price_to_charge, config, e)
-        error_content = getattr(e, "content", None)
-        error_code = (error_content or {}).get('code') if isinstance(error_content, dict) else None
-        _plog_yookassa_tech(
-            "TECH_RECURRING_ERROR",
-            ErrorClass=type(e).__name__,
-            ErrorCode=error_code,
-            Body=_encode_log_json(e.content) if isinstance(e.content, dict) else str(e),
-        )
-        if error_code == 'payment_method_not_found':
-            return 'deactivate', None, None, error_code
-        return 'integration_error', None, None, error_code
-    except (ForbiddenError, InternalServerError, TooManyRequestsError, UnauthorizedError) as e:
-        log.error(
-            "Failed to charge user %s. API Error: %s",
-            sub.user_id,
-            _sanitize_log_value(e),
-        )
-        await _notify_yookassa_recurring_failure(bot, sub, plan, price_to_charge, config, e)
-        _plog_yookassa_tech(
-            "TECH_RECURRING_ERROR",
-            ErrorClass=type(e).__name__,
-            Body=_encode_log_json(e.content) if isinstance(getattr(e, "content", None), dict) else str(e),
-        )
-        return 'provider_error', None, None, None
-    except Exception as e:
-        log.error(
-            "Unknown error during payment processing for user %s: %s",
-            sub.user_id,
-            _sanitize_log_value(e),
-        )
-        await _notify_yookassa_recurring_failure(bot, sub, plan, price_to_charge, config, e)
-        _plog_yookassa_tech(
-            "TECH_RECURRING_ERROR",
-            ErrorClass=type(e).__name__,
-            Body=str(e),
-        )
-        return 'provider_error', None, None, None
+    result = await execute_yookassa_recurring_attempt(
+        sub=sub,
+        plan=plan,
+        price_to_charge=price_to_charge,
+        config=config,
+        attempt_started_at=attempt_started_at,
+    )
+    if result.outcome == 'success':
+        return True, result.payment_id, result.payment_status, None
+    elif result.outcome == 'pending':
+        return 'pending', result.payment_id, result.payment_status, None
+    elif result.outcome == 'declined':
+        return False, result.payment_id, result.payment_status, result.failure_reason
+    elif result.outcome == 'deactivate':
+        # Guard G: DO NOT send generic recurring failure alert. Deactivation alert is sent separately.
+        return 'deactivate', None, None, result.failure_reason
+    else:
+        # provider_error or integration_error
+        if result.error:
+            await _notify_yookassa_recurring_failure(bot, sub, plan, price_to_charge, config, result.error)
+        return result.outcome, None, None, result.failure_reason
 
 
 async def check_subscriptions(bot: Bot):
@@ -911,7 +830,7 @@ async def check_subscriptions(bot: Bot):
                     final_price = plan_to_charge.price * (1 - current_discount / 100)
 
                     if sub.payment_provider == 'Yookassa' and sub.payment_method_id:
-                        attempt_started_at = sub.last_payment_attempt or now
+                        attempt_started_at = now
                         res, yk_payment_id, yk_payment_status, yk_failure_reason = await process_recurring_payment(
                             bot, sub, plan_to_charge, final_price, config, attempt_started_at
                         )
@@ -969,15 +888,17 @@ async def check_subscriptions(bot: Bot):
                         elif res == 'deactivate':
                             plog.warning(f"АВТОПРОДЛ_ОТКЛ | {user_ref} | причина: deactivate | {plan_to_charge.name}")
                             sub.auto_renewal = False
+                            sub.payment_method_id = None
+                            sub.last_payment_attempt = attempt_started_at
                             await session.commit()
                             await bot.send_message(sub.user_id,
-                                                   "Ваша подписка истекла. Ошибка при автоплатеже (ЮKassa) — автопродление отключено.\n\nПродлите подписку вручную в меню.",
+                                                   "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nПродлите подписку вручную в меню.",
                                                    reply_markup=subscribe_kb)
                             if config and config.notifications_enabled:
                                 for admin_id in all_admin_ids:
                                     try:
                                         await bot.send_message(admin_id,
-                                                                f"🚫 Автопродление отключено (отказ провайдера)\nПользователь: {user_ref}\nПровайдер: Yookassa")
+                                                               f"🚫 Автопродление отключено (карта недоступна в YooKassa)\nПользователь: {user_ref}\nПровайдер: Yookassa")
                                     except Exception:
                                         pass
                         elif res == 'provider_error':
