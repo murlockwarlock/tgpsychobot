@@ -32,6 +32,21 @@ from ..time_utils import format_msk, utc_now
 from .subscription_access import load_active_subscription
 from robokassa_signing import generate_robokassa_payment_url
 from error_reporting import sanitize_secret_values
+from subscription_renewal import (
+    calculate_renewal_details,
+    claim_yookassa_recurring_attempt,
+    execute_or_replay_yookassa_recurring_attempt,
+    execute_yookassa_recurring_attempt,
+    finalize_yookassa_payment_success,
+    finalize_yookassa_payment_canceled,
+    finalize_yookassa_attempt_no_payment,
+    transition_attempt_to_manual_review,
+    update_yookassa_attempt_pending,
+    update_yookassa_attempt_unknown,
+    mask_payment_method_id,
+)
+from subscription_retry_policy import can_retry_now, get_next_retry_at
+from subscription_dates import extend_subscription_end_date
 
 
 log = get_payments_logger("subscriptions")
@@ -77,7 +92,7 @@ async def show_subscription_info(client: MaxApiClient, chat_id: int, user_id: in
     async with async_session_maker() as session:
         active_subscription = await load_active_subscription(session, user_id, now)
     referral_enabled = bool(config and config.referral_enabled)
-    referral_btn_name = config.referral_sub_btn_name if config else "🤝 Реферальная программа"
+    referral_btn_name = getattr(config, "referral_sub_btn_name", "🤝 Реферальная программа") if config else "🤝 Реферальная программа"
     tg_link_line = (
         f"\n\n<b>Привязанный TG ID:</b> <code>{user.tg_user_id}</code>"
         if user.tg_user_id is not None
@@ -112,9 +127,24 @@ async def show_subscription_info(client: MaxApiClient, chat_id: int, user_id: in
                 f"Действует до: {format_msk(sub.end_date)} МСК"
                 f"{source_line}"
             )
-    elif user.subscription and user.subscription.end_date <= now and user.subscription.auto_renewal and user.subscription.payment_method_id:
+    elif (
+        user.subscription
+        and user.subscription.end_date <= now
+        and user.subscription.auto_renewal
+        and user.subscription.payment_method_id
+    ):
+        details = calculate_renewal_details(user, user.subscription)
+        plan_line = f"\n<b>Тариф:</b> {details.plan_name}" if details else ""
+        period_line = f"\n<b>Период:</b> {details.duration_text}" if details else ""
+        price_line = f"\n<b>Сумма к списанию:</b> {details.final_price:.2f} руб." if details else ""
+        attempts_count = details.attempt_count if details else user.subscription.payment_attempt_count
+        attempts_line = f"\n<b>Попыток списания:</b> {attempts_count} из 3"
         text = (
-            "<b>⚠️ Подписка истекла, ожидается оплата по автопродлению</b>\n\n"
+            "<b>⚠️ Подписка истекла, ожидается оплата по автопродлению</b>\n"
+            f"{plan_line}"
+            f"{period_line}"
+            f"{price_line}"
+            f"{attempts_line}\n\n"
             "Вы можете повторить списание вручную или оформить подписку заново."
         )
         await client.send_message(chat_id=chat_id, text=f"{text}{tg_link_line}", attachments=retry_subscription_keyboard())
@@ -534,3 +564,520 @@ async def show_referral_info(client: MaxApiClient, chat_id: int, user_id: int) -
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=inline_keyboard([main_menu_row()]))
     await _send_referral_templates(client, chat_id, link)
+
+
+async def cancel_retry(client: MaxApiClient, chat_id: int, user_id: int) -> None:
+    async with async_session_maker() as session:
+        sub = await session.scalar(
+            select(UserSubscription)
+            .where(UserSubscription.user_id == user_id)
+            .options(selectinload(UserSubscription.plan))
+        )
+        if not sub:
+            await client.send_message(chat_id=chat_id, text="Подписка не найдена.")
+            return
+        sub.auto_renewal = False
+        await session.commit()
+
+    await client.send_message(
+        chat_id=chat_id,
+        text="Автопродление отключено. Вы можете оформить подписку заново, выбрав подходящий тариф.",
+    )
+    await show_plans(client, chat_id, user_id)
+
+
+async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: int) -> None:
+    now = utc_now()
+    async with async_session_maker() as session:
+        user = await session.get(
+            User,
+            user_id,
+            options=[
+                selectinload(User.subscription)
+                .selectinload(UserSubscription.plan)
+                .selectinload(SubscriptionPlan.upgrades_to_plan),
+                selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans),
+            ],
+        )
+        config = await session.get(SubscriptionConfig, 1)
+        sub = user.subscription if user else None
+
+        if (
+            not sub
+            or not sub.auto_renewal
+            or not sub.payment_method_id
+            or sub.payment_attempt_count >= 3
+        ):
+            await client.send_message(chat_id=chat_id, text="Невозможно выполнить списание.")
+            return
+
+        if not can_retry_now(sub.payment_attempt_count, sub.last_payment_attempt, now, retry_not_before=getattr(sub, 'retry_not_before', None)):
+            next_retry_at = get_next_retry_at(sub.payment_attempt_count, sub.last_payment_attempt, retry_not_before=getattr(sub, 'retry_not_before', None))
+            next_retry_str = format_msk(next_retry_at) if next_retry_at else "позже"
+            await client.send_message(
+                chat_id=chat_id,
+                text=f"Повторное списание пока недоступно. Следующая попытка после {next_retry_str} МСК.",
+            )
+            return
+
+        renewal_details = calculate_renewal_details(user, sub)
+        if not renewal_details:
+            await client.send_message(chat_id=chat_id, text="Тариф не найден.")
+            return
+
+        plan_to_charge = renewal_details.plan_to_charge
+        final_price = renewal_details.final_price
+
+        # Provider dispatch
+        if sub.payment_provider == 'Robokassa':
+            new_payment = RobokassaPayment(user_id=user_id, plan_id=plan_to_charge.id, amount=final_price)
+            session.add(new_payment)
+            await session.commit()
+            log.info(
+                "РУЧНОЙ_РЕТРАЙ_ОТПРАВКА | %s | Robokassa | attempts=%s | amount=%.2f | parent_inv=%s | new_inv=%s",
+                user_id,
+                sub.payment_attempt_count,
+                final_price,
+                sub.payment_method_id or "none",
+                new_payment.id,
+            )
+
+            from scheduler import process_recurring_robokassa_payment
+            robokassa_res = await process_recurring_robokassa_payment(
+                config, plan_to_charge, final_price, sub.payment_method_id, new_payment.id
+            )
+            log.info(
+                "РУЧНОЙ_РЕТРАЙ_РЕЗУЛЬТАТ | %s | Robokassa | result=%s | new_inv=%s",
+                user_id,
+                robokassa_res,
+                new_payment.id,
+            )
+
+            if robokassa_res is True:
+                sub.pending_robokassa_invoice_id = new_payment.id
+                sub.payment_attempt_count += 1
+                sub.last_payment_attempt = now
+                await session.commit()
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="⏳ Запрос на списание отправлен в Robokassa. Ожидайте подтверждения оплаты.",
+                )
+                return
+            elif robokassa_res == 'deactivate':
+                sub.auto_renewal = False
+                sub.payment_attempt_count = 0
+                new_payment.status = 'request_deactivated'
+                await session.commit()
+                from .common import notify_telegram_admins
+                user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                await notify_telegram_admins(
+                    f"🚫 Автопродление отключено (Robokassa, MAX)\n"
+                    f"Пользователь: {user_ref}\n"
+                    f"Провайдер: Robokassa"
+                )
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Не удалось списать средства через Robokassa. Автопродление отключено.\n\nОформите подписку заново.",
+                )
+                await show_plans(client, chat_id, user_id)
+                return
+            elif robokassa_res == 'provider_error':
+                new_payment.status = 'request_provider_error'
+                sub.last_payment_attempt = now
+                await session.commit()
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Сервис Robokassa временно недоступен. Эта ошибка не засчитана как попытка списания.\n\nПопробуйте повторить запрос позже.",
+                )
+                return
+            else:
+                attempt_num = sub.payment_attempt_count + 1
+                sub.payment_attempt_count = attempt_num
+                sub.last_payment_attempt = now
+                new_payment.status = 'request_failed'
+                if attempt_num >= 3:
+                    sub.auto_renewal = False
+                    await session.commit()
+                    from .common import notify_telegram_admins
+                    user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                    await notify_telegram_admins(
+                        f"🚫 Автопродление отключено (3 попытки Robokassa, MAX)\n"
+                        f"Пользователь: {user_ref}\n"
+                        f"Провайдер: Robokassa"
+                    )
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Не удалось списать средства после 3 попыток через Robokassa. Автопродление отключено.\n\nОформите подписку заново.",
+                    )
+                    await show_plans(client, chat_id, user_id)
+                else:
+                    await session.commit()
+                    next_retry_at = get_next_retry_at(sub.payment_attempt_count, sub.last_payment_attempt)
+                    next_retry_str = format_msk(next_retry_at) if next_retry_at else "позже"
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text=f"Банк отклонил платёж (Robokassa). Попытка {attempt_num} из 3.\n\nСледующая попытка после {next_retry_str} МСК.",
+                    )
+                return
+
+        elif sub.payment_provider == 'Yookassa':
+            claim_res = await claim_yookassa_recurring_attempt(
+                session=session,
+                sub=sub,
+                plan=plan_to_charge,
+                price_to_charge=final_price,
+                client_context="max_manual_retry",
+                attempt_started_at=now,
+            )
+            if not claim_res.claimed:
+                if claim_res.attempt:
+                    if claim_res.attempt.status == "pending":
+                        await client.send_message(
+                            chat_id=chat_id,
+                            text="Запрос в ЮKassa принят и ожидает подтверждения оплаты. Мы проверяем статус операции.",
+                        )
+                    else:
+                        await client.send_message(
+                            chat_id=chat_id,
+                            text="Предыдущий платёж ещё обрабатывается шлюзом. Пожалуйста, подождите завершения операции.",
+                        )
+                else:
+                    await client.send_message(chat_id=chat_id, text="Повторное списание недоступно.")
+                return
+
+            attempt = claim_res.attempt
+            attempt_started_at = attempt.attempt_started_at
+
+            await client.send_message(chat_id=chat_id, text="Отправляем запрос на списание...")
+
+            if hasattr(session, "in_transaction") and session.in_transaction():
+                await session.commit()
+
+            res = await execute_or_replay_yookassa_recurring_attempt(
+                attempt, plan_to_charge.name, config, logger=log
+            )
+
+            if res.outcome == "success" and res.payment_id:
+                res_fin = await finalize_yookassa_payment_success(
+                    session=session,
+                    payment_id=res.payment_id,
+                    user_id=user_id,
+                    plan_id=plan_to_charge.id,
+                    amount=final_price,
+                    payment_method_id=sub.payment_method_id,
+                    is_recurring=True,
+                    recurring_attempt_key=attempt.idempotency_key,
+                    logger=log,
+                )
+                is_new, updated_sub = res_fin[0], res_fin[1]
+                action = getattr(res_fin, "action", "success")
+                rec_details = getattr(res_fin, "reconciliation_details", {})
+                if not is_new:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан. Подписка активна.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                if action == "manual_reconciliation_required":
+                    reason = rec_details.get("reason")
+                    charge_amount = rec_details.get("amount", final_price)
+                    from .common import notify_telegram_admins
+                    user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                    if reason == "subscription_unresolved":
+                        await notify_telegram_admins(
+                            f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА: ПОДПИСКА НЕ НАЙДЕНА (YooKassa, MAX manual)\n\n"
+                            f"Пользователь: {user_ref}\n"
+                            f"Сумма: {charge_amount:.2f} руб\n"
+                            f"PayId: {res.payment_id}\n"
+                            f"Попытка (Attempt ID): {rec_details.get('attempt_id')}\n"
+                            f"ID подписки: {rec_details.get('subscription_id')}\n"
+                            f"Тариф (Plan ID): {rec_details.get('paid_plan_id') or rec_details.get('plan_id')}\n"
+                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                        )
+                        await client.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
+                                f"Платёж отправлен на проверку администратору."
+                            ),
+                        )
+                        await show_subscription_info(client, chat_id, user_id)
+                        return
+                    else:
+                        paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
+                        curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                        await notify_telegram_admins(
+                            f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, MAX manual)\n\n"
+                            f"Пользователь: {user_ref}\n"
+                            f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                            f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                            f"Сумма: {charge_amount:.2f} руб\n"
+                            f"PayId: {res.payment_id}\n"
+                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                        )
+                        await client.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"⚠️ Мы получили оплату ({charge_amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                                f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                                f"Срок действия текущей подписки не был изменён автоматически."
+                            ),
+                        )
+                        await show_subscription_info(client, chat_id, user_id)
+                        return
+
+                end_date_ref = (updated_sub or sub).end_date
+                await client.send_message(
+                    chat_id=chat_id,
+                    text=f"✅ Подписка успешно продлена до {format_msk(end_date_ref)} МСК.",
+                )
+                from .common import notify_telegram_admins
+                user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                await notify_telegram_admins(
+                    f"🔔 Автопродление (YooKassa, MAX)!\n\n"
+                    f"Пользователь: {user_ref}\n"
+                    f"Тариф: {plan_to_charge.name}\n"
+                    f"Сумма: {final_price:.2f} руб\n"
+                    f"До: {format_msk(end_date_ref)} МСК\n"
+                    f"PayId: {res.payment_id}"
+                )
+                await show_subscription_info(client, chat_id, user_id)
+                return
+
+            elif res.outcome == "deactivate":
+                if res.payment_id:
+                    is_new, action, _ = await finalize_yookassa_payment_canceled(
+                        session=session,
+                        payment_id=res.payment_id,
+                        cancellation_reason=res.failure_reason,
+                        user_id=user_id,
+                        plan_id=plan_to_charge.id,
+                        amount=final_price,
+                        payment_method_id=sub.payment_method_id,
+                        attempt_started_at=attempt_started_at,
+                        force_deactivate=True,
+                        recurring_attempt_key=attempt.idempotency_key,
+                        logger=log,
+                    )
+                else:
+                    is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                        session=session,
+                        attempt_id=attempt.id,
+                        outcome="deactivate",
+                        error_code=res.failure_reason,
+                        error_message=str(res.error) if res.error else None,
+                        attempt_started_at=attempt_started_at,
+                        sub=sub,
+                        attempt=attempt,
+                        logger=log,
+                    )
+                    action = "deactivate"
+                if not is_new:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                if action in ("historical_canceled", "orphan_canceled"):
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                from .common import notify_telegram_admins
+                user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                await notify_telegram_admins(
+                    f"🚫 Автопродление отключено (карта недоступна в YooKassa, MAX)\n"
+                    f"Пользователь: {user_ref}\n"
+                    f"Провайдер: Yookassa"
+                )
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Сохранённый способ оплаты больше недоступен в ЮKassa. Автопродление отключено.\n\nПожалуйста, выберите тариф и оформите подписку заново.",
+                )
+                await show_plans(client, chat_id, user_id)
+                return
+
+            elif res.outcome == "manual_review":
+                is_new_mr, _ = await transition_attempt_to_manual_review(
+                    session=session,
+                    attempt_id=attempt.id,
+                    reason=res.failure_reason or "missing_or_corrupt_payload",
+                    logger=log,
+                )
+                if not is_new_mr:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                from .common import notify_telegram_admins
+                user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                await notify_telegram_admins(
+                    f"⚠️ Платёж YooKassa требует ручной проверки (manual_review, MAX)\n"
+                    f"Пользователь: {user_ref}\n"
+                    f"Тариф: {plan_to_charge.name}\n"
+                    f"AttemptId: {attempt.id}\n"
+                    f"Причина: {res.failure_reason or 'missing_or_corrupt_payload'}\n"
+                    f"Автопродление приостановлено."
+                )
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню.",
+                )
+                await show_plans(client, chat_id, user_id)
+                return
+
+            elif res.outcome == "pending":
+                if res.payment_id:
+                    await update_yookassa_attempt_pending(session, attempt.id, res.payment_id)
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Запрос в ЮKassa принят и ожидает подтверждения. Мы проверяем статус операции. Пока не отправляйте повторный запрос.",
+                )
+                return
+
+            elif res.outcome == "unknown":
+                await update_yookassa_attempt_unknown(
+                    session, attempt.id, error_code="unknown", error_message=res.failure_reason
+                )
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Платёжный шлюз ЮKassa обрабатывает запрос. Мы проверяем статус операции. Попробуйте снова позже.",
+                )
+                return
+
+            elif res.outcome == "integration_error":
+                is_new_ie, _ = await finalize_yookassa_attempt_no_payment(
+                    session=session,
+                    attempt_id=attempt.id,
+                    outcome="integration_error",
+                    error_code=res.failure_reason,
+                    error_message=str(res.error) if res.error else None,
+                    attempt_started_at=attempt_started_at,
+                    sub=sub,
+                    attempt=attempt,
+                    logger=log,
+                )
+                if not is_new_ie:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Ошибка интеграции с платёжным сервисом. Списание временно приостановлено. Мы уже разбираемся с проблемой.",
+                )
+                return
+
+            elif res.outcome in ("provider_error", "rate_limit", "auth_error"):
+                await update_yookassa_attempt_unknown(
+                    session, attempt.id, error_code=res.outcome, error_message=res.failure_reason
+                )
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Платёжный сервис ЮKassa временно недоступен или вернул ошибку. Эта ошибка не засчитана как попытка списания.\n\nПопробуйте повторить запрос позже.",
+                )
+                return
+
+            else:  # declined
+                if res.payment_id:
+                    is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
+                        session=session,
+                        payment_id=res.payment_id,
+                        cancellation_reason=res.failure_reason,
+                        user_id=user_id,
+                        plan_id=plan_to_charge.id,
+                        amount=final_price,
+                        payment_method_id=sub.payment_method_id,
+                        attempt_started_at=attempt_started_at,
+                        recurring_attempt_key=attempt.idempotency_key,
+                        logger=log,
+                    )
+                else:
+                    is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                        session=session,
+                        attempt_id=attempt.id,
+                        outcome="canceled",
+                        error_code=res.failure_reason,
+                        error_message=str(res.error) if res.error else None,
+                        attempt_started_at=attempt_started_at,
+                        sub=sub,
+                        attempt=attempt,
+                        logger=log,
+                    )
+                    action = "canceled"
+
+                if not is_new:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                if action in ("historical_canceled", "orphan_canceled"):
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                if action == "unknown_cancellation":
+                    from .common import notify_telegram_admins
+                    user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                    await notify_telegram_admins(
+                        f"⚠️ Автопродление приостановлено (неизвестная причина отмены YooKassa, MAX)\n"
+                        f"Пользователь: {user_ref}\nТариф: {plan_to_charge.name}\n"
+                        f"PayId: {res.payment_id}\nПричина: {res.failure_reason or 'не указана'}"
+                    )
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Не удалось выполнить списание (нестандартный ответ банка). Автопродление приостановлено во избежание повторных списаний. Пожалуйста, оформите подписку вручную.",
+                    )
+                    await show_plans(client, chat_id, user_id)
+                    return
+
+                attempt_num = (updated_sub or sub).payment_attempt_count
+                if attempt_num >= 3 or action == "deactivate":
+                    from .common import notify_telegram_admins
+                    user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                    await notify_telegram_admins(
+                        f"🚫 Автопродление отключено (3 попытки YooKassa, MAX)\n"
+                        f"Пользователь: {user_ref}\n"
+                        f"Провайдер: Yookassa"
+                    )
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Не удалось списать средства после 3 попыток. Автопродление отключено.\n\nОформите подписку заново.",
+                    )
+                    await show_plans(client, chat_id, user_id)
+                else:
+                    retry_nb = getattr(updated_sub or sub, 'retry_not_before', None)
+                    next_retry_at = get_next_retry_at(attempt_num, attempt_started_at, retry_not_before=retry_nb)
+                    next_retry_str = format_msk(next_retry_at) if next_retry_at else "позже"
+                    reason_txt = f" ({res.failure_reason})" if res.failure_reason else ""
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text=f"Банк отклонил платёж{reason_txt}. Попытка {attempt_num} из 3.\n\nСледующая попытка после {next_retry_str} МСК.",
+                    )
+                return
+
+        else:
+            await client.send_message(
+                chat_id=chat_id,
+                text="Платёжный провайдер подписки не поддерживает автоматическое списание.\n\nОформите подписку заново.",
+            )
+            return

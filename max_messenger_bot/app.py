@@ -882,8 +882,13 @@ class MaxBotApplication:
         if data == "sub_disable_renewal":
             await subscriptions_service.set_renewal(self.client, chat_id, user_id, False)
             return
-        if data == "sub_retry_now" or data == "sub_cancel_retry":
-            await subscriptions_service.show_subscription_info(self.client, chat_id, user_id)
+        if data == "sub_cancel_retry":
+            await self.client.answer_callback(callback.callback_id)
+            await subscriptions_service.cancel_retry(self.client, chat_id, user_id)
+            return
+        if data == "sub_retry_now":
+            await self.client.answer_callback(callback.callback_id)
+            await subscriptions_service.handle_max_manual_retry(self.client, chat_id, user_id)
             return
         if data == "referral_sub_info":
             await subscriptions_service.show_referral_info(self.client, chat_id, user_id)

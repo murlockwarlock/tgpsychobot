@@ -335,6 +335,7 @@ class UserSubscription(Base):
     payment_method_id = Column(String, nullable=True)
     pending_robokassa_invoice_id = Column(Integer, nullable=True)
     last_payment_attempt = Column(DateTime, nullable=True)
+    retry_not_before = Column(DateTime, nullable=True)
     payment_attempt_count = Column(Integer, default=0, nullable=False)
     user = relationship("User", back_populates="subscription")
     plan = relationship("SubscriptionPlan")
@@ -857,6 +858,123 @@ def _migrate_legacy_media_ownership(sync_conn) -> None:
     sync_conn.execute(text("DELETE FROM topic_media_deck"))
 
 
+def verify_yookassa_recurring_safety_schema(sync_conn) -> None:
+    """
+    Production startup and test safety verifier for YooKassa recurring charging.
+    Asserts presence and correct definition of:
+    1. user_subscriptions.retry_not_before column
+    2. yookassa_recurring_attempts.request_payload column
+    3. idx_unresolved_yookassa_attempt partial unique index with status IN ('claimed', 'pending', 'unknown')
+    """
+    from sqlalchemy import text, inspect as sa_inspect
+    insp = sa_inspect(sync_conn)
+
+    sub_columns = [c['name'] for c in insp.get_columns('user_subscriptions')]
+    if 'retry_not_before' not in sub_columns:
+        raise RuntimeError("Critical column user_subscriptions.retry_not_before is missing")
+
+    yk_attempt_cols = [c['name'] for c in insp.get_columns('yookassa_recurring_attempts')]
+    if 'request_payload' not in yk_attempt_cols:
+        raise RuntimeError("Critical column yookassa_recurring_attempts.request_payload is missing")
+
+    dialect_name = sync_conn.dialect.name
+    if dialect_name == "sqlite":
+        row = sync_conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_unresolved_yookassa_attempt'"
+        )).first()
+        if not row or not row[0]:
+            raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is missing in SQLite")
+        sql_def = row[0]
+    elif dialect_name == "postgresql":
+        row = sync_conn.execute(text(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'yookassa_recurring_attempts' AND indexname = 'idx_unresolved_yookassa_attempt'"
+        )).first()
+        if not row or not row[0]:
+            raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is missing in PostgreSQL")
+        sql_def = row[0]
+    else:
+        indexes = insp.get_indexes('yookassa_recurring_attempts')
+        idx_info = next((i for i in indexes if i['name'] == 'idx_unresolved_yookassa_attempt'), None)
+        if not idx_info or not idx_info.get('unique') or 'subscription_id' not in idx_info.get('column_names', []):
+            raise RuntimeError("Critical index idx_unresolved_yookassa_attempt verification failed")
+        return
+
+    import re
+    # 1. Structural check: Must be UNIQUE index
+    if not re.search(r'\bCREATE\s+UNIQUE\s+INDEX\b', sql_def, re.IGNORECASE):
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is not UNIQUE")
+
+    # 2. Structural check: Must index exactly subscription_id before WHERE
+    col_match = re.search(r'\(\s*["`]?subscription_id["`]?\s*\)\s+WHERE\b', sql_def, re.IGNORECASE)
+    if not col_match:
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt does not index subscription_id")
+
+    # 3. Structural check: Predicate after WHERE
+    where_match = re.search(r'\bWHERE\b', sql_def, re.IGNORECASE)
+    if not where_match:
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt missing WHERE clause")
+    where_clause = sql_def[where_match.end():].strip()
+
+    def _strip_outer_parens(s: str) -> str:
+        s = s.strip()
+        while s.startswith("(") and s.endswith(")"):
+            depth = 0
+            matched = False
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        matched = (i == len(s) - 1)
+                        break
+            if matched:
+                s = s[1:-1].strip()
+            else:
+                break
+        return s
+
+    pred = _strip_outer_parens(where_clause)
+
+    # Reject additional connectors, boolean logic, or negation anywhere in predicate
+    if re.search(r'\b(AND|OR|NOT)\b', pred, re.IGNORECASE) or "!=" in pred or "<>" in pred:
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt contains disallowed operator or connector")
+
+    # Match exact predicate structure:
+    # 1. IN form: status IN ('claimed', 'pending', 'unknown')
+    # 2. ANY form: (status)::text = ANY (ARRAY['claimed'::varchar, ...]::text[])
+    in_pattern = r'^\(*["`]?status["`]?\)*(?:::[a-zA-Z0-9_\s]+)?\s+IN\s*\((.+)\)$'
+    any_pattern = r'^\(*["`]?status["`]?\)*(?:::[a-zA-Z0-9_\s]+)?\s*=\s*ANY\s*\(\s*\(?\s*ARRAY\s*\[(.+?)\]\s*\)?(?:::text\[\]|::varchar\[\]|::character\s+varying\[\]|::[a-zA-Z0-9_\s\[\]]+)?\s*\)$'
+
+    match_in = re.match(in_pattern, pred, re.IGNORECASE)
+    match_any = re.match(any_pattern, pred, re.IGNORECASE)
+
+    if match_in:
+        items_raw = match_in.group(1)
+    elif match_any:
+        items_raw = match_any.group(1)
+    else:
+        raise RuntimeError(
+            f"Critical index idx_unresolved_yookassa_attempt predicate is not recognized: '{pred}'"
+        )
+
+    # Validate each item in the list
+    items = [item.strip() for item in items_raw.split(',')]
+    extracted_states = set()
+    for item in items:
+        item_match = re.match(r"^'([a-zA-Z0-9_]+)'(?:::text|::varchar|::character\s+varying)?$", item.strip(), re.IGNORECASE)
+        if not item_match:
+            raise RuntimeError(f"Critical index idx_unresolved_yookassa_attempt contains invalid state item: '{item}'")
+        extracted_states.add(item_match.group(1).lower())
+
+    expected_states = {"claimed", "pending", "unknown"}
+    if extracted_states != expected_states:
+        raise RuntimeError(
+            f"Critical index idx_unresolved_yookassa_attempt predicate has invalid states: {extracted_states}, "
+            f"expected exactly {expected_states}"
+        )
+
+
 async def init_db():
     async with engine.begin() as conn:
         await _acquire_database_init_lock(conn)
@@ -1131,6 +1249,24 @@ async def init_db():
 
             AutomationDialogueState.__table__.create(sync_conn, checkfirst=True)
             UserAIActivity.__table__.create(sync_conn, checkfirst=True)
+            YookassaRecurringAttempt.__table__.create(sync_conn, checkfirst=True)
+
+            sub_columns = [c['name'] for c in insp.get_columns('user_subscriptions')]
+            if 'retry_not_before' not in sub_columns:
+                sync_conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN retry_not_before TIMESTAMP"))
+
+            yk_attempt_cols = [c['name'] for c in insp.get_columns('yookassa_recurring_attempts')]
+            if 'request_payload' not in yk_attempt_cols:
+                sync_conn.execute(text("ALTER TABLE yookassa_recurring_attempts ADD COLUMN request_payload TEXT"))
+
+            # Create safety index if not exists (no swallowed exception)
+            sync_conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_yookassa_attempt "
+                "ON yookassa_recurring_attempts (subscription_id) "
+                "WHERE status IN ('claimed', 'pending', 'unknown')"
+            ))
+
+            verify_yookassa_recurring_safety_schema(sync_conn)
 
         await conn.run_sync(_check_and_migrate)
 
@@ -1571,6 +1707,38 @@ class YookassaPayment(Base):
     is_recurring = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     processed_at = Column(DateTime, nullable=True)
+
+
+class YookassaRecurringAttempt(Base):
+    __tablename__ = 'yookassa_recurring_attempts'
+    __table_args__ = (
+        Index(
+            'idx_unresolved_yookassa_attempt',
+            'subscription_id',
+            unique=True,
+            postgresql_where=text("status IN ('claimed', 'pending', 'unknown')"),
+            sqlite_where=text("status IN ('claimed', 'pending', 'unknown')"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    subscription_id = Column(Integer, ForeignKey('user_subscriptions.id'), nullable=False, index=True)
+    user_id = Column(BigInteger, ForeignKey('users.id'), nullable=False, index=True)
+    plan_id = Column(Integer, ForeignKey('subscription_plans.id'), nullable=False)
+    idempotency_key = Column(String, nullable=False, unique=True, index=True)
+    amount = Column(Float, nullable=False)
+    payment_method_id = Column(String, nullable=False)
+    request_payload = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default='claimed', index=True)
+    payment_id = Column(String, nullable=True, index=True)
+    attempt_started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_reconciled_at = Column(DateTime, nullable=True)
+    cancellation_reason = Column(String, nullable=True)
+    error_code = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    client_context = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class TopicMediaDeck(Base):
