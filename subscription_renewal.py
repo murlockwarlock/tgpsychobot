@@ -704,24 +704,43 @@ async def finalize_yookassa_payment_success(
         .execution_options(populate_existing=True)
         .with_for_update()
     )
-    if yk_payment and yk_payment.status == "completed" and yk_payment.processed_at:
-        # Already finalized: do not extend subscription twice!
-        if attempt and attempt.status != "succeeded":
-            attempt.status = "succeeded"
-            attempt.payment_id = payment_id
-            attempt.updated_at = now
-            await session.commit()
-        user_sub = None
-        target_uid = yk_payment.user_id or effective_uid
-        if target_sub_id:
-            user_sub = await session.get(
-                UserSubscription, target_sub_id, execution_options={"populate_existing": True}
-            )
-        elif target_uid:
-            user_sub = await session.scalar(
-                select(UserSubscription).where(UserSubscription.user_id == target_uid)
-            )
-        return FinalizePaymentSuccessResult(False, user_sub, action="already_processed")
+    if yk_payment and yk_payment.processed_at:
+        if yk_payment.status in ("canceled", "deactivated"):
+            # Terminal local conflict: canceled payment cannot be transitioned to completed!
+            if logger:
+                logger.warning(
+                    f"TECH_PAYMENT_TERMINAL_CONFLICT | payment_id={payment_id} | "
+                    f"local_status={yk_payment.status} | incoming_action=succeeded"
+                )
+            user_sub = None
+            target_uid = yk_payment.user_id or effective_uid
+            if target_sub_id:
+                user_sub = await session.get(
+                    UserSubscription, target_sub_id, execution_options={"populate_existing": True}
+                )
+            elif target_uid:
+                user_sub = await session.scalar(
+                    select(UserSubscription).where(UserSubscription.user_id == target_uid)
+                )
+            return FinalizePaymentSuccessResult(False, user_sub, action="already_processed")
+        elif yk_payment.status == "completed":
+            # Already finalized: do not extend subscription twice!
+            if attempt and attempt.status != "succeeded":
+                attempt.status = "succeeded"
+                attempt.payment_id = payment_id
+                attempt.updated_at = now
+                await session.commit()
+            user_sub = None
+            target_uid = yk_payment.user_id or effective_uid
+            if target_sub_id:
+                user_sub = await session.get(
+                    UserSubscription, target_sub_id, execution_options={"populate_existing": True}
+                )
+            elif target_uid:
+                user_sub = await session.scalar(
+                    select(UserSubscription).where(UserSubscription.user_id == target_uid)
+                )
+            return FinalizePaymentSuccessResult(False, user_sub, action="already_processed")
 
     if attempt:
         # Atomic CAS update on the attempt
@@ -758,7 +777,8 @@ async def finalize_yookassa_payment_success(
                 update(YookassaPayment)
                 .where(
                     YookassaPayment.payment_id == payment_id,
-                    or_(YookassaPayment.status != "completed", YookassaPayment.processed_at.is_(None)),
+                    YookassaPayment.status.notin_(["completed", "canceled", "deactivated"]),
+                    YookassaPayment.processed_at.is_(None),
                 )
                 .values(
                     status="completed",
@@ -905,15 +925,53 @@ async def finalize_yookassa_payment_success(
             SubscriptionPlan, user_sub.plan_id, execution_options={"populate_existing": True}
         )
 
-    plan_to_apply = paid_plan or current_sub_plan
-    if not plan_to_apply:
+    # Blocker 1: If exact attempt plan (or effective_plan_id) cannot be resolved:
+    # NEVER substitute current_sub_plan!
+    if not paid_plan and (attempt or effective_plan_id):
         if logger:
             logger.error(
                 f"TECH_RECURRING_PLAN_UNRESOLVED | payment_id={payment_id} | "
                 f"user_id={effective_uid} | plan_id={effective_plan_id}"
             )
+        rec_details = {
+            "payment_id": payment_id,
+            "paid_plan_id": effective_plan_id,
+            "paid_plan_name": f"Unknown (ID {effective_plan_id})",
+            "current_plan_id": user_sub.plan_id,
+            "current_plan_name": getattr(current_sub_plan, "name", "Unknown") if current_sub_plan else "Unknown",
+            "user_id": effective_uid,
+            "subscription_id": user_sub.id,
+            "amount": effective_amount,
+            "reason": "paid_plan_unresolved",
+        }
         await session.commit()
-        return FinalizePaymentSuccessResult(False, user_sub, action="error_unresolved_plan")
+        return FinalizePaymentSuccessResult(
+            True,
+            user_sub,
+            action="manual_reconciliation_required",
+            reconciliation_details=rec_details,
+        )
+
+    plan_to_apply = paid_plan or current_sub_plan
+    if not plan_to_apply:
+        rec_details = {
+            "payment_id": payment_id,
+            "paid_plan_id": effective_plan_id,
+            "paid_plan_name": f"Unknown (ID {effective_plan_id})",
+            "current_plan_id": user_sub.plan_id,
+            "current_plan_name": getattr(current_sub_plan, "name", "Unknown") if current_sub_plan else "Unknown",
+            "user_id": effective_uid,
+            "subscription_id": user_sub.id,
+            "amount": effective_amount,
+            "reason": "paid_plan_unresolved",
+        }
+        await session.commit()
+        return FinalizePaymentSuccessResult(
+            True,
+            user_sub,
+            action="manual_reconciliation_required",
+            reconciliation_details=rec_details,
+        )
 
     paid_ptc = (
         plan_to_apply.upgrades_to_plan
@@ -1058,25 +1116,44 @@ async def finalize_yookassa_payment_canceled(
         .execution_options(populate_existing=True)
         .with_for_update()
     )
-    if yk_payment and yk_payment.status == "canceled" and yk_payment.processed_at:
-        # Already finalized: do not increment attempts or deactivate twice!
-        if attempt and attempt.status not in ("canceled", "deactivated"):
-            attempt.status = target_terminal_status
-            attempt.payment_id = payment_id
-            attempt.cancellation_reason = cancellation_reason
-            attempt.updated_at = now
-            await session.commit()
-        user_sub = None
-        target_uid = yk_payment.user_id or effective_uid
-        if target_sub_id:
-            user_sub = await session.get(
-                UserSubscription, target_sub_id, execution_options={"populate_existing": True}
-            )
-        elif target_uid:
-            user_sub = await session.scalar(
-                select(UserSubscription).where(UserSubscription.user_id == target_uid)
-            )
-        return False, "already_processed", user_sub
+    if yk_payment and yk_payment.processed_at:
+        if yk_payment.status == "completed":
+            # Terminal local conflict: completed payment cannot be transitioned to canceled!
+            if logger:
+                logger.warning(
+                    f"TECH_PAYMENT_TERMINAL_CONFLICT | payment_id={payment_id} | "
+                    f"local_status=completed | incoming_action=canceled"
+                )
+            user_sub = None
+            target_uid = yk_payment.user_id or effective_uid
+            if target_sub_id:
+                user_sub = await session.get(
+                    UserSubscription, target_sub_id, execution_options={"populate_existing": True}
+                )
+            elif target_uid:
+                user_sub = await session.scalar(
+                    select(UserSubscription).where(UserSubscription.user_id == target_uid)
+                )
+            return False, "already_processed", user_sub
+        elif yk_payment.status in ("canceled", "deactivated"):
+            # Already finalized: do not increment attempts or deactivate twice!
+            if attempt and attempt.status not in ("canceled", "deactivated"):
+                attempt.status = target_terminal_status
+                attempt.payment_id = payment_id
+                attempt.cancellation_reason = cancellation_reason
+                attempt.updated_at = now
+                await session.commit()
+            user_sub = None
+            target_uid = yk_payment.user_id or effective_uid
+            if target_sub_id:
+                user_sub = await session.get(
+                    UserSubscription, target_sub_id, execution_options={"populate_existing": True}
+                )
+            elif target_uid:
+                user_sub = await session.scalar(
+                    select(UserSubscription).where(UserSubscription.user_id == target_uid)
+                )
+            return False, "already_processed", user_sub
 
     if attempt:
         stmt = (
@@ -1113,7 +1190,8 @@ async def finalize_yookassa_payment_canceled(
                 update(YookassaPayment)
                 .where(
                     YookassaPayment.payment_id == payment_id,
-                    or_(YookassaPayment.status != "canceled", YookassaPayment.processed_at.is_(None)),
+                    YookassaPayment.status.notin_(["completed", "canceled", "deactivated"]),
+                    YookassaPayment.processed_at.is_(None),
                 )
                 .values(
                     status="canceled",
@@ -1180,8 +1258,9 @@ async def finalize_yookassa_payment_canceled(
             except IntegrityError:
                 pass
         else:
-            yk_payment.status = "canceled"
-            yk_payment.processed_at = now
+            if yk_payment.status != "completed":
+                yk_payment.status = "canceled"
+                yk_payment.processed_at = now
 
     # Step 4: Reload fresh DB state for UserSubscription (Issue #1)
     user_sub = None

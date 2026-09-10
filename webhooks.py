@@ -199,7 +199,20 @@ async def handle_yookassa_webhook(request: web.Request):
         is_recurring_payment = str(metadata.get('recurring', '')).lower() == 'true'
         recurring_attempt_key = metadata.get('recurring_attempt_key') if isinstance(metadata, dict) else None
 
-        if event == 'payment.canceled' or payment_status == 'canceled':
+        # Diagnostic logging for mismatch between incoming event and authoritative GET status
+        expected_status_by_event = {
+            'payment.succeeded': 'succeeded',
+            'payment.canceled': 'canceled',
+            'payment.waiting_for_capture': 'waiting_for_capture',
+        }
+        expected_status = expected_status_by_event.get(event)
+        if expected_status and expected_status != payment_status:
+            log.warning(
+                f"YooKassa webhook event/status mismatch | payment_id={payment_id} | "
+                f"incoming_event={event} | verified_status={payment_status}"
+            )
+
+        if payment_status == 'canceled':
             cancellation_details = payment_object.get('cancellation_details') or {}
             cancellation_reason = cancellation_details.get('reason')
             raw_amount = float(payment_object.get('amount', {}).get('value', 0))

@@ -915,27 +915,62 @@ def verify_yookassa_recurring_safety_schema(sync_conn) -> None:
         raise RuntimeError("Critical index idx_unresolved_yookassa_attempt missing WHERE clause")
     where_clause = sql_def[where_match.end():].strip()
 
-    # Must NOT contain negation
-    if re.search(r'\bNOT\b', where_clause, re.IGNORECASE) or "!=" in where_clause or "<>" in where_clause:
-        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt contains negative predicate")
+    def _strip_outer_parens(s: str) -> str:
+        s = s.strip()
+        while s.startswith("(") and s.endswith(")"):
+            depth = 0
+            matched = False
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        matched = (i == len(s) - 1)
+                        break
+            if matched:
+                s = s[1:-1].strip()
+            else:
+                break
+        return s
 
-    # Must reference 'status'
-    if not re.search(r'\bstatus\b', where_clause, re.IGNORECASE):
-        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt predicate must filter on status")
+    pred = _strip_outer_parens(where_clause)
 
-    # Must use positive set membership (IN (...) or = ANY (...))
-    has_in = bool(re.search(r'\bIN\s*\(', where_clause, re.IGNORECASE))
-    has_any = bool(re.search(r'=\s*ANY\b', where_clause, re.IGNORECASE))
-    if not (has_in or has_any):
-        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt predicate does not use IN or = ANY")
+    # Reject additional connectors, boolean logic, or negation anywhere in predicate
+    if re.search(r'\b(AND|OR|NOT)\b', pred, re.IGNORECASE) or "!=" in pred or "<>" in pred:
+        raise RuntimeError("Critical index idx_unresolved_yookassa_attempt contains disallowed operator or connector")
 
-    # Extract literal states and verify exact match
-    quoted = re.findall(r"'([^']+)'", where_clause)
-    found_states = {s.lower() for s in quoted}
-    expected_states = {"claimed", "pending", "unknown"}
-    if found_states != expected_states:
+    # Match exact predicate structure:
+    # 1. IN form: status IN ('claimed', 'pending', 'unknown')
+    # 2. ANY form: (status)::text = ANY (ARRAY['claimed'::varchar, ...]::text[])
+    in_pattern = r'^\(*["`]?status["`]?\)*(?:::[a-zA-Z0-9_\s]+)?\s+IN\s*\((.+)\)$'
+    any_pattern = r'^\(*["`]?status["`]?\)*(?:::[a-zA-Z0-9_\s]+)?\s*=\s*ANY\s*\(\s*\(?\s*ARRAY\s*\[(.+?)\]\s*\)?(?:::text\[\]|::varchar\[\]|::character\s+varying\[\]|::[a-zA-Z0-9_\s\[\]]+)?\s*\)$'
+
+    match_in = re.match(in_pattern, pred, re.IGNORECASE)
+    match_any = re.match(any_pattern, pred, re.IGNORECASE)
+
+    if match_in:
+        items_raw = match_in.group(1)
+    elif match_any:
+        items_raw = match_any.group(1)
+    else:
         raise RuntimeError(
-            f"Critical index idx_unresolved_yookassa_attempt predicate has invalid states: {found_states}, "
+            f"Critical index idx_unresolved_yookassa_attempt predicate is not recognized: '{pred}'"
+        )
+
+    # Validate each item in the list
+    items = [item.strip() for item in items_raw.split(',')]
+    extracted_states = set()
+    for item in items:
+        item_match = re.match(r"^'([a-zA-Z0-9_]+)'(?:::text|::varchar|::character\s+varying)?$", item.strip(), re.IGNORECASE)
+        if not item_match:
+            raise RuntimeError(f"Critical index idx_unresolved_yookassa_attempt contains invalid state item: '{item}'")
+        extracted_states.add(item_match.group(1).lower())
+
+    expected_states = {"claimed", "pending", "unknown"}
+    if extracted_states != expected_states:
+        raise RuntimeError(
+            f"Critical index idx_unresolved_yookassa_attempt predicate has invalid states: {extracted_states}, "
             f"expected exactly {expected_states}"
         )
 

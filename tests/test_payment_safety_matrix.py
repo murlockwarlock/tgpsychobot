@@ -1899,7 +1899,7 @@ async def test_verify_yookassa_recurring_safety_schema_helper():
             "CREATE UNIQUE INDEX idx_unresolved_yookassa_attempt ON yookassa_recurring_attempts (subscription_id) "
             "WHERE status NOT IN ('claimed', 'pending', 'unknown')"
         ))
-        with pytest.raises(RuntimeError, match="negative predicate"):
+        with pytest.raises(RuntimeError, match="disallowed operator or connector"):
             await conn.run_sync(verify_yookassa_recurring_safety_schema)
         await conn.execute(text("DROP INDEX IF EXISTS idx_unresolved_yookassa_attempt"))
 
@@ -1918,6 +1918,33 @@ async def test_verify_yookassa_recurring_safety_schema_helper():
             "WHERE status IN ('claimed', 'pending', 'unknown', 'succeeded')"
         ))
         with pytest.raises(RuntimeError, match="invalid states"):
+            await conn.run_sync(verify_yookassa_recurring_safety_schema)
+        await conn.execute(text("DROP INDEX IF EXISTS idx_unresolved_yookassa_attempt"))
+
+        # 5d. Wrong predicate: AND 0=1 fails
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX idx_unresolved_yookassa_attempt ON yookassa_recurring_attempts (subscription_id) "
+            "WHERE status IN ('claimed', 'pending', 'unknown') AND 0=1"
+        ))
+        with pytest.raises(RuntimeError, match="disallowed operator or connector"):
+            await conn.run_sync(verify_yookassa_recurring_safety_schema)
+        await conn.execute(text("DROP INDEX IF EXISTS idx_unresolved_yookassa_attempt"))
+
+        # 5e. Wrong predicate: OR 1=1 fails
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX idx_unresolved_yookassa_attempt ON yookassa_recurring_attempts (subscription_id) "
+            "WHERE status IN ('claimed', 'pending', 'unknown') OR 1=1"
+        ))
+        with pytest.raises(RuntimeError, match="disallowed operator or connector"):
+            await conn.run_sync(verify_yookassa_recurring_safety_schema)
+        await conn.execute(text("DROP INDEX IF EXISTS idx_unresolved_yookassa_attempt"))
+
+        # 5f. Wrong predicate: extra column condition fails
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX idx_unresolved_yookassa_attempt ON yookassa_recurring_attempts (subscription_id) "
+            "WHERE status IN ('claimed', 'pending', 'unknown') AND user_id > 0"
+        ))
+        with pytest.raises(RuntimeError, match="disallowed operator or connector"):
             await conn.run_sync(verify_yookassa_recurring_safety_schema)
         await conn.execute(text("DROP INDEX IF EXISTS idx_unresolved_yookassa_attempt"))
 
@@ -3122,6 +3149,396 @@ async def test_ordinary_robokassa_result_url_happy_path_regression(test_db):
         # Zero YooKassa attempts
         attempts = (await session.scalars(select(YookassaRecurringAttempt).where(YookassaRecurringAttempt.subscription_id == 1508))).all()
         assert len(attempts) == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_attempt_unresolved_paid_plan_never_substitutes_current_plan(test_db):
+    """
+    Blocker 1 Regression:
+    Exact attempt:
+    - Plan A ID is authoritative (e.g. 1609);
+    - Plan A cannot be resolved (does not exist in DB);
+    - Current subscription is Plan B (id=1610);
+    Late success arrives.
+    Assert:
+    - Plan B untouched;
+    - end_date untouched;
+    - binding/retry state untouched;
+    - no fallback to Plan B as paid entitlement;
+    - real YookassaPayment remains auditable completed;
+    - exact attempt resolved consistently;
+    - is_new=True;
+    - action manual_reconciliation_required;
+    - reason paid_plan_unresolved;
+    - duplicate invocation returns is_new=False;
+    - admin reconciliation event belongs only to first owner.
+    """
+    initial_end = datetime(2026, 9, 20, 12, 0, 0)
+    async with test_db() as session:
+        u = User(id=1601, username="user1601", first_name="User1601")
+        # Only Plan B is created in DB. Plan A (1609) is NOT in DB.
+        plan_b = SubscriptionPlan(id=1610, name="Plan B", price=250.0, duration_value=1, duration_unit="months")
+        sub = UserSubscription(
+            id=1601,
+            user_id=1601,
+            plan_id=1610,
+            auto_renewal=True,
+            payment_provider="Yookassa",
+            payment_method_id="pm_curr_card",
+            payment_attempt_count=1,
+            last_payment_attempt=datetime(2026, 9, 10, 8, 0, 0),
+            retry_not_before=datetime(2026, 9, 11, 8, 0, 0),
+            end_date=initial_end,
+        )
+        att = YookassaRecurringAttempt(
+            id=1601,
+            subscription_id=1601,
+            user_id=1601,
+            plan_id=1609,  # Authoritative Plan A (unresolvable)
+            amount=150.0,  # Authoritative amount A
+            payment_method_id="pm_att_card",
+            idempotency_key="yk-rec-unres-1601",
+            status="claimed",
+        )
+        session.add_all([u, plan_b, sub, att])
+        await session.commit()
+
+    # First owner invocation:
+    async with test_db() as session:
+        res_fin = await finalize_yookassa_payment_success(
+            session=session,
+            payment_id="pay_unres_1601",
+            user_id=1601,
+            plan_id=1610,  # Caller passes Plan B, but exact attempt has Plan A (1609)
+            amount=250.0,
+            payment_method_id="pm_curr_card",
+            is_recurring=True,
+            recurring_attempt_key="yk-rec-unres-1601",
+        )
+        assert res_fin.is_new is True
+        assert res_fin.action == "manual_reconciliation_required"
+        details = res_fin.reconciliation_details
+        assert details.get("reason") == "paid_plan_unresolved"
+        assert details.get("payment_id") == "pay_unres_1601"
+        assert details.get("paid_plan_id") == 1609
+        assert details.get("amount") == 150.0
+        assert details.get("current_plan_id") == 1610
+
+    # Verify DB state:
+    async with test_db() as session:
+        final_sub = await session.get(UserSubscription, 1601)
+        assert final_sub.plan_id == 1610  # Plan B untouched!
+        assert final_sub.end_date == initial_end  # end_date untouched!
+        assert final_sub.payment_method_id == "pm_curr_card"  # Binding untouched!
+        assert final_sub.payment_attempt_count == 1  # Retry state untouched!
+        assert final_sub.retry_not_before == datetime(2026, 9, 11, 8, 0, 0)
+
+        # Payment remains auditable completed:
+        pay = await session.scalar(select(YookassaPayment).where(YookassaPayment.payment_id == "pay_unres_1601"))
+        assert pay is not None
+        assert pay.status == "completed"
+        assert pay.processed_at is not None
+
+        # Exact attempt resolved consistently:
+        db_att = await session.get(YookassaRecurringAttempt, 1601)
+        assert db_att.status == "succeeded"
+        assert db_att.payment_id == "pay_unres_1601"
+
+    # Duplicate invocation: returns is_new=False
+    async with test_db() as session:
+        res_dup = await finalize_yookassa_payment_success(
+            session=session,
+            payment_id="pay_unres_1601",
+            user_id=1601,
+            plan_id=1610,
+            amount=250.0,
+            payment_method_id="pm_curr_card",
+            is_recurring=True,
+            recurring_attempt_key="yk-rec-unres-1601",
+        )
+        assert res_dup.is_new is False
+        assert res_dup.action == "already_processed"
+
+
+@pytest.mark.asyncio
+async def test_webhook_forged_stale_cancel_event_with_verified_succeeded_status(test_db):
+    """
+    Blocker 3 Regression:
+    Incoming webhook event='payment.canceled', but verified GET from YooKassa has status='succeeded'.
+    Must follow verified status as SUCCEEDED, never cancel or downgrade payment/subscription.
+    """
+    from webhooks import handle_yookassa_webhook
+    from aiohttp.test_utils import make_mocked_request
+    from aiogram.fsm.storage.memory import MemoryStorage
+
+    async with test_db() as session:
+        u = User(id=1701, username="user1701", first_name="User1701")
+        p = SubscriptionPlan(id=1710, name="Standard Month", price=195.0, duration_value=1, duration_unit="months")
+        cfg = SubscriptionConfig(id=1, yookassa_shop_id="shop", yookassa_secret_key="sec", notifications_enabled=False)
+        sub = UserSubscription(
+            id=1701,
+            user_id=1701,
+            plan_id=1710,
+            auto_renewal=True,
+            payment_provider="Yookassa",
+            payment_method_id="pm_valid_card",
+            payment_attempt_count=1,
+            end_date=datetime(2026, 9, 15, 12, 0, 0),
+        )
+        session.add_all([u, p, cfg, sub])
+        await session.commit()
+
+    webhook_payload = {
+        "type": "notification",
+        "event": "payment.canceled",  # Forged or stale event
+        "object": {
+            "id": "pay_forged_cancel_1701",
+            "status": "succeeded",  # Verified provider status is succeeded!
+            "amount": {"value": "195.00", "currency": "RUB"},
+            "payment_method": {"id": "pm_new_card", "saved": True},
+            "metadata": {"user_id": "1701", "plan_id": "1710", "recurring": "false"},
+        },
+    }
+
+    mock_bot = AsyncMock()
+    mock_bot.id = 1
+    mock_req = make_mocked_request(
+        "POST",
+        "/yookassa/webhook",
+        headers={"Content-Type": "application/json"},
+        app={"bot": mock_bot, "fsm_storage": MemoryStorage()},
+    )
+    mock_req.json = AsyncMock(return_value=webhook_payload)
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value=webhook_payload["object"])
+    mock_get_cm = AsyncMock()
+    mock_get_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_get_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_http_session = AsyncMock()
+    mock_http_session.get = MagicMock(return_value=mock_get_cm)
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_http_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch("webhooks.async_session_maker", test_db),
+        patch("webhooks.send_msg_universal", AsyncMock()),
+        patch("aiohttp.ClientSession", MagicMock(return_value=mock_session_cm)),
+    ):
+        resp = await handle_yookassa_webhook(mock_req)
+        assert resp.status == 200
+
+    async with test_db() as session:
+        final_sub = await session.get(UserSubscription, 1701)
+        # Success path must be followed:
+        assert final_sub.end_date == datetime(2026, 10, 15, 12, 0, 0)
+        assert final_sub.auto_renewal is True  # NOT disabled!
+        assert final_sub.payment_method_id == "pm_new_card"  # NOT cleared!
+        assert final_sub.payment_attempt_count == 0  # Reset!
+
+        pay = await session.scalar(select(YookassaPayment).where(YookassaPayment.payment_id == "pay_forged_cancel_1701"))
+        assert pay is not None
+        assert pay.status == "completed"  # Not downgraded to canceled!
+
+
+@pytest.mark.asyncio
+async def test_webhook_opposite_mismatch_succeeded_event_with_verified_canceled_status(test_db):
+    """
+    Blocker 3 Regression:
+    Incoming webhook event='payment.succeeded', but verified GET has status='canceled'.
+    Must follow verified status as CANCELED.
+    """
+    from webhooks import handle_yookassa_webhook
+    from aiohttp.test_utils import make_mocked_request
+    from aiogram.fsm.storage.memory import MemoryStorage
+
+    async with test_db() as session:
+        u = User(id=1702, username="user1702", first_name="User1702")
+        p = SubscriptionPlan(id=1710, name="Standard Month", price=195.0, duration_value=1, duration_unit="months")
+        cfg = SubscriptionConfig(id=1, yookassa_shop_id="shop", yookassa_secret_key="sec", notifications_enabled=False)
+        sub = UserSubscription(
+            id=1702,
+            user_id=1702,
+            plan_id=1710,
+            auto_renewal=True,
+            payment_provider="Yookassa",
+            payment_method_id="pm_valid_card",
+            payment_attempt_count=0,
+            end_date=datetime(2026, 9, 15, 12, 0, 0),
+        )
+        session.add_all([u, p, cfg, sub])
+        await session.commit()
+
+    webhook_payload = {
+        "type": "notification",
+        "event": "payment.succeeded",  # Stale success notification
+        "object": {
+            "id": "pay_stale_succ_1702",
+            "status": "canceled",  # Verified provider status is canceled!
+            "cancellation_details": {"reason": "permission_revoked"},
+            "amount": {"value": "195.00", "currency": "RUB"},
+            "payment_method": {"id": "pm_valid_card", "saved": True},
+            "metadata": {"user_id": "1702", "plan_id": "1710", "recurring": "true"},
+        },
+    }
+
+    mock_bot = AsyncMock()
+    mock_bot.id = 1
+    mock_req = make_mocked_request(
+        "POST",
+        "/yookassa/webhook",
+        headers={"Content-Type": "application/json"},
+        app={"bot": mock_bot, "fsm_storage": MemoryStorage()},
+    )
+    mock_req.json = AsyncMock(return_value=webhook_payload)
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value=webhook_payload["object"])
+    mock_get_cm = AsyncMock()
+    mock_get_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_get_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_http_session = AsyncMock()
+    mock_http_session.get = MagicMock(return_value=mock_get_cm)
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_http_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch("webhooks.async_session_maker", test_db),
+        patch("webhooks.send_msg_universal", AsyncMock()),
+        patch("aiohttp.ClientSession", MagicMock(return_value=mock_session_cm)),
+    ):
+        resp = await handle_yookassa_webhook(mock_req)
+        assert resp.status == 200
+
+    async with test_db() as session:
+        final_sub = await session.get(UserSubscription, 1702)
+        # Cancellation path followed (permission_revoked terminal deactivation):
+        assert final_sub.auto_renewal is False
+        assert final_sub.payment_method_id is None
+        assert final_sub.end_date == datetime(2026, 9, 15, 12, 0, 0)  # NOT extended!
+
+
+@pytest.mark.asyncio
+async def test_terminal_local_conflict_completed_payment_called_with_cancel_finalizer(test_db):
+    """
+    Blocker 3 Regression:
+    Existing YookassaPayment(status='completed', processed_at != NULL).
+    Calling canceled finalizer must:
+    - keep status completed
+    - leave current subscription unchanged
+    - return is_new=False (caller does not become cancellation event owner).
+    """
+    processed_time = datetime(2026, 9, 10, 10, 0, 0)
+    async with test_db() as session:
+        u = User(id=1703, username="user1703", first_name="User1703")
+        p = SubscriptionPlan(id=1710, name="Standard Month", price=195.0, duration_value=1, duration_unit="months")
+        sub = UserSubscription(
+            id=1703,
+            user_id=1703,
+            plan_id=1710,
+            auto_renewal=True,
+            payment_provider="Yookassa",
+            payment_method_id="pm_saved_card",
+            payment_attempt_count=0,
+            end_date=datetime(2026, 10, 15, 12, 0, 0),
+        )
+        pay = YookassaPayment(
+            payment_id="pay_term_conflict_1703",
+            user_id=1703,
+            plan_id=1710,
+            amount=195.0,
+            status="completed",
+            processed_at=processed_time,
+        )
+        session.add_all([u, p, sub, pay])
+        await session.commit()
+
+    async with test_db() as session:
+        is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
+            session=session,
+            payment_id="pay_term_conflict_1703",
+            cancellation_reason="permission_revoked",
+            user_id=1703,
+            plan_id=1710,
+            amount=195.0,
+            is_recurring=False,
+        )
+        assert is_new is False
+        assert action == "already_processed"
+
+    async with test_db() as session:
+        final_pay = await session.scalar(select(YookassaPayment).where(YookassaPayment.payment_id == "pay_term_conflict_1703"))
+        assert final_pay.status == "completed"  # Completed remains completed!
+        assert final_pay.processed_at == processed_time
+
+        final_sub = await session.get(UserSubscription, 1703)
+        assert final_sub.auto_renewal is True  # Sub unchanged!
+        assert final_sub.payment_method_id == "pm_saved_card"
+        assert final_sub.payment_attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_local_conflict_canceled_payment_called_with_success_finalizer(test_db):
+    """
+    Blocker 3 Regression (Symmetrical):
+    Existing YookassaPayment(status='canceled', processed_at != NULL).
+    Calling success finalizer must:
+    - keep status canceled
+    - leave current subscription unchanged
+    - return is_new=False (caller does not become success event owner).
+    """
+    processed_time = datetime(2026, 9, 10, 10, 0, 0)
+    initial_end = datetime(2026, 9, 15, 12, 0, 0)
+    async with test_db() as session:
+        u = User(id=1704, username="user1704", first_name="User1704")
+        p = SubscriptionPlan(id=1710, name="Standard Month", price=195.0, duration_value=1, duration_unit="months")
+        sub = UserSubscription(
+            id=1704,
+            user_id=1704,
+            plan_id=1710,
+            auto_renewal=False,
+            payment_provider="Yookassa",
+            payment_method_id=None,
+            payment_attempt_count=3,
+            end_date=initial_end,
+        )
+        pay = YookassaPayment(
+            payment_id="pay_term_conflict_1704",
+            user_id=1704,
+            plan_id=1710,
+            amount=195.0,
+            status="canceled",
+            processed_at=processed_time,
+        )
+        session.add_all([u, p, sub, pay])
+        await session.commit()
+
+    async with test_db() as session:
+        res = await finalize_yookassa_payment_success(
+            session=session,
+            payment_id="pay_term_conflict_1704",
+            user_id=1704,
+            plan_id=1710,
+            amount=195.0,
+            is_recurring=False,
+        )
+        assert res.is_new is False
+        assert res.action == "already_processed"
+
+    async with test_db() as session:
+        final_pay = await session.scalar(select(YookassaPayment).where(YookassaPayment.payment_id == "pay_term_conflict_1704"))
+        assert final_pay.status == "canceled"  # Canceled remains canceled!
+        assert final_pay.processed_at == processed_time
+
+        final_sub = await session.get(UserSubscription, 1704)
+        assert final_sub.end_date == initial_end  # end_date NOT extended!
+        assert final_sub.auto_renewal is False
+        assert final_sub.payment_attempt_count == 3
+
 
 
 
