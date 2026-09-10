@@ -1142,14 +1142,48 @@ async def init_db():
             if 'request_payload' not in yk_attempt_cols:
                 sync_conn.execute(text("ALTER TABLE yookassa_recurring_attempts ADD COLUMN request_payload TEXT"))
 
-            try:
-                sync_conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_yookassa_attempt "
-                    "ON yookassa_recurring_attempts (subscription_id) "
-                    "WHERE status IN ('claimed', 'pending', 'unknown')"
-                ))
-            except Exception:
-                pass
+            # Create safety index if not exists (no swallowed exception)
+            sync_conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_yookassa_attempt "
+                "ON yookassa_recurring_attempts (subscription_id) "
+                "WHERE status IN ('claimed', 'pending', 'unknown')"
+            ))
+
+            # Fatal startup verification of idx_unresolved_yookassa_attempt
+            dialect_name = sync_conn.dialect.name
+            if dialect_name == "sqlite":
+                row = sync_conn.execute(text(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_unresolved_yookassa_attempt'"
+                )).first()
+                if not row or not row[0]:
+                    raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is missing in SQLite")
+                sql_def = row[0].upper()
+                if "UNIQUE" not in sql_def:
+                    raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is not UNIQUE")
+                if "SUBSCRIPTION_ID" not in sql_def:
+                    raise RuntimeError("Critical index idx_unresolved_yookassa_attempt does not index subscription_id")
+                for st in ("CLAIMED", "PENDING", "UNKNOWN"):
+                    if st not in sql_def:
+                        raise RuntimeError(f"Critical index idx_unresolved_yookassa_attempt missing predicate status {st}")
+            elif dialect_name == "postgresql":
+                row = sync_conn.execute(text(
+                    "SELECT indexdef FROM pg_indexes WHERE tablename = 'yookassa_recurring_attempts' AND indexname = 'idx_unresolved_yookassa_attempt'"
+                )).first()
+                if not row or not row[0]:
+                    raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is missing in PostgreSQL")
+                sql_def = row[0].upper()
+                if "UNIQUE" not in sql_def:
+                    raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is not UNIQUE")
+                if "SUBSCRIPTION_ID" not in sql_def:
+                    raise RuntimeError("Critical index idx_unresolved_yookassa_attempt does not index subscription_id")
+                for st in ("CLAIMED", "PENDING", "UNKNOWN"):
+                    if st not in sql_def:
+                        raise RuntimeError(f"Critical index idx_unresolved_yookassa_attempt missing predicate status {st}")
+            else:
+                indexes = insp.get_indexes('yookassa_recurring_attempts')
+                idx_info = next((i for i in indexes if i['name'] == 'idx_unresolved_yookassa_attempt'), None)
+                if not idx_info or not idx_info.get('unique') or 'subscription_id' not in idx_info.get('column_names', []):
+                    raise RuntimeError("Critical index idx_unresolved_yookassa_attempt verification failed")
 
         await conn.run_sync(_check_and_migrate)
 

@@ -196,6 +196,7 @@ async def handle_yookassa_webhook(request: web.Request):
         user_id_str = metadata.get('user_id')
         plan_id_raw = metadata.get('plan_id')
         is_recurring_payment = str(metadata.get('recurring', '')).lower() == 'true'
+        recurring_attempt_key = metadata.get('recurring_attempt_key') if isinstance(metadata, dict) else None
 
         if event == 'payment.canceled' or payment_status == 'canceled':
             cancellation_details = payment_object.get('cancellation_details') or {}
@@ -215,6 +216,7 @@ async def handle_yookassa_webhook(request: web.Request):
                     amount=raw_amount,
                     payment_method_id=pm_id,
                     is_recurring=is_recurring_payment,
+                    recurring_attempt_key=recurring_attempt_key,
                 )
                 config = await session.get(SubscriptionConfig, 1)
 
@@ -254,6 +256,28 @@ async def handle_yookassa_webhook(request: web.Request):
                             "Платёжный шлюз ЮKassa временно недоступен. Эта ошибка не засчитана как попытка списания.\n\n"
                             "Повторим попытку позже."
                         )
+                        return web.Response(status=200)
+
+                    elif action == 'unknown_cancellation':
+                        await send_msg_universal(
+                            bot,
+                            uid_int,
+                            "Не удалось выполнить автоматическое списание (нестандартный ответ банка). "
+                            "Автопродление приостановлено во избежание повторных списаний.\n\n"
+                            "Пожалуйста, оформите или продлите подписку вручную в меню бота."
+                        )
+                        if config and config.notifications_enabled:
+                            for admin_id in await get_all_admin_ids():
+                                try:
+                                    await bot.send_message(
+                                        admin_id,
+                                        f"⚠️ Автопродление приостановлено (неизвестный статус отмены YooKassa)\n"
+                                        f"Пользователь: {user_part}\nТариф: {plan_part}\nPayId: {payment_id}\n"
+                                        f"Причина отмены: {cancellation_reason or 'не указана'}\n"
+                                        f"Автопродление приостановлено, требуется действие пользователя."
+                                    )
+                                except Exception:
+                                    pass
                         return web.Response(status=200)
 
                     else:
@@ -325,6 +349,7 @@ async def handle_yookassa_webhook(request: web.Request):
                     amount=plan_price_for_notif,
                     payment_method_id=payment_method_id,
                     is_recurring=True,
+                    recurring_attempt_key=recurring_attempt_key,
                 )
                 plan = await session.get(SubscriptionPlan, plan_id)
                 if plan:
@@ -413,6 +438,7 @@ async def handle_yookassa_webhook(request: web.Request):
                 user_sub.payment_provider = 'Yookassa'
                 user_sub.payment_attempt_count = 0
                 user_sub.last_payment_attempt = None
+                user_sub.retry_not_before = None
                 user_sub.pending_robokassa_invoice_id = None
                 if effective_payment_method_id:
                     user_sub.payment_method_id = effective_payment_method_id
@@ -865,6 +891,7 @@ async def handle_robokassa_result(request: web.Request):
                 user_sub.pending_robokassa_invoice_id = None
                 user_sub.payment_attempt_count = 0
                 user_sub.last_payment_attempt = None
+                user_sub.retry_not_before = None
             else:
                 new_sub = UserSubscription(
                     user_id=payment.user_id,

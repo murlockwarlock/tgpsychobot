@@ -49,6 +49,7 @@ from subscription_renewal import (
     finalize_yookassa_payment_success,
     finalize_yookassa_payment_canceled,
     finalize_yookassa_attempt_no_payment,
+    transition_attempt_to_manual_review,
     transition_attempt_to_unknown_expired,
     update_yookassa_attempt_pending,
     update_yookassa_attempt_unknown,
@@ -477,6 +478,20 @@ async def check_subscriptions(bot: Bot):
         except Exception:
             pass
 
+        has_yookassa_creds = bool(
+            config and getattr(config, "yookassa_shop_id", None) and getattr(config, "yookassa_secret_key", None)
+        )
+        yookassa_incident_tripped = not has_yookassa_creds
+        if not has_yookassa_creds and should_send_auth_alert(now) and config and config.notifications_enabled:
+            for admin_id in all_admin_ids:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        "🚨 YooKassa Circuit Breaker: Отсутствуют shop_id или secret_key в настройках. Новые попытки списания в этом цикле пропущены."
+                    )
+                except Exception:
+                    pass
+
         # Reconcile unresolved YooKassa recurring attempts with bounded backoff
         unresolved_stmt = select(YookassaRecurringAttempt).where(
             YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"])
@@ -506,6 +521,9 @@ async def check_subscriptions(bot: Bot):
                                 )
                             except Exception:
                                 pass
+            elif not has_yookassa_creds:
+                # Do not churn existing unresolved attempt state merely because credentials are absent
+                continue
             elif should_reconcile_attempt(u_att, now):
                 plan_obj = await session.get(SubscriptionPlan, u_att.plan_id)
                 plan_name_rec = plan_obj.name if plan_obj else "Подписка"
@@ -526,6 +544,7 @@ async def check_subscriptions(bot: Bot):
                     plan_id=u_att.plan_id,
                     amount=u_att.amount,
                     is_recurring=True,
+                    recurring_attempt_key=u_att.idempotency_key,
                     logger=plog,
                 )
                 if is_new and updated_sub:
@@ -558,6 +577,7 @@ async def check_subscriptions(bot: Bot):
                         is_recurring=True,
                         attempt_started_at=u_att.attempt_started_at,
                         force_deactivate=True,
+                        recurring_attempt_key=u_att.idempotency_key,
                         logger=plog,
                     )
                 else:
@@ -588,6 +608,7 @@ async def check_subscriptions(bot: Bot):
                         amount=u_att.amount,
                         is_recurring=True,
                         attempt_started_at=u_att.attempt_started_at,
+                        recurring_attempt_key=u_att.idempotency_key,
                         logger=plog,
                     )
                 else:
@@ -601,6 +622,24 @@ async def check_subscriptions(bot: Bot):
                         attempt=u_att,
                         logger=plog,
                     )
+            elif rec_result.outcome == 'manual_review':
+                await transition_attempt_to_manual_review(
+                    session=session,
+                    attempt_id=u_att.id,
+                    reason=rec_result.failure_reason or "corrupt_or_missing_payload",
+                    logger=plog,
+                )
+                if config and config.notifications_enabled:
+                    for admin_id in all_admin_ids:
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                f"⚠️ YooKassa Reconciliation: попытка {u_att.id} требует ручной проверки (manual_review)\n"
+                                f"Пользователь: [id={u_att.user_id}]\n"
+                                f"Причина: {rec_result.failure_reason or 'corrupt_or_missing_payload'}"
+                            )
+                        except Exception:
+                            pass
             elif rec_result.outcome == 'integration_error':
                 await finalize_yookassa_attempt_no_payment(
                     session=session,
@@ -617,7 +656,11 @@ async def check_subscriptions(bot: Bot):
                     await update_yookassa_attempt_pending(session, u_att.id, rec_result.payment_id)
                 else:
                     await update_yookassa_attempt_unknown(session, u_att.id, error_code="pending", error_message="pending_without_id")
-            elif rec_result.outcome in ('unknown', 'provider_error', 'rate_limit', 'auth_error'):
+            elif rec_result.outcome == 'auth_error':
+                yookassa_incident_tripped = True
+                await update_yookassa_attempt_unknown(session, u_att.id, error_code="auth_error", error_message=rec_result.failure_reason)
+                break
+            elif rec_result.outcome in ('unknown', 'provider_error', 'rate_limit'):
                 await update_yookassa_attempt_unknown(session, u_att.id, error_code=rec_result.outcome, error_message=rec_result.failure_reason)
 
         if hasattr(session, "in_transaction") and session.in_transaction():
@@ -631,7 +674,7 @@ async def check_subscriptions(bot: Bot):
 
         result = await session.execute(stmt)
         subscriptions = result.scalars().all()
-        yookassa_incident_tripped = False
+        yookassa_incident_tripped = yookassa_incident_tripped or (not has_yookassa_creds)
 
         for sub in subscriptions:
             try:
@@ -805,6 +848,7 @@ async def check_subscriptions(bot: Bot):
                                 sub.pending_robokassa_invoice_id = None
                                 sub.payment_attempt_count = 0
                                 sub.last_payment_attempt = None
+                                sub.retry_not_before = None
                                 await session.commit()
                                 continue
                             ok_amount = float(pending_payment_ok.amount) if pending_payment_ok else 0.0
@@ -819,6 +863,7 @@ async def check_subscriptions(bot: Bot):
                                 ok_plan_name = ptc_ok.name
                             sub.payment_attempt_count = 0
                             sub.last_payment_attempt = None
+                            sub.retry_not_before = None
                             sub.pending_robokassa_invoice_id = None
                             if pending_payment_ok:
                                 pending_payment_ok.status = 'completed'
@@ -852,6 +897,7 @@ async def check_subscriptions(bot: Bot):
                                 sub.pending_robokassa_invoice_id = None
                                 sub.payment_attempt_count = 0
                                 sub.last_payment_attempt = None
+                                sub.retry_not_before = None
                                 await session.commit()
                                 continue
                             attempt_num_op = sub.payment_attempt_count
@@ -1029,6 +1075,7 @@ async def check_subscriptions(bot: Bot):
                                 amount=final_price,
                                 payment_method_id=sub.payment_method_id,
                                 is_recurring=True,
+                                recurring_attempt_key=att.idempotency_key,
                                 logger=plog,
                             )
                             if is_new and updated_sub:
@@ -1065,6 +1112,7 @@ async def check_subscriptions(bot: Bot):
                                     payment_method_id=sub.payment_method_id,
                                     attempt_started_at=att.attempt_started_at,
                                     force_deactivate=True,
+                                    recurring_attempt_key=att.idempotency_key,
                                     logger=plog,
                                 )
                             else:
@@ -1095,6 +1143,26 @@ async def check_subscriptions(bot: Bot):
                                             )
                                         except Exception:
                                             pass
+
+                        elif res.outcome == 'manual_review':
+                            await transition_attempt_to_manual_review(
+                                session=session,
+                                attempt_id=att.id,
+                                reason=res.failure_reason or "missing_or_corrupt_payload",
+                                logger=plog,
+                            )
+                            if config and config.notifications_enabled:
+                                for admin_id in all_admin_ids:
+                                    try:
+                                        await bot.send_message(
+                                            admin_id,
+                                            f"⚠️ Платёж YooKassa требует ручной проверки (manual_review)\n"
+                                            f"Пользователь: {user_ref}\nТариф: {plan_to_charge.name}\n"
+                                            f"AttemptId: {att.id}\nПричина: {res.failure_reason or 'missing_or_corrupt_payload'}\n"
+                                            f"Автопродление приостановлено."
+                                        )
+                                    except Exception:
+                                        pass
 
                         elif res.outcome == 'integration_error':
                             is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
@@ -1206,6 +1274,7 @@ async def check_subscriptions(bot: Bot):
                                     amount=final_price,
                                     payment_method_id=sub.payment_method_id,
                                     attempt_started_at=att.attempt_started_at,
+                                    recurring_attempt_key=att.idempotency_key,
                                     logger=plog,
                                 )
                             else:
@@ -1222,6 +1291,27 @@ async def check_subscriptions(bot: Bot):
                                 )
                                 action = "declined"
                             if is_new:
+                                if action == "unknown_cancellation":
+                                    plog.warning(
+                                        f"АВТОПРОДЛ_ПАУЗА_UNKNOWN | {user_ref} | PayId={res.payment_id or 'none'} | Reason={res.failure_reason or 'none'}"
+                                    )
+                                    user_msg_yk = (
+                                        "Не удалось выполнить автоматическое списание (нестандартный ответ банка). "
+                                        "Автопродление приостановлено. Пожалуйста, продлите подписку вручную в меню бота."
+                                    )
+                                    await bot.send_message(sub.user_id, user_msg_yk, reply_markup=subscribe_kb)
+                                    if config and config.notifications_enabled:
+                                        for admin_id in all_admin_ids:
+                                            try:
+                                                await bot.send_message(
+                                                    admin_id,
+                                                    f"⚠️ Автопродление приостановлено (неизвестная причина отмены YooKassa)\n"
+                                                    f"Пользователь: {user_ref}\nТариф: {plan_to_charge.name}\n"
+                                                    f"PayId: {res.payment_id}\nПричина: {res.failure_reason or 'не указана'}"
+                                                )
+                                            except Exception:
+                                                pass
+                                    continue
                                 att_count = getattr(updated_sub, 'payment_attempt_count', 0) if updated_sub else 0
                                 auto_off = getattr(updated_sub, 'auto_renewal', True) is False
                                 plog.warning(

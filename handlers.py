@@ -252,6 +252,7 @@ from subscription_renewal import (
     finalize_yookassa_payment_success,
     finalize_yookassa_payment_canceled,
     finalize_yookassa_attempt_no_payment,
+    transition_attempt_to_manual_review,
     update_yookassa_attempt_pending,
     update_yookassa_attempt_unknown,
     mask_payment_method_id,
@@ -10350,7 +10351,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     if res.outcome == 'success' and res.payment_id:
                         is_new, updated_sub = await finalize_yookassa_payment_success(
                             session, res.payment_id, user_id=user_id, plan_id=plan_to_charge.id,
-                            amount=final_price, is_recurring=True, logger=plog
+                            amount=final_price, is_recurring=True, recurring_attempt_key=att.idempotency_key, logger=plog
                         )
                         if is_new:
                             await bot.send_message(
@@ -10365,7 +10366,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             is_new, action, _ = await finalize_yookassa_payment_canceled(
                                 session, res.payment_id, cancellation_reason=res.failure_reason,
                                 user_id=user_id, plan_id=plan_to_charge.id, amount=final_price, is_recurring=True,
-                                force_deactivate=True, logger=plog
+                                force_deactivate=True, recurring_attempt_key=att.idempotency_key, logger=plog
                             )
                         else:
                             is_new, _ = await finalize_yookassa_attempt_no_payment(
@@ -10385,7 +10386,8 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         if res.payment_id:
                             is_new, action, _ = await finalize_yookassa_payment_canceled(
                                 session, res.payment_id, cancellation_reason=res.failure_reason,
-                                user_id=user_id, plan_id=plan_to_charge.id, amount=final_price, is_recurring=True, logger=plog
+                                user_id=user_id, plan_id=plan_to_charge.id, amount=final_price, is_recurring=True,
+                                recurring_attempt_key=att.idempotency_key, logger=plog
                             )
                         else:
                             is_new, _ = await finalize_yookassa_attempt_no_payment(
@@ -10393,10 +10395,26 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                 error_message=str(res.error) if res.error else None, attempt_started_at=att.attempt_started_at,
                                 sub=user_sub, attempt=att, logger=plog
                             )
+                            action = "declined"
                         if is_new:
-                            await bot.send_message(user_id, f"Не удалось списать средства ({res.failure_reason or 'отказ банка'}).")
+                            if action == "unknown_cancellation":
+                                await bot.send_message(
+                                    user_id,
+                                    "Не удалось провести оплату (нестандартный ответ банка). Автопродление приостановлено во избежание повторных списаний. Пожалуйста, оформите подписку вручную."
+                                )
+                            else:
+                                await bot.send_message(user_id, f"Не удалось списать средства ({res.failure_reason or 'отказ банка'}).")
                         else:
                             await bot.send_message(user_id, "Платёж уже обработан.")
+                        return
+                    elif res.outcome == 'manual_review':
+                        await transition_attempt_to_manual_review(
+                            session, att.id, reason=res.failure_reason or "corrupt_or_missing_payload", logger=plog
+                        )
+                        await bot.send_message(
+                            user_id,
+                            "Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню."
+                        )
                         return
                     elif res.outcome == 'integration_error':
                         await finalize_yookassa_attempt_no_payment(
@@ -10449,6 +10467,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     amount=final_price,
                     payment_method_id=user_sub.payment_method_id,
                     is_recurring=True,
+                    recurring_attempt_key=attempt.idempotency_key,
                     logger=plog,
                 )
                 pay_id_suffix = f" | PayId={res.payment_id}"
@@ -10483,6 +10502,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         payment_method_id=user_sub.payment_method_id,
                         attempt_started_at=attempt_started_at,
                         force_deactivate=True,
+                        recurring_attempt_key=attempt.idempotency_key,
                         logger=plog,
                     )
                 else:
@@ -10515,6 +10535,19 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                 pass
                 else:
                     await bot.send_message(user_id, "Платёж уже обработан. Способ оплаты был отключён.")
+
+            elif res.outcome == 'manual_review':
+                await transition_attempt_to_manual_review(
+                    session=session,
+                    attempt_id=attempt.id,
+                    reason=res.failure_reason or "missing_or_corrupt_payload",
+                    logger=plog,
+                )
+                await bot.send_message(
+                    user_id,
+                    "Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню."
+                )
+                return
 
             elif res.outcome == 'integration_error':
                 is_new, _ = await finalize_yookassa_attempt_no_payment(
@@ -10570,6 +10603,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         amount=final_price,
                         payment_method_id=user_sub.payment_method_id,
                         attempt_started_at=attempt_started_at,
+                        recurring_attempt_key=attempt.idempotency_key,
                         logger=plog,
                     )
                 else:
@@ -10586,6 +10620,12 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     )
                     action = "declined"
                 if is_new:
+                    if action == "unknown_cancellation":
+                        await bot.send_message(
+                            user_id,
+                            "Не удалось провести оплату (нестандартный ответ банка). Автопродление приостановлено во избежание повторных списаний. Пожалуйста, оформите подписку вручную."
+                        )
+                        return
                     attempt_num = user_sub.payment_attempt_count
                     pay_id_suffix = f" | PayId={res.payment_id}" if res.payment_id else ""
                     reason_suffix = f" | Причина={res.failure_reason}" if res.failure_reason else ""
