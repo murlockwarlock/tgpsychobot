@@ -537,7 +537,7 @@ async def check_subscriptions(bot: Bot):
                 u_att, plan_name_rec, config, logger=plog
             )
             if rec_result.outcome == 'success' and rec_result.payment_id:
-                is_new, updated_sub = await finalize_yookassa_payment_success(
+                res_fin = await finalize_yookassa_payment_success(
                     session=session,
                     payment_id=rec_result.payment_id,
                     user_id=u_att.user_id,
@@ -547,7 +547,38 @@ async def check_subscriptions(bot: Bot):
                     recurring_attempt_key=u_att.idempotency_key,
                     logger=plog,
                 )
-                if is_new and updated_sub:
+                is_new, updated_sub = res_fin[0], res_fin[1]
+                action = getattr(res_fin, "action", "success")
+                rec_details = getattr(res_fin, "reconciliation_details", {})
+                if is_new and action == "manual_reconciliation_required":
+                    paid_name = rec_details.get("paid_plan_name", plan_name_rec)
+                    curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                    await _send_deduplicated_notification(
+                        bot,
+                        u_att.user_id,
+                        f"⚠️ Мы получили оплату ({u_att.amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                        f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                        f"Срок действия текущей подписки не был изменён автоматически.",
+                        f"yk_cross_plan:{u_att.subscription_id}:{rec_result.payment_id}",
+                        now,
+                        window=timedelta(days=2),
+                    )
+                    if config and config.notifications_enabled:
+                        for admin_id in all_admin_ids:
+                            try:
+                                await bot.send_message(
+                                    admin_id,
+                                    f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, reconciliation)\n\n"
+                                    f"Пользователь: [id={u_att.user_id}]\n"
+                                    f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                                    f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                    f"Сумма: {u_att.amount:.2f} руб\n"
+                                    f"PayId: {rec_result.payment_id}\n"
+                                    f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                )
+                            except Exception:
+                                pass
+                elif is_new and updated_sub:
                     await _send_deduplicated_notification(
                         bot,
                         u_att.user_id,
@@ -623,13 +654,13 @@ async def check_subscriptions(bot: Bot):
                         logger=plog,
                     )
             elif rec_result.outcome == 'manual_review':
-                await transition_attempt_to_manual_review(
+                is_new_mr, _ = await transition_attempt_to_manual_review(
                     session=session,
                     attempt_id=u_att.id,
                     reason=rec_result.failure_reason or "corrupt_or_missing_payload",
                     logger=plog,
                 )
-                if config and config.notifications_enabled:
+                if is_new_mr and config and config.notifications_enabled:
                     for admin_id in all_admin_ids:
                         try:
                             await bot.send_message(
@@ -1067,7 +1098,7 @@ async def check_subscriptions(bot: Bot):
                         )
 
                         if res.outcome == 'success' and res.payment_id:
-                            is_new, updated_sub = await finalize_yookassa_payment_success(
+                            res_fin = await finalize_yookassa_payment_success(
                                 session=session,
                                 payment_id=res.payment_id,
                                 user_id=sub.user_id,
@@ -1078,7 +1109,39 @@ async def check_subscriptions(bot: Bot):
                                 recurring_attempt_key=att.idempotency_key,
                                 logger=plog,
                             )
-                            if is_new and updated_sub:
+                            is_new, updated_sub = res_fin[0], res_fin[1]
+                            action = getattr(res_fin, "action", "success")
+                            rec_details = getattr(res_fin, "reconciliation_details", {})
+                            if is_new and action == "manual_reconciliation_required":
+                                paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
+                                curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                                await _send_deduplicated_notification(
+                                    bot,
+                                    sub.user_id,
+                                    f"⚠️ Мы получили оплату ({final_price:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                                    f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                                    f"Срок действия текущей подписки не был изменён автоматически.",
+                                    f"yk_cross_plan:{sub.id}:{res.payment_id}",
+                                    now,
+                                    window=timedelta(days=2),
+                                    logger=plog,
+                                )
+                                if config and config.notifications_enabled:
+                                    for admin_id in all_admin_ids:
+                                        try:
+                                            await bot.send_message(
+                                                admin_id,
+                                                f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa)\n\n"
+                                                f"Пользователь: {user_ref}\n"
+                                                f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                                                f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                                f"Сумма: {final_price:.2f} руб\n"
+                                                f"PayId: {res.payment_id}\n"
+                                                f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                            )
+                                        except Exception:
+                                            pass
+                            elif is_new and updated_sub:
                                 plog.info(
                                     f"ПРОДЛЕНИЕ | Yookassa | {user_ref} | {plan_to_charge.name} | {final_price:.2f} руб | PayId={res.payment_id}"
                                 )
@@ -1145,13 +1208,13 @@ async def check_subscriptions(bot: Bot):
                                             pass
 
                         elif res.outcome == 'manual_review':
-                            await transition_attempt_to_manual_review(
+                            is_new_mr, _ = await transition_attempt_to_manual_review(
                                 session=session,
                                 attempt_id=att.id,
                                 reason=res.failure_reason or "missing_or_corrupt_payload",
                                 logger=plog,
                             )
-                            if config and config.notifications_enabled:
+                            if is_new_mr and config and config.notifications_enabled:
                                 for admin_id in all_admin_ids:
                                     try:
                                         await bot.send_message(
@@ -1176,7 +1239,7 @@ async def check_subscriptions(bot: Bot):
                                 attempt=att,
                                 logger=plog,
                             )
-                            if config and config.notifications_enabled:
+                            if is_new and config and config.notifications_enabled:
                                 await notify_admins_about_error(
                                     bot,
                                     title="Ошибка интеграции YooKassa (неверный запрос/параметры)",

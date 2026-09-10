@@ -21,6 +21,7 @@ from subscription_renewal import (
     finalize_yookassa_payment_success,
     finalize_yookassa_payment_canceled,
     classify_yookassa_cancellation_reason,
+    mark_unresolved_attempts_superseded,
     CancellationPolicy,
 )
 from error_reporting import notify_admins_about_error, sanitize_secret_values
@@ -341,7 +342,7 @@ async def handle_yookassa_webhook(request: web.Request):
 
         if is_recurring_payment:
             async with async_session_maker() as session:
-                is_new, user_sub = await finalize_yookassa_payment_success(
+                res = await finalize_yookassa_payment_success(
                     session=session,
                     payment_id=payment_id,
                     user_id=user_id,
@@ -351,6 +352,9 @@ async def handle_yookassa_webhook(request: web.Request):
                     is_recurring=True,
                     recurring_attempt_key=recurring_attempt_key,
                 )
+                is_new, user_sub = res[0], res[1]
+                action = getattr(res, "action", "success")
+                rec_details = getattr(res, "reconciliation_details", {})
                 plan = await session.get(SubscriptionPlan, plan_id)
                 if plan:
                     plan_name_for_notif = plan.name
@@ -358,6 +362,38 @@ async def handle_yookassa_webhook(request: web.Request):
 
             if not is_new:
                 plog.info(f"WEBHOOK_ДУБЛЬ | Yookassa | payment_id={payment_id} | status=completed")
+                return web.Response(status=200)
+
+            if action == "manual_reconciliation_required":
+                paid_name = rec_details.get("paid_plan_name", plan_name_for_notif)
+                curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                plog.warning(
+                    f"РЕКУРРЕНТ_ТАРИФ_НЕСОВПАДЕНИЕ | payment_id={payment_id} | "
+                    f"user_id={user_id} | paid_plan={paid_name} | current_plan={curr_name} | "
+                    f"amount={plan_price_for_notif:.2f} руб"
+                )
+                await send_msg_universal(
+                    bot,
+                    user_id,
+                    f"⚠️ Мы получили оплату ({plan_price_for_notif:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                    f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                    f"Срок действия текущей подписки не был изменён автоматически."
+                )
+                if config and config.notifications_enabled:
+                    for admin_id in await get_all_admin_ids():
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa)\n\n"
+                                f"Пользователь: {user_display}\n"
+                                f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                                f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                f"Сумма: {plan_price_for_notif:.2f} руб\n"
+                                f"PayId: {payment_id}\n"
+                                f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                            )
+                        except Exception:
+                            pass
                 return web.Response(status=200)
 
             plog.info(f"ПРОДЛЕНИЕ | Yookassa | [id={user_id}] | {plan_name_for_notif} | {plan_price_for_notif:.2f} руб | PayId={payment_id}")
@@ -432,6 +468,7 @@ async def handle_yookassa_webhook(request: web.Request):
             effective_payment_method_id = payment_method_id if (plan_allows_renewal and payment_method_saved) else None
 
             if user_sub:
+                await mark_unresolved_attempts_superseded(session, user_sub.id)
                 user_sub.plan_id = plan_id
                 user_sub.start_date = start_date
                 user_sub.end_date = end_date
@@ -878,6 +915,7 @@ async def handle_robokassa_result(request: web.Request):
             effective_payment_method_id = str(inv_id) if plan_allows_renewal else None
 
             if user_sub:
+                await mark_unresolved_attempts_superseded(session, user_sub.id)
                 user_sub.plan_id = payment.plan_id
                 user_sub.start_date = start_date
                 user_sub.end_date = end_date

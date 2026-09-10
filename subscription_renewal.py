@@ -28,7 +28,7 @@ except ModuleNotFoundError:
     TooManyRequestsError = type("TooManyRequestsError", (Exception,), {})
     UnauthorizedError = type("UnauthorizedError", (Exception,), {})
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -581,6 +581,53 @@ async def execute_yookassa_recurring_attempt(
     return await execute_or_replay_yookassa_recurring_attempt(attempt, plan_name, config, logger=logger)
 
 
+class FinalizePaymentSuccessResult(tuple):
+    """
+    Backwards-compatible 2-tuple (is_new, user_sub) that also exposes
+    .is_new, .user_sub, .action, and .reconciliation_details.
+    """
+    def __new__(
+        cls,
+        is_new: bool,
+        user_sub: UserSubscription | None,
+        action: str = "success",
+        reconciliation_details: dict[str, Any] | None = None,
+    ):
+        obj = super().__new__(cls, (is_new, user_sub))
+        obj.is_new = is_new
+        obj.user_sub = user_sub
+        obj.action = action
+        obj.reconciliation_details = reconciliation_details or {}
+        return obj
+
+    @property
+    def subscription(self) -> UserSubscription | None:
+        return self.user_sub
+
+
+async def mark_unresolved_attempts_superseded(
+    session: AsyncSession,
+    subscription_id: int,
+    now: datetime | None = None,
+) -> int:
+    """
+    Transitions all open recurring attempts ('claimed', 'pending', 'unknown')
+    for the given subscription to 'superseded'.
+    Must be called inside the canonical transaction applying a confirmed explicit purchase.
+    """
+    current_time = now or datetime.utcnow()
+    stmt = (
+        update(YookassaRecurringAttempt)
+        .where(
+            YookassaRecurringAttempt.subscription_id == subscription_id,
+            YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"]),
+        )
+        .values(status="superseded", updated_at=current_time)
+    )
+    res = await session.execute(stmt)
+    return getattr(res, "rowcount", 0)
+
+
 async def finalize_yookassa_payment_success(
     session: AsyncSession,
     payment_id: str,
@@ -591,12 +638,12 @@ async def finalize_yookassa_payment_success(
     is_recurring: bool = True,
     recurring_attempt_key: str | None = None,
     logger: logging.Logger | None = None,
-) -> tuple[bool, UserSubscription | None]:
+) -> FinalizePaymentSuccessResult:
     """
     Canonical exact-once finalization for a successful YooKassa payment.
     Shared by webhook, scheduler, TG manual, and MAX manual callers.
     Correlates exact attempt via payment_id or recurring_attempt_key.
-    Returns (is_newly_finalized, user_sub).
+    Returns FinalizePaymentSuccessResult(is_new, user_sub, action, reconciliation_details).
     """
     now = datetime.utcnow()
     yk_payment = await session.scalar(
@@ -611,7 +658,7 @@ async def finalize_yookassa_payment_success(
             sub = await session.scalar(
                 select(UserSubscription).where(UserSubscription.user_id == target_uid)
             )
-        return False, sub
+        return FinalizePaymentSuccessResult(False, sub, action="already_processed")
 
     effective_uid = (yk_payment.user_id if yk_payment else None) or user_id
     effective_plan_id = (yk_payment.plan_id if yk_payment else None) or plan_id
@@ -640,59 +687,177 @@ async def finalize_yookassa_payment_success(
         user_sub = await session.scalar(
             select(UserSubscription).where(UserSubscription.user_id == effective_uid).with_for_update()
         )
-        if user_sub:
-            plan = None
-            if effective_plan_id:
-                plan = await session.get(SubscriptionPlan, effective_plan_id)
-            plan_to_apply = plan or user_sub.plan
-            if plan_to_apply:
-                ptc = plan_to_apply.upgrades_to_plan if (getattr(plan_to_apply, "is_trial", False) and getattr(plan_to_apply, "upgrades_to_plan", None)) else plan_to_apply
-                user_sub.end_date = extend_subscription_end_date(
-                    user_sub.end_date,
-                    now,
-                    ptc.duration_value,
-                    ptc.duration_unit,
+
+    if not user_sub:
+        await session.commit()
+        return FinalizePaymentSuccessResult(True, None, action="success")
+
+    # Correlate exact attempt if recurring
+    attempt = None
+    if is_recurring:
+        attempt = await session.scalar(
+            select(YookassaRecurringAttempt)
+            .where(
+                YookassaRecurringAttempt.subscription_id == user_sub.id,
+                YookassaRecurringAttempt.payment_id == payment_id,
+            )
+            .order_by(YookassaRecurringAttempt.id.desc())
+        )
+        if not attempt and recurring_attempt_key:
+            attempt = await session.scalar(
+                select(YookassaRecurringAttempt)
+                .where(
+                    YookassaRecurringAttempt.subscription_id == user_sub.id,
+                    YookassaRecurringAttempt.idempotency_key == recurring_attempt_key,
                 )
-                user_sub.plan_id = ptc.id
+                .order_by(YookassaRecurringAttempt.id.desc())
+            )
+
+    newer_attempt_exists = False
+    if attempt:
+        newer_count = await session.scalar(
+            select(func.count(YookassaRecurringAttempt.id)).where(
+                YookassaRecurringAttempt.subscription_id == user_sub.id,
+                YookassaRecurringAttempt.id > attempt.id,
+            )
+        )
+        newer_attempt_exists = bool(newer_count and newer_count > 0)
+
+    prior_attempt_status = getattr(attempt, "status", None) if attempt else None
+    attempt_was_active = prior_attempt_status in ("claimed", "pending", "unknown")
+
+    attempt_owns_payment_binding = False
+    if not is_recurring:
+        attempt_owns_payment_binding = True
+    elif attempt:
+        if attempt_was_active and not newer_attempt_exists:
+            provider_matches = (user_sub.payment_provider == "Yookassa")
+            method_matches = (
+                user_sub.payment_method_id is not None
+                and user_sub.payment_method_id == attempt.payment_method_id
+            )
+            if provider_matches and method_matches:
+                attempt_owns_payment_binding = True
+    else:
+        provider_matches = (user_sub.payment_provider in ("Yookassa", None))
+        method_matches = (
+            not payment_method_id
+            or not user_sub.payment_method_id
+            or user_sub.payment_method_id == payment_method_id
+        )
+        active_att = await session.scalar(
+            select(YookassaRecurringAttempt.id).where(
+                YookassaRecurringAttempt.subscription_id == user_sub.id,
+                YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"]),
+            ).limit(1)
+        )
+        if provider_matches and method_matches and not active_att:
+            attempt_owns_payment_binding = True
+
+    # Resolve target paid plan
+    paid_plan = None
+    target_plan_id = effective_plan_id or (attempt.plan_id if attempt else None) or user_sub.plan_id
+    if target_plan_id:
+        paid_plan = await session.get(SubscriptionPlan, target_plan_id)
+    plan_to_apply = paid_plan or user_sub.plan
+
+    if not plan_to_apply:
+        if logger:
+            logger.error(
+                f"TECH_RECURRING_PLAN_UNRESOLVED | payment_id={payment_id} | "
+                f"user_id={effective_uid} | plan_id={target_plan_id}"
+            )
+        await session.commit()
+        return FinalizePaymentSuccessResult(False, user_sub, action="error_unresolved_plan")
+
+    paid_ptc = (
+        plan_to_apply.upgrades_to_plan
+        if (getattr(plan_to_apply, "is_trial", False) and getattr(plan_to_apply, "upgrades_to_plan", None))
+        else plan_to_apply
+    )
+
+    current_sub_plan = user_sub.plan
+    current_sub_ptc = (
+        current_sub_plan.upgrades_to_plan
+        if (current_sub_plan and getattr(current_sub_plan, "is_trial", False) and getattr(current_sub_plan, "upgrades_to_plan", None))
+        else current_sub_plan
+    )
+
+    is_same_effective_plan = (
+        (current_sub_ptc is not None and current_sub_ptc.id == paid_ptc.id)
+        or (user_sub.plan_id == paid_ptc.id)
+    )
+
+    attempt_owns_plan_state = (
+        attempt_owns_payment_binding
+        and prior_attempt_status != "superseded"
+        and is_same_effective_plan
+    )
+
+    if is_same_effective_plan or not is_recurring:
+        # Same effective plan (or fresh explicit purchase):
+        # 1. Extend end_date exactly once
+        user_sub.end_date = extend_subscription_end_date(
+            user_sub.end_date,
+            now,
+            paid_ptc.duration_value,
+            paid_ptc.duration_unit,
+        )
+        if attempt_owns_plan_state or not is_recurring:
+            user_sub.plan_id = paid_ptc.id
+
+        # 2. Update binding only if attempt owns payment binding (or not recurring)
+        if attempt_owns_payment_binding or not is_recurring:
             user_sub.payment_provider = "Yookassa"
             user_sub.payment_attempt_count = 0
             user_sub.last_payment_attempt = None
             user_sub.retry_not_before = None
-            # Preserve user's auto-renewal choice: do NOT force True if already False!
-            if not getattr(ptc, 'allow_auto_renewal', True):
+            user_sub.pending_robokassa_invoice_id = None
+            if not getattr(paid_ptc, 'allow_auto_renewal', True):
                 user_sub.auto_renewal = False
-            if payment_method_id:
-                user_sub.payment_method_id = payment_method_id
+            effective_pm = payment_method_id or getattr(attempt, 'payment_method_id', None)
+            if effective_pm:
+                user_sub.payment_method_id = effective_pm
 
-            # Exact correlation: 1) payment_id, 2) recurring_attempt_key
-            # Never fallback to arbitrary open attempt
-            attempt = None
-            if is_recurring:
-                attempt = await session.scalar(
-                    select(YookassaRecurringAttempt)
-                    .where(
-                        YookassaRecurringAttempt.subscription_id == user_sub.id,
-                        YookassaRecurringAttempt.payment_id == payment_id,
-                    )
-                    .order_by(YookassaRecurringAttempt.id.desc())
-                )
-                if not attempt and recurring_attempt_key:
-                    attempt = await session.scalar(
-                        select(YookassaRecurringAttempt)
-                        .where(
-                            YookassaRecurringAttempt.subscription_id == user_sub.id,
-                            YookassaRecurringAttempt.idempotency_key == recurring_attempt_key,
-                        )
-                        .order_by(YookassaRecurringAttempt.id.desc())
-                    )
+        if attempt:
+            attempt.status = "succeeded"
+            attempt.payment_id = payment_id
+            attempt.updated_at = now
 
-                if attempt:
-                    attempt.status = "succeeded"
-                    attempt.payment_id = payment_id
-                    attempt.updated_at = now
+        await session.commit()
+        return FinalizePaymentSuccessResult(True, user_sub, action="success")
+    else:
+        # Cross-plan late success:
+        # Paid plan differs from current plan!
+        # 1. Real payment remains recorded as completed (yk_payment already added/updated)
+        # 2. Resolve attempt historically
+        if attempt:
+            attempt.status = "succeeded"
+            attempt.payment_id = payment_id
+            attempt.updated_at = now
 
-    await session.commit()
-    return True, user_sub
+        # 3. DO NOT alter current user_sub.plan_id
+        # 4. DO NOT automatically extend user_sub.end_date using another tariff's duration
+        # 5. DO NOT overwrite current payment binding, provider, or retry state
+
+        rec_details = {
+            "payment_id": payment_id,
+            "paid_plan_id": paid_ptc.id if paid_ptc else target_plan_id,
+            "paid_plan_name": getattr(paid_ptc, "name", "Unknown"),
+            "current_plan_id": user_sub.plan_id,
+            "current_plan_name": getattr(current_sub_plan, "name", "Unknown") if current_sub_plan else "Unknown",
+            "user_id": effective_uid,
+            "subscription_id": user_sub.id,
+            "amount": effective_amount,
+        }
+
+        await session.commit()
+        return FinalizePaymentSuccessResult(
+            True,
+            user_sub,
+            action="manual_reconciliation_required",
+            reconciliation_details=rec_details,
+        )
 
 
 async def finalize_yookassa_payment_canceled(
@@ -714,7 +879,7 @@ async def finalize_yookassa_payment_canceled(
     Shared by webhook, scheduler, TG manual, and MAX manual callers.
     Requires a REAL YooKassa payment_id (never an idempotency key).
     Returns (is_newly_finalized, action, user_sub).
-    action is one of: 'deactivate', 'provider_error', 'limit_exceeded', 'declined', 'unknown_cancellation', 'already_processed'.
+    action is one of: 'deactivate', 'provider_error', 'limit_exceeded', 'declined', 'unknown_cancellation', 'historical_canceled', 'already_processed'.
     """
     if not payment_id or payment_id.startswith("yk-rec-"):
         raise ValueError(
@@ -771,14 +936,74 @@ async def finalize_yookassa_payment_canceled(
         user_sub = await session.scalar(
             select(UserSubscription).where(UserSubscription.user_id == effective_uid).with_for_update()
         )
-        if user_sub and is_recurring:
+
+    attempt = None
+    if user_sub and is_recurring:
+        # Exact correlation: 1) payment_id, 2) recurring_attempt_key
+        attempt = await session.scalar(
+            select(YookassaRecurringAttempt)
+            .where(
+                YookassaRecurringAttempt.subscription_id == user_sub.id,
+                YookassaRecurringAttempt.payment_id == payment_id,
+            )
+            .order_by(YookassaRecurringAttempt.id.desc())
+        )
+        if not attempt and recurring_attempt_key:
+            attempt = await session.scalar(
+                select(YookassaRecurringAttempt)
+                .where(
+                    YookassaRecurringAttempt.subscription_id == user_sub.id,
+                    YookassaRecurringAttempt.idempotency_key == recurring_attempt_key,
+                )
+                .order_by(YookassaRecurringAttempt.id.desc())
+            )
+
+        newer_attempt_exists = False
+        if attempt:
+            newer_count = await session.scalar(
+                select(func.count(YookassaRecurringAttempt.id)).where(
+                    YookassaRecurringAttempt.subscription_id == user_sub.id,
+                    YookassaRecurringAttempt.id > attempt.id,
+                )
+            )
+            newer_attempt_exists = bool(newer_count and newer_count > 0)
+
+        prior_attempt_status = getattr(attempt, "status", None) if attempt else None
+        attempt_was_active = prior_attempt_status in ("claimed", "pending", "unknown")
+
+        attempt_owns_payment_binding = False
+        if attempt:
+            if attempt_was_active and not newer_attempt_exists:
+                provider_matches = (user_sub.payment_provider == "Yookassa")
+                method_matches = (
+                    user_sub.payment_method_id is not None
+                    and user_sub.payment_method_id == attempt.payment_method_id
+                )
+                if provider_matches and method_matches:
+                    attempt_owns_payment_binding = True
+        else:
+            provider_matches = (user_sub.payment_provider in ("Yookassa", None))
+            method_matches = (
+                not payment_method_id
+                or not user_sub.payment_method_id
+                or user_sub.payment_method_id == payment_method_id
+            )
+            active_att = await session.scalar(
+                select(YookassaRecurringAttempt.id).where(
+                    YookassaRecurringAttempt.subscription_id == user_sub.id,
+                    YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"]),
+                ).limit(1)
+            )
+            if provider_matches and method_matches and not active_att:
+                attempt_owns_payment_binding = True
+
+        if attempt_owns_payment_binding:
             if policy == CancellationPolicy.TERMINAL_DEACTIVATE:
                 user_sub.auto_renewal = False
                 user_sub.payment_method_id = None
                 user_sub.last_payment_attempt = attempt_ts
                 action_taken = "deactivate"
             elif policy == CancellationPolicy.TEMPORARY_PROVIDER:
-                # Do not increment attempts
                 user_sub.last_payment_attempt = attempt_ts
                 action_taken = "provider_error"
             elif policy == CancellationPolicy.LIMIT_EXCEEDED:
@@ -789,47 +1014,24 @@ async def finalize_yookassa_payment_canceled(
                     user_sub.auto_renewal = False
                 action_taken = "limit_exceeded"
             elif policy == CancellationPolicy.UNKNOWN:
-                # Unknown cancellation reason:
-                # Do not increment retry attempt count
-                # Do not schedule blind +24h automatic charge
-                # Pause unattended auto-renewal
-                # Preserve payment_method_id (do NOT clear token or classify card as permanently invalid)
                 user_sub.auto_renewal = False
                 user_sub.last_payment_attempt = attempt_ts
                 action_taken = "unknown_cancellation"
             else:
-                # Declined
                 user_sub.payment_attempt_count += 1
                 user_sub.last_payment_attempt = attempt_ts
                 if user_sub.payment_attempt_count >= 3:
                     user_sub.auto_renewal = False
                 action_taken = "declined"
+        else:
+            # Historical or superseded attempt: zero mutations to current subscription binding/retry state
+            action_taken = "historical_canceled"
 
-            # Exact correlation: 1) payment_id, 2) recurring_attempt_key
-            # Never fallback to arbitrary open attempt
-            attempt = await session.scalar(
-                select(YookassaRecurringAttempt)
-                .where(
-                    YookassaRecurringAttempt.subscription_id == user_sub.id,
-                    YookassaRecurringAttempt.payment_id == payment_id,
-                )
-                .order_by(YookassaRecurringAttempt.id.desc())
-            )
-            if not attempt and recurring_attempt_key:
-                attempt = await session.scalar(
-                    select(YookassaRecurringAttempt)
-                    .where(
-                        YookassaRecurringAttempt.subscription_id == user_sub.id,
-                        YookassaRecurringAttempt.idempotency_key == recurring_attempt_key,
-                    )
-                    .order_by(YookassaRecurringAttempt.id.desc())
-                )
-
-            if attempt:
-                attempt.status = "deactivated" if action_taken == "deactivate" else "canceled"
-                attempt.payment_id = payment_id
-                attempt.cancellation_reason = cancellation_reason
-                attempt.updated_at = now
+        if attempt:
+            attempt.status = "deactivated" if policy == CancellationPolicy.TERMINAL_DEACTIVATE else "canceled"
+            attempt.payment_id = payment_id
+            attempt.cancellation_reason = cancellation_reason
+            attempt.updated_at = now
 
     await session.commit()
     return True, action_taken, user_sub
@@ -850,6 +1052,8 @@ async def finalize_yookassa_attempt_no_payment(
     Dedicated finalizer for outcomes where YooKassa rejected the request
     BEFORE creating a payment object (payment_id is None).
     NEVER creates a YookassaPayment row!
+    Validates exact subscription existence BEFORE executing terminal CAS.
+    If subscription is missing, fails closed without executing or committing terminal CAS.
     Uses cross-dialect atomic CAS on status IN ('claimed', 'pending', 'unknown') -> terminal_status.
     Only the CAS winner mutates the exact subscription matching attempt.subscription_id.
     Returns (is_newly_finalized, user_sub).
@@ -869,14 +1073,34 @@ async def finalize_yookassa_attempt_no_payment(
     if att is None and target_attempt_id is not None:
         att = await session.get(YookassaRecurringAttempt, target_attempt_id)
 
-    # If attempt was already terminal in memory
-    if att is not None and getattr(att, "status", None) in ("succeeded", "deactivated", "integration_error", "canceled", "unknown_expired", "manual_review"):
+    # If attempt was already terminal in memory or DB
+    if att is not None and getattr(att, "status", None) in (
+        "succeeded", "deactivated", "integration_error", "canceled", "unknown_expired", "manual_review", "superseded"
+    ):
         user_sub = sub if (sub and getattr(att, "subscription_id", None) == getattr(sub, "id", None)) else None
         return False, user_sub
 
+    # Resolve and validate exact target subscription BEFORE terminal CAS
+    sub_id = getattr(att, "subscription_id", None) if att else None
+    user_sub = None
+    if sub and sub_id and getattr(sub, "id", None) == sub_id:
+        user_sub = sub
+    elif sub_id:
+        user_sub = await session.get(UserSubscription, sub_id)
+
+    # Missing subscription: Fail closed!
+    # Do NOT execute terminal CAS! Do NOT commit terminal attempt!
+    if user_sub is None:
+        if logger:
+            logger.error(
+                f"TECH_RECURRING_ORPHAN_ATTEMPT | attempt_id={target_attempt_id} | "
+                f"subscription_id={sub_id} not found in user_subscriptions"
+            )
+        return False, None
+
+    # Only with exact valid subscription: perform conditional active -> terminal CAS
     is_new = True
     if target_attempt_id is not None and hasattr(session, "execute"):
-        # Cross-dialect atomic CAS transition
         stmt = (
             update(YookassaRecurringAttempt)
             .where(
@@ -893,53 +1117,31 @@ async def finalize_yookassa_attempt_no_payment(
         res = await session.execute(stmt)
         is_new = (getattr(res, "rowcount", 0) == 1)
     elif target_attempt_id is None and att is None:
-        return False, sub
-
-    # Update in-memory attempt attributes
-    if att is not None:
-        if hasattr(att, "status"):
-            att.status = terminal_status
-        if hasattr(att, "error_code"):
-            att.error_code = error_code
-        if hasattr(att, "error_message"):
-            att.error_message = error_message
-        if hasattr(att, "updated_at"):
-            att.updated_at = now
-
-    sub_id = getattr(att, "subscription_id", None) if att else None
-    if sub_id is None and target_attempt_id is not None:
-        fetched = await session.get(YookassaRecurringAttempt, target_attempt_id)
-        if fetched:
-            sub_id = fetched.subscription_id
-
-    user_sub = None
-    if sub and sub_id and getattr(sub, "id", None) == sub_id:
-        user_sub = sub
-    elif sub_id:
-        user_sub = await session.get(UserSubscription, sub_id)
-    elif sub and target_attempt_id is None:
-        user_sub = sub
+        return False, None
 
     if not is_new:
         return False, user_sub
 
+    # Update in-memory attempt attributes
+    if att is not None:
+        att.status = terminal_status
+        att.error_code = error_code
+        att.error_message = error_message
+        att.updated_at = now
+
     # Only CAS winner mutates exact subscription state
     attempt_ts = attempt_started_at or getattr(att, "attempt_started_at", None) or now
-    if user_sub:
-        if outcome == "deactivate":
-            user_sub.auto_renewal = False
-            user_sub.payment_method_id = None
-            user_sub.last_payment_attempt = attempt_ts
-        elif outcome == "integration_error":
-            # DO NOT increment payment_attempt_count
-            # DO NOT clear payment_method_id
-            # DO NOT disable auto_renewal as a card failure
-            user_sub.last_payment_attempt = attempt_ts
+    if outcome == "deactivate":
+        user_sub.auto_renewal = False
+        user_sub.payment_method_id = None
+        user_sub.last_payment_attempt = attempt_ts
+    elif outcome == "integration_error":
+        user_sub.last_payment_attempt = attempt_ts
+        user_sub.retry_not_before = attempt_ts + timedelta(hours=24)
+    else:
+        user_sub.last_payment_attempt = attempt_ts
+        if error_code == "payment_method_limit_exceeded":
             user_sub.retry_not_before = attempt_ts + timedelta(hours=24)
-        else:
-            user_sub.last_payment_attempt = attempt_ts
-            if error_code == "payment_method_limit_exceeded":
-                user_sub.retry_not_before = attempt_ts + timedelta(hours=24)
 
     if hasattr(session, "commit"):
         await session.commit()

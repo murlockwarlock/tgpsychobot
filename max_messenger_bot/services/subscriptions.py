@@ -758,7 +758,7 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
             )
 
             if res.outcome == "success" and res.payment_id:
-                is_new, updated_sub = await finalize_yookassa_payment_success(
+                res_fin = await finalize_yookassa_payment_success(
                     session=session,
                     payment_id=res.payment_id,
                     user_id=user_id,
@@ -769,10 +769,20 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     recurring_attempt_key=attempt.idempotency_key,
                     logger=log,
                 )
+                is_new, updated_sub = res_fin[0], res_fin[1]
+                action = getattr(res_fin, "action", "success")
                 if not is_new:
                     await client.send_message(
                         chat_id=chat_id,
                         text="Платёж уже обработан. Подписка активна.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                if action == "manual_reconciliation_required":
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="⚠️ Оплата получена за ваш предыдущий тариф. Поскольку сейчас выбран другой тариф, платёж отправлен на проверку администратору. Срок действия текущей подписки не был изменён автоматически.",
                     )
                     await show_subscription_info(client, chat_id, user_id)
                     return
@@ -845,12 +855,20 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                 return
 
             elif res.outcome == "manual_review":
-                await transition_attempt_to_manual_review(
+                is_new_mr, _ = await transition_attempt_to_manual_review(
                     session=session,
                     attempt_id=attempt.id,
                     reason=res.failure_reason or "missing_or_corrupt_payload",
                     logger=log,
                 )
+                if not is_new_mr:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
                 from .common import notify_telegram_admins
                 user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
                 await notify_telegram_admins(
@@ -888,7 +906,7 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                 return
 
             elif res.outcome == "integration_error":
-                await finalize_yookassa_attempt_no_payment(
+                is_new_ie, _ = await finalize_yookassa_attempt_no_payment(
                     session=session,
                     attempt_id=attempt.id,
                     outcome="integration_error",
@@ -899,6 +917,14 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     attempt=attempt,
                     logger=log,
                 )
+                if not is_new_ie:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
                 await client.send_message(
                     chat_id=chat_id,
                     text="Ошибка интеграции с платёжным сервисом. Списание временно приостановлено. Мы уже разбираемся с проблемой.",

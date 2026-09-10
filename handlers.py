@@ -10349,11 +10349,18 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         await session.commit()
                     res = await execute_or_replay_yookassa_recurring_attempt(att, plan_to_charge.name, config, logger=plog)
                     if res.outcome == 'success' and res.payment_id:
-                        is_new, updated_sub = await finalize_yookassa_payment_success(
+                        res_fin = await finalize_yookassa_payment_success(
                             session, res.payment_id, user_id=user_id, plan_id=plan_to_charge.id,
                             amount=final_price, is_recurring=True, recurring_attempt_key=att.idempotency_key, logger=plog
                         )
-                        if is_new:
+                        is_new, updated_sub = res_fin[0], res_fin[1]
+                        action = getattr(res_fin, "action", "success")
+                        if is_new and action == "manual_reconciliation_required":
+                            await bot.send_message(
+                                user_id,
+                                "⚠️ Оплата получена за ваш предыдущий тариф. Поскольку сейчас выбран другой тариф, платёж отправлен на проверку администратору. Срок действия текущей подписки не был изменён автоматически."
+                            )
+                        elif is_new:
                             await bot.send_message(
                                 user_id,
                                 f"✅ Подписка продлена до {user_sub.end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M')} МСК."
@@ -10408,21 +10415,27 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             await bot.send_message(user_id, "Платёж уже обработан.")
                         return
                     elif res.outcome == 'manual_review':
-                        await transition_attempt_to_manual_review(
+                        is_new_mr, _ = await transition_attempt_to_manual_review(
                             session, att.id, reason=res.failure_reason or "corrupt_or_missing_payload", logger=plog
                         )
-                        await bot.send_message(
-                            user_id,
-                            "Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню."
-                        )
+                        if is_new_mr:
+                            await bot.send_message(
+                                user_id,
+                                "Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню."
+                            )
+                        else:
+                            await bot.send_message(user_id, "Платёж уже обработан.")
                         return
                     elif res.outcome == 'integration_error':
-                        await finalize_yookassa_attempt_no_payment(
+                        is_new_ie, _ = await finalize_yookassa_attempt_no_payment(
                             session, att.id, outcome="integration_error", error_code=res.failure_reason,
                             error_message=str(res.error) if res.error else None, attempt_started_at=att.attempt_started_at,
                             sub=user_sub, attempt=att, logger=plog
                         )
-                        await bot.send_message(user_id, "Произошла ошибка при обработке запроса. Попробуйте снова позже.")
+                        if is_new_ie:
+                            await bot.send_message(user_id, "Произошла ошибка при обработке запроса. Попробуйте снова позже.")
+                        else:
+                            await bot.send_message(user_id, "Платёж уже обработан.")
                         return
                     else:
                         await bot.send_message(
