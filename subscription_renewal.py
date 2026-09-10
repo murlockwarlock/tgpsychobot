@@ -718,7 +718,7 @@ async def finalize_yookassa_payment_success(
                 user_sub = await session.get(
                     UserSubscription, target_sub_id, execution_options={"populate_existing": True}
                 )
-            elif target_uid:
+            elif not attempt and target_uid:
                 user_sub = await session.scalar(
                     select(UserSubscription).where(UserSubscription.user_id == target_uid)
                 )
@@ -736,7 +736,7 @@ async def finalize_yookassa_payment_success(
                 user_sub = await session.get(
                     UserSubscription, target_sub_id, execution_options={"populate_existing": True}
                 )
-            elif target_uid:
+            elif not attempt and target_uid:
                 user_sub = await session.scalar(
                     select(UserSubscription).where(UserSubscription.user_id == target_uid)
                 )
@@ -860,7 +860,7 @@ async def finalize_yookassa_payment_success(
             execution_options={"populate_existing": True},
             with_for_update=True,
         )
-    elif effective_uid:
+    elif not attempt and effective_uid:
         user_sub = await session.scalar(
             select(UserSubscription)
             .where(UserSubscription.user_id == effective_uid)
@@ -869,8 +869,29 @@ async def finalize_yookassa_payment_success(
         )
 
     if not user_sub:
+        rec_details = {
+            "reason": "subscription_unresolved",
+            "payment_id": payment_id,
+            "attempt_id": getattr(attempt, "id", None) if attempt else None,
+            "subscription_id": target_sub_id,
+            "user_id": effective_uid,
+            "plan_id": effective_plan_id,
+            "paid_plan_id": effective_plan_id,
+            "amount": effective_amount,
+        }
+        if logger:
+            logger.error(
+                f"TECH_RECURRING_SUBSCRIPTION_UNRESOLVED | payment_id={payment_id} | "
+                f"attempt_id={rec_details.get('attempt_id')} | "
+                f"subscription_id={target_sub_id} | user_id={effective_uid}"
+            )
         await session.commit()
-        return FinalizePaymentSuccessResult(True, None, action="success")
+        return FinalizePaymentSuccessResult(
+            True,
+            None,
+            action="manual_reconciliation_required",
+            reconciliation_details=rec_details,
+        )
 
     # Step 5: Check ownership on fresh DB state
     newer_attempt_exists = False
@@ -1130,7 +1151,7 @@ async def finalize_yookassa_payment_canceled(
                 user_sub = await session.get(
                     UserSubscription, target_sub_id, execution_options={"populate_existing": True}
                 )
-            elif target_uid:
+            elif not attempt and target_uid:
                 user_sub = await session.scalar(
                     select(UserSubscription).where(UserSubscription.user_id == target_uid)
                 )
@@ -1149,7 +1170,7 @@ async def finalize_yookassa_payment_canceled(
                 user_sub = await session.get(
                     UserSubscription, target_sub_id, execution_options={"populate_existing": True}
                 )
-            elif target_uid:
+            elif not attempt and target_uid:
                 user_sub = await session.scalar(
                     select(UserSubscription).where(UserSubscription.user_id == target_uid)
                 )
@@ -1233,6 +1254,18 @@ async def finalize_yookassa_payment_canceled(
                     )
                 return False, "already_processed", sub
 
+    if not is_recurring:
+        # Ordinary checkout cancellation: exact-once payment recorded, NEVER apply recurring failure policy
+        user_sub = None
+        if effective_uid:
+            user_sub = await session.scalar(
+                select(UserSubscription)
+                .where(UserSubscription.user_id == effective_uid)
+                .execution_options(populate_existing=True)
+            )
+        await session.commit()
+        return True, "ordinary_canceled", user_sub
+
     # Persist/update YookassaPayment record if attempt was correlated
     if attempt:
         yk_payment = await session.scalar(
@@ -1271,7 +1304,7 @@ async def finalize_yookassa_payment_canceled(
             execution_options={"populate_existing": True},
             with_for_update=True,
         )
-    elif effective_uid:
+    elif not attempt and effective_uid:
         user_sub = await session.scalar(
             select(UserSubscription)
             .where(UserSubscription.user_id == effective_uid)
@@ -1280,8 +1313,14 @@ async def finalize_yookassa_payment_canceled(
         )
 
     if not user_sub:
+        if logger:
+            logger.warning(
+                f"TECH_RECURRING_CANCELED_ORPHAN | payment_id={payment_id} | "
+                f"attempt_id={getattr(attempt, 'id', None)} | "
+                f"subscription_id={target_sub_id} | user_id={effective_uid}"
+            )
         await session.commit()
-        return True, policy.value, None
+        return True, "orphan_canceled", None
 
     # Step 5: Check binding ownership on fresh DB state
     newer_attempt_exists = False

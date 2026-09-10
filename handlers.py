@@ -10357,30 +10357,56 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         action = getattr(res_fin, "action", "success")
                         rec_details = getattr(res_fin, "reconciliation_details", {})
                         if is_new and action == "manual_reconciliation_required":
-                            paid_name = rec_details.get("paid_plan_name", "предыдущий тариф")
-                            curr_name = rec_details.get("current_plan_name", "текущий тариф")
-                            await bot.send_message(
-                                user_id,
-                                f"⚠️ Мы получили оплату ({rec_details.get('amount', final_price):.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                                f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                                f"Срок действия текущей подписки не был изменён автоматически."
-                            )
-                            cfg = await session.get(SubscriptionConfig, 1)
-                            if cfg and cfg.notifications_enabled:
-                                for admin_id in await get_all_admin_ids():
-                                    try:
-                                        await bot.send_message(
-                                            admin_id,
-                                            f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, Telegram manual replay)\n\n"
-                                            f"Пользователь: {user_ref}\n"
-                                            f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
-                                            f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
-                                            f"Сумма: {rec_details.get('amount', final_price):.2f} руб\n"
-                                            f"PayId: {res.payment_id}\n"
-                                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
-                                        )
-                                    except Exception:
-                                        pass
+                            reason = rec_details.get("reason")
+                            charge_amount = rec_details.get("amount", final_price)
+                            if reason == "subscription_unresolved":
+                                await bot.send_message(
+                                    user_id,
+                                    f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
+                                    f"Платёж отправлен на проверку администратору."
+                                )
+                                cfg = await session.get(SubscriptionConfig, 1)
+                                if cfg and cfg.notifications_enabled:
+                                    for admin_id in await get_all_admin_ids():
+                                        try:
+                                            await bot.send_message(
+                                                admin_id,
+                                                f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА: ПОДПИСКА НЕ НАЙДЕНА (YooKassa, Telegram manual replay)\n\n"
+                                                f"Пользователь: {user_ref}\n"
+                                                f"Сумма: {charge_amount:.2f} руб\n"
+                                                f"PayId: {res.payment_id}\n"
+                                                f"Попытка (Attempt ID): {rec_details.get('attempt_id')}\n"
+                                                f"ID подписки: {rec_details.get('subscription_id')}\n"
+                                                f"Тариф (Plan ID): {rec_details.get('paid_plan_id') or rec_details.get('plan_id')}\n"
+                                                f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                            )
+                                        except Exception:
+                                            pass
+                            else:
+                                paid_name = rec_details.get("paid_plan_name", "предыдущий тариф")
+                                curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                                await bot.send_message(
+                                    user_id,
+                                    f"⚠️ Мы получили оплату ({rec_details.get('amount', final_price):.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                                    f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                                    f"Срок действия текущей подписки не был изменён автоматически."
+                                )
+                                cfg = await session.get(SubscriptionConfig, 1)
+                                if cfg and cfg.notifications_enabled:
+                                    for admin_id in await get_all_admin_ids():
+                                        try:
+                                            await bot.send_message(
+                                                admin_id,
+                                                f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, Telegram manual replay)\n\n"
+                                                f"Пользователь: {user_ref}\n"
+                                                f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                                                f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                                f"Сумма: {rec_details.get('amount', final_price):.2f} руб\n"
+                                                f"PayId: {res.payment_id}\n"
+                                                f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                            )
+                                        except Exception:
+                                            pass
                         elif is_new:
                             await bot.send_message(
                                 user_id,
@@ -10404,7 +10430,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             )
                             action = "deactivate"
                         if is_new:
-                            if action == "historical_canceled":
+                            if action in ("historical_canceled", "orphan_canceled"):
                                 await bot.send_message(
                                     user_id,
                                     "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены."
@@ -10432,7 +10458,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             )
                             action = "declined"
                         if is_new:
-                            if action == "historical_canceled":
+                            if action in ("historical_canceled", "orphan_canceled"):
                                 await bot.send_message(
                                     user_id,
                                     "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены."
@@ -10523,30 +10549,56 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 plog.info(f"ПРОДЛЕНИЕ | Yookassa | {user_ref} | {plan_to_charge.name} | {final_price:.2f} руб{pay_id_suffix}")
                 if is_new:
                     if action == "manual_reconciliation_required":
-                        paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
-                        curr_name = rec_details.get("current_plan_name", "текущий тариф")
-                        await bot.send_message(
-                            user_id,
-                            f"⚠️ Мы получили оплату ({rec_details.get('amount', final_price):.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                            f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                            f"Срок действия текущей подписки не был изменён автоматически."
-                        )
-                        cfg = await session.get(SubscriptionConfig, 1)
-                        if cfg and cfg.notifications_enabled:
-                            for admin_id in await get_all_admin_ids():
-                                try:
-                                    await bot.send_message(
-                                        admin_id,
-                                        f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, Telegram manual)\n\n"
-                                        f"Пользователь: {user_ref}\n"
-                                        f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
-                                        f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
-                                        f"Сумма: {rec_details.get('amount', final_price):.2f} руб\n"
-                                        f"PayId: {res.payment_id}\n"
-                                        f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
-                                    )
-                                except Exception:
-                                    pass
+                        reason = rec_details.get("reason")
+                        charge_amount = rec_details.get("amount", final_price)
+                        if reason == "subscription_unresolved":
+                            await bot.send_message(
+                                user_id,
+                                f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
+                                f"Платёж отправлен на проверку администратору."
+                            )
+                            cfg = await session.get(SubscriptionConfig, 1)
+                            if cfg and cfg.notifications_enabled:
+                                for admin_id in await get_all_admin_ids():
+                                    try:
+                                        await bot.send_message(
+                                            admin_id,
+                                            f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА: ПОДПИСКА НЕ НАЙДЕНА (YooKassa, Telegram manual)\n\n"
+                                            f"Пользователь: {user_ref}\n"
+                                            f"Сумма: {charge_amount:.2f} руб\n"
+                                            f"PayId: {res.payment_id}\n"
+                                            f"Попытка (Attempt ID): {rec_details.get('attempt_id')}\n"
+                                            f"ID подписки: {rec_details.get('subscription_id')}\n"
+                                            f"Тариф (Plan ID): {rec_details.get('paid_plan_id') or rec_details.get('plan_id')}\n"
+                                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                        )
+                                    except Exception:
+                                        pass
+                        else:
+                            paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
+                            curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                            await bot.send_message(
+                                user_id,
+                                f"⚠️ Мы получили оплату ({rec_details.get('amount', final_price):.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                                f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                                f"Срок действия текущей подписки не был изменён автоматически."
+                            )
+                            cfg = await session.get(SubscriptionConfig, 1)
+                            if cfg and cfg.notifications_enabled:
+                                for admin_id in await get_all_admin_ids():
+                                    try:
+                                        await bot.send_message(
+                                            admin_id,
+                                            f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, Telegram manual)\n\n"
+                                            f"Пользователь: {user_ref}\n"
+                                            f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                                            f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                            f"Сумма: {rec_details.get('amount', final_price):.2f} руб\n"
+                                            f"PayId: {res.payment_id}\n"
+                                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                        )
+                                    except Exception:
+                                        pass
                     else:
                         await bot.send_message(
                             user_id,
@@ -10594,7 +10646,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     )
                     action = "deactivate"
                 if is_new:
-                    if action == "historical_canceled":
+                    if action in ("historical_canceled", "orphan_canceled"):
                         await bot.send_message(
                             user_id,
                             "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены."
@@ -10709,7 +10761,7 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     )
                     action = "declined"
                 if is_new:
-                    if action == "historical_canceled":
+                    if action in ("historical_canceled", "orphan_canceled"):
                         await bot.send_message(
                             user_id,
                             "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены."

@@ -781,29 +781,52 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     return
 
                 if action == "manual_reconciliation_required":
-                    paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
-                    curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                    reason = rec_details.get("reason")
+                    charge_amount = rec_details.get("amount", final_price)
                     from .common import notify_telegram_admins
                     user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
-                    await notify_telegram_admins(
-                        f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, MAX manual)\n\n"
-                        f"Пользователь: {user_ref}\n"
-                        f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
-                        f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
-                        f"Сумма: {rec_details.get('amount', final_price):.2f} руб\n"
-                        f"PayId: {res.payment_id}\n"
-                        f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
-                    )
-                    await client.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"⚠️ Мы получили оплату ({rec_details.get('amount', final_price):.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                            f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                            f"Срок действия текущей подписки не был изменён автоматически."
-                        ),
-                    )
-                    await show_subscription_info(client, chat_id, user_id)
-                    return
+                    if reason == "subscription_unresolved":
+                        await notify_telegram_admins(
+                            f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА: ПОДПИСКА НЕ НАЙДЕНА (YooKassa, MAX manual)\n\n"
+                            f"Пользователь: {user_ref}\n"
+                            f"Сумма: {charge_amount:.2f} руб\n"
+                            f"PayId: {res.payment_id}\n"
+                            f"Попытка (Attempt ID): {rec_details.get('attempt_id')}\n"
+                            f"ID подписки: {rec_details.get('subscription_id')}\n"
+                            f"Тариф (Plan ID): {rec_details.get('paid_plan_id') or rec_details.get('plan_id')}\n"
+                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                        )
+                        await client.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
+                                f"Платёж отправлен на проверку администратору."
+                            ),
+                        )
+                        await show_subscription_info(client, chat_id, user_id)
+                        return
+                    else:
+                        paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
+                        curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                        await notify_telegram_admins(
+                            f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, MAX manual)\n\n"
+                            f"Пользователь: {user_ref}\n"
+                            f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                            f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                            f"Сумма: {charge_amount:.2f} руб\n"
+                            f"PayId: {res.payment_id}\n"
+                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                        )
+                        await client.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"⚠️ Мы получили оплату ({charge_amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                                f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                                f"Срок действия текущей подписки не был изменён автоматически."
+                            ),
+                        )
+                        await show_subscription_info(client, chat_id, user_id)
+                        return
 
                 end_date_ref = (updated_sub or sub).end_date
                 await client.send_message(
@@ -859,7 +882,7 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     await show_subscription_info(client, chat_id, user_id)
                     return
 
-                if action == "historical_canceled":
+                if action in ("historical_canceled", "orphan_canceled"):
                     await client.send_message(
                         chat_id=chat_id,
                         text="Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
@@ -1004,7 +1027,7 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     await show_subscription_info(client, chat_id, user_id)
                     return
 
-                if action == "historical_canceled":
+                if action in ("historical_canceled", "orphan_canceled"):
                     await client.send_message(
                         chat_id=chat_id,
                         text="Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",

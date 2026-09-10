@@ -551,33 +551,68 @@ async def check_subscriptions(bot: Bot):
                 action = getattr(res_fin, "action", "success")
                 rec_details = getattr(res_fin, "reconciliation_details", {})
                 if is_new and action == "manual_reconciliation_required":
-                    paid_name = rec_details.get("paid_plan_name", plan_name_rec)
-                    curr_name = rec_details.get("current_plan_name", "текущий тариф")
-                    await _send_deduplicated_notification(
-                        bot,
-                        u_att.user_id,
-                        f"⚠️ Мы получили оплату ({u_att.amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                        f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                        f"Срок действия текущей подписки не был изменён автоматически.",
-                        f"yk_cross_plan:{u_att.subscription_id}:{rec_result.payment_id}",
-                        now,
-                        window=timedelta(days=2),
-                    )
-                    if config and config.notifications_enabled:
-                        for admin_id in all_admin_ids:
-                            try:
-                                await bot.send_message(
-                                    admin_id,
-                                    f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, reconciliation)\n\n"
-                                    f"Пользователь: [id={u_att.user_id}]\n"
-                                    f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
-                                    f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
-                                    f"Сумма: {u_att.amount:.2f} руб\n"
-                                    f"PayId: {rec_result.payment_id}\n"
-                                    f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
-                                )
-                            except Exception:
-                                pass
+                    reason = rec_details.get("reason")
+                    if reason == "subscription_unresolved":
+                        sub_id_rec = rec_details.get("subscription_id")
+                        att_id_rec = rec_details.get("attempt_id")
+                        plog.warning(
+                            f"РЕКУРРЕНТ_ПОДПИСКА_НЕ_НАЙДЕНА | payment_id={rec_result.payment_id} | "
+                            f"user_id={u_att.user_id} | sub_id={sub_id_rec} | attempt_id={att_id_rec} | "
+                            f"amount={u_att.amount:.2f} руб"
+                        )
+                        await _send_deduplicated_notification(
+                            bot,
+                            u_att.user_id,
+                            f"⚠️ Мы получили оплату ({u_att.amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
+                            f"Платёж отправлен на проверку администратору.",
+                            f"yk_unresolved_sub:{u_att.subscription_id}:{rec_result.payment_id}",
+                            now,
+                            window=timedelta(days=2),
+                        )
+                        if config and config.notifications_enabled:
+                            for admin_id in all_admin_ids:
+                                try:
+                                    await bot.send_message(
+                                        admin_id,
+                                        f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА: ПОДПИСКА НЕ НАЙДЕНА (YooKassa, reconciliation)\n\n"
+                                        f"Пользователь: [id={u_att.user_id}]\n"
+                                        f"Сумма: {u_att.amount:.2f} руб\n"
+                                        f"PayId: {rec_result.payment_id}\n"
+                                        f"Попытка (Attempt ID): {att_id_rec}\n"
+                                        f"ID подписки: {sub_id_rec}\n"
+                                        f"Тариф (Plan ID): {rec_details.get('paid_plan_id') or rec_details.get('plan_id')}\n"
+                                        f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                    )
+                                except Exception:
+                                    pass
+                    else:
+                        paid_name = rec_details.get("paid_plan_name", plan_name_rec)
+                        curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                        await _send_deduplicated_notification(
+                            bot,
+                            u_att.user_id,
+                            f"⚠️ Мы получили оплату ({u_att.amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                            f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                            f"Срок действия текущей подписки не был изменён автоматически.",
+                            f"yk_cross_plan:{u_att.subscription_id}:{rec_result.payment_id}",
+                            now,
+                            window=timedelta(days=2),
+                        )
+                        if config and config.notifications_enabled:
+                            for admin_id in all_admin_ids:
+                                try:
+                                    await bot.send_message(
+                                        admin_id,
+                                        f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, reconciliation)\n\n"
+                                        f"Пользователь: [id={u_att.user_id}]\n"
+                                        f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                                        f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                        f"Сумма: {u_att.amount:.2f} руб\n"
+                                        f"PayId: {rec_result.payment_id}\n"
+                                        f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                    )
+                                except Exception:
+                                    pass
                 elif is_new and updated_sub:
                     await _send_deduplicated_notification(
                         bot,
@@ -624,7 +659,7 @@ async def check_subscriptions(bot: Bot):
                     )
                     action = "deactivate"
                 if is_new:
-                    if action == "historical_canceled":
+                    if action in ("historical_canceled", "orphan_canceled"):
                         plog.info(
                             f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | reconciliation | [id={u_att.user_id}] | PayId={rec_result.payment_id or 'none'}"
                         )
@@ -660,7 +695,7 @@ async def check_subscriptions(bot: Bot):
                         logger=plog,
                     )
                     action = "declined"
-                if is_new and action == "historical_canceled":
+                if is_new and action in ("historical_canceled", "orphan_canceled"):
                     plog.info(
                         f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | reconciliation | [id={u_att.user_id}] | PayId={rec_result.payment_id or 'none'}"
                     )
@@ -1124,35 +1159,66 @@ async def check_subscriptions(bot: Bot):
                             action = getattr(res_fin, "action", "success")
                             rec_details = getattr(res_fin, "reconciliation_details", {})
                             if is_new and action == "manual_reconciliation_required":
-                                paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
-                                curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                                reason = rec_details.get("reason")
                                 charge_amount = rec_details.get("amount", final_price)
-                                await _send_deduplicated_notification(
-                                    bot,
-                                    sub.user_id,
-                                    f"⚠️ Мы получили оплату ({charge_amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                                    f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                                    f"Срок действия текущей подписки не был изменён автоматически.",
-                                    f"yk_cross_plan:{sub.id}:{res.payment_id}",
-                                    now,
-                                    window=timedelta(days=2),
-                                    logger=plog,
-                                )
-                                if config and config.notifications_enabled:
-                                    for admin_id in all_admin_ids:
-                                        try:
-                                            await bot.send_message(
-                                                admin_id,
-                                                f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa)\n\n"
-                                                f"Пользователь: {user_ref}\n"
-                                                f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
-                                                f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
-                                                f"Сумма: {charge_amount:.2f} руб\n"
-                                                f"PayId: {res.payment_id}\n"
-                                                f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
-                                            )
-                                        except Exception:
-                                            pass
+                                if reason == "subscription_unresolved":
+                                    sub_id_rec = rec_details.get("subscription_id")
+                                    att_id_rec = rec_details.get("attempt_id")
+                                    await _send_deduplicated_notification(
+                                        bot,
+                                        sub.user_id,
+                                        f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
+                                        f"Платёж отправлен на проверку администратору.",
+                                        f"yk_unresolved_sub:{sub.id}:{res.payment_id}",
+                                        now,
+                                        window=timedelta(days=2),
+                                        logger=plog,
+                                    )
+                                    if config and config.notifications_enabled:
+                                        for admin_id in all_admin_ids:
+                                            try:
+                                                await bot.send_message(
+                                                    admin_id,
+                                                    f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА: ПОДПИСКА НЕ НАЙДЕНА (YooKassa)\n\n"
+                                                    f"Пользователь: {user_ref}\n"
+                                                    f"Сумма: {charge_amount:.2f} руб\n"
+                                                    f"PayId: {res.payment_id}\n"
+                                                    f"Попытка (Attempt ID): {att_id_rec}\n"
+                                                    f"ID подписки: {sub_id_rec}\n"
+                                                    f"Тариф (Plan ID): {rec_details.get('paid_plan_id') or rec_details.get('plan_id')}\n"
+                                                    f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                                )
+                                            except Exception:
+                                                pass
+                                else:
+                                    paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
+                                    curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                                    await _send_deduplicated_notification(
+                                        bot,
+                                        sub.user_id,
+                                        f"⚠️ Мы получили оплату ({charge_amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
+                                        f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
+                                        f"Срок действия текущей подписки не был изменён автоматически.",
+                                        f"yk_cross_plan:{sub.id}:{res.payment_id}",
+                                        now,
+                                        window=timedelta(days=2),
+                                        logger=plog,
+                                    )
+                                    if config and config.notifications_enabled:
+                                        for admin_id in all_admin_ids:
+                                            try:
+                                                await bot.send_message(
+                                                    admin_id,
+                                                    f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa)\n\n"
+                                                    f"Пользователь: {user_ref}\n"
+                                                    f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
+                                                    f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                                    f"Сумма: {charge_amount:.2f} руб\n"
+                                                    f"PayId: {res.payment_id}\n"
+                                                    f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                                                )
+                                            except Exception:
+                                                pass
                             elif is_new and updated_sub:
                                 plog.info(
                                     f"ПРОДЛЕНИЕ | Yookassa | {user_ref} | {plan_to_charge.name} | {final_price:.2f} руб | PayId={res.payment_id}"
@@ -1204,7 +1270,7 @@ async def check_subscriptions(bot: Bot):
                                 )
                                 action = "deactivate"
                             if is_new:
-                                if action == "historical_canceled":
+                                if action in ("historical_canceled", "orphan_canceled"):
                                     plog.info(
                                         f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | scheduler | {user_ref} | {plan_to_charge.name} | "
                                         f"PayId={res.payment_id or 'none'} | Текущая подписка не затронута"
@@ -1373,7 +1439,7 @@ async def check_subscriptions(bot: Bot):
                                 )
                                 action = "declined"
                             if is_new:
-                                if action == "historical_canceled":
+                                if action in ("historical_canceled", "orphan_canceled"):
                                     plog.info(
                                         f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | scheduler | {user_ref} | {plan_to_charge.name} | "
                                         f"PayId={res.payment_id or 'none'} | Текущая подписка не затронута"
