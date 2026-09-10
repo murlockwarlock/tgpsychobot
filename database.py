@@ -335,6 +335,7 @@ class UserSubscription(Base):
     payment_method_id = Column(String, nullable=True)
     pending_robokassa_invoice_id = Column(Integer, nullable=True)
     last_payment_attempt = Column(DateTime, nullable=True)
+    retry_not_before = Column(DateTime, nullable=True)
     payment_attempt_count = Column(Integer, default=0, nullable=False)
     user = relationship("User", back_populates="subscription")
     plan = relationship("SubscriptionPlan")
@@ -1132,6 +1133,15 @@ async def init_db():
             AutomationDialogueState.__table__.create(sync_conn, checkfirst=True)
             UserAIActivity.__table__.create(sync_conn, checkfirst=True)
             YookassaRecurringAttempt.__table__.create(sync_conn, checkfirst=True)
+
+            sub_columns = [c['name'] for c in insp.get_columns('user_subscriptions')]
+            if 'retry_not_before' not in sub_columns:
+                sync_conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN retry_not_before TIMESTAMP"))
+
+            yk_attempt_cols = [c['name'] for c in insp.get_columns('yookassa_recurring_attempts')]
+            if 'request_payload' not in yk_attempt_cols:
+                sync_conn.execute(text("ALTER TABLE yookassa_recurring_attempts ADD COLUMN request_payload TEXT"))
+
             try:
                 sync_conn.execute(text(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_yookassa_attempt "
@@ -1601,6 +1611,7 @@ class YookassaRecurringAttempt(Base):
     idempotency_key = Column(String, nullable=False, unique=True, index=True)
     amount = Column(Float, nullable=False)
     payment_method_id = Column(String, nullable=False)
+    request_payload = Column(Text, nullable=True)
     status = Column(String, nullable=False, default='claimed', index=True)
     payment_id = Column(String, nullable=True, index=True)
     attempt_started_at = Column(DateTime, nullable=False, default=datetime.utcnow)

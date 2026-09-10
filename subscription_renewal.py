@@ -66,8 +66,7 @@ CANCELLATION_TAXONOMY: dict[str, CancellationPolicy] = {
     "fraud_suspected": CancellationPolicy.TERMINAL_DEACTIVATE,
     "payment_method_not_found": CancellationPolicy.TERMINAL_DEACTIVATE,
     "payment_method_id": CancellationPolicy.TERMINAL_DEACTIVATE,
-    "invalid_request": CancellationPolicy.TERMINAL_DEACTIVATE,
-    "deactivate": CancellationPolicy.TERMINAL_DEACTIVATE,
+    "invalid_card_number": CancellationPolicy.TERMINAL_DEACTIVATE,
     # Temporary / provider: retry later without burning card decline attempts
     "issuer_unavailable": CancellationPolicy.TEMPORARY_PROVIDER,
     "internal_timeout": CancellationPolicy.TEMPORARY_PROVIDER,
@@ -80,7 +79,6 @@ CANCELLATION_TAXONOMY: dict[str, CancellationPolicy] = {
     "3d_secure_failed": CancellationPolicy.RETRYABLE_DECLINE,
     "expired_on_capture": CancellationPolicy.RETRYABLE_DECLINE,
     "expired_on_confirmation": CancellationPolicy.RETRYABLE_DECLINE,
-    "invalid_card_number": CancellationPolicy.TERMINAL_DEACTIVATE,
     "invalid_csc": CancellationPolicy.RETRYABLE_DECLINE,
 }
 
@@ -201,6 +199,8 @@ async def claim_yookassa_recurring_attempt(
         .order_by(YookassaRecurringAttempt.id.desc())
     )
     if existing_unresolved:
+        if hasattr(session, "in_transaction") and session.in_transaction():
+            await session.commit()
         return ClaimAttemptResult(claimed=False, attempt=existing_unresolved, reason="unresolved_exists")
 
     # 2. Check subscription eligibility
@@ -210,11 +210,29 @@ async def claim_yookassa_recurring_attempt(
         or sub.payment_provider != "Yookassa"
         or sub.payment_attempt_count >= 3
     ):
+        if hasattr(session, "in_transaction") and session.in_transaction():
+            await session.commit()
         return ClaimAttemptResult(claimed=False, attempt=None, reason="ineligible")
 
-    # 3. Create stable attempt record
+    # 3. Create stable attempt record with immutable request snapshot
     now = attempt_started_at or datetime.utcnow()
     stable_key = f"yk-rec-{sub.id}-{sub.user_id}-{sub.payment_attempt_count + 1}-{uuid.uuid4().hex[:12]}"
+
+    exact_payload = {
+        "amount": {
+            "value": f"{price_to_charge:.2f}",
+            "currency": "RUB",
+        },
+        "capture": True,
+        "payment_method_id": sub.payment_method_id,
+        "description": f"Автопродление подписки: {plan.name}",
+        "metadata": {
+            "user_id": str(sub.user_id),
+            "plan_id": str(plan.id),
+            "recurring": "true",
+        },
+    }
+    request_payload_json = json.dumps(exact_payload, ensure_ascii=False)
 
     attempt = YookassaRecurringAttempt(
         subscription_id=sub.id,
@@ -223,6 +241,7 @@ async def claim_yookassa_recurring_attempt(
         idempotency_key=stable_key,
         amount=price_to_charge,
         payment_method_id=sub.payment_method_id,
+        request_payload=request_payload_json,
         status="claimed",
         attempt_started_at=now,
         client_context=client_context,
@@ -230,6 +249,7 @@ async def claim_yookassa_recurring_attempt(
         updated_at=now,
     )
 
+    sub_id = sub.id
     try:
         session.add(attempt)
         await session.commit()
@@ -240,11 +260,13 @@ async def claim_yookassa_recurring_attempt(
         existing_conflict = await session.scalar(
             select(YookassaRecurringAttempt)
             .where(
-                YookassaRecurringAttempt.subscription_id == sub.id,
+                YookassaRecurringAttempt.subscription_id == sub_id,
                 YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"]),
             )
             .order_by(YookassaRecurringAttempt.id.desc())
         )
+        if hasattr(session, "in_transaction") and session.in_transaction():
+            await session.commit()
         return ClaimAttemptResult(claimed=False, attempt=existing_conflict, reason="unresolved_exists")
 
 
@@ -329,23 +351,43 @@ async def execute_or_replay_yookassa_recurring_attempt(
             )
 
     # Dispatch / Replay POST with exact immutable payload & stable key
-    payload = {
-        "amount": {
-            "value": f"{attempt.amount:.2f}",
-            "currency": "RUB",
-        },
-        "capture": True,
-        "payment_method_id": attempt.payment_method_id,
-        "description": f"Автопродление подписки: {plan_name}",
-        "metadata": {
-            "user_id": str(attempt.user_id),
-            "plan_id": str(attempt.plan_id),
-            "recurring": "true",
-        },
-    }
+    if getattr(attempt, "request_payload", None):
+        try:
+            payload = json.loads(attempt.request_payload)
+        except Exception:
+            payload = {
+                "amount": {
+                    "value": f"{attempt.amount:.2f}",
+                    "currency": "RUB",
+                },
+                "capture": True,
+                "payment_method_id": attempt.payment_method_id,
+                "description": f"Автопродление подписки: {plan_name}",
+                "metadata": {
+                    "user_id": str(attempt.user_id),
+                    "plan_id": str(attempt.plan_id),
+                    "recurring": "true",
+                },
+            }
+    else:
+        payload = {
+            "amount": {
+                "value": f"{attempt.amount:.2f}",
+                "currency": "RUB",
+            },
+            "capture": True,
+            "payment_method_id": attempt.payment_method_id,
+            "description": f"Автопродление подписки: {plan_name}",
+            "metadata": {
+                "user_id": str(attempt.user_id),
+                "plan_id": str(attempt.plan_id),
+                "recurring": "true",
+            },
+        }
 
     payload_for_log = dict(payload)
-    payload_for_log["payment_method_id"] = mask_payment_method_id(attempt.payment_method_id)
+    if "payment_method_id" in payload_for_log:
+        payload_for_log["payment_method_id"] = mask_payment_method_id(payload_for_log["payment_method_id"])
 
     _plog_yookassa_tech(
         "TECH_RECURRING_REQUEST",
@@ -504,7 +546,22 @@ async def execute_yookassa_recurring_attempt(
     Wraps parameters into a YookassaRecurringAttempt and delegates to execute_or_replay_yookassa_recurring_attempt.
     """
     now = attempt_started_at or datetime.utcnow()
-    stable_key = idempotence_key or f"yk-rec-{getattr(sub, 'id', 0)}-{getattr(sub, 'user_id', 0)}-{uuid.uuid4().hex[:12]}"
+    plan_name = getattr(plan, "name", "Подписка")
+    payload = {
+        "amount": {"value": f"{price_to_charge:.2f}", "currency": "RUB"},
+        "capture": True,
+        "payment_method_id": getattr(sub, "payment_method_id", None),
+        "description": f"Автопродление подписки: {plan_name}",
+        "metadata": {
+            "user_id": str(getattr(sub, "user_id", 0)),
+            "plan_id": str(getattr(plan, "id", 0)),
+            "recurring": "true",
+        },
+    }
+    stable_key = (
+        idempotence_key
+        or f"yk-rec-sub{getattr(sub, 'id', 0)}-u{getattr(sub, 'user_id', 0)}-{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    )
     attempt = YookassaRecurringAttempt(
         subscription_id=getattr(sub, "id", 0),
         user_id=getattr(sub, "user_id", 0),
@@ -512,13 +569,13 @@ async def execute_yookassa_recurring_attempt(
         idempotency_key=stable_key,
         amount=price_to_charge,
         payment_method_id=getattr(sub, "payment_method_id", None),
+        request_payload=json.dumps(payload, ensure_ascii=False),
         status="claimed",
         attempt_started_at=now,
         client_context="compat",
         created_at=now,
         updated_at=now,
     )
-    plan_name = getattr(plan, "name", "Подписка")
     return await execute_or_replay_yookassa_recurring_attempt(attempt, plan_name, config, logger=logger)
 
 
@@ -596,6 +653,9 @@ async def finalize_yookassa_payment_success(
             user_sub.payment_provider = "Yookassa"
             user_sub.payment_attempt_count = 0
             user_sub.last_payment_attempt = None
+            user_sub.retry_not_before = None
+            if getattr(ptc, 'allow_auto_renewal', True):
+                user_sub.auto_renewal = True
             if payment_method_id:
                 user_sub.payment_method_id = payment_method_id
 
@@ -604,7 +664,10 @@ async def finalize_yookassa_payment_success(
                 select(YookassaRecurringAttempt)
                 .where(
                     YookassaRecurringAttempt.subscription_id == user_sub.id,
-                    YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"]),
+                    (
+                        (YookassaRecurringAttempt.payment_id == payment_id)
+                        | (YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown", "unknown_expired"]))
+                    ),
                 )
                 .order_by(YookassaRecurringAttempt.id.desc())
             )
@@ -633,9 +696,16 @@ async def finalize_yookassa_payment_canceled(
     """
     Canonical exact-once finalization for a canceled YooKassa payment.
     Shared by webhook, scheduler, TG manual, and MAX manual callers.
+    Requires a REAL YooKassa payment_id (never an idempotency key).
     Returns (is_newly_finalized, action, user_sub).
     action is one of: 'deactivate', 'provider_error', 'limit_exceeded', 'declined', 'already_processed'.
     """
+    if not payment_id or payment_id.startswith("yk-rec-"):
+        raise ValueError(
+            "A real payment_id is required for finalize_yookassa_payment_canceled; "
+            "for no-payment outcomes use finalize_yookassa_attempt_no_payment"
+        )
+
     now = datetime.utcnow()
     attempt_ts = attempt_started_at or now
 
@@ -695,20 +765,30 @@ async def finalize_yookassa_payment_canceled(
                 # Do not increment attempts
                 user_sub.last_payment_attempt = attempt_ts
                 action_taken = "provider_error"
+            elif policy == CancellationPolicy.LIMIT_EXCEEDED:
+                user_sub.payment_attempt_count += 1
+                user_sub.last_payment_attempt = attempt_ts
+                user_sub.retry_not_before = attempt_ts + timedelta(hours=24)
+                if user_sub.payment_attempt_count >= 3:
+                    user_sub.auto_renewal = False
+                action_taken = "limit_exceeded"
             else:
-                # Declined or limit exceeded
+                # Declined
                 user_sub.payment_attempt_count += 1
                 user_sub.last_payment_attempt = attempt_ts
                 if user_sub.payment_attempt_count >= 3:
                     user_sub.auto_renewal = False
-                action_taken = "declined" if policy == CancellationPolicy.RETRYABLE_DECLINE else policy.value
+                action_taken = "declined"
 
             # Update open attempt
             attempt = await session.scalar(
                 select(YookassaRecurringAttempt)
                 .where(
                     YookassaRecurringAttempt.subscription_id == user_sub.id,
-                    YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"]),
+                    (
+                        (YookassaRecurringAttempt.payment_id == payment_id)
+                        | (YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"]))
+                    ),
                 )
                 .order_by(YookassaRecurringAttempt.id.desc())
             )
@@ -720,6 +800,116 @@ async def finalize_yookassa_payment_canceled(
 
     await session.commit()
     return True, action_taken, user_sub
+
+
+async def finalize_yookassa_attempt_no_payment(
+    session: AsyncSession,
+    attempt_id: int | None = None,
+    outcome: str = "canceled",  # 'deactivate' | 'integration_error' | 'canceled'
+    error_code: str | None = None,
+    error_message: str | None = None,
+    attempt_started_at: datetime | None = None,
+    sub: UserSubscription | None = None,
+    attempt: YookassaRecurringAttempt | None = None,
+    logger: logging.Logger | None = None,
+) -> tuple[bool, UserSubscription | None]:
+    """
+    Dedicated finalizer for outcomes where YooKassa rejected the request
+    BEFORE creating a payment object (payment_id is None).
+    NEVER creates a YookassaPayment row!
+    Returns (is_newly_finalized, user_sub).
+    """
+    now = datetime.utcnow()
+    att = attempt
+    if att is None and attempt_id is not None:
+        fetched = await session.get(YookassaRecurringAttempt, attempt_id)
+        if isinstance(fetched, YookassaRecurringAttempt):
+            att = fetched
+
+    att_status = getattr(att, "status", None)
+    if att_status in ("succeeded", "deactivated", "integration_error", "canceled", "unknown_expired"):
+        user_sub = sub
+        sub_id = getattr(att, "subscription_id", None)
+        if not user_sub and sub_id:
+            user_sub = await session.get(UserSubscription, sub_id)
+        return False, user_sub
+
+    attempt_ts = attempt_started_at or getattr(att, "attempt_started_at", None) or now
+    if att is not None:
+        if hasattr(att, "error_code"):
+            att.error_code = error_code
+        if hasattr(att, "error_message"):
+            att.error_message = error_message
+        if hasattr(att, "updated_at"):
+            att.updated_at = now
+
+    user_sub = sub
+    sub_id = getattr(att, "subscription_id", None)
+    if not user_sub and sub_id:
+        fetched_sub = await session.get(UserSubscription, sub_id)
+        if isinstance(fetched_sub, UserSubscription):
+            user_sub = fetched_sub
+    if not user_sub:
+        user_sub = await session.scalar(select(UserSubscription).order_by(UserSubscription.id.desc()))
+
+    if outcome == "deactivate":
+        if att is not None and hasattr(att, "status"):
+            att.status = "deactivated"
+        if user_sub:
+            user_sub.auto_renewal = False
+            user_sub.payment_method_id = None
+            user_sub.last_payment_attempt = attempt_ts
+    elif outcome == "integration_error":
+        if att is not None and hasattr(att, "status"):
+            att.status = "integration_error"
+        if user_sub:
+            # DO NOT increment payment_attempt_count
+            # DO NOT clear payment_method_id
+            # DO NOT disable auto_renewal as a card failure
+            user_sub.last_payment_attempt = attempt_ts
+            user_sub.retry_not_before = attempt_ts + timedelta(hours=24)
+    else:
+        if att is not None and hasattr(att, "status"):
+            att.status = "canceled"
+        if user_sub:
+            user_sub.last_payment_attempt = attempt_ts
+            if error_code == "payment_method_limit_exceeded":
+                user_sub.retry_not_before = attempt_ts + timedelta(hours=24)
+
+    await session.commit()
+    return True, user_sub
+
+
+async def transition_attempt_to_unknown_expired(
+    session: AsyncSession,
+    attempt_id: int,
+    now: datetime | None = None,
+) -> tuple[bool, UserSubscription | None]:
+    """
+    Explicit >24h terminal safety transition for unresolved attempts.
+    Transitions attempt to 'unknown_expired', pauses subscription auto_renewal safely,
+    and removes attempt from partial unique unresolved index.
+    Returns (is_new, user_sub).
+    """
+    current_time = now or datetime.utcnow()
+    attempt = await session.get(YookassaRecurringAttempt, attempt_id)
+    if not attempt or attempt.status not in ("claimed", "pending", "unknown"):
+        sub = await session.get(UserSubscription, attempt.subscription_id) if attempt else None
+        return False, sub
+
+    attempt.status = "unknown_expired"
+    attempt.error_code = "timeout_24h"
+    attempt.error_message = "Unresolved attempt exceeded 24 hours reconciliation window"
+    attempt.last_reconciled_at = current_time
+    attempt.updated_at = current_time
+
+    user_sub = await session.get(UserSubscription, attempt.subscription_id)
+    if user_sub:
+        user_sub.auto_renewal = False
+        user_sub.last_payment_attempt = attempt.attempt_started_at
+
+    await session.commit()
+    return True, user_sub
 
 
 async def update_yookassa_attempt_pending(

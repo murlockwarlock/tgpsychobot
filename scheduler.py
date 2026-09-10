@@ -48,6 +48,8 @@ from subscription_renewal import (
     execute_yookassa_recurring_attempt,
     finalize_yookassa_payment_success,
     finalize_yookassa_payment_canceled,
+    finalize_yookassa_attempt_no_payment,
+    transition_attempt_to_unknown_expired,
     update_yookassa_attempt_pending,
     update_yookassa_attempt_unknown,
     should_reconcile_attempt,
@@ -480,36 +482,106 @@ async def check_subscriptions(bot: Bot):
             YookassaRecurringAttempt.status.in_(["claimed", "pending", "unknown"])
         )
         unresolved_attempts = (await session.execute(unresolved_stmt)).scalars().all()
+        attempts_to_reconcile = []
         for u_att in unresolved_attempts:
-            if should_reconcile_attempt(u_att, now):
+            time_since_start = now - u_att.attempt_started_at
+            if time_since_start >= timedelta(hours=24):
+                is_new_exp, exp_sub = await transition_attempt_to_unknown_expired(session, u_att.id, now)
+                if is_new_exp:
+                    await _send_deduplicated_notification(
+                        bot,
+                        u_att.user_id,
+                        "Не удалось подтвердить результат списания за 24 часа. Чтобы избежать двойных списаний, автопродление приостановлено.\n\nПроверьте статус в банке или оформите подписку в меню.",
+                        f"yk_expired_24h:{u_att.subscription_id}:{u_att.id}",
+                        now,
+                        reply_markup=subscribe_kb,
+                        window=timedelta(days=2),
+                    )
+                    if config and config.notifications_enabled:
+                        for admin_id in all_admin_ids:
+                            try:
+                                await bot.send_message(
+                                    admin_id,
+                                    f"⚠️ Платёж YooKassa переведён в unknown_expired (>24ч)\nПользователь: [id={u_att.user_id}]\nSubscriptionId: {u_att.subscription_id}\nAttemptId: {u_att.id}\nPayId: {u_att.payment_id or 'none'}"
+                                )
+                            except Exception:
+                                pass
+            elif should_reconcile_attempt(u_att, now):
                 plan_obj = await session.get(SubscriptionPlan, u_att.plan_id)
                 plan_name_rec = plan_obj.name if plan_obj else "Подписка"
-                rec_result = await execute_or_replay_yookassa_recurring_attempt(
-                    u_att, plan_name_rec, config, logger=plog
+                attempts_to_reconcile.append((u_att, plan_name_rec))
+
+        if hasattr(session, "in_transaction") and session.in_transaction():
+            await session.commit()
+
+        for u_att, plan_name_rec in attempts_to_reconcile:
+            rec_result = await execute_or_replay_yookassa_recurring_attempt(
+                u_att, plan_name_rec, config, logger=plog
+            )
+            if rec_result.outcome == 'success' and rec_result.payment_id:
+                is_new, updated_sub = await finalize_yookassa_payment_success(
+                    session=session,
+                    payment_id=rec_result.payment_id,
+                    user_id=u_att.user_id,
+                    plan_id=u_att.plan_id,
+                    amount=u_att.amount,
+                    is_recurring=True,
+                    logger=plog,
                 )
-                if rec_result.outcome == 'success' and rec_result.payment_id:
-                    is_new, updated_sub = await finalize_yookassa_payment_success(
+                if is_new and updated_sub:
+                    await _send_deduplicated_notification(
+                        bot,
+                        u_att.user_id,
+                        f"✅ Подписка продлена до {_format_msk(updated_sub.end_date, '%d.%m.%Y %H:%M')}.",
+                        f"yk_success:{updated_sub.id}:{rec_result.payment_id}",
+                        now,
+                        window=timedelta(days=2),
+                    )
+                    if config and config.notifications_enabled:
+                        for admin_id in all_admin_ids:
+                            try:
+                                await bot.send_message(
+                                    admin_id,
+                                    f"🔔 Автопродление (YooKassa, reconciliation)!\n\nПользователь: [id={u_att.user_id}]\nТариф: {plan_name_rec}\nСумма: {u_att.amount:.2f} руб\nPayId: {rec_result.payment_id}"
+                                )
+                            except Exception:
+                                pass
+            elif rec_result.outcome == 'deactivate':
+                if rec_result.payment_id:
+                    is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
                         session=session,
                         payment_id=rec_result.payment_id,
+                        cancellation_reason=rec_result.failure_reason,
                         user_id=u_att.user_id,
                         plan_id=u_att.plan_id,
                         amount=u_att.amount,
                         is_recurring=True,
+                        attempt_started_at=u_att.attempt_started_at,
+                        force_deactivate=True,
                         logger=plog,
                     )
-                    if is_new and updated_sub:
-                        await _send_deduplicated_notification(
-                            bot,
-                            u_att.user_id,
-                            f"✅ Подписка продлена до {_format_msk(updated_sub.end_date, '%d.%m.%Y %H:%M')}.",
-                            f"yk_success:{updated_sub.id}:{rec_result.payment_id}",
-                            now,
-                            window=timedelta(days=2),
-                        )
-                elif rec_result.outcome in ('declined', 'deactivate'):
+                else:
+                    is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                        session=session,
+                        attempt_id=u_att.id,
+                        outcome="deactivate",
+                        error_code=rec_result.failure_reason,
+                        error_message=str(rec_result.error) if rec_result.error else None,
+                        attempt_started_at=u_att.attempt_started_at,
+                        attempt=u_att,
+                        logger=plog,
+                    )
+                if is_new:
+                    await bot.send_message(
+                        u_att.user_id,
+                        "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nПродлите подписку вручную в меню.",
+                        reply_markup=subscribe_kb,
+                    )
+            elif rec_result.outcome in ('declined', 'limit_exceeded'):
+                if rec_result.payment_id:
                     is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
                         session=session,
-                        payment_id=rec_result.payment_id or u_att.idempotency_key,
+                        payment_id=rec_result.payment_id,
                         cancellation_reason=rec_result.failure_reason,
                         user_id=u_att.user_id,
                         plan_id=u_att.plan_id,
@@ -518,19 +590,38 @@ async def check_subscriptions(bot: Bot):
                         attempt_started_at=u_att.attempt_started_at,
                         logger=plog,
                     )
-                    if is_new and action == 'deactivate':
-                        await bot.send_message(
-                            u_att.user_id,
-                            "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nПродлите подписку вручную в меню.",
-                            reply_markup=subscribe_kb,
-                        )
-                elif rec_result.outcome == 'pending':
-                    if rec_result.payment_id:
-                        await update_yookassa_attempt_pending(session, u_att.id, rec_result.payment_id)
-                    else:
-                        await update_yookassa_attempt_unknown(session, u_att.id, error_code="pending", error_message="pending_without_id")
-                elif rec_result.outcome in ('unknown', 'provider_error', 'rate_limit', 'auth_error'):
-                    await update_yookassa_attempt_unknown(session, u_att.id, error_code=rec_result.outcome, error_message=rec_result.failure_reason)
+                else:
+                    is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                        session=session,
+                        attempt_id=u_att.id,
+                        outcome="declined",
+                        error_code=rec_result.failure_reason,
+                        error_message=str(rec_result.error) if rec_result.error else None,
+                        attempt_started_at=u_att.attempt_started_at,
+                        attempt=u_att,
+                        logger=plog,
+                    )
+            elif rec_result.outcome == 'integration_error':
+                await finalize_yookassa_attempt_no_payment(
+                    session=session,
+                    attempt_id=u_att.id,
+                    outcome="integration_error",
+                    error_code=rec_result.failure_reason,
+                    error_message=str(rec_result.error) if rec_result.error else None,
+                    attempt_started_at=u_att.attempt_started_at,
+                    attempt=u_att,
+                    logger=plog,
+                )
+            elif rec_result.outcome == 'pending':
+                if rec_result.payment_id:
+                    await update_yookassa_attempt_pending(session, u_att.id, rec_result.payment_id)
+                else:
+                    await update_yookassa_attempt_unknown(session, u_att.id, error_code="pending", error_message="pending_without_id")
+            elif rec_result.outcome in ('unknown', 'provider_error', 'rate_limit', 'auth_error'):
+                await update_yookassa_attempt_unknown(session, u_att.id, error_code=rec_result.outcome, error_message=rec_result.failure_reason)
+
+        if hasattr(session, "in_transaction") and session.in_transaction():
+            await session.commit()
 
         stmt = select(UserSubscription).where(
             UserSubscription.end_date > lookback_cutoff
@@ -540,6 +631,7 @@ async def check_subscriptions(bot: Bot):
 
         result = await session.execute(stmt)
         subscriptions = result.scalars().all()
+        yookassa_incident_tripped = False
 
         for sub in subscriptions:
             try:
@@ -859,6 +951,7 @@ async def check_subscriptions(bot: Bot):
                         sub.payment_attempt_count,
                         sub.last_payment_attempt,
                         now,
+                        retry_not_before=getattr(sub, 'retry_not_before', None),
                     )
 
                     if not can_attempt:
@@ -900,6 +993,10 @@ async def check_subscriptions(bot: Bot):
                     final_price = plan_to_charge.price * (1 - current_discount / 100)
 
                     if sub.payment_provider == 'Yookassa' and sub.payment_method_id:
+                        if yookassa_incident_tripped:
+                            log.warning("YooKassa incident circuit breaker active; skipping sub %s", sub.id)
+                            continue
+
                         claim_result = await claim_yookassa_recurring_attempt(
                             session=session,
                             sub=sub,
@@ -916,6 +1013,9 @@ async def check_subscriptions(bot: Bot):
                             continue
 
                         att = claim_result.attempt
+                        if hasattr(session, "in_transaction") and session.in_transaction():
+                            await session.commit()
+
                         res = await execute_or_replay_yookassa_recurring_attempt(
                             att, plan_to_charge.name, config, logger=plog
                         )
@@ -954,17 +1054,31 @@ async def check_subscriptions(bot: Bot):
                                             pass
 
                         elif res.outcome == 'deactivate':
-                            is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
-                                session=session,
-                                payment_id=res.payment_id or att.idempotency_key,
-                                cancellation_reason=res.failure_reason,
-                                user_id=sub.user_id,
-                                plan_id=plan_to_charge.id,
-                                amount=final_price,
-                                payment_method_id=sub.payment_method_id,
-                                attempt_started_at=att.attempt_started_at,
-                                logger=plog,
-                            )
+                            if res.payment_id:
+                                is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
+                                    session=session,
+                                    payment_id=res.payment_id,
+                                    cancellation_reason=res.failure_reason,
+                                    user_id=sub.user_id,
+                                    plan_id=plan_to_charge.id,
+                                    amount=final_price,
+                                    payment_method_id=sub.payment_method_id,
+                                    attempt_started_at=att.attempt_started_at,
+                                    force_deactivate=True,
+                                    logger=plog,
+                                )
+                            else:
+                                is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                                    session=session,
+                                    attempt_id=att.id,
+                                    outcome="deactivate",
+                                    error_code=res.failure_reason,
+                                    error_message=str(res.error) if res.error else None,
+                                    attempt_started_at=att.attempt_started_at,
+                                    sub=sub,
+                                    attempt=att,
+                                    logger=plog,
+                                )
                             if is_new:
                                 plog.warning(f"АВТОПРОДЛ_ОТКЛ | {user_ref} | причина: deactivate | {plan_to_charge.name}")
                                 await bot.send_message(
@@ -981,6 +1095,51 @@ async def check_subscriptions(bot: Bot):
                                             )
                                         except Exception:
                                             pass
+
+                        elif res.outcome == 'integration_error':
+                            is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                                session=session,
+                                attempt_id=att.id,
+                                outcome="integration_error",
+                                error_code=res.failure_reason,
+                                error_message=str(res.error) if res.error else None,
+                                attempt_started_at=att.attempt_started_at,
+                                sub=sub,
+                                attempt=att,
+                                logger=plog,
+                            )
+                            if config and config.notifications_enabled:
+                                await notify_admins_about_error(
+                                    bot,
+                                    title="Ошибка интеграции YooKassa (неверный запрос/параметры)",
+                                    user_id=sub.user_id,
+                                    provider="YooKassa",
+                                    stage="recurring_payment_create",
+                                    extra={
+                                        "subscription_id": sub.id,
+                                        "plan_id": plan_to_charge.id,
+                                        "amount": f"{final_price:.2f}",
+                                        "error": str(res.error),
+                                    },
+                                    exception=res.error,
+                                    include_traceback=False,
+                                    logger=log,
+                                )
+
+                        elif res.outcome == 'auth_error':
+                            yookassa_incident_tripped = True
+                            await update_yookassa_attempt_unknown(
+                                session, att.id, error_code="auth_error", error_message=res.failure_reason
+                            )
+                            if should_send_auth_alert(now) and config and config.notifications_enabled:
+                                for admin_id in all_admin_ids:
+                                    try:
+                                        await bot.send_message(
+                                            admin_id,
+                                            "🚨 YooKassa Circuit Breaker: Ошибка авторизации магазина (HTTP 401/403). Проверьте настройки shop_id и secret_key в панели управления. Новые списания в этом цикле приостановлены."
+                                        )
+                                    except Exception:
+                                        pass
 
                         elif res.outcome == 'pending':
                             if res.payment_id:
@@ -1036,32 +1195,32 @@ async def check_subscriptions(bot: Bot):
                                 window=timedelta(days=1),
                             )
 
-                        elif res.outcome == 'auth_error':
-                            await update_yookassa_attempt_unknown(
-                                session, att.id, error_code="auth_error", error_message=res.failure_reason
-                            )
-                            if should_send_auth_alert(now) and config and config.notifications_enabled:
-                                for admin_id in all_admin_ids:
-                                    try:
-                                        await bot.send_message(
-                                            admin_id,
-                                            "⚠️ Ошибка авторизации магазина YooKassa (HTTP 401/403). Проверьте настройки shop_id и secret_key в панели управления."
-                                        )
-                                    except Exception:
-                                        pass
-
-                        else:
-                            is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
-                                session=session,
-                                payment_id=res.payment_id or att.idempotency_key,
-                                cancellation_reason=res.failure_reason,
-                                user_id=sub.user_id,
-                                plan_id=plan_to_charge.id,
-                                amount=final_price,
-                                payment_method_id=sub.payment_method_id,
-                                attempt_started_at=att.attempt_started_at,
-                                logger=plog,
-                            )
+                        else:  # declined or limit_exceeded
+                            if res.payment_id:
+                                is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
+                                    session=session,
+                                    payment_id=res.payment_id,
+                                    cancellation_reason=res.failure_reason,
+                                    user_id=sub.user_id,
+                                    plan_id=plan_to_charge.id,
+                                    amount=final_price,
+                                    payment_method_id=sub.payment_method_id,
+                                    attempt_started_at=att.attempt_started_at,
+                                    logger=plog,
+                                )
+                            else:
+                                is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                                    session=session,
+                                    attempt_id=att.id,
+                                    outcome="declined",
+                                    error_code=res.failure_reason,
+                                    error_message=str(res.error) if res.error else None,
+                                    attempt_started_at=att.attempt_started_at,
+                                    sub=sub,
+                                    attempt=att,
+                                    logger=plog,
+                                )
+                                action = "declined"
                             if is_new:
                                 att_count = getattr(updated_sub, 'payment_attempt_count', 0) if updated_sub else 0
                                 auto_off = getattr(updated_sub, 'auto_renewal', True) is False
@@ -1073,13 +1232,24 @@ async def check_subscriptions(bot: Bot):
                                         session, bot, sub, user_ref, plan_to_charge.name, subscribe_kb, config, all_admin_ids
                                     )
                                     continue
-                                next_retry_at = get_next_retry_at(att_count, getattr(updated_sub, 'last_payment_attempt', None))
-                                next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК') if next_retry_at else "позже"
-                                user_msg_yk = (
-                                    f"Не удалось списать средства (ЮKassa). Повторим попытку {next_retry_str}."
-                                    if att_count == 1
-                                    else f"Не удалось списать средства (ЮKassa). Последняя попытка — {next_retry_str}."
-                                )
+
+                                if action == "limit_exceeded":
+                                    user_msg_yk = (
+                                        "Не удалось провести списание (превышен лимит по карте). Следующая попытка будет завтра. "
+                                        "Вы также можете привязать другую карту в меню."
+                                    )
+                                else:
+                                    next_retry_at = get_next_retry_at(
+                                        att_count,
+                                        getattr(updated_sub, 'last_payment_attempt', None),
+                                        retry_not_before=getattr(updated_sub, 'retry_not_before', None),
+                                    )
+                                    next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК') if next_retry_at else "позже"
+                                    user_msg_yk = (
+                                        f"Не удалось списать средства (ЮKassa). Повторим попытку {next_retry_str}."
+                                        if att_count == 1
+                                        else f"Не удалось списать средства (ЮKassa). Последняя попытка — {next_retry_str}."
+                                    )
                                 await _send_deduplicated_notification(
                                     bot,
                                     sub.user_id,

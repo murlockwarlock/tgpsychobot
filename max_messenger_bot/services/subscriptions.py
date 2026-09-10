@@ -39,6 +39,7 @@ from subscription_renewal import (
     execute_yookassa_recurring_attempt,
     finalize_yookassa_payment_success,
     finalize_yookassa_payment_canceled,
+    finalize_yookassa_attempt_no_payment,
     update_yookassa_attempt_pending,
     update_yookassa_attempt_unknown,
     mask_payment_method_id,
@@ -609,8 +610,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
             await client.send_message(chat_id=chat_id, text="Невозможно выполнить списание.")
             return
 
-        if not can_retry_now(sub.payment_attempt_count, sub.last_payment_attempt, now):
-            next_retry_at = get_next_retry_at(sub.payment_attempt_count, sub.last_payment_attempt)
+        if not can_retry_now(sub.payment_attempt_count, sub.last_payment_attempt, now, retry_not_before=getattr(sub, 'retry_not_before', None)):
+            next_retry_at = get_next_retry_at(sub.payment_attempt_count, sub.last_payment_attempt, retry_not_before=getattr(sub, 'retry_not_before', None))
             next_retry_str = format_msk(next_retry_at) if next_retry_at else "позже"
             await client.send_message(
                 chat_id=chat_id,
@@ -748,6 +749,9 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
 
             await client.send_message(chat_id=chat_id, text="Отправляем запрос на списание...")
 
+            if hasattr(session, "in_transaction") and session.in_transaction():
+                await session.commit()
+
             res = await execute_or_replay_yookassa_recurring_attempt(
                 attempt, plan_to_charge.name, config, logger=log
             )
@@ -763,46 +767,73 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     is_recurring=True,
                     logger=log,
                 )
+                if not is_new:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан. Подписка активна.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
                 end_date_ref = (updated_sub or sub).end_date
                 await client.send_message(
                     chat_id=chat_id,
                     text=f"✅ Подписка успешно продлена до {format_msk(end_date_ref)} МСК.",
                 )
-                if is_new:
-                    from .common import notify_telegram_admins
-                    user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
-                    await notify_telegram_admins(
-                        f"🔔 Автопродление (YooKassa, MAX)!\n\n"
-                        f"Пользователь: {user_ref}\n"
-                        f"Тариф: {plan_to_charge.name}\n"
-                        f"Сумма: {final_price:.2f} руб\n"
-                        f"До: {format_msk(end_date_ref)} МСК\n"
-                        f"PayId: {res.payment_id}"
-                    )
+                from .common import notify_telegram_admins
+                user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                await notify_telegram_admins(
+                    f"🔔 Автопродление (YooKassa, MAX)!\n\n"
+                    f"Пользователь: {user_ref}\n"
+                    f"Тариф: {plan_to_charge.name}\n"
+                    f"Сумма: {final_price:.2f} руб\n"
+                    f"До: {format_msk(end_date_ref)} МСК\n"
+                    f"PayId: {res.payment_id}"
+                )
                 await show_subscription_info(client, chat_id, user_id)
                 return
 
             elif res.outcome == "deactivate":
-                is_new, _, _ = await finalize_yookassa_payment_canceled(
-                    session=session,
-                    payment_id=res.payment_id or attempt.idempotency_key,
-                    cancellation_reason=res.failure_reason,
-                    user_id=user_id,
-                    plan_id=plan_to_charge.id,
-                    amount=final_price,
-                    payment_method_id=sub.payment_method_id,
-                    attempt_started_at=attempt_started_at,
-                    force_deactivate=True,
-                    logger=log,
-                )
-                if is_new:
-                    from .common import notify_telegram_admins
-                    user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
-                    await notify_telegram_admins(
-                        f"🚫 Автопродление отключено (карта недоступна в YooKassa, MAX)\n"
-                        f"Пользователь: {user_ref}\n"
-                        f"Провайдер: Yookassa"
+                if res.payment_id:
+                    is_new, _, _ = await finalize_yookassa_payment_canceled(
+                        session=session,
+                        payment_id=res.payment_id,
+                        cancellation_reason=res.failure_reason,
+                        user_id=user_id,
+                        plan_id=plan_to_charge.id,
+                        amount=final_price,
+                        payment_method_id=sub.payment_method_id,
+                        attempt_started_at=attempt_started_at,
+                        force_deactivate=True,
+                        logger=log,
                     )
+                else:
+                    is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                        session=session,
+                        attempt_id=attempt.id,
+                        outcome="deactivate",
+                        error_code=res.failure_reason,
+                        error_message=str(res.error) if res.error else None,
+                        attempt_started_at=attempt_started_at,
+                        sub=sub,
+                        attempt=attempt,
+                        logger=log,
+                    )
+                if not is_new:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
+                from .common import notify_telegram_admins
+                user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                await notify_telegram_admins(
+                    f"🚫 Автопродление отключено (карта недоступна в YooKassa, MAX)\n"
+                    f"Пользователь: {user_ref}\n"
+                    f"Провайдер: Yookassa"
+                )
                 await client.send_message(
                     chat_id=chat_id,
                     text="Сохранённый способ оплаты больше недоступен в ЮKassa. Автопродление отключено.\n\nПожалуйста, выберите тариф и оформите подписку заново.",
@@ -829,7 +860,25 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                 )
                 return
 
-            elif res.outcome in ("provider_error", "rate_limit", "integration_error", "auth_error"):
+            elif res.outcome == "integration_error":
+                await finalize_yookassa_attempt_no_payment(
+                    session=session,
+                    attempt_id=attempt.id,
+                    outcome="integration_error",
+                    error_code=res.failure_reason,
+                    error_message=str(res.error) if res.error else None,
+                    attempt_started_at=attempt_started_at,
+                    sub=sub,
+                    attempt=attempt,
+                    logger=log,
+                )
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="Ошибка интеграции с платёжным сервисом. Списание временно приостановлено. Мы уже разбираемся с проблемой.",
+                )
+                return
+
+            elif res.outcome in ("provider_error", "rate_limit", "auth_error"):
                 await update_yookassa_attempt_unknown(
                     session, attempt.id, error_code=res.outcome, error_message=res.failure_reason
                 )
@@ -840,34 +889,57 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                 return
 
             else:  # declined
-                is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
-                    session=session,
-                    payment_id=res.payment_id or attempt.idempotency_key,
-                    cancellation_reason=res.failure_reason,
-                    user_id=user_id,
-                    plan_id=plan_to_charge.id,
-                    amount=final_price,
-                    payment_method_id=sub.payment_method_id,
-                    attempt_started_at=attempt_started_at,
-                    logger=log,
-                )
+                if res.payment_id:
+                    is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
+                        session=session,
+                        payment_id=res.payment_id,
+                        cancellation_reason=res.failure_reason,
+                        user_id=user_id,
+                        plan_id=plan_to_charge.id,
+                        amount=final_price,
+                        payment_method_id=sub.payment_method_id,
+                        attempt_started_at=attempt_started_at,
+                        logger=log,
+                    )
+                else:
+                    is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
+                        session=session,
+                        attempt_id=attempt.id,
+                        outcome="canceled",
+                        error_code=res.failure_reason,
+                        error_message=str(res.error) if res.error else None,
+                        attempt_started_at=attempt_started_at,
+                        sub=sub,
+                        attempt=attempt,
+                        logger=log,
+                    )
+                    action = "canceled"
+
+                if not is_new:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Платёж уже обработан.",
+                    )
+                    await show_subscription_info(client, chat_id, user_id)
+                    return
+
                 attempt_num = (updated_sub or sub).payment_attempt_count
                 if attempt_num >= 3 or action == "deactivate":
-                    if is_new:
-                        from .common import notify_telegram_admins
-                        user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
-                        await notify_telegram_admins(
-                            f"🚫 Автопродление отключено (3 попытки YooKassa, MAX)\n"
-                            f"Пользователь: {user_ref}\n"
-                            f"Провайдер: Yookassa"
-                        )
+                    from .common import notify_telegram_admins
+                    user_ref = max_communication_name(user) if is_max_user_id(user_id) else (user.first_name or "")
+                    await notify_telegram_admins(
+                        f"🚫 Автопродление отключено (3 попытки YooKassa, MAX)\n"
+                        f"Пользователь: {user_ref}\n"
+                        f"Провайдер: Yookassa"
+                    )
                     await client.send_message(
                         chat_id=chat_id,
                         text="Не удалось списать средства после 3 попыток. Автопродление отключено.\n\nОформите подписку заново.",
                     )
                     await show_plans(client, chat_id, user_id)
                 else:
-                    next_retry_at = get_next_retry_at(attempt_num, attempt_started_at)
+                    retry_nb = getattr(updated_sub or sub, 'retry_not_before', None)
+                    next_retry_at = get_next_retry_at(attempt_num, attempt_started_at, retry_not_before=retry_nb)
                     next_retry_str = format_msk(next_retry_at) if next_retry_at else "позже"
                     reason_txt = f" ({res.failure_reason})" if res.failure_reason else ""
                     await client.send_message(
