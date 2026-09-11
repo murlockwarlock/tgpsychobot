@@ -129,6 +129,9 @@ async def save_key(client: MaxApiClient, states: StateStore, chat_id: int, user_
     await show_keys(client, chat_id)
 
 
+from effective_subscription import choose_active_subscription
+
+
 PAGE_LOG_SIZE = 15
 
 
@@ -140,33 +143,50 @@ async def show_payment_stats(client: MaxApiClient, chat_id: int) -> None:
             select(func.count(User.id)).where(User.id >= MAX_ID_OFFSET)
         )).scalar() or 0
 
-        active_paid_subs = (await session.execute(
-            select(UserSubscription)
-            .where(
-                UserSubscription.plan_id.is_not(None),
-                UserSubscription.end_date > now,
-                UserSubscription.user_id >= MAX_ID_OFFSET,
+        max_users_res = await session.execute(
+            select(User)
+            .where(User.id >= MAX_ID_OFFSET)
+            .options(
+                selectinload(User.subscription).selectinload(UserSubscription.plan)
             )
-            .options(selectinload(UserSubscription.plan))
-        )).scalars().all()
-        active_paid_count = len(active_paid_subs)
-        current_mrr = sum(sub.plan.price for sub in active_paid_subs if sub.plan)
+        )
+        max_users = max_users_res.scalars().all()
 
-        active_trials_count = (await session.execute(
-            select(func.count(UserSubscription.id)).where(
-                UserSubscription.plan_id.is_(None),
-                UserSubscription.end_date > now,
-                UserSubscription.user_id >= MAX_ID_OFFSET,
+        linked_tg_ids = {u.tg_user_id for u in max_users if getattr(u, "tg_user_id", None) is not None}
+        tg_subs_by_id = {}
+        if linked_tg_ids:
+            tg_users_res = await session.execute(
+                select(User)
+                .where(User.id.in_(linked_tg_ids))
+                .options(
+                    selectinload(User.subscription).selectinload(UserSubscription.plan)
+                )
             )
-        )).scalar() or 0
+            for tgu in tg_users_res.scalars().all():
+                tg_subs_by_id[tgu.id] = tgu.subscription
 
-        expired_count = (await session.execute(
-            select(func.count(UserSubscription.id)).where(
-                UserSubscription.end_date <= now,
-                UserSubscription.plan_id.is_not(None),
-                UserSubscription.user_id >= MAX_ID_OFFSET,
-            )
-        )).scalar() or 0
+        active_paid_count = 0
+        active_trials_count = 0
+        expired_count = 0
+        current_mrr = 0.0
+        plan_counts: dict[str, int] = {}
+
+        for max_u in max_users:
+            tg_sub = tg_subs_by_id.get(max_u.tg_user_id) if getattr(max_u, "tg_user_id", None) else None
+            effective_active = choose_active_subscription(max_u.subscription, tg_sub, now)
+
+            if effective_active:
+                eff_sub = effective_active.subscription
+                if eff_sub.plan_id is not None and eff_sub.plan:
+                    active_paid_count += 1
+                    current_mrr += float(eff_sub.plan.price)
+                    plan_counts[eff_sub.plan.name] = plan_counts.get(eff_sub.plan.name, 0) + 1
+                else:
+                    active_trials_count += 1
+            else:
+                if (max_u.subscription and max_u.subscription.plan_id is not None and max_u.subscription.end_date and max_u.subscription.end_date <= now) or \
+                   (tg_sub and tg_sub.plan_id is not None and tg_sub.end_date and tg_sub.end_date <= now):
+                    expired_count += 1
 
         total_robo_revenue = (await session.execute(
             select(func.sum(RobokassaPayment.amount)).where(
@@ -181,13 +201,6 @@ async def show_payment_stats(client: MaxApiClient, chat_id: int) -> None:
             )
         )).scalar() or 0.0
 
-        plan_breakdown = (await session.execute(
-            select(SubscriptionPlan.name, func.count(UserSubscription.id))
-            .join(UserSubscription)
-            .where(UserSubscription.end_date > now, UserSubscription.user_id >= MAX_ID_OFFSET)
-            .group_by(SubscriptionPlan.name)
-        )).all()
-
     text = (
         "<b>📊 Расширенная статистика</b>\n\n"
         "👥 <b>Пользователи:</b>\n"
@@ -201,8 +214,8 @@ async def show_payment_stats(client: MaxApiClient, chat_id: int) -> None:
         f"• Доход YooKassa: {total_yoo_revenue:,.2f} руб.\n\n"
         "📉 <b>Популярность тарифов (Активные):</b>\n"
     )
-    if plan_breakdown:
-        for name, count in plan_breakdown:
+    if plan_counts:
+        for name, count in sorted(plan_counts.items(), key=lambda x: x[1], reverse=True):
             text += f"• {html.escape(name)}: {count} шт.\n"
     else:
         text += "• Нет активных тарифов\n"

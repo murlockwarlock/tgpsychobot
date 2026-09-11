@@ -67,6 +67,8 @@ from ai_integration import (
     _get_kie_base_url,
 )
 from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error, sanitize_secret_values
+from effective_subscription import is_active_subscription, load_active_subscription
+from time_helpers import format_msk
 from media_scope import PHOTO_MEDIA_TYPES, TopicMediaScope, load_media_scope, photo_media_predicate
 from ai_request_context import extract_effective_provider_and_model
 from ai_request_builder import (
@@ -14812,7 +14814,6 @@ def _calculate_effective_discount(user_sub: UserSubscription | None, user_promos
 
 async def _build_client_payment_info_text(user_id: int) -> str:
     now = datetime.utcnow()
-    msk = timezone(timedelta(hours=3))
 
     async with async_session_maker() as session:
         user = await session.get(
@@ -14825,6 +14826,30 @@ async def _build_client_payment_info_text(user_id: int) -> str:
         )
         if not user:
             return "Клиент не найден."
+
+        # For MAX users, resolve canonical effective subscription across linked accounts
+        effective_active_sub = None
+        effective_pricing_sub = user.subscription
+        effective_pricing_promos = list(user.promo_codes or [])
+
+        if user_id >= 100_000_000_000:
+            effective_active_sub = await load_active_subscription(session, user_id, now)
+            if effective_active_sub and effective_active_sub.source == "telegram":
+                tg_sub = effective_active_sub.subscription
+                tg_user = await session.get(
+                    User,
+                    tg_sub.user_id,
+                    options=[
+                        selectinload(User.subscription).selectinload(UserSubscription.plan),
+                        selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans),
+                    ],
+                )
+                if tg_user:
+                    effective_pricing_sub = tg_user.subscription or tg_sub
+                    effective_pricing_promos = list(tg_user.promo_codes or [])
+                else:
+                    effective_pricing_sub = tg_sub
+                    effective_pricing_promos = []
 
         user_sub = user.subscription
         user_promos = list(user.promo_codes or [])
@@ -14842,13 +14867,32 @@ async def _build_client_payment_info_text(user_id: int) -> str:
             )
         ) or 0.0
 
-    active_access = bool(user_sub and user_sub.end_date and user_sub.end_date > now)
-    active_paid = bool(active_access and user_sub.plan_id is not None)
-    active_bonus = bool(active_access and user_sub.plan_id is None)
-    active_referral_bonus = bool(active_bonus and user_sub.payment_provider in ['Trial Referral', 'Trial Referral Bonus'])
-    active_promo_bonus = bool(active_bonus and user_sub.payment_provider == 'Trial Promo')
-    active_welcome_bonus = bool(active_bonus and user_sub.payment_provider == 'Trial Welcome')
-    active_discount = bool((user_sub.discount_percent if user_sub else 0) > 0)
+    if effective_active_sub:
+        active_access = True
+        eff_sub_obj = effective_active_sub.subscription
+        active_sub_plan = eff_sub_obj.plan
+        effective_end_date = eff_sub_obj.end_date
+        effective_auto_renewal = eff_sub_obj.auto_renewal
+        active_paid = bool(active_sub_plan is not None)
+        active_bonus = bool(active_sub_plan is None)
+        effective_provider = eff_sub_obj.payment_provider
+        active_referral_bonus = bool(active_bonus and effective_provider in ['Trial Referral', 'Trial Referral Bonus', 'Trial Referral Pay Bonus'])
+        active_promo_bonus = bool(active_bonus and effective_provider == 'Trial Promo')
+        active_welcome_bonus = bool(active_bonus and effective_provider == 'Trial Welcome')
+    else:
+        active_access = is_active_subscription(user_sub, now)
+        active_sub_plan = user_sub.plan if (active_access and user_sub) else None
+        effective_end_date = user_sub.end_date if (active_access and user_sub) else (user_sub.end_date if user_sub else None)
+        effective_auto_renewal = user_sub.auto_renewal if user_sub else False
+        active_paid = bool(active_access and user_sub and user_sub.plan_id is not None)
+        active_bonus = bool(active_access and user_sub and user_sub.plan_id is None)
+        effective_provider = user_sub.payment_provider if user_sub else None
+        active_referral_bonus = bool(active_bonus and effective_provider in ['Trial Referral', 'Trial Referral Bonus', 'Trial Referral Pay Bonus'])
+        active_promo_bonus = bool(active_bonus and effective_provider == 'Trial Promo')
+        active_welcome_bonus = bool(active_bonus and effective_provider == 'Trial Welcome')
+
+    user_discount_percent = user_sub.discount_percent if user_sub else 0
+    active_discount = bool(user_discount_percent > 0)
 
     display_id = _display_client_id(user.id)
     display_id_label = _display_client_id_label(user.id)
@@ -14856,7 +14900,7 @@ async def _build_client_payment_info_text(user_id: int) -> str:
         "<b>💳 Платежная информация клиента</b>",
         "",
         f"<b>{display_id_label}:</b> <code>{display_id}</code>",
-        f"<b>Статус доступа:</b> {'✅ Активен' if (active_access or active_discount) else '❌ Неактивен'}",
+        f"<b>Статус доступа:</b> {'✅ Активен' if active_access else '❌ Неактивен'}",
     ]
 
     reasons = []
@@ -14868,23 +14912,26 @@ async def _build_client_payment_info_text(user_id: int) -> str:
         reasons.append("промо-бонус")
     if active_welcome_bonus:
         reasons.append("приветственный бонус")
-    if active_discount:
-        reasons.append(f"скидка {user_sub.discount_percent}%")
     if reasons:
         text_lines.append(f"<b>Основание:</b> {', '.join(reasons)}")
 
-    if user_sub and user_sub.end_date:
-        text_lines.append(f"<b>Доступ до:</b> {user_sub.end_date.astimezone(msk).strftime('%d.%m.%Y %H:%M')} МСК")
+    if active_access and effective_end_date:
+        text_lines.append(f"<b>Доступ до:</b> {format_msk(effective_end_date)}")
+    elif user_sub and user_sub.end_date:
+        text_lines.append(f"<b>Истёк:</b> {format_msk(user_sub.end_date)}")
 
     text_lines.append("")
     text_lines.append("<b>Текущий тариф:</b>")
-    if active_paid and user_sub and user_sub.plan:
-        plan = user_sub.plan
-        effective_discount = _calculate_effective_discount(user_sub, user_promos, plan.id)
+    if active_paid and active_sub_plan:
+        plan = active_sub_plan
+        effective_discount = (
+            _calculate_effective_discount(effective_pricing_sub, effective_pricing_promos, plan.id)
+            if effective_pricing_sub else 0
+        )
         final_price = plan.price * (1 - effective_discount / 100)
         duration_unit = "дн." if plan.duration_unit == 'days' else "мес."
         text_lines.append(f"• {html.escape(plan.name)} ({plan.duration_value} {duration_unit})")
-        text_lines.append(f"• Автопродление: {'✅ Включено' if user_sub.auto_renewal else '❌ Выключено'}")
+        text_lines.append(f"• Автопродление: {'✅ Включено' if effective_auto_renewal else '❌ Выключено'}")
         text_lines.append(f"• Стоимость со скидкой: {final_price:.2f} руб.")
     else:
         text_lines.append("• Активного платного тарифа нет")
@@ -14900,16 +14947,16 @@ async def _build_client_payment_info_text(user_id: int) -> str:
     else:
         text_lines.append("• Не активировались")
 
-    if active_promo_bonus and user_sub and user_sub.end_date:
+    if active_promo_bonus and effective_end_date:
         promo_candidates = [p.code for p in user_promos if p.free_days > 0]
         promo_name = promo_candidates[0] if len(promo_candidates) == 1 else "не удалось определить точно"
         text_lines.append(
-            f"• Активный промо-бонус: {html.escape(promo_name)} до {user_sub.end_date.astimezone(msk).strftime('%d.%m.%Y %H:%M')} МСК"
+            f"• Активный промо-бонус: {html.escape(promo_name)} до {format_msk(effective_end_date)}"
         )
     elif active_discount:
-        text_lines.append("• Активная скидка сохранена в аккаунте")
-        if active_bonus and user_sub and user_sub.end_date:
-            text_lines.append(f"• Скидка действует до конца бонусного периода: {user_sub.end_date.astimezone(msk).strftime('%d.%m.%Y %H:%M')} МСК")
+        text_lines.append(f"• Активная скидка сохранена в аккаунте ({user_discount_percent}%)")
+        if active_bonus and effective_end_date:
+            text_lines.append(f"• Скидка действует до конца бонусного периода: {format_msk(effective_end_date)}")
         else:
             text_lines.append("• Точный срок скидочного промокода в текущей схеме БД отдельно не хранится")
     else:
