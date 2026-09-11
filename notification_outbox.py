@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -33,6 +34,9 @@ BACKOFF_DELAYS = [
     timedelta(hours=16),
     timedelta(hours=28),
 ]
+
+OUTBOX_DELIVERY_TIMEOUT_SECONDS = 150
+OUTBOX_LEASE_SECONDS = 300
 
 
 def get_outbox_backoff(attempt_num: int) -> timedelta:
@@ -145,7 +149,7 @@ async def dispatch_outbox_by_key(
     try:
         async with sm() as session:
             token = str(uuid.uuid4())
-            lease_duration = timedelta(seconds=60)
+            lease_duration = timedelta(seconds=OUTBOX_LEASE_SECONDS)
             now = datetime.utcnow()
 
             stmt = (
@@ -153,7 +157,10 @@ async def dispatch_outbox_by_key(
                 .where(
                     PaymentNotificationOutbox.unique_key == unique_key,
                     or_(
-                        PaymentNotificationOutbox.status == "pending",
+                        and_(
+                            PaymentNotificationOutbox.status == "pending",
+                            PaymentNotificationOutbox.next_retry_at <= now,
+                        ),
                         and_(
                             PaymentNotificationOutbox.status == "processing",
                             PaymentNotificationOutbox.lease_until < now,
@@ -185,7 +192,29 @@ async def dispatch_outbox_by_key(
             payload = json.loads(row.event_payload_json)
             text, parse_mode, keyboard_type = render_outbox_message(row.event_type, payload, row.recipient_id)
 
-            delivered = await deliver_func(bot, row.recipient_id, text, keyboard_type=keyboard_type, parse_mode=parse_mode)
+            is_timeout = False
+            try:
+                delivered = await asyncio.wait_for(
+                    deliver_func(bot, row.recipient_id, text, keyboard_type=keyboard_type, parse_mode=parse_mode),
+                    timeout=OUTBOX_DELIVERY_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                delivered = False
+                is_timeout = True
+                log.warning(
+                    "OUTBOX_DELIVERY_TIMEOUT | key=%s | recipient=%s | timeout=%ss",
+                    row.unique_key,
+                    row.recipient_id,
+                    OUTBOX_DELIVERY_TIMEOUT_SECONDS,
+                )
+            except Exception as e:
+                delivered = False
+                log.warning(
+                    "OUTBOX_DELIVERY_EXCEPTION | key=%s | recipient=%s | err=%s",
+                    row.unique_key,
+                    row.recipient_id,
+                    e,
+                )
             now_done = datetime.utcnow()
 
             if delivered:
@@ -206,6 +235,7 @@ async def dispatch_outbox_by_key(
             else:
                 backoff = get_outbox_backoff(row.attempts)
                 new_status = "failed_terminal" if row.attempts >= row.max_attempts else "pending"
+                last_err = "transport_delivery_timeout" if is_timeout else "transport_delivery_failed"
                 await session.execute(
                     update(PaymentNotificationOutbox)
                     .where(PaymentNotificationOutbox.id == row.id, PaymentNotificationOutbox.claim_token == token)
@@ -214,7 +244,7 @@ async def dispatch_outbox_by_key(
                         claim_token=None,
                         lease_until=None,
                         next_retry_at=now_done + backoff,
-                        last_error="transport_delivery_failed",
+                        last_error=last_err,
                         updated_at=now_done,
                     )
                 )

@@ -14829,8 +14829,27 @@ async def _build_client_payment_info_text(user_id: int) -> str:
 
         # For MAX users, resolve canonical effective subscription across linked accounts
         effective_active_sub = None
+        effective_pricing_sub = user.subscription
+        effective_pricing_promos = list(user.promo_codes or [])
+
         if user_id >= 100_000_000_000:
             effective_active_sub = await load_active_subscription(session, user_id, now)
+            if effective_active_sub and effective_active_sub.source == "telegram":
+                tg_sub = effective_active_sub.subscription
+                tg_user = await session.get(
+                    User,
+                    tg_sub.user_id,
+                    options=[
+                        selectinload(User.subscription).selectinload(UserSubscription.plan),
+                        selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans),
+                    ],
+                )
+                if tg_user:
+                    effective_pricing_sub = tg_user.subscription or tg_sub
+                    effective_pricing_promos = list(tg_user.promo_codes or [])
+                else:
+                    effective_pricing_sub = tg_sub
+                    effective_pricing_promos = []
 
         user_sub = user.subscription
         user_promos = list(user.promo_codes or [])
@@ -14905,7 +14924,10 @@ async def _build_client_payment_info_text(user_id: int) -> str:
     text_lines.append("<b>Текущий тариф:</b>")
     if active_paid and active_sub_plan:
         plan = active_sub_plan
-        effective_discount = _calculate_effective_discount(user_sub, user_promos, plan.id) if user_sub else 0
+        effective_discount = (
+            _calculate_effective_discount(effective_pricing_sub, effective_pricing_promos, plan.id)
+            if effective_pricing_sub else 0
+        )
         final_price = plan.price * (1 - effective_discount / 100)
         duration_unit = "дн." if plan.duration_unit == 'days' else "мес."
         text_lines.append(f"• {html.escape(plan.name)} ({plan.duration_value} {duration_unit})")

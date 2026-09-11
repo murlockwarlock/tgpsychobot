@@ -222,3 +222,152 @@ class NotificationOutboxConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(final_row.status, "failed_terminal")
             self.assertEqual(final_row.attempts, 2)
+
+    async def test_live_sender_vs_expired_lease_race(self):
+        """Worker A starts delivery; clock advances beyond old 60s boundary; Worker B cannot claim lease; exactly 1 send."""
+        key = "test:race:lease_safety"
+        now = datetime(2026, 9, 11, 12, 0, 0)
+        async with async_session_maker() as session:
+            await enqueue_outbox_event(
+                session,
+                key,
+                "Yookassa",
+                123001,
+                "purchase_success",
+                {"plan_name": "Lease Guard Plan"},
+            )
+            await session.commit()
+
+        worker_a_started = asyncio.Event()
+        worker_a_finish = asyncio.Event()
+
+        async def hanging_deliver_a(*args, **kwargs):
+            worker_a_started.set()
+            await worker_a_finish.wait()
+            return True
+
+        delivery_mock_b = AsyncMock(return_value=True)
+
+        with patch("notification_outbox.datetime") as mock_dt:
+            mock_dt.utcnow.return_value = now
+            # Worker A starts and claims row (lease_until = now + 300s)
+            task_a = asyncio.create_task(
+                dispatch_outbox_by_key(self.bot, key, deliver_func=hanging_deliver_a)
+            )
+            await worker_a_started.wait()
+
+            # Advance clock 75 seconds (past the old 60s boundary, but within 300s lease)
+            mock_dt.utcnow.return_value = now + timedelta(seconds=75)
+
+            # Worker B tries to claim the same row
+            res_b = await dispatch_outbox_by_key(self.bot, key, deliver_func=delivery_mock_b)
+            self.assertFalse(res_b)
+            delivery_mock_b.assert_not_called()
+
+            # Worker A finishes
+            mock_dt.utcnow.return_value = now + timedelta(seconds=80)
+            worker_a_finish.set()
+            res_a = await task_a
+            self.assertTrue(res_a)
+
+        from sqlalchemy import select
+        async with async_session_maker() as session:
+            row = await session.scalar(
+                select(PaymentNotificationOutbox).where(PaymentNotificationOutbox.unique_key == key)
+            )
+            self.assertEqual(row.status, "delivered")
+            self.assertEqual(row.attempts, 1)
+
+    async def test_delivery_exceeds_hard_timeout_handling(self):
+        """Delivery exceeding bounded timeout cancels cleanly, resets to pending with backoff, zero payment mutations."""
+        key = "test:timeout:hard_bound"
+        async with async_session_maker() as session:
+            await enqueue_outbox_event(
+                session,
+                key,
+                "Yookassa",
+                123002,
+                "purchase_success",
+                {"plan_name": "Timeout Plan"},
+            )
+            await session.commit()
+
+        async def slow_deliver(*args, **kwargs):
+            await asyncio.sleep(0.5)
+            return True
+
+        with patch("notification_outbox.OUTBOX_DELIVERY_TIMEOUT_SECONDS", 0.05):
+            res = await dispatch_outbox_by_key(self.bot, key, deliver_func=slow_deliver)
+            self.assertFalse(res)
+
+        from sqlalchemy import select
+        async with async_session_maker() as session:
+            row = await session.scalar(
+                select(PaymentNotificationOutbox).where(PaymentNotificationOutbox.unique_key == key)
+            )
+            self.assertIsNotNone(row)
+            self.assertEqual(row.status, "pending")
+            self.assertIsNone(row.claim_token)
+            self.assertIsNone(row.lease_until)
+            self.assertEqual(row.last_error, "transport_delivery_timeout")
+            self.assertEqual(row.attempts, 1)
+
+    async def test_stale_candidate_next_retry_at_cas_race(self):
+        """Deterministic CAS race: Worker B with stale candidate key fails claim while next_retry_at is in future."""
+        key = "test:stale:cas_race"
+        now = datetime(2026, 9, 11, 12, 0, 0)
+        async with async_session_maker() as session:
+            await enqueue_outbox_event(
+                session,
+                key,
+                "Yookassa",
+                123003,
+                "purchase_success",
+                {"plan_name": "Stale Candidate Plan"},
+            )
+            await session.commit()
+
+        deliver_mock_a = AsyncMock(return_value=False)
+        deliver_mock_b = AsyncMock(return_value=True)
+
+        with patch("notification_outbox.datetime") as mock_dt:
+            # Both workers see row as pending at 'now'
+            mock_dt.utcnow.return_value = now
+
+            # Worker A claims and fails delivery
+            res_a = await dispatch_outbox_by_key(self.bot, key, deliver_func=deliver_mock_a)
+            self.assertFalse(res_a)
+            deliver_mock_a.assert_awaited_once()
+
+            # Worker B immediately attempts claim with stale key at now + 1 second
+            mock_dt.utcnow.return_value = now + timedelta(seconds=1)
+            res_b = await dispatch_outbox_by_key(self.bot, key, deliver_func=deliver_mock_b)
+            self.assertFalse(res_b)
+            # Transport was NOT called by B
+            deliver_mock_b.assert_not_called()
+
+            # Verify attempts was incremented only once
+            from sqlalchemy import select
+            async with async_session_maker() as session:
+                row = await session.scalar(
+                    select(PaymentNotificationOutbox).where(PaymentNotificationOutbox.unique_key == key)
+                )
+                self.assertEqual(row.status, "pending")
+                self.assertEqual(row.attempts, 1)
+                self.assertEqual(row.last_error, "transport_delivery_failed")
+                future_retry = row.next_retry_at
+
+            # Advance clock past next_retry_at
+            mock_dt.utcnow.return_value = future_retry + timedelta(seconds=1)
+
+            # Now Worker B attempts again -> claim succeeds and delivers
+            res_b_retry = await dispatch_outbox_by_key(self.bot, key, deliver_func=deliver_mock_b)
+            self.assertTrue(res_b_retry)
+            deliver_mock_b.assert_awaited_once()
+
+            async with async_session_maker() as session:
+                delivered_row = await session.scalar(
+                    select(PaymentNotificationOutbox).where(PaymentNotificationOutbox.unique_key == key)
+                )
+                self.assertEqual(delivered_row.status, "delivered")
+                self.assertEqual(delivered_row.attempts, 2)
