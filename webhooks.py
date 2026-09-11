@@ -30,6 +30,15 @@ from robokassa_signing import (
     format_robokassa_expiration,
     robokassa_payment_diagnostics,
 )
+from time_helpers import format_msk
+from notification_outbox import (
+    NotificationPolicy,
+    dispatch_outbox_by_key,
+    enqueue_outbox_event,
+    build_canonical_outbox_key,
+    get_canonical_key_for_yookassa_success,
+    get_canonical_key_for_yookassa_cancellation,
+)
 
 import os
 import re
@@ -231,6 +240,7 @@ async def handle_yookassa_webhook(request: web.Request):
                     payment_method_id=pm_id,
                     is_recurring=is_recurring_payment,
                     recurring_attempt_key=recurring_attempt_key,
+                    notification_policy=NotificationPolicy.ALL_USER_EVENTS,
                 )
                 config = await session.get(SubscriptionConfig, 1)
 
@@ -243,98 +253,47 @@ async def handle_yookassa_webhook(request: web.Request):
             plog.info(f"ОПЛАТА_ПРЕРВАНА | Yookassa | {user_part} | {plan_part} | PayId={payment_id} | action={action}")
 
             if uid_int and is_recurring_payment:
-                try:
-                    if action in ('historical_canceled', 'orphan_canceled'):
-                        plog.info(
-                            f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | Yookassa | {user_part} | {plan_part} | "
-                            f"PayId={payment_id} | action={action} | Текущая подписка не затронута"
-                        )
-                        return web.Response(status=200)
+                if action not in ('historical_canceled', 'orphan_canceled'):
+                    att_count = getattr(user_sub, 'payment_attempt_count', 0) if user_sub else 0
+                    key = get_canonical_key_for_yookassa_cancellation(payment_id, uid_int, action, att_count)
+                    await dispatch_outbox_by_key(bot, key, session_maker=async_session_maker)
 
-                    elif action == 'deactivate':
-                        await send_msg_universal(
-                            bot,
-                            uid_int,
-                            "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\n"
-                            "Продлите подписку вручную в меню."
-                        )
-                        if config and config.notifications_enabled:
-                            for admin_id in await get_all_admin_ids():
-                                try:
-                                    await bot.send_message(
-                                        admin_id,
-                                        f"🚫 Автопродление отключено (карта недоступна в YooKassa)\n"
-                                        f"Пользователь: {user_part}\nПровайдер: Yookassa\nPayId: {payment_id}"
-                                    )
-                                except Exception:
-                                    pass
-                        return web.Response(status=200)
+                if action in ('historical_canceled', 'orphan_canceled'):
+                    plog.info(
+                        f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | Yookassa | {user_part} | {plan_part} | "
+                        f"PayId={payment_id} | action={action} | Текущая подписка не затронута"
+                    )
+                    return web.Response(status=200)
 
-                    elif action == 'provider_error':
-                        await send_msg_universal(
-                            bot,
-                            uid_int,
-                            "Платёжный шлюз ЮKassa временно недоступен. Эта ошибка не засчитана как попытка списания.\n\n"
-                            "Повторим попытку позже."
-                        )
-                        return web.Response(status=200)
-
-                    elif action == 'unknown_cancellation':
-                        await send_msg_universal(
-                            bot,
-                            uid_int,
-                            "Не удалось выполнить автоматическое списание (нестандартный ответ банка). "
-                            "Автопродление приостановлено во избежание повторных списаний.\n\n"
-                            "Пожалуйста, оформите или продлите подписку вручную в меню бота."
-                        )
-                        if config and config.notifications_enabled:
-                            for admin_id in await get_all_admin_ids():
-                                try:
-                                    await bot.send_message(
-                                        admin_id,
-                                        f"⚠️ Автопродление приостановлено (неизвестный статус отмены YooKassa)\n"
-                                        f"Пользователь: {user_part}\nТариф: {plan_part}\nPayId: {payment_id}\n"
-                                        f"Причина отмены: {cancellation_reason or 'не указана'}\n"
-                                        f"Автопродление приостановлено, требуется действие пользователя."
-                                    )
-                                except Exception:
-                                    pass
-                        return web.Response(status=200)
-
-                    else:
-                        att_count = getattr(user_sub, 'payment_attempt_count', 0) if user_sub else 0
-                        auto_off = getattr(user_sub, 'auto_renewal', True) is False
-                        if auto_off or att_count >= 3:
-                            await send_msg_universal(
-                                bot,
-                                uid_int,
-                                "Не удалось списать средства (ЮKassa) после 3 попыток. Автопродление отключено.\n\n"
-                                "Оформите подписку заново в меню."
-                            )
-                        else:
-                            next_retry_at = get_next_retry_at(att_count, getattr(user_sub, 'last_payment_attempt', None))
-                            next_retry_text = next_retry_at.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m %H:%M МСК') if next_retry_at else "позже"
-                            msg_text = (
-                                f"Не удалось списать средства (ЮKassa). Повторим попытку {next_retry_text}."
-                                if att_count == 1
-                                else f"Не удалось списать средства (ЮKassa). Последняя попытка — {next_retry_text}."
-                            )
-                            await send_msg_universal(bot, uid_int, msg_text)
-
-                        if config and config.notifications_enabled:
-                            for admin_id in await get_all_admin_ids():
-                                try:
-                                    admin_text = (
-                                        f"⏹ Платёж прерван (YooKassa)\nПользователь: {user_part}\n"
-                                        f"Тариф: {plan_part}\nPayId: {payment_id}\nПопытка: {att_count}/3"
-                                    )
-                                    if auto_off or att_count >= 3:
-                                        admin_text += "\nАвтопродление отключено."
-                                    await bot.send_message(admin_id, admin_text)
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
+                if config and config.notifications_enabled:
+                    for admin_id in await get_all_admin_ids():
+                        try:
+                            if action == 'deactivate':
+                                await bot.send_message(
+                                    admin_id,
+                                    f"🚫 Автопродление отключено (карта недоступна в YooKassa)\n"
+                                    f"Пользователь: {user_part}\nПровайдер: Yookassa\nPayId: {payment_id}"
+                                )
+                            elif action == 'unknown_cancellation':
+                                await bot.send_message(
+                                    admin_id,
+                                    f"⚠️ Автопродление приостановлено (неизвестный статус отмены YooKassa)\n"
+                                    f"Пользователь: {user_part}\nТариф: {plan_part}\nPayId: {payment_id}\n"
+                                    f"Причина отмены: {cancellation_reason or 'не указана'}\n"
+                                    f"Автопродление приостановлено, требуется действие пользователя."
+                                )
+                            else:
+                                att_count = getattr(user_sub, 'payment_attempt_count', 0) if user_sub else 0
+                                auto_off = getattr(user_sub, 'auto_renewal', True) is False
+                                admin_text = (
+                                    f"⏹ Платёж прерван (YooKassa)\nПользователь: {user_part}\n"
+                                    f"Тариф: {plan_part}\nPayId: {payment_id}\nПопытка: {att_count}/3"
+                                )
+                                if auto_off or att_count >= 3:
+                                    admin_text += "\nАвтопродление отключено."
+                                await bot.send_message(admin_id, admin_text)
+                        except Exception:
+                            pass
 
             return web.Response(status=200)
 
@@ -371,6 +330,7 @@ async def handle_yookassa_webhook(request: web.Request):
                     payment_method_id=payment_method_id,
                     is_recurring=True,
                     recurring_attempt_key=recurring_attempt_key,
+                    notification_policy=NotificationPolicy.ALL_USER_EVENTS,
                 )
                 is_new, user_sub = res[0], res[1]
                 action = getattr(res, "action", "success")
@@ -384,6 +344,11 @@ async def handle_yookassa_webhook(request: web.Request):
                 plog.info(f"WEBHOOK_ДУБЛЬ | Yookassa | payment_id={payment_id} | status=completed")
                 return web.Response(status=200)
 
+            key = get_canonical_key_for_yookassa_success(
+                payment_id, user_id, action, is_recurring=True, reconciliation_details=rec_details
+            )
+            await dispatch_outbox_by_key(bot, key, session_maker=async_session_maker)
+
             if action == "manual_reconciliation_required":
                 reason = rec_details.get("reason")
                 charge_amount = rec_details.get("amount", plan_price_for_notif)
@@ -394,12 +359,6 @@ async def handle_yookassa_webhook(request: web.Request):
                         f"РЕКУРРЕНТ_ПОДПИСКА_НЕ_НАЙДЕНА | payment_id={payment_id} | "
                         f"user_id={user_id} | sub_id={sub_id_rec} | attempt_id={att_id_rec} | "
                         f"amount={charge_amount:.2f} руб"
-                    )
-                    await send_msg_universal(
-                        bot,
-                        user_id,
-                        f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
-                        f"Платёж отправлен на проверку администратору."
                     )
                     if config and config.notifications_enabled:
                         for admin_id in await get_all_admin_ids():
@@ -423,12 +382,6 @@ async def handle_yookassa_webhook(request: web.Request):
                         f"РЕКУРРЕНТ_ТАРИФ_НЕ_НАЙДЕН | payment_id={payment_id} | "
                         f"user_id={user_id} | paid_plan_id={rec_details.get('paid_plan_id')} | "
                         f"amount={charge_amount:.2f} руб"
-                    )
-                    await send_msg_universal(
-                        bot,
-                        user_id,
-                        f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но оплаченный тариф не найден в системе. "
-                        f"Платёж отправлен на проверку администратору. Срок действия текущей подписки не был изменён автоматически."
                     )
                     if config and config.notifications_enabled:
                         for admin_id in await get_all_admin_ids():
@@ -454,13 +407,6 @@ async def handle_yookassa_webhook(request: web.Request):
                         f"user_id={user_id} | paid_plan={paid_name} | current_plan={curr_name} | "
                         f"amount={charge_amount:.2f} руб"
                     )
-                    await send_msg_universal(
-                        bot,
-                        user_id,
-                        f"⚠️ Мы получили оплату ({charge_amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                        f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                        f"Срок действия текущей подписки не был изменён автоматически."
-                    )
                     if config and config.notifications_enabled:
                         for admin_id in await get_all_admin_ids():
                             try:
@@ -479,9 +425,6 @@ async def handle_yookassa_webhook(request: web.Request):
                     return web.Response(status=200)
 
             plog.info(f"ПРОДЛЕНИЕ | Yookassa | [id={user_id}] | {plan_name_for_notif} | {plan_price_for_notif:.2f} руб | PayId={payment_id}")
-            if user_sub:
-                end_str = user_sub.end_date.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M МСК')
-                await send_msg_universal(bot, user_id, f"✅ Подписка продлена до {end_str}.")
             if config and config.notifications_enabled:
                 for admin_id in await get_all_admin_ids():
                     try:
@@ -583,6 +526,18 @@ async def handle_yookassa_webhook(request: web.Request):
             yk_payment.payment_method_id = payment_method_id
             yk_payment.processed_at = now
 
+            # Outbox: ordinary purchase
+            purchase_key = get_canonical_key_for_yookassa_success(payment_id, user_id, "success", is_recurring=False)
+            purchase_payload = {
+                "user_id": user_id,
+                "plan_name": plan_name_for_notif,
+                "amount": plan_price_for_notif,
+                "payment_id": payment_id,
+                "provider": "Yookassa",
+            }
+            await enqueue_outbox_event(session, purchase_key, "Yookassa", user_id, "purchase_success", purchase_payload, payment_id=payment_id)
+
+            ref_key = None
             paying_user = await session.get(User, user_id)
             if paying_user and paying_user.referred_by:
                 ref_config = await session.get(SubscriptionConfig, 1)
@@ -625,6 +580,17 @@ async def handle_yookassa_webhook(request: web.Request):
                                 ))
                             referrer_bonus_user_id = paying_user.referred_by
                             referrer_bonus_days = bonus_days
+
+                            ref_key = f"yookassa:payment:{payment_id}:{paying_user.referred_by}:referral_bonus"
+                            ref_payload = {
+                                "user_id": paying_user.referred_by,
+                                "bonus_days": bonus_days,
+                                "referred_user_id": user_id,
+                            }
+                            await enqueue_outbox_event(
+                                session, ref_key, "Yookassa", paying_user.referred_by, "referral_bonus", ref_payload, payment_id=payment_id
+                            )
+
                     session.add(ReferralPaymentLog(
                         referrer_id=paying_user.referred_by,
                         referred_user_id=user_id,
@@ -632,6 +598,11 @@ async def handle_yookassa_webhook(request: web.Request):
                     ))
 
             await session.commit()
+
+            # Immediate post-commit dispatch
+            await dispatch_outbox_by_key(bot, purchase_key, session_maker=async_session_maker)
+            if ref_key and referrer_bonus_user_id and referrer_bonus_days > 0:
+                await dispatch_outbox_by_key(bot, ref_key, session_maker=async_session_maker)
 
             user = paying_user
             if user:
@@ -648,14 +619,6 @@ async def handle_yookassa_webhook(request: web.Request):
                 user_ref_log = f"[id={user_id}]"
 
             plog.info(f"ОПЛАТА | Yookassa | {user_ref_log} | {plan_name_for_notif} | {plan_price_for_notif:.2f} руб | PayId={payment_id}")
-            await send_msg_universal(bot, user_id, f"✅ Ваша подписка на тариф «{plan_name_for_notif}» успешно оформлена!")
-            if referrer_bonus_user_id and referrer_bonus_days > 0:
-                await send_msg_universal(
-                    bot,
-                    referrer_bonus_user_id,
-                    f"💰 Ваш реферал оформил подписку! Вам начислено <b>{referrer_bonus_days} бонусных дн.</b>",
-                    parse_mode="HTML"
-                )
 
             config = await session.get(SubscriptionConfig, 1)
             if config and config.notifications_enabled:
@@ -1028,7 +991,24 @@ async def handle_robokassa_result(request: web.Request):
                 )
                 session.add(new_sub)
 
-            await session.commit()
+            end_date_msk = format_msk(end_date)
+            rk_event_type = "renewal_success" if is_renewal else "purchase_success"
+            rk_key = build_canonical_outbox_key("robokassa", "payment", inv_id, payment_user_id, rk_event_type)
+            rk_payload = {
+                "user_id": payment_user_id,
+                "amount": payment_amount_for_notif,
+                "plan_name": plan_name_for_notif,
+                "end_date_msk": end_date_msk,
+                "provider": "Robokassa",
+                "payment_id": str(inv_id),
+            }
+            await enqueue_outbox_event(
+                session, rk_key, "Robokassa", payment_user_id, rk_event_type, rk_payload, payment_id=str(inv_id)
+            )
+
+            ref_key_rk = None
+            referrer_bonus_user_id_rk = None
+            referrer_bonus_days_rk = 0
 
             # Referral: log payment and optionally give bonus days to referrer
             paying_user_rk = await session.get(User, payment_user_id)
@@ -1073,31 +1053,33 @@ async def handle_robokassa_result(request: web.Request):
                                 ))
                             referrer_bonus_user_id_rk = paying_user_rk.referred_by
                             referrer_bonus_days_rk = bonus_days_rk
+                            ref_key_rk = f"robokassa:payment:{inv_id}:{paying_user_rk.referred_by}:referral_bonus"
+                            ref_payload_rk = {
+                                "user_id": paying_user_rk.referred_by,
+                                "bonus_days": bonus_days_rk,
+                                "referred_user_id": payment_user_id,
+                            }
+                            await enqueue_outbox_event(
+                                session,
+                                ref_key_rk,
+                                "Robokassa",
+                                paying_user_rk.referred_by,
+                                "referral_bonus",
+                                ref_payload_rk,
+                                payment_id=str(inv_id),
+                            )
                     session.add(ReferralPaymentLog(
                         referrer_id=paying_user_rk.referred_by,
                         referred_user_id=payment_user_id,
                         amount=payment_amount_for_notif,
                     ))
-                    await session.commit()
-                    if ref_config_rk.referral_pay_bonus_enabled and ref_config_rk.referral_pay_bonus_days > 0:
-                        if not already_paid_rk:
-                            await send_msg_universal(
-                                bot,
-                                referrer_bonus_user_id_rk,
-                                f"💰 Ваш реферал оформил подписку! Вам начислено <b>{referrer_bonus_days_rk} бонусных дн.</b>",
-                                parse_mode="HTML"
-                            )
 
-        end_date_msk = end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M')
+            await session.commit()
 
-        await send_msg_universal(
-            bot,
-            payment_user_id,
-            f"Мы получили оплату {payment_amount_for_notif:.2f} руб по вашему тарифу «{plan_name_for_notif}».\n"
-            f"Действие тарифа продлено до {end_date_msk} МСК.\n\n"
-            f"Благодарим, что продолжаете пользоваться ботом!\n"
-            f"Вы всегда можете направить нам свои пожелания, предложения по его работе."
-        )
+            # Immediate post-commit dispatch
+            await dispatch_outbox_by_key(bot, rk_key, session_maker=async_session_maker)
+            if ref_key_rk and referrer_bonus_user_id_rk and referrer_bonus_days_rk > 0:
+                await dispatch_outbox_by_key(bot, ref_key_rk, session_maker=async_session_maker)
 
         if is_renewal:
             plog.info(f"ПРОДЛЕНИЕ | Robokassa | {user_display} | {plan_name_for_notif} | {payment_amount_for_notif:.2f} руб | InvId={inv_id}")

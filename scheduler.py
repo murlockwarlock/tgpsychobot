@@ -57,6 +57,16 @@ from subscription_renewal import (
     should_send_auth_alert,
     mask_payment_method_id,
 )
+from time_helpers import format_msk, to_msk
+from notification_transport import send_notification_transport
+from notification_outbox import (
+    NotificationPolicy,
+    dispatch_outbox_by_key,
+    enqueue_outbox_event,
+    build_canonical_outbox_key,
+    get_canonical_key_for_yookassa_success,
+    get_canonical_key_for_yookassa_cancellation,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -153,14 +163,8 @@ def _payment_log_path() -> str:
     return os.path.join(os.path.dirname(__file__), "logs", f"payment_events_{app_port}.log")
 
 
-def _to_msk(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(MSK)
-
-
-def _format_msk(dt: datetime, fmt: str = "%d.%m.%Y %H:%M МСК") -> str:
-    return _to_msk(dt).strftime(fmt)
+_to_msk = to_msk
+_format_msk = format_msk
 
 
 def _was_recent_notification_logged(recipient_id: int, key: str, now: datetime, window: timedelta) -> bool:
@@ -204,12 +208,18 @@ async def _send_deduplicated_notification(
         *,
         reply_markup=None,
         window: timedelta = EXPIRATION_DEDUP_WINDOW,
+        logger=None,
 ) -> bool:
     if _was_recent_notification_logged(recipient_id, key, now, window):
         return False
-    await bot.send_message(recipient_id, text, reply_markup=reply_markup)
-    plog.info(f"NOTIFY_SENT | recipient_id={recipient_id} | key={key}")
-    return True
+    delivered = await send_notification_transport(bot, recipient_id, text, reply_markup=reply_markup)
+    target_logger = logger or plog
+    if delivered:
+        target_logger.info(f"NOTIFY_SENT | recipient_id={recipient_id} | key={key}")
+        return True
+    else:
+        target_logger.warning(f"NOTIFY_FAILED | recipient_id={recipient_id} | key={key}")
+        return False
 
 
 def patch_bot_send_message(bot: Bot):
@@ -345,7 +355,9 @@ async def disable_auto_renewal_after_failed_attempts(
         plan_name: str,
         subscribe_kb: InlineKeyboardMarkup,
         config: SubscriptionConfig,
-        all_admin_ids: set[int]
+        all_admin_ids: set[int],
+        *,
+        skip_user_message: bool = False,
 ):
     plog.warning(f"АВТОПРОДЛ_ОТКЛ | {user_ref} | причина: 3 попытки | {plan_name}")
     sub.auto_renewal = False
@@ -353,14 +365,16 @@ async def disable_auto_renewal_after_failed_attempts(
     sub.last_payment_attempt = None
     await session.commit()
 
-    try:
-        await bot.send_message(
-            sub.user_id,
-            "Ваша подписка истекла. Не удалось списать средства после 3 попыток — автопродление отключено.\n\nПродлите подписку вручную в меню.",
-            reply_markup=subscribe_kb
-        )
-    except Exception:
-        pass
+    if not skip_user_message:
+        try:
+            await send_notification_transport(
+                bot,
+                sub.user_id,
+                "Ваша подписка истекла. Не удалось списать средства после 3 попыток — автопродление отключено.\n\nПродлите подписку вручную в меню.",
+                reply_markup=subscribe_kb,
+            )
+        except Exception:
+            pass
 
     if config and config.notifications_enabled:
         for admin_id in all_admin_ids:
@@ -537,10 +551,21 @@ async def check_subscriptions(bot: Bot):
                     is_recurring=True,
                     recurring_attempt_key=u_att.idempotency_key,
                     logger=plog,
+                    notification_policy=NotificationPolicy.TERMINAL_ONLY,
                 )
                 is_new, updated_sub = res_fin[0], res_fin[1]
                 action = getattr(res_fin, "action", "success")
                 rec_details = getattr(res_fin, "reconciliation_details", {})
+                if is_new:
+                    key = get_canonical_key_for_yookassa_success(
+                        rec_result.payment_id,
+                        u_att.user_id,
+                        action,
+                        is_recurring=True,
+                        reconciliation_details=rec_details,
+                    )
+                    await dispatch_outbox_by_key(bot, key)
+
                 if is_new and action == "manual_reconciliation_required":
                     reason = rec_details.get("reason")
                     if reason == "subscription_unresolved":
@@ -550,15 +575,6 @@ async def check_subscriptions(bot: Bot):
                             f"РЕКУРРЕНТ_ПОДПИСКА_НЕ_НАЙДЕНА | payment_id={rec_result.payment_id} | "
                             f"user_id={u_att.user_id} | sub_id={sub_id_rec} | attempt_id={att_id_rec} | "
                             f"amount={u_att.amount:.2f} руб"
-                        )
-                        await _send_deduplicated_notification(
-                            bot,
-                            u_att.user_id,
-                            f"⚠️ Мы получили оплату ({u_att.amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
-                            f"Платёж отправлен на проверку администратору.",
-                            f"yk_unresolved_sub:{u_att.subscription_id}:{rec_result.payment_id}",
-                            now,
-                            window=timedelta(days=2),
                         )
                         if config and config.notifications_enabled:
                             for admin_id in all_admin_ids:
@@ -579,16 +595,6 @@ async def check_subscriptions(bot: Bot):
                     else:
                         paid_name = rec_details.get("paid_plan_name", plan_name_rec)
                         curr_name = rec_details.get("current_plan_name", "текущий тариф")
-                        await _send_deduplicated_notification(
-                            bot,
-                            u_att.user_id,
-                            f"⚠️ Мы получили оплату ({u_att.amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                            f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                            f"Срок действия текущей подписки не был изменён автоматически.",
-                            f"yk_cross_plan:{u_att.subscription_id}:{rec_result.payment_id}",
-                            now,
-                            window=timedelta(days=2),
-                        )
                         if config and config.notifications_enabled:
                             for admin_id in all_admin_ids:
                                 try:
@@ -605,14 +611,6 @@ async def check_subscriptions(bot: Bot):
                                 except Exception:
                                     pass
                 elif is_new and updated_sub:
-                    await _send_deduplicated_notification(
-                        bot,
-                        u_att.user_id,
-                        f"✅ Подписка продлена до {_format_msk(updated_sub.end_date, '%d.%m.%Y %H:%M')}.",
-                        f"yk_success:{updated_sub.id}:{rec_result.payment_id}",
-                        now,
-                        window=timedelta(days=2),
-                    )
                     if config and config.notifications_enabled:
                         for admin_id in all_admin_ids:
                             try:
@@ -636,6 +634,7 @@ async def check_subscriptions(bot: Bot):
                         force_deactivate=True,
                         recurring_attempt_key=u_att.idempotency_key,
                         logger=plog,
+                        notification_policy=NotificationPolicy.TERMINAL_ONLY,
                     )
                 else:
                     is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
@@ -647,6 +646,7 @@ async def check_subscriptions(bot: Bot):
                         attempt_started_at=u_att.attempt_started_at,
                         attempt=u_att,
                         logger=plog,
+                        notification_policy=NotificationPolicy.TERMINAL_ONLY,
                     )
                     action = "deactivate"
                 if is_new:
@@ -655,11 +655,16 @@ async def check_subscriptions(bot: Bot):
                             f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | reconciliation | [id={u_att.user_id}] | PayId={rec_result.payment_id or 'none'}"
                         )
                     else:
-                        await bot.send_message(
-                            u_att.user_id,
-                            "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nПродлите подписку вручную в меню.",
-                            reply_markup=subscribe_kb,
-                        )
+                        if rec_result.payment_id:
+                            key = get_canonical_key_for_yookassa_cancellation(
+                                rec_result.payment_id,
+                                u_att.user_id,
+                                action,
+                                getattr(updated_sub, 'payment_attempt_count', 0),
+                            )
+                        else:
+                            key = build_canonical_outbox_key("yookassa", "attempt", str(u_att.id), u_att.user_id, "deactivate")
+                        await dispatch_outbox_by_key(bot, key)
             elif rec_result.outcome in ('declined', 'limit_exceeded'):
                 if rec_result.payment_id:
                     is_new, action, updated_sub = await finalize_yookassa_payment_canceled(
@@ -673,6 +678,7 @@ async def check_subscriptions(bot: Bot):
                         attempt_started_at=u_att.attempt_started_at,
                         recurring_attempt_key=u_att.idempotency_key,
                         logger=plog,
+                        notification_policy=NotificationPolicy.TERMINAL_ONLY,
                     )
                 else:
                     is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
@@ -684,12 +690,22 @@ async def check_subscriptions(bot: Bot):
                         attempt_started_at=u_att.attempt_started_at,
                         attempt=u_att,
                         logger=plog,
+                        notification_policy=NotificationPolicy.TERMINAL_ONLY,
                     )
                     action = "declined"
-                if is_new and action in ("historical_canceled", "orphan_canceled"):
-                    plog.info(
-                        f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | reconciliation | [id={u_att.user_id}] | PayId={rec_result.payment_id or 'none'}"
-                    )
+                if is_new:
+                    if action in ("historical_canceled", "orphan_canceled"):
+                        plog.info(
+                            f"ИСТОРИЧЕСКИЙ_ПЛАТЁЖ_ОТМЕНЁН | reconciliation | [id={u_att.user_id}] | PayId={rec_result.payment_id or 'none'}"
+                        )
+                    elif rec_result.payment_id:
+                        key = get_canonical_key_for_yookassa_cancellation(
+                            rec_result.payment_id,
+                            u_att.user_id,
+                            action,
+                            getattr(updated_sub, 'payment_attempt_count', 0),
+                        )
+                        await dispatch_outbox_by_key(bot, key)
             elif rec_result.outcome == 'manual_review':
                 is_new_mr, _ = await transition_attempt_to_manual_review(
                     session=session,
@@ -935,19 +951,19 @@ async def check_subscriptions(bot: Bot):
                             sub.pending_robokassa_invoice_id = None
                             if pending_payment_ok:
                                 pending_payment_ok.status = 'completed'
+                            key = build_canonical_outbox_key("robokassa", "payment", pending_inv_id, sub.user_id, "renewal_success")
+                            payload = {
+                                "user_id": sub.user_id,
+                                "amount": ok_amount,
+                                "plan_name": ok_plan_name,
+                                "end_date_msk": _format_msk(sub.end_date, '%d.%m.%Y %H:%M'),
+                                "provider": "Robokassa",
+                                "payment_id": str(pending_inv_id),
+                            }
+                            await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, "renewal_success", payload, payment_id=str(pending_inv_id))
                             await session.commit()
+                            await dispatch_outbox_by_key(bot, key)
                             plog.info(f"ПРОДЛЕНИЕ | Robokassa | {user_ref} | {ok_plan_name} | {ok_amount:.2f} руб | InvId={pending_inv_id} (OpState)")
-                            try:
-                                await _send_deduplicated_notification(
-                                    bot,
-                                    sub.user_id,
-                                    f"✅ Подписка продлена до {_format_msk(sub.end_date, '%d.%m.%Y %H:%M')}.",
-                                    f"rk_success:{sub.id}:{pending_inv_id}",
-                                    now,
-                                    window=timedelta(days=2),
-                                )
-                            except Exception:
-                                pass
                             if config.notifications_enabled:
                                 for admin_id in all_admin_ids:
                                     try:
@@ -975,31 +991,21 @@ async def check_subscriptions(bot: Bot):
                             if pending_payment_fail:
                                 pending_payment_fail.status = 'failed'
                             if attempt_num_op >= 3:
+                                key = build_canonical_outbox_key("robokassa", "payment", pending_inv_id, sub.user_id, "final_decline")
+                                payload = {"user_id": sub.user_id, "action": "final_decline", "provider": "Robokassa"}
+                                await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, "final_decline", payload, payment_id=str(pending_inv_id))
                                 await disable_auto_renewal_after_failed_attempts(
-                                    session, bot, sub, user_ref, plan_name_op, subscribe_kb, config, all_admin_ids
+                                    session, bot, sub, user_ref, plan_name_op, subscribe_kb, config, all_admin_ids, skip_user_message=True
                                 )
+                                await dispatch_outbox_by_key(bot, key)
                                 continue
-                            await session.commit()
                             next_retry_at = get_next_retry_at(sub.payment_attempt_count, sub.last_payment_attempt)
-                            user_msg_op = "Не удалось провести автосписание (Robokassa)."
-                            if attempt_num_op == 1 and next_retry_at:
-                                next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК')
-                                user_msg_op = f"Не удалось провести автосписание (Robokassa). Повторим попытку {next_retry_str}."
-                            elif attempt_num_op == 2 and next_retry_at:
-                                next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК')
-                                user_msg_op = f"Не удалось провести автосписание (Robokassa). Последняя попытка — {next_retry_str}."
-                            try:
-                                await _send_deduplicated_notification(
-                                    bot,
-                                    sub.user_id,
-                                    user_msg_op,
-                                    f"rk_failed_op:{sub.id}:{attempt_num_op}",
-                                    now,
-                                    reply_markup=subscribe_kb,
-                                    window=timedelta(days=1),
-                                )
-                            except Exception:
-                                pass
+                            next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК') if next_retry_at else "позже"
+                            key = build_canonical_outbox_key("robokassa", "payment", pending_inv_id, sub.user_id, f"retry_failed_{attempt_num_op}")
+                            payload = {"user_id": sub.user_id, "attempt_count": attempt_num_op, "next_retry_str": next_retry_str, "provider": "Robokassa"}
+                            await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, f"retry_failed_{attempt_num_op}", payload, payment_id=str(pending_inv_id))
+                            await session.commit()
+                            await dispatch_outbox_by_key(bot, key)
                             if config.notifications_enabled:
                                 for admin_id in all_admin_ids:
                                     try:
@@ -1027,31 +1033,21 @@ async def check_subscriptions(bot: Bot):
                                     pending_payment_timeout.status = 'timeout'
                                 plog.warning(f"ОШИБКА_СПИСАНИЯ | Robokassa | {user_ref} | попытка {attempt_num_to} | {plan_name_to}")
                                 if attempt_num_to >= 3:
+                                    key = build_canonical_outbox_key("robokassa", "payment", pending_inv_id, sub.user_id, "final_decline")
+                                    payload = {"user_id": sub.user_id, "action": "final_decline", "provider": "Robokassa"}
+                                    await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, "final_decline", payload, payment_id=str(pending_inv_id))
                                     await disable_auto_renewal_after_failed_attempts(
-                                        session, bot, sub, user_ref, plan_name_to, subscribe_kb, config, all_admin_ids
+                                        session, bot, sub, user_ref, plan_name_to, subscribe_kb, config, all_admin_ids, skip_user_message=True
                                     )
+                                    await dispatch_outbox_by_key(bot, key)
                                     continue
-                                await session.commit()
                                 next_retry_at = get_next_retry_at(sub.payment_attempt_count, sub.last_payment_attempt)
-                                user_msg_to = "Не удалось провести автосписание (Robokassa)."
-                                if attempt_num_to == 1 and next_retry_at:
-                                    next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК')
-                                    user_msg_to = f"Не удалось провести автосписание (Robokassa). Повторим попытку {next_retry_str}."
-                                elif attempt_num_to == 2 and next_retry_at:
-                                    next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК')
-                                    user_msg_to = f"Не удалось провести автосписание (Robokassa). Последняя попытка — {next_retry_str}."
-                                try:
-                                    await _send_deduplicated_notification(
-                                        bot,
-                                        sub.user_id,
-                                        user_msg_to,
-                                        f"rk_failed_timeout:{sub.id}:{attempt_num_to}",
-                                        now,
-                                        reply_markup=subscribe_kb,
-                                        window=timedelta(days=1),
-                                    )
-                                except Exception:
-                                    pass
+                                next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК') if next_retry_at else "позже"
+                                key = build_canonical_outbox_key("robokassa", "payment", pending_inv_id, sub.user_id, f"retry_failed_{attempt_num_to}")
+                                payload = {"user_id": sub.user_id, "attempt_count": attempt_num_to, "next_retry_str": next_retry_str, "provider": "Robokassa"}
+                                await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, f"retry_failed_{attempt_num_to}", payload, payment_id=str(pending_inv_id))
+                                await session.commit()
+                                await dispatch_outbox_by_key(bot, key)
                                 if config.notifications_enabled:
                                     for admin_id in all_admin_ids:
                                         try:
@@ -1145,26 +1141,27 @@ async def check_subscriptions(bot: Bot):
                                 is_recurring=True,
                                 recurring_attempt_key=att.idempotency_key,
                                 logger=plog,
+                                notification_policy=NotificationPolicy.TERMINAL_ONLY,
                             )
                             is_new, updated_sub = res_fin[0], res_fin[1]
                             action = getattr(res_fin, "action", "success")
                             rec_details = getattr(res_fin, "reconciliation_details", {})
+                            if is_new:
+                                key = get_canonical_key_for_yookassa_success(
+                                    res.payment_id,
+                                    sub.user_id,
+                                    action,
+                                    is_recurring=True,
+                                    reconciliation_details=rec_details,
+                                )
+                                await dispatch_outbox_by_key(bot, key)
+
                             if is_new and action == "manual_reconciliation_required":
                                 reason = rec_details.get("reason")
                                 charge_amount = rec_details.get("amount", final_price)
                                 if reason == "subscription_unresolved":
                                     sub_id_rec = rec_details.get("subscription_id")
                                     att_id_rec = rec_details.get("attempt_id")
-                                    await _send_deduplicated_notification(
-                                        bot,
-                                        sub.user_id,
-                                        f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
-                                        f"Платёж отправлен на проверку администратору.",
-                                        f"yk_unresolved_sub:{sub.id}:{res.payment_id}",
-                                        now,
-                                        window=timedelta(days=2),
-                                        logger=plog,
-                                    )
                                     if config and config.notifications_enabled:
                                         for admin_id in all_admin_ids:
                                             try:
@@ -1184,17 +1181,6 @@ async def check_subscriptions(bot: Bot):
                                 else:
                                     paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
                                     curr_name = rec_details.get("current_plan_name", "текущий тариф")
-                                    await _send_deduplicated_notification(
-                                        bot,
-                                        sub.user_id,
-                                        f"⚠️ Мы получили оплату ({charge_amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                                        f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                                        f"Срок действия текущей подписки не был изменён автоматически.",
-                                        f"yk_cross_plan:{sub.id}:{res.payment_id}",
-                                        now,
-                                        window=timedelta(days=2),
-                                        logger=plog,
-                                    )
                                     if config and config.notifications_enabled:
                                         for admin_id in all_admin_ids:
                                             try:
@@ -1213,14 +1199,6 @@ async def check_subscriptions(bot: Bot):
                             elif is_new and updated_sub:
                                 plog.info(
                                     f"ПРОДЛЕНИЕ | Yookassa | {user_ref} | {plan_to_charge.name} | {final_price:.2f} руб | PayId={res.payment_id}"
-                                )
-                                await _send_deduplicated_notification(
-                                    bot,
-                                    sub.user_id,
-                                    f"✅ Подписка продлена до {_format_msk(updated_sub.end_date, '%d.%m.%Y %H:%M')}.",
-                                    f"yk_success:{sub.id}:{res.payment_id}",
-                                    now,
-                                    window=timedelta(days=2),
                                 )
                                 if config and config.notifications_enabled:
                                     for admin_id in all_admin_ids:
@@ -1246,6 +1224,7 @@ async def check_subscriptions(bot: Bot):
                                     force_deactivate=True,
                                     recurring_attempt_key=att.idempotency_key,
                                     logger=plog,
+                                    notification_policy=NotificationPolicy.TERMINAL_ONLY,
                                 )
                             else:
                                 is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
@@ -1258,6 +1237,7 @@ async def check_subscriptions(bot: Bot):
                                     sub=sub,
                                     attempt=att,
                                     logger=plog,
+                                    notification_policy=NotificationPolicy.TERMINAL_ONLY,
                                 )
                                 action = "deactivate"
                             if is_new:
@@ -1268,11 +1248,16 @@ async def check_subscriptions(bot: Bot):
                                     )
                                     continue
                                 plog.warning(f"АВТОПРОДЛ_ОТКЛ | {user_ref} | причина: deactivate | {plan_to_charge.name}")
-                                await bot.send_message(
-                                    sub.user_id,
-                                    "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nПродлите подписку вручную в меню.",
-                                    reply_markup=subscribe_kb,
-                                )
+                                if res.payment_id:
+                                    key = get_canonical_key_for_yookassa_cancellation(
+                                        res.payment_id,
+                                        sub.user_id,
+                                        action,
+                                        getattr(updated_sub, 'payment_attempt_count', 0),
+                                    )
+                                else:
+                                    key = build_canonical_outbox_key("yookassa", "attempt", str(att.id), sub.user_id, "deactivate")
+                                await dispatch_outbox_by_key(bot, key)
                                 if config and config.notifications_enabled:
                                     for admin_id in all_admin_ids:
                                         try:
@@ -1415,6 +1400,7 @@ async def check_subscriptions(bot: Bot):
                                     attempt_started_at=att.attempt_started_at,
                                     recurring_attempt_key=att.idempotency_key,
                                     logger=plog,
+                                    notification_policy=NotificationPolicy.TERMINAL_ONLY,
                                 )
                             else:
                                 is_new, updated_sub = await finalize_yookassa_attempt_no_payment(
@@ -1427,6 +1413,7 @@ async def check_subscriptions(bot: Bot):
                                     sub=sub,
                                     attempt=att,
                                     logger=plog,
+                                    notification_policy=NotificationPolicy.TERMINAL_ONLY,
                                 )
                                 action = "declined"
                             if is_new:
@@ -1436,15 +1423,16 @@ async def check_subscriptions(bot: Bot):
                                         f"PayId={res.payment_id or 'none'} | Текущая подписка не затронута"
                                     )
                                     continue
+                                att_count = getattr(updated_sub, 'payment_attempt_count', 0) if updated_sub else 0
+                                auto_off = getattr(updated_sub, 'auto_renewal', True) is False
+                                if res.payment_id:
+                                    key = get_canonical_key_for_yookassa_cancellation(res.payment_id, sub.user_id, action, att_count)
+                                    await dispatch_outbox_by_key(bot, key)
+
                                 if action == "unknown_cancellation":
                                     plog.warning(
                                         f"АВТОПРОДЛ_ПАУЗА_UNKNOWN | {user_ref} | PayId={res.payment_id or 'none'} | Reason={res.failure_reason or 'none'}"
                                     )
-                                    user_msg_yk = (
-                                        "Не удалось выполнить автоматическое списание (нестандартный ответ банка). "
-                                        "Автопродление приостановлено. Пожалуйста, продлите подписку вручную в меню бота."
-                                    )
-                                    await bot.send_message(sub.user_id, user_msg_yk, reply_markup=subscribe_kb)
                                     if config and config.notifications_enabled:
                                         for admin_id in all_admin_ids:
                                             try:
@@ -1457,43 +1445,16 @@ async def check_subscriptions(bot: Bot):
                                             except Exception:
                                                 pass
                                     continue
-                                att_count = getattr(updated_sub, 'payment_attempt_count', 0) if updated_sub else 0
-                                auto_off = getattr(updated_sub, 'auto_renewal', True) is False
+
                                 plog.warning(
                                     f"ОШИБКА_СПИСАНИЯ | Yookassa | {user_ref} | попытка {att_count} | {plan_to_charge.name} | PayId={res.payment_id or 'none'} | Причина={res.failure_reason or 'none'}"
                                 )
                                 if auto_off or att_count >= 3:
                                     await disable_auto_renewal_after_failed_attempts(
-                                        session, bot, sub, user_ref, plan_to_charge.name, subscribe_kb, config, all_admin_ids
+                                        session, bot, sub, user_ref, plan_to_charge.name, subscribe_kb, config, all_admin_ids, skip_user_message=True
                                     )
                                     continue
 
-                                if action == "limit_exceeded":
-                                    user_msg_yk = (
-                                        "Не удалось провести списание (превышен лимит по карте). Следующая попытка будет завтра. "
-                                        "Вы также можете привязать другую карту в меню."
-                                    )
-                                else:
-                                    next_retry_at = get_next_retry_at(
-                                        att_count,
-                                        getattr(updated_sub, 'last_payment_attempt', None),
-                                        retry_not_before=getattr(updated_sub, 'retry_not_before', None),
-                                    )
-                                    next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК') if next_retry_at else "позже"
-                                    user_msg_yk = (
-                                        f"Не удалось списать средства (ЮKassa). Повторим попытку {next_retry_str}."
-                                        if att_count == 1
-                                        else f"Не удалось списать средства (ЮKassa). Последняя попытка — {next_retry_str}."
-                                    )
-                                await _send_deduplicated_notification(
-                                    bot,
-                                    sub.user_id,
-                                    user_msg_yk,
-                                    f"yk_failed:{sub.id}:{att_count}",
-                                    now,
-                                    reply_markup=subscribe_kb,
-                                    window=timedelta(days=1),
-                                 )
                                 if config and config.notifications_enabled:
                                     reason_line = format_yookassa_admin_reason_line(res.failure_reason)
                                     for admin_id in all_admin_ids:
@@ -1550,10 +1511,11 @@ async def check_subscriptions(bot: Bot):
                             sub.auto_renewal = False
                             sub.payment_attempt_count = 0
                             new_payment.status = 'request_deactivated'
+                            key = build_canonical_outbox_key("robokassa", "payment", new_payment.id, sub.user_id, "deactivate")
+                            payload = {"user_id": sub.user_id, "action": "deactivate", "provider": "Robokassa"}
+                            await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, "deactivate", payload, payment_id=str(new_payment.id))
                             await session.commit()
-                            await bot.send_message(sub.user_id,
-                                                   "Ваша подписка истекла. Ошибка при автоплатеже (Robokassa) — автопродление отключено.\n\nПродлите подписку вручную в меню.",
-                                                   reply_markup=subscribe_kb)
+                            await dispatch_outbox_by_key(bot, key)
                             if config and config.notifications_enabled:
                                 for admin_id in all_admin_ids:
                                     try:
@@ -1605,27 +1567,21 @@ async def check_subscriptions(bot: Bot):
                             sub.last_payment_attempt = now
                             new_payment.status = 'request_failed'
                             if attempt_num_rk >= 3:
+                                key = build_canonical_outbox_key("robokassa", "payment", new_payment.id, sub.user_id, "final_decline")
+                                payload = {"user_id": sub.user_id, "action": "final_decline", "provider": "Robokassa"}
+                                await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, "final_decline", payload, payment_id=str(new_payment.id))
                                 await disable_auto_renewal_after_failed_attempts(
-                                    session, bot, sub, user_ref, plan_to_charge.name, subscribe_kb, config, all_admin_ids
+                                    session, bot, sub, user_ref, plan_to_charge.name, subscribe_kb, config, all_admin_ids, skip_user_message=True
                                 )
+                                await dispatch_outbox_by_key(bot, key)
                                 continue
-                            await session.commit()
                             next_retry_at = get_next_retry_at(sub.payment_attempt_count, sub.last_payment_attempt)
-                            if attempt_num_rk == 1 and next_retry_at:
-                                next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК')
-                                user_msg_rk = f"Не удалось провести автосписание (Robokassa). Повторим попытку {next_retry_str}."
-                            elif attempt_num_rk == 2 and next_retry_at:
-                                next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК')
-                                user_msg_rk = f"Не удалось провести автосписание (Robokassa). Последняя попытка — {next_retry_str}."
-                            await _send_deduplicated_notification(
-                                bot,
-                                sub.user_id,
-                                user_msg_rk,
-                                f"rk_failed:{sub.id}:{attempt_num_rk}",
-                                now,
-                                reply_markup=subscribe_kb,
-                                window=timedelta(days=1),
-                            )
+                            next_retry_str = _format_msk(next_retry_at, '%d.%m %H:%M МСК') if next_retry_at else "позже"
+                            key = build_canonical_outbox_key("robokassa", "payment", new_payment.id, sub.user_id, f"retry_failed_{attempt_num_rk}")
+                            payload = {"user_id": sub.user_id, "attempt_count": attempt_num_rk, "next_retry_str": next_retry_str, "provider": "Robokassa"}
+                            await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, f"retry_failed_{attempt_num_rk}", payload, payment_id=str(new_payment.id))
+                            await session.commit()
+                            await dispatch_outbox_by_key(bot, key)
                             if config and config.notifications_enabled:
                                 for admin_id in all_admin_ids:
                                     try:

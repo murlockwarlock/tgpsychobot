@@ -16,6 +16,7 @@ from automation_admin import router as automation_admin_router
 from database import init_db
 from background_worker import process_queue, process_mailings
 from scheduler import check_subscriptions, check_kie_credit_balance
+from notification_outbox import process_payment_notification_outbox
 from webhooks import setup_webhooks
 from error_reporting import notify_admins_about_error
 from bot_restart import notify_admins_after_requested_restart
@@ -185,6 +186,20 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
             exception=e,
         )
 
+    logging.info("Running initial payment notification outbox drain...")
+    try:
+        await process_payment_notification_outbox(bot)
+        logging.info("Initial payment notification outbox drain complete.")
+    except Exception as e:
+        logging.error(f"Error during initial payment notification outbox drain: {e}")
+        await notify_admins_about_error(
+            bot,
+            title="Сбой startup",
+            stage="initial_payment_notification_outbox_drain",
+            details=str(e),
+            exception=e,
+        )
+
     try:
         await check_kie_credit_balance(bot)
     except Exception as e:
@@ -200,6 +215,7 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
     scheduler.add_job(check_kie_credit_balance, 'interval', minutes=15, args=(bot,))
+    scheduler.add_job(process_payment_notification_outbox, 'interval', seconds=30, args=(bot,), max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_events, 'interval', minutes=1, args=(bot,), max_instances=1)
     scheduler.add_job(process_due_followups, 'interval', minutes=1, args=(bot,), max_instances=1)
     scheduler.start()

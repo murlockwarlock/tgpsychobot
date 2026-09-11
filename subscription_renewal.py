@@ -39,6 +39,15 @@ from payment_failure_reasons import (
     get_yookassa_cancellation_reason,
 )
 from subscription_dates import extend_subscription_end_date
+from subscription_retry_policy import get_next_retry_at
+from notification_outbox import (
+    NotificationPolicy,
+    build_canonical_outbox_key,
+    enqueue_outbox_event,
+    get_canonical_key_for_yookassa_cancellation,
+    get_canonical_key_for_yookassa_success,
+)
+from time_helpers import format_msk
 
 # Default to payment_events logger to ensure records reach logs/payment_events_<port>.log
 plog = logging.getLogger("payment_events")
@@ -584,7 +593,7 @@ async def execute_yookassa_recurring_attempt(
 class FinalizePaymentSuccessResult(tuple):
     """
     Backwards-compatible 2-tuple (is_new, user_sub) that also exposes
-    .is_new, .user_sub, .action, and .reconciliation_details.
+    .is_new, .user_sub, .action, .reconciliation_details, and .is_recurring.
     """
     def __new__(
         cls,
@@ -592,12 +601,14 @@ class FinalizePaymentSuccessResult(tuple):
         user_sub: UserSubscription | None,
         action: str = "success",
         reconciliation_details: dict[str, Any] | None = None,
+        is_recurring: bool = True,
     ):
         obj = super().__new__(cls, (is_new, user_sub))
         obj.is_new = is_new
         obj.user_sub = user_sub
         obj.action = action
         obj.reconciliation_details = reconciliation_details or {}
+        obj.is_recurring = is_recurring
         return obj
 
     @property
@@ -638,6 +649,7 @@ async def finalize_yookassa_payment_success(
     is_recurring: bool = True,
     recurring_attempt_key: str | None = None,
     logger: logging.Logger | None = None,
+    notification_policy: NotificationPolicy = NotificationPolicy.NONE,
 ) -> FinalizePaymentSuccessResult:
     """
     Canonical exact-once finalization for a successful YooKassa payment.
@@ -819,7 +831,7 @@ async def finalize_yookassa_payment_success(
                         .where(UserSubscription.user_id == effective_uid)
                         .execution_options(populate_existing=True)
                     )
-                return FinalizePaymentSuccessResult(False, sub, action="already_processed")
+                return FinalizePaymentSuccessResult(False, sub, action="already_processed", is_recurring=is_recurring)
 
     # If attempt was present, ensure YookassaPayment is also persisted/updated
     if attempt:
@@ -885,12 +897,30 @@ async def finalize_yookassa_payment_success(
                 f"attempt_id={rec_details.get('attempt_id')} | "
                 f"subscription_id={target_sub_id} | user_id={effective_uid}"
             )
+        if notification_policy in (NotificationPolicy.ALL_USER_EVENTS, NotificationPolicy.TERMINAL_ONLY):
+            reason = rec_details.get("reason", "unknown")
+            event_type = f"manual_review_{reason}"
+            key = get_canonical_key_for_yookassa_success(
+                payment_id, effective_uid, "manual_reconciliation_required", is_recurring=is_recurring, reconciliation_details=rec_details
+            )
+            payload = {
+                "user_id": effective_uid,
+                "amount": effective_amount,
+                "paid_plan_name": "",
+                "current_plan_name": "",
+                "payment_id": payment_id,
+                "provider": "Yookassa",
+            }
+            await enqueue_outbox_event(
+                session, key, "Yookassa", effective_uid, event_type, payload, payment_id=payment_id, attempt_id=getattr(attempt, "id", None)
+            )
         await session.commit()
         return FinalizePaymentSuccessResult(
             True,
             None,
             action="manual_reconciliation_required",
             reconciliation_details=rec_details,
+            is_recurring=is_recurring,
         )
 
     # Step 5: Check ownership on fresh DB state
@@ -965,12 +995,30 @@ async def finalize_yookassa_payment_success(
             "amount": effective_amount,
             "reason": "paid_plan_unresolved",
         }
+        if notification_policy in (NotificationPolicy.ALL_USER_EVENTS, NotificationPolicy.TERMINAL_ONLY):
+            reason = rec_details.get("reason", "unknown")
+            event_type = f"manual_review_{reason}"
+            key = get_canonical_key_for_yookassa_success(
+                payment_id, effective_uid, "manual_reconciliation_required", is_recurring=is_recurring, reconciliation_details=rec_details
+            )
+            payload = {
+                "user_id": effective_uid,
+                "amount": effective_amount,
+                "paid_plan_name": rec_details.get("paid_plan_name", ""),
+                "current_plan_name": rec_details.get("current_plan_name", ""),
+                "payment_id": payment_id,
+                "provider": "Yookassa",
+            }
+            await enqueue_outbox_event(
+                session, key, "Yookassa", effective_uid, event_type, payload, payment_id=payment_id, attempt_id=getattr(attempt, "id", None)
+            )
         await session.commit()
         return FinalizePaymentSuccessResult(
             True,
             user_sub,
             action="manual_reconciliation_required",
             reconciliation_details=rec_details,
+            is_recurring=is_recurring,
         )
 
     plan_to_apply = paid_plan or current_sub_plan
@@ -986,12 +1034,30 @@ async def finalize_yookassa_payment_success(
             "amount": effective_amount,
             "reason": "paid_plan_unresolved",
         }
+        if notification_policy in (NotificationPolicy.ALL_USER_EVENTS, NotificationPolicy.TERMINAL_ONLY):
+            reason = rec_details.get("reason", "unknown")
+            event_type = f"manual_review_{reason}"
+            key = get_canonical_key_for_yookassa_success(
+                payment_id, effective_uid, "manual_reconciliation_required", is_recurring=is_recurring, reconciliation_details=rec_details
+            )
+            payload = {
+                "user_id": effective_uid,
+                "amount": effective_amount,
+                "paid_plan_name": rec_details.get("paid_plan_name", ""),
+                "current_plan_name": rec_details.get("current_plan_name", ""),
+                "payment_id": payment_id,
+                "provider": "Yookassa",
+            }
+            await enqueue_outbox_event(
+                session, key, "Yookassa", effective_uid, event_type, payload, payment_id=payment_id, attempt_id=getattr(attempt, "id", None)
+            )
         await session.commit()
         return FinalizePaymentSuccessResult(
             True,
             user_sub,
             action="manual_reconciliation_required",
             reconciliation_details=rec_details,
+            is_recurring=is_recurring,
         )
 
     paid_ptc = (
@@ -1039,8 +1105,24 @@ async def finalize_yookassa_payment_success(
             if effective_pm:
                 user_sub.payment_method_id = effective_pm
 
+        if notification_policy in (NotificationPolicy.ALL_USER_EVENTS, NotificationPolicy.TERMINAL_ONLY):
+            event_type = "renewal_success" if is_recurring else "purchase_success"
+            key = get_canonical_key_for_yookassa_success(payment_id, effective_uid, "success", is_recurring=is_recurring)
+            end_str = format_msk(user_sub.end_date, "%d.%m.%Y %H:%M") if user_sub and user_sub.end_date else ""
+            payload = {
+                "user_id": effective_uid,
+                "plan_name": getattr(paid_ptc, "name", ""),
+                "amount": effective_amount,
+                "end_date_msk": end_str,
+                "payment_id": payment_id,
+                "provider": "Yookassa",
+            }
+            await enqueue_outbox_event(
+                session, key, "Yookassa", effective_uid, event_type, payload, payment_id=payment_id, attempt_id=getattr(attempt, "id", None)
+            )
+
         await session.commit()
-        return FinalizePaymentSuccessResult(True, user_sub, action="success")
+        return FinalizePaymentSuccessResult(True, user_sub, action="success", is_recurring=is_recurring)
     else:
         # Cross-plan late success:
         rec_details = {
@@ -1053,12 +1135,31 @@ async def finalize_yookassa_payment_success(
             "subscription_id": user_sub.id,
             "amount": effective_amount,
         }
+        if notification_policy in (NotificationPolicy.ALL_USER_EVENTS, NotificationPolicy.TERMINAL_ONLY):
+            reason = rec_details.get("reason", "cross_plan")
+            event_type = f"manual_review_{reason}"
+            key = get_canonical_key_for_yookassa_success(
+                payment_id, effective_uid, "manual_reconciliation_required", is_recurring=is_recurring, reconciliation_details=rec_details
+            )
+            payload = {
+                "user_id": effective_uid,
+                "amount": effective_amount,
+                "paid_plan_name": rec_details.get("paid_plan_name", ""),
+                "current_plan_name": rec_details.get("current_plan_name", ""),
+                "payment_id": payment_id,
+                "provider": "Yookassa",
+            }
+            await enqueue_outbox_event(
+                session, key, "Yookassa", effective_uid, event_type, payload, payment_id=payment_id, attempt_id=getattr(attempt, "id", None)
+            )
+
         await session.commit()
         return FinalizePaymentSuccessResult(
             True,
             user_sub,
             action="manual_reconciliation_required",
             reconciliation_details=rec_details,
+            is_recurring=is_recurring,
         )
 
 
@@ -1075,6 +1176,7 @@ async def finalize_yookassa_payment_canceled(
     force_deactivate: bool = False,
     recurring_attempt_key: str | None = None,
     logger: logging.Logger | None = None,
+    notification_policy: NotificationPolicy = NotificationPolicy.NONE,
 ) -> tuple[bool, str, UserSubscription | None]:
     """
     Canonical exact-once finalization for a canceled/failed YooKassa payment.
@@ -1392,6 +1494,35 @@ async def finalize_yookassa_payment_canceled(
         # Historical or superseded attempt: zero mutations to current subscription binding/retry state
         action_taken = "historical_canceled"
 
+    if action_taken not in ("already_processed", "historical_canceled", "orphan_canceled", "ordinary_canceled"):
+        if notification_policy in (NotificationPolicy.ALL_USER_EVENTS, NotificationPolicy.TERMINAL_ONLY):
+            att_count = getattr(user_sub, "payment_attempt_count", 0) if user_sub else 0
+            key = get_canonical_key_for_yookassa_cancellation(payment_id, effective_uid, action_taken, att_count)
+            next_retry_str = "позже"
+            if action_taken in ("declined", "limit_exceeded"):
+                next_retry_at = get_next_retry_at(
+                    att_count,
+                    getattr(user_sub, "last_payment_attempt", None),
+                    retry_not_before=getattr(user_sub, "retry_not_before", None),
+                )
+                next_retry_str = format_msk(next_retry_at, "%d.%m %H:%M МСК") if next_retry_at else "позже"
+            event_type = action_taken
+            if action_taken == "declined":
+                event_type = "final_decline" if att_count >= 3 else f"retry_failed_{att_count}"
+            elif action_taken == "limit_exceeded":
+                event_type = "final_decline" if att_count >= 3 else f"retry_limit_{att_count}"
+            payload = {
+                "user_id": effective_uid,
+                "action": action_taken,
+                "attempt_count": att_count,
+                "next_retry_str": next_retry_str,
+                "provider": "ЮKassa",
+                "payment_id": payment_id,
+            }
+            await enqueue_outbox_event(
+                session, key, "Yookassa", effective_uid, event_type, payload, payment_id=payment_id, attempt_id=getattr(attempt, "id", None)
+            )
+
     await session.commit()
     return True, action_taken, user_sub
 
@@ -1406,6 +1537,7 @@ async def finalize_yookassa_attempt_no_payment(
     sub: UserSubscription | None = None,
     attempt: YookassaRecurringAttempt | None = None,
     logger: logging.Logger | None = None,
+    notification_policy: NotificationPolicy = NotificationPolicy.NONE,
 ) -> tuple[bool, UserSubscription | None]:
     """
     Dedicated finalizer for outcomes where YooKassa rejected the request
@@ -1505,6 +1637,16 @@ async def finalize_yookassa_attempt_no_payment(
         user_sub.last_payment_attempt = attempt_ts
         if error_code == "payment_method_limit_exceeded":
             user_sub.retry_not_before = attempt_ts + timedelta(hours=24)
+
+    if is_new and outcome == "deactivate" and notification_policy in (NotificationPolicy.ALL_USER_EVENTS, NotificationPolicy.TERMINAL_ONLY):
+        target_att_id = target_attempt_id or getattr(att, "id", None)
+        key = build_canonical_outbox_key("yookassa", "attempt", str(target_att_id), user_sub.user_id, "deactivate")
+        payload = {
+            "user_id": user_sub.user_id,
+            "action": "deactivate",
+            "provider": "ЮKassa",
+        }
+        await enqueue_outbox_event(session, key, "Yookassa", user_sub.user_id, "deactivate", payload, attempt_id=target_att_id)
 
     if hasattr(session, "commit"):
         await session.commit()

@@ -975,6 +975,52 @@ def verify_yookassa_recurring_safety_schema(sync_conn) -> None:
         )
 
 
+def verify_payment_notification_outbox_schema(sync_conn) -> None:
+    """
+    Fail-closed structural safety verifier for payment notification outbox.
+    Asserts presence and correct definition of:
+    1. Table payment_notification_outbox
+    2. All required columns
+    3. Unique index/constraint on unique_key
+    4. Composite worker index on (status, next_retry_at)
+    5. Composite lease index on (status, lease_until)
+    """
+    from sqlalchemy import inspect as sa_inspect
+    insp = sa_inspect(sync_conn)
+
+    if not insp.has_table("payment_notification_outbox"):
+        raise RuntimeError("Critical table payment_notification_outbox is missing")
+
+    required_cols = {
+        "id", "unique_key", "provider", "payment_id", "attempt_id", "recipient_id",
+        "event_type", "event_payload_json", "status", "claim_token", "lease_until",
+        "attempts", "max_attempts", "next_retry_at", "last_error", "delivered_at",
+        "created_at", "updated_at"
+    }
+    cols = {c["name"] for c in insp.get_columns("payment_notification_outbox")}
+    missing_cols = required_cols - cols
+    if missing_cols:
+        raise RuntimeError(f"Critical columns missing in payment_notification_outbox: {missing_cols}")
+
+    indexes = insp.get_indexes("payment_notification_outbox")
+    u_constraints = insp.get_unique_constraints("payment_notification_outbox")
+
+    has_unique_key = any(idx.get("unique") and idx.get("column_names") == ["unique_key"] for idx in indexes)
+    if not has_unique_key:
+        has_unique_key = any(uc.get("column_names") == ["unique_key"] for uc in u_constraints)
+    if not has_unique_key:
+        raise RuntimeError("Critical unique index on payment_notification_outbox.unique_key is missing")
+
+    has_worker_scan = any(idx.get("column_names") == ["status", "next_retry_at"] for idx in indexes)
+    if not has_worker_scan:
+        raise RuntimeError("Critical composite index on payment_notification_outbox(status, next_retry_at) is missing")
+
+    has_lease_rec = any(idx.get("column_names") == ["status", "lease_until"] for idx in indexes)
+    if not has_lease_rec:
+        raise RuntimeError("Critical composite index on payment_notification_outbox(status, lease_until) is missing")
+
+
+
 async def init_db():
     async with engine.begin() as conn:
         await _acquire_database_init_lock(conn)
@@ -1267,6 +1313,7 @@ async def init_db():
             ))
 
             verify_yookassa_recurring_safety_schema(sync_conn)
+            verify_payment_notification_outbox_schema(sync_conn)
 
         await conn.run_sync(_check_and_migrate)
 
@@ -1770,3 +1817,32 @@ class MediaLibrary(Base):
     description = Column(Text, nullable=True)
     media_type = Column(String, nullable=False)
     collections = relationship("MediaCollection", secondary=media_collection_items, back_populates="media_files")
+
+
+class PaymentNotificationOutbox(Base):
+    __tablename__ = 'payment_notification_outbox'
+    __table_args__ = (
+        Index('uq_outbox_unique_key', 'unique_key', unique=True),
+        Index('ix_outbox_worker_scan', 'status', 'next_retry_at'),
+        Index('ix_outbox_lease_recovery', 'status', 'lease_until'),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    unique_key = Column(String(255), nullable=False, unique=True)
+    provider = Column(String(64), nullable=False)
+    payment_id = Column(String(128), nullable=True)
+    attempt_id = Column(BigInteger, nullable=True)
+    recipient_id = Column(BigInteger, nullable=False, index=True)
+    event_type = Column(String(64), nullable=False)
+    event_payload_json = Column(Text, nullable=False)
+    status = Column(String(32), nullable=False, default='pending')
+    claim_token = Column(String(64), nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=7)
+    next_retry_at = Column(DateTime, nullable=False)
+    last_error = Column(Text, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
