@@ -508,9 +508,7 @@ async def set_renewal(client: MaxApiClient, chat_id: int, user_id: int, enabled:
             user_ref_cr += f" [id=<code>{display_id}</code>]"
             
             plan_name_cr = sub.plan.name if sub.plan else "Unknown"
-            from datetime import timezone, timedelta
-            MSK = timezone(timedelta(hours=3))
-            end_date_msk_cr = sub.end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M') if sub.end_date else "Неизвестно"
+            end_date_msk_cr = format_msk(sub.end_date) if sub.end_date else "Неизвестно"
             
             from .common import notify_telegram_admins
             await notify_telegram_admins(

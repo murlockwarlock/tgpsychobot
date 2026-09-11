@@ -506,17 +506,12 @@ async def check_subscriptions(bot: Bot):
         for u_att in unresolved_attempts:
             time_since_start = now - u_att.attempt_started_at
             if time_since_start >= timedelta(hours=24):
-                is_new_exp, exp_sub = await transition_attempt_to_unknown_expired(session, u_att.id, now)
+                is_new_exp, exp_sub = await transition_attempt_to_unknown_expired(
+                    session, u_att.id, now, notification_policy=NotificationPolicy.TERMINAL_ONLY
+                )
                 if is_new_exp:
-                    await _send_deduplicated_notification(
-                        bot,
-                        u_att.user_id,
-                        "Не удалось подтвердить результат списания за 24 часа. Чтобы избежать двойных списаний, автопродление приостановлено.\n\nПроверьте статус в банке или оформите подписку в меню.",
-                        f"yk_expired_24h:{u_att.subscription_id}:{u_att.id}",
-                        now,
-                        reply_markup=subscribe_kb,
-                        window=timedelta(days=2),
-                    )
+                    key = f"yookassa:attempt:{u_att.id}:{u_att.user_id}:unknown_expired"
+                    await dispatch_outbox_by_key(bot, key)
                     if config and config.notifications_enabled:
                         for admin_id in all_admin_ids:
                             try:
@@ -1526,7 +1521,6 @@ async def check_subscriptions(bot: Bot):
                         elif robokassa_res == 'provider_error':
                             new_payment.status = 'request_provider_error'
                             sub.last_payment_attempt = now
-                            await session.commit()
                             next_retry_at = (
                                 now + timedelta(hours=2)
                                 if sub.payment_attempt_count <= 0
@@ -1536,19 +1530,24 @@ async def check_subscriptions(bot: Bot):
                                 _format_msk(next_retry_at, '%d.%m %H:%M МСК')
                                 if next_retry_at else "позже"
                             )
-                            try:
-                                await _send_deduplicated_notification(
-                                    bot,
-                                    sub.user_id,
-                                    f"Платёжный шлюз Robokassa временно недоступен. Эта ошибка не засчитана как попытка списания.\n\n"
-                                    f"Повторим запрос после {next_retry_str}.",
-                                    f"rk_provider_error:{sub.id}:{sub.last_payment_attempt.isoformat() if sub.last_payment_attempt else 'none'}",
-                                    now,
-                                    reply_markup=subscribe_kb,
-                                    window=timedelta(days=1),
-                                )
-                            except Exception:
-                                pass
+                            rk_err_key = f"robokassa:payment:{new_payment.id}:{sub.user_id}:provider_error"
+                            rk_payload = {
+                                "user_id": sub.user_id,
+                                "provider": "Robokassa",
+                                "next_retry_str": next_retry_str,
+                                "payment_id": str(new_payment.id),
+                            }
+                            await enqueue_outbox_event(
+                                session,
+                                rk_err_key,
+                                "Robokassa",
+                                sub.user_id,
+                                "provider_error",
+                                rk_payload,
+                                payment_id=str(new_payment.id),
+                            )
+                            await session.commit()
+                            await dispatch_outbox_by_key(bot, rk_err_key)
                             if config and config.notifications_enabled:
                                 for admin_id in all_admin_ids:
                                     try:

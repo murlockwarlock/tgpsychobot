@@ -1704,6 +1704,7 @@ async def transition_attempt_to_unknown_expired(
     session: AsyncSession,
     attempt_id: int,
     now: datetime | None = None,
+    notification_policy: NotificationPolicy = NotificationPolicy.NONE,
 ) -> tuple[bool, UserSubscription | None]:
     """
     Explicit >24h terminal safety transition for unresolved attempts.
@@ -1740,6 +1741,24 @@ async def transition_attempt_to_unknown_expired(
     if user_sub:
         user_sub.auto_renewal = False
         user_sub.last_payment_attempt = att.attempt_started_at if att else current_time
+
+    if is_new and notification_policy in (NotificationPolicy.ALL_USER_EVENTS, NotificationPolicy.TERMINAL_ONLY):
+        user_id = user_sub.user_id if user_sub else (att.user_id if att else None)
+        if user_id:
+            key = f"yookassa:attempt:{attempt_id}:{user_id}:unknown_expired"
+            payload = {
+                "user_id": user_id,
+                "attempt_id": attempt_id,
+            }
+            await enqueue_outbox_event(
+                session,
+                key,
+                "Yookassa",
+                user_id,
+                "unknown_expired",
+                payload,
+                attempt_id=attempt_id,
+            )
 
     await session.commit()
     return True, user_sub

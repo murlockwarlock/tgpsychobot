@@ -991,7 +991,7 @@ async def handle_robokassa_result(request: web.Request):
                 )
                 session.add(new_sub)
 
-            end_date_msk = format_msk(end_date)
+            end_date_msk = format_msk(end_date, "%d.%m.%Y %H:%M")
             rk_event_type = "renewal_success" if is_renewal else "purchase_success"
             rk_key = build_canonical_outbox_key("robokassa", "payment", inv_id, payment_user_id, rk_event_type)
             rk_payload = {

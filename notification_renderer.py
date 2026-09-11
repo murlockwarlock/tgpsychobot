@@ -42,7 +42,7 @@ def render_outbox_message(
             )
             return text, None, None
         else:
-            return f"✅ Подписка продлена до {end_date_msk}.", None, None
+            return f"✅ Подписка продлена до {end_date_msk} МСК.", None, None
 
     if event_type == "referral_bonus":
         bonus_days = payload.get("bonus_days", 0)
@@ -60,6 +60,13 @@ def render_outbox_message(
         text = (
             "Не удалось выполнить автоматическое списание (нестандартный ответ банка). "
             "Автопродление приостановлено. Пожалуйста, продлите подписку вручную в меню бота."
+        )
+        return text, None, "subscribe"
+
+    if event_type == "unknown_expired":
+        text = (
+            "Не удалось подтвердить результат списания за 24 часа. Чтобы избежать двойных списаний, автопродление приостановлено.\n\n"
+            "Проверьте статус в банке или оформите подписку в меню."
         )
         return text, None, "subscribe"
 
@@ -98,6 +105,14 @@ def render_outbox_message(
             return f"{prefix} Последняя попытка — {next_retry}.", None, "subscribe"
 
     if event_type == "provider_error":
+        provider = payload.get("provider", "Yookassa")
+        if provider == "Robokassa":
+            next_retry = payload.get("next_retry_str", "позже")
+            text = (
+                f"Платёжный шлюз Robokassa временно недоступен. Эта ошибка не засчитана как попытка списания.\n\n"
+                f"Повторим запрос после {next_retry}."
+            )
+            return text, None, "subscribe"
         text = "Платёжный шлюз ЮKassa временно недоступен. Эта ошибка не засчитана как попытка списания.\n\nПовторим запрос позже."
         return text, None, "subscribe"
 
