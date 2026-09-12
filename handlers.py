@@ -6903,13 +6903,22 @@ async def view_client_merged_metadata(callback: CallbackQuery):
     client_id = int(parts[3])
     page = int(parts[4]) if len(parts) > 4 else 0
 
+    MAX_MESSAGE_BUDGET = 3900
+
     async with async_session_maker() as session:
         user = await session.get(User, client_id)
         if not user:
             await callback.answer("Клиент не найден.", show_alert=True)
             return
 
-        display_name = html.escape(_display_client_name(user))
+        # Bound dynamic client display name before HTML escaping
+        raw_client_name = _display_client_name(user)
+        if len(raw_client_name) > 80:
+            raw_client_name = raw_client_name[:77] + "..."
+        while len(html.escape(raw_client_name)) > 100 and len(raw_client_name) > 4:
+            raw_client_name = raw_client_name[:-4] + "..."
+        display_name = html.escape(raw_client_name)
+
         display_id = _display_client_id(user.id)
         display_id_label = _display_client_id_label(user.id)
 
@@ -6973,7 +6982,12 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                     .order_by(AutomationEvent.id.desc())
                     .limit(1)
                 )
-                last_event_name = event_res.scalar() or "не зафиксировано"
+                raw_event_name = event_res.scalar() or "не зафиксировано"
+                if len(str(raw_event_name)) > 80:
+                    raw_event_name = str(raw_event_name)[:77] + "..."
+                while len(html.escape(str(raw_event_name))) > 100 and len(str(raw_event_name)) > 4:
+                    raw_event_name = str(raw_event_name)[:-4] + "..."
+                escaped_event_name = html.escape(str(raw_event_name))
 
                 page_hdr = f" (Диалог {page + 1} из {total_pages})" if total_pages > 1 else ""
 
@@ -6992,17 +7006,25 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                     topic_lines = []
                     visible_slice = topic_states[:MAX_VISIBLE_TOPIC_STATES]
                     for ts in visible_slice:
-                        t_label = f"Топик #{ts.topic_id}" if ts.topic_id else "Основной диалог"
-                        t_step = ts.current_step or "не задан"
-                        if len(str(t_step)) > 60:
-                            t_step = str(t_step)[:57] + "..."
+                        raw_topic_id = str(ts.topic_id) if ts.topic_id is not None else ""
+                        if len(raw_topic_id) > 20:
+                            raw_topic_id = raw_topic_id[:17] + "..."
+                        t_label = f"Топик #{html.escape(raw_topic_id)}" if raw_topic_id else "Основной диалог"
+
+                        raw_t_step = str(ts.current_step or "не задан")
+                        if len(raw_t_step) > 60:
+                            raw_t_step = raw_t_step[:57] + "..."
+                        while len(html.escape(raw_t_step)) > 80 and len(raw_t_step) > 4:
+                            raw_t_step = raw_t_step[:-4] + "..."
+                        t_step_escaped = html.escape(raw_t_step)
+
                         t_dt = (
                             format_msk(ts.updated_at or ts.created_at, "%d-%m-%Y %H:%M МСК")
                             if (ts.updated_at or ts.created_at)
                             else "время неизвестно"
                         )
                         topic_lines.append(
-                            f"  • {t_label}: шаг=<code>{html.escape(str(t_step))}</code> ({t_dt})"
+                            f"  • {t_label}: шаг=<code>{t_step_escaped}</code> ({t_dt})"
                         )
                     remaining = len(topic_states) - len(visible_slice)
                     if remaining > 0:
@@ -7017,17 +7039,16 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                     f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
                     f"{display_id_label}: <code>{display_id}</code>\n\n"
                     f"📍 <b>{diag_info}</b>\n"
-                    f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{html.escape(str(last_event_name))}</code>\n"
+                    f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{escaped_event_name}</code>\n"
                     f"▫️ <b>Состояния топиков:</b>\n{topics_block}\n"
                     f"▫️ <b>Слитные метаданные ({html.escape('{metadata}')}):</b>\n"
                     f"<code>"
                 )
                 suffix = "</code>"
 
-                # Dynamic safe budget: max 3900 total chars for Telegram edit_text
-                MAX_MESSAGE_BUDGET = 3900
+                # Compute dynamic remaining metadata budget (no forced positive minimum)
                 total_fixed_len = len(prefix) + len(suffix)
-                available_meta_budget = max(200, MAX_MESSAGE_BUDGET - total_fixed_len)
+                available_meta_budget = max(0, MAX_MESSAGE_BUDGET - total_fixed_len)
 
                 if diag_state is not None and diag_state.metadata_json is not None:
                     try:
@@ -7038,16 +7059,28 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                 else:
                     raw_meta_str = "не инициализированы"
 
-                # Build/truncate CONTENT before adding HTML wrappers
+                # Build/truncate CONTENT before adding HTML wrappers; guarantee bounds
+                omission_notice = "\n... (полный текст доступен при скачивании .json)"
+                short_omission = "\n... (см. .json)"
+                min_omission = "..."
+
                 if len(html.escape(raw_meta_str)) <= available_meta_budget:
                     meta_rendered = html.escape(raw_meta_str)
-                else:
-                    omission_notice = "\n... (полный текст доступен при скачивании .json)"
-                    target_content_budget = max(50, available_meta_budget - len(omission_notice))
+                elif available_meta_budget >= len(omission_notice) + 20:
+                    target_content_budget = available_meta_budget - len(omission_notice)
                     truncated = raw_meta_str[:target_content_budget]
-                    while len(html.escape(truncated)) > target_content_budget and len(truncated) > 0:
-                        truncated = truncated[:len(truncated) - 10]
+                    while len(html.escape(truncated)) > target_content_budget and truncated:
+                        step = max(1, (len(html.escape(truncated)) - target_content_budget) // 5)
+                        truncated = truncated[:-step]
                     meta_rendered = html.escape(truncated) + omission_notice
+                elif available_meta_budget >= len(omission_notice):
+                    meta_rendered = omission_notice.lstrip("\n")
+                elif available_meta_budget >= len(short_omission):
+                    meta_rendered = short_omission.lstrip("\n")
+                elif available_meta_budget >= len(min_omission):
+                    meta_rendered = min_omission
+                else:
+                    meta_rendered = min_omission[:available_meta_budget]
 
                 text = prefix + meta_rendered + suffix
 
@@ -7082,6 +7115,8 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                 page = max(0, min(page, total_states - 1))
                 st = states[page]
                 cur_step = st.current_step or "не задан"
+                if len(str(cur_step)) > 60:
+                    cur_step = str(cur_step)[:57] + "..."
                 topic_info = f", Топик #{st.topic_id}" if st.topic_id else ""
                 dt_val = st.updated_at or st.created_at
                 dt_str = format_msk(dt_val, "%d-%m-%Y %H:%M МСК") if dt_val else "время неизвестно"
@@ -7096,7 +7131,10 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                     .order_by(AutomationEvent.id.desc())
                     .limit(1)
                 )
-                last_event_name = event_res.scalar() or "не зафиксировано"
+                raw_event_name = event_res.scalar() or "не зафиксировано"
+                if len(str(raw_event_name)) > 80:
+                    raw_event_name = str(raw_event_name)[:77] + "..."
+                escaped_event_name = html.escape(str(raw_event_name))
 
                 try:
                     meta_obj = json.loads(st.metadata_json or "{}")
@@ -7112,7 +7150,7 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                     f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
                     f"{display_id_label}: <code>{display_id}</code>\n\n"
                     f"📍 <b>{diag_info}</b>\n"
-                    f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{html.escape(str(last_event_name))}</code>\n"
+                    f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{escaped_event_name}</code>\n"
                     f"▫️ <b>Текущий шаг ({html.escape('{current_step}')}):</b> <code>{html.escape(str(cur_step))}</code>\n"
                     f"▫️ <b>Слитные метаданные ({html.escape('{metadata}')}):</b>\n"
                     f"<code>{html.escape(meta_rendered)}</code>"
@@ -7129,6 +7167,8 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                 builder.row(InlineKeyboardButton(text="📥 Скачать все диалоги (.json)", callback_data=f"run_metadata_export_merged_{client_id}"))
                 builder.row(InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}"))
 
+        # Guarantee by construction that Telegram text budget is strictly observed
+        assert len(text) <= MAX_MESSAGE_BUDGET, f"Admin text exceeded safe budget: {len(text)} > {MAX_MESSAGE_BUDGET}"
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
         await callback.answer()
 

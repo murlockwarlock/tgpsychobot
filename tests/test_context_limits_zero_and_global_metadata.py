@@ -2,6 +2,7 @@ import html
 import json
 import os
 import unittest
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -749,6 +750,10 @@ class TestContextLimitsZeroAndGlobalMetadata(unittest.IsolatedAsyncioTestCase):
         # Assert final text length is safely within the safe message budget (<= 3900 chars)
         self.assertLessEqual(len(final_text), 3900)
 
+        # Assert HTML wrappers remain structurally intact (balanced, valid XML/HTML)
+        parsed_html = ET.fromstring(f"<root>{final_text}</root>")
+        self.assertIsNotNone(parsed_html)
+
         # Assert valid canonical metadata remains visibly represented
         self.assertIn("Стресс и перегрузка", final_text)
         self.assertIn("... (полный текст доступен при скачивании .json)", final_text)
@@ -817,7 +822,189 @@ class TestContextLimitsZeroAndGlobalMetadata(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conv_before, conv_after_export)
 
     # =========================================================================
-    # 7. TOPIC and RESET Non-Regression
+    # 8. Adversarial length regression: large fixed headers, long event names,
+    #    long current_step, large metadata, >5 topic states -> safe budget <= 3900
+    # =========================================================================
+    async def test_global_admin_display_adversarial_fixed_headers_and_length_bounding(self):
+        user_id = 777
+        dt_fixed = datetime(2026, 9, 13, 10, 0, 0)
+        async with self.sessions() as session:
+            # 1. Very long user display name (> 1,500 chars)
+            user = User(
+                id=user_id,
+                first_name="ОченьДлинноеИмяПользователяДляСтрессТеста_" * 40,
+                username="adversarial_long_name_user",
+                current_dialogue_id=1,
+            )
+            ai_config = AIConfig(id=1, memory_mode=MEMORY_MODE_GLOBAL)
+
+            # 2. Very long AutomationEvent.name (> 1,200 chars)
+            event = AutomationEvent(
+                user_id=user_id,
+                dialogue_id=1,
+                name="EVENT_VERY_LONG_DYNAMIC_MARKER_NAME_WITH_EXCESSIVE_PAYLOAD_" * 25,
+                created_at=dt_fixed,
+            )
+
+            # 3. Large canonical metadata (> 10,000 chars)
+            large_meta = {
+                "primary_theme": "Глубокий стресс и эмоциональное выгорание",
+                "detailed_notes": [f"Подробная заметка #{i}: " + ("x" * 150) for i in range(80)],
+                "diagnostics": {"score": 99, "items": ["item_" + ("y" * 100) for _ in range(30)]},
+            }
+            diag_state = AutomationDialogueState(
+                user_id=user_id,
+                dialogue_id=1,
+                metadata_json=json.dumps(large_meta, ensure_ascii=False),
+                updated_at=dt_fixed,
+            )
+            session.add_all([user, ai_config, event, diag_state])
+
+            # 4. >5 topic states (12 topics) with long current_step values (> 250 chars) and large current_state_json (> 2,000 chars)
+            for i in range(1, 13):
+                long_step = f"step_pipeline_stage_deeply_nested_subsystem_verification_{i}_" * 5
+                large_state = {
+                    "step": long_step,
+                    "state_blob": "large_state_data_" * 100,
+                }
+                conv = AutomationConversationState(
+                    user_id=user_id,
+                    dialogue_id=1,
+                    topic_id=i,
+                    current_step=long_step,
+                    current_state_json=json.dumps(large_state, ensure_ascii=False),
+                    updated_at=dt_fixed + timedelta(minutes=i),
+                )
+                session.add(conv)
+
+            await session.commit()
+
+        # Snapshot DB before
+        async with self.sessions() as session:
+            diag_before = [
+                (d.id, d.metadata_json, d.updated_at)
+                for d in (await session.scalars(select(AutomationDialogueState))).all()
+            ]
+            conv_before = [
+                (c.id, c.current_step, c.current_state_json, c.updated_at)
+                for c in (await session.scalars(select(AutomationConversationState))).all()
+            ]
+            event_before = [
+                (e.id, e.name, e.created_at)
+                for e in (await session.scalars(select(AutomationEvent))).all()
+            ]
+            user_before = [
+                (u.id, u.first_name, u.current_dialogue_id)
+                for u in (await session.scalars(select(User))).all()
+            ]
+
+        # 1. Prove view_client_merged_metadata completes and edit_text is called exactly once
+        view_callback = MagicMock()
+        view_callback.from_user.id = 999999
+        view_callback.data = f"client_merged_metadata_{user_id}_0"
+        view_callback.message.edit_text = AsyncMock()
+        view_callback.answer = AsyncMock()
+
+        with patch("handlers.check_history_permission", AsyncMock(return_value=True)):
+            await handlers.view_client_merged_metadata(view_callback)
+
+        view_callback.message.edit_text.assert_awaited_once()
+        final_text = view_callback.message.edit_text.call_args[0][0]
+
+        # 2. Prove final text length is safely within the safe message budget (<= 3900 chars)
+        self.assertLessEqual(len(final_text), 3900)
+
+        # 3. Prove HTML wrappers remain structurally intact (balanced, valid XML/HTML)
+        parsed_html = ET.fromstring(f"<root>{final_text}</root>")
+        self.assertIsNotNone(parsed_html)
+
+        # 4. Prove topic omission marker is present where applicable
+        self.assertIn("... ещё 7 состояний; полный список доступен в JSON", final_text)
+
+        # 5. Prove bounded topics: first 5 visible, subsequent hidden
+        self.assertIn("Топик #1", final_text)
+        self.assertIn("Топик #5", final_text)
+        self.assertNotIn("Топик #6", final_text)
+
+        # 6. Prove display name and event name were safely truncated with visible truncation marker
+        self.assertIn("...", final_text)
+
+        # 7. Prove zero DB mutation after view
+        async with self.sessions() as session:
+            diag_after_view = [
+                (d.id, d.metadata_json, d.updated_at)
+                for d in (await session.scalars(select(AutomationDialogueState))).all()
+            ]
+            conv_after_view = [
+                (c.id, c.current_step, c.current_state_json, c.updated_at)
+                for c in (await session.scalars(select(AutomationConversationState))).all()
+            ]
+            event_after_view = [
+                (e.id, e.name, e.created_at)
+                for e in (await session.scalars(select(AutomationEvent))).all()
+            ]
+            user_after_view = [
+                (u.id, u.first_name, u.current_dialogue_id)
+                for u in (await session.scalars(select(User))).all()
+            ]
+        self.assertEqual(diag_before, diag_after_view)
+        self.assertEqual(conv_before, conv_after_view)
+        self.assertEqual(event_before, event_after_view)
+        self.assertEqual(user_before, user_after_view)
+
+        # 8. Prove full metadata and states remain present in JSON export
+        export_callback = MagicMock()
+        export_callback.from_user.id = 999999
+        export_callback.data = f"run_metadata_export_merged_{user_id}"
+        export_callback.message.answer_document = AsyncMock()
+        export_callback.answer = AsyncMock()
+
+        with patch("handlers.check_history_permission", AsyncMock(return_value=True)):
+            await handlers.run_client_metadata_export(export_callback)
+
+        export_callback.message.answer_document.assert_awaited_once()
+        sent_doc = export_callback.message.answer_document.call_args[0][0]
+        export_data = json.loads(sent_doc.data.decode("utf-8"))
+
+        # Assert full untruncated canonical metadata is present in export
+        self.assertEqual(
+            export_data["dialogue_states"][0]["metadata"]["primary_theme"],
+            "Глубокий стресс и эмоциональное выгорание",
+        )
+        self.assertEqual(len(export_data["dialogue_states"][0]["metadata"]["detailed_notes"]), 80)
+
+        # Assert ALL 12 topic states and full current_state payloads are present in export
+        topic_states_export = export_data["dialogue_states"][0]["topic_states"]
+        self.assertEqual(len(topic_states_export), 12)
+        for i, ts in enumerate(topic_states_export, start=1):
+            self.assertEqual(ts["topic_id"], i)
+            self.assertIn("large_state_data_", ts["current_state"]["state_blob"])
+
+        # 9. Prove zero DB mutation after export as well
+        async with self.sessions() as session:
+            diag_after_export = [
+                (d.id, d.metadata_json, d.updated_at)
+                for d in (await session.scalars(select(AutomationDialogueState))).all()
+            ]
+            conv_after_export = [
+                (c.id, c.current_step, c.current_state_json, c.updated_at)
+                for c in (await session.scalars(select(AutomationConversationState))).all()
+            ]
+            event_after_export = [
+                (e.id, e.name, e.created_at)
+                for e in (await session.scalars(select(AutomationEvent))).all()
+            ]
+            user_after_export = [
+                (u.id, u.first_name, u.current_dialogue_id)
+                for u in (await session.scalars(select(User))).all()
+            ]
+        self.assertEqual(diag_before, diag_after_export)
+        self.assertEqual(conv_before, conv_after_export)
+        self.assertEqual(event_before, event_after_export)
+        self.assertEqual(user_before, user_after_export)
+
+    # =========================================================================
+    # 9. TOPIC and RESET Non-Regression
     # =========================================================================
     async def test_topic_and_reset_mode_non_regression(self):
         user_id = 99
