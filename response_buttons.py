@@ -70,6 +70,23 @@ def split_action_callback_data(callback_data: str) -> tuple[str, int | None]:
     return payload[:match.start()], int(match.group(1), 16)
 
 
+def _sanitize_ai_button_fragment(value: str | None) -> str:
+    value = value if isinstance(value, str) else ""
+    value = value.replace("\\", "\\\\")
+    value = re.sub(r"[\r\n\t]+", " ", value)
+    for character in ('"', "[", "]", "(", ")"):
+        value = value.replace(character, f"\\{character}")
+    return value
+
+
+def build_ai_button_system_message(button_text: str | None, action: str) -> str:
+    return (
+        '[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку '
+        f'"{_sanitize_ai_button_fragment(button_text)}" '
+        f'({_sanitize_ai_button_fragment(action)})]'
+    )
+
+
 def _is_valid_action(action: str) -> bool:
     if not 1 <= len(action) <= MAX_ACTION_CHARS:
         return False

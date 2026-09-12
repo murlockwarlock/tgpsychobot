@@ -31,7 +31,7 @@ from ..storage import MaxContentMedia, StateStore
 from ..time_utils import utc_now
 from .subscription_access import load_active_subscription
 from memory_mode import normalize_memory_mode, start_new_dialogue
-from response_buttons import ResponseButton, extract_response_buttons, extract_test_start_directive
+from response_buttons import ResponseButton, build_action_callback_data, extract_response_buttons, extract_test_start_directive
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
 
@@ -229,14 +229,30 @@ def compose_max_keyboard(
     is_start: bool = False,
     is_menu: bool = False,
 ) -> list[dict] | None:
+    if not parsed_rows:
+        keyboard_rows = [main_menu_row("⬅️ В меню")] if not is_start and not is_menu else []
+        return inline_keyboard(keyboard_rows) if keyboard_rows else None
+
+    action_counts: dict[str, int] = {}
+    for row in parsed_rows:
+        for btn in row:
+            if btn.kind == "action":
+                action_counts[btn.value] = action_counts.get(btn.value, 0) + 1
+
     keyboard_rows: list[list[dict]] = []
+    action_button_index = 0
     for row in parsed_rows:
         converted_row: list[dict] = []
         for btn in row:
             if btn.kind == "url":
                 converted_row.append(link_button(btn.text, btn.value))
             else:
-                converted_row.append(callback_button(btn.text, f"ai_btn:{btn.value}"))
+                payload = build_action_callback_data(
+                    btn.value,
+                    action_button_index if action_counts[btn.value] > 1 else None,
+                )
+                converted_row.append(callback_button(btn.text, payload))
+                action_button_index += 1
         if converted_row:
             keyboard_rows.append(converted_row)
     if not is_start and not is_menu:
@@ -1257,6 +1273,10 @@ async def resume_pending_ai_turn(client: MaxApiClient, chat_id: int, user_id: in
         if pending_kind == "resume":
             from system_events import build_topic_resume_system_message, record_navigation_system_event
             synthetic_text = build_topic_resume_system_message(topic.name)
+            await client.send_message(
+                chat_id=chat_id,
+                text=f"✅ Продолжаем тему: <b>{html.escape(topic.name)}</b>.",
+            )
         else:
             from system_events import build_topic_auto_start_system_message, record_navigation_system_event
             synthetic_text = build_topic_auto_start_system_message(topic.name)

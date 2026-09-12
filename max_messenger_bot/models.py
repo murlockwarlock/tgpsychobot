@@ -66,6 +66,7 @@ class IncomingCallback:
     chat_id: int
     message_id: str | None
     sender: Sender
+    message: dict[str, Any] | None = None
 
 
 def parse_sender(raw: dict[str, Any]) -> Sender:
@@ -300,4 +301,5 @@ def parse_callback(update: dict[str, Any]) -> IncomingCallback | None:
         chat_id=int(chat_id),
         message_id=message.get("mid") or message.get("message_id") or message.get("id"),
         sender=sender,
+        message=message or None,
     )
