@@ -7676,6 +7676,26 @@ async def _complete_telegram_topic_entry(
         return
 
     if switch_res.status == "already_current":
+        topic_name = switch_res.topic.name if (switch_res.topic and getattr(switch_res.topic, "name", None)) else ""
+        if topic_name:
+            text = (
+                f"Вы уже находитесь в теме «{html.escape(topic_name)}».\n\n"
+                "Продолжайте диалог — просто напишите ваш вопрос или сообщение.\n\n"
+                "Если хотите начать эту тему заново, нажмите «🗑️ Новый диалог»."
+            )
+        else:
+            text = (
+                "Вы уже находитесь в этой теме.\n\n"
+                "Продолжайте диалог — просто напишите ваш вопрос или сообщение.\n\n"
+                "Если хотите начать эту тему заново, нажмите «🗑️ Новый диалог»."
+            )
+        if message and hasattr(message, "answer"):
+            try:
+                await message.answer(text)
+            except Exception:
+                await bot.send_message(chat_id, text)
+        else:
+            await bot.send_message(chat_id, text)
         return
 
     async with async_session_maker() as session:
