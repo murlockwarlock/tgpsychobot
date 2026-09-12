@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
@@ -23,7 +24,7 @@ async def show_topics(client: MaxApiClient, chat_id: int, user_id: int) -> None:
         current_topic_id = user.current_topic_id if user else None
         current_status = "в <b>Основном диалоге</b>"
         if user and user.current_topic:
-            current_status = f"в диалоге: <b>{user.current_topic.name}</b>"
+            current_status = f"в диалоге: <b>{html.escape(user.current_topic.name)}</b>"
 
     if not topics:
         await client.send_message(chat_id=chat_id, text="Сейчас нет доступных тем.")
@@ -51,6 +52,15 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         return
 
     if user.current_topic_id == topic_id:
+        escaped_topic_name = html.escape(topic.name)
+        await client.send_message(
+            chat_id=chat_id,
+            text=(
+                f"Вы уже находитесь в теме «{escaped_topic_name}».\n\n"
+                "Продолжайте диалог — просто напишите ваш вопрос или сообщение.\n\n"
+                "Если хотите начать эту тему заново, начните новый диалог."
+            ),
+        )
         return
 
     current_memory_mode = normalize_memory_mode(config)
@@ -88,11 +98,11 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         if topic.start_message:
             text = translate_telegram_links_to_max(topic.start_message)
         elif current_memory_mode == "global":
-            text = f"✅ Переключились на тему: <b>{topic.name}</b>.\n\nТекущий диалог продолжается. Память сохранена."
+            text = f"✅ Переключились на тему: <b>{html.escape(topic.name)}</b>.\n\nТекущий диалог продолжается. Память сохранена."
         elif restored:
-            text = f"✅ Продолжаем тему: <b>{topic.name}</b>."
+            text = f"✅ Продолжаем тему: <b>{html.escape(topic.name)}</b>."
         else:
-            text = f"✅ Переключились на тему: <b>{topic.name}</b>.\n\nПамять диалога очищена."
+            text = f"✅ Переключились на тему: <b>{html.escape(topic.name)}</b>.\n\nПамять диалога очищена."
 
         auto_start = getattr(topic, "auto_start_dialogue", False)
         if auto_start:
@@ -200,6 +210,11 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
             return
 
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"✅ Продолжаем тему: <b>{html.escape(topic.name)}</b>.",
+        )
+
         await common.run_hidden_ai_kickoff(
             client,
             chat_id,
@@ -236,7 +251,7 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
 
     await client.send_message(
         chat_id=chat_id,
-        text="✅ Мы вернулись в общий режим диалога.",
+        text="✅ Мы вернулись в основной диалог.",
         attachments=inline_keyboard([main_menu_row()]),
     )
 

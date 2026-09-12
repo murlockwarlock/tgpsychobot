@@ -287,7 +287,7 @@ async def test_journey_2_return_to_main_memory_modes_tg(db_session, monkeypatch,
     await drain_tg_runner(1001)
 
     sent_texts = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
-    assert any("✅ Мы вернулись в общий режим диалога." in t for t in sent_texts)
+    assert any("✅ Мы вернулись в основной диалог." in t for t in sent_texts)
 
     async with db_session() as session:
         user = await session.get(User, 1001)
@@ -340,7 +340,7 @@ async def test_journey_2_return_to_main_memory_modes_max(db_session, monkeypatch
 
     client.send_message.assert_any_await(
         chat_id=1001,
-        text="✅ Мы вернулись в общий режим диалога.",
+        text="✅ Мы вернулись в основной диалог.",
         attachments=ANY,
     )
 
@@ -949,7 +949,7 @@ async def test_journey_9_memory_reset_in_topic_vs_main_tg(db_session, monkeypatc
     await drain_tg_runner(1001)
 
     sent_texts_main = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
-    assert any("Мы вернулись в общий режим диалога" in t for t in sent_texts_main)
+    assert any("Мы вернулись в основной диалог" in t for t in sent_texts_main)
     assert not any("Добро пожаловать в тему" in t for t in sent_texts_main)
 
 
@@ -1285,7 +1285,7 @@ async def test_remediation_2_real_max_app_main_callbacks_pass_states(db_session,
         assert user.current_topic_id is None
 
     # 3. Exactly one confirmation sent
-    confirm_calls = [c for c in client.send_message.call_args_list if "Мы вернулись в общий режим диалога" in str(c)]
+    confirm_calls = [c for c in client.send_message.call_args_list if "Мы вернулись в основной диалог" in str(c)]
     assert len(confirm_calls) == 1
 
     # 4. Kickoff executed once
@@ -1332,7 +1332,7 @@ async def test_remediation_3_max_main_disclaimer_gates_and_continuation(db_sessi
         expected_main_dialogue_id = user.current_dialogue_id
 
     # Confirmation sent
-    confirm_calls = [c for c in client.send_message.call_args_list if "Мы вернулись в общий режим диалога" in str(c)]
+    confirm_calls = [c for c in client.send_message.call_args_list if "Мы вернулись в основной диалог" in str(c)]
     assert len(confirm_calls) == 1
 
     # Disclaimer UI sent
@@ -1425,7 +1425,7 @@ async def test_remediation_4_tg_main_disclaimer_continuation(db_session, monkeyp
 
     # Confirmation + disclaimer UI sent
     sent_texts = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
-    assert any("Мы вернулись в общий режим диалога" in t for t in sent_texts)
+    assert any("Мы вернулись в основной диалог" in t for t in sent_texts)
     assert any("TG Правила и условия диалога." in t for t in sent_texts)
 
     # Provider NOT called yet
@@ -2381,3 +2381,271 @@ async def test_stale_hidden_kickoff_error_ui_suppression_and_normal_failure_pres
 
     sent_err_normal = [call for call in bot.send_message.mock_calls if error_text_needle in str(call)]
     assert len(sent_err_normal) == 1
+
+
+# ==============================================================================
+# UX PARITY CONTRACT: TG & MAX RESUME NOTIFICATION & MAIN DIALOGUE CONFIRMATION
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_ux_parity_tg_topic_resume_journey(db_session, monkeypatch):
+    """
+    Focused test A & F:
+    - User starts in main (or another topic)
+    - Target topic was already visited / welcome_shown=True
+    - Genuine switch occurs
+    - Exactly one visible acknowledgement: '✅ Продолжаем тему: «{topic.name}».'
+    - Acknowledgement happens BEFORE hidden kickoff
+    - Hidden kickoff called exactly once
+    - Navigation system_event remains exactly one
+    - No new welcome message or welcome marker created
+    - Correct topic/dialogue state
+    """
+    await seed_env(db_session, auto_start=True)
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    monkeypatch.setattr("handlers.ai_integration.generate_response", AsyncMock(return_value="AI ответ"))
+    monkeypatch.setattr("ai_integration.generate_response", AsyncMock(return_value="AI ответ"))
+
+    from system_events import SYSTEM_EVENT_ROLE
+
+    # Step 1: Visit Topic 10 first
+    cb_first = SimpleNamespace(
+        id="cb_first",
+        data="select_topic_10",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=10,
+            chat=SimpleNamespace(id=1001, type="private"),
+            delete=AsyncMock(),
+            answer=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.process_topic_selection(cb_first, state, bot)
+    await drain_tg_runner(1001)
+
+    # First entry: welcome shown, but NO 'Продолжаем тему'
+    sent_first = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
+    assert any("Добро пожаловать в тему" in t for t in sent_first)
+    assert not any("Продолжаем тему" in t for t in sent_first)
+    bot.send_message.reset_mock()
+
+    # Step 2: Return to main dialogue
+    cb_main = SimpleNamespace(
+        id="cb_main",
+        data="ai_btn:svc:topic:main",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=11,
+            chat=SimpleNamespace(id=1001, type="private"),
+            answer=AsyncMock(),
+            edit_reply_markup=AsyncMock(),
+            reply_markup=handlers.InlineKeyboardMarkup(
+                inline_keyboard=[[handlers.InlineKeyboardButton(text="Основной диалог", callback_data="ai_btn:svc:topic:main")]]
+            ),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.process_response_button(cb_main, state, bot)
+    await drain_tg_runner(1001)
+
+    # Return to main: exactly '✅ Мы вернулись в основной диалог.'
+    sent_main = [call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "") for call in bot.send_message.call_args_list]
+    assert any("✅ Мы вернулись в основной диалог." in t for t in sent_main)
+    assert not any("общий режим диалога" in t for t in sent_main)
+    bot.send_message.reset_mock()
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id is None
+        # Count system events before resume
+        sys_events_before = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == SYSTEM_EVENT_ROLE)
+        )).scalars().all()
+        # Count topic_welcome rows before resume
+        welcome_rows_before = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == TOPIC_WELCOME_ROLE)
+        )).scalars().all()
+
+    # Step 3: Resume Topic 10 with event ordering capture
+    call_order = []
+    original_send_message = bot.send_message
+
+    async def tracking_send_message(*args, **kwargs):
+        text = args[1] if len(args) > 1 else kwargs.get("text", "")
+        call_order.append(("send_message", text))
+        return await original_send_message(*args, **kwargs)
+
+    bot.send_message = AsyncMock(side_effect=tracking_send_message)
+
+    kickoff_calls = []
+    original_kickoff = handlers._start_telegram_hidden_kickoff
+
+    async def tracking_kickoff(*args, **kwargs):
+        call_order.append(("hidden_kickoff", args[3] if len(args) > 3 else kwargs.get("synthetic_prompt")))
+        kickoff_calls.append(args)
+        return await original_kickoff(*args, **kwargs)
+
+    monkeypatch.setattr(handlers, "_start_telegram_hidden_kickoff", tracking_kickoff)
+
+    cb_resume = SimpleNamespace(
+        id="cb_resume",
+        data="select_topic_10",
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        message=SimpleNamespace(
+            message_id=12,
+            chat=SimpleNamespace(id=1001, type="private"),
+            delete=AsyncMock(),
+            answer=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+    await handlers.process_topic_selection(cb_resume, state, bot)
+    await drain_tg_runner(1001)
+
+    # 1. Exactly one visible '✅ Продолжаем тему: «Психосоматика».'
+    resume_messages = [item for item in call_order if item[0] == "send_message" and "✅ Продолжаем тему: «Психосоматика»." in item[1]]
+    assert len(resume_messages) == 1
+
+    # 2. Ordering: send_message completes BEFORE hidden_kickoff
+    send_idx = next(i for i, item in enumerate(call_order) if item[0] == "send_message" and "✅ Продолжаем тему: «Психосоматика»." in item[1])
+    kickoff_idx = next(i for i, item in enumerate(call_order) if item[0] == "hidden_kickoff")
+    assert send_idx < kickoff_idx, f"send_message ({send_idx}) must precede hidden_kickoff ({kickoff_idx})"
+
+    # 3. Hidden kickoff called exactly once
+    assert len(kickoff_calls) == 1
+
+    # 4. No repeated welcome message
+    assert not any("Добро пожаловать в тему" in item[1] for item in call_order if item[0] == "send_message")
+
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        assert user.current_topic_id == 10
+
+        # Navigation system_event count increased by exactly 1
+        sys_events_after = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == SYSTEM_EVENT_ROLE)
+        )).scalars().all()
+        assert len(sys_events_after) == len(sys_events_before) + 1
+
+        # No new topic_welcome row
+        welcome_rows_after = (await session.execute(
+            select(DBMessage).where(DBMessage.user_id == 1001, DBMessage.role == TOPIC_WELCOME_ROLE)
+        )).scalars().all()
+        assert len(welcome_rows_after) == len(welcome_rows_before)
+
+
+@pytest.mark.asyncio
+async def test_ux_parity_max_topic_resume_journey(db_session, monkeypatch):
+    """
+    Focused test B & F:
+    - Genuine switch occurs into already-visited topic
+    - Visible '✅ Продолжаем тему: <b>{topic.name}</b>.' sent BEFORE kickoff
+    - Kickoff executed exactly once
+    - Correct topic/dialogue state
+    """
+    await seed_env(db_session, auto_start=True)
+    client = AsyncMock()
+    states = StateStore()
+
+    monkeypatch.setattr(max_common, "get_ai_response", AsyncMock(return_value="MAX AI ответ"))
+
+    call_order = []
+
+    async def tracking_send_message(*args, **kwargs):
+        text = kwargs.get("text", "")
+        call_order.append(("send_message", text))
+        return {"message_id": 123}
+
+    client.send_message = AsyncMock(side_effect=tracking_send_message)
+
+    original_kickoff = max_common.run_hidden_ai_kickoff
+
+    async def tracking_kickoff(*args, **kwargs):
+        call_order.append(("hidden_kickoff", args[3] if len(args) > 3 else kwargs.get("synthetic_text")))
+        return await original_kickoff(*args, **kwargs)
+
+    import max_messenger_bot.services.common as s_common
+    monkeypatch.setattr(s_common, "run_hidden_ai_kickoff", tracking_kickoff)
+    monkeypatch.setattr(max_common, "run_hidden_ai_kickoff", tracking_kickoff)
+
+    # 1. First entry into topic 10
+    await max_topics.select_topic(client, chat_id=1001, user_id=1001, topic_id=10, states=states)
+    assert any("Добро пожаловать в тему" in item[1] for item in call_order if item[0] == "send_message")
+    assert not any("Продолжаем тему" in item[1] for item in call_order if item[0] == "send_message")
+    call_order.clear()
+
+    # 2. Leave to main
+    await max_topics.reset_topic(client, chat_id=1001, user_id=1001, states=states)
+    assert any("✅ Мы вернулись в основной диалог." in item[1] for item in call_order if item[0] == "send_message")
+    assert not any("общий режим диалога" in item[1] for item in call_order if item[0] == "send_message")
+    call_order.clear()
+
+    # 3. Resume topic 10
+    await max_topics.select_topic(client, chat_id=1001, user_id=1001, topic_id=10, states=states)
+
+    # Visible resume notification sent
+    resume_messages = [item for item in call_order if item[0] == "send_message" and "✅ Продолжаем тему: <b>Психосоматика</b>." in item[1]]
+    assert len(resume_messages) == 1
+
+    # Ordering: send_message BEFORE hidden_kickoff
+    send_idx = next(i for i, item in enumerate(call_order) if item[0] == "send_message" and "✅ Продолжаем тему: <b>Психосоматика</b>." in item[1])
+    kickoff_idx = next(i for i, item in enumerate(call_order) if item[0] == "hidden_kickoff")
+    assert send_idx < kickoff_idx
+
+    # Kickoff called
+    kickoff_calls = [item for item in call_order if item[0] == "hidden_kickoff"]
+    assert len(kickoff_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ux_parity_already_current_topic_preserves_pr22(db_session, monkeypatch):
+    """
+    Focused test D:
+    - Pressing already current topic sends PR #22 acknowledgement
+    - NO 'Продолжаем тему'
+    - NO AI kickoff
+    - NO DB mutations
+    """
+    await seed_env(db_session, auto_start=True)
+    bot = make_mock_bot()
+    state = make_mock_state()
+
+    # User already in topic 10
+    async with db_session() as session:
+        user = await session.get(User, 1001)
+        user.current_topic_id = 10
+        user.current_dialogue_id = 2
+        await session.commit()
+
+    mock_msg = SimpleNamespace(
+        message_id=99,
+        from_user=SimpleNamespace(id=1001, username="testuser", full_name="Иван"),
+        chat=SimpleNamespace(id=1001, type="private"),
+        answer=AsyncMock(),
+    )
+
+    res = await handlers._perform_telegram_topic_switch(1001, 10)
+    assert res.status == "already_current"
+
+    with patch("handlers._start_telegram_hidden_kickoff", new_callable=AsyncMock) as mock_kickoff:
+        await handlers._complete_telegram_topic_entry(
+            user_id=1001,
+            chat_id=1001,
+            switch_res=res,
+            bot=bot,
+            state=state,
+            message=mock_msg,
+        )
+
+        mock_msg.answer.assert_called_once()
+        sent_text = mock_msg.answer.call_args[0][0]
+        assert "Вы уже находитесь в теме «Психосоматика»." in sent_text
+        assert "Продолжайте диалог" in sent_text
+        assert "Продолжаем тему" not in sent_text
+
+        bot.send_message.assert_not_called()
+        mock_kickoff.assert_not_called()
+

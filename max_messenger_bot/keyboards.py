@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from sqlalchemy import select
-from response_buttons import ResponseButton
+from response_buttons import ResponseButton, build_action_callback_data
 
 from .legacy import Content, SubscriptionConfig, SubscriptionPlan, TestConfig, Topic, async_session_maker
 from .identity import max_client_list_label
@@ -31,14 +31,28 @@ def response_buttons_keyboard(
     *,
     include_main_menu: bool = False,
 ) -> list[dict]:
-    converted_rows: list[list[dict]] = []
+    if not rows:
+        return inline_keyboard([main_menu_row()]) if include_main_menu else []
+    action_counts: dict[str, int] = {}
     for row in rows:
-        converted = [
-            link_button(button.text, button.value)
-            if button.kind == "url"
-            else callback_button(button.text, f"ai_btn:{button.value}")
-            for button in row
-        ]
+        for button in row:
+            if button.kind == "action":
+                action_counts[button.value] = action_counts.get(button.value, 0) + 1
+
+    converted_rows: list[list[dict]] = []
+    action_button_index = 0
+    for row in rows:
+        converted = []
+        for button in row:
+            if button.kind == "url":
+                converted.append(link_button(button.text, button.value))
+            else:
+                payload = build_action_callback_data(
+                    button.value,
+                    action_button_index if action_counts[button.value] > 1 else None,
+                )
+                converted.append(callback_button(button.text, payload))
+                action_button_index += 1
         if converted:
             converted_rows.append(converted)
     if include_main_menu:

@@ -195,8 +195,7 @@ async def test_indexed_special_actions_still_dispatch(monkeypatch):
         await handlers.process_response_button(callback, None, bot)
 
     for target in targets.values():
-        expected_count = 2 if target is targets["main_menu"] else 1
-        assert target.await_count == expected_count
+        assert target.await_count == 1
 
 
 @pytest.mark.asyncio
