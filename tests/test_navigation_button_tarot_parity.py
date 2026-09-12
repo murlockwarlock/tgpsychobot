@@ -532,90 +532,140 @@ async def test_primary_max_topic_matrix_via_handle_update(db_session, monkeypatc
 
     client = AsyncMock()
     app = MaxBotApplication(client)
-    monkeypatch.setattr(max_common, "run_hidden_ai_kickoff", AsyncMock())
+
+    # Real kickoff orchestration, spy on kickoff, fake provider boundary
+    max_kickoff_count = 0
+    orig_max_kickoff = max_common.run_hidden_ai_kickoff
+    async def spy_max_kickoff(*args, **kwargs):
+        nonlocal max_kickoff_count
+        max_kickoff_count += 1
+        return await orig_max_kickoff(*args, **kwargs)
+    monkeypatch.setattr(max_common, "run_hidden_ai_kickoff", spy_max_kickoff)
+
+    max_provider_count = 0
+    async def fake_max_get_ai_response(*args, **kwargs):
+        nonlocal max_provider_count
+        max_provider_count += 1
+        return "Тестовый ответ MAX ИИ"
+    monkeypatch.setattr(max_common, "get_ai_response", fake_max_get_ai_response)
     monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+
+    async def get_max_snapshot():
+        async with db_session() as s:
+            u = await s.get(User, INTERNAL_USER_ID)
+            navs = (await s.execute(
+                select(DBMessage).where(DBMessage.user_id == INTERNAL_USER_ID, DBMessage.role == "system_event").order_by(DBMessage.id.asc())
+            )).scalars().all()
+            welcomes = (await s.execute(
+                select(func.count(DBMessage.id)).where(DBMessage.user_id == INTERNAL_USER_ID, DBMessage.role == TOPIC_WELCOME_ROLE)
+            )).scalar_one()
+            resume_notices = sum(1 for c in client.send_message.call_args_list if "✅ Продолжаем тему:" in str(c))
+        return {
+            "ack": client.answer_callback.await_count,
+            "topic_id": u.current_topic_id if u else None,
+            "dialogue_id": u.current_dialogue_id if u else None,
+            "nav_count": len(navs),
+            "nav_msgs": navs,
+            "welcome_count": welcomes,
+            "resume_notices": resume_notices,
+            "kickoff_count": max_kickoff_count,
+            "provider_count": max_provider_count,
+        }
 
     # --------------------------------------------------------------------------
     # ROW 1: MAX First Entry
     # --------------------------------------------------------------------------
+    s1_before = await get_max_snapshot()
     upd_first = make_raw_max_callback_update("select_topic_10", update_id="max_first_1")
     await app.handle_update(upd_first)
     await await_spawned_tasks(app, INTERNAL_USER_ID)
+    s1_after = await get_max_snapshot()
 
-    assert client.answer_callback.await_count == 1
-    async with db_session() as session:
-        u = await session.get(User, INTERNAL_USER_ID)
-        assert u.current_topic_id == 10
-        assert await is_topic_welcome_shown(session, INTERNAL_USER_ID, u.current_dialogue_id, 10)
-        nav_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == INTERNAL_USER_ID, DBMessage.topic_id == 10, DBMessage.role == "system_event"))).scalars().all()
-        assert len(nav_msgs) == 1
-        assert nav_msgs[0].content == build_topic_auto_start_system_message("Карьера и цели")
-    assert max_common.run_hidden_ai_kickoff.await_count == 1
+    assert s1_after["ack"] - s1_before["ack"] == 1
+    assert s1_after["topic_id"] == 10
+    assert s1_after["nav_count"] - s1_before["nav_count"] == 1
+    assert s1_after["nav_msgs"][-1].content == build_topic_auto_start_system_message("Карьера и цели")
+    assert s1_after["welcome_count"] - s1_before["welcome_count"] == 1
+    assert s1_after["resume_notices"] - s1_before["resume_notices"] == 0
+    assert s1_after["kickoff_count"] - s1_before["kickoff_count"] == 1
+    assert s1_after["provider_count"] - s1_before["provider_count"] == 1
+    # Switched from main (1) to topic 10 (2) under MEMORY_MODE_TOPIC
+    assert s1_after["dialogue_id"] == 2
 
     # --------------------------------------------------------------------------
     # ROW 2: MAX Genuine Resume
     # --------------------------------------------------------------------------
-    async with db_session() as session:
-        u = await session.get(User, INTERNAL_USER_ID)
+    # User switches to main first
+    async with db_session() as s:
+        u = await s.get(User, INTERNAL_USER_ID)
         u.current_topic_id = None
-        await session.commit()
+        u.current_dialogue_id = 1
+        await s.commit()
 
-    client.answer_callback.reset_mock()
-    client.send_message.reset_mock()
-    max_common.run_hidden_ai_kickoff.reset_mock()
-
+    s2_before = await get_max_snapshot()
     upd_resume = make_raw_max_callback_update("select_topic_10", update_id="max_resume_2")
     await app.handle_update(upd_resume)
     await await_spawned_tasks(app, INTERNAL_USER_ID)
+    s2_after = await get_max_snapshot()
 
-    assert client.answer_callback.await_count == 1
-    assert any("✅ Продолжаем тему: <b>Карьера и цели</b>." in str(call) for call in client.send_message.call_args_list)
-    assert max_common.run_hidden_ai_kickoff.await_count == 1
-    async with db_session() as session:
-        u = await session.get(User, INTERNAL_USER_ID)
-        assert u.current_topic_id == 10
-        nav_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == INTERNAL_USER_ID, DBMessage.topic_id == 10, DBMessage.role == "system_event"))).scalars().all()
-        assert len(nav_msgs) == 2
-        assert nav_msgs[1].content == build_topic_resume_system_message("Карьера и цели")
+    assert s2_after["ack"] - s2_before["ack"] == 1
+    assert s2_after["topic_id"] == 10
+    assert s2_after["nav_count"] - s2_before["nav_count"] == 1
+    assert s2_after["nav_msgs"][-1].content == build_topic_resume_system_message("Карьера и цели")
+    assert s2_after["welcome_count"] - s2_before["welcome_count"] == 0
+    assert s2_after["resume_notices"] - s2_before["resume_notices"] == 1
+    assert s2_after["kickoff_count"] - s2_before["kickoff_count"] == 1
+    assert s2_after["provider_count"] - s2_before["provider_count"] == 1
+    # Restored to saved topic dialogue 2 under MEMORY_MODE_TOPIC
+    assert s2_after["dialogue_id"] == 2
 
     # --------------------------------------------------------------------------
     # ROW 3: MAX Already Current
     # --------------------------------------------------------------------------
-    client.answer_callback.reset_mock()
-    client.send_message.reset_mock()
-    max_common.run_hidden_ai_kickoff.reset_mock()
+    async with db_session() as s:
+        uts_before = (await s.execute(select(UserTopicState).where(UserTopicState.user_id == INTERNAL_USER_ID))).scalars().all()
+        uts_snapshot = [(x.topic_id, x.dialogue_id) for x in uts_before]
 
+    s3_before = await get_max_snapshot()
     upd_current = make_raw_max_callback_update("select_topic_10", update_id="max_current_3")
     await app.handle_update(upd_current)
     await await_spawned_tasks(app, INTERNAL_USER_ID)
+    s3_after = await get_max_snapshot()
 
-    assert client.answer_callback.await_count == 1
+    assert s3_after["ack"] - s3_before["ack"] == 1
+    assert s3_after["topic_id"] == 10
+    assert s3_after["dialogue_id"] == 2
+    assert s3_after["nav_count"] - s3_before["nav_count"] == 0
+    assert s3_after["welcome_count"] - s3_before["welcome_count"] == 0
+    assert s3_after["resume_notices"] - s3_before["resume_notices"] == 0
+    assert s3_after["kickoff_count"] - s3_before["kickoff_count"] == 0
+    assert s3_after["provider_count"] - s3_before["provider_count"] == 0
     assert any("Вы уже находитесь в теме «Карьера и цели»." in str(call) for call in client.send_message.call_args_list)
-    assert max_common.run_hidden_ai_kickoff.await_count == 0
-    async with db_session() as session:
-        u = await session.get(User, INTERNAL_USER_ID)
-        assert u.current_topic_id == 10
-        # No extra navigation system event created
-        nav_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == INTERNAL_USER_ID, DBMessage.topic_id == 10, DBMessage.role == "system_event"))).scalars().all()
-        assert len(nav_msgs) == 2
+
+    async with db_session() as s:
+        uts_after = (await s.execute(select(UserTopicState).where(UserTopicState.user_id == INTERNAL_USER_ID))).scalars().all()
+        assert [(x.topic_id, x.dialogue_id) for x in uts_after] == uts_snapshot
 
     # --------------------------------------------------------------------------
     # ROW 4: MAX Return to Main
     # --------------------------------------------------------------------------
-    client.answer_callback.reset_mock()
-    client.send_message.reset_mock()
-
+    s4_before = await get_max_snapshot()
     upd_reset = make_raw_max_callback_update("reset_topic", update_id="max_reset_4")
     await app.handle_update(upd_reset)
     await await_spawned_tasks(app, INTERNAL_USER_ID)
+    s4_after = await get_max_snapshot()
 
-    assert client.answer_callback.await_count == 1
+    assert s4_after["ack"] - s4_before["ack"] == 1
+    assert s4_after["topic_id"] is None
+    assert s4_after["nav_count"] - s4_before["nav_count"] == 1
+    assert s4_after["nav_msgs"][-1].content == build_main_dialogue_resume_system_message()
+    assert s4_after["welcome_count"] - s4_before["welcome_count"] == 0
+    assert s4_after["resume_notices"] - s4_before["resume_notices"] == 0
+    assert s4_after["kickoff_count"] - s4_before["kickoff_count"] == 1
+    assert s4_after["provider_count"] - s4_before["provider_count"] == 1
+    # Restored to saved main dialogue 1 under MEMORY_MODE_TOPIC
+    assert s4_after["dialogue_id"] == 1
     assert any("✅ Мы вернулись в основной диалог." in str(call) for call in client.send_message.call_args_list)
-    async with db_session() as session:
-        u = await session.get(User, INTERNAL_USER_ID)
-        assert u.current_topic_id is None
-        main_nav = (await session.execute(select(DBMessage).where(DBMessage.user_id == INTERNAL_USER_ID, DBMessage.topic_id.is_(None), DBMessage.role == "system_event"))).scalars().all()
-        assert any(m.content == build_main_dialogue_resume_system_message() for m in main_nav)
 
 
 # ==============================================================================
@@ -634,11 +684,58 @@ async def test_telegram_primary_topic_matrix_via_handlers(db_session, monkeypatc
         session.add(User(id=100, first_name="TG User", name="TG User", gender="male", age="25", is_admin=True, accepted_disclaimer=True, current_topic_id=None, current_dialogue_id=1))
         await session.commit()
 
-    monkeypatch.setattr(handlers, "_start_telegram_hidden_kickoff", AsyncMock())
+    handlers.user_isolated_turn_queues.clear()
+    handlers.user_processing_tasks.clear()
+    handlers.user_message_buffers.clear()
+
+    tg_provider_count = 0
+    async def fake_tg_provider(user_id, prompt_text, *args, **kwargs):
+        nonlocal tg_provider_count
+        tg_provider_count += 1
+        return "Тестовый ответ TG ИИ"
+    monkeypatch.setattr("handlers.ai_integration.generate_response", fake_tg_provider)
+    monkeypatch.setattr("ai_integration.generate_response", fake_tg_provider)
+
+    tg_kickoff_count = 0
+    orig_tg_kickoff = handlers._start_telegram_hidden_kickoff
+    async def spy_tg_kickoff(*args, **kwargs):
+        nonlocal tg_kickoff_count
+        tg_kickoff_count += 1
+        return await orig_tg_kickoff(*args, **kwargs)
+    monkeypatch.setattr(handlers, "_start_telegram_hidden_kickoff", spy_tg_kickoff)
+
+    async def drain_tg_runner(user_id: int):
+        while handlers._has_user_turn_work(user_id) or (user_id in handlers.user_processing_tasks and not handlers.user_processing_tasks[user_id].done()):
+            task = handlers.user_processing_tasks.get(user_id)
+            if task:
+                await task
+            await asyncio.sleep(0.01)
+
+    async def get_tg_snapshot():
+        async with db_session() as s:
+            u = await s.get(User, 100)
+            navs = (await s.execute(
+                select(DBMessage).where(DBMessage.user_id == 100, DBMessage.role == "system_event").order_by(DBMessage.id.asc())
+            )).scalars().all()
+            welcomes = (await s.execute(
+                select(func.count(DBMessage.id)).where(DBMessage.user_id == 100, DBMessage.role == TOPIC_WELCOME_ROLE)
+            )).scalar_one()
+            resume_notices = sum(1 for c in bot.send_message.call_args_list if "✅ Продолжаем тему:" in str(c))
+        return {
+            "topic_id": u.current_topic_id if u else None,
+            "dialogue_id": u.current_dialogue_id if u else None,
+            "nav_count": len(navs),
+            "nav_msgs": navs,
+            "welcome_count": welcomes,
+            "resume_notices": resume_notices,
+            "kickoff_count": tg_kickoff_count,
+            "provider_count": tg_provider_count,
+        }
 
     # --------------------------------------------------------------------------
     # ROW 1: TG First Entry
     # --------------------------------------------------------------------------
+    s1_before = await get_tg_snapshot()
     cb_first = SimpleNamespace(
         data="select_topic_10",
         from_user=SimpleNamespace(id=100),
@@ -646,26 +743,31 @@ async def test_telegram_primary_topic_matrix_via_handlers(db_session, monkeypatc
         answer=AsyncMock(),
     )
     await handlers.process_topic_selection(cb_first, state, bot)
+    await drain_tg_runner(100)
+    s1_after = await get_tg_snapshot()
+
     assert cb_first.answer.await_count == 1
-    async with db_session() as session:
-        u = await session.get(User, 100)
-        assert u.current_topic_id == 10
-        assert await is_topic_welcome_shown(session, 100, u.current_dialogue_id, 10)
-        nav_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 100, DBMessage.topic_id == 10, DBMessage.role == "system_event"))).scalars().all()
-        assert len(nav_msgs) == 1
-        assert nav_msgs[0].content == build_topic_auto_start_system_message("Карьера и цели")
+    assert s1_after["topic_id"] == 10
+    assert s1_after["nav_count"] - s1_before["nav_count"] == 1
+    assert s1_after["nav_msgs"][-1].content == build_topic_auto_start_system_message("Карьера и цели")
+    assert s1_after["welcome_count"] - s1_before["welcome_count"] == 1
+    assert s1_after["resume_notices"] - s1_before["resume_notices"] == 0
+    assert s1_after["kickoff_count"] - s1_before["kickoff_count"] == 1
+    assert s1_after["provider_count"] - s1_before["provider_count"] == 1
+    # Switched from main (1) to topic 10 (2) under MEMORY_MODE_TOPIC
+    assert s1_after["dialogue_id"] == 2
 
     # --------------------------------------------------------------------------
     # ROW 2: TG Genuine Resume
     # --------------------------------------------------------------------------
-    async with db_session() as session:
-        u = await session.get(User, 100)
+    # User switches to main first
+    async with db_session() as s:
+        u = await s.get(User, 100)
         u.current_topic_id = None
-        await session.commit()
+        u.current_dialogue_id = 1
+        await s.commit()
 
-    bot.send_message.reset_mock()
-    handlers._start_telegram_hidden_kickoff.reset_mock()
-
+    s2_before = await get_tg_snapshot()
     cb_resume = SimpleNamespace(
         data="select_topic_10",
         from_user=SimpleNamespace(id=100),
@@ -673,22 +775,28 @@ async def test_telegram_primary_topic_matrix_via_handlers(db_session, monkeypatc
         answer=AsyncMock(),
     )
     await handlers.process_topic_selection(cb_resume, state, bot)
+    await drain_tg_runner(100)
+    s2_after = await get_tg_snapshot()
+
     assert cb_resume.answer.await_count == 1
-    assert any("✅ Продолжаем тему: «Карьера и цели»." in str(call) for call in bot.send_message.call_args_list)
-    assert handlers._start_telegram_hidden_kickoff.await_count == 1
-    async with db_session() as session:
-        u = await session.get(User, 100)
-        assert u.current_topic_id == 10
-        nav_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 100, DBMessage.topic_id == 10, DBMessage.role == "system_event"))).scalars().all()
-        assert len(nav_msgs) == 2
-        assert nav_msgs[1].content == build_topic_resume_system_message("Карьера и цели")
+    assert s2_after["topic_id"] == 10
+    assert s2_after["nav_count"] - s2_before["nav_count"] == 1
+    assert s2_after["nav_msgs"][-1].content == build_topic_resume_system_message("Карьера и цели")
+    assert s2_after["welcome_count"] - s2_before["welcome_count"] == 0
+    assert s2_after["resume_notices"] - s2_before["resume_notices"] == 1
+    assert s2_after["kickoff_count"] - s2_before["kickoff_count"] == 1
+    assert s2_after["provider_count"] - s2_before["provider_count"] == 1
+    # Restored to saved topic dialogue 2 under MEMORY_MODE_TOPIC
+    assert s2_after["dialogue_id"] == 2
 
     # --------------------------------------------------------------------------
     # ROW 3: TG Already Current
     # --------------------------------------------------------------------------
-    bot.send_message.reset_mock()
-    handlers._start_telegram_hidden_kickoff.reset_mock()
+    async with db_session() as s:
+        uts_before = (await s.execute(select(UserTopicState).where(UserTopicState.user_id == 100))).scalars().all()
+        uts_snapshot = [(x.topic_id, x.dialogue_id) for x in uts_before]
 
+    s3_before = await get_tg_snapshot()
     cb_current = SimpleNamespace(
         data="select_topic_10",
         from_user=SimpleNamespace(id=100),
@@ -696,20 +804,27 @@ async def test_telegram_primary_topic_matrix_via_handlers(db_session, monkeypatc
         answer=AsyncMock(),
     )
     await handlers.process_topic_selection(cb_current, state, bot)
+    await drain_tg_runner(100)
+    s3_after = await get_tg_snapshot()
+
     assert cb_current.answer.await_count == 1
+    assert s3_after["topic_id"] == 10
+    assert s3_after["dialogue_id"] == 2
+    assert s3_after["nav_count"] - s3_before["nav_count"] == 0
+    assert s3_after["welcome_count"] - s3_before["welcome_count"] == 0
+    assert s3_after["resume_notices"] - s3_before["resume_notices"] == 0
+    assert s3_after["kickoff_count"] - s3_before["kickoff_count"] == 0
+    assert s3_after["provider_count"] - s3_before["provider_count"] == 0
     assert any("Вы уже находитесь в теме «Карьера и цели»." in str(call) for call in cb_current.message.answer.call_args_list)
-    assert handlers._start_telegram_hidden_kickoff.await_count == 0
-    async with db_session() as session:
-        u = await session.get(User, 100)
-        assert u.current_topic_id == 10
-        nav_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 100, DBMessage.topic_id == 10, DBMessage.role == "system_event"))).scalars().all()
-        assert len(nav_msgs) == 2
+
+    async with db_session() as s:
+        uts_after = (await s.execute(select(UserTopicState).where(UserTopicState.user_id == 100))).scalars().all()
+        assert [(x.topic_id, x.dialogue_id) for x in uts_after] == uts_snapshot
 
     # --------------------------------------------------------------------------
     # ROW 4: TG Return to Main
     # --------------------------------------------------------------------------
-    bot.send_message.reset_mock()
-
+    s4_before = await get_tg_snapshot()
     cb_reset = SimpleNamespace(
         data="reset_topic",
         from_user=SimpleNamespace(id=100),
@@ -717,13 +832,20 @@ async def test_telegram_primary_topic_matrix_via_handlers(db_session, monkeypatc
         answer=AsyncMock(),
     )
     await handlers.process_topic_reset(cb_reset, bot, state)
+    await drain_tg_runner(100)
+    s4_after = await get_tg_snapshot()
+
     assert cb_reset.answer.await_count == 1
+    assert s4_after["topic_id"] is None
+    assert s4_after["nav_count"] - s4_before["nav_count"] == 1
+    assert s4_after["nav_msgs"][-1].content == build_main_dialogue_resume_system_message()
+    assert s4_after["welcome_count"] - s4_before["welcome_count"] == 0
+    assert s4_after["resume_notices"] - s4_before["resume_notices"] == 0
+    assert s4_after["kickoff_count"] - s4_before["kickoff_count"] == 1
+    assert s4_after["provider_count"] - s4_before["provider_count"] == 1
+    # Restored to saved main dialogue 1 under MEMORY_MODE_TOPIC
+    assert s4_after["dialogue_id"] == 1
     assert any("✅ Мы вернулись в основной диалог." in str(call) for call in bot.send_message.call_args_list)
-    async with db_session() as session:
-        u = await session.get(User, 100)
-        assert u.current_topic_id is None
-        main_nav = (await session.execute(select(DBMessage).where(DBMessage.user_id == 100, DBMessage.topic_id.is_(None), DBMessage.role == "system_event"))).scalars().all()
-        assert any(m.content == build_main_dialogue_resume_system_message() for m in main_nav)
 
 
 # ==============================================================================
@@ -755,6 +877,15 @@ async def test_telegram_and_max_button_service_matrix(db_session, monkeypatch):
         answer=AsyncMock(),
     )
     await handlers.process_response_button(cb_menu, state, bot)
+    assert cb_menu.answer.await_count == 1
+    assert 505 not in handlers.user_message_buffers
+    assert cb_menu.message.answer.await_count == 1
+
+    # TG svc:menu duplicate click: service not executed again, duplicate acknowledged, no generic processing
+    cb_menu.answer.reset_mock()
+    cb_menu.message.answer.reset_mock()
+    await handlers.process_response_button(cb_menu, state, bot)
+    assert cb_menu.message.answer.await_count == 0
     assert cb_menu.answer.await_count == 1
     assert 505 not in handlers.user_message_buffers
 
@@ -846,32 +977,42 @@ async def test_telegram_and_max_button_service_matrix(db_session, monkeypatch):
     monkeypatch.setattr(max_common, "run_ai_dialogue", run_ai_mock)
 
     # MAX svc:menu
+    max_client.answer_callback.reset_mock()
     await max_app_inst.handle_update(make_raw_max_callback_update("ai_btn:svc:menu", update_id="max_svc_menu"))
     await await_spawned_tasks(max_app_inst, INTERNAL_USER_ID)
+    assert max_client.answer_callback.await_count == 1
     assert max_common.show_menu.await_count == 1
     assert run_ai_mock.await_count == 0
 
     # MAX svc:topics
+    max_client.answer_callback.reset_mock()
     await max_app_inst.handle_update(make_raw_max_callback_update("ai_btn:svc:topics", update_id="max_svc_topics"))
     await await_spawned_tasks(max_app_inst, INTERNAL_USER_ID)
+    assert max_client.answer_callback.await_count == 1
     assert max_topics.show_topics.await_count == 1
     assert run_ai_mock.await_count == 0
 
     # MAX svc:topic:2
+    max_client.answer_callback.reset_mock()
     await max_app_inst.handle_update(make_raw_max_callback_update("ai_btn:svc:topic:2", update_id="max_svc_topic_2"))
     await await_spawned_tasks(max_app_inst, INTERNAL_USER_ID)
+    assert max_client.answer_callback.await_count == 1
     assert max_topics.select_topic.await_count == 1
     assert run_ai_mock.await_count == 0
 
     # MAX svc:topic:main
+    max_client.answer_callback.reset_mock()
     await max_app_inst.handle_update(make_raw_max_callback_update("ai_btn:svc:topic:main", update_id="max_svc_main"))
     await await_spawned_tasks(max_app_inst, INTERNAL_USER_ID)
+    assert max_client.answer_callback.await_count == 1
     assert max_topics.reset_topic.await_count == 1
     assert run_ai_mock.await_count == 0
 
     # MAX unknown svc:*
+    max_client.answer_callback.reset_mock()
     await max_app_inst.handle_update(make_raw_max_callback_update("ai_btn:svc:unknown_random", update_id="max_svc_unk"))
     await await_spawned_tasks(max_app_inst, INTERNAL_USER_ID)
+    assert max_client.answer_callback.await_count == 1
     assert run_ai_mock.await_count == 0
 
 
@@ -1140,6 +1281,8 @@ async def test_tarot_deduplication_comprehensive_contract(db_session, monkeypatc
     r1_synthetic = handlers._card_selection_system_message("card_1.jpg: Маг", {
         "chosen_card_ids": [], "total_rounds": 3, "rounds_left": 2
     })
+    r1_payload_msgs = captured_openai_payloads[0]["messages"]
+    assert sum(1 for m in r1_payload_msgs if m["content"] == r1_synthetic) == 1
     async with db_session() as session:
         r1_user_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 801, DBMessage.role == "user", DBMessage.content == r1_synthetic))).scalars().all()
         assert len(r1_user_msgs) == 1
@@ -1205,6 +1348,17 @@ async def test_tarot_deduplication_comprehensive_contract(db_session, monkeypatc
         assert len(r3_user_msgs) == 1
         r3_asst_msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 801, DBMessage.role == "assistant", DBMessage.content == "Интерпретация карты 3 (Императрица)"))).scalars().all()
         assert len(r3_asst_msgs) == 1
+
+    # Normal spread completion verification
+    assert await handlers._get_card_spread_state(801) is None
+    assert any("Твой расклад целиком:" in str(call) for call in bot.send_message.call_args_list)
+    final_album_calls = [
+        call for call in handlers.send_card_album.call_args_list
+        if call.kwargs.get("context") == "process_card_selection.final_spread"
+    ]
+    assert len(final_album_calls) == 1
+    assert final_album_calls[0].args[1] == 801
+    assert final_album_calls[0].args[2] == ["f_1", "f_2", "f_3"]
 
     # ==========================================================================
     # PATH 2: process_buffered_messages (Random Card)
