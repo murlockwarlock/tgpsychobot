@@ -88,25 +88,31 @@ def _spawn_update_task(app: web.Application, update: dict[str, Any]) -> None:
 
 
 def resolve_max_ai_button_label(callback: IncomingCallback) -> str | None:
-    message = callback.message
+    message = callback.message or {}
     if not isinstance(message, dict):
         return None
-    body = message.get("body")
-    attachments = body.get("attachments") if isinstance(body, dict) else message.get("attachments")
+    body = message.get("body") if isinstance(message.get("body"), dict) else {}
+
+    attachments = body.get("attachments")
     if not isinstance(attachments, list):
-        return None
+        attachments = message.get("attachments")
+    if not isinstance(attachments, list):
+        attachments = []
 
     target_payload = callback.payload
     matching_buttons: list[dict] = []
-    for att in attachments:
-        if not isinstance(att, dict):
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
             continue
-        payload = att.get("payload")
+        if attachment.get("type") != "inline_keyboard":
+            continue
+
+        payload = attachment.get("payload")
         buttons_matrix = None
         if isinstance(payload, dict):
             buttons_matrix = payload.get("buttons")
-        elif att.get("type") == "inline_keyboard" and isinstance(att.get("buttons"), list):
-            buttons_matrix = att.get("buttons")
+        elif isinstance(attachment.get("buttons"), list):
+            buttons_matrix = attachment.get("buttons")
 
         if not isinstance(buttons_matrix, list):
             continue
