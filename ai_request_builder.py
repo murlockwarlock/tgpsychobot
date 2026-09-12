@@ -43,6 +43,15 @@ from subscription_context import active_subscription_flag
 log = logging.getLogger(__name__)
 
 
+def resolve_context_limit(value: Any, default: int) -> int:
+    """Resolve context limit honoring explicit zero, with fallback to default on None/invalid."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else default
+    except (TypeError, ValueError):
+        return default
 
 
 def build_temporal_activity_context(
@@ -277,7 +286,9 @@ async def load_conversational_ai_history(
     if exclude_message_id is not None:
         raw_messages = [m for m in raw_messages if getattr(m, "id", None) != exclude_message_id]
 
-    selected = select_ai_history_messages(raw_messages, limit_first, limit_recent)
+    effective_first = resolve_context_limit(limit_first, default=2)
+    effective_recent = resolve_context_limit(limit_recent, default=10)
+    selected = select_ai_history_messages(raw_messages, effective_first, effective_recent)
     history_items = [
         {"role": item.role, "content": item.content}
         for item in selected
@@ -383,8 +394,14 @@ async def build_conversational_request_layout(
     if knowledge_context and knowledge_context.strip():
         request_parts.append("РЕЛЕВАНТНЫЕ ДАННЫЕ ИЗ БАЗЫ ЗНАНИЙ:\n" + knowledge_context.strip())
 
-    first_limit = limit_first if limit_first is not None else (getattr(ai_config, "context_limit_first", 2) or 2)
-    recent_limit = limit_recent if limit_recent is not None else (getattr(ai_config, "context_limit_recent", 10) or 10)
+    first_limit = resolve_context_limit(
+        limit_first if limit_first is not None else getattr(ai_config, "context_limit_first", None),
+        default=2,
+    )
+    recent_limit = resolve_context_limit(
+        limit_recent if limit_recent is not None else getattr(ai_config, "context_limit_recent", None),
+        default=10,
+    )
     if history is None:
         canonical_history = await load_conversational_ai_history(
             session,
