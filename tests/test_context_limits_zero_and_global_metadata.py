@@ -1058,3 +1058,76 @@ class TestContextLimitsZeroAndGlobalMetadata(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(data2["dialogue_states"]), 1)
         st2 = data2["dialogue_states"][0]
         self.assertEqual(st2["current_step"], "step_topic_mode")
+
+    # =========================================================================
+    # 10. Non-Global (TOPIC/RESET) Display Scope Boundary:
+    #     Proves legacy rendering containing HTML-escapable characters that
+    #     expand rendered text length > 3900 is NOT blocked by the GLOBAL assertion.
+    # =========================================================================
+    async def test_non_global_topic_and_reset_display_not_blocked_by_global_3900_budget(self):
+        user_id = 999
+        dt_fixed = datetime(2026, 9, 13, 10, 0, 0)
+        async with self.sessions() as session:
+            user = User(id=user_id, first_name="ТестТопикПользователь", current_dialogue_id=1)
+            ai_config = AIConfig(id=1, memory_mode=MEMORY_MODE_TOPIC)
+
+            # Create metadata containing many HTML-escapable characters ('&', '<', '>')
+            # In TOPIC mode, legacy slicing happens around 2800 chars of raw JSON,
+            # which expands to > 4,000 chars when html.escape() is applied!
+            escapable_meta = {
+                "items": [f"key_{i}_&&&&_<<<>>>_test" for i in range(120)],
+                "description": "Текст с амперсандами &&&& и скобками <<<>>> " * 30,
+            }
+            conv = AutomationConversationState(
+                user_id=user_id,
+                dialogue_id=1,
+                topic_id=3,
+                current_step="step_topic_legacy_long_name",
+                current_state_json='{"current_step": "step_topic_legacy_long_name"}',
+                metadata_json=json.dumps(escapable_meta, ensure_ascii=False),
+                updated_at=dt_fixed,
+            )
+            session.add_all([user, ai_config, conv])
+            await session.commit()
+
+        # 1. Invoke view_client_merged_metadata in TOPIC mode
+        view_callback = MagicMock()
+        view_callback.from_user.id = 999999
+        view_callback.data = f"client_merged_metadata_{user_id}_0"
+        view_callback.message.edit_text = AsyncMock()
+        view_callback.answer = AsyncMock()
+
+        with patch("handlers.check_history_permission", AsyncMock(return_value=True)):
+            await handlers.view_client_merged_metadata(view_callback)
+
+        view_callback.message.edit_text.assert_awaited_once()
+        topic_text = view_callback.message.edit_text.call_args[0][0]
+
+        # Prove rendered text length actually exceeds 3900 chars due to HTML escaping
+        self.assertGreater(len(topic_text), 3900)
+
+        # Prove existing TOPIC content contract is preserved
+        self.assertIn("Топик #3", topic_text)
+        self.assertIn("step_topic_legacy_long_name", topic_text)
+        self.assertIn("&amp;&amp;&amp;&amp;", topic_text)
+        self.assertIn("&lt;&lt;&lt;&gt;&gt;&gt;", topic_text)
+        self.assertIn("... (полный текст доступен при скачивании .json)", topic_text)
+
+        # 2. Switch to RESET mode and verify identical non-gated behavior
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.memory_mode = MEMORY_MODE_RESET
+            await session.commit()
+
+        view_callback.reset_mock()
+        with patch("handlers.check_history_permission", AsyncMock(return_value=True)):
+            await handlers.view_client_merged_metadata(view_callback)
+
+        view_callback.message.edit_text.assert_awaited_once()
+        reset_text = view_callback.message.edit_text.call_args[0][0]
+
+        self.assertGreater(len(reset_text), 3900)
+        self.assertIn("Топик #3", reset_text)
+        self.assertIn("step_topic_legacy_long_name", reset_text)
+        self.assertIn("&amp;&amp;&amp;&amp;", reset_text)
+

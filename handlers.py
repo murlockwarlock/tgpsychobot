@@ -6903,22 +6903,13 @@ async def view_client_merged_metadata(callback: CallbackQuery):
     client_id = int(parts[3])
     page = int(parts[4]) if len(parts) > 4 else 0
 
-    MAX_MESSAGE_BUDGET = 3900
-
     async with async_session_maker() as session:
         user = await session.get(User, client_id)
         if not user:
             await callback.answer("Клиент не найден.", show_alert=True)
             return
 
-        # Bound dynamic client display name before HTML escaping
-        raw_client_name = _display_client_name(user)
-        if len(raw_client_name) > 80:
-            raw_client_name = raw_client_name[:77] + "..."
-        while len(html.escape(raw_client_name)) > 100 and len(raw_client_name) > 4:
-            raw_client_name = raw_client_name[:-4] + "..."
-        display_name = html.escape(raw_client_name)
-
+        display_name = html.escape(_display_client_name(user))
         display_id = _display_client_id(user.id)
         display_id_label = _display_client_id_label(user.id)
 
@@ -6926,6 +6917,16 @@ async def view_client_merged_metadata(callback: CallbackQuery):
         memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
 
         if memory_mode == MEMORY_MODE_GLOBAL:
+            MAX_MESSAGE_BUDGET = 3900
+
+            # Bound dynamic client display name before HTML escaping for GLOBAL mode
+            raw_client_name = _display_client_name(user)
+            if len(raw_client_name) > 80:
+                raw_client_name = raw_client_name[:77] + "..."
+            while len(html.escape(raw_client_name)) > 100 and len(raw_client_name) > 4:
+                raw_client_name = raw_client_name[:-4] + "..."
+            display_name = html.escape(raw_client_name)
+
             diag_state_ids_res = await session.execute(
                 select(AutomationDialogueState.dialogue_id)
                 .where(AutomationDialogueState.user_id == client_id)
@@ -7084,6 +7085,9 @@ async def view_client_merged_metadata(callback: CallbackQuery):
 
                 text = prefix + meta_rendered + suffix
 
+                # Guarantee by construction that Telegram text budget is strictly observed in GLOBAL mode
+                assert len(text) <= MAX_MESSAGE_BUDGET, f"Admin text exceeded safe budget: {len(text)} > {MAX_MESSAGE_BUDGET}"
+
                 builder = InlineKeyboardBuilder()
                 for navigation_row in kb.fixed_pagination_rows(
                     page,
@@ -7115,8 +7119,6 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                 page = max(0, min(page, total_states - 1))
                 st = states[page]
                 cur_step = st.current_step or "не задан"
-                if len(str(cur_step)) > 60:
-                    cur_step = str(cur_step)[:57] + "..."
                 topic_info = f", Топик #{st.topic_id}" if st.topic_id else ""
                 dt_val = st.updated_at or st.created_at
                 dt_str = format_msk(dt_val, "%d-%m-%Y %H:%M МСК") if dt_val else "время неизвестно"
@@ -7131,10 +7133,7 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                     .order_by(AutomationEvent.id.desc())
                     .limit(1)
                 )
-                raw_event_name = event_res.scalar() or "не зафиксировано"
-                if len(str(raw_event_name)) > 80:
-                    raw_event_name = str(raw_event_name)[:77] + "..."
-                escaped_event_name = html.escape(str(raw_event_name))
+                last_event_name = event_res.scalar() or "не зафиксировано"
 
                 try:
                     meta_obj = json.loads(st.metadata_json or "{}")
@@ -7150,7 +7149,7 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                     f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
                     f"{display_id_label}: <code>{display_id}</code>\n\n"
                     f"📍 <b>{diag_info}</b>\n"
-                    f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{escaped_event_name}</code>\n"
+                    f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{html.escape(str(last_event_name))}</code>\n"
                     f"▫️ <b>Текущий шаг ({html.escape('{current_step}')}):</b> <code>{html.escape(str(cur_step))}</code>\n"
                     f"▫️ <b>Слитные метаданные ({html.escape('{metadata}')}):</b>\n"
                     f"<code>{html.escape(meta_rendered)}</code>"
@@ -7167,8 +7166,6 @@ async def view_client_merged_metadata(callback: CallbackQuery):
                 builder.row(InlineKeyboardButton(text="📥 Скачать все диалоги (.json)", callback_data=f"run_metadata_export_merged_{client_id}"))
                 builder.row(InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}"))
 
-        # Guarantee by construction that Telegram text budget is strictly observed
-        assert len(text) <= MAX_MESSAGE_BUDGET, f"Admin text exceeded safe budget: {len(text)} > {MAX_MESSAGE_BUDGET}"
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
         await callback.answer()
 
