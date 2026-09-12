@@ -552,58 +552,95 @@ class TestContextLimitsZeroAndGlobalMetadata(unittest.IsolatedAsyncioTestCase):
 
         view_callback.message.edit_text.assert_awaited_once()
         view_text = view_callback.message.edit_text.call_args[0][0]
-        # Check that canonical metadata and both topics are rendered
-        self.assertIn("Тревожность", view_text)
-        self.assertIn("Бессонница", view_text)
+        # Assert the complete expected canonical metadata rendering is contained in admin view text
+        expected_rendered = html.escape(
+            json.dumps(canonical_db_metadata, ensure_ascii=False, indent=2)
+        )
+        self.assertIn(expected_rendered, view_text)
         self.assertIn("step_intro", view_text)
         self.assertIn("step_sleep_assessment", view_text)
 
     # =========================================================================
-    # 6. Admin read must prove ZERO persistence mutation
+    # 6. Admin read must prove ZERO persistence mutation (both initialized & uninitialized)
     # =========================================================================
     async def test_admin_read_and_export_zero_persistence_mutation(self):
         user_id = 77
+        dt_fixed = datetime(2026, 9, 13, 10, 0, 0)
         async with self.sessions() as session:
-            user = User(id=user_id, first_name="Анна", username="anna_user", current_dialogue_id=1)
+            user = User(id=user_id, first_name="Анна", username="anna_user", current_dialogue_id=2)
             ai_config = AIConfig(id=1, memory_mode=MEMORY_MODE_GLOBAL)
-            # Create a dialogue with topic state but NO AutomationDialogueState yet
-            conv = AutomationConversationState(
+            # Dialogue 1: Uninitialized dialogue (topic state exists, but NO AutomationDialogueState)
+            conv_uninit = AutomationConversationState(
                 user_id=user_id,
                 dialogue_id=1,
                 topic_id=1,
                 current_step="step_start",
                 current_state_json='{"current_step": "step_start"}',
+                metadata_json='{"local": "old"}',
+                updated_at=dt_fixed,
             )
-            session.add_all([user, ai_config, conv])
+            # Dialogue 2: Fully initialized dialogue (AutomationDialogueState exists with metadata and updated_at)
+            diag_init = AutomationDialogueState(
+                user_id=user_id,
+                dialogue_id=2,
+                metadata_json='{"primary_theme": "Тревога", "depth_level": 2}',
+                updated_at=dt_fixed,
+            )
+            conv_init = AutomationConversationState(
+                user_id=user_id,
+                dialogue_id=2,
+                topic_id=2,
+                current_step="step_progress",
+                current_state_json='{"current_step": "step_progress"}',
+                metadata_json='{"local": "ignore"}',
+                updated_at=dt_fixed,
+            )
+            session.add_all([user, ai_config, conv_uninit, diag_init, conv_init])
             await session.commit()
 
         # Snapshot DB state BEFORE admin view and export
         async with self.sessions() as session:
             diag_count_before = await session.scalar(select(func.count(AutomationDialogueState.id)))
             conv_count_before = await session.scalar(select(func.count(AutomationConversationState.id)))
-            diag_rows_before = (await session.scalars(select(AutomationDialogueState))).all()
+            diag_rows_before = [
+                (d.id, d.user_id, d.dialogue_id, d.metadata_json, d.updated_at)
+                for d in (await session.scalars(select(AutomationDialogueState).order_by(AutomationDialogueState.id))).all()
+            ]
             conv_rows_before = [
-                (c.user_id, c.dialogue_id, c.topic_id, c.current_step, c.current_state_json)
-                for c in (await session.scalars(select(AutomationConversationState))).all()
+                (c.id, c.user_id, c.dialogue_id, c.topic_id, c.current_step, c.current_state_json, c.metadata_json, c.updated_at)
+                for c in (await session.scalars(select(AutomationConversationState).order_by(AutomationConversationState.id))).all()
             ]
 
-        self.assertEqual(diag_count_before, 0)
-        self.assertEqual(conv_count_before, 1)
+        self.assertEqual(diag_count_before, 1)
+        self.assertEqual(conv_count_before, 2)
 
-        # Invoke merged admin view
-        view_callback = MagicMock()
-        view_callback.from_user.id = 999999
-        view_callback.data = f"client_merged_metadata_{user_id}_0"
-        view_callback.message.edit_text = AsyncMock()
-        view_callback.answer = AsyncMock()
+        # 1. Invoke merged admin view on page 0 (dialogue 2 - initialized)
+        view_callback_init = MagicMock()
+        view_callback_init.from_user.id = 999999
+        view_callback_init.data = f"client_merged_metadata_{user_id}_0"
+        view_callback_init.message.edit_text = AsyncMock()
+        view_callback_init.answer = AsyncMock()
 
         with patch("handlers.check_history_permission", AsyncMock(return_value=True)):
-            await handlers.view_client_merged_metadata(view_callback)
+            await handlers.view_client_merged_metadata(view_callback_init)
 
-        view_text = view_callback.message.edit_text.call_args[0][0]
-        self.assertIn("не инициализированы", view_text)
+        view_text_init = view_callback_init.message.edit_text.call_args[0][0]
+        self.assertIn("Тревога", view_text_init)
 
-        # Invoke merged metadata export
+        # 2. Invoke merged admin view on page 1 (dialogue 1 - uninitialized)
+        view_callback_uninit = MagicMock()
+        view_callback_uninit.from_user.id = 999999
+        view_callback_uninit.data = f"client_merged_metadata_{user_id}_1"
+        view_callback_uninit.message.edit_text = AsyncMock()
+        view_callback_uninit.answer = AsyncMock()
+
+        with patch("handlers.check_history_permission", AsyncMock(return_value=True)):
+            await handlers.view_client_merged_metadata(view_callback_uninit)
+
+        view_text_uninit = view_callback_uninit.message.edit_text.call_args[0][0]
+        self.assertIn("не инициализированы", view_text_uninit)
+
+        # 3. Invoke merged metadata export
         export_callback = MagicMock()
         export_callback.from_user.id = 999999
         export_callback.data = f"run_metadata_export_merged_{user_id}"
@@ -615,24 +652,169 @@ class TestContextLimitsZeroAndGlobalMetadata(unittest.IsolatedAsyncioTestCase):
 
         sent_doc = export_callback.message.answer_document.call_args[0][0]
         export_data = json.loads(sent_doc.data.decode("utf-8"))
-        self.assertIsNone(export_data["dialogue_states"][0]["metadata"])
+        # Dialogue 2 has canonical metadata, dialogue 1 has null
+        self.assertEqual(export_data["dialogue_states"][0]["dialogue_id"], 2)
+        self.assertEqual(export_data["dialogue_states"][0]["metadata"], {"primary_theme": "Тревога", "depth_level": 2})
+        self.assertEqual(export_data["dialogue_states"][1]["dialogue_id"], 1)
+        self.assertIsNone(export_data["dialogue_states"][1]["metadata"])
 
         # Snapshot DB state AFTER admin operations
         async with self.sessions() as session:
             diag_count_after = await session.scalar(select(func.count(AutomationDialogueState.id)))
             conv_count_after = await session.scalar(select(func.count(AutomationConversationState.id)))
-            diag_rows_after = (await session.scalars(select(AutomationDialogueState))).all()
+            diag_rows_after = [
+                (d.id, d.user_id, d.dialogue_id, d.metadata_json, d.updated_at)
+                for d in (await session.scalars(select(AutomationDialogueState).order_by(AutomationDialogueState.id))).all()
+            ]
             conv_rows_after = [
-                (c.user_id, c.dialogue_id, c.topic_id, c.current_step, c.current_state_json)
-                for c in (await session.scalars(select(AutomationConversationState))).all()
+                (c.id, c.user_id, c.dialogue_id, c.topic_id, c.current_step, c.current_state_json, c.metadata_json, c.updated_at)
+                for c in (await session.scalars(select(AutomationConversationState).order_by(AutomationConversationState.id))).all()
             ]
 
-        # Assert absolute zero mutation
+        # Assert absolute zero mutation: row counts, fields, timestamps are 100% invariant
         self.assertEqual(diag_count_before, diag_count_after)
         self.assertEqual(conv_count_before, conv_count_after)
         self.assertEqual(diag_rows_before, diag_rows_after)
         self.assertEqual(conv_rows_before, conv_rows_after)
-        self.assertEqual(diag_count_after, 0)
+
+    # =========================================================================
+    # 7. Real length regression test: safe budget <= 3900 chars under extreme load
+    # =========================================================================
+    async def test_global_admin_display_length_bounding_and_truncation(self):
+        user_id = 888
+        dt_fixed = datetime(2026, 9, 13, 10, 0, 0)
+        async with self.sessions() as session:
+            user = User(id=user_id, first_name="Большой Пользователь", username="big_user", current_dialogue_id=1)
+            ai_config = AIConfig(id=1, memory_mode=MEMORY_MODE_GLOBAL)
+
+            # 1. Canonical metadata large enough to exercise truncation (> 10,000 chars)
+            large_meta = {
+                "primary_theme": "Стресс и перегрузка",
+                "secondary_themes": [f"Специфическая подтема номер {i}" for i in range(100)],
+                "situation_summary": "Длинное описание ситуации " * 200,
+                "key_facts": [f"Факт из биографии номер {i}: детальное описание жизненных обстоятельств" for i in range(50)],
+                "depth_level": 5,
+            }
+            diag_state = AutomationDialogueState(
+                user_id=user_id,
+                dialogue_id=1,
+                metadata_json=json.dumps(large_meta, ensure_ascii=False),
+                updated_at=dt_fixed,
+            )
+            session.add_all([user, ai_config, diag_state])
+
+            # 2. Many topic states (15 topics) with large current_state_json (> 3,000 chars each)
+            for i in range(1, 16):
+                large_state = {
+                    "current_step": f"step_complex_topic_pipeline_{i}",
+                    "diagnostic_markers": [f"marker_data_{j}_{'x' * 100}" for j in range(25)],
+                    "session_notes": "Заметка по ходу сессии " * 50,
+                }
+                conv = AutomationConversationState(
+                    user_id=user_id,
+                    dialogue_id=1,
+                    topic_id=i,
+                    current_step=f"step_complex_topic_pipeline_{i}",
+                    current_state_json=json.dumps(large_state, ensure_ascii=False),
+                    updated_at=dt_fixed + timedelta(minutes=i),
+                )
+                session.add(conv)
+
+            await session.commit()
+
+        # Snapshot DB before
+        async with self.sessions() as session:
+            diag_before = [
+                (d.id, d.metadata_json, d.updated_at)
+                for d in (await session.scalars(select(AutomationDialogueState))).all()
+            ]
+            conv_before = [
+                (c.id, c.current_step, c.current_state_json, c.updated_at)
+                for c in (await session.scalars(select(AutomationConversationState))).all()
+            ]
+
+        # Invoke merged admin display
+        view_callback = MagicMock()
+        view_callback.from_user.id = 999999
+        view_callback.data = f"client_merged_metadata_{user_id}_0"
+        view_callback.message.edit_text = AsyncMock()
+        view_callback.answer = AsyncMock()
+
+        with patch("handlers.check_history_permission", AsyncMock(return_value=True)):
+            await handlers.view_client_merged_metadata(view_callback)
+
+        view_callback.message.edit_text.assert_awaited_once()
+        final_text = view_callback.message.edit_text.call_args[0][0]
+
+        # Assert final text length is safely within the safe message budget (<= 3900 chars)
+        self.assertLessEqual(len(final_text), 3900)
+
+        # Assert valid canonical metadata remains visibly represented
+        self.assertIn("Стресс и перегрузка", final_text)
+        self.assertIn("... (полный текст доступен при скачивании .json)", final_text)
+
+        # Assert topic summary is bounded (only first 5 topics shown in UI)
+        self.assertIn("Топик #1", final_text)
+        self.assertIn("Топик #5", final_text)
+        self.assertNotIn("Топик #6", final_text)
+
+        # Assert omission marker appears for remaining 10 topic states
+        self.assertIn("... ещё 10 состояний; полный список доступен в JSON", final_text)
+
+        # Assert NO large current_state_json payloads were dumped into the Telegram text
+        self.assertNotIn("diagnostic_markers", final_text)
+        self.assertNotIn("marker_data", final_text)
+
+        # Assert zero DB mutation after view
+        async with self.sessions() as session:
+            diag_after_view = [
+                (d.id, d.metadata_json, d.updated_at)
+                for d in (await session.scalars(select(AutomationDialogueState))).all()
+            ]
+            conv_after_view = [
+                (c.id, c.current_step, c.current_state_json, c.updated_at)
+                for c in (await session.scalars(select(AutomationConversationState))).all()
+            ]
+        self.assertEqual(diag_before, diag_after_view)
+        self.assertEqual(conv_before, conv_after_view)
+
+        # Invoke JSON export: full states must still be present in the JSON export
+        export_callback = MagicMock()
+        export_callback.from_user.id = 999999
+        export_callback.data = f"run_metadata_export_merged_{user_id}"
+        export_callback.message.answer_document = AsyncMock()
+        export_callback.answer = AsyncMock()
+
+        with patch("handlers.check_history_permission", AsyncMock(return_value=True)):
+            await handlers.run_client_metadata_export(export_callback)
+
+        sent_doc = export_callback.message.answer_document.call_args[0][0]
+        export_data = json.loads(sent_doc.data.decode("utf-8"))
+
+        # Assert full untruncated canonical metadata is present in export
+        self.assertEqual(export_data["dialogue_states"][0]["metadata"]["primary_theme"], "Стресс и перегрузка")
+        self.assertEqual(len(export_data["dialogue_states"][0]["metadata"]["secondary_themes"]), 100)
+
+        # Assert ALL 15 topic states and full current_state payloads are present in export
+        topic_states_export = export_data["dialogue_states"][0]["topic_states"]
+        self.assertEqual(len(topic_states_export), 15)
+        for i, ts in enumerate(topic_states_export, start=1):
+            self.assertEqual(ts["topic_id"], i)
+            self.assertIn("diagnostic_markers", ts["current_state"])
+            self.assertEqual(len(ts["current_state"]["diagnostic_markers"]), 25)
+
+        # Assert zero DB mutation after export as well
+        async with self.sessions() as session:
+            diag_after_export = [
+                (d.id, d.metadata_json, d.updated_at)
+                for d in (await session.scalars(select(AutomationDialogueState))).all()
+            ]
+            conv_after_export = [
+                (c.id, c.current_step, c.current_state_json, c.updated_at)
+                for c in (await session.scalars(select(AutomationConversationState))).all()
+            ]
+        self.assertEqual(diag_before, diag_after_export)
+        self.assertEqual(conv_before, conv_after_export)
 
     # =========================================================================
     # 7. TOPIC and RESET Non-Regression

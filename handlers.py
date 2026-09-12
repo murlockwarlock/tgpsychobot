@@ -6986,41 +6986,70 @@ async def view_client_merged_metadata(callback: CallbackQuery):
 
                 diag_info = f"Диалог #{current_dialogue_id} ({dt_str})"
 
-                if diag_state is not None and diag_state.metadata_json is not None:
-                    try:
-                        meta_obj = json.loads(diag_state.metadata_json or "{}")
-                        meta_rendered = json.dumps(meta_obj, ensure_ascii=False, indent=2)
-                    except Exception:
-                        meta_rendered = diag_state.metadata_json or "{}"
-                else:
-                    meta_rendered = "не инициализированы"
-
-                if len(meta_rendered) > 2800:
-                    meta_rendered = meta_rendered[:2800] + "\n... (полный текст доступен при скачивании .json)"
-
+                # Bounded topic states summary (no raw current_state_json in Telegram UI)
+                MAX_VISIBLE_TOPIC_STATES = 5
                 if topic_states:
                     topic_lines = []
-                    for ts in topic_states:
+                    visible_slice = topic_states[:MAX_VISIBLE_TOPIC_STATES]
+                    for ts in visible_slice:
                         t_label = f"Топик #{ts.topic_id}" if ts.topic_id else "Основной диалог"
                         t_step = ts.current_step or "не задан"
-                        t_dt = format_msk(ts.updated_at or ts.created_at, "%d-%m-%Y %H:%M МСК") if (ts.updated_at or ts.created_at) else "время неизвестно"
+                        if len(str(t_step)) > 60:
+                            t_step = str(t_step)[:57] + "..."
+                        t_dt = (
+                            format_msk(ts.updated_at or ts.created_at, "%d-%m-%Y %H:%M МСК")
+                            if (ts.updated_at or ts.created_at)
+                            else "время неизвестно"
+                        )
                         topic_lines.append(
-                            f"  • {t_label}: шаг=<code>{html.escape(str(t_step))}</code>, "
-                            f"состояние=<code>{html.escape(str(ts.current_state_json or '{}'))}</code> ({t_dt})"
+                            f"  • {t_label}: шаг=<code>{html.escape(str(t_step))}</code> ({t_dt})"
+                        )
+                    remaining = len(topic_states) - len(visible_slice)
+                    if remaining > 0:
+                        topic_lines.append(
+                            f"  • <i>... ещё {remaining} состояний; полный список доступен в JSON</i>"
                         )
                     topics_block = "\n".join(topic_lines)
                 else:
                     topics_block = "  <i>Состояния топиков отсутствуют</i>"
 
-                text = (
+                prefix = (
                     f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
                     f"{display_id_label}: <code>{display_id}</code>\n\n"
                     f"📍 <b>{diag_info}</b>\n"
                     f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{html.escape(str(last_event_name))}</code>\n"
                     f"▫️ <b>Состояния топиков:</b>\n{topics_block}\n"
                     f"▫️ <b>Слитные метаданные ({html.escape('{metadata}')}):</b>\n"
-                    f"<code>{html.escape(meta_rendered)}</code>"
+                    f"<code>"
                 )
+                suffix = "</code>"
+
+                # Dynamic safe budget: max 3900 total chars for Telegram edit_text
+                MAX_MESSAGE_BUDGET = 3900
+                total_fixed_len = len(prefix) + len(suffix)
+                available_meta_budget = max(200, MAX_MESSAGE_BUDGET - total_fixed_len)
+
+                if diag_state is not None and diag_state.metadata_json is not None:
+                    try:
+                        meta_obj = json.loads(diag_state.metadata_json or "{}")
+                        raw_meta_str = json.dumps(meta_obj, ensure_ascii=False, indent=2)
+                    except Exception:
+                        raw_meta_str = diag_state.metadata_json or "{}"
+                else:
+                    raw_meta_str = "не инициализированы"
+
+                # Build/truncate CONTENT before adding HTML wrappers
+                if len(html.escape(raw_meta_str)) <= available_meta_budget:
+                    meta_rendered = html.escape(raw_meta_str)
+                else:
+                    omission_notice = "\n... (полный текст доступен при скачивании .json)"
+                    target_content_budget = max(50, available_meta_budget - len(omission_notice))
+                    truncated = raw_meta_str[:target_content_budget]
+                    while len(html.escape(truncated)) > target_content_budget and len(truncated) > 0:
+                        truncated = truncated[:len(truncated) - 10]
+                    meta_rendered = html.escape(truncated) + omission_notice
+
+                text = prefix + meta_rendered + suffix
 
                 builder = InlineKeyboardBuilder()
                 for navigation_row in kb.fixed_pagination_rows(
