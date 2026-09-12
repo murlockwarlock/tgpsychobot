@@ -323,10 +323,10 @@ async def test_max_reset_topic_static_parser_behavior(db_session):
     await max_topics.reset_topic(mock_client, chat_id=555, user_id=555)
 
     # Return to Main UX (Plan v1.2):
-    # Exactly "✅ Мы вернулись в общий режим диалога." with "⬅️ В меню" button
+    # Exactly "✅ Мы вернулись в основной диалог." with "⬅️ В меню" button
     assert mock_client.send_message.call_count == 1
     call = mock_client.send_message.call_args_list[0].kwargs
-    assert "✅ Мы вернулись в общий режим диалога." in call["text"]
+    assert "✅ Мы вернулись в основной диалог." in call["text"]
     assert call["attachments"][0]["payload"]["buttons"][0][0]["text"] == "⬅️ В меню"
 
 

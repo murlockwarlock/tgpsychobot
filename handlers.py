@@ -7779,6 +7779,9 @@ async def _complete_telegram_topic_entry(
             if not await _check_telegram_chat_access(session_acc, user_id, bot, chat_id):
                 return
 
+        topic_name = switch_res.topic.name if (switch_res.topic and getattr(switch_res.topic, "name", None)) else ""
+        await bot.send_message(chat_id, f"✅ Продолжаем тему: «{topic_name}».")
+
         from system_events import build_topic_resume_system_message
         synthetic_prompt = switch_res.synthetic_prompt or build_topic_resume_system_message(switch_res.topic.name)
         await _start_telegram_hidden_kickoff(
@@ -8184,7 +8187,7 @@ async def _complete_telegram_main_continuation(
 
         accepted_disclaimer = user.accepted_disclaimer
 
-    await bot.send_message(user_id, "✅ Мы вернулись в общий режим диалога.")
+    await bot.send_message(user_id, "✅ Мы вернулись в основной диалог.")
 
     if not accepted_disclaimer:
         async with async_session_maker() as session_acc:

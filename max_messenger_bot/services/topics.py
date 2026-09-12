@@ -200,6 +200,11 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
         if fresh_user and not await common.ensure_access_before_chat(client, chat_id, fresh_user):
             return
 
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"✅ Продолжаем тему: <b>{topic.name}</b>.",
+        )
+
         await common.run_hidden_ai_kickoff(
             client,
             chat_id,
@@ -236,7 +241,7 @@ async def reset_topic(client: MaxApiClient, chat_id: int, user_id: int, states: 
 
     await client.send_message(
         chat_id=chat_id,
-        text="✅ Мы вернулись в общий режим диалога.",
+        text="✅ Мы вернулись в основной диалог.",
         attachments=inline_keyboard([main_menu_row()]),
     )
 
