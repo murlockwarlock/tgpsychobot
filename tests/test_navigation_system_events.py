@@ -872,3 +872,187 @@ class NavigationSystemEventsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(nav_msg.role, SYSTEM_EVENT_ROLE)
             self.assertEqual(nav_msg.topic_id, 1)
             self.assertIn('Пользователь выбрал тему "Тревожность"', nav_msg.content)
+
+    # 89. Telegram already-current topic sends visible acknowledgement without mutating state
+    async def test_telegram_already_current_topic_visible_ack_no_state_mutation(self):
+        import handlers
+
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            user.accepted_disclaimer = True
+            user.current_topic_id = 1
+            user.current_dialogue_id = 1
+            await session.commit()
+
+        bot = AsyncMock()
+        state = AsyncMock()
+        mock_msg = AsyncMock()
+
+        with patch("handlers.async_session_maker", self.sessions), \
+             patch("handlers._send_topic_intro", new_callable=AsyncMock) as mock_intro, \
+             patch("handlers._start_telegram_hidden_kickoff", new_callable=AsyncMock) as mock_kickoff, \
+             patch("handlers._start_telegram_topic_auto_start", new_callable=AsyncMock) as mock_auto_start, \
+             patch("ai_integration.get_ai_response", new_callable=AsyncMock) as mock_ai:
+
+            # 1. User.current_topic_id == selected topic (1)
+            # 2. Call _perform_telegram_topic_switch()
+            res = await handlers._perform_telegram_topic_switch(2001, 1)
+
+            # 3. Assert status == "already_current"
+            self.assertEqual(res.status, "already_current")
+            self.assertIsNotNone(res.topic)
+            self.assertEqual(res.topic.name, "Тревожность")
+
+            # Count messages before completion
+            async with self.sessions() as session:
+                msg_count_before = await session.scalar(
+                    select(func.count(DBMessage.id)).where(DBMessage.user_id == 2001)
+                )
+
+            # 4. Call _complete_telegram_topic_entry()
+            await handlers._complete_telegram_topic_entry(
+                user_id=2001,
+                chat_id=2001,
+                switch_res=res,
+                bot=bot,
+                state=state,
+                message=mock_msg,
+            )
+
+            # 5. Assert exactly one visible Telegram response is sent.
+            mock_msg.answer.assert_called_once()
+            bot.send_message.assert_not_called()
+
+            # 6. Assert response contains current topic name and "Новый диалог" guidance.
+            sent_text = mock_msg.answer.call_args[0][0]
+            self.assertIn("Тревожность", sent_text)
+            self.assertIn("Новый диалог", sent_text)
+            self.assertIn("Вы уже находитесь в теме «Тревожность».", sent_text)
+            self.assertIn("Продолжайте диалог — просто напишите ваш вопрос или сообщение.", sent_text)
+            self.assertIn("Если хотите начать эту тему заново, нажмите «🗑️ Новый диалог».", sent_text)
+
+            # 7. Assert ZERO:
+            #    - AI generation / hidden kickoff;
+            #    - _send_topic_intro;
+            #    - navigation system_event;
+            #    - new topic_welcome row;
+            #    - current_topic_id mutation;
+            #    - current_dialogue_id mutation.
+            mock_ai.assert_not_called()
+            mock_kickoff.assert_not_called()
+            mock_auto_start.assert_not_called()
+            mock_intro.assert_not_called()
+
+            async with self.sessions() as session:
+                user = await session.get(User, 2001)
+                self.assertEqual(user.current_topic_id, 1)
+                self.assertEqual(user.current_dialogue_id, 1)
+
+                msg_count_after = await session.scalar(
+                    select(func.count(DBMessage.id)).where(DBMessage.user_id == 2001)
+                )
+                self.assertEqual(msg_count_before, msg_count_after)
+
+                nav_events = await session.scalars(
+                    select(DBMessage).where(
+                        DBMessage.user_id == 2001,
+                        DBMessage.role == SYSTEM_EVENT_ROLE,
+                    )
+                )
+                self.assertEqual(len(nav_events.all()), 0)
+
+                welcome_rows = await session.scalars(
+                    select(DBMessage).where(
+                        DBMessage.user_id == 2001,
+                        DBMessage.role == TOPIC_WELCOME_ROLE,
+                    )
+                )
+                self.assertEqual(len(welcome_rows.all()), 0)
+
+    # 90. Repeatedly selecting already-current topic provides visible ack each time with ZERO DB mutations
+    async def test_telegram_already_current_topic_repeated_press_idempotent_db(self):
+        import handlers
+
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            user.accepted_disclaimer = True
+            user.current_topic_id = 1
+            user.current_dialogue_id = 1
+            await session.commit()
+
+        bot = AsyncMock()
+        state = AsyncMock()
+
+        with patch("handlers.async_session_maker", self.sessions), \
+             patch("handlers._send_topic_intro", new_callable=AsyncMock) as mock_intro, \
+             patch("handlers._start_telegram_hidden_kickoff", new_callable=AsyncMock) as mock_kickoff, \
+             patch("handlers._start_telegram_topic_auto_start", new_callable=AsyncMock) as mock_auto_start, \
+             patch("ai_integration.get_ai_response", new_callable=AsyncMock) as mock_ai:
+
+            for _ in range(2):
+                mock_msg = AsyncMock()
+                res = await handlers._perform_telegram_topic_switch(2001, 1)
+                self.assertEqual(res.status, "already_current")
+
+                await handlers._complete_telegram_topic_entry(
+                    user_id=2001,
+                    chat_id=2001,
+                    switch_res=res,
+                    bot=bot,
+                    state=state,
+                    message=mock_msg,
+                )
+
+                mock_msg.answer.assert_called_once()
+                sent_text = mock_msg.answer.call_args[0][0]
+                self.assertIn("Тревожность", sent_text)
+                self.assertIn("Новый диалог", sent_text)
+
+            mock_ai.assert_not_called()
+            mock_kickoff.assert_not_called()
+            mock_auto_start.assert_not_called()
+            mock_intro.assert_not_called()
+            bot.send_message.assert_not_called()
+
+            # DB state remains completely unchanged: zero DB messages added
+            async with self.sessions() as session:
+                user = await session.get(User, 2001)
+                self.assertEqual(user.current_topic_id, 1)
+                self.assertEqual(user.current_dialogue_id, 1)
+
+                total_msgs = await session.scalar(
+                    select(func.count(DBMessage.id)).where(DBMessage.user_id == 2001)
+                )
+                self.assertEqual(total_msgs, 0)
+
+    # 91. Telegram already-current fallback to bot.send_message when message is None
+    async def test_telegram_already_current_topic_fallback_to_bot_send_message(self):
+        import handlers
+
+        async with self.sessions() as session:
+            user = await session.get(User, 2001)
+            user.accepted_disclaimer = True
+            user.current_topic_id = 1
+            user.current_dialogue_id = 1
+            await session.commit()
+
+        bot = AsyncMock()
+        state = AsyncMock()
+
+        with patch("handlers.async_session_maker", self.sessions):
+            res = await handlers._perform_telegram_topic_switch(2001, 1)
+            self.assertEqual(res.status, "already_current")
+
+            await handlers._complete_telegram_topic_entry(
+                user_id=2001,
+                chat_id=2001,
+                switch_res=res,
+                bot=bot,
+                state=state,
+                message=None,
+            )
+
+            bot.send_message.assert_called_once()
+            sent_text = bot.send_message.call_args[0][1]
+            self.assertIn("Тревожность", sent_text)
+            self.assertIn("Новый диалог", sent_text)
