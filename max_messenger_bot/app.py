@@ -33,7 +33,7 @@ from .services import common, settings as settings_service, subscriptions as sub
 from .settings import get_settings, validate_webhook_runtime_settings
 from .keyboards import inline_keyboard, main_menu_row
 from .identity import is_max_user_id
-from response_buttons import MAIN_TOPIC_ACTIONS, split_action_callback_data
+from response_buttons import MAIN_TOPIC_ACTIONS, build_ai_button_system_message, split_action_callback_data
 from .storage import StateStore, init_storage
 
 
@@ -85,6 +85,52 @@ def _track_task(tasks: set[asyncio.Task[None]], task: asyncio.Task[None]) -> Non
 def _spawn_update_task(app: web.Application, update: dict[str, Any]) -> None:
     task = asyncio.create_task(app["bot_app"].handle_update(update))
     _track_task(app["background_tasks"], task)
+
+
+def resolve_max_ai_button_label(callback: IncomingCallback) -> str | None:
+    message = callback.message
+    if not isinstance(message, dict):
+        return None
+    body = message.get("body")
+    attachments = body.get("attachments") if isinstance(body, dict) else message.get("attachments")
+    if not isinstance(attachments, list):
+        return None
+
+    target_payload = callback.payload
+    matching_buttons: list[dict] = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        payload = att.get("payload")
+        buttons_matrix = None
+        if isinstance(payload, dict):
+            buttons_matrix = payload.get("buttons")
+        elif att.get("type") == "inline_keyboard" and isinstance(att.get("buttons"), list):
+            buttons_matrix = att.get("buttons")
+
+        if not isinstance(buttons_matrix, list):
+            continue
+
+        for row in buttons_matrix:
+            if not isinstance(row, list):
+                continue
+            for btn in row:
+                if not isinstance(btn, dict):
+                    continue
+                if btn.get("payload") == target_payload:
+                    matching_buttons.append(btn)
+
+    if not matching_buttons:
+        return None
+    if len(matching_buttons) == 1:
+        text = matching_buttons[0].get("text")
+        return str(text) if text is not None else None
+
+    first_text = matching_buttons[0].get("text")
+    for btn in matching_buttons[1:]:
+        if btn.get("text") != first_text:
+            return None
+    return str(first_text) if first_text is not None else None
 
 
 class MaxBotApplication:
@@ -692,6 +738,7 @@ class MaxBotApplication:
             return
         await common.run_ai_dialogue_with_image(self.client, message.chat_id, message.sender.user_id, image_bytes, caption)
 
+
     async def handle_callback(self, callback: IncomingCallback) -> None:
         log.info("Incoming callback user_id=%s chat_id=%s payload=%s", callback.sender.user_id, callback.chat_id, callback.payload)
         if is_max_user_id(callback.sender.user_id):
@@ -763,12 +810,15 @@ class MaxBotApplication:
                 max_log.warning("Unknown service action in MAX: %s", action)
                 return
 
+            button_text = resolve_max_ai_button_label(callback) or action
+            prompt = build_ai_button_system_message(button_text, action)
+
             async with async_session_maker() as session:
                 user = await session.get(User, user_id, options=[selectinload(User.subscription)])
             if user and await common.ensure_access_before_chat(self.client, chat_id, user):
                 self.spawn_user_task(
                     user_id,
-                    common.run_ai_dialogue(self.client, chat_id, user_id, action, self.states),
+                    common.run_ai_dialogue(self.client, chat_id, user_id, prompt, self.states),
                 )
             return
         if data == "cancel_test":

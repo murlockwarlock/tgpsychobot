@@ -531,8 +531,8 @@ async def test_telegram_svc_menu_preserves_telegram_menu(db_session):
 
     await handlers.process_response_button(callback, mock_state, mock_bot)
 
-    assert callback.message.answer.call_count == 2
-    hint_call = callback.message.answer.call_args_list[1]
+    assert callback.message.answer.call_count == 1
+    hint_call = callback.message.answer.call_args_list[0]
     assert hint_call[0][0] == handlers.NAVIGATION_MENU_HINT
     # Reply keyboard is passed, not Content("menu")
     assert hint_call[1]["reply_markup"] is not None
@@ -1271,8 +1271,8 @@ async def test_telegram_service_action_continue_and_topic_positive_routing(db_se
     )
     await handlers.process_response_button(cb_continue, mock_state, mock_bot)
     assert cb_continue.answer.call_count == 1
-    assert cb_continue.message.answer.call_count == 2
-    assert cb_continue.message.answer.call_args_list[1].args[0] == "Введите ваше сообщение для начала/продолжения диалога:"
+    assert cb_continue.message.answer.call_count == 1
+    assert cb_continue.message.answer.call_args_list[0].args[0] == "Введите ваше сообщение для начала/продолжения диалога:"
 
     # 2. svc:topic:<public active id>
     cb_topic = SimpleNamespace(

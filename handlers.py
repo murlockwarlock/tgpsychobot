@@ -193,7 +193,9 @@ from profile_onboarding import missing_profile_fields
 from response_buttons import (
     MAIN_TOPIC_ACTIONS,
     ResponseButton,
+    _sanitize_ai_button_fragment,
     build_action_callback_data,
+    build_ai_button_system_message,
     extract_response_buttons,
     extract_test_start_directive,
     split_action_callback_data,
@@ -380,22 +382,6 @@ def _resolve_ai_button_label(callback: CallbackQuery, callback_data: str) -> str
                 return text if isinstance(text, str) and text else None
     return None
 
-
-def _sanitize_ai_button_fragment(value: str | None) -> str:
-    value = value if isinstance(value, str) else ""
-    value = value.replace("\\", "\\\\")
-    value = re.sub(r"[\r\n\t]+", " ", value)
-    for character in ('"', "[", "]", "(", ")"):
-        value = value.replace(character, f"\\{character}")
-    return value
-
-
-def build_ai_button_system_message(button_text: str | None, action: str) -> str:
-    return (
-        '[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку '
-        f'"{_sanitize_ai_button_fragment(button_text)}" '
-        f'({_sanitize_ai_button_fragment(action)})]'
-    )
 
 
 def normalize_ai_processing_message_text(value: str | None) -> str:
@@ -2175,11 +2161,15 @@ async def process_buffered_messages(
                     dialogue_id=target_dialogue_id,
                     topic_id=target_topic_id,
                 ))
+                current_card_message_id = None
                 if drawn_cards_info:
                     cards_text = "; ".join(drawn_cards_info)
                     card_system_msg = f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]"
-                    session.add(DBMessage(user_id=user.id, role='user', content=card_system_msg, dialogue_id=target_dialogue_id, topic_id=target_topic_id))
+                    card_db_msg = DBMessage(user_id=user.id, role='user', content=card_system_msg, dialogue_id=target_dialogue_id, topic_id=target_topic_id)
+                    session.add(card_db_msg)
                 await session.commit()
+                if drawn_cards_info and card_db_msg:
+                    current_card_message_id = card_db_msg.id
 
         if drawn_cards_info:
             typing_task_interp = None
@@ -2192,6 +2182,7 @@ async def process_buffered_messages(
                     user_id,
                     f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]",
                     bot=bot,
+                    exclude_message_id=current_card_message_id,
                 )
                 await _cancel_task(typing_task_interp)
                 if not await _check_scope_guard():
@@ -2574,6 +2565,38 @@ async def render_static_content_telegram(
     return True
 
 
+def _is_service_action(action: str) -> bool:
+    if action == "start_test":
+        return True
+    if action in ("topics", "svc:topics"):
+        return True
+    if action in MAIN_TOPIC_ACTIONS:
+        return True
+    if (action.startswith("topic_") and action[6:].isdigit() and int(action[6:]) > 0) or (
+        action.startswith("svc:topic:") and action[10:].isdigit() and int(action[10:]) > 0
+    ):
+        return True
+    if action in ("new_dialogue", "svc:reset"):
+        return True
+    if action in ("main_menu", "svc:menu"):
+        return True
+    if action in ("subscription", "svc:subscription"):
+        return True
+    if action in ("referral", "svc:referral"):
+        return True
+    if action == "svc:settings":
+        return True
+    if action == "svc:start":
+        return True
+    if action == "svc:continue":
+        return True
+    if action.startswith("svc:content:"):
+        return True
+    if action.startswith("svc:"):
+        return True
+    return False
+
+
 @router.callback_query(F.data.startswith("ai_btn:"))
 async def process_response_button(callback: CallbackQuery, state: FSMContext, bot: Bot):
     callback_data = callback.data or ""
@@ -2584,79 +2607,89 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         (action.startswith("topic_") and action[6:].isdigit() and int(action[6:]) > 0)
         or (action.startswith("svc:topic:") and action[10:].isdigit() and int(action[10:]) > 0)
     )
+
+    if _is_service_action(action):
+        if not _claim_ai_button_message(callback):
+            await callback.answer()
+            return
+        await _disable_ai_button_keyboard(callback)
+        if not delegates_topic_callback:
+            await callback.answer()
+
+        if action == "start_test":
+            await _start_test_from_ai_directive(bot, user_id, state)
+            return
+        if action in ("topics", "svc:topics"):
+            message_proxy = SimpleNamespace(
+                from_user=callback.from_user,
+                chat=callback.message.chat,
+                answer=callback.message.answer,
+            )
+            await select_topic_menu(message_proxy)
+            return
+        if is_main_topic_action:
+            await _perform_telegram_topic_reset_to_main(user_id, bot, state)
+            return
+        if delegates_topic_callback:
+            topic_id_str = action[10:] if action.startswith("svc:topic:") else action[6:]
+            topic_callback = callback.model_copy(update={"data": f"select_topic_{topic_id_str}"})
+            await process_topic_selection(topic_callback, state, bot)
+            return
+        if action in ("new_dialogue", "svc:reset"):
+            message_proxy = SimpleNamespace(
+                from_user=callback.from_user,
+                answer=callback.message.answer,
+            )
+            await ask_delete_history(message_proxy, state)
+            return
+        if action in ("main_menu", "svc:menu"):
+            await callback.message.answer(NAVIGATION_MENU_HINT, reply_markup=await kb.main_client_keyboard(user_id))
+            return
+        if action in ("subscription", "svc:subscription"):
+            message_proxy = SimpleNamespace(
+                from_user=callback.from_user,
+                answer=callback.message.answer,
+            )
+            await show_subscription_info(message_proxy, state, bot)
+            return
+        if action in ("referral", "svc:referral"):
+            message_proxy = SimpleNamespace(
+                from_user=callback.from_user,
+                chat=callback.message.chat,
+                answer=callback.message.answer,
+            )
+            await show_referral_info(message_proxy, bot)
+            return
+        if action == "svc:settings":
+            message_proxy = SimpleNamespace(
+                from_user=callback.from_user,
+                chat=callback.message.chat,
+                answer=callback.message.answer,
+            )
+            await user_settings_menu(message_proxy, state)
+            return
+        if action == "svc:start":
+            await render_static_content_telegram(bot, callback.message.chat.id, user_id, "start_message", is_start=True)
+            return
+        if action == "svc:continue":
+            await callback.message.answer("Введите ваше сообщение для начала/продолжения диалога:")
+            return
+        if action.startswith("svc:content:"):
+            content_key = action[12:]
+            await render_static_content_telegram(bot, callback.message.chat.id, user_id, content_key)
+            return
+        if action.startswith("svc:"):
+            logging.warning(f"Unknown service action in Telegram: {action}")
+            return
+
+    # Generic AI path — does NOT pre-claim! _prepare_ai_button_submission is the claim owner.
     accepted, button_text = await _prepare_ai_button_submission(
         callback,
         bot,
         callback_data,
-        acknowledge=not delegates_topic_callback,
+        acknowledge=True,
     )
     if not accepted:
-        return
-
-    if action == "start_test":
-        await _start_test_from_ai_directive(bot, user_id, state)
-        return
-    if action in ("topics", "svc:topics"):
-        message_proxy = SimpleNamespace(
-            from_user=callback.from_user,
-            chat=callback.message.chat,
-            answer=callback.message.answer,
-        )
-        await select_topic_menu(message_proxy)
-        return
-    if is_main_topic_action:
-        await _perform_telegram_topic_reset_to_main(user_id, bot, state)
-        return
-    if delegates_topic_callback:
-        topic_id_str = action[10:] if action.startswith("svc:topic:") else action[6:]
-        topic_callback = callback.model_copy(update={"data": f"select_topic_{topic_id_str}"})
-        await process_topic_selection(topic_callback, state, bot)
-        return
-    if action in ("new_dialogue", "svc:reset"):
-        message_proxy = SimpleNamespace(
-            from_user=callback.from_user,
-            answer=callback.message.answer,
-        )
-        await ask_delete_history(message_proxy, state)
-        return
-    if action in ("main_menu", "svc:menu"):
-        await callback.message.answer(NAVIGATION_MENU_HINT, reply_markup=await kb.main_client_keyboard(user_id))
-        return
-    if action in ("subscription", "svc:subscription"):
-        message_proxy = SimpleNamespace(
-            from_user=callback.from_user,
-            answer=callback.message.answer,
-        )
-        await show_subscription_info(message_proxy, state, bot)
-        return
-    if action in ("referral", "svc:referral"):
-        message_proxy = SimpleNamespace(
-            from_user=callback.from_user,
-            chat=callback.message.chat,
-            answer=callback.message.answer,
-        )
-        await show_referral_info(message_proxy, bot)
-        return
-    if action == "svc:settings":
-        message_proxy = SimpleNamespace(
-            from_user=callback.from_user,
-            chat=callback.message.chat,
-            answer=callback.message.answer,
-        )
-        await user_settings_menu(message_proxy, state)
-        return
-    if action == "svc:start":
-        await render_static_content_telegram(bot, callback.message.chat.id, user_id, "start_message", is_start=True)
-        return
-    if action == "svc:continue":
-        await callback.message.answer("Введите ваше сообщение для начала/продолжения диалога:")
-        return
-    if action.startswith("svc:content:"):
-        content_key = action[12:]
-        await render_static_content_telegram(bot, callback.message.chat.id, user_id, content_key)
-        return
-    if action.startswith("svc:"):
-        logging.warning(f"Unknown service action in Telegram: {action}")
         return
 
     if not isinstance(button_text, str) or not button_text:
@@ -2717,10 +2750,13 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
 
             card_info = f"{media.file_name}: {media.description or 'без описания'}"
             card_system_msg = _card_selection_system_message(card_info, spread)
+            current_card_message_id = None
             if user:
-                session.add(DBMessage(user_id=user_id, role='user', content=card_system_msg,
-                                      dialogue_id=user.current_dialogue_id, topic_id=spread_topic_id))
+                card_db_msg = DBMessage(user_id=user_id, role='user', content=card_system_msg,
+                                      dialogue_id=user.current_dialogue_id, topic_id=spread_topic_id)
+                session.add(card_db_msg)
                 await session.commit()
+                current_card_message_id = card_db_msg.id
 
             typing_task_interp = None
             try:
@@ -2733,7 +2769,12 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                         pass
 
                 typing_task_interp = asyncio.create_task(_typing_loop_card())
-                interpretation = await ai_integration.generate_response(user_id, card_system_msg, bot=bot)
+                interpretation = await ai_integration.generate_response(
+                    user_id,
+                    card_system_msg,
+                    bot=bot,
+                    exclude_message_id=current_card_message_id,
+                )
                 typing_task_interp.cancel()
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
                 if clean_interpretation:
@@ -6564,13 +6605,16 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                         )
                     await bot.send_message(chat_id=user_id, text="Выбери карту, которая тебе откликается:", reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]))
 
+            current_card_message_id = None
             if drawn_cards_info:
                 cards_text = "; ".join(drawn_cards_info)
                 card_system_msg = f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]"
                 user_obj = await session.get(User, user_id)
                 if user_obj:
-                    session.add(DBMessage(user_id=user_id, role='user', content=card_system_msg, dialogue_id=user_obj.current_dialogue_id, topic_id=user_obj.current_topic_id))
+                    card_db_msg = DBMessage(user_id=user_id, role='user', content=card_system_msg, dialogue_id=user_obj.current_dialogue_id, topic_id=user_obj.current_topic_id)
+                    session.add(card_db_msg)
                     await session.commit()
+                    current_card_message_id = card_db_msg.id
 
         if drawn_cards_info:
             typing_task_interp = None
@@ -6589,6 +6633,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                     user_id,
                     f"[СИСТЕМА: Случайно выпала карта: {cards_text}. Дай интерпретацию этой карты.]",
                     bot=bot,
+                    exclude_message_id=current_card_message_id,
                 )
                 typing_task_interp.cancel()
                 clean_interpretation = re.sub(r"\[(SEND_AUDIO|RANDOM_IMG|CHOICE_IMG|CHOICE_IMG_HIDDEN|SHOW_IMG|GEN_IMG):.*?\]", "", interpretation).strip()
@@ -6746,6 +6791,7 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
                             )
                             await session.commit()
                             nav_msg_id = nav_msg.id
+                        await bot.send_message(callback.message.chat.id, f"✅ Продолжаем тему: «{html.escape(topic.name)}».")
                         await _start_telegram_hidden_kickoff(
                             user_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(pending_topic_id),
                             navigation_message_id=nav_msg_id,
@@ -7779,8 +7825,8 @@ async def _complete_telegram_topic_entry(
             if not await _check_telegram_chat_access(session_acc, user_id, bot, chat_id):
                 return
 
-        topic_name = switch_res.topic.name if (switch_res.topic and getattr(switch_res.topic, "name", None)) else ""
-        await bot.send_message(chat_id, f"✅ Продолжаем тему: «{topic_name}».")
+        raw_topic_name = switch_res.topic.name if (switch_res.topic and getattr(switch_res.topic, "name", None)) else ""
+        await bot.send_message(chat_id, f"✅ Продолжаем тему: «{html.escape(raw_topic_name)}».")
 
         from system_events import build_topic_resume_system_message
         synthetic_prompt = switch_res.synthetic_prompt or build_topic_resume_system_message(switch_res.topic.name)
@@ -7946,6 +7992,7 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                 )
                 await session.commit()
                 nav_msg_id = nav_msg.id
+        await bot.send_message(chat_id, f"✅ Продолжаем тему: «{html.escape(topic.name)}».")
         await _start_telegram_hidden_kickoff(
             chat_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(topic_id),
             navigation_message_id=nav_msg_id,
