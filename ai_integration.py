@@ -1629,9 +1629,6 @@ async def get_ai_response(
         if provider_key in ['anthropic', 'claude'] and not model:
             model = _normalize_config_value(ai_config.claude_model)
 
-        limit_first = getattr(ai_config, "context_limit_first", 2) or 2
-        limit_recent = getattr(ai_config, "context_limit_recent", 10) or 10
-
         system_prompt_text = _load_configured_system_prompt(
             ai_config,
             active_topic.system_prompt if active_topic else None
@@ -1713,8 +1710,6 @@ async def get_ai_response(
             media_instruction_block=media_instruction_block,
             subscription_config=subscription_config,
             memory_mode=get_memory_mode(ai_config),
-            limit_first=limit_first,
-            limit_recent=limit_recent,
             service_capabilities=TELEGRAM_CAPABILITIES,
         )
 

@@ -209,7 +209,13 @@ def select_ai_history_messages(
     if current_turn:
         turns.append(current_turn)
 
-    if len(turns) > limit_first + limit_recent:
+    if limit_first <= 0 and limit_recent <= 0:
+        turns = []
+    elif limit_first <= 0:
+        turns = turns[-limit_recent:]
+    elif limit_recent <= 0:
+        turns = turns[:limit_first]
+    elif len(turns) > limit_first + limit_recent:
         turns = turns[:limit_first] + turns[-limit_recent:]
     return [message for turn in turns for message in turn]
 

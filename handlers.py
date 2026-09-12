@@ -46,7 +46,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      ReferralPaymentLog, MailingDeliveryLog,
                      MediaCollection, media_collection_items, topic_collection_association,
                      main_dialogue_collection_association,
-                     ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationEvent,
+                     ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationDialogueState, AutomationEvent,
                      DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_MAX_LENGTH)
 from aiogram.types import LabeledPrice
 import keyboards as kb
@@ -6909,79 +6909,265 @@ async def view_client_merged_metadata(callback: CallbackQuery):
             await callback.answer("Клиент не найден.", show_alert=True)
             return
 
-        res = await session.execute(
-            select(AutomationConversationState)
-            .where(AutomationConversationState.user_id == client_id)
-            .order_by(AutomationConversationState.dialogue_id.desc())
-        )
-        states = res.scalars().all()
+        display_name = html.escape(_display_client_name(user))
+        display_id = _display_client_id(user.id)
+        display_id_label = _display_client_id_label(user.id)
 
-    display_name = html.escape(_display_client_name(user))
-    display_id = _display_client_id(user.id)
-    display_id_label = _display_client_id_label(user.id)
-    total_states = len(states)
+        ai_config = await session.get(AIConfig, 1)
+        memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
 
-    if not states:
-        text = (
-            f"✨ <b>Итоговые метаданные (Merged):</b> {display_name}\n"
-            f"{display_id_label}: <code>{display_id}</code>\n\n"
-            f"<i>Текущих активных слитных метаданных в БД пока нет.</i>"
-        )
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")
-    else:
-        page = max(0, min(page, total_states - 1))
-        st = states[page]
-        cur_step = st.current_step or "не задан"
-        topic_info = f", Топик #{st.topic_id}" if st.topic_id else ""
-        dt_val = st.updated_at or st.created_at
-        dt_str = format_msk(dt_val, "%d-%m-%Y %H:%M МСК") if dt_val else "время неизвестно"
-        diag_info = f"Диалог #{st.dialogue_id} ({dt_str}){topic_info}"
+        if memory_mode == MEMORY_MODE_GLOBAL:
+            MAX_MESSAGE_BUDGET = 3900
 
-        event_res = await session.execute(
-            select(AutomationEvent.name)
-            .where(
-                AutomationEvent.user_id == client_id,
-                AutomationEvent.dialogue_id == st.dialogue_id,
+            # Bound dynamic client display name before HTML escaping for GLOBAL mode
+            raw_client_name = _display_client_name(user)
+            if len(raw_client_name) > 80:
+                raw_client_name = raw_client_name[:77] + "..."
+            while len(html.escape(raw_client_name)) > 100 and len(raw_client_name) > 4:
+                raw_client_name = raw_client_name[:-4] + "..."
+            display_name = html.escape(raw_client_name)
+
+            diag_state_ids_res = await session.execute(
+                select(AutomationDialogueState.dialogue_id)
+                .where(AutomationDialogueState.user_id == client_id)
+                .distinct()
             )
-            .order_by(AutomationEvent.id.desc())
-            .limit(1)
-        )
-        last_event_name = event_res.scalar() or "не зафиксировано"
+            conv_state_ids_res = await session.execute(
+                select(AutomationConversationState.dialogue_id)
+                .where(AutomationConversationState.user_id == client_id)
+                .distinct()
+            )
+            dialogue_ids = sorted(
+                {did for did in diag_state_ids_res.scalars().all() if did is not None}
+                | {did for did in conv_state_ids_res.scalars().all() if did is not None},
+                reverse=True,
+            )
+            total_pages = len(dialogue_ids)
 
-        try:
-            meta_obj = json.loads(st.metadata_json or "{}")
-            meta_rendered = json.dumps(meta_obj, ensure_ascii=False, indent=2)
-        except Exception:
-            meta_rendered = st.metadata_json or "{}"
+            if not dialogue_ids:
+                text = (
+                    f"✨ <b>Итоговые метаданные (Merged):</b> {display_name}\n"
+                    f"{display_id_label}: <code>{display_id}</code>\n\n"
+                    f"<i>Текущих активных слитных метаданных в БД пока нет.</i>"
+                )
+                builder = InlineKeyboardBuilder()
+                builder.button(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")
+            else:
+                page = max(0, min(page, total_pages - 1))
+                current_dialogue_id = dialogue_ids[page]
 
-        if len(meta_rendered) > 2800:
-            meta_rendered = meta_rendered[:2800] + "\n... (полный текст доступен при скачивании .json)"
+                diag_state_res = await session.execute(
+                    select(AutomationDialogueState).where(
+                        AutomationDialogueState.user_id == client_id,
+                        AutomationDialogueState.dialogue_id == current_dialogue_id,
+                    )
+                )
+                diag_state = diag_state_res.scalar_one_or_none()
 
-        page_hdr = f" (Диалог {page + 1} из {total_states})" if total_states > 1 else ""
-        text = (
-            f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
-            f"{display_id_label}: <code>{display_id}</code>\n\n"
-            f"📍 <b>{diag_info}</b>\n"
-            f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{html.escape(str(last_event_name))}</code>\n"
-            f"▫️ <b>Текущий шаг ({html.escape('{current_step}')}):</b> <code>{html.escape(str(cur_step))}</code>\n"
-            f"▫️ <b>Слитные метаданные ({html.escape('{metadata}')}):</b>\n"
-            f"<code>{html.escape(meta_rendered)}</code>"
-        )
+                conv_res = await session.execute(
+                    select(AutomationConversationState)
+                    .where(
+                        AutomationConversationState.user_id == client_id,
+                        AutomationConversationState.dialogue_id == current_dialogue_id,
+                    )
+                    .order_by(AutomationConversationState.topic_id.asc().nulls_first())
+                )
+                topic_states = conv_res.scalars().all()
 
-        builder = InlineKeyboardBuilder()
-        for navigation_row in kb.fixed_pagination_rows(
-            page,
-            total_states,
-            lambda target_page: f"client_merged_metadata_{client_id}_{target_page}",
-        ):
-            builder.row(*navigation_row)
+                event_res = await session.execute(
+                    select(AutomationEvent.name)
+                    .where(
+                        AutomationEvent.user_id == client_id,
+                        AutomationEvent.dialogue_id == current_dialogue_id,
+                    )
+                    .order_by(AutomationEvent.id.desc())
+                    .limit(1)
+                )
+                raw_event_name = event_res.scalar() or "не зафиксировано"
+                if len(str(raw_event_name)) > 80:
+                    raw_event_name = str(raw_event_name)[:77] + "..."
+                while len(html.escape(str(raw_event_name))) > 100 and len(str(raw_event_name)) > 4:
+                    raw_event_name = str(raw_event_name)[:-4] + "..."
+                escaped_event_name = html.escape(str(raw_event_name))
 
-        builder.row(InlineKeyboardButton(text="📥 Скачать все диалоги (.json)", callback_data=f"run_metadata_export_merged_{client_id}"))
-        builder.row(InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}"))
+                page_hdr = f" (Диалог {page + 1} из {total_pages})" if total_pages > 1 else ""
 
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    await callback.answer()
+                if diag_state and (diag_state.updated_at or diag_state.created_at):
+                    dt_val = diag_state.updated_at or diag_state.created_at
+                    dt_str = format_msk(dt_val, "%d-%m-%Y %H:%M МСК")
+                else:
+                    topic_dts = [ts.updated_at or ts.created_at for ts in topic_states if (ts.updated_at or ts.created_at)]
+                    dt_str = format_msk(max(topic_dts), "%d-%m-%Y %H:%M МСК") if topic_dts else "время неизвестно"
+
+                diag_info = f"Диалог #{current_dialogue_id} ({dt_str})"
+
+                # Bounded topic states summary (no raw current_state_json in Telegram UI)
+                MAX_VISIBLE_TOPIC_STATES = 5
+                if topic_states:
+                    topic_lines = []
+                    visible_slice = topic_states[:MAX_VISIBLE_TOPIC_STATES]
+                    for ts in visible_slice:
+                        raw_topic_id = str(ts.topic_id) if ts.topic_id is not None else ""
+                        if len(raw_topic_id) > 20:
+                            raw_topic_id = raw_topic_id[:17] + "..."
+                        t_label = f"Топик #{html.escape(raw_topic_id)}" if raw_topic_id else "Основной диалог"
+
+                        raw_t_step = str(ts.current_step or "не задан")
+                        if len(raw_t_step) > 60:
+                            raw_t_step = raw_t_step[:57] + "..."
+                        while len(html.escape(raw_t_step)) > 80 and len(raw_t_step) > 4:
+                            raw_t_step = raw_t_step[:-4] + "..."
+                        t_step_escaped = html.escape(raw_t_step)
+
+                        t_dt = (
+                            format_msk(ts.updated_at or ts.created_at, "%d-%m-%Y %H:%M МСК")
+                            if (ts.updated_at or ts.created_at)
+                            else "время неизвестно"
+                        )
+                        topic_lines.append(
+                            f"  • {t_label}: шаг=<code>{t_step_escaped}</code> ({t_dt})"
+                        )
+                    remaining = len(topic_states) - len(visible_slice)
+                    if remaining > 0:
+                        topic_lines.append(
+                            f"  • <i>... ещё {remaining} состояний; полный список доступен в JSON</i>"
+                        )
+                    topics_block = "\n".join(topic_lines)
+                else:
+                    topics_block = "  <i>Состояния топиков отсутствуют</i>"
+
+                prefix = (
+                    f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
+                    f"{display_id_label}: <code>{display_id}</code>\n\n"
+                    f"📍 <b>{diag_info}</b>\n"
+                    f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{escaped_event_name}</code>\n"
+                    f"▫️ <b>Состояния топиков:</b>\n{topics_block}\n"
+                    f"▫️ <b>Слитные метаданные ({html.escape('{metadata}')}):</b>\n"
+                    f"<code>"
+                )
+                suffix = "</code>"
+
+                # Compute dynamic remaining metadata budget (no forced positive minimum)
+                total_fixed_len = len(prefix) + len(suffix)
+                available_meta_budget = max(0, MAX_MESSAGE_BUDGET - total_fixed_len)
+
+                if diag_state is not None and diag_state.metadata_json is not None:
+                    try:
+                        meta_obj = json.loads(diag_state.metadata_json or "{}")
+                        raw_meta_str = json.dumps(meta_obj, ensure_ascii=False, indent=2)
+                    except Exception:
+                        raw_meta_str = diag_state.metadata_json or "{}"
+                else:
+                    raw_meta_str = "не инициализированы"
+
+                # Build/truncate CONTENT before adding HTML wrappers; guarantee bounds
+                omission_notice = "\n... (полный текст доступен при скачивании .json)"
+                short_omission = "\n... (см. .json)"
+                min_omission = "..."
+
+                if len(html.escape(raw_meta_str)) <= available_meta_budget:
+                    meta_rendered = html.escape(raw_meta_str)
+                elif available_meta_budget >= len(omission_notice) + 20:
+                    target_content_budget = available_meta_budget - len(omission_notice)
+                    truncated = raw_meta_str[:target_content_budget]
+                    while len(html.escape(truncated)) > target_content_budget and truncated:
+                        step = max(1, (len(html.escape(truncated)) - target_content_budget) // 5)
+                        truncated = truncated[:-step]
+                    meta_rendered = html.escape(truncated) + omission_notice
+                elif available_meta_budget >= len(omission_notice):
+                    meta_rendered = omission_notice.lstrip("\n")
+                elif available_meta_budget >= len(short_omission):
+                    meta_rendered = short_omission.lstrip("\n")
+                elif available_meta_budget >= len(min_omission):
+                    meta_rendered = min_omission
+                else:
+                    meta_rendered = min_omission[:available_meta_budget]
+
+                text = prefix + meta_rendered + suffix
+
+                # Guarantee by construction that Telegram text budget is strictly observed in GLOBAL mode
+                assert len(text) <= MAX_MESSAGE_BUDGET, f"Admin text exceeded safe budget: {len(text)} > {MAX_MESSAGE_BUDGET}"
+
+                builder = InlineKeyboardBuilder()
+                for navigation_row in kb.fixed_pagination_rows(
+                    page,
+                    total_pages,
+                    lambda target_page: f"client_merged_metadata_{client_id}_{target_page}",
+                ):
+                    builder.row(*navigation_row)
+
+                builder.row(InlineKeyboardButton(text="📥 Скачать все диалоги (.json)", callback_data=f"run_metadata_export_merged_{client_id}"))
+                builder.row(InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}"))
+        else:
+            res = await session.execute(
+                select(AutomationConversationState)
+                .where(AutomationConversationState.user_id == client_id)
+                .order_by(AutomationConversationState.dialogue_id.desc())
+            )
+            states = res.scalars().all()
+            total_states = len(states)
+
+            if not states:
+                text = (
+                    f"✨ <b>Итоговые метаданные (Merged):</b> {display_name}\n"
+                    f"{display_id_label}: <code>{display_id}</code>\n\n"
+                    f"<i>Текущих активных слитных метаданных в БД пока нет.</i>"
+                )
+                builder = InlineKeyboardBuilder()
+                builder.button(text="⬅️ В профиль", callback_data=f"view_client_{client_id}")
+            else:
+                page = max(0, min(page, total_states - 1))
+                st = states[page]
+                cur_step = st.current_step or "не задан"
+                topic_info = f", Топик #{st.topic_id}" if st.topic_id else ""
+                dt_val = st.updated_at or st.created_at
+                dt_str = format_msk(dt_val, "%d-%m-%Y %H:%M МСК") if dt_val else "время неизвестно"
+                diag_info = f"Диалог #{st.dialogue_id} ({dt_str}){topic_info}"
+
+                event_res = await session.execute(
+                    select(AutomationEvent.name)
+                    .where(
+                        AutomationEvent.user_id == client_id,
+                        AutomationEvent.dialogue_id == st.dialogue_id,
+                    )
+                    .order_by(AutomationEvent.id.desc())
+                    .limit(1)
+                )
+                last_event_name = event_res.scalar() or "не зафиксировано"
+
+                try:
+                    meta_obj = json.loads(st.metadata_json or "{}")
+                    meta_rendered = json.dumps(meta_obj, ensure_ascii=False, indent=2)
+                except Exception:
+                    meta_rendered = st.metadata_json or "{}"
+
+                if len(meta_rendered) > 2800:
+                    meta_rendered = meta_rendered[:2800] + "\n... (полный текст доступен при скачивании .json)"
+
+                page_hdr = f" (Диалог {page + 1} из {total_states})" if total_states > 1 else ""
+                text = (
+                    f"✨ <b>Итоговые слитные метаданные:</b> {display_name}{page_hdr}\n"
+                    f"{display_id_label}: <code>{display_id}</code>\n\n"
+                    f"📍 <b>{diag_info}</b>\n"
+                    f"⚡️ <b>Текущий маркер события ({html.escape('{event}')}):</b> <code>{html.escape(str(last_event_name))}</code>\n"
+                    f"▫️ <b>Текущий шаг ({html.escape('{current_step}')}):</b> <code>{html.escape(str(cur_step))}</code>\n"
+                    f"▫️ <b>Слитные метаданные ({html.escape('{metadata}')}):</b>\n"
+                    f"<code>{html.escape(meta_rendered)}</code>"
+                )
+
+                builder = InlineKeyboardBuilder()
+                for navigation_row in kb.fixed_pagination_rows(
+                    page,
+                    total_states,
+                    lambda target_page: f"client_merged_metadata_{client_id}_{target_page}",
+                ):
+                    builder.row(*navigation_row)
+
+                builder.row(InlineKeyboardButton(text="📥 Скачать все диалоги (.json)", callback_data=f"run_metadata_export_merged_{client_id}"))
+                builder.row(InlineKeyboardButton(text="⬅️ В профиль", callback_data=f"view_client_{client_id}"))
+
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("download_metadata_"))
@@ -7030,32 +7216,108 @@ async def run_client_metadata_export(callback: CallbackQuery):
             return
 
         if mode == "merged":
-            res = await session.execute(
-                select(AutomationConversationState)
-                .where(AutomationConversationState.user_id == client_id)
-                .order_by(AutomationConversationState.dialogue_id.desc())
-            )
-            states = res.scalars().all()
-            merged_states = []
-            for st in states:
-                try:
-                    meta_obj = json.loads(st.metadata_json or "{}")
-                except Exception:
-                    meta_obj = st.metadata_json
-                try:
-                    state_obj = json.loads(st.current_state_json or "{}")
-                except Exception:
-                    state_obj = st.current_state_json
+            ai_config = await session.get(AIConfig, 1)
+            memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
 
-                dt_val = st.updated_at or st.created_at
-                merged_states.append({
-                    "dialogue_id": st.dialogue_id,
-                    "topic_id": st.topic_id,
-                    "current_step": st.current_step,
-                    "updated_at": format_msk(dt_val, "%Y-%m-%dT%H:%M:%S+03:00") if dt_val else None,
-                    "current_state": state_obj,
-                    "metadata": meta_obj,
-                })
+            if memory_mode == MEMORY_MODE_GLOBAL:
+                diag_state_ids_res = await session.execute(
+                    select(AutomationDialogueState.dialogue_id)
+                    .where(AutomationDialogueState.user_id == client_id)
+                    .distinct()
+                )
+                conv_state_ids_res = await session.execute(
+                    select(AutomationConversationState.dialogue_id)
+                    .where(AutomationConversationState.user_id == client_id)
+                    .distinct()
+                )
+                dialogue_ids = sorted(
+                    {did for did in diag_state_ids_res.scalars().all() if did is not None}
+                    | {did for did in conv_state_ids_res.scalars().all() if did is not None},
+                    reverse=True,
+                )
+
+                merged_states = []
+                for d_id in dialogue_ids:
+                    diag_state_res = await session.execute(
+                        select(AutomationDialogueState).where(
+                            AutomationDialogueState.user_id == client_id,
+                            AutomationDialogueState.dialogue_id == d_id,
+                        )
+                    )
+                    diag_state = diag_state_res.scalar_one_or_none()
+
+                    conv_res = await session.execute(
+                        select(AutomationConversationState)
+                        .where(
+                            AutomationConversationState.user_id == client_id,
+                            AutomationConversationState.dialogue_id == d_id,
+                        )
+                        .order_by(AutomationConversationState.topic_id.asc().nulls_first())
+                    )
+                    conv_rows = conv_res.scalars().all()
+
+                    topic_states = []
+                    for ts in conv_rows:
+                        try:
+                            state_obj = json.loads(ts.current_state_json) if ts.current_state_json else {}
+                        except Exception:
+                            state_obj = ts.current_state_json
+                        t_dt = ts.updated_at or ts.created_at
+                        topic_states.append({
+                            "topic_id": ts.topic_id,
+                            "current_step": ts.current_step,
+                            "current_state": state_obj,
+                            "updated_at": format_msk(t_dt, "%Y-%m-%dT%H:%M:%S+03:00") if t_dt else None,
+                        })
+
+                    if diag_state is not None and diag_state.metadata_json is not None:
+                        try:
+                            meta_obj = json.loads(diag_state.metadata_json)
+                        except Exception:
+                            meta_obj = diag_state.metadata_json
+                    else:
+                        meta_obj = None
+
+                    diag_updated_at = (
+                        format_msk(diag_state.updated_at, "%Y-%m-%dT%H:%M:%S+03:00")
+                        if (diag_state and diag_state.updated_at)
+                        else None
+                    )
+
+                    merged_states.append({
+                        "dialogue_id": d_id,
+                        "updated_at": diag_updated_at,
+                        "memory_mode": "global",
+                        "metadata": meta_obj,
+                        "topic_states": topic_states,
+                    })
+            else:
+                res = await session.execute(
+                    select(AutomationConversationState)
+                    .where(AutomationConversationState.user_id == client_id)
+                    .order_by(AutomationConversationState.dialogue_id.desc())
+                )
+                states = res.scalars().all()
+                merged_states = []
+                for st in states:
+                    try:
+                        meta_obj = json.loads(st.metadata_json or "{}")
+                    except Exception:
+                        meta_obj = st.metadata_json
+                    try:
+                        state_obj = json.loads(st.current_state_json or "{}")
+                    except Exception:
+                        state_obj = st.current_state_json
+
+                    dt_val = st.updated_at or st.created_at
+                    merged_states.append({
+                        "dialogue_id": st.dialogue_id,
+                        "topic_id": st.topic_id,
+                        "current_step": st.current_step,
+                        "updated_at": format_msk(dt_val, "%Y-%m-%dT%H:%M:%S+03:00") if dt_val else None,
+                        "current_state": state_obj,
+                        "metadata": meta_obj,
+                    })
 
             export_data = {
                 "user_info": {
