@@ -38,6 +38,7 @@ from result_history import ai_history_role_filter, select_ai_history_messages
 from error_reporting import classify_ai_error, exception_summary
 from vector_store import search_relevant_chunks
 from provider_models import (
+    DEEPSEEK_CHAT_MAX_TOKENS,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
@@ -46,6 +47,7 @@ from provider_models import (
     PROVIDER_OPENAI,
     ensure_model_available,
     get_default_model,
+    inspect_deepseek_response,
     is_retired_model,
     normalize_deepseek_model,
     should_omit_claude_sampling,
@@ -264,7 +266,7 @@ async def _call_deepseek(
     payload = {
         "model": normalized_model,
         "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
-        "max_tokens": 4096,
+        "max_tokens": DEEPSEEK_CHAT_MAX_TOKENS,
         "temperature": temperature,
     }
     _capture_ai_request(
@@ -281,7 +283,35 @@ async def _call_deepseek(
     response = await client.chat.completions.create(
         **payload,
     )
-    return response.choices[0].message.content or ""
+    visible_content, diagnostics = inspect_deepseek_response(
+        response,
+        model=normalized_model,
+        platform="max",
+    )
+    if diagnostics.output_budget_exhausted:
+        log.warning(
+            "DeepSeek output budget exhausted: provider=%s model=%s platform=%s finish_reason=%s "
+            "visible_content_present=%s visible_content_length=%s "
+            "reasoning_content_present=%s reasoning_content_length=%s "
+            "output_budget_exhausted=%s",
+            diagnostics.provider,
+            diagnostics.model,
+            diagnostics.platform,
+            diagnostics.finish_reason,
+            diagnostics.visible_content_present,
+            diagnostics.visible_content_length,
+            diagnostics.reasoning_content_present,
+            diagnostics.reasoning_content_length,
+            diagnostics.output_budget_exhausted,
+        )
+    if visible_content is not None:
+        return visible_content
+
+    if diagnostics.output_budget_exhausted:
+        raise AIResponseError(
+            f"Deepseek returned empty content (output budget exhausted: finish_reason={diagnostics.finish_reason}, reasoning_len={diagnostics.reasoning_content_length})"
+        )
+    raise AIResponseError("Deepseek returned an empty or invalid text response")
 
 
 async def _call_claude(
