@@ -1,11 +1,15 @@
 import html
+import json
 import logging
+import os
 import re
 import traceback
+from datetime import datetime, timedelta
 from typing import Any, Sequence
 
 from aiogram import Bot
 
+from alert_cooldown import KeyedAlertCooldown
 from database import get_all_admin_ids
 
 
@@ -99,6 +103,7 @@ _ERROR_CLASS_DESCRIPTIONS = {
     "forbidden_geo": "Провайдер запретил доступ или ограничил его по региону",
     "rate_limit": "Провайдер ограничил частоту запросов",
     "insufficient_balance_quota": "Недостаточно баланса, кредитов или квоты провайдера",
+    "output_budget_exhausted": "Исчерпан лимит токенов вывода (output budget exhausted)",
     "provider_rejection": "Провайдер отклонил запрос или платеж",
     "provider_5xx": "Внутренняя ошибка или перегрузка сервиса провайдера",
     "empty_response": "Провайдер вернул пустой ответ",
@@ -240,6 +245,11 @@ def classify_external_error(
         ))
     ):
         code = "provider_5xx"
+    elif (
+        getattr(exception, "classification", None) == "output_budget_exhausted"
+        or any(marker in combined for marker in ("output budget exhausted", "output_budget_exhausted"))
+    ):
+        code = "output_budget_exhausted"
     elif any(marker in combined for marker in (
         "empty response",
         "empty content",
@@ -503,3 +513,202 @@ async def notify_admins_about_error(
             await bot.send_message(admin_id, admin_text, parse_mode="HTML")
         except Exception as send_exc:
             log.error("Failed to deliver admin error notification admin_id=%s error=%s", admin_id, send_exc)
+
+
+_terminal_failure_cooldown = KeyedAlertCooldown(timedelta(minutes=30))
+_output_budget_cooldown = KeyedAlertCooldown(timedelta(minutes=30))
+
+
+def extract_error_metadata(
+    exception: Exception | None,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    """Extract structured failure diagnostics and provider metadata without fragile regexes."""
+    if exception is None:
+        return {
+            "error_type": None,
+            "error_message": None,
+            "error_classification": None,
+            "http_status": None,
+            "finish_reason": None,
+            "diagnostics": None,
+            "provider_response_payload": None,
+        }
+
+    chain = exception_chain(exception, include_context=True)
+    root = root_cause_exception(exception) or exception
+    error_type = type(root).__name__ if root is not None else type(exception).__name__
+    raw_msg = str(exception).strip() or str(root).strip()
+    error_message = sanitize_secret_values(raw_msg)
+
+    http_status = getattr(exception, "http_status", None)
+    if http_status is None:
+        status_codes = _exception_status_codes(exception)
+        if status_codes:
+            http_status = next((s for s in status_codes if 200 <= s < 600), None)
+
+    finish_reason = getattr(exception, "finish_reason", None)
+    diagnostics = getattr(exception, "diagnostics", None)
+    provider_response_payload = getattr(exception, "provider_response_payload", None)
+
+    for item in chain:
+        if finish_reason is None and hasattr(item, "finish_reason"):
+            finish_reason = getattr(item, "finish_reason")
+        if diagnostics is None and hasattr(item, "diagnostics"):
+            diagnostics = getattr(item, "diagnostics")
+        if provider_response_payload is None and hasattr(item, "provider_response_payload"):
+            provider_response_payload = getattr(item, "provider_response_payload")
+        if provider_response_payload is None and hasattr(item, "response"):
+            resp = getattr(item, "response")
+            if hasattr(resp, "text"):
+                provider_response_payload = getattr(resp, "text")
+
+    classification = getattr(exception, "classification", None)
+    if not classification:
+        classification, _ = classify_external_error(exception, provider=provider)
+
+    return {
+        "error_type": error_type,
+        "error_message": error_message,
+        "error_classification": classification,
+        "http_status": http_status,
+        "finish_reason": finish_reason,
+        "diagnostics": diagnostics,
+        "provider_response_payload": provider_response_payload,
+    }
+
+
+async def _dispatch_admin_alert_text(bot: Bot | None, text: str) -> bool:
+    """Best-effort alert delivery to all configured administrators."""
+    try:
+        admin_ids = await get_all_admin_ids()
+        if not admin_ids:
+            return False
+
+        if bot is not None:
+            for admin_id in admin_ids:
+                try:
+                    await bot.send_message(admin_id, text, parse_mode="HTML")
+                except Exception as exc:
+                    logging.getLogger(__name__).error("Failed to send admin alert to %s: %s", admin_id, exc)
+            return True
+
+        bot_token = os.getenv("BOT_TOKEN")
+        if not bot_token:
+            return False
+
+        from telegram_client import create_telegram_bot
+        async with create_telegram_bot(bot_token) as t_bot:
+            for admin_id in admin_ids:
+                try:
+                    await t_bot.send_message(admin_id, text, parse_mode="HTML")
+                except Exception as exc:
+                    logging.getLogger(__name__).error("Failed to send admin alert to %s: %s", admin_id, exc)
+            return True
+    except Exception as exc:
+        logging.getLogger(__name__).error("Admin alert delivery failed: %s", exc)
+        return False
+
+
+async def send_terminal_ai_failure_alert(
+    bot: Bot | None = None,
+    *,
+    platform: str,
+    user_id: int | None,
+    chat_id: int | None = None,
+    bot_name: str | None = None,
+    primary_provider: str,
+    primary_model: str,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
+    exception: Exception | None = None,
+    classification: str | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    ai_log_ids: Sequence[int | str] | None = None,
+) -> bool:
+    """Send realtime terminal AI failure alert to Telegram admins with 30m cooldown."""
+    platform_norm = "MAX" if platform.lower() == "max" else "Telegram"
+    b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
+    cls_str = classification or "provider_failure"
+    primary_p = primary_provider or "primary"
+    fb_p = fallback_provider or "none"
+
+    fingerprint = f"{platform_norm}:{b_name}:{primary_p}:{fb_p}:{cls_str}"
+    if not _terminal_failure_cooldown.should_send(fingerprint):
+        return False
+
+    id_label = f"MAX ID: <code>{user_id}</code>" if platform_norm == "MAX" else f"Telegram ID: <code>{user_id}</code>"
+    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
+
+    err_type_str = error_type or (type(exception).__name__ if exception is not None else "AIServiceError")
+    err_msg_str = error_message or sanitize_secret_values(str(exception) if exception is not None else "Unknown error")
+    err_msg_short = _shorten(err_msg_str, 500)
+
+    if ai_log_ids:
+        logs_str = ", ".join(f"#{i}" if str(i).isdigit() else str(i) for i in ai_log_ids)
+        label = "AI Log:" if len(ai_log_ids) == 1 else "AI Log IDs:"
+        ai_log_line = f"\n{label} {logs_str}"
+    else:
+        ai_log_line = "\nAI Log: не удалось сохранить"
+
+    fb_lines = ""
+    if fallback_provider:
+        fb_lines = f"Fallback: {html.escape(fallback_provider)} / {html.escape(fallback_model or '—')} ❌\n"
+
+    text = (
+        f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
+        f"Бот: <code>{html.escape(b_name)}</code>\n"
+        f"{id_label}\n"
+        f"{chat_line}"
+        f"Primary: {html.escape(primary_provider)} / {html.escape(primary_model)} ❌\n"
+        f"{fb_lines}\n"
+        f"Ошибка:\n"
+        f"<code>{html.escape(err_type_str)}</code> / <code>{html.escape(err_msg_short)}</code>\n\n"
+        f"Классификация:\n"
+        f"<code>{html.escape(cls_str)}</code>\n"
+        f"{ai_log_line}"
+    )
+
+    return await _dispatch_admin_alert_text(bot, text)
+
+
+async def send_output_budget_exhausted_alert(
+    bot: Bot | None = None,
+    *,
+    platform: str,
+    user_id: int | None,
+    bot_name: str | None = None,
+    provider: str = "Deepseek",
+    model: str,
+    finish_reason: str = "length",
+    visible_content_length: int = 0,
+    reasoning_content_length: int = 0,
+    max_tokens: int | str = "65536",
+    ai_log_id: int | str | None = None,
+) -> bool:
+    """Send alert when DeepSeek exhaust output budget on reasoning tokens (30m cooldown)."""
+    platform_norm = "MAX" if platform.lower() == "max" else "Telegram"
+    b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
+
+    fingerprint = f"{b_name}:{provider}:{model}:output_budget_exhausted"
+    if not _output_budget_cooldown.should_send(fingerprint):
+        return False
+
+    ai_log_str = f"#{ai_log_id}" if ai_log_id is not None and str(ai_log_id).isdigit() else (str(ai_log_id) if ai_log_id else "не удалось сохранить")
+
+    text = (
+        f"⚠️ <b>[AI] {html.escape(provider)} исчерпал output budget</b>\n\n"
+        f"Бот: <code>{html.escape(b_name)}</code>\n"
+        f"Платформа: <b>{platform_norm}</b>\n"
+        f"User ID: <code>{user_id if user_id is not None else 'не указан'}</code>\n"
+        f"Model: <code>{html.escape(model)}</code>\n"
+        f"finish_reason: <code>{html.escape(finish_reason)}</code>\n"
+        f"visible_content_length: <code>{visible_content_length}</code>\n"
+        f"reasoning_content_length: <code>{reasoning_content_length}</code>\n"
+        f"max_tokens: <code>{max_tokens}</code>\n"
+        f"AI Log: {ai_log_str}"
+    )
+
+    return await _dispatch_admin_alert_text(bot, text)
+

@@ -67,7 +67,7 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
         pairs = [(button.text, button.callback_data) for row in markup.inline_keyboard for button in row]
         self.assertIn(("⏮ В начало", "admin_user_ai_logs_777_0_7d"), pairs)
         self.assertIn(("В конец ⏭", "admin_user_ai_logs_777_4_7d"), pairs)
-        self.assertIn(("📦 Скачать пакет логов", "export_ai_logs_777_7d"), pairs)
+        self.assertIn(("📦 Скачать пакет логов", "export_ai_logs_777_7d_all_all"), pairs)
         self.assertIn(("⬅️ Назад", "view_client_777"), pairs)
         self.assertTrue(any(text == "✅ 7 дней" for text, _ in pairs))
 
@@ -92,10 +92,10 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
             request_type="followup",
         )
         pairs = [(button.text, button.callback_data) for row in markup.inline_keyboard for button in row]
-        self.assertIn(("↪️ 26.08 17:41 | Gemini: flash (0.1s)", "admin_ai_log_10_0_0_7d_followup"), pairs)
-        self.assertIn(("✅ Догоняющие", "admin_ai_logs_0_7d_followup"), pairs)
-        self.assertIn(("Сегодня", "admin_ai_logs_0_today_followup"), pairs)
-        self.assertIn(("📦 Скачать пакет логов", "export_ai_logs_0_7d_followup"), pairs)
+        self.assertIn(("✅ [F] 26.08 17:41 | Gemini: flash (0.1s)", "admin_ai_log_10_0_0_7d_followup_all"), pairs)
+        self.assertIn(("✅ Догоняющие", "admin_ai_logs_0_7d_followup_all"), pairs)
+        self.assertIn(("Сегодня", "admin_ai_logs_0_today_followup_all"), pairs)
+        self.assertIn(("📦 Скачать пакет логов", "export_ai_logs_0_7d_followup_all"), pairs)
 
     def test_ai_log_button_format_is_shared_for_global_and_user_lists(self):
         log = AILog(
@@ -124,7 +124,7 @@ class AILogFeatureTests(unittest.IsolatedAsyncioTestCase):
         )
         label = format_ai_log_button(log)
         self.assertLessEqual(len(label), 60)
-        self.assertTrue(label.startswith("26.08 17:41 | Gemini: a-very"))
+        self.assertTrue(label.startswith("✅ 26.08 17:41 | Gemini: a-very"))
         self.assertNotIn("#13", label)
 
     def test_fixed_navigation_has_same_two_rows_on_every_page(self):

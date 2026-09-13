@@ -659,7 +659,8 @@ class GlobalDataMemoryModeTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.sessions() as session:
             logs = (await session.scalars(select(AILog))).all()
-            self.assertEqual(len(logs), 0)
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0].status, "success")
             diag_state = await session.scalar(
                 select(AutomationDialogueState).where(AutomationDialogueState.user_id == 42)
             )
@@ -681,7 +682,8 @@ class GlobalDataMemoryModeTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.sessions() as session:
             logs = (await session.scalars(select(AILog))).all()
-            self.assertEqual(len(logs), 0)
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0].status, "success")
             diag_state = await session.scalar(
                 select(AutomationDialogueState).where(AutomationDialogueState.user_id == 42)
             )

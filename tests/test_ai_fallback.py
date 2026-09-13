@@ -589,15 +589,15 @@ async def test_post_response_application_failure_does_not_invoke_fallback(monkey
     import ai_integration
 
     fallback = AsyncMock(return_value="must not be called")
-    with pytest.raises(RuntimeError, match="database commit failed"):
-        await _run_telegram(
-            monkeypatch,
-            "valid primary answer",
-            fallback_enabled=True,
-            fallback_call=fallback,
-            commit_error=RuntimeError("database commit failed"),
-        )
-
+    # AILog persistence failure is best-effort and must not raise or invoke fallback
+    result, _, _ = await _run_telegram(
+        monkeypatch,
+        "valid primary answer",
+        fallback_enabled=True,
+        fallback_call=fallback,
+        commit_error=RuntimeError("database commit failed"),
+    )
+    assert result == "valid primary answer"
     fallback.assert_not_awaited()
 
 

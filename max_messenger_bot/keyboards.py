@@ -1079,12 +1079,15 @@ def _truncate_ai_log_model(value: str, limit: int) -> str:
 
 
 def format_ai_log_button(log, max_length: int = 60) -> str:
-    marker = "↪️ " if getattr(log, "request_type", "chat") == "followup" else ""
+    status = getattr(log, "status", None) or "success"
+    status_marker = "❌ " if status == "error" else "✅ "
+    fallback_marker = "↪️ " if getattr(log, "attempt_role", None) == "fallback" else ""
+    followup_marker = "[F] " if getattr(log, "request_type", "chat") == "followup" else ""
     timestamp = format_msk(log.created_at, "%d.%m %H:%M") if log.created_at else "--.-- --:--"
     provider = str(log.provider or "—")
     model = str(log.model or "—")
     latency = f" ({log.latency_ms / 1000:.1f}s)" if log.latency_ms else ""
-    fixed = f"{marker}{timestamp} | "
+    fixed = f"{fallback_marker}{status_marker}{followup_marker}{timestamp} | "
     provider_prefix = f"{provider}: "
     model_limit = max_length - len(fixed) - len(provider_prefix) - len(latency)
     if model_limit < 1:
@@ -1102,29 +1105,31 @@ def admin_ai_logs_keyboard(
     filter_user_id: int | None = None,
     period: str = "all",
     request_type: str = "all",
+    status: str = "all",
 ) -> list[dict]:
     period = period if period in {"today", "7d", "30d", "all"} else "all"
     request_type = request_type if request_type in {"all", "chat", "followup"} else "all"
+    status = status if status in {"all", "success", "error"} else "all"
     rows: list[list[dict]] = []
 
     for log in logs:
-        cb = f"admin_ai_log_{log.id}_{page}_{filter_user_id or 0}_{period}_{request_type}"
+        cb = f"admin_ai_log_{log.id}_{page}_{filter_user_id or 0}_{period}_{request_type}_{status}"
         rows.append([callback_button(format_ai_log_button(log), cb)])
 
     nav_row: list[dict] = []
     if page > 0:
         prev_cb = (
-            f"admin_user_ai_logs_{filter_user_id}_{page - 1}_{period}_{request_type}"
+            f"admin_user_ai_logs_{filter_user_id}_{page - 1}_{period}_{request_type}_{status}"
             if filter_user_id
-            else f"admin_ai_logs_{page - 1}_{period}_{request_type}"
+            else f"admin_ai_logs_{page - 1}_{period}_{request_type}_{status}"
         )
         nav_row.append(callback_button("◀️", prev_cb))
     nav_row.append(callback_button(f"{page + 1}/{total_pages}", "noop"))
     if page < total_pages - 1:
         next_cb = (
-            f"admin_user_ai_logs_{filter_user_id}_{page + 1}_{period}_{request_type}"
+            f"admin_user_ai_logs_{filter_user_id}_{page + 1}_{period}_{request_type}_{status}"
             if filter_user_id
-            else f"admin_ai_logs_{page + 1}_{period}_{request_type}"
+            else f"admin_ai_logs_{page + 1}_{period}_{request_type}_{status}"
         )
         nav_row.append(callback_button("▶️", next_cb))
     if nav_row:
@@ -1136,9 +1141,9 @@ def admin_ai_logs_keyboard(
         active_prefix = "· " if val == period else ""
         active_suffix = " ·" if val == period else ""
         cb = (
-            f"admin_user_ai_logs_{filter_user_id}_0_{val}_{request_type}"
+            f"admin_user_ai_logs_{filter_user_id}_0_{val}_{request_type}_{status}"
             if filter_user_id
-            else f"admin_ai_logs_0_{val}_{request_type}"
+            else f"admin_ai_logs_0_{val}_{request_type}_{status}"
         )
         period_row.append(callback_button(f"{active_prefix}{label}{active_suffix}", cb))
     rows.append(period_row)
@@ -1149,16 +1154,29 @@ def admin_ai_logs_keyboard(
         active_prefix = "· " if val == request_type else ""
         active_suffix = " ·" if val == request_type else ""
         cb = (
-            f"admin_user_ai_logs_{filter_user_id}_0_{period}_{val}"
+            f"admin_user_ai_logs_{filter_user_id}_0_{period}_{val}_{status}"
             if filter_user_id
-            else f"admin_ai_logs_0_{period}_{val}"
+            else f"admin_ai_logs_0_{period}_{val}_{status}"
         )
         type_row.append(callback_button(f"{active_prefix}{label}{active_suffix}", cb))
     rows.append(type_row)
 
+    status_labels = (("Все статусы", "all"), ("Успешные", "success"), ("Ошибки", "error"))
+    status_row = []
+    for label, val in status_labels:
+        active_prefix = "· " if val == status else ""
+        active_suffix = " ·" if val == status else ""
+        cb = (
+            f"admin_user_ai_logs_{filter_user_id}_0_{period}_{request_type}_{val}"
+            if filter_user_id
+            else f"admin_ai_logs_0_{period}_{request_type}_{val}"
+        )
+        status_row.append(callback_button(f"{active_prefix}{label}{active_suffix}", cb))
+    rows.append(status_row)
+
     rows.append([callback_button(
         "📦 Скачать пакет логов",
-        f"export_ai_logs_{filter_user_id or 0}_{period}_{request_type}",
+        f"export_ai_logs_{filter_user_id or 0}_{period}_{request_type}_{status}",
     )])
 
     back_cb = f"view_client_{filter_user_id}" if filter_user_id else "admin_ai_settings"
@@ -1173,11 +1191,13 @@ def admin_ai_log_detail_keyboard(
     filter_user_id: int | None = None,
     period: str = "all",
     request_type: str = "all",
+    status: str = "all",
 ) -> list[dict]:
+    status_suffix = f"_{status}" if status != "all" else ""
     back_cb = (
-        f"admin_user_ai_logs_{filter_user_id}_{page}_{period}_{request_type}"
+        f"admin_user_ai_logs_{filter_user_id}_{page}_{period}_{request_type}{status_suffix}"
         if filter_user_id
-        else f"admin_ai_logs_{page}_{period}_{request_type}"
+        else f"admin_ai_logs_{page}_{period}_{request_type}{status_suffix}"
     )
     return inline_keyboard(
         [

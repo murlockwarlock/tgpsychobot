@@ -118,6 +118,8 @@ def extract_effective_provider_and_model(
     actual_provider = (
         request_capture.get("provider") if isinstance(request_capture, dict) else None
     ) or default_provider or "OpenAI"
+    if default_provider and actual_provider.lower() == default_provider.lower():
+        actual_provider = default_provider
 
     actual_model = None
     if isinstance(request_capture, dict):
