@@ -5641,7 +5641,8 @@ async def callback_admin_ai_logs(callback: CallbackQuery):
     page = int(parts[3])
     period = parts[4] if len(parts) > 4 else "all"
     request_type = parts[5] if len(parts) > 5 else "all"
-    await show_ai_logs_list(callback, page=page, period=period, request_type=request_type)
+    status = parts[6] if len(parts) > 6 else "all"
+    await show_ai_logs_list(callback, page=page, period=period, request_type=request_type, status=status)
 
 
 @router.callback_query(F.data.startswith("admin_user_ai_logs_"))
@@ -5653,12 +5654,14 @@ async def callback_admin_user_ai_logs(callback: CallbackQuery):
     page = int(parts[5])
     period = parts[6] if len(parts) > 6 else "all"
     request_type = parts[7] if len(parts) > 7 else "all"
+    status = parts[8] if len(parts) > 8 else "all"
     await show_ai_logs_list(
         callback,
         page=page,
         filter_user_id=user_id,
         period=period,
         request_type=request_type,
+        status=status,
     )
 
 
@@ -5673,6 +5676,12 @@ AI_LOG_TYPE_LABELS = {
     "all": "все типы",
     "chat": "обычные запросы",
     "followup": "догоняющие",
+}
+
+AI_LOG_STATUS_LABELS = {
+    "all": "все статусы",
+    "success": "успешные",
+    "error": "с ошибками",
 }
 
 
@@ -5713,7 +5722,14 @@ def _ai_log_period_start(period: str) -> datetime | None:
     return None
 
 
-def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str, request_type: str = "all"):
+def _apply_ai_log_filters(
+    query,
+    *,
+    filter_user_id: int | None,
+    period: str,
+    request_type: str = "all",
+    status: str = "all",
+):
     if filter_user_id:
         query = query.where(AILog.user_id == filter_user_id)
     period_start = _ai_log_period_start(period)
@@ -5721,6 +5737,10 @@ def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str, req
         query = query.where(AILog.created_at >= period_start)
     if request_type in AI_LOG_TYPE_LABELS and request_type != "all":
         query = query.where(AILog.request_type == request_type)
+    if status == "success":
+        query = query.where(or_(AILog.status == "success", AILog.status == None))
+    elif status == "error":
+        query = query.where(AILog.status == "error")
     return query
 
 
@@ -5730,16 +5750,19 @@ async def show_ai_logs_list(
     filter_user_id: int | None = None,
     period: str = "all",
     request_type: str = "all",
+    status: str = "all",
 ):
     PER_PAGE = 8
     period = period if period in AI_LOG_PERIOD_LABELS else "all"
     request_type = request_type if request_type in AI_LOG_TYPE_LABELS else "all"
+    status = status if status in AI_LOG_STATUS_LABELS else "all"
     async with async_session_maker() as session:
         query = _apply_ai_log_filters(
             select(AILog),
             filter_user_id=filter_user_id,
             period=period,
             request_type=request_type,
+            status=status,
         )
 
         count_query = select(func.count()).select_from(query.subquery())
@@ -5759,6 +5782,7 @@ async def show_ai_logs_list(
             filter_user_id=filter_user_id,
             period=period,
             request_type=request_type,
+            status=status,
         )
         if isinstance(event, CallbackQuery):
             await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -5771,6 +5795,7 @@ async def show_ai_logs_list(
         f"📜 <b>Логи вызовов ИИ{filter_text}</b> (Стр. {page + 1}/{total_pages})\n\n"
         f"Период: <b>{AI_LOG_PERIOD_LABELS[period]}</b>\n"
         f"Тип: <b>{AI_LOG_TYPE_LABELS[request_type]}</b>\n"
+        f"Статус: <b>{AI_LOG_STATUS_LABELS[status]}</b>\n"
         f"Всего вызовов: <b>{total_count}</b>\nВыберите запись:"
     )
 
@@ -5781,6 +5806,7 @@ async def show_ai_logs_list(
         filter_user_id=filter_user_id,
         period=period,
         request_type=request_type,
+        status=status,
     )
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(header, reply_markup=markup, parse_mode="HTML")
@@ -5802,6 +5828,7 @@ async def callback_admin_ai_log_detail(callback: CallbackQuery):
     filter_user_id = int(parts[5]) if len(parts) > 5 and int(parts[5]) else None
     period = parts[6] if len(parts) > 6 else "all"
     request_type = parts[7] if len(parts) > 7 else "all"
+    status = parts[8] if len(parts) > 8 else "all"
     await show_ai_log_detail(
         callback,
         log_id,
@@ -5809,6 +5836,7 @@ async def callback_admin_ai_log_detail(callback: CallbackQuery):
         filter_user_id=filter_user_id,
         period=period,
         request_type=request_type,
+        status=status,
     )
 
 
@@ -5819,6 +5847,7 @@ async def show_ai_log_detail(
     filter_user_id: int | None = None,
     period: str = "all",
     request_type: str = "all",
+    status: str = "all",
 ):
     async with async_session_maker() as session:
         log_entry = await session.get(AILog, log_id)
@@ -5878,25 +5907,66 @@ async def show_ai_log_detail(
     if len(prompt_str) > 1200:
         prompt_str = prompt_str[:1200] + "..."
 
-    raw_resp = log_entry.raw_response or ""
-    display_raw = html.escape(raw_resp)
-    if len(display_raw) > 2500:
-        display_raw = display_raw[:2500] + "\n\n[...] (Полный сырой файл скачайте по кнопке ниже)"
+    log_status = getattr(log_entry, "status", None) or "success"
+    attempt_no = getattr(log_entry, "attempt_no", None) or 1
+    attempt_role = getattr(log_entry, "attempt_role", None) or "primary"
+    attempt_role_label = "primary" if attempt_role == "primary" else "fallback"
+    group_id = getattr(log_entry, "request_group_id", None)
+    group_line = f"🔗 <b>Группа запроса:</b> <code>{group_id}</code>\n" if group_id else ""
 
-    text = (
-        f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
-        + "\n".join(identity_lines)
-        + "\n"
-        f"🧾 <b>Тип запроса:</b> {html.escape(AI_LOG_TYPE_LABELS.get(log_type, log_type))}\n"
-        f"📍 <b>Контекст:</b> {html.escape(ai_log_context_label(log_entry))}\n"
-        f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider)}</b>\n"
-        f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model)}</code>\n"
-        f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
-        f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
-        f"📤 <b>Полный payload запроса (превью):</b>\n<code>{prompt_str}</code>\n\n"
-        f"📥 <b>Сырой ответ модели (Raw LLM Output):</b>\n"
-        f"<code>{display_raw}</code>"
-    )
+    if log_status == "error":
+        err_type = log_entry.error_type or "UnknownError"
+        err_msg = log_entry.error_message or "не указано"
+        err_cls = log_entry.error_classification or "не классифицировано"
+        raw_resp_preview = log_entry.provider_response_payload or log_entry.raw_response or "не зафиксирован"
+        if len(raw_resp_preview) > 1500:
+            raw_resp_preview = raw_resp_preview[:1500] + "\n\n[...] (Полный файл скачайте по кнопке ниже)"
+
+        diag_info = ""
+        if log_entry.diagnostics_json:
+            diag_info = f"🔬 <b>Диагностика:</b>\n<code>{html.escape(log_entry.diagnostics_json[:500])}</code>\n\n"
+
+        text = (
+            f"❌ <b>Ошибка вызова ИИ #{log_entry.id}</b>\n\n"
+            + "\n".join(identity_lines)
+            + "\n"
+            f"🧾 <b>Тип запроса:</b> {html.escape(AI_LOG_TYPE_LABELS.get(log_type, log_type))}\n"
+            f"📍 <b>Контекст:</b> {html.escape(ai_log_context_label(log_entry))}\n"
+            f"{group_line}"
+            f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider)}</b> (Попытка {attempt_no} / {attempt_role_label})\n"
+            f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model)}</code>\n"
+            f"⏱ <b>Время до ошибки:</b> <code>{lat_text}</code>\n"
+            f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
+            f"🚨 <b>Ошибка приложения:</b>\n"
+            f"<code>{html.escape(err_type)}</code>: <code>{html.escape(err_msg[:500])}</code>\n\n"
+            f"🏷 <b>Классификация ошибки:</b>\n"
+            f"<code>{html.escape(err_cls)}</code>\n\n"
+            f"{diag_info}"
+            f"📤 <b>Полный payload запроса (превью):</b>\n<code>{prompt_str}</code>\n\n"
+            f"📥 <b>Сырой ответ провайдера (Raw Response / Payload):</b>\n"
+            f"<code>{html.escape(raw_resp_preview)}</code>"
+        )
+    else:
+        raw_resp = log_entry.raw_response or ""
+        display_raw = html.escape(raw_resp)
+        if len(display_raw) > 2500:
+            display_raw = display_raw[:2500] + "\n\n[...] (Полный сырой файл скачайте по кнопке ниже)"
+
+        text = (
+            f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
+            + "\n".join(identity_lines)
+            + "\n"
+            f"🧾 <b>Тип запроса:</b> {html.escape(AI_LOG_TYPE_LABELS.get(log_type, log_type))}\n"
+            f"📍 <b>Контекст:</b> {html.escape(ai_log_context_label(log_entry))}\n"
+            f"{group_line}"
+            f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider)}</b> (Попытка {attempt_no} / {attempt_role_label})\n"
+            f"🧠 <b>Модель:</b> <code>{html.escape(log_entry.model)}</code>\n"
+            f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
+            f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
+            f"📤 <b>Полный payload запроса (превью):</b>\n<code>{prompt_str}</code>\n\n"
+            f"📥 <b>Сырой ответ модели (Raw LLM Output):</b>\n"
+            f"<code>{display_raw}</code>"
+        )
 
     markup = kb.admin_ai_log_detail_keyboard(
         log_id,
@@ -5904,6 +5974,7 @@ async def show_ai_log_detail(
         filter_user_id=filter_user_id,
         period=period,
         request_type=request_type,
+        status=status,
     )
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -5912,32 +5983,8 @@ async def show_ai_log_detail(
 
 
 def _build_ai_log_file_content(log_entry: AILog) -> str:
-    request_preview = log_entry.request_payload or "не зафиксирован"
-    return (
-        f"========================================\n"
-        f"AI LOG RECORD #{log_entry.id}\n"
-        f"========================================\n"
-        f"Timestamp: {log_entry.created_at}\n"
-        f"User ID: {_ai_log_display_user_id(log_entry)}\n"
-        f"Request type: {getattr(log_entry, 'request_type', 'chat')}\n"
-        f"Platform: {_ai_log_platform_label(log_entry)}\n"
-        f"Context: {ai_log_context_label(log_entry)}\n"
-        f"Provider: {log_entry.provider}\n"
-        f"Model: {log_entry.model}\n"
-        f"Latency: {log_entry.latency_ms} ms\n"
-        f"========================================\n\n"
-        f"📤 [1] FULL REQUEST PAYLOAD:\n"
-        f"----------------------------------------\n"
-        f"{request_preview}\n\n"
-        f"========================================\n"
-        f"🤖 [2] RAW RESPONSE FROM LLM:\n"
-        f"----------------------------------------\n"
-        f"{log_entry.raw_response or ''}\n\n"
-        f"========================================\n"
-        f"💬 [3] CLEAN TEXT SENT TO USER:\n"
-        f"----------------------------------------\n"
-        f"{log_entry.clean_text or ''}\n"
-    )
+    from ai_log_context import build_ai_attempt_txt_file
+    return build_ai_attempt_txt_file(log_entry)
 
 
 async def send_ai_log_file(callback: CallbackQuery, log_id: int):
@@ -5962,12 +6009,15 @@ async def export_ai_logs_package(callback: CallbackQuery):
     parts = callback.data.split("_")
     filter_user_id = int(parts[3]) or None
     period = parts[4] if len(parts) > 4 and parts[4] in AI_LOG_PERIOD_LABELS else "all"
+    request_type = parts[5] if len(parts) > 5 else "all"
+    status = parts[6] if len(parts) > 6 else "all"
     async with async_session_maker() as session:
         stmt = _apply_ai_log_filters(
             select(AILog).order_by(AILog.created_at.desc()),
             filter_user_id=filter_user_id,
             period=period,
-            request_type=parts[5] if len(parts) > 5 else "all",
+            request_type=request_type,
+            status=status,
         )
         logs = (await session.execute(stmt)).scalars().all()
     if not logs:
@@ -5983,12 +6033,18 @@ async def export_ai_logs_package(callback: CallbackQuery):
             archive.writestr(filename, _build_ai_log_file_content(log_entry))
             manifest.append({
                 "id": log_entry.id,
+                "status": getattr(log_entry, "status", None) or "success",
+                "request_group_id": getattr(log_entry, "request_group_id", None),
+                "attempt_no": getattr(log_entry, "attempt_no", None) or 1,
+                "attempt_role": getattr(log_entry, "attempt_role", None) or "primary",
                 "created_at": log_entry.created_at.isoformat() if log_entry.created_at else None,
                 "user_id": _ai_log_display_user_id(log_entry),
                 "platform": _ai_log_platform_label(log_entry),
                 "provider": log_entry.provider,
                 "model": log_entry.model,
                 "latency_ms": log_entry.latency_ms,
+                "error_type": getattr(log_entry, "error_type", None),
+                "error_classification": getattr(log_entry, "error_classification", None),
                 "file": filename,
             })
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))

@@ -1053,7 +1053,7 @@ class MaxBotApplication:
             if data.startswith("admin_ai_log_"):
                 await self.client.answer_callback(callback.callback_id)
                 parts = data.split("_")
-                if len(parts) != 8:
+                if len(parts) not in {8, 9}:
                     log.warning("Malformed admin_ai_log detail callback payload: %s", data)
                     return
                 try:
@@ -1062,10 +1062,11 @@ class MaxBotApplication:
                     filter_user_id = int(parts[5]) if int(parts[5]) else None
                     period = parts[6]
                     request_type = parts[7]
+                    status = parts[8] if len(parts) > 8 else "all"
                 except ValueError:
                     log.warning("Malformed admin_ai_log callback payload: %s", data)
                     return
-                if not admin_ai_logs_service.validate_filters(period, request_type) or page < 0:
+                if not admin_ai_logs_service.validate_filters(period, request_type, status) or page < 0:
                     log.warning("Invalid filter values in admin_ai_log callback payload: %s", data)
                     await self.client.send_message(chat_id=chat_id, text="Некорректные параметры фильтра логов.")
                     return
@@ -1077,12 +1078,13 @@ class MaxBotApplication:
                     filter_user_id=filter_user_id,
                     period=period,
                     request_type=request_type,
+                    status=status,
                 )
                 return
             if data.startswith("admin_user_ai_logs_"):
                 await self.client.answer_callback(callback.callback_id)
                 parts = data.split("_")
-                if len(parts) != 8:
+                if len(parts) not in {8, 9}:
                     log.warning("Malformed admin_user_ai_logs callback payload: %s", data)
                     return
                 try:
@@ -1090,10 +1092,11 @@ class MaxBotApplication:
                     page = int(parts[5])
                     period = parts[6]
                     request_type = parts[7]
+                    status = parts[8] if len(parts) > 8 else "all"
                 except ValueError:
                     log.warning("Malformed admin_user_ai_logs callback payload: %s", data)
                     return
-                if not admin_ai_logs_service.validate_filters(period, request_type) or page < 0:
+                if not admin_ai_logs_service.validate_filters(period, request_type, status) or page < 0:
                     log.warning("Invalid filter values in admin_user_ai_logs callback payload: %s", data)
                     await self.client.send_message(chat_id=chat_id, text="Некорректные параметры фильтра логов.")
                     return
@@ -1104,22 +1107,24 @@ class MaxBotApplication:
                     filter_user_id=target_user_id,
                     period=period,
                     request_type=request_type,
+                    status=status,
                 )
                 return
             if data.startswith("admin_ai_logs_"):
                 await self.client.answer_callback(callback.callback_id)
                 parts = data.split("_")
-                if len(parts) != 6:
+                if len(parts) not in {6, 7}:
                     log.warning("Malformed admin_ai_logs callback payload: %s", data)
                     return
                 try:
                     page = int(parts[3])
                     period = parts[4]
                     request_type = parts[5]
+                    status = parts[6] if len(parts) > 6 else "all"
                 except ValueError:
                     log.warning("Malformed admin_ai_logs callback payload: %s", data)
                     return
-                if not admin_ai_logs_service.validate_filters(period, request_type) or page < 0:
+                if not admin_ai_logs_service.validate_filters(period, request_type, status) or page < 0:
                     log.warning("Invalid filter values in admin_ai_logs callback payload: %s", data)
                     await self.client.send_message(chat_id=chat_id, text="Некорректные параметры фильтра логов.")
                     return
@@ -1129,22 +1134,24 @@ class MaxBotApplication:
                     page=page,
                     period=period,
                     request_type=request_type,
+                    status=status,
                 )
                 return
             if data.startswith("export_ai_logs_"):
                 await self.client.answer_callback(callback.callback_id)
                 parts = data.split("_")
-                if len(parts) != 6:
+                if len(parts) not in {6, 7}:
                     log.warning("Malformed export_ai_logs callback payload: %s", data)
                     return
                 try:
                     filter_user_id = int(parts[3]) if int(parts[3]) else None
                     period = parts[4]
                     request_type = parts[5]
+                    status = parts[6] if len(parts) > 6 else "all"
                 except ValueError:
                     log.warning("Malformed export_ai_logs callback payload: %s", data)
                     return
-                if not admin_ai_logs_service.validate_filters(period, request_type):
+                if not admin_ai_logs_service.validate_filters(period, request_type, status):
                     log.warning("Invalid filter values in export_ai_logs callback payload: %s", data)
                     await self.client.send_message(chat_id=chat_id, text="Некорректные параметры фильтра для экспорта логов.")
                     return
@@ -1154,6 +1161,7 @@ class MaxBotApplication:
                     filter_user_id=filter_user_id,
                     period=period,
                     request_type=request_type,
+                    status=status,
                 )
                 return
             if data == "admin_clients":

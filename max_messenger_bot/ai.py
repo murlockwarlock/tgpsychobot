@@ -21,7 +21,7 @@ from sqlalchemy.orm import selectinload
 import gemini_image
 
 from prompt_blocks import MAX_CAPABILITIES
-from ai_log_context import apply_ai_log_context
+from ai_log_context import apply_ai_log_context, record_ai_attempt_log
 from ai_request_builder import (
     ActivityTracker,
     build_conversational_request_layout,
@@ -35,7 +35,13 @@ from automation_engine import apply_service_data_blocks, build_runtime_automatio
 from user_metadata import extract_service_data
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, get_memory_mode, normalize_memory_mode
 from result_history import ai_history_role_filter, select_ai_history_messages
-from error_reporting import classify_ai_error, exception_summary
+from error_reporting import (
+    classify_ai_error,
+    exception_summary,
+    extract_error_metadata,
+    send_output_budget_exhausted_alert,
+    send_terminal_ai_failure_alert,
+)
 from vector_store import search_relevant_chunks
 from provider_models import (
     CLAUDE_CHAT_MAX_TOKENS,
@@ -93,8 +99,12 @@ class InsufficientBalanceError(AIServiceError):
 
 def _validate_text_response(response_text: object, *, provider: str) -> str:
     if not isinstance(response_text, str) or not response_text.strip():
-        raise AIResponseError(f"{provider} returned an empty or invalid text response")
+        err = AIResponseError(f"{provider} returned an empty or invalid text response")
+        err.provider_response_payload = str(response_text) if response_text else None
+        err.classification = "empty_response"
+        raise err
     return response_text
+
 
 
 def _resolve_temperature(config, default: float = 0.7) -> float:
@@ -287,6 +297,19 @@ async def _call_deepseek(
     response = await client.chat.completions.create(
         **payload,
     )
+    raw_payload_str = None
+    try:
+        if hasattr(response, "model_dump_json"):
+            raw_payload_str = response.model_dump_json()
+        elif hasattr(response, "to_dict"):
+            raw_payload_str = json.dumps(response.to_dict(), default=str)
+        elif isinstance(response, dict):
+            raw_payload_str = json.dumps(response, default=str)
+        else:
+            raw_payload_str = str(response)
+    except Exception:
+        raw_payload_str = str(response)
+
     visible_content, diagnostics = inspect_deepseek_response(
         response,
         model=normalized_model,
@@ -312,10 +335,24 @@ async def _call_deepseek(
         return visible_content
 
     if diagnostics.output_budget_exhausted:
-        raise AIResponseError(
+        err = AIResponseError(
             f"Deepseek returned empty content (output budget exhausted: finish_reason={diagnostics.finish_reason}, reasoning_len={diagnostics.reasoning_content_length})"
         )
-    raise AIResponseError("Deepseek returned an empty or invalid text response")
+        err.http_status = 200
+        err.finish_reason = diagnostics.finish_reason
+        err.diagnostics = diagnostics
+        err.provider_response_payload = raw_payload_str
+        err.classification = "output_budget_exhausted"
+        raise err
+
+    err = AIResponseError("Deepseek returned an empty or invalid text response")
+    err.http_status = 200
+    err.finish_reason = diagnostics.finish_reason
+    err.diagnostics = diagnostics
+    err.provider_response_payload = raw_payload_str
+    err.classification = "empty_response"
+    raise err
+
 
 
 async def _call_claude(
@@ -1105,24 +1142,108 @@ async def get_ai_response(
             service_capabilities=MAX_CAPABILITIES,
         )
         temperature = _resolve_temperature(ai_config)
-        start_time = time.monotonic()
-        request_capture: dict = {}
+        request_group_id = uuid.uuid4().hex[:12]
+        primary_capture: dict = {}
+        fallback_capture: dict = {}
+        primary_start = time.monotonic()
+        primary_succeeded = False
+        primary_log_id = None
+        fb_log_id = None
+
         try:
             result = await _dispatch_provider(
                 ai_config,
                 request_layout,
-                request_capture=request_capture,
+                request_capture=primary_capture,
                 activity_tracker=activity_tracker,
             )
+            primary_latency = int((time.monotonic() - primary_start) * 1000)
             actual_provider, actual_model = _extract_effective_provider_and_model(
-                request_capture,
+                primary_capture,
                 default_provider=actual_provider,
                 default_model=actual_model,
             )
+            visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+            if invalid_data_blocks:
+                log.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+
+            primary_log_id = await record_ai_attempt_log(
+                session,
+                user_id=user_id,
+                platform="max",
+                dialogue_id=active_dialogue_id,
+                topic_id=active_topic_id,
+                topic_name=active_topic.name if active_topic else None,
+                request_type=request_type or "chat",
+                provider=actual_provider,
+                model=actual_model,
+                prompt_summary=user_prompt if user_prompt else None,
+                request_capture=primary_capture,
+                raw_response=result,
+                clean_text=visible_text,
+                latency_ms=primary_latency,
+                status="success",
+                request_group_id=request_group_id,
+                attempt_no=1,
+                attempt_role="primary",
+            )
+            primary_succeeded = True
             log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, actual_provider, active_topic_id)
         except (AIServiceError, Exception) as primary_err:
-            # Clear request_capture so failed attempt payload is not retained
-            request_capture.clear()
+            primary_latency = int((time.monotonic() - primary_start) * 1000)
+            primary_prov, primary_mod = _extract_effective_provider_and_model(
+                primary_capture,
+                default_provider=actual_provider,
+                default_model=actual_model,
+            )
+            err_meta = extract_error_metadata(primary_err, provider=primary_prov)
+            primary_log_id = await record_ai_attempt_log(
+                session,
+                user_id=user_id,
+                platform="max",
+                dialogue_id=active_dialogue_id,
+                topic_id=active_topic_id,
+                topic_name=active_topic.name if active_topic else None,
+                request_type=request_type or "chat",
+                provider=primary_prov,
+                model=primary_mod,
+                prompt_summary=user_prompt if user_prompt else None,
+                request_capture=primary_capture,
+                raw_response="",
+                latency_ms=primary_latency,
+                status="error",
+                request_group_id=request_group_id,
+                attempt_no=1,
+                attempt_role="primary",
+                error_type=err_meta["error_type"],
+                error_message=err_meta["error_message"],
+                error_classification=err_meta["error_classification"],
+                http_status=err_meta["http_status"],
+                finish_reason=err_meta["finish_reason"],
+                diagnostics=err_meta["diagnostics"],
+                provider_response_payload=err_meta["provider_response_payload"],
+            )
+
+            # Check output budget exhausted alert on primary
+            if (
+                getattr(primary_err, "classification", None) == "output_budget_exhausted"
+                or err_meta["error_classification"] == "output_budget_exhausted"
+                or (err_meta["diagnostics"] and getattr(err_meta["diagnostics"], "output_budget_exhausted", False))
+            ):
+                diag = err_meta["diagnostics"]
+                await send_output_budget_exhausted_alert(
+                    bot=None,
+                    platform="max",
+                    user_id=user_id,
+                    provider=primary_prov,
+                    model=primary_mod,
+                    finish_reason=getattr(diag, "finish_reason", "length") if diag else "length",
+                    visible_content_length=getattr(diag, "visible_content_length", 0) if diag else 0,
+                    reasoning_content_length=getattr(diag, "reasoning_content_length", 0) if diag else 0,
+                    max_tokens=DEEPSEEK_CHAT_MAX_TOKENS,
+                    ai_log_id=primary_log_id,
+                )
+
             # Try fallback provider if configured
             fb_provider = getattr(ai_config, "fallback_provider", None)
             fb_model = getattr(ai_config, "fallback_model", None)
@@ -1136,33 +1257,34 @@ async def get_ai_response(
                     fb_api_key = getattr(ai_config, f"{fb_key}_api_key", None)
                 if fb_api_key:
                     log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
+                    fb_start = time.monotonic()
                     try:
                         if fb_key == "openai":
                             result = await _call_openai(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
-                                request_capture=request_capture,
+                                request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         elif fb_key in {"claude", "anthropic"}:
                             result = await _call_claude(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
-                                request_capture=request_capture,
+                                request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         elif fb_key == "gemini":
                             result = await _call_gemini(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
-                                request_capture=request_capture,
+                                request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         elif fb_key == "deepseek":
                             result = await _call_deepseek(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
-                                request_capture=request_capture,
+                                request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         elif fb_key == "kie":
@@ -1170,56 +1292,120 @@ async def get_ai_response(
                                 fb_api_key, _get_kie_base_url(ai_config), fb_model, [],
                                 stable_system_prompt, temperature,
                                 request_layout=request_layout,
-                                request_capture=request_capture,
+                                request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
                         result = _validate_text_response(result, provider=fb_key)
+                        fb_latency = int((time.monotonic() - fb_start) * 1000)
                         actual_provider, actual_model = _extract_effective_provider_and_model(
-                            request_capture,
+                            fallback_capture,
                             default_provider=str(fb_provider),
                             default_model=str(fb_model),
+                        )
+                        visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+                        if invalid_data_blocks:
+                            log.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+
+                        fb_log_id = await record_ai_attempt_log(
+                            session,
+                            user_id=user_id,
+                            platform="max",
+                            dialogue_id=active_dialogue_id,
+                            topic_id=active_topic_id,
+                            topic_name=active_topic.name if active_topic else None,
+                            request_type=request_type or "chat",
+                            provider=actual_provider,
+                            model=actual_model,
+                            prompt_summary=user_prompt if user_prompt else None,
+                            request_capture=fallback_capture,
+                            raw_response=result,
+                            clean_text=visible_text,
+                            latency_ms=fb_latency,
+                            status="success",
+                            request_group_id=request_group_id,
+                            attempt_no=2,
+                            attempt_role="fallback",
                         )
                         fallback_succeeded = True
                         log.info("Fallback response generated user_id=%s provider=%s", user_id, actual_provider)
                     except Exception as fb_err:
-                        request_capture.clear()
+                        fb_latency = int((time.monotonic() - fb_start) * 1000)
+                        fb_prov, fb_mod = _extract_effective_provider_and_model(
+                            fallback_capture,
+                            default_provider=str(fb_provider),
+                            default_model=str(fb_model),
+                        )
+                        fb_err_meta = extract_error_metadata(fb_err, provider=fb_prov)
+                        fb_log_id = await record_ai_attempt_log(
+                            session,
+                            user_id=user_id,
+                            platform="max",
+                            dialogue_id=active_dialogue_id,
+                            topic_id=active_topic_id,
+                            topic_name=active_topic.name if active_topic else None,
+                            request_type=request_type or "chat",
+                            provider=fb_prov,
+                            model=fb_mod,
+                            prompt_summary=user_prompt if user_prompt else None,
+                            request_capture=fallback_capture,
+                            raw_response="",
+                            latency_ms=fb_latency,
+                            status="error",
+                            request_group_id=request_group_id,
+                            attempt_no=2,
+                            attempt_role="fallback",
+                            error_type=fb_err_meta["error_type"],
+                            error_message=fb_err_meta["error_message"],
+                            error_classification=fb_err_meta["error_classification"],
+                            http_status=fb_err_meta["http_status"],
+                            finish_reason=fb_err_meta["finish_reason"],
+                            diagnostics=fb_err_meta["diagnostics"],
+                            provider_response_payload=fb_err_meta["provider_response_payload"],
+                        )
                         log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
-                        raise AIServiceError(
+                        ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None]
+                        await send_terminal_ai_failure_alert(
+                            bot=None,
+                            platform="max",
+                            user_id=user_id,
+                            primary_provider=primary_prov,
+                            primary_model=primary_mod,
+                            fallback_provider=fb_prov,
+                            fallback_model=fb_mod,
+                            exception=fb_err,
+                            classification=fb_err_meta["error_classification"],
+                            ai_log_ids=ai_log_ids if ai_log_ids else None,
+                        )
+                        service_err = AIServiceError(
                             f"Основной провайдер ({ai_config.provider}) и резервный ({fb_provider}) недоступны"
-                        ) from fb_err
+                        )
+                        service_err.ai_log_ids = ai_log_ids
+                        raise service_err from fb_err
+
             if not fallback_succeeded:
-                request_capture.clear()
+                ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None]
+                await send_terminal_ai_failure_alert(
+                    bot=None,
+                    platform="max",
+                    user_id=user_id,
+                    primary_provider=primary_prov,
+                    primary_model=primary_mod,
+                    fallback_provider=fb_provider,
+                    fallback_model=fb_model,
+                    exception=primary_err,
+                    classification=err_meta["error_classification"],
+                    ai_log_ids=ai_log_ids if ai_log_ids else None,
+                )
                 if isinstance(primary_err, AIServiceError):
                     log.exception("AI request failed user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
+                    primary_err.ai_log_ids = ai_log_ids
                     raise
                 log.exception("Unexpected AI request failure user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
-                raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}") from primary_err
-
-        latency_ms = int((time.monotonic() - start_time) * 1000)
-        visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
-        if invalid_data_blocks:
-            log.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
-
-        ai_log = AILog(
-            user_id=user_id,
-            request_type=(request_type or "chat").strip().lower(),
-            provider=actual_provider,
-            model=actual_model,
-            prompt_summary=user_prompt if user_prompt else None,
-            request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2) if request_capture else None,
-            raw_response=result,
-            clean_text=visible_text,
-            latency_ms=latency_ms,
-        )
-        apply_ai_log_context(
-            ai_log,
-            platform="max",
-            topic_id=active_topic_id,
-            topic_name=active_topic.name if active_topic else None,
-        )
-        session.add(ai_log)
+                service_err = AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}")
+                service_err.ai_log_ids = ai_log_ids
+                raise service_err from primary_err
 
         if service_blocks:
             try:
@@ -1233,13 +1419,8 @@ async def get_ai_response(
                 await session.commit()
             except Exception as exc:
                 await session.rollback()
-                log.exception("Could not save shared AI log / service data for user %s: %s", user_id, exc)
+                log.exception("Could not save shared AI service data for user %s: %s", user_id, exc)
                 raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
-        else:
-            try:
-                await session.commit()
-            except Exception:
-                log.exception("Could not save shared AI log for user %s", user_id)
 
         return visible_text
 

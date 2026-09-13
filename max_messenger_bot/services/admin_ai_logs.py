@@ -9,7 +9,7 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from ..api import MaxApiClient, MaxApiError
 from ..identity import is_max_user_id, max_public_name, max_username, raw_max_user_id
@@ -17,7 +17,7 @@ from ..keyboards import admin_ai_log_detail_keyboard, admin_ai_logs_keyboard
 from ..legacy import AILog, User, async_session_maker
 from ..logging_utils import get_bot_logger
 from ..time_utils import format_msk
-from ai_log_context import ai_log_context_label
+from ai_log_context import ai_log_context_label, build_ai_attempt_txt_file
 
 log = get_bot_logger("admin_ai_logs")
 
@@ -28,6 +28,7 @@ MAX_EXPORT_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
 
 VALID_PERIODS = frozenset({"all", "today", "7d", "30d"})
 VALID_REQUEST_TYPES = frozenset({"all", "chat", "followup"})
+VALID_STATUSES = frozenset({"all", "success", "error"})
 
 AI_LOG_PERIOD_LABELS = {
     "all": "всё время",
@@ -42,9 +43,15 @@ AI_LOG_TYPE_LABELS = {
     "followup": "догоняющие",
 }
 
+AI_LOG_STATUS_LABELS = {
+    "all": "все статусы",
+    "success": "успешные",
+    "error": "с ошибками",
+}
 
-def validate_filters(period: str, request_type: str) -> bool:
-    return period in VALID_PERIODS and request_type in VALID_REQUEST_TYPES
+
+def validate_filters(period: str, request_type: str, status: str = "all") -> bool:
+    return period in VALID_PERIODS and request_type in VALID_REQUEST_TYPES and status in VALID_STATUSES
 
 
 def _ai_log_platform(log_entry: AILog) -> str | None:
@@ -84,7 +91,14 @@ def _ai_log_period_start(period: str) -> datetime | None:
     return None
 
 
-def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str, request_type: str = "all"):
+def _apply_ai_log_filters(
+    query,
+    *,
+    filter_user_id: int | None,
+    period: str,
+    request_type: str = "all",
+    status: str = "all",
+):
     if filter_user_id:
         query = query.where(AILog.user_id == filter_user_id)
     period_start = _ai_log_period_start(period)
@@ -92,36 +106,15 @@ def _apply_ai_log_filters(query, *, filter_user_id: int | None, period: str, req
         query = query.where(AILog.created_at >= period_start)
     if request_type in AI_LOG_TYPE_LABELS and request_type != "all":
         query = query.where(AILog.request_type == request_type)
+    if status == "success":
+        query = query.where(or_(AILog.status == "success", AILog.status == None))
+    elif status == "error":
+        query = query.where(AILog.status == "error")
     return query
 
 
 def _build_ai_log_file_content(log_entry: AILog) -> str:
-    request_preview = log_entry.request_payload or "не зафиксирован"
-    return (
-        f"========================================\n"
-        f"AI LOG RECORD #{log_entry.id}\n"
-        f"========================================\n"
-        f"Timestamp: {log_entry.created_at}\n"
-        f"User ID: {_ai_log_display_user_id(log_entry)}\n"
-        f"Request type: {getattr(log_entry, 'request_type', 'chat')}\n"
-        f"Platform: {_ai_log_platform_label(log_entry)}\n"
-        f"Context: {ai_log_context_label(log_entry)}\n"
-        f"Provider: {log_entry.provider}\n"
-        f"Model: {log_entry.model}\n"
-        f"Latency: {log_entry.latency_ms} ms\n"
-        f"========================================\n\n"
-        f"📤 [1] FULL REQUEST PAYLOAD:\n"
-        f"----------------------------------------\n"
-        f"{request_preview}\n\n"
-        f"========================================\n"
-        f"🤖 [2] RAW RESPONSE FROM LLM:\n"
-        f"----------------------------------------\n"
-        f"{log_entry.raw_response or ''}\n\n"
-        f"========================================\n"
-        f"💬 [3] CLEAN TEXT SENT TO USER:\n"
-        f"----------------------------------------\n"
-        f"{log_entry.clean_text or ''}\n"
-    )
+    return build_ai_attempt_txt_file(log_entry)
 
 
 def _safe_truncate_escaped(raw_text: str, max_escaped_len: int, truncation_suffix: str = "...") -> str:
@@ -206,13 +199,106 @@ def _format_bounded_detail_text(log_entry: AILog, user: User | None) -> str:
     model_str = _esc_meta(log_entry.model, 60, "—")
     type_str = _esc_meta(AI_LOG_TYPE_LABELS.get(log_type, log_type), 40, log_type)
 
+    log_status = getattr(log_entry, "status", None) or "success"
+    attempt_no = getattr(log_entry, "attempt_no", None) or 1
+    attempt_role = getattr(log_entry, "attempt_role", None) or "primary"
+    attempt_role_label = "primary" if attempt_role == "primary" else "fallback"
+    group_id = getattr(log_entry, "request_group_id", None)
+    group_line = f"🔗 <b>Группа запроса:</b> <code>{group_id}</code>\n" if group_id else ""
+
+    if log_status == "error":
+        err_type = _esc_meta(getattr(log_entry, "error_type", None), 60, "UnknownError")
+        err_msg = _safe_truncate_escaped(getattr(log_entry, "error_message", None) or "не указано", 500, "...")
+        err_cls = _esc_meta(getattr(log_entry, "error_classification", None), 60, "не классифицировано")
+
+        header_text = (
+            f"❌ <b>Ошибка вызова ИИ #{log_entry.id}</b>\n\n"
+            + "\n".join(identity_lines)
+            + "\n"
+            f"🧾 <b>Тип запроса:</b> {type_str}\n"
+            f"📍 <b>Контекст:</b> {context_str}\n"
+            f"{group_line}"
+            f"🤖 <b>Провайдер:</b> <b>{provider_str}</b> (Попытка {attempt_no} / {attempt_role_label})\n"
+            f"🧠 <b>Модель:</b> <code>{model_str}</code>\n"
+            f"⏱ <b>Время до ошибки:</b> <code>{lat_text}</code>\n"
+            f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
+            f"🚨 <b>Ошибка приложения:</b>\n"
+            f"<code>{err_type}</code>: <code>{err_msg}</code>\n\n"
+            f"🏷 <b>Классификация ошибки:</b>\n"
+            f"<code>{err_cls}</code>\n\n"
+        )
+        diag_json = getattr(log_entry, "diagnostics_json", None)
+        if diag_json:
+            diag_preview = _safe_truncate_escaped(diag_json, 500, "...")
+            header_text += f"🔬 <b>Диагностика:</b>\n<code>{diag_preview}</code>\n\n"
+
+        section1_prefix = "📤 <b>Полный payload запроса (превью):</b>\n<code>"
+        section1_suffix = "</code>\n\n"
+        section2_prefix = "📥 <b>Сырой ответ провайдера (Raw Response / Payload):</b>\n<code>"
+        section2_suffix = "</code>"
+
+        overhead = (
+            len(header_text)
+            + len(section1_prefix) + len(section1_suffix)
+            + len(section2_prefix) + len(section2_suffix)
+        )
+        available_budget = max(90, MAX_AI_LOG_DETAIL_TEXT_LIMIT - overhead)
+
+        raw_payload = log_entry.request_payload
+        raw_response = getattr(log_entry, "provider_response_payload", None) or log_entry.raw_response or ""
+
+        if not raw_payload:
+            payload_preview = "не зафиксирован"
+            payload_cost = len(payload_preview)
+        else:
+            max_p = min(700, max(30, int(available_budget * 0.35)))
+            payload_preview = _safe_truncate_escaped(raw_payload, max_p, "...")
+            payload_cost = len(payload_preview)
+
+        rem_after_payload = max(40, available_budget - payload_cost)
+        raw_preview = _safe_truncate_escaped(
+            raw_response,
+            rem_after_payload,
+            "\n\n[...] (Полный сырой файл скачайте по кнопке ниже)",
+        )
+
+        final_text = (
+            header_text
+            + section1_prefix
+            + payload_preview
+            + section1_suffix
+            + section2_prefix
+            + raw_preview
+            + section2_suffix
+        )
+
+        if len(final_text) > MAX_AI_LOG_DETAIL_TEXT_LIMIT:
+            excess = len(final_text) - MAX_AI_LOG_DETAIL_TEXT_LIMIT
+            tighter_raw_budget = max(10, rem_after_payload - excess)
+            raw_preview = _safe_truncate_escaped(
+                raw_response,
+                tighter_raw_budget,
+                "\n\n[...] (Полный сырой файл скачайте по кнопке ниже)",
+            )
+            final_text = (
+                header_text
+                + section1_prefix
+                + payload_preview
+                + section1_suffix
+                + section2_prefix
+                + raw_preview
+                + section2_suffix
+            )
+        return final_text
+
     header_text = (
         f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
         + "\n".join(identity_lines)
         + "\n"
         f"🧾 <b>Тип запроса:</b> {type_str}\n"
         f"📍 <b>Контекст:</b> {context_str}\n"
-        f"🤖 <b>Провайдер:</b> <b>{provider_str}</b>\n"
+        f"{group_line}"
+        f"🤖 <b>Провайдер:</b> <b>{provider_str}</b> (Попытка {attempt_no} / {attempt_role_label})\n"
         f"🧠 <b>Модель:</b> <code>{model_str}</code>\n"
         f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
         f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
@@ -322,9 +408,10 @@ async def show_ai_logs_list(
     filter_user_id: int | None = None,
     period: str = "all",
     request_type: str = "all",
+    status: str = "all",
 ) -> None:
-    if period not in VALID_PERIODS or request_type not in VALID_REQUEST_TYPES:
-        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}'")
+    if not validate_filters(period=period, request_type=request_type, status=status):
+        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}', status='{status}'")
 
     async with async_session_maker() as session:
         query = _apply_ai_log_filters(
@@ -332,6 +419,7 @@ async def show_ai_logs_list(
             filter_user_id=filter_user_id,
             period=period,
             request_type=request_type,
+            status=status,
         )
 
         count_query = select(func.count()).select_from(query.subquery())
@@ -351,6 +439,7 @@ async def show_ai_logs_list(
             filter_user_id=filter_user_id,
             period=period,
             request_type=request_type,
+            status=status,
         )
         await client.send_message(chat_id=chat_id, text=text, attachments=markup)
         return
@@ -360,6 +449,7 @@ async def show_ai_logs_list(
         f"📜 <b>Логи вызовов ИИ{filter_text}</b> (Стр. {page + 1}/{total_pages})\n\n"
         f"Период: <b>{AI_LOG_PERIOD_LABELS[period]}</b>\n"
         f"Тип: <b>{AI_LOG_TYPE_LABELS[request_type]}</b>\n"
+        f"Статус: <b>{AI_LOG_STATUS_LABELS[status]}</b>\n"
         f"Всего вызовов: <b>{total_count}</b>\nВыберите запись:"
     )
 
@@ -370,6 +460,7 @@ async def show_ai_logs_list(
         filter_user_id=filter_user_id,
         period=period,
         request_type=request_type,
+        status=status,
     )
     await client.send_message(chat_id=chat_id, text=header, attachments=markup)
 
@@ -382,9 +473,10 @@ async def show_ai_log_detail(
     filter_user_id: int | None = None,
     period: str = "all",
     request_type: str = "all",
+    status: str = "all",
 ) -> None:
-    if period not in VALID_PERIODS or request_type not in VALID_REQUEST_TYPES:
-        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}'")
+    if not validate_filters(period=period, request_type=request_type, status=status):
+        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}', status='{status}'")
 
     async with async_session_maker() as session:
         log_entry = await session.get(AILog, log_id)
@@ -401,6 +493,7 @@ async def show_ai_log_detail(
         filter_user_id=filter_user_id,
         period=period,
         request_type=request_type,
+        status=status,
     )
     await client.send_message(chat_id=chat_id, text=text, attachments=markup)
 
@@ -434,9 +527,10 @@ async def export_ai_logs_package(
     filter_user_id: int | None = None,
     period: str = "all",
     request_type: str = "all",
+    status: str = "all",
 ) -> None:
-    if period not in VALID_PERIODS or request_type not in VALID_REQUEST_TYPES:
-        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}'")
+    if not validate_filters(period=period, request_type=request_type, status=status):
+        raise ValueError(f"Invalid AI log filter period='{period}', request_type='{request_type}', status='{status}'")
 
     async with async_session_maker() as session:
         base_query = _apply_ai_log_filters(
@@ -444,6 +538,7 @@ async def export_ai_logs_package(
             filter_user_id=filter_user_id,
             period=period,
             request_type=request_type,
+            status=status,
         )
         count_query = select(func.count()).select_from(base_query.subquery())
         total_count = (await session.execute(count_query)).scalar() or 0
@@ -478,6 +573,13 @@ async def export_ai_logs_package(
                     "platform": platform or "unknown",
                     "provider": log_entry.provider,
                     "model": log_entry.model,
+                    "request_type": getattr(log_entry, "request_type", "chat") or "chat",
+                    "status": getattr(log_entry, "status", None) or "success",
+                    "request_group_id": getattr(log_entry, "request_group_id", None),
+                    "attempt_no": getattr(log_entry, "attempt_no", None) or 1,
+                    "attempt_role": getattr(log_entry, "attempt_role", None) or "primary",
+                    "error_type": getattr(log_entry, "error_type", None),
+                    "error_classification": getattr(log_entry, "error_classification", None),
                     "latency_ms": log_entry.latency_ms,
                     "file": filename,
                 }
@@ -534,7 +636,7 @@ async def export_ai_logs_package(
         else:
             limit_note = ""
 
-        caption = f"📦 Логи ИИ: {len(included_logs)} шт.{limit_note}, период — {AI_LOG_PERIOD_LABELS[period]}"
+        caption = f"📦 Логи ИИ: {len(included_logs)} шт.{limit_note}, период — {AI_LOG_PERIOD_LABELS[period]}, статус — {AI_LOG_STATUS_LABELS[status]}"
 
         await client.send_media_attachment(
             chat_id=chat_id,
@@ -551,3 +653,4 @@ async def export_ai_logs_package(
                 Path(tmp_path).unlink()
             except Exception:
                 pass
+

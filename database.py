@@ -130,6 +130,19 @@ class AILog(Base):
     latency_ms = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
+    status = Column(String, default='success', nullable=False, index=True)
+    request_group_id = Column(String, nullable=True, index=True)
+    attempt_no = Column(Integer, default=1, nullable=False)
+    attempt_role = Column(String, default='primary', nullable=False)
+    dialogue_id = Column(Integer, nullable=True)
+    error_type = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    error_classification = Column(String, nullable=True)
+    http_status = Column(Integer, nullable=True)
+    finish_reason = Column(String, nullable=True)
+    diagnostics_json = Column(Text, nullable=True)
+    provider_response_payload = Column(Text, nullable=True)
+
     user = relationship("User")
 
 
@@ -1144,6 +1157,36 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN topic_id INTEGER"))
             if 'topic_name_snapshot' not in ai_log_columns:
                 sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN topic_name_snapshot VARCHAR"))
+            if 'status' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN status VARCHAR DEFAULT 'success' NOT NULL"))
+            if 'request_group_id' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN request_group_id VARCHAR"))
+            if 'attempt_no' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN attempt_no INTEGER DEFAULT 1 NOT NULL"))
+            if 'attempt_role' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN attempt_role VARCHAR DEFAULT 'primary' NOT NULL"))
+            if 'dialogue_id' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN dialogue_id INTEGER"))
+            if 'error_type' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN error_type VARCHAR"))
+            if 'error_message' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN error_message TEXT"))
+            if 'error_classification' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN error_classification VARCHAR"))
+            if 'http_status' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN http_status INTEGER"))
+            if 'finish_reason' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN finish_reason VARCHAR"))
+            if 'diagnostics_json' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN diagnostics_json TEXT"))
+            if 'provider_response_payload' not in ai_log_columns:
+                sync_conn.execute(text("ALTER TABLE ai_logs ADD COLUMN provider_response_payload TEXT"))
+
+            try:
+                sync_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ai_logs_request_group ON ai_logs (request_group_id)"))
+            except Exception:
+                pass
+
 
             ai_columns = [c['name'] for c in insp.get_columns('ai_config')]
             if 'memory_mode' not in ai_columns:

@@ -434,7 +434,7 @@ async def test_max_fallback_chat_log_records_whole_provider_latency_and_fallback
     config.fallback_model = "gpt-fallback"
     config.allow_fallback = True
     session = _MaxAISession(user, config)
-    monotonic_values = iter((200.0, 201.25))
+    monotonic_values = iter((200.0, 200.5, 200.5, 201.75))
     primary_error = max_ai.AIServiceError("primary provider failed")
     monkeypatch.setattr(max_ai, "async_session_maker", lambda: _SessionContext(session))
     monkeypatch.setattr(automation_engine, "build_runtime_automation_context", AsyncMock(return_value=""))
@@ -445,7 +445,14 @@ async def test_max_fallback_chat_log_records_whole_provider_latency_and_fallback
     result = await max_ai.get_ai_response(user.id, "question")
 
     assert result == "fallback answer"
-    log_entry = session.added[0]
+    assert len(session.added) == 2
+    primary_log = session.added[0]
+    assert primary_log.status == "error"
+    assert primary_log.attempt_role == "primary"
+
+    log_entry = session.added[1]
+    assert log_entry.status == "success"
+    assert log_entry.attempt_role == "fallback"
     assert log_entry.provider == "OpenAI"
     assert log_entry.model == "gpt-fallback"
     assert log_entry.latency_ms == 1250
@@ -464,7 +471,9 @@ async def test_max_failed_chat_request_preserves_provider_error_and_does_not_cre
         await max_ai.get_ai_response(user.id, "question")
 
     assert raised.value is primary_error
-    assert session.added == []
+    assert len(session.added) == 1
+    assert session.added[0].status == "error"
+    assert session.added[0].attempt_role == "primary"
 
 
 @pytest.mark.asyncio
@@ -1132,8 +1141,12 @@ async def test_max_fallback_orchestration_persists_fallback_payload_only(monkeyp
     result = await max_ai.get_ai_response(user.id, "Вопрос для фолбэка")
 
     assert result == "Mocked OpenAI response"
-    assert len(session.added) == 1
-    log_entry = session.added[0]
+    assert len(session.added) == 2
+    assert session.added[0].status == "error"
+    assert session.added[0].attempt_role == "primary"
+    log_entry = session.added[1]
+    assert log_entry.status == "success"
+    assert log_entry.attempt_role == "fallback"
 
     # 1. Final provider and model correspond to fallback
     assert log_entry.provider == "OpenAI"
@@ -1194,8 +1207,12 @@ async def test_max_deepseek_fallback_legacy_alias_persists_normalized_model_and_
     result = await max_ai.get_ai_response(user.id, "Вопрос для DeepSeek фолбэка")
 
     assert result == "Mocked OpenAI response"
-    assert len(session.added) == 1
-    log_entry = session.added[0]
+    assert len(session.added) == 2
+    assert session.added[0].status == "error"
+    assert session.added[0].attempt_role == "primary"
+    log_entry = session.added[1]
+    assert log_entry.status == "success"
+    assert log_entry.attempt_role == "fallback"
 
     # 1. Final provider and model correspond to DeepSeek fallback
     assert log_entry.provider == "Deepseek"
