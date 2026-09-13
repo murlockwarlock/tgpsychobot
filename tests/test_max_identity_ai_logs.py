@@ -884,7 +884,7 @@ async def test_max_openai_request_payload_captured_and_sanitized(monkeypatch):
     assert parsed["provider"] == "OpenAI"
     assert parsed["endpoint"] == "https://api.openai.com/v1/chat/completions"
     assert parsed["payload"]["model"] == "gpt-5.6-terra"
-    assert parsed["payload"]["max_completion_tokens"] == 4096
+    assert parsed["payload"]["max_completion_tokens"] == 16384
     messages = parsed["payload"]["messages"]
     assert any(m["role"] == "user" and m["content"] == "Как дела?" for m in messages)
 
@@ -995,7 +995,7 @@ async def test_max_claude_request_payload_shape_and_sanitized(monkeypatch):
     assert parsed["provider"] == "Claude"
     assert parsed["endpoint"] == "https://api.anthropic.com/v1/messages"
     assert parsed["payload"]["model"] == "claude-sonnet-5"
-    assert parsed["payload"]["max_tokens"] == 4096
+    assert parsed["payload"]["max_tokens"] == 16384
     assert isinstance(parsed["payload"]["system"], list)
     assert any("Ты мудрый терапевт" in block.get("text", "") for block in parsed["payload"]["system"])
     assert parsed["payload"]["messages"][-1] == {"role": "user", "content": "Вопрос к Клоду"}
