@@ -344,3 +344,197 @@ class TestA1MaxTemporaryStatusLifecycle:
         assert len(client.events) == 2
         assert client.events[0] == ("send_message", "🎙 Распознаю голосовое сообщение...", "mid.thinking.123")
         assert client.events[1] == ("edit_message", "Произошла ошибка при распознавании аудио.", "mid.thinking.123")
+
+
+@pytest.mark.asyncio
+class TestA1MaxImageProgressBestEffort:
+    """Proves that image progress status delivery is best-effort and never gates image operations."""
+
+    async def test_chat_gen_img_with_visible_text_progress_send_failure_does_not_gate_image(self):
+        client = MockMaxClient(thinking_mid="mid.thinking.123")
+        orig_send = client.send_message
+        async def failing_send(chat_id, text, **kwargs):
+            if "Генерирую" in text:
+                raise RuntimeError("MAX transport unavailable for status send")
+            return await orig_send(chat_id, text, **kwargs)
+        client.send_message = failing_send
+
+        gen_mock = AsyncMock(return_value=b"fake_image_bytes")
+        with patch.object(common, "save_user_message", AsyncMock(return_value=None)), \
+             patch.object(common, "async_session_maker") as mock_session_maker, \
+             patch.object(common, "get_ai_response", AsyncMock(return_value="Красивый пейзаж.\nGEN_IMG: [лес]")), \
+             patch.object(common, "save_ai_message", AsyncMock()), \
+             patch.object(common, "generate_image", gen_mock):
+            mock_session = AsyncMock()
+            mock_session.get.return_value = None
+            mock_session_maker.return_value.__aenter__.return_value = mock_session
+
+            await common.run_ai_dialogue(client, chat_id=100, user_id=200, prompt_text="Нарисуй лес")
+
+        gen_mock.assert_awaited_once_with("лес")
+        upload_events = [e for e in client.events if e[0] == "upload_file"]
+        send_media_events = [e for e in client.events if e[0] == "send_media_attachment"]
+        assert len(upload_events) == 1
+        assert len(send_media_events) == 1
+
+    async def test_chat_gen_img_only_progress_edit_failure_does_not_gate_image_and_preserves_mid(self):
+        client = MockMaxClient(thinking_mid="mid.thinking.123")
+        orig_edit = client.edit_message
+        async def failing_edit(message_id, text, **kwargs):
+            if "Генерирую" in text:
+                raise RuntimeError("MAX transport unavailable for status edit")
+            return await orig_edit(message_id, text, **kwargs)
+        client.edit_message = failing_edit
+
+        gen_mock = AsyncMock(return_value=b"fake_image_bytes")
+        with patch.object(common, "save_user_message", AsyncMock(return_value=None)), \
+             patch.object(common, "async_session_maker") as mock_session_maker, \
+             patch.object(common, "get_ai_response", AsyncMock(return_value="GEN_IMG: [лес]")), \
+             patch.object(common, "save_ai_message", AsyncMock()), \
+             patch.object(common, "generate_image", gen_mock):
+            mock_session = AsyncMock()
+            mock_session.get.return_value = None
+            mock_session_maker.return_value.__aenter__.return_value = mock_session
+
+            await common.run_ai_dialogue(client, chat_id=100, user_id=200, prompt_text="Нарисуй лес")
+
+        gen_mock.assert_awaited_once_with("лес")
+        delete_events = [e for e in client.events if e[0] == "delete_message"]
+        assert any(e[1] == "mid.thinking.123" for e in delete_events)
+
+    async def test_hidden_kickoff_gen_img_progress_failure_does_not_gate_image(self):
+        client = MockMaxClient(thinking_mid="mid.thinking.kickoff")
+        orig_edit = client.edit_message
+        async def failing_edit(message_id, text, **kwargs):
+            if "Генерирую" in text:
+                raise RuntimeError("MAX transport edit failed")
+            return await orig_edit(message_id, text, **kwargs)
+        client.edit_message = failing_edit
+
+        gen_mock = AsyncMock(return_value=b"fake_image_bytes")
+        mock_user = MagicMock()
+        mock_user.current_dialogue_id = 1
+        mock_user.current_topic_id = None
+        mock_session = AsyncMock()
+        mock_session.get.return_value = mock_user
+
+        with patch.object(common, "save_user_message", AsyncMock(return_value=None)), \
+             patch.object(common, "async_session_maker") as mock_session_maker, \
+             patch.object(common, "get_ai_response", AsyncMock(return_value="GEN_IMG: [космос]")), \
+             patch.object(common, "save_ai_message", AsyncMock()), \
+             patch.object(common, "generate_image", gen_mock):
+            mock_session_maker.return_value.__aenter__.return_value = mock_session
+
+            await common.run_hidden_ai_kickoff(
+                client, chat_id=100, user_id=200, synthetic_prompt="[kickoff]",
+                expected_dialogue_id=1, expected_topic_id=None
+            )
+
+        gen_mock.assert_awaited_once_with("космос")
+        delete_events = [e for e in client.events if e[0] == "delete_message"]
+        assert any(e[1] == "mid.thinking.kickoff" for e in delete_events)
+
+    async def test_vision_edit_img_with_visible_text_progress_send_failure_does_not_gate_edit(self):
+        client = MockMaxClient(thinking_mid="mid.analyzing.123")
+        orig_send = client.send_message
+        async def failing_send(chat_id, text, **kwargs):
+            if "Редактирую" in text:
+                raise RuntimeError("MAX transport send edit status failed")
+            return await orig_send(chat_id, text, **kwargs)
+        client.send_message = failing_send
+
+        edit_mock = AsyncMock(return_value=b"fake_edited_bytes")
+        with patch.object(common, "async_session_maker") as mock_session_maker, \
+             patch("max_messenger_bot.ai.analyze_image", AsyncMock(return_value="Результат анализа.\nEDIT_IMG: [сделай ярче]")), \
+             patch.object(common, "save_ai_message", AsyncMock()), \
+             patch.object(common, "edit_image", edit_mock):
+            mock_session = AsyncMock()
+            mock_session.get.return_value = None
+            mock_session_maker.return_value.__aenter__.return_value = mock_session
+
+            await common.run_ai_dialogue_with_image(
+                client, chat_id=100, user_id=200, image_bytes=b"input_bytes", caption="Сделай ярче"
+            )
+
+        edit_mock.assert_awaited_once_with("[сделай ярче]", b"input_bytes")
+        send_media_events = [e for e in client.events if e[0] == "send_media_attachment"]
+        assert len(send_media_events) == 1
+
+    async def test_vision_edit_img_only_progress_edit_failure_does_not_gate_edit_and_preserves_mid(self):
+        client = MockMaxClient(thinking_mid="mid.analyzing.123")
+        orig_edit = client.edit_message
+        async def failing_edit(message_id, text, **kwargs):
+            if "Редактирую" in text:
+                raise RuntimeError("MAX transport edit status failed")
+            return await orig_edit(message_id, text, **kwargs)
+        client.edit_message = failing_edit
+
+        edit_mock = AsyncMock(return_value=b"fake_edited_bytes")
+        with patch.object(common, "async_session_maker") as mock_session_maker, \
+             patch("max_messenger_bot.ai.analyze_image", AsyncMock(return_value="EDIT_IMG: [сделай ярче]")), \
+             patch.object(common, "save_ai_message", AsyncMock()), \
+             patch.object(common, "edit_image", edit_mock):
+            mock_session = AsyncMock()
+            mock_session.get.return_value = None
+            mock_session_maker.return_value.__aenter__.return_value = mock_session
+
+            await common.run_ai_dialogue_with_image(
+                client, chat_id=100, user_id=200, image_bytes=b"input_bytes", caption="Сделай ярче"
+            )
+
+        edit_mock.assert_awaited_once_with("[сделай ярче]", b"input_bytes")
+        delete_events = [e for e in client.events if e[0] == "delete_message"]
+        assert any(e[1] == "mid.analyzing.123" for e in delete_events)
+
+    async def test_vision_gen_img_with_visible_text_progress_send_failure_does_not_gate_gen(self):
+        client = MockMaxClient(thinking_mid="mid.analyzing.123")
+        orig_send = client.send_message
+        async def failing_send(chat_id, text, **kwargs):
+            if "Генерирую" in text:
+                raise RuntimeError("MAX transport gen status failed")
+            return await orig_send(chat_id, text, **kwargs)
+        client.send_message = failing_send
+
+        gen_mock = AsyncMock(return_value=b"fake_gen_bytes")
+        with patch.object(common, "async_session_maker") as mock_session_maker, \
+             patch("max_messenger_bot.ai.analyze_image", AsyncMock(return_value="Текст анализа.\nGEN_IMG: [новый пейзаж]")), \
+             patch.object(common, "save_ai_message", AsyncMock()), \
+             patch.object(common, "generate_image", gen_mock):
+            mock_session = AsyncMock()
+            mock_session.get.return_value = None
+            mock_session_maker.return_value.__aenter__.return_value = mock_session
+
+            await common.run_ai_dialogue_with_image(
+                client, chat_id=100, user_id=200, image_bytes=b"input_bytes", caption="Сделай новое"
+            )
+
+        gen_mock.assert_awaited_once_with("[новый пейзаж]")
+        send_media_events = [e for e in client.events if e[0] == "send_media_attachment"]
+        assert len(send_media_events) == 1
+
+    async def test_vision_gen_img_only_progress_edit_failure_does_not_gate_gen_and_preserves_mid(self):
+        client = MockMaxClient(thinking_mid="mid.analyzing.456")
+        orig_edit = client.edit_message
+        async def failing_edit(message_id, text, **kwargs):
+            if "Генерирую" in text:
+                raise RuntimeError("MAX transport gen status edit failed")
+            return await orig_edit(message_id, text, **kwargs)
+        client.edit_message = failing_edit
+
+        gen_mock = AsyncMock(return_value=b"fake_gen_bytes")
+        with patch.object(common, "async_session_maker") as mock_session_maker, \
+             patch("max_messenger_bot.ai.analyze_image", AsyncMock(return_value="GEN_IMG: [новый пейзаж]")), \
+             patch.object(common, "save_ai_message", AsyncMock()), \
+             patch.object(common, "generate_image", gen_mock):
+            mock_session = AsyncMock()
+            mock_session.get.return_value = None
+            mock_session_maker.return_value.__aenter__.return_value = mock_session
+
+            await common.run_ai_dialogue_with_image(
+                client, chat_id=100, user_id=200, image_bytes=b"input_bytes", caption="Сделай новое"
+            )
+
+        gen_mock.assert_awaited_once_with("[новый пейзаж]")
+        delete_events = [e for e in client.events if e[0] == "delete_message"]
+        assert any(e[1] == "mid.analyzing.456" for e in delete_events)
+

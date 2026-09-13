@@ -212,6 +212,60 @@ class TestA1DataSanitization:
         assert len(blocks) == 0
         assert invalid == 2
 
+    def test_23_self_closing_data_marker_preserves_text_around_it(self):
+        cases = [
+            "Ответ до.\n<DATA/>\nОтвет после.",
+            "Ответ до.\n<DATA />\nОтвет после.",
+            "Ответ до.\n<data/>\nОтвет после.",
+            "Ответ до.\n<DaTa />\nОтвет после.",
+            "Ответ до.\n<DATA version=\"1\" />\nОтвет после.",
+        ]
+        for c in cases:
+            visible, blocks, invalid = extract_service_data(c)
+            assert visible == "Ответ до.\n\nОтвет после.", f"Failed on case: {c}"
+            assert len(blocks) == 0
+            assert invalid == 1
+
+    def test_24_self_closing_database_datax_remain_unchanged(self):
+        t1 = "Ответ до.\n<DATABASE/>\nОтвет после."
+        v1, b1, i1 = extract_service_data(t1)
+        assert v1 == "Ответ до.\n<DATABASE/>\nОтвет после."
+        assert len(b1) == 0
+        assert i1 == 0
+
+        t2 = "Ответ до.\n<DATAX/>\nОтвет после."
+        v2, b2, i2 = extract_service_data(t2)
+        assert v2 == "Ответ до.\n<DATAX/>\nОтвет после."
+        assert len(b2) == 0
+        assert i2 == 0
+
+    def test_25_four_plus_backticks_markdown_fence_incomplete_data(self):
+        # 4 backticks with json
+        t1 = "Visible\n````json\n<DATA>\n{\"metadata\":{\"x\":"
+        v1, _, i1 = extract_service_data(t1)
+        assert v1 == "Visible"
+        assert i1 == 1
+
+        # 4 backticks plain
+        t2 = "Visible\n````\n<DATA>\n{\"metadata\":{\"x\":"
+        v2, _, i2 = extract_service_data(t2)
+        assert v2 == "Visible"
+        assert i2 == 1
+
+        # 5 backticks
+        t3 = "Visible\n`````json\n<DATA>\n{\"metadata\":{\"x\":"
+        v3, _, i3 = extract_service_data(t3)
+        assert v3 == "Visible"
+        assert i3 == 1
+
+    def test_26_four_plus_backticks_earlier_code_block_remains_intact(self):
+        code_block = "````python\ndef foo():\n    return 42\n````"
+        tail = "\n````json\n<DATA>\n{\"metadata\":{\"x\":"
+        text = f"{code_block}{tail}"
+        visible, _, invalid = extract_service_data(text)
+        assert visible == code_block
+        assert invalid == 1
+
 
 class TestA1ResultHistoryAndIntegration:
     """Covers Section L: raw/clean/history proof, result_history safety, and provider request parity."""

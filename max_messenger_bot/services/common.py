@@ -782,6 +782,44 @@ async def save_ai_message(user_id: int, response_text: str, dialogue_id: int | N
         await session.commit()
 
 
+async def _transition_image_progress_status(
+    client: MaxApiClient,
+    chat_id: int,
+    status_text: str,
+    reusable_mid: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Transition to an image progress status (GEN_IMG / EDIT_IMG) without gating image work.
+
+    Returns:
+        (progress_mid, remaining_reusable_mid)
+
+    Semantics:
+    1. If reusable_mid is provided, we attempt to edit it into status_text.
+       - If edit succeeds: progress_mid = reusable_mid, remaining_reusable_mid = None.
+       - If edit fails: logs warning, STILL returns (reusable_mid, None) so that the
+         MID remains owned for later cleanup in finally.
+    2. If reusable_mid is None:
+       - We attempt to send a new status message with status_text.
+       - If send succeeds: progress_mid = extract_sent_message_id(sent).
+       - If send fails: logs warning, returns (None, None).
+    3. Failure never raises and never prevents image generation or editing.
+    """
+    if reusable_mid:
+        try:
+            await client.edit_message(reusable_mid, text=status_text)
+        except Exception as exc:
+            log.warning("Failed to edit temporary image progress status %s: %s", reusable_mid, exc)
+        return reusable_mid, None
+
+    progress_mid = None
+    try:
+        sent = await client.send_message(chat_id=chat_id, text=status_text)
+        progress_mid = extract_sent_message_id(sent)
+    except Exception as exc:
+        log.warning("Failed to send temporary image progress status: %s", exc)
+    return progress_mid, None
+
+
 async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prompt_text: str, states: StateStore | None = None) -> None:
     log.info("AI dialogue requested user_id=%s chat_id=%s", user_id, chat_id)
     user_msg = await save_user_message(user_id, prompt_text)
@@ -830,30 +868,34 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             gen_status_id: str | None = None
             if clean_text:
                 if thinking_message_id:
-                    await client.edit_message(
-                        thinking_message_id,
-                        text=markdown_to_html(clean_text),
-                        attachments=_response_buttons_keyboard(response_buttons),
-                    )
+                    try:
+                        await client.edit_message(
+                            thinking_message_id,
+                            text=markdown_to_html(clean_text),
+                            attachments=_response_buttons_keyboard(response_buttons),
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to deliver visible text before image generation: %s", exc)
                     thinking_message_id = None
                     buttons_sent = bool(response_buttons)
                 else:
-                    await client.send_message(
-                        chat_id=chat_id,
-                        text=markdown_to_html(clean_text),
-                        attachments=_response_buttons_keyboard(response_buttons),
-                    )
+                    try:
+                        await client.send_message(
+                            chat_id=chat_id,
+                            text=markdown_to_html(clean_text),
+                            attachments=_response_buttons_keyboard(response_buttons),
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to deliver visible text before image generation: %s", exc)
                     buttons_sent = bool(response_buttons)
-                gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
-                gen_status_id = extract_sent_message_id(gen_status)
+
+                gen_status_id, _ = await _transition_image_progress_status(
+                    client, chat_id, "🖼 Генерирую новое изображение..."
+                )
             else:
-                if thinking_message_id:
-                    await client.edit_message(thinking_message_id, text="🖼 Генерирую новое изображение...")
-                    gen_status_id = thinking_message_id
-                    thinking_message_id = None
-                else:
-                    gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
-                    gen_status_id = extract_sent_message_id(gen_status)
+                gen_status_id, thinking_message_id = await _transition_image_progress_status(
+                    client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+                )
 
             try:
                 img_bytes = await generate_image(img_prompt)
@@ -1015,30 +1057,34 @@ async def run_hidden_ai_kickoff(
             gen_status_id: str | None = None
             if clean_text:
                 if thinking_message_id:
-                    await client.edit_message(
-                        thinking_message_id,
-                        text=markdown_to_html(clean_text),
-                        attachments=_response_buttons_keyboard(response_buttons),
-                    )
+                    try:
+                        await client.edit_message(
+                            thinking_message_id,
+                            text=markdown_to_html(clean_text),
+                            attachments=_response_buttons_keyboard(response_buttons),
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to deliver visible text before kickoff image generation: %s", exc)
                     thinking_message_id = None
                     buttons_sent = bool(response_buttons)
                 else:
-                    await client.send_message(
-                        chat_id=chat_id,
-                        text=markdown_to_html(clean_text),
-                        attachments=_response_buttons_keyboard(response_buttons),
-                    )
+                    try:
+                        await client.send_message(
+                            chat_id=chat_id,
+                            text=markdown_to_html(clean_text),
+                            attachments=_response_buttons_keyboard(response_buttons),
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to deliver visible text before kickoff image generation: %s", exc)
                     buttons_sent = bool(response_buttons)
-                gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
-                gen_status_id = extract_sent_message_id(gen_status)
+
+                gen_status_id, _ = await _transition_image_progress_status(
+                    client, chat_id, "🖼 Генерирую новое изображение..."
+                )
             else:
-                if thinking_message_id:
-                    await client.edit_message(thinking_message_id, text="🖼 Генерирую новое изображение...")
-                    gen_status_id = thinking_message_id
-                    thinking_message_id = None
-                else:
-                    gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
-                    gen_status_id = extract_sent_message_id(gen_status)
+                gen_status_id, thinking_message_id = await _transition_image_progress_status(
+                    client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+                )
 
             try:
                 img_bytes = await generate_image(img_prompt)
@@ -1131,22 +1177,16 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
         chunks = [c for c in split_text(html_text) if c.strip()] if clean_text else []
 
         if chunks:
-            await _send_ai_text(client, chat_id, thinking_message_id, chunks)
+            try:
+                await _send_ai_text(client, chat_id, thinking_message_id, chunks)
+            except Exception as exc:
+                log.warning("Failed to send text chunks in image dialogue: %s", exc)
             thinking_message_id = None
 
         if edit_prompt:
-            edit_status_id: str | None = None
-            if clean_text:
-                edit_status = await client.send_message(chat_id=chat_id, text="🎨 Редактирую ваше фото...")
-                edit_status_id = extract_sent_message_id(edit_status)
-            else:
-                if thinking_message_id:
-                    await client.edit_message(thinking_message_id, text="🎨 Редактирую ваше фото...")
-                    edit_status_id = thinking_message_id
-                    thinking_message_id = None
-                else:
-                    edit_status = await client.send_message(chat_id=chat_id, text="🎨 Редактирую ваше фото...")
-                    edit_status_id = extract_sent_message_id(edit_status)
+            edit_status_id, thinking_message_id = await _transition_image_progress_status(
+                client, chat_id, "🎨 Редактирую ваше фото...", reusable_mid=thinking_message_id
+            )
 
             try:
                 edited_data = await edit_image(edit_prompt, image_bytes)
@@ -1174,18 +1214,9 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
                     edit_status_id = None
 
         elif gen_prompt:
-            gen_status_id: str | None = None
-            if clean_text:
-                gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
-                gen_status_id = extract_sent_message_id(gen_status)
-            else:
-                if thinking_message_id:
-                    await client.edit_message(thinking_message_id, text="🖼 Генерирую новое изображение...")
-                    gen_status_id = thinking_message_id
-                    thinking_message_id = None
-                else:
-                    gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
-                    gen_status_id = extract_sent_message_id(gen_status)
+            gen_status_id, thinking_message_id = await _transition_image_progress_status(
+                client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+            )
 
             try:
                 new_img = await generate_image(gen_prompt)
