@@ -154,6 +154,8 @@ def select_ai_history_messages(
         elif message.role == "assistant":
             raw = getattr(message, "content", None) or getattr(message, "ai_context_content", None) or ""
             clean_content, _, _ = extract_service_data(raw)
+            if not clean_content or not clean_content.strip():
+                continue
             normalized.append(AIHistoryMessage(
                 role="assistant",
                 content=clean_content,

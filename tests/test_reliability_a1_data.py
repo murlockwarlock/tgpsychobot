@@ -319,9 +319,84 @@ class TestA1ResultHistoryAndIntegration:
         mock_msg.topic = None
 
         selected = select_ai_history_messages([mock_msg], limit_first=0, limit_recent=10)
+        assert len(selected) == 0  # Omitted: clean_content is empty, no empty assistant artifact!
+
+    def test_result_history_omits_complete_data_only_assistant(self):
+        raw_complete = "<DATA>\n{\"current_state\": {\"stage\": \"greeting\"}}\n</DATA>"
+        mock_msg = MagicMock()
+        mock_msg.role = "assistant"
+        mock_msg.content = raw_complete
+        mock_msg.ai_context_content = None
+        mock_msg.topic_id = None
+        mock_msg.topic = None
+
+        selected = select_ai_history_messages([mock_msg], limit_first=0, limit_recent=10)
+        assert len(selected) == 0
+
+    def test_result_history_omits_truncated_data_only_assistant(self):
+        raw_truncated = "<DATA>\n{\"current_state\": {\"stage\":"
+        mock_msg = MagicMock()
+        mock_msg.role = "assistant"
+        mock_msg.content = raw_truncated
+        mock_msg.ai_context_content = None
+        mock_msg.topic_id = None
+        mock_msg.topic = None
+
+        selected = select_ai_history_messages([mock_msg], limit_first=0, limit_recent=10)
+        assert len(selected) == 0
+
+    def test_result_history_omits_whitespace_plus_data_only_assistant(self):
+        raw_whitespace = "  \n\t  <DATA>\n{\"current_state\": {\"stage\": \"greeting\"}}\n</DATA>  \n "
+        mock_msg = MagicMock()
+        mock_msg.role = "assistant"
+        mock_msg.content = raw_whitespace
+        mock_msg.ai_context_content = None
+        mock_msg.topic_id = None
+        mock_msg.topic = None
+
+        selected = select_ai_history_messages([mock_msg], limit_first=0, limit_recent=10)
+        assert len(selected) == 0
+
+    def test_result_history_preserves_visible_assistant_prose_and_strips_data(self):
+        raw = "Здравствуйте! Чем я могу вам помочь?\n<DATA>\n{\"current_state\": {\"stage\": \"greeting\"}}\n</DATA>"
+        mock_msg = MagicMock()
+        mock_msg.role = "assistant"
+        mock_msg.content = raw
+        mock_msg.ai_context_content = None
+        mock_msg.topic_id = None
+        mock_msg.topic = None
+
+        selected = select_ai_history_messages([mock_msg], limit_first=0, limit_recent=10)
         assert len(selected) == 1
         assert selected[0].role == "assistant"
-        assert selected[0].content == ""  # NOT resurrected to raw_broken!
+        assert selected[0].content == "Здравствуйте! Чем я могу вам помочь?"
+        assert "<DATA" not in selected[0].content
+
+    def test_result_history_db_split_ai_context_content_handling(self):
+        # Case A: ai_context_content has DATA-only, content is None
+        mock_msg_data_only = MagicMock()
+        mock_msg_data_only.role = "assistant"
+        mock_msg_data_only.content = None
+        mock_msg_data_only.ai_context_content = "<DATA>\n{\"current_state\": {}}\n</DATA>"
+        mock_msg_data_only.topic_id = None
+        mock_msg_data_only.topic = None
+
+        selected_a = select_ai_history_messages([mock_msg_data_only], limit_first=0, limit_recent=10)
+        assert len(selected_a) == 0  # No empty artifact and no DATA resurrection
+
+        # Case B: ai_context_content has visible text + DATA, content is None
+        mock_msg_with_text = MagicMock()
+        mock_msg_with_text.role = "assistant"
+        mock_msg_with_text.content = None
+        mock_msg_with_text.ai_context_content = "Текст ответа.\n<DATA>\n{\"x\": 1}\n</DATA>"
+        mock_msg_with_text.topic_id = None
+        mock_msg_with_text.topic = None
+
+        selected_b = select_ai_history_messages([mock_msg_with_text], limit_first=0, limit_recent=10)
+        assert len(selected_b) == 1
+        assert selected_b[0].role == "assistant"
+        assert selected_b[0].content == "Текст ответа."
+        assert "<DATA" not in selected_b[0].content
 
     @pytest.mark.asyncio
     async def test_telegram_truncated_data_flow_boundary_contract(self):
@@ -523,12 +598,13 @@ class TestA1ResultHistoryAndIntegration:
                 )
 
             # Prove: empty sanitized assistant content never becomes raw provider history
+            # and no empty assistant message artifact is appended to layout.history
+            assistant_history_items = [m for m in layout.history if getattr(m, "role", None) == "assistant"]
+            assert len(assistant_history_items) == 0
             for msg in layout.history:
                 content = getattr(msg, "content", "")
                 assert "<DATA" not in content
                 assert '{"metadata"' not in content
-                if getattr(msg, "role", None) == "assistant":
-                    assert content != broken_data_only
 
         finally:
             ai_integration.async_session_maker = orig_ai_session
