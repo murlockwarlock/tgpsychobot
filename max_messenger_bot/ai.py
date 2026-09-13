@@ -35,7 +35,7 @@ from automation_engine import apply_service_data_blocks, build_runtime_automatio
 from user_metadata import extract_service_data
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, get_memory_mode, normalize_memory_mode
 from result_history import ai_history_role_filter, select_ai_history_messages
-from error_reporting import classify_ai_error, exception_summary
+from error_reporting import classify_ai_error, classify_external_error, exception_summary
 from vector_store import search_relevant_chunks
 from provider_models import (
     CLAUDE_CHAT_MAX_TOKENS,
@@ -89,6 +89,67 @@ class AIResponseError(AIServiceError):
 
 class InsufficientBalanceError(AIServiceError):
     pass
+
+
+class MaxVisionServiceError(AIServiceError):
+    """Structured error for terminal MAX vision service failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str = "KIE",
+        model: str,
+        classification: str,
+        is_transient: bool,
+        attempts: list[dict[str, Any]],
+        status_code: int | None = None,
+        provider_error_code: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model = model
+        self.classification = classification
+        self.is_transient = is_transient
+        self.attempts = attempts
+        self.status_code = status_code
+        self.provider_error_code = provider_error_code
+
+
+KIE_VISION_TRANSIENT_CLASSES: frozenset[str] = frozenset({
+    "network_ssl",
+    "network_connection",
+    "timeout",
+    "rate_limit",
+    "provider_5xx",
+})
+
+
+def _extract_status_and_provider_error_code(exc: Exception) -> tuple[int | None, Any | None]:
+    status_code: int | None = None
+    provider_error_code: Any | None = None
+    curr: BaseException | None = exc
+    while curr is not None:
+        if status_code is None:
+            sc = getattr(curr, "status_code", None)
+            if sc is None:
+                sc = getattr(curr, "status", None)
+            if sc is None and hasattr(curr, "response"):
+                resp = getattr(curr, "response")
+                sc = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+            if sc is not None:
+                try:
+                    status_code = int(sc)
+                except (TypeError, ValueError):
+                    pass
+        if provider_error_code is None:
+            pec = getattr(curr, "provider_error_code", None)
+            if pec is not None:
+                provider_error_code = pec
+            elif hasattr(curr, "content") and isinstance(getattr(curr, "content"), dict):
+                provider_error_code = getattr(curr, "content").get("code")
+        curr = getattr(curr, "__cause__", None) or getattr(curr, "__context__", None)
+    return status_code, provider_error_code
 
 
 def _validate_text_response(response_text: object, *, provider: str) -> str:
@@ -478,15 +539,35 @@ def _validate_kie_json_response(status_code: int, payload: dict, *, context: str
         else str(payload)
     )
     detail = str(raw_detail).strip() or f"HTTP {status_code} без описания"
+    code = payload.get("code") if isinstance(payload, dict) else None
     if status_code != 200:
         if is_kie_insufficient_balance(status_code, payload):
-            raise InsufficientBalanceError(f"KIE API Error: {detail}")
-        raise AIServiceError(f"{context}: status={status_code} message={detail}")
-    code = payload.get("code")
+            exc = InsufficientBalanceError(f"KIE API Error: {detail}")
+            exc.status_code = status_code
+            exc.provider_error_code = code
+            if isinstance(payload, dict):
+                exc.content = payload
+            raise exc
+        exc = AIServiceError(f"{context}: status={status_code} message={detail}")
+        exc.status_code = status_code
+        exc.provider_error_code = code
+        if isinstance(payload, dict):
+            exc.content = payload
+        raise exc
     if code not in (None, 200, "200"):
         if is_kie_insufficient_balance(status_code, payload):
-            raise InsufficientBalanceError(f"KIE API Error: {detail}")
-        raise AIServiceError(f"{context}: {detail}")
+            exc = InsufficientBalanceError(f"KIE API Error: {detail}")
+            exc.status_code = status_code
+            exc.provider_error_code = code
+            if isinstance(payload, dict):
+                exc.content = payload
+            raise exc
+        exc = AIServiceError(f"{context}: {detail}")
+        exc.status_code = status_code
+        exc.provider_error_code = code
+        if isinstance(payload, dict):
+            exc.content = payload
+        raise exc
     return payload.get("data") if isinstance(payload.get("data"), dict) else payload
 
 
@@ -529,7 +610,10 @@ async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: by
     try:
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(url, headers=headers, data=form_data, files=files)
-        payload = response.json()
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
         data_payload = _validate_kie_json_response(response.status_code, payload, context="KIE upload failed")
         file_url = data_payload.get("downloadUrl") or data_payload.get("fileUrl")
         if not file_url:
@@ -649,8 +733,12 @@ async def _call_kie_multimodal(
                 headers=headers,
                 json=payload,
             )
+        try:
+            resp_payload = response.json()
+        except Exception:
+            resp_payload = {}
         response_payload = _validate_kie_json_response(
-            response.status_code, response.json(),
+            response.status_code, resp_payload,
             context="Ошибка обращения к KIE multimodal API",
         )
         text = _extract_kie_chat_text(response_payload)
@@ -1635,20 +1723,87 @@ async def analyze_image(
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
-        model = config.vision_model or "gemini-3-flash"
-        raw_result = await _analyze_kie(
-            api_key,
-            _get_kie_base_url(config),
-            _get_kie_upload_base_url(config),
-            model,
-            image_bytes,
-            request_layout.stable_system_prompt,
-            prompt,
-            temperature,
-            history=list(request_layout.history),
-            request_layout=request_layout,
-            activity_tracker=activity_tracker,
-        )
+        preferred = (config.vision_model or "").strip() or "gemini-3-flash"
+        try:
+            ensure_model_available(PROVIDER_KIE, preferred, channel="vision")
+        except Exception as cfg_exc:
+            classification, _ = classify_external_error(cfg_exc, provider="KIE")
+            attempt_record = {
+                "provider": "KIE",
+                "model": preferred,
+                "status": "FAILED",
+                "classification": classification,
+                "exception_class": type(cfg_exc).__name__,
+                "error": exception_summary(cfg_exc),
+            }
+            raise MaxVisionServiceError(
+                f"KIE vision model configuration error: {exception_summary(cfg_exc)}",
+                provider="KIE",
+                model=preferred,
+                classification=classification,
+                is_transient=False,
+                attempts=[attempt_record],
+                status_code=None,
+                provider_error_code=None,
+            ) from cfg_exc
+
+        candidate_models: list[str] = []
+        for m in (preferred, "gemini-2.5-flash", "gemini-3-flash"):
+            if m and m not in candidate_models:
+                candidate_models.append(m)
+
+        attempts: list[dict[str, Any]] = []
+        raw_result: str | None = None
+        for idx, model_name in enumerate(candidate_models):
+            has_next = (idx + 1 < len(candidate_models))
+            try:
+                raw_result = await _analyze_kie(
+                    api_key,
+                    _get_kie_base_url(config),
+                    _get_kie_upload_base_url(config),
+                    model_name,
+                    image_bytes,
+                    request_layout.stable_system_prompt,
+                    prompt,
+                    temperature,
+                    history=list(request_layout.history),
+                    request_layout=request_layout,
+                    activity_tracker=activity_tracker,
+                )
+                break
+            except Exception as exc:
+                status_code, provider_error_code = _extract_status_and_provider_error_code(exc)
+                classification, _ = classify_external_error(exc, provider="KIE")
+                is_transient = classification in KIE_VISION_TRANSIENT_CLASSES
+                attempt_record = {
+                    "provider": "KIE",
+                    "model": model_name,
+                    "status": "FAILED",
+                    "classification": classification,
+                    "exception_class": type(exc).__name__,
+                    "error": exception_summary(exc),
+                }
+                attempts.append(attempt_record)
+
+                if not is_transient or not has_next:
+                    raise MaxVisionServiceError(
+                        f"KIE vision analysis failed for model {model_name}: {exception_summary(exc)}",
+                        provider="KIE",
+                        model=model_name,
+                        classification=classification,
+                        is_transient=is_transient,
+                        attempts=attempts,
+                        status_code=status_code,
+                        provider_error_code=provider_error_code,
+                    ) from exc
+
+                log.warning(
+                    "Transient KIE vision failure for model %s (classification=%s, status=%s), retrying alternate candidate: %s",
+                    model_name,
+                    classification,
+                    status_code,
+                    exc,
+                )
     else:
         # Default: OpenAI
         api_key = config.openai_api_key

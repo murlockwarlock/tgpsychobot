@@ -10,7 +10,9 @@ from pathlib import Path
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
 
-from ..ai import AIServiceError, generate_image, get_ai_response, edit_image
+import os
+
+from ..ai import AIServiceError, MaxVisionServiceError, generate_image, get_ai_response, edit_image
 from ..api import MaxApiClient
 from ..models import extract_sent_message_id
 from ..formatting import markdown_to_html, split_text
@@ -35,6 +37,10 @@ from memory_mode import normalize_memory_mode, start_new_dialogue
 from response_buttons import ResponseButton, build_action_callback_data, extract_response_buttons, extract_test_start_directive
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
+from alert_cooldown import AlertCooldown
+from error_reporting import notify_admins_about_error
+
+_VISION_ALERT_COOLDOWNS: dict[tuple[str, str, str], AlertCooldown] = {}
 
 
 log = get_bot_logger("common")
@@ -1294,6 +1300,52 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
                     pass
                 thinking_message_id = None
 
+    except MaxVisionServiceError as exc:
+        log.error("MAX vision terminal failure: %s", exc, exc_info=True)
+        if thinking_message_id:
+            await client.edit_message(thinking_message_id, text="Сервис анализа изображений временно недоступен.")
+            thinking_message_id = None
+        else:
+            await client.send_message(chat_id=chat_id, text="Сервис анализа изображений временно недоступен.")
+
+        bot_token = os.getenv("BOT_TOKEN")
+        if bot_token:
+            async with async_session_maker() as session:
+                sub_config = await session.get(SubscriptionConfig, 1)
+                notifications_enabled = sub_config.notifications_enabled if sub_config is not None else True
+
+            if notifications_enabled:
+                stage = "vision_analysis"
+                cooldown_key = (stage, exc.provider, exc.classification)
+                if cooldown_key not in _VISION_ALERT_COOLDOWNS:
+                    _VISION_ALERT_COOLDOWNS[cooldown_key] = AlertCooldown(timedelta(hours=1))
+                cooldown = _VISION_ALERT_COOLDOWNS[cooldown_key]
+
+                if cooldown.should_send():
+                    try:
+                        async with create_telegram_bot(bot_token) as bot:
+                            await notify_admins_about_error(
+                                bot,
+                                title="🚨 Сбой сервиса анализа изображений MAX (KIE Vision)",
+                                stage=stage,
+                                provider=exc.provider,
+                                model=exc.model,
+                                classification_override=exc.classification,
+                                provider_attempts=exc.attempts,
+                                exception=exc,
+                                user_id=None,
+                                extra={
+                                    "max_user_id": user_id,
+                                    "max_chat_id": chat_id,
+                                },
+                            )
+                    except Exception as notify_err:
+                        log.error("Failed to deliver admin vision alert: %s", notify_err)
+                else:
+                    log.info(
+                        "MAX vision admin alert suppressed by cooldown for key %s",
+                        cooldown_key,
+                    )
     except AIServiceError as exc:
         log.exception("Vision AIServiceError: %s", exc)
         if thinking_message_id:
