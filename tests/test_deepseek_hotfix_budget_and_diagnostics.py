@@ -618,11 +618,11 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured_deepseek[0]["max_tokens"], 16384)
 
     # -------------------------------------------------------------------------
-    # 6. Negative / Invariant Confirmation: Other Provider Budgets Untouched
+    # 6. Negative / Invariant Confirmation: Direct Chat 16384 & KIE / Vision 4096
     # -------------------------------------------------------------------------
 
-    async def test_openai_claude_gemini_kie_budgets_remain_4096(self):
-        # 1. OpenAI: max_completion_tokens == 4096
+    async def test_direct_normal_chat_budgets_are_16384_and_kie_vision_remain_4096(self):
+        # 1. OpenAI: max_completion_tokens == 16384
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
             cfg.provider = "OpenAI"
@@ -639,10 +639,10 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_openai):
             await ai_integration.generate_response(user_id=7001, user_prompt="Тест OpenAI")
 
-        self.assertEqual(openai_captured[0]["max_completion_tokens"], 4096)
+        self.assertEqual(openai_captured[0]["max_completion_tokens"], 16384)
         self.assertNotIn("max_tokens", openai_captured[0])
 
-        # 2. Claude: max_tokens == 4096
+        # 2. Claude: max_tokens == 16384
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
             cfg.provider = "Claude"
@@ -664,9 +664,10 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(ai_integration.anthropic, "AsyncAnthropic", return_value=mock_claude_client):
             await ai_integration.generate_response(user_id=7001, user_prompt="Тест Claude")
 
-        self.assertEqual(claude_captured[0]["max_tokens"], 4096)
+        self.assertEqual(claude_captured[0]["max_tokens"], 16384)
+        self.assertNotIn("max_completion_tokens", claude_captured[0])
 
-        # 3. Gemini: maxOutputTokens == 4096
+        # 3. Gemini: maxOutputTokens == 16384
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
             cfg.provider = "Gemini"
@@ -691,9 +692,29 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(ai_integration.httpx, "AsyncClient", return_value=FakeGeminiClient()):
             await ai_integration.generate_response(user_id=7001, user_prompt="Тест Gemini")
 
-        self.assertEqual(gemini_captured[0]["json"]["generationConfig"]["maxOutputTokens"], 4096)
+        self.assertEqual(gemini_captured[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
 
-        # 4. KIE: max_tokens == 4096
+        # 4. DeepSeek: max_tokens == 16384
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "DeepSeek"
+            await session.commit()
+
+        deepseek_captured = []
+
+        async def mock_deepseek(**kwargs):
+            deepseek_captured.append(kwargs)
+            return FakeSDKCompletion(
+                choices=[FakeSDKChoice(finish_reason="stop", message=FakeSDKMessage(content="DeepSeek ok"))]
+            )
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_deepseek):
+            await ai_integration.generate_response(user_id=7001, user_prompt="Тест DeepSeek")
+
+        self.assertEqual(deepseek_captured[0]["max_tokens"], 16384)
+        self.assertNotIn("max_completion_tokens", deepseek_captured[0])
+
+        # 5. KIE: max_tokens == 4096 (NON-TARGET remains 4096)
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
             cfg.provider = "KIE"
@@ -721,3 +742,70 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             await ai_integration.generate_response(user_id=7001, user_prompt="Тест KIE")
 
         self.assertEqual(kie_captured[0]["json"]["max_tokens"], 4096)
+
+    async def test_vision_budgets_remain_4096_across_providers(self):
+        # Explicit test proving vision paths remain 4096
+        # 1. Telegram OpenAI Vision: max_completion_tokens == 4096
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.openai_api_key = "sk-openai-test-key"
+            cfg.vision_model = "gpt-5.6-terra"
+            await session.commit()
+
+        openai_vision_captured = []
+        async def mock_v_openai(**kwargs):
+            openai_vision_captured.append(kwargs)
+            return FakeSDKCompletion(
+                choices=[FakeSDKChoice(finish_reason="stop", message=FakeSDKMessage(content="OpenAI Vision ok"))]
+            )
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_v_openai):
+            await ai_integration.analyze_image_content(
+                image_bytes=b"fake_image_bytes",
+                prompt="Describe",
+            )
+        self.assertEqual(openai_vision_captured[0]["max_completion_tokens"], 4096)
+
+        # 2. Telegram Claude Vision: max_tokens == 4096
+        claude_vision_captured = []
+        mock_v_claude_client = AsyncMock()
+        mock_v_msg = MagicMock()
+        mock_v_part = MagicMock()
+        mock_v_part.type = "text"
+        mock_v_part.text = "Claude Vision ok"
+        mock_v_msg.content = [mock_v_part]
+        async def mock_v_claude(**kwargs):
+            claude_vision_captured.append(kwargs)
+            return mock_v_msg
+        mock_v_claude_client.messages.create.side_effect = mock_v_claude
+        with patch.object(ai_integration.anthropic, "AsyncAnthropic", return_value=mock_v_claude_client):
+            await ai_integration._call_claude_vision(
+                api_key="sk-test",
+                model="claude-sonnet-5",
+                image_bytes=b"fake_image_bytes",
+                prompt="Describe",
+            )
+        self.assertEqual(claude_vision_captured[0]["max_tokens"], 4096)
+
+        # 3. Telegram Gemini Vision: generationConfig.maxOutputTokens == 4096
+        gemini_vision_captured = []
+        class FakeGeminiVisionResponse:
+            status_code = 200
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "Gemini Vision ok"}]}}]}
+        class FakeGeminiVisionClient:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def post(self, url, **kwargs):
+                gemini_vision_captured.append(kwargs)
+                return FakeGeminiVisionResponse()
+        with patch.object(ai_integration.httpx, "AsyncClient", return_value=FakeGeminiVisionClient()):
+            await ai_integration._call_gemini_vision(
+                api_key="sk-test",
+                model="gemini-3.7-flash",
+                image_bytes=b"fake_image_bytes",
+                prompt="Describe",
+            )
+        self.assertEqual(gemini_vision_captured[0]["json"]["generationConfig"]["maxOutputTokens"], 4096)

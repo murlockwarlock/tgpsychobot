@@ -38,8 +38,11 @@ from result_history import ai_history_role_filter, select_ai_history_messages
 from error_reporting import classify_ai_error, exception_summary
 from vector_store import search_relevant_chunks
 from provider_models import (
+    CLAUDE_CHAT_MAX_TOKENS,
     DEEPSEEK_CHAT_MAX_TOKENS,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+    GEMINI_CHAT_MAX_TOKENS,
+    OPENAI_CHAT_MAX_TOKENS,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
@@ -230,7 +233,7 @@ async def _call_openai(
     payload: dict = {
         "model": target_model,
         "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
-        "max_completion_tokens": 4096,
+        "max_completion_tokens": OPENAI_CHAT_MAX_TOKENS,
     }
     if not target_model.startswith("gpt-5.6"):
         payload["temperature"] = temperature
@@ -337,7 +340,7 @@ async def _call_claude(
     client = anthropic.AsyncAnthropic(api_key=api_key)
     payload: dict = {
         "model": target_model,
-        "max_tokens": 4096,
+        "max_tokens": CLAUDE_CHAT_MAX_TOKENS,
         "system": build_anthropic_system(layout),
         "messages": anthropic_messages,
     }
@@ -385,7 +388,7 @@ async def _call_gemini(
     target_model = model or "gemini-3.7-flash"
     ensure_model_available(PROVIDER_GEMINI, target_model)
     layout = request_layout or _legacy_layout(messages, system_prompt)
-    generation_config: dict = {"maxOutputTokens": 4096}
+    generation_config: dict = {"maxOutputTokens": GEMINI_CHAT_MAX_TOKENS}
     if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
         generation_config["temperature"] = temperature
 
