@@ -125,6 +125,15 @@ async def resolve_topic_entry_state(
     return False
 
 
+VISION_HISTORY_MARKERS = ("[Изображение]", "[Фото для анализа]")
+
+
+def _is_vision_history_marker(content: str | None) -> bool:
+    if not content:
+        return False
+    return content.strip().startswith(VISION_HISTORY_MARKERS)
+
+
 def select_ai_history_messages(
     messages: list[Any],
     limit_first: int,
@@ -173,19 +182,29 @@ def select_ai_history_messages(
             ))
         elif role == "user":
             content = getattr(message, "ai_context_content", None) or getattr(message, "content", "") or ""
-            if (
-                last_consecutive_user_content is not None
-                and content.strip() == last_consecutive_user_content.strip()
-            ):
-                continue
-            normalized.append(AIHistoryMessage(
-                role="user",
-                content=content,
-                topic_id=getattr(message, "topic_id", None),
-                topic=getattr(message, "topic", None),
-                source_role="user",
-            ))
-            last_consecutive_user_content = content
+            if _is_vision_history_marker(content):
+                last_consecutive_user_content = None
+                normalized.append(AIHistoryMessage(
+                    role="user",
+                    content=content,
+                    topic_id=getattr(message, "topic_id", None),
+                    topic=getattr(message, "topic", None),
+                    source_role="user",
+                ))
+            else:
+                if (
+                    last_consecutive_user_content is not None
+                    and content.strip() == last_consecutive_user_content.strip()
+                ):
+                    continue
+                normalized.append(AIHistoryMessage(
+                    role="user",
+                    content=content,
+                    topic_id=getattr(message, "topic_id", None),
+                    topic=getattr(message, "topic", None),
+                    source_role="user",
+                ))
+                last_consecutive_user_content = content
         else:
             last_consecutive_user_content = None
             normalized.append(AIHistoryMessage(
@@ -203,6 +222,8 @@ def select_ai_history_messages(
         and normalized
         and normalized[-1].role == "user"
         and normalized[-1].source_role == "user"
+        and not _is_vision_history_marker(normalized[-1].content)
+        and not _is_vision_history_marker(pending_user_content)
         and normalized[-1].content.strip() == pending_user_content.strip()
     ):
         normalized.pop()

@@ -553,15 +553,14 @@ class IncidentB1HistoryDedupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("chat/completions", capture["endpoint"])
             self.assertEqual(capture["payload"]["messages"], outbound_payload["messages"])
 
-    async def test_25_normal_text_flow_with_image_prefix_collapses_wire_to_single_turn(self):
-        """Normal text flow where user typed '[Изображение] A' must deduplicate historical retries."""
-        text_content = "[Изображение] A"
+    async def test_25_max_consecutive_failed_vision_history_preserved(self):
+        """Historical consecutive failed vision attempts with same prompt are preserved (both image turns kept)."""
+        content = "[Изображение] Опиши"
         base_ts = datetime.utcnow()
         async with self.sessions() as session:
-            h1 = DBMessage(id=801, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=text_content, timestamp=base_ts)
-            h2 = DBMessage(id=802, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=text_content, timestamp=base_ts + timedelta(seconds=1))
-            current = DBMessage(id=803, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=text_content, timestamp=base_ts + timedelta(seconds=2))
-            session.add_all([h1, h2, current])
+            h1 = DBMessage(id=801, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=content, timestamp=base_ts)
+            h2 = DBMessage(id=802, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=content, timestamp=base_ts + timedelta(seconds=1))
+            session.add_all([h1, h2])
             await session.commit()
 
             db_user = await session.get(User, 9001)
@@ -573,15 +572,67 @@ class IncidentB1HistoryDedupTests(unittest.IsolatedAsyncioTestCase):
                 ai_config=ai_cfg,
                 dialogue_id=1,
                 topic_id=1,
-                current_user_content=text_content,
-                exclude_message_id=803,
+                current_user_content="Новый вопрос",
             )
 
-            # In normal text flow, history duplicates are superseded and collapsed
-            self.assertEqual(len(layout.history), 0)
+            user_history = [m for m in layout.history if m.role == "user"]
+            self.assertEqual(len(user_history), 2)
+            self.assertEqual(user_history[0].content, content)
+            self.assertEqual(user_history[1].content, content)
 
-            # WIRE contains exactly one current user turn with "[Изображение] A"
-            openai_wire = build_openai_chat_messages(layout)
-            wire_user_msgs = [m for m in openai_wire if m["role"] == "user"]
-            self.assertEqual(len(wire_user_msgs), 1)
-            self.assertEqual(wire_user_msgs[0]["content"], text_content)
+    async def test_26_max_third_current_vision_preserves_both_previous_turns(self):
+        """Historical image rows #1 & #2 preserved when current persisted vision row #3 is excluded by ID."""
+        content = "[Изображение] Опиши"
+        base_ts = datetime.utcnow()
+        async with self.sessions() as session:
+            h1 = DBMessage(id=811, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=content, timestamp=base_ts)
+            h2 = DBMessage(id=812, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=content, timestamp=base_ts + timedelta(seconds=1))
+            current = DBMessage(id=813, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=content, timestamp=base_ts + timedelta(seconds=2))
+            session.add_all([h1, h2, current])
+            await session.commit()
+
+            db_user = await session.get(User, 9001)
+            ai_cfg = await session.get(AIConfig, 1)
+
+            # MAX vision flow calls layout builder with current_user_content=None and exclude_message_id
+            layout = await build_conversational_request_layout(
+                session,
+                user=db_user,
+                ai_config=ai_cfg,
+                dialogue_id=1,
+                topic_id=1,
+                current_user_content=None,
+                exclude_message_id=813,
+            )
+
+            user_history = [m for m in layout.history if m.role == "user"]
+            self.assertEqual(len(user_history), 2)
+            self.assertEqual(user_history[0].content, content)
+            self.assertEqual(user_history[1].content, content)
+
+    async def test_27_telegram_vision_marker_preserves_both_consecutive_rows(self):
+        """Telegram vision marker [Фото для анализа] X consecutive rows are both preserved."""
+        content = "[Фото для анализа] X"
+        msgs = [
+            DBMessage(id=821, role="user", content=content),
+            DBMessage(id=822, role="user", content=content),
+        ]
+        selected = select_ai_history_messages(msgs, 2, 10)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected[0].content, content)
+        self.assertEqual(selected[1].content, content)
+
+    async def test_28_vision_marker_acts_as_text_dedup_boundary(self):
+        """Vision marker acts as boundary: user A, user A, vision X, user A, user A -> A, vision X, A."""
+        msgs = [
+            DBMessage(id=831, role="user", content="A"),
+            DBMessage(id=832, role="user", content="A"),
+            DBMessage(id=833, role="user", content="[Изображение] X"),
+            DBMessage(id=834, role="user", content="A"),
+            DBMessage(id=835, role="user", content="A"),
+        ]
+        selected = select_ai_history_messages(msgs, 2, 10)
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected[0].content, "A")
+        self.assertEqual(selected[1].content, "[Изображение] X")
+        self.assertEqual(selected[2].content, "A")
