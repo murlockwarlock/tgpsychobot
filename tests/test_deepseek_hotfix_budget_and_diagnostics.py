@@ -253,6 +253,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-flash")
         self.assertEqual(wire_payload["max_tokens"], 16384)
+        self.assertEqual(wire_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
         self.assertNotIn("max_completion_tokens", wire_payload)
 
     async def test_telegram_deepseek_v4_pro_outbound_max_tokens_is_16384(self):
@@ -277,6 +278,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-pro")
         self.assertEqual(wire_payload["max_tokens"], 16384)
+        self.assertEqual(wire_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
 
     async def test_max_deepseek_v4_flash_outbound_max_tokens_is_16384(self):
         captured_payloads = []
@@ -295,6 +297,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-flash")
         self.assertEqual(wire_payload["max_tokens"], 16384)
+        self.assertEqual(wire_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
         self.assertNotIn("max_completion_tokens", wire_payload)
 
     async def test_max_deepseek_v4_pro_outbound_max_tokens_is_16384(self):
@@ -319,6 +322,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-pro")
         self.assertEqual(wire_payload["max_tokens"], 16384)
+        self.assertEqual(wire_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
 
     async def test_deepseek_legacy_aliases_normalized_and_receive_16384(self):
         self.assertEqual(normalize_deepseek_model("deepseek-chat"), "deepseek-v4-flash")
@@ -344,6 +348,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured[0]["model"], "deepseek-v4-flash")
         self.assertEqual(captured[0]["max_tokens"], 16384)
+        self.assertEqual(captured[0].get("extra_body"), {"thinking": {"type": "disabled"}})
 
     # -------------------------------------------------------------------------
     # 3. Partial Content Semantics (finish_reason == "length" with non-empty content)
@@ -809,3 +814,109 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 prompt="Describe",
             )
         self.assertEqual(gemini_vision_captured[0]["json"]["generationConfig"]["maxOutputTokens"], 4096)
+        self.assertNotIn("extra_body", gemini_vision_captured[0]["json"])
+
+    # -------------------------------------------------------------------------
+    # 8. Hotfix B1: Thinking Disabled & Request Capture Regression Tests
+    # -------------------------------------------------------------------------
+
+    async def test_deepseek_thinking_disabled_in_wire_payload_and_request_capture_both_platforms(self):
+        # 1. Telegram DeepSeek
+        tg_captured = []
+        async def mock_tg_deepseek(**kwargs):
+            tg_captured.append(kwargs)
+            return FakeSDKCompletion(
+                choices=[FakeSDKChoice(finish_reason="stop", message=FakeSDKMessage(content="Ответ TG DeepSeek"))]
+            )
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_tg_deepseek):
+            resp = await ai_integration.generate_response(user_id=7001, user_prompt="Тест TG Thinking Disabled")
+            self.assertEqual(resp, "Ответ TG DeepSeek")
+
+        self.assertEqual(len(tg_captured), 1)
+        tg_payload = tg_captured[0]
+        self.assertEqual(tg_payload["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
+        self.assertEqual(tg_payload["max_tokens"], 16384)
+        self.assertEqual(tg_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
+
+        # Verify Telegram request_payload in AILog
+        async with self.sessions() as session:
+            tg_ai_log = await session.scalar(
+                select(AILog).where(AILog.platform == "telegram").order_by(AILog.id.desc())
+            )
+            self.assertIsNotNone(tg_ai_log)
+            self.assertIsNotNone(tg_ai_log.request_payload)
+            tg_parsed = json.loads(tg_ai_log.request_payload)
+            self.assertEqual(tg_parsed["provider"], "Deepseek")
+            self.assertEqual(tg_parsed["payload"]["max_tokens"], 16384)
+            self.assertEqual(tg_parsed["payload"]["extra_body"], {"thinking": {"type": "disabled"}})
+
+        # 2. MAX DeepSeek
+        max_captured = []
+        async def mock_max_deepseek(**kwargs):
+            max_captured.append(kwargs)
+            return FakeSDKCompletion(
+                choices=[FakeSDKChoice(finish_reason="stop", message=FakeSDKMessage(content="Ответ MAX DeepSeek"))]
+            )
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_max_deepseek):
+            resp = await max_ai.get_ai_response(7001, "Тест MAX Thinking Disabled")
+            self.assertEqual(resp, "Ответ MAX DeepSeek")
+
+        self.assertEqual(len(max_captured), 1)
+        max_payload = max_captured[0]
+        self.assertEqual(max_payload["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
+        self.assertEqual(max_payload["max_tokens"], 16384)
+        self.assertEqual(max_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
+
+        # Verify MAX request_payload in AILog
+        async with self.sessions() as session:
+            max_ai_log = await session.scalar(
+                select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc())
+            )
+            self.assertIsNotNone(max_ai_log)
+            self.assertIsNotNone(max_ai_log.request_payload)
+            max_parsed = json.loads(max_ai_log.request_payload)
+            self.assertEqual(max_parsed["provider"], "Deepseek")
+            self.assertEqual(max_parsed["payload"]["max_tokens"], 16384)
+            self.assertEqual(max_parsed["payload"]["extra_body"], {"thinking": {"type": "disabled"}})
+
+    async def test_other_providers_isolated_from_deepseek_thinking_parameter(self):
+        # Verify OpenAI, Claude, Gemini, KIE do not have extra_body/thinking passed
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "OpenAI"
+            await session.commit()
+
+        # 1. Telegram OpenAI
+        openai_captured = []
+        async def mock_openai(**kwargs):
+            openai_captured.append(kwargs)
+            return FakeSDKCompletion(
+                choices=[FakeSDKChoice(finish_reason="stop", message=FakeSDKMessage(content="OpenAI TG ok"))]
+            )
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_openai):
+            resp = await ai_integration.generate_response(user_id=7001, user_prompt="Тест OpenAI TG")
+            self.assertEqual(resp, "OpenAI TG ok")
+
+        self.assertEqual(len(openai_captured), 1)
+        self.assertNotIn("extra_body", openai_captured[0])
+        self.assertNotIn("thinking", openai_captured[0])
+
+        # 2. MAX OpenAI
+        max_openai_captured = []
+        async def mock_max_openai(**kwargs):
+            max_openai_captured.append(kwargs)
+            return FakeSDKCompletion(
+                choices=[FakeSDKChoice(finish_reason="stop", message=FakeSDKMessage(content="OpenAI MAX ok"))]
+            )
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_max_openai):
+            resp = await max_ai.get_ai_response(7001, "Тест OpenAI MAX")
+            self.assertEqual(resp, "OpenAI MAX ok")
+
+        self.assertEqual(len(max_openai_captured), 1)
+        self.assertNotIn("extra_body", max_openai_captured[0])
+        self.assertNotIn("thinking", max_openai_captured[0])
+

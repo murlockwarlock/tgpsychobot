@@ -1370,6 +1370,7 @@ async def _call_deepseek_api(
             "messages": build_openai_chat_messages(layout),
             "max_tokens": DEEPSEEK_CHAT_MAX_TOKENS,
             "temperature": temperature,
+            "extra_body": {"thinking": {"type": "disabled"}},
         }
         _capture_ai_request(
             request_capture,
