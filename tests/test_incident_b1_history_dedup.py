@@ -552,3 +552,36 @@ class IncidentB1HistoryDedupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(capture["provider"], "OpenAI")
             self.assertIn("chat/completions", capture["endpoint"])
             self.assertEqual(capture["payload"]["messages"], outbound_payload["messages"])
+
+    async def test_25_normal_text_flow_with_image_prefix_collapses_wire_to_single_turn(self):
+        """Normal text flow where user typed '[Изображение] A' must deduplicate historical retries."""
+        text_content = "[Изображение] A"
+        base_ts = datetime.utcnow()
+        async with self.sessions() as session:
+            h1 = DBMessage(id=801, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=text_content, timestamp=base_ts)
+            h2 = DBMessage(id=802, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=text_content, timestamp=base_ts + timedelta(seconds=1))
+            current = DBMessage(id=803, user_id=9001, dialogue_id=1, topic_id=1, role="user", content=text_content, timestamp=base_ts + timedelta(seconds=2))
+            session.add_all([h1, h2, current])
+            await session.commit()
+
+            db_user = await session.get(User, 9001)
+            ai_cfg = await session.get(AIConfig, 1)
+
+            layout = await build_conversational_request_layout(
+                session,
+                user=db_user,
+                ai_config=ai_cfg,
+                dialogue_id=1,
+                topic_id=1,
+                current_user_content=text_content,
+                exclude_message_id=803,
+            )
+
+            # In normal text flow, history duplicates are superseded and collapsed
+            self.assertEqual(len(layout.history), 0)
+
+            # WIRE contains exactly one current user turn with "[Изображение] A"
+            openai_wire = build_openai_chat_messages(layout)
+            wire_user_msgs = [m for m in openai_wire if m["role"] == "user"]
+            self.assertEqual(len(wire_user_msgs), 1)
+            self.assertEqual(wire_user_msgs[0]["content"], text_content)

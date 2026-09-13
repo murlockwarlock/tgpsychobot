@@ -301,11 +301,7 @@ async def load_conversational_ai_history(
         excluded_msg = (await session.execute(stmt_pending)).scalar_one_or_none()
         if excluded_msg is not None:
             raw_content = getattr(excluded_msg, "ai_context_content", None) or getattr(excluded_msg, "content", None)
-            if (
-                raw_content
-                and str(raw_content).strip()
-                and not str(raw_content).startswith(("[Фото для анализа]", "[Изображение]"))
-            ):
+            if raw_content and str(raw_content).strip():
                 pending_user_content = str(raw_content)
 
     effective_first = resolve_context_limit(limit_first, default=2)
@@ -430,6 +426,7 @@ async def build_conversational_request_layout(
         default=10,
     )
     if history is None:
+        history_user_content = None if modality_instructions else current_user_content
         canonical_history = await load_conversational_ai_history(
             session,
             user_id=user.id,
@@ -439,7 +436,7 @@ async def build_conversational_request_layout(
             limit_first=first_limit,
             limit_recent=recent_limit,
             exclude_message_id=exclude_message_id,
-            current_user_content=current_user_content,
+            current_user_content=history_user_content,
         )
     else:
         canonical_history = list(history)
