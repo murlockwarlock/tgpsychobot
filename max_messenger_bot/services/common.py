@@ -1302,50 +1302,65 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
 
     except MaxVisionServiceError as exc:
         log.error("MAX vision terminal failure: %s", exc, exc_info=True)
-        if thinking_message_id:
-            await client.edit_message(thinking_message_id, text="Сервис анализа изображений временно недоступен.")
-            thinking_message_id = None
-        else:
-            await client.send_message(chat_id=chat_id, text="Сервис анализа изображений временно недоступен.")
+        # A) Friendly MAX terminal delivery (best effort, no blind fallback)
+        try:
+            if thinking_message_id:
+                try:
+                    await client.edit_message(thinking_message_id, text="Сервис анализа изображений временно недоступен.")
+                except Exception as edit_err:
+                    log.error("Failed to edit thinking message %s on terminal vision failure: %s", thinking_message_id, edit_err)
+                finally:
+                    thinking_message_id = None
+            else:
+                try:
+                    await client.send_message(chat_id=chat_id, text="Сервис анализа изображений временно недоступен.")
+                except Exception as send_err:
+                    log.error("Failed to send friendly terminal vision message chat_id=%s: %s", chat_id, send_err)
+        except Exception as delivery_err:
+            log.error("Unexpected error during MAX friendly error delivery: %s", delivery_err)
 
-        bot_token = os.getenv("BOT_TOKEN")
-        if bot_token:
-            async with async_session_maker() as session:
-                sub_config = await session.get(SubscriptionConfig, 1)
-                notifications_enabled = sub_config.notifications_enabled if sub_config is not None else True
+        # B) Admin notification / gating (contained)
+        try:
+            bot_token = os.getenv("BOT_TOKEN")
+            if bot_token:
+                async with async_session_maker() as session:
+                    sub_config = await session.get(SubscriptionConfig, 1)
+                    notifications_enabled = sub_config.notifications_enabled if sub_config is not None else True
 
-            if notifications_enabled:
-                stage = "vision_analysis"
-                cooldown_key = (stage, exc.provider, exc.classification)
-                if cooldown_key not in _VISION_ALERT_COOLDOWNS:
-                    _VISION_ALERT_COOLDOWNS[cooldown_key] = AlertCooldown(timedelta(hours=1))
-                cooldown = _VISION_ALERT_COOLDOWNS[cooldown_key]
+                if notifications_enabled:
+                    stage = "vision_analysis"
+                    cooldown_key = (stage, exc.provider, exc.classification)
+                    if cooldown_key not in _VISION_ALERT_COOLDOWNS:
+                        _VISION_ALERT_COOLDOWNS[cooldown_key] = AlertCooldown(timedelta(hours=1))
+                    cooldown = _VISION_ALERT_COOLDOWNS[cooldown_key]
 
-                if cooldown.should_send():
-                    try:
-                        async with create_telegram_bot(bot_token) as bot:
-                            await notify_admins_about_error(
-                                bot,
-                                title="🚨 Сбой сервиса анализа изображений MAX (KIE Vision)",
-                                stage=stage,
-                                provider=exc.provider,
-                                model=exc.model,
-                                classification_override=exc.classification,
-                                provider_attempts=exc.attempts,
-                                exception=exc,
-                                user_id=None,
-                                extra={
-                                    "max_user_id": user_id,
-                                    "max_chat_id": chat_id,
-                                },
-                            )
-                    except Exception as notify_err:
-                        log.error("Failed to deliver admin vision alert: %s", notify_err)
-                else:
-                    log.info(
-                        "MAX vision admin alert suppressed by cooldown for key %s",
-                        cooldown_key,
-                    )
+                    if cooldown.should_send():
+                        try:
+                            async with create_telegram_bot(bot_token) as bot:
+                                await notify_admins_about_error(
+                                    bot,
+                                    title="🚨 Сбой сервиса анализа изображений MAX (KIE Vision)",
+                                    stage=stage,
+                                    provider=exc.provider,
+                                    model=exc.model,
+                                    classification_override=exc.classification,
+                                    provider_attempts=exc.attempts,
+                                    exception=exc,
+                                    user_id=None,
+                                    extra={
+                                        "max_user_id": user_id,
+                                        "max_chat_id": chat_id,
+                                    },
+                                )
+                        except Exception as notify_err:
+                            log.error("Failed to deliver admin vision alert: %s", notify_err)
+                    else:
+                        log.info(
+                            "MAX vision admin alert suppressed by cooldown for key %s",
+                            cooldown_key,
+                        )
+        except Exception as alert_gating_err:
+            log.error("Unexpected error in MAX vision admin alert processing: %s", alert_gating_err)
     except AIServiceError as exc:
         log.exception("Vision AIServiceError: %s", exc)
         if thinking_message_id:

@@ -1720,10 +1720,29 @@ async def analyze_image(
             activity_tracker=activity_tracker,
         )
     elif provider == "KIE":
+        preferred = (config.vision_model or "").strip() or "gemini-3-flash"
         api_key = getattr(config, "kie_api_key", None)
         if not api_key:
-            raise AIServiceError("API ключ KIE для vision не задан")
-        preferred = (config.vision_model or "").strip() or "gemini-3-flash"
+            config_exc = AIServiceError("API ключ KIE для vision не задан")
+            classification, _ = classify_external_error(config_exc, provider="KIE")
+            attempt_record = {
+                "provider": "KIE",
+                "model": preferred,
+                "status": "FAILED",
+                "classification": classification,
+                "exception_class": type(config_exc).__name__,
+                "error": exception_summary(config_exc),
+            }
+            raise MaxVisionServiceError(
+                str(config_exc),
+                provider="KIE",
+                model=preferred,
+                classification=classification,
+                is_transient=False,
+                attempts=[attempt_record],
+                status_code=None,
+                provider_error_code=None,
+            ) from config_exc
         try:
             ensure_model_available(PROVIDER_KIE, preferred, channel="vision")
         except Exception as cfg_exc:

@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-os.environ["BOT_TOKEN"] = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+os.environ.setdefault("BOT_TOKEN", "test")
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -26,6 +26,8 @@ from max_messenger_bot.services import common as max_common
 
 class TestMaxVisionReliabilityA3(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self._env_patch = patch.dict(os.environ, {"BOT_TOKEN": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"}, clear=False)
+        self._env_patch.start()
         self.engine = create_async_engine(
             "sqlite+aiosqlite:///:memory:",
             poolclass=StaticPool,
@@ -76,6 +78,7 @@ class TestMaxVisionReliabilityA3(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
     async def asyncTearDown(self):
+        self._env_patch.stop()
         max_ai.async_session_maker = self._orig_max_ai_sessions
         max_common.async_session_maker = self._orig_max_common_sessions
         max_common._VISION_ALERT_COOLDOWNS.clear()
@@ -627,3 +630,171 @@ class TestMaxVisionReliabilityA3(unittest.IsolatedAsyncioTestCase):
         key = ("vision_analysis", "KIE", "timeout")
         # Cooldown entry was not consumed
         self.assertNotIn(key, max_common._VISION_ALERT_COOLDOWNS)
+
+    # Blocker 1 test: missing KIE API key raises MaxVisionServiceError with configuration classification
+    async def test_22_missing_kie_api_key_raises_max_vision_service_error_configuration(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.kie_api_key = None
+            await session.commit()
+
+        calls = []
+
+        async def fake_analyze_kie(*args, **kwargs):
+            calls.append(args[3])
+            return "OK"
+
+        with patch.object(max_ai, "_analyze_kie", side_effect=fake_analyze_kie):
+            with self.assertRaises(MaxVisionServiceError) as ctx:
+                await max_ai.analyze_image(7001, b"fake_bytes", "Промпт")
+
+        # Zero provider calls
+        self.assertEqual(len(calls), 0)
+        err = ctx.exception
+        self.assertEqual(err.provider, "KIE")
+        self.assertEqual(err.model, "gemini-3-flash")
+        self.assertEqual(err.classification, "configuration")
+        self.assertFalse(err.is_transient)
+        self.assertIsNone(err.status_code)
+        self.assertIsNone(err.provider_error_code)
+        self.assertEqual(len(err.attempts), 1)
+        self.assertEqual(err.attempts[0]["classification"], "configuration")
+        self.assertIsInstance(err.__cause__, AIServiceError)
+
+    # Blocker 1 test: missing KIE API key triggers admin alert through run_ai_dialogue_with_image
+    async def test_23_missing_kie_api_key_through_run_ai_dialogue_with_image_triggers_admin_alert(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.kie_api_key = None
+            await session.commit()
+
+        mock_client = MagicMock()
+        mock_client.send_message = AsyncMock(return_value={"message": {"mid": "mid_think_missing_key"}})
+        mock_client.edit_message = AsyncMock(return_value={"ok": True})
+
+        with patch("max_messenger_bot.services.common.notify_admins_about_error", new_callable=AsyncMock) as mock_notify:
+            await max_common.run_ai_dialogue_with_image(
+                client=mock_client,
+                chat_id=999,
+                user_id=7001,
+                image_bytes=b"fake_bytes",
+                caption="Разбери",
+            )
+
+        # Friendly MAX terminal message edited exactly once
+        mock_client.edit_message.assert_called_once_with(
+            "mid_think_missing_key",
+            text="Сервис анализа изображений временно недоступен.",
+        )
+        # Exactly one Telegram notifier invocation
+        mock_notify.assert_called_once()
+        _, kwargs = mock_notify.call_args
+        self.assertEqual(kwargs["stage"], "vision_analysis")
+        self.assertEqual(kwargs["provider"], "KIE")
+        self.assertEqual(kwargs["classification_override"], "configuration")
+        self.assertIsNone(kwargs["user_id"])
+        self.assertEqual(kwargs["extra"], {"max_user_id": 7001, "max_chat_id": 999})
+
+    # Blocker 2 test: thinking MID exists and edit_message raises -> admin alert still invoked, no blind fallback send
+    async def test_24_thinking_mid_exists_edit_message_raises_admin_alert_still_invoked_no_blind_fallback(self):
+        mock_client = MagicMock()
+        mock_client.send_message = AsyncMock(return_value={"message": {"mid": "mid_think_error"}})
+        mock_client.edit_message = AsyncMock(side_effect=RuntimeError("Network error editing message"))
+
+        terminal_err = MaxVisionServiceError(
+            "Timeout terminal",
+            provider="KIE",
+            model="gemini-3-flash",
+            classification="timeout",
+            is_transient=True,
+            attempts=[],
+        )
+
+        with patch("max_messenger_bot.ai.analyze_image", side_effect=terminal_err), \
+             patch("max_messenger_bot.services.common.notify_admins_about_error", new_callable=AsyncMock) as mock_notify:
+            # Must NOT raise or leak the edit_message exception
+            await max_common.run_ai_dialogue_with_image(
+                client=mock_client,
+                chat_id=999,
+                user_id=7001,
+                image_bytes=b"fake_bytes",
+                caption="Разбери",
+            )
+
+        # Attempted edit once
+        mock_client.edit_message.assert_called_once()
+        # send_message was called only once initially for the thinking message; NO blind fallback send was issued!
+        self.assertEqual(mock_client.send_message.call_count, 1)
+        # Admin notifier was still invoked exactly once
+        mock_notify.assert_called_once()
+
+    # Blocker 2 test: no thinking MID and send_message raises -> admin alert still invoked
+    async def test_25_no_thinking_mid_send_message_raises_admin_alert_still_invoked(self):
+        mock_client = MagicMock()
+        # First send_message returns None (no thinking MID extracted)
+        # Second send_message (for friendly error) raises
+        mock_client.send_message = AsyncMock(side_effect=[None, RuntimeError("Network send error")])
+        mock_client.edit_message = AsyncMock()
+
+        terminal_err = MaxVisionServiceError(
+            "Server error terminal",
+            provider="KIE",
+            model="gemini-3-flash",
+            classification="provider_5xx",
+            is_transient=True,
+            attempts=[],
+        )
+
+        with patch("max_messenger_bot.ai.analyze_image", side_effect=terminal_err), \
+             patch("max_messenger_bot.services.common.notify_admins_about_error", new_callable=AsyncMock) as mock_notify:
+            # Must NOT raise or leak the send_message exception
+            await max_common.run_ai_dialogue_with_image(
+                client=mock_client,
+                chat_id=999,
+                user_id=7001,
+                image_bytes=b"fake_bytes",
+                caption="Разбери",
+            )
+
+        mock_client.edit_message.assert_not_called()
+        self.assertEqual(mock_client.send_message.call_count, 2)
+        # Admin notifier was still invoked exactly once
+        mock_notify.assert_called_once()
+
+    # Blocker 2 test: admin notifier exception is contained and does not leak
+    async def test_26_admin_notifier_exception_contained_does_not_leak(self):
+        mock_client = MagicMock()
+        mock_client.send_message = AsyncMock(return_value={"message": {"mid": "mid_think"}})
+        mock_client.edit_message = AsyncMock(return_value={"ok": True})
+
+        terminal_err = MaxVisionServiceError(
+            "Terminal",
+            provider="KIE",
+            model="gemini-3-flash",
+            classification="timeout",
+            is_transient=True,
+            attempts=[],
+        )
+
+        with patch("max_messenger_bot.ai.analyze_image", side_effect=terminal_err), \
+             patch("max_messenger_bot.services.common.notify_admins_about_error", side_effect=RuntimeError("Telegram dispatch crashed")):
+            # Must NOT leak the exception
+            await max_common.run_ai_dialogue_with_image(
+                client=mock_client,
+                chat_id=999,
+                user_id=7001,
+                image_bytes=b"fake_bytes",
+                caption="Разбери",
+            )
+
+        # Friendly message was still edited
+        mock_client.edit_message.assert_called_once()
+
+    # Blocker 3 test: prove BOT_TOKEN environment is properly scoped and restored
+    async def test_27_bot_token_environment_scoped_and_restored(self):
+        # Inside test, BOT_TOKEN is the scoped valid test token
+        self.assertEqual(os.environ["BOT_TOKEN"], "123456789:ABCdefGHIjklMNOpqrsTUVwxyz")
+        # Demonstrate that patch.dict restores previous value upon context exit
+        with patch.dict(os.environ, {"BOT_TOKEN": "scoped_temporary_token"}, clear=False):
+            self.assertEqual(os.environ["BOT_TOKEN"], "scoped_temporary_token")
+        self.assertEqual(os.environ["BOT_TOKEN"], "123456789:ABCdefGHIjklMNOpqrsTUVwxyz")
