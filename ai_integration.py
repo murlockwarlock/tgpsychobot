@@ -53,9 +53,12 @@ from error_reporting import (
 from vector_store import search_relevant_chunks
 from user_metadata import extract_service_data
 from provider_models import (
+    CLAUDE_CHAT_MAX_TOKENS,
     DEEPSEEK_CHAT_MAX_TOKENS,
     DEFAULT_KIE_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+    GEMINI_CHAT_MAX_TOKENS,
+    OPENAI_CHAT_MAX_TOKENS,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
@@ -800,7 +803,7 @@ async def _call_gemini_api(
             raise AIResponseError("Gemini request history must end with a user message")
 
         generation_config: dict[str, Any] = {
-            "maxOutputTokens": 4096,
+            "maxOutputTokens": GEMINI_CHAT_MAX_TOKENS,
         }
         if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
             generation_config["temperature"] = temperature
@@ -1207,7 +1210,7 @@ async def _call_claude_api(
 
         payload: dict[str, Any] = {
             "model": target_model,
-            "max_tokens": 4096,
+            "max_tokens": CLAUDE_CHAT_MAX_TOKENS,
             "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
@@ -1548,7 +1551,7 @@ async def _call_openai_api(
         payload: dict[str, Any] = {
             "model": target_model,
             "messages": build_openai_chat_messages(layout),
-            "max_completion_tokens": 4096,
+            "max_completion_tokens": OPENAI_CHAT_MAX_TOKENS,
         }
         if not target_model.startswith("gpt-5.6"):
             payload["temperature"] = temperature

@@ -179,6 +179,9 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             captured_body = logged_payload.get("payload", logged_payload)
             self.assertEqual(captured_body["model"], payload["model"])
             self.assertEqual(captured_body["messages"], payload["messages"])
+            self.assertEqual(payload["max_completion_tokens"], 16384)
+            self.assertNotIn("max_tokens", payload)
+            self.assertEqual(captured_body["max_completion_tokens"], 16384)
 
     async def test_max_normal_openai_payload_and_ailog(self):
         captured_payloads = []
@@ -241,6 +244,9 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             captured_body = logged_payload.get("payload", logged_payload)
             self.assertEqual(captured_body["model"], payload["model"])
             self.assertEqual(captured_body["messages"], payload["messages"])
+            self.assertEqual(payload["max_completion_tokens"], 16384)
+            self.assertNotIn("max_tokens", payload)
+            self.assertEqual(captured_body["max_completion_tokens"], 16384)
 
     async def test_max_vision_shared_builder_payload(self):
         captured_payloads = []
@@ -363,6 +369,8 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<DATA>", all_system_content)
         self.assertIn("ВРЕМЕННОЙ КОНТЕКСТ:", all_system_content)
         self.assertEqual(payload["messages"][-1]["content"], "Тест Claude на MAX")
+        self.assertEqual(payload["max_tokens"], 16384)
+        self.assertNotIn("max_completion_tokens", payload)
 
     async def test_max_normal_gemini_family_payload(self):
         captured_payloads = []
@@ -401,6 +409,147 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GEN_IMG", system_text)
         self.assertIn("<DATA>", system_text)
         self.assertIn("ВРЕМЕННОЙ КОНТЕКСТ:", system_text)
+        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 16384)
+
+    async def test_claude_platform_payload_parity_and_ailog(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "Claude"
+            await session.commit()
+
+        captured_tg = []
+        captured_max = []
+
+        async def fake_claude_tg(**kwargs):
+            captured_tg.append(kwargs)
+            resp = MagicMock()
+            part = MagicMock()
+            part.text = "Ответ Claude TG"
+            resp.content = [part]
+            return resp
+
+        async def fake_claude_max(**kwargs):
+            captured_max.append(kwargs)
+            resp = MagicMock()
+            part = MagicMock()
+            part.text = "Ответ Claude MAX"
+            resp.content = [part]
+            return resp
+
+        mock_tg_client = AsyncMock()
+        mock_tg_client.messages.create.side_effect = fake_claude_tg
+        with patch.object(ai_integration.anthropic, "AsyncAnthropic", return_value=mock_tg_client):
+            resp_tg = await ai_integration.generate_response(
+                user_id=5001,
+                user_prompt="Как мне справиться со стрессом?",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp_tg, "Ответ Claude TG")
+
+        # Verify persisted Telegram AILog for Claude
+        async with self.sessions() as session:
+            tg_ai_log = await session.scalar(select(AILog).where(AILog.platform == "telegram").order_by(AILog.id.desc()))
+            self.assertIsNotNone(tg_ai_log)
+            self.assertEqual(tg_ai_log.provider, "Claude")
+            tg_log_data = json.loads(tg_ai_log.request_payload)
+            self.assertEqual(tg_log_data["provider"], "Claude")
+            self.assertEqual(tg_log_data["payload"]["max_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", tg_log_data["payload"])
+
+        with patch("anthropic.resources.messages.AsyncMessages.create", side_effect=fake_claude_max):
+            resp_max = await max_ai.get_ai_response(
+                5001,
+                "Как мне справиться со стрессом?",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp_max, "Ответ Claude MAX")
+
+        # Verify persisted MAX AILog for Claude
+        async with self.sessions() as session:
+            max_ai_log = await session.scalar(select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc()))
+            self.assertIsNotNone(max_ai_log)
+            self.assertEqual(max_ai_log.provider, "Claude")
+            max_log_data = json.loads(max_ai_log.request_payload)
+            self.assertEqual(max_log_data["provider"], "Claude")
+            self.assertEqual(max_log_data["payload"]["max_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", max_log_data["payload"])
+
+        # Parity comparison
+        self.assertEqual(captured_tg[0]["max_tokens"], 16384)
+        self.assertEqual(captured_max[0]["max_tokens"], 16384)
+        self.assertNotIn("max_completion_tokens", captured_tg[0])
+        self.assertNotIn("max_completion_tokens", captured_max[0])
+
+    async def test_gemini_platform_payload_parity_and_ailog(self):
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.provider = "Gemini"
+            await session.commit()
+
+        captured_tg = []
+        captured_max = []
+
+        class FakeGeminiTGClient:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def post(self, url, **kwargs):
+                captured_tg.append(kwargs)
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.json.return_value = {
+                    "candidates": [{"content": {"parts": [{"text": "Ответ Gemini TG"}]}}]
+                }
+                return resp
+
+        with patch.object(ai_integration.httpx, "AsyncClient", return_value=FakeGeminiTGClient()):
+            resp_tg = await ai_integration.generate_response(
+                user_id=5001,
+                user_prompt="Как мне справиться со стрессом?",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp_tg, "Ответ Gemini TG")
+
+        # Verify persisted Telegram AILog for Gemini
+        async with self.sessions() as session:
+            tg_ai_log = await session.scalar(select(AILog).where(AILog.platform == "telegram").order_by(AILog.id.desc()))
+            self.assertIsNotNone(tg_ai_log)
+            self.assertEqual(tg_ai_log.provider, "Gemini")
+            tg_log_data = json.loads(tg_ai_log.request_payload)
+            self.assertEqual(tg_log_data["provider"], "Gemini")
+            self.assertEqual(tg_log_data["payload"]["generationConfig"]["maxOutputTokens"], 16384)
+
+        async def fake_gemini_max_post(url, *args, **kwargs):
+            captured_max.append(kwargs)
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "candidates": [{"content": {"parts": [{"text": "Ответ Gemini MAX"}]}}]
+            }
+            return resp
+
+        with patch("httpx.AsyncClient.post", side_effect=fake_gemini_max_post):
+            resp_max = await max_ai.get_ai_response(
+                5001,
+                "Как мне справиться со стрессом?",
+                track_user_activity=True,
+            )
+            self.assertEqual(resp_max, "Ответ Gemini MAX")
+
+        # Verify persisted MAX AILog for Gemini
+        async with self.sessions() as session:
+            max_ai_log = await session.scalar(select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc()))
+            self.assertIsNotNone(max_ai_log)
+            self.assertEqual(max_ai_log.provider, "Gemini")
+            max_log_data = json.loads(max_ai_log.request_payload)
+            self.assertEqual(max_log_data["provider"], "Gemini")
+            self.assertEqual(max_log_data["payload"]["generationConfig"]["maxOutputTokens"], 16384)
+
+        # Parity comparison
+        self.assertEqual(captured_tg[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
+        self.assertEqual(captured_max[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
 
     async def test_deepseek_platform_payload_parity_and_ailog(self):
         async with self.sessions() as session:
