@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from ..ai import AIServiceError, generate_image, get_ai_response, edit_image
 from ..api import MaxApiClient
+from ..models import extract_sent_message_id
 from ..formatting import markdown_to_html, split_text
 from ..keyboards import callback_button, disclaimer_keyboard, inline_keyboard, link_button, main_menu_row, response_buttons_keyboard
 from ..logging_utils import get_bot_logger
@@ -71,7 +72,13 @@ async def _send_ai_text(
     response_buttons: list[list[ResponseButton]] | None = None,
 ) -> None:
     main_menu_kb = _response_buttons_keyboard(response_buttons)
+    chunks = [c for c in chunks if c.strip()]
     if not chunks:
+        if thinking_message_id:
+            try:
+                await client.delete_message(thinking_message_id)
+            except Exception:
+                pass
         return
 
     if len(chunks) == 1:
@@ -780,7 +787,7 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
     user_msg = await save_user_message(user_id, prompt_text)
     exclude_message_id = user_msg.id if user_msg else None
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Думаю...")
-    thinking_message_id = ((thinking.get("message") or {}).get("mid") if isinstance(thinking, dict) else None)
+    thinking_message_id = extract_sent_message_id(thinking)
 
     topic_phrase = None
     async with async_session_maker() as session:
@@ -800,11 +807,13 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
         await save_ai_message(user_id, response_without_test_directive)
 
         if should_start_test:
-            clean_text = response_without_test_directive
-            if clean_text:
-                await client.edit_message(thinking_message_id, text=markdown_to_html(clean_text))
-            elif thinking_message_id:
-                await client.edit_message(thinking_message_id, text="Запускаю тест.")
+            clean_text = (response_without_test_directive or "").strip()
+            text_to_send = markdown_to_html(clean_text) if clean_text else "Запускаю тест."
+            if thinking_message_id:
+                await client.edit_message(thinking_message_id, text=text_to_send)
+                thinking_message_id = None
+            else:
+                await client.send_message(chat_id=chat_id, text=text_to_send)
             from .tests import start_test
 
             await start_test(client, chat_id, user_id, states)
@@ -818,21 +827,34 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             img_prompt = (img_match.group(1) or img_match.group(2) or "").strip()
             clean_text = re.sub(r"GEN_IMG:\s*\[.*?\]|\[IMG:\s*.*?\]", "", clean_response_text, flags=re.DOTALL).strip()
             buttons_sent = False
-            if thinking_message_id and clean_text:
-                await client.edit_message(
-                    thinking_message_id,
-                    text=markdown_to_html(clean_text),
-                    attachments=_response_buttons_keyboard(response_buttons),
-                )
-                thinking_message_id = None
-                buttons_sent = bool(response_buttons)
-            elif clean_text:
-                await client.send_message(
-                    chat_id=chat_id,
-                    text=markdown_to_html(clean_text),
-                    attachments=_response_buttons_keyboard(response_buttons),
-                )
-                buttons_sent = bool(response_buttons)
+            gen_status_id: str | None = None
+            if clean_text:
+                if thinking_message_id:
+                    await client.edit_message(
+                        thinking_message_id,
+                        text=markdown_to_html(clean_text),
+                        attachments=_response_buttons_keyboard(response_buttons),
+                    )
+                    thinking_message_id = None
+                    buttons_sent = bool(response_buttons)
+                else:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text=markdown_to_html(clean_text),
+                        attachments=_response_buttons_keyboard(response_buttons),
+                    )
+                    buttons_sent = bool(response_buttons)
+                gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
+                gen_status_id = extract_sent_message_id(gen_status)
+            else:
+                if thinking_message_id:
+                    await client.edit_message(thinking_message_id, text="🖼 Генерирую новое изображение...")
+                    gen_status_id = thinking_message_id
+                    thinking_message_id = None
+                else:
+                    gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
+                    gen_status_id = extract_sent_message_id(gen_status)
+
             try:
                 img_bytes = await generate_image(img_prompt)
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -850,6 +872,14 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             except Exception as img_exc:
                 log.exception("Image generation failed user_id=%s: %s", user_id, img_exc)
                 await client.send_message(chat_id=chat_id, text="⚠️ Не удалось создать изображение. Попробуйте позже.")
+            finally:
+                if gen_status_id:
+                    try:
+                        await client.delete_message(gen_status_id)
+                    except Exception:
+                        pass
+                    gen_status_id = None
+
             if response_buttons and not buttons_sent:
                 await client.send_message(
                     chat_id=chat_id,
@@ -863,17 +893,20 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
         html_text = markdown_to_html(clean_response_text)
         chunks = split_text(html_text)
         await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
+        thinking_message_id = None
         log.info("AI dialogue completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
+            thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
     except Exception:
         log.exception("Unexpected bot dialogue failure user_id=%s chat_id=%s", user_id, chat_id)
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+            thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
 
@@ -911,7 +944,7 @@ async def run_hidden_ai_kickoff(
             return
 
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Думаю...")
-    thinking_message_id = ((thinking.get("message") or {}).get("mid") if isinstance(thinking, dict) else None)
+    thinking_message_id = extract_sent_message_id(thinking)
 
     topic_phrase = None
     if expected_topic_id:
@@ -959,11 +992,13 @@ async def run_hidden_ai_kickoff(
         await save_ai_message(user_id, response_without_test_directive, dialogue_id=expected_dialogue_id, topic_id=expected_topic_id)
 
         if should_start_test:
-            clean_text = response_without_test_directive
-            if clean_text:
-                await client.edit_message(thinking_message_id, text=markdown_to_html(clean_text))
-            elif thinking_message_id:
-                await client.edit_message(thinking_message_id, text="Запускаю тест.")
+            clean_text = (response_without_test_directive or "").strip()
+            text_to_send = markdown_to_html(clean_text) if clean_text else "Запускаю тест."
+            if thinking_message_id:
+                await client.edit_message(thinking_message_id, text=text_to_send)
+                thinking_message_id = None
+            else:
+                await client.send_message(chat_id=chat_id, text=text_to_send)
             from .tests import start_test
 
             await start_test(client, chat_id, user_id, states)
@@ -977,21 +1012,34 @@ async def run_hidden_ai_kickoff(
             img_prompt = (img_match.group(1) or img_match.group(2) or "").strip()
             clean_text = re.sub(r"GEN_IMG:\s*\[.*?\]|\[IMG:\s*.*?\]", "", clean_response_text, flags=re.DOTALL).strip()
             buttons_sent = False
-            if thinking_message_id and clean_text:
-                await client.edit_message(
-                    thinking_message_id,
-                    text=markdown_to_html(clean_text),
-                    attachments=_response_buttons_keyboard(response_buttons),
-                )
-                thinking_message_id = None
-                buttons_sent = bool(response_buttons)
-            elif clean_text:
-                await client.send_message(
-                    chat_id=chat_id,
-                    text=markdown_to_html(clean_text),
-                    attachments=_response_buttons_keyboard(response_buttons),
-                )
-                buttons_sent = bool(response_buttons)
+            gen_status_id: str | None = None
+            if clean_text:
+                if thinking_message_id:
+                    await client.edit_message(
+                        thinking_message_id,
+                        text=markdown_to_html(clean_text),
+                        attachments=_response_buttons_keyboard(response_buttons),
+                    )
+                    thinking_message_id = None
+                    buttons_sent = bool(response_buttons)
+                else:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text=markdown_to_html(clean_text),
+                        attachments=_response_buttons_keyboard(response_buttons),
+                    )
+                    buttons_sent = bool(response_buttons)
+                gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
+                gen_status_id = extract_sent_message_id(gen_status)
+            else:
+                if thinking_message_id:
+                    await client.edit_message(thinking_message_id, text="🖼 Генерирую новое изображение...")
+                    gen_status_id = thinking_message_id
+                    thinking_message_id = None
+                else:
+                    gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
+                    gen_status_id = extract_sent_message_id(gen_status)
+
             try:
                 img_bytes = await generate_image(img_prompt)
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -1009,6 +1057,14 @@ async def run_hidden_ai_kickoff(
             except Exception as img_exc:
                 log.exception("Image generation failed user_id=%s: %s", user_id, img_exc)
                 await client.send_message(chat_id=chat_id, text="⚠️ Не удалось создать изображение. Попробуйте позже.")
+            finally:
+                if gen_status_id:
+                    try:
+                        await client.delete_message(gen_status_id)
+                    except Exception:
+                        pass
+                    gen_status_id = None
+
             if response_buttons and not buttons_sent:
                 await client.send_message(
                     chat_id=chat_id,
@@ -1022,17 +1078,20 @@ async def run_hidden_ai_kickoff(
         html_text = markdown_to_html(clean_response_text)
         chunks = split_text(html_text)
         await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
+        thinking_message_id = None
         log.info("Hidden AI kickoff completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
+            thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
     except Exception:
         log.exception("Unexpected bot dialogue failure user_id=%s chat_id=%s", user_id, chat_id)
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+            thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
 
@@ -1057,7 +1116,7 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
     user_msg = await save_user_message(user_id, f"[Изображение] {prompt}")
     user_msg_id = getattr(user_msg, "id", None) if user_msg else None
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Анализирую изображение...")
-    thinking_message_id = ((thinking.get("message") or {}).get("mid") if isinstance(thinking, dict) else None)
+    thinking_message_id = extract_sent_message_id(thinking)
 
     try:
         response_text = await analyze_image(user_id, image_bytes, prompt, exclude_message_id=user_msg_id)
@@ -1069,15 +1128,26 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
 
         await save_ai_message(user_id, clean_text)
         html_text = markdown_to_html(clean_text)
-        chunks = split_text(html_text)
+        chunks = [c for c in split_text(html_text) if c.strip()] if clean_text else []
 
         if chunks:
             await _send_ai_text(client, chat_id, thinking_message_id, chunks)
             thinking_message_id = None
 
         if edit_prompt:
-            edit_status = await client.send_message(chat_id=chat_id, text="🎨 Редактирую ваше фото...")
-            edit_status_id = ((edit_status.get("message") or {}).get("mid") if isinstance(edit_status, dict) else None)
+            edit_status_id: str | None = None
+            if clean_text:
+                edit_status = await client.send_message(chat_id=chat_id, text="🎨 Редактирую ваше фото...")
+                edit_status_id = extract_sent_message_id(edit_status)
+            else:
+                if thinking_message_id:
+                    await client.edit_message(thinking_message_id, text="🎨 Редактирую ваше фото...")
+                    edit_status_id = thinking_message_id
+                    thinking_message_id = None
+                else:
+                    edit_status = await client.send_message(chat_id=chat_id, text="🎨 Редактирую ваше фото...")
+                    edit_status_id = extract_sent_message_id(edit_status)
+
             try:
                 edited_data = await edit_image(edit_prompt, image_bytes)
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -1101,10 +1171,22 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
                         await client.delete_message(edit_status_id)
                     except Exception:
                         pass
+                    edit_status_id = None
 
         elif gen_prompt:
-            gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
-            gen_status_id = ((gen_status.get("message") or {}).get("mid") if isinstance(gen_status, dict) else None)
+            gen_status_id: str | None = None
+            if clean_text:
+                gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
+                gen_status_id = extract_sent_message_id(gen_status)
+            else:
+                if thinking_message_id:
+                    await client.edit_message(thinking_message_id, text="🖼 Генерирую новое изображение...")
+                    gen_status_id = thinking_message_id
+                    thinking_message_id = None
+                else:
+                    gen_status = await client.send_message(chat_id=chat_id, text="🖼 Генерирую новое изображение...")
+                    gen_status_id = extract_sent_message_id(gen_status)
+
             try:
                 new_img = await generate_image(gen_prompt)
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -1128,17 +1210,27 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
                         await client.delete_message(gen_status_id)
                     except Exception:
                         pass
+                    gen_status_id = None
+        else:
+            if not chunks and thinking_message_id:
+                try:
+                    await client.delete_message(thinking_message_id)
+                except Exception:
+                    pass
+                thinking_message_id = None
 
     except AIServiceError as exc:
         log.exception("Vision AIServiceError: %s", exc)
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text="Сервис анализа изображений временно недоступен.")
+            thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text="Сервис анализа изображений временно недоступен.")
     except Exception:
         log.exception("Vision unexpected failure user_id=%s", user_id)
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text="Произошла ошибка при анализе изображения.")
+            thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text="Произошла ошибка при анализе изображения.")
 
@@ -1149,7 +1241,7 @@ async def run_ai_dialogue_with_voice(client: MaxApiClient, chat_id: int, user_id
 
     log.info("Voice message received user_id=%s chat_id=%s", user_id, chat_id)
     thinking = await client.send_message(chat_id=chat_id, text="🎙 Распознаю голосовое сообщение...")
-    thinking_message_id = ((thinking.get("message") or {}).get("mid") if isinstance(thinking, dict) else None)
+    thinking_message_id = extract_sent_message_id(thinking)
 
     try:
         transcription = await transcribe_audio(audio_bytes, filename)
@@ -1164,6 +1256,7 @@ async def run_ai_dialogue_with_voice(client: MaxApiClient, chat_id: int, user_id
         msg = "Не удалось распознать аудио. Сервис временно недоступен."
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text=msg)
+            thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text=msg)
         return
@@ -1172,6 +1265,7 @@ async def run_ai_dialogue_with_voice(client: MaxApiClient, chat_id: int, user_id
         msg = "Произошла ошибка при распознавании аудио."
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text=msg)
+            thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text=msg)
         return
