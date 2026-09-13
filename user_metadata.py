@@ -161,7 +161,7 @@ SELF_CLOSING_DATA_RE = re.compile(
 
 UNMATCHED_DATA_OPENER_RE = re.compile(
     r"(?P<fence>^[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*\r?\n\s*)?"
-    r"(?P<tag><DATA(?:\s*>|\s+[^/>\r\n]*(?:>|\r?\n|$)|[ \t]*(?:\r?\n|$))|\[DATA\])",
+    r"(?P<tag><DATA(?:\s*>|\s+[^>\r\n]*(?:>|\r?\n|$)|[ \t]*(?:\r?\n|$))|\[DATA\])",
     re.IGNORECASE | re.MULTILINE,
 )
 

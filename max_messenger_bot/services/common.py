@@ -70,7 +70,7 @@ async def _send_ai_text(
     thinking_message_id: str | None,
     chunks: list[str],
     response_buttons: list[list[ResponseButton]] | None = None,
-) -> None:
+) -> tuple[str | None, bool]:
     main_menu_kb = _response_buttons_keyboard(response_buttons)
     chunks = [c for c in chunks if c.strip()]
     if not chunks:
@@ -79,33 +79,55 @@ async def _send_ai_text(
                 await client.delete_message(thinking_message_id)
             except Exception:
                 pass
-        return
+        return None, False
 
     if len(chunks) == 1:
         if thinking_message_id:
+            try:
+                await client.edit_message(
+                    thinking_message_id,
+                    text=chunks[0],
+                    attachments=main_menu_kb,
+                )
+                return None, bool(response_buttons)
+            except Exception as exc:
+                log.warning("Failed to edit thinking message %s into text: %s", thinking_message_id, exc)
+                return thinking_message_id, False
+        else:
+            try:
+                await client.send_message(chat_id=chat_id, text=chunks[0], attachments=main_menu_kb)
+                return None, bool(response_buttons)
+            except Exception as exc:
+                log.warning("Failed to send text chunk: %s", exc)
+                return None, False
+
+    if thinking_message_id:
+        try:
             await client.edit_message(
                 thinking_message_id,
                 text=chunks[0],
-                attachments=main_menu_kb,
+                attachments=None,
             )
-        else:
-            await client.send_message(chat_id=chat_id, text=chunks[0], attachments=main_menu_kb)
-        return
-
-    if thinking_message_id:
-        await client.edit_message(
-            thinking_message_id,
-            text=chunks[0],
-            attachments=None,
-        )
+            thinking_message_id = None
+        except Exception as exc:
+            log.warning("Failed to edit thinking message %s into first chunk: %s", thinking_message_id, exc)
+            return thinking_message_id, False
         remaining_chunks = chunks[1:]
     else:
         remaining_chunks = chunks
 
+    all_sent = True
     for i, chunk in enumerate(remaining_chunks):
         is_last = (i == len(remaining_chunks) - 1)
         kb = main_menu_kb if is_last else None
-        await client.send_message(chat_id=chat_id, text=chunk, attachments=kb)
+        try:
+            await client.send_message(chat_id=chat_id, text=chunk, attachments=kb)
+        except Exception as exc:
+            log.warning("Failed to send chunk %s: %s", i + 1, exc)
+            all_sent = False
+            break
+
+    return None, (all_sent and bool(response_buttons))
 
 
 async def is_admin(user_id: int) -> bool:
@@ -874,10 +896,16 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
                             text=markdown_to_html(clean_text),
                             attachments=_response_buttons_keyboard(response_buttons),
                         )
+                        thinking_message_id = None
+                        buttons_sent = bool(response_buttons)
+                        gen_status_id, _ = await _transition_image_progress_status(
+                            client, chat_id, "🖼 Генерирую новое изображение..."
+                        )
                     except Exception as exc:
                         log.warning("Failed to deliver visible text before image generation: %s", exc)
-                    thinking_message_id = None
-                    buttons_sent = bool(response_buttons)
+                        gen_status_id, thinking_message_id = await _transition_image_progress_status(
+                            client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+                        )
                 else:
                     try:
                         await client.send_message(
@@ -885,13 +913,12 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
                             text=markdown_to_html(clean_text),
                             attachments=_response_buttons_keyboard(response_buttons),
                         )
+                        buttons_sent = bool(response_buttons)
                     except Exception as exc:
                         log.warning("Failed to deliver visible text before image generation: %s", exc)
-                    buttons_sent = bool(response_buttons)
-
-                gen_status_id, _ = await _transition_image_progress_status(
-                    client, chat_id, "🖼 Генерирую новое изображение..."
-                )
+                    gen_status_id, _ = await _transition_image_progress_status(
+                        client, chat_id, "🖼 Генерирую новое изображение..."
+                    )
             else:
                 gen_status_id, thinking_message_id = await _transition_image_progress_status(
                     client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
@@ -923,19 +950,27 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
                     gen_status_id = None
 
             if response_buttons and not buttons_sent:
-                await client.send_message(
-                    chat_id=chat_id,
-                    text="Выберите действие:",
-                    attachments=_response_buttons_keyboard(response_buttons),
-                )
+                try:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Выберите действие:",
+                        attachments=_response_buttons_keyboard(response_buttons),
+                    )
+                except Exception as exc:
+                    log.warning("Failed to deliver fallback response buttons: %s", exc)
             return
 
         if not clean_response_text and response_buttons:
             clean_response_text = "Выберите действие:"
         html_text = markdown_to_html(clean_response_text)
         chunks = split_text(html_text)
-        await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
-        thinking_message_id = None
+        thinking_message_id, _ = await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
+        if thinking_message_id:
+            try:
+                await client.delete_message(thinking_message_id)
+            except Exception:
+                pass
+            thinking_message_id = None
         log.info("AI dialogue completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)
@@ -1063,10 +1098,16 @@ async def run_hidden_ai_kickoff(
                             text=markdown_to_html(clean_text),
                             attachments=_response_buttons_keyboard(response_buttons),
                         )
+                        thinking_message_id = None
+                        buttons_sent = bool(response_buttons)
+                        gen_status_id, _ = await _transition_image_progress_status(
+                            client, chat_id, "🖼 Генерирую новое изображение..."
+                        )
                     except Exception as exc:
                         log.warning("Failed to deliver visible text before kickoff image generation: %s", exc)
-                    thinking_message_id = None
-                    buttons_sent = bool(response_buttons)
+                        gen_status_id, thinking_message_id = await _transition_image_progress_status(
+                            client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+                        )
                 else:
                     try:
                         await client.send_message(
@@ -1074,13 +1115,12 @@ async def run_hidden_ai_kickoff(
                             text=markdown_to_html(clean_text),
                             attachments=_response_buttons_keyboard(response_buttons),
                         )
+                        buttons_sent = bool(response_buttons)
                     except Exception as exc:
                         log.warning("Failed to deliver visible text before kickoff image generation: %s", exc)
-                    buttons_sent = bool(response_buttons)
-
-                gen_status_id, _ = await _transition_image_progress_status(
-                    client, chat_id, "🖼 Генерирую новое изображение..."
-                )
+                    gen_status_id, _ = await _transition_image_progress_status(
+                        client, chat_id, "🖼 Генерирую новое изображение..."
+                    )
             else:
                 gen_status_id, thinking_message_id = await _transition_image_progress_status(
                     client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
@@ -1112,19 +1152,27 @@ async def run_hidden_ai_kickoff(
                     gen_status_id = None
 
             if response_buttons and not buttons_sent:
-                await client.send_message(
-                    chat_id=chat_id,
-                    text="Выберите действие:",
-                    attachments=_response_buttons_keyboard(response_buttons),
-                )
+                try:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text="Выберите действие:",
+                        attachments=_response_buttons_keyboard(response_buttons),
+                    )
+                except Exception as exc:
+                    log.warning("Failed to deliver kickoff fallback response buttons: %s", exc)
             return
 
         if not clean_response_text and response_buttons:
             clean_response_text = "Выберите действие:"
         html_text = markdown_to_html(clean_response_text)
         chunks = split_text(html_text)
-        await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
-        thinking_message_id = None
+        thinking_message_id, _ = await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
+        if thinking_message_id:
+            try:
+                await client.delete_message(thinking_message_id)
+            except Exception:
+                pass
+            thinking_message_id = None
         log.info("Hidden AI kickoff completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)
@@ -1177,11 +1225,7 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
         chunks = [c for c in split_text(html_text) if c.strip()] if clean_text else []
 
         if chunks:
-            try:
-                await _send_ai_text(client, chat_id, thinking_message_id, chunks)
-            except Exception as exc:
-                log.warning("Failed to send text chunks in image dialogue: %s", exc)
-            thinking_message_id = None
+            thinking_message_id, _ = await _send_ai_text(client, chat_id, thinking_message_id, chunks)
 
         if edit_prompt:
             edit_status_id, thinking_message_id = await _transition_image_progress_status(
@@ -1243,7 +1287,7 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
                         pass
                     gen_status_id = None
         else:
-            if not chunks and thinking_message_id:
+            if thinking_message_id:
                 try:
                     await client.delete_message(thinking_message_id)
                 except Exception:

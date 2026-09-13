@@ -266,6 +266,42 @@ class TestA1DataSanitization:
         assert visible == code_block
         assert invalid == 1
 
+    def test_27_incomplete_data_with_schema_url_attribute(self):
+        t = "Visible\n<DATA schema=\"https://example.com\">\n{\"x\":"
+        visible, blocks, invalid = extract_service_data(t)
+        assert visible == "Visible"
+        assert len(blocks) == 0
+        assert invalid == 1
+
+    def test_28_incomplete_data_with_path_attribute(self):
+        t = "Visible\n<DATA path=\"/foo/bar\">\n{\"x\":"
+        visible, blocks, invalid = extract_service_data(t)
+        assert visible == "Visible"
+        assert len(blocks) == 0
+        assert invalid == 1
+
+    def test_29_truncated_data_opener_with_schema_url(self):
+        t = "Visible\n<DATA schema=\"https://example.com\""
+        visible, blocks, invalid = extract_service_data(t)
+        assert visible == "Visible"
+        assert len(blocks) == 0
+        assert invalid == 1
+
+    def test_30_complete_valid_data_with_slash_containing_attribute(self):
+        t = "Visible\n<DATA schema=\"https://example.com\">\n{\"metadata\":{\"key\":\"value\"}}\n</DATA>"
+        visible, blocks, invalid = extract_service_data(t)
+        assert visible == "Visible"
+        assert len(blocks) == 1
+        assert blocks[0].metadata == {"key": "value"}
+        assert invalid == 0
+
+    def test_31_self_closing_with_schema_url_attribute_preserves_surrounding_text(self):
+        t = "Visible before\n<DATA schema=\"https://example.com\" />\nVisible after"
+        visible, blocks, invalid = extract_service_data(t)
+        assert visible == "Visible before\n\nVisible after"
+        assert len(blocks) == 0
+        assert invalid == 1
+
 
 class TestA1ResultHistoryAndIntegration:
     """Covers Section L: raw/clean/history proof, result_history safety, and provider request parity."""
