@@ -70,10 +70,10 @@ class TestA1MaxSentMessageIdExtractor:
         payload = {"body": {"mid": "mid.body.789"}}
         assert extract_sent_message_id(payload) == "mid.body.789"
 
-    def test_04_root_mid_and_fallbacks(self):
+    def test_04_root_mid(self):
         assert extract_sent_message_id({"mid": "mid.root.1"}) == "mid.root.1"
-        assert extract_sent_message_id({"message_id": "mid.fallback.2"}) == "mid.fallback.2"
-        assert extract_sent_message_id({"id": "mid.fallback.3"}) == "mid.fallback.3"
+        assert extract_sent_message_id({"message_id": "mid.fallback.2"}) is None
+        assert extract_sent_message_id({"id": "mid.fallback.3"}) is None
         assert extract_sent_message_id(None) is None
         assert extract_sent_message_id({}) is None
         assert extract_sent_message_id("not_a_dict") is None

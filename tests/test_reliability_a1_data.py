@@ -6,13 +6,18 @@ from unittest.mock import AsyncMock, patch, MagicMock
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+import ai_integration
+import handlers
 from user_metadata import extract_service_data
 from result_history import (
     AIHistoryMessage,
     select_ai_history_messages,
 )
 from ai_request_builder import build_conversational_request_layout
-from database import async_session_maker, init_db, User, Message as DBMessage, AIConfig
+from database import Base, async_session_maker, init_db, User, Message as DBMessage, AIConfig, AILog, BotGeneralConfig
 
 
 class TestA1DataSanitization:
@@ -229,70 +234,214 @@ class TestA1ResultHistoryAndIntegration:
         assert selected[0].content == ""  # NOT resurrected to raw_broken!
 
     @pytest.mark.asyncio
-    async def test_ai_request_builder_omits_empty_assistant_message(self):
-        raw_broken = "<DATA>\n{\"current_state\": {\"stage\":"
-        mock_user = MagicMock()
-        mock_user.role = "user"
-        mock_user.content = "Привет!"
-        mock_user.ai_context_content = None
-        mock_user.topic_id = None
-        mock_user.topic = None
+    async def test_telegram_truncated_data_flow_boundary_contract(self):
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
 
-        mock_asst = MagicMock()
-        mock_asst.role = "assistant"
-        mock_asst.content = raw_broken
-        mock_asst.ai_context_content = None
-        mock_asst.topic_id = None
-        mock_asst.topic = None
+        orig_ai_session = ai_integration.async_session_maker
+        orig_handlers_session = handlers.async_session_maker
+        ai_integration.async_session_maker = sessions
+        handlers.async_session_maker = sessions
 
-        selected = select_ai_history_messages([mock_user, mock_asst], limit_first=0, limit_recent=10)
-        assert len(selected) == 2
-        assert selected[1].content == ""
+        try:
+            async with sessions() as s:
+                user = User(
+                    id=2001,
+                    first_name="Мария",
+                    gender="female",
+                    current_dialogue_id=1,
+                    current_topic_id=None,
+                    metadata_json="{}",
+                )
+                ai_config = AIConfig(
+                    id=1,
+                    provider="OpenAI",
+                    openai_api_key="sk-test-telegram-a1",
+                    openai_model="gpt-5.6-terra",
+                    system_prompt="Ты эмпатичный психолог.",
+                )
+                bot_gen = BotGeneralConfig(id=1)
+                s.add(user)
+                s.add(ai_config)
+                s.add(bot_gen)
+                await s.commit()
 
-        # Build history items as done in build_conversational_request_layout
-        history_items = [
-            {"role": item.role, "content": item.content}
-            for item in selected
-            if item.content
-        ]
-        assert len(history_items) == 1
-        assert history_items[0]["role"] == "user"
-        assert history_items[0]["content"] == "Привет!"
-        # The broken assistant turn was dropped; raw DATA never leaked into outbound history!
+            broken_response = (
+                "Нормальный ответ TG.\n"
+                "<DATA>\n"
+                '{"metadata":{"x":'
+            )
+
+            # 1. Invoke real ai_integration.generate_response() with outbound provider mocked
+            response_capture = {}
+            with patch.object(ai_integration, "_call_openai_api", AsyncMock(return_value=broken_response)):
+                result = await ai_integration.generate_response(
+                    user_id=2001,
+                    user_prompt="Вопрос TG 1",
+                    response_capture=response_capture,
+                )
+
+            assert result == "Нормальный ответ TG."
+
+            # 2. Query actual AILog persisted by generate_response()
+            async with sessions() as s:
+                ai_logs = (
+                    await s.execute(select(AILog).where(AILog.user_id == 2001).order_by(AILog.id.desc()))
+                ).scalars().all()
+                assert len(ai_logs) >= 1
+                assert ai_logs[0].raw_response == broken_response
+                assert ai_logs[0].clean_text == "Нормальный ответ TG."
+
+            # 3. Drive actual Telegram assistant persistence path via handlers.process_buffered_messages
+            mock_bot = AsyncMock()
+            mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=555))
+            mock_bot.send_chat_action = AsyncMock()
+            mock_bot.delete_message = AsyncMock()
+
+            with patch.object(ai_integration, "_call_openai_api", AsyncMock(return_value=broken_response)):
+                await handlers.process_buffered_messages(
+                    user_id=2001,
+                    bot=mock_bot,
+                    isolated_prompt="Вопрос в диалоге TG",
+                )
+
+            # Query actual assistant DBMessage
+            async with sessions() as s:
+                messages = (
+                    await s.execute(
+                        select(DBMessage).where(DBMessage.user_id == 2001, DBMessage.role == "assistant").order_by(DBMessage.id.desc())
+                    )
+                ).scalars().all()
+                assert len(messages) >= 1
+                last_msg = messages[0]
+                assert last_msg.content == "Нормальный ответ TG."
+                assert "<DATA" not in last_msg.content
+                assert '{"metadata"' not in last_msg.content
+
+            # Inspect visible output sent to Telegram user
+            sent_texts = [call.kwargs.get("text") or (call.args[1] if len(call.args) > 1 else "") for call in mock_bot.send_message.mock_calls]
+            assert any("Нормальный ответ TG." in t for t in sent_texts if t)
+            assert all("<DATA" not in t for t in sent_texts if t)
+            assert all('{"metadata"' not in t for t in sent_texts if t)
+
+            # 4. Execute/build next actual conversational request via build_conversational_request_layout
+            async with sessions() as s:
+                user = await s.get(User, 2001)
+                ai_config = await s.get(AIConfig, 1)
+                layout = await build_conversational_request_layout(
+                    s,
+                    user=user,
+                    ai_config=ai_config,
+                    dialogue_id=user.current_dialogue_id,
+                    current_user_content="Второй вопрос TG",
+                )
+
+            assistant_history = [m.content for m in layout.history if getattr(m, "role", None) == "assistant"]
+            assert assistant_history == ["Нормальный ответ TG."]
+            assert assistant_history.count("Нормальный ответ TG.") == 1
+            assert all("<DATA" not in c for c in assistant_history)
+            assert all('{"metadata"' not in c for c in assistant_history)
+
+        finally:
+            ai_integration.async_session_maker = orig_ai_session
+            handlers.async_session_maker = orig_handlers_session
+            await engine.dispose()
 
     @pytest.mark.asyncio
-    async def test_telegram_flow_ailog_and_persistence_parity(self):
-        raw_response = (
-            "Нормальный ответ пользователю.\n"
-            "```json\n"
-            "<DATA>\n"
-            "{\"current_state\": {\"stage\": 1"
-        )
-        visible, blocks, invalid = extract_service_data(raw_response)
-        assert visible == "Нормальный ответ пользователю."
-        assert invalid == 1
+    async def test_telegram_data_only_truncated_variant_boundary_contract(self):
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
 
-        # Simulate AILog creation
-        ai_log_raw = raw_response
-        ai_log_clean = visible
+        orig_ai_session = ai_integration.async_session_maker
+        orig_handlers_session = handlers.async_session_maker
+        ai_integration.async_session_maker = sessions
+        handlers.async_session_maker = sessions
 
-        # AILog retains full response, clean_text contains only visible
-        assert "<DATA>" in ai_log_raw
-        assert "<DATA>" not in ai_log_clean
-        assert "{\"current_state\"" not in ai_log_clean
+        try:
+            async with sessions() as s:
+                user = User(
+                    id=2001,
+                    first_name="Мария",
+                    gender="female",
+                    current_dialogue_id=1,
+                    current_topic_id=None,
+                    metadata_json="{}",
+                )
+                ai_config = AIConfig(
+                    id=1,
+                    provider="OpenAI",
+                    openai_api_key="sk-test-telegram-a1",
+                    openai_model="gpt-5.6-terra",
+                    system_prompt="Ты эмпатичный психолог.",
+                )
+                bot_gen = BotGeneralConfig(id=1)
+                s.add(user)
+                s.add(ai_config)
+                s.add(bot_gen)
+                await s.commit()
 
-    @pytest.mark.asyncio
-    async def test_max_flow_ailog_and_persistence_parity(self):
-        raw_response = (
-            "Ответ в MAX.\n"
-            "<DATA>\n"
-            "{\"partial\": true"
-        )
-        visible, blocks, invalid = extract_service_data(raw_response)
-        assert visible == "Ответ в MAX."
-        assert invalid == 1
+            broken_data_only = (
+                "<DATA>\n"
+                '{"metadata":{"x":'
+            )
 
-        # Simulate MAX save_ai_message
-        persisted_content = visible
-        assert "<DATA>" not in persisted_content
-        assert "{\"partial\"" not in persisted_content
+            # 1. Invoke real ai_integration.generate_response()
+            with patch.object(ai_integration, "_call_openai_api", AsyncMock(return_value=broken_data_only)):
+                result = await ai_integration.generate_response(
+                    user_id=2001,
+                    user_prompt="Вопрос TG DATA-only",
+                )
+
+            assert result == ""
+
+            # 2. Query actual AILog
+            async with sessions() as s:
+                ai_logs = (
+                    await s.execute(select(AILog).where(AILog.user_id == 2001).order_by(AILog.id.desc()))
+                ).scalars().all()
+                assert len(ai_logs) >= 1
+                assert ai_logs[0].raw_response == broken_data_only
+                assert ai_logs[0].clean_text == ""
+
+            # 3. Drive Telegram conversational flow with broken data-only response
+            mock_bot = AsyncMock()
+            mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=556))
+            mock_bot.send_chat_action = AsyncMock()
+            mock_bot.delete_message = AsyncMock()
+
+            with patch.object(ai_integration, "_call_openai_api", AsyncMock(return_value=broken_data_only)):
+                await handlers.process_buffered_messages(
+                    user_id=2001,
+                    bot=mock_bot,
+                    isolated_prompt="Вопрос в диалоге TG DATA-only",
+                )
+
+            # 4. Build next actual conversational request layout using repository builder
+            async with sessions() as s:
+                user = await s.get(User, 2001)
+                ai_config = await s.get(AIConfig, 1)
+                layout = await build_conversational_request_layout(
+                    s,
+                    user=user,
+                    ai_config=ai_config,
+                    dialogue_id=user.current_dialogue_id,
+                    current_user_content="Следующий вопрос TG",
+                )
+
+            # Prove: empty sanitized assistant content never becomes raw provider history
+            for msg in layout.history:
+                content = getattr(msg, "content", "")
+                assert "<DATA" not in content
+                assert '{"metadata"' not in content
+                if getattr(msg, "role", None) == "assistant":
+                    assert content != broken_data_only
+
+        finally:
+            ai_integration.async_session_maker = orig_ai_session
+            handlers.async_session_maker = orig_handlers_session
+            await engine.dispose()
+
