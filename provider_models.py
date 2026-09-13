@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from hmac import compare_digest
 import re
+from typing import Any
 
 
 # ==========================================
@@ -32,6 +33,7 @@ DEEPSEEK_LEGACY_MODELS = (
     "deepseek-reasoner",
     "deepseek-coder",
 )
+DEEPSEEK_CHAT_MAX_TOKENS = 16384
 
 KIE_DEFAULT_CHAT_MODEL = "gemini-3-flash"
 
@@ -492,3 +494,122 @@ def get_default_model(provider: str | None, channel: str = "chat") -> str:
             )
         return selectable[0]
     return PROVIDER_DEFAULT_MODELS.get(p_name, "gemini-3.7-flash")
+
+
+# ==========================================
+# 7. DEEPSEEK RESPONSE INSPECTION & DIAGNOSTICS
+# ==========================================
+
+@dataclass(frozen=True)
+class DeepSeekDiagnostics:
+    provider: str
+    model: str
+    platform: str
+    finish_reason: str | None
+    visible_content_present: bool
+    visible_content_length: int
+    reasoning_content_present: bool
+    reasoning_content_length: int
+    output_budget_exhausted: bool
+
+
+def inspect_deepseek_response(
+    response: Any,
+    *,
+    model: str,
+    platform: str,
+) -> tuple[str | None, DeepSeekDiagnostics]:
+    """Safely inspect DeepSeek chat completion response and extract metadata.
+
+    The raw reasoning string is only inspected transiently to derive presence
+    and length. It is NEVER retained in diagnostics or returned to callers.
+    """
+    effective_model = str(model or DEEPSEEK_DEFAULT_MODEL)
+
+    if response is None:
+        return None, DeepSeekDiagnostics(
+            provider="Deepseek",
+            model=effective_model,
+            platform=platform,
+            finish_reason=None,
+            visible_content_present=False,
+            visible_content_length=0,
+            reasoning_content_present=False,
+            reasoning_content_length=0,
+            output_budget_exhausted=False,
+        )
+
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices")
+
+    if not choices:
+        return None, DeepSeekDiagnostics(
+            provider="Deepseek",
+            model=effective_model,
+            platform=platform,
+            finish_reason=None,
+            visible_content_present=False,
+            visible_content_length=0,
+            reasoning_content_present=False,
+            reasoning_content_length=0,
+            output_budget_exhausted=False,
+        )
+
+    choice = choices[0]
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason is None and isinstance(choice, dict):
+        finish_reason = choice.get("finish_reason")
+    finish_reason_str = str(finish_reason).strip() if finish_reason is not None else None
+
+    message = getattr(choice, "message", None)
+    if message is None and isinstance(choice, dict):
+        message = choice.get("message")
+
+    content: Any = None
+    reasoning_content: Any = None
+
+    if message is not None:
+        if isinstance(message, dict):
+            content = message.get("content")
+            reasoning_content = message.get("reasoning_content")
+        else:
+            content = getattr(message, "content", None)
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if reasoning_content is None:
+                model_extra = getattr(message, "model_extra", None)
+                if isinstance(model_extra, dict):
+                    reasoning_content = model_extra.get("reasoning_content")
+            if reasoning_content is None:
+                pydantic_extra = getattr(message, "__pydantic_extra__", None)
+                if isinstance(pydantic_extra, dict):
+                    reasoning_content = pydantic_extra.get("reasoning_content")
+
+    visible_str = content if isinstance(content, str) else ""
+    visible_present = bool(visible_str and visible_str.strip())
+    visible_len = len(visible_str)
+
+    reasoning_str = reasoning_content if isinstance(reasoning_content, str) else ""
+    reasoning_present = bool(reasoning_str and reasoning_str.strip())
+    reasoning_len = len(reasoning_str)
+
+    # Security invariant: reasoning string is never preserved
+    del reasoning_content
+    del reasoning_str
+
+    output_exhausted = (finish_reason_str.lower() == "length") if finish_reason_str else False
+
+    diagnostics = DeepSeekDiagnostics(
+        provider="Deepseek",
+        model=effective_model,
+        platform=platform,
+        finish_reason=finish_reason_str,
+        visible_content_present=visible_present,
+        visible_content_length=visible_len,
+        reasoning_content_present=reasoning_present,
+        reasoning_content_length=reasoning_len,
+        output_budget_exhausted=output_exhausted,
+    )
+
+    clean_content = visible_str if visible_present else None
+    return clean_content, diagnostics
