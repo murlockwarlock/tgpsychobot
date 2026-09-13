@@ -272,6 +272,7 @@ async def load_conversational_ai_history(
     limit_first: int = 2,
     limit_recent: int = 10,
     exclude_message_id: int | None = None,
+    current_user_content: Any = None,
 ) -> tuple[AIRequestMessage, ...]:
     """Load, filter, and turn-group conversational messages deterministically."""
     stmt = select(Message).where(
@@ -286,9 +287,31 @@ async def load_conversational_ai_history(
     if exclude_message_id is not None:
         raw_messages = [m for m in raw_messages if getattr(m, "id", None) != exclude_message_id]
 
+    pending_user_content: str | None = None
+    if (
+        exclude_message_id is not None
+        and isinstance(current_user_content, str)
+        and bool(current_user_content.strip())
+    ):
+        stmt_pending = select(Message).where(
+            Message.id == exclude_message_id,
+            Message.role == "user",
+            build_history_scope(Message, user_id, dialogue_id, topic_id, memory_mode),
+        )
+        excluded_msg = (await session.execute(stmt_pending)).scalar_one_or_none()
+        if excluded_msg is not None:
+            raw_content = getattr(excluded_msg, "ai_context_content", None) or getattr(excluded_msg, "content", None)
+            if raw_content and str(raw_content).strip():
+                pending_user_content = str(raw_content)
+
     effective_first = resolve_context_limit(limit_first, default=2)
     effective_recent = resolve_context_limit(limit_recent, default=10)
-    selected = select_ai_history_messages(raw_messages, effective_first, effective_recent)
+    selected = select_ai_history_messages(
+        raw_messages,
+        effective_first,
+        effective_recent,
+        pending_user_content=pending_user_content,
+    )
     history_items = [
         {"role": item.role, "content": item.content}
         for item in selected
@@ -403,6 +426,7 @@ async def build_conversational_request_layout(
         default=10,
     )
     if history is None:
+        history_user_content = None if modality_instructions else current_user_content
         canonical_history = await load_conversational_ai_history(
             session,
             user_id=user.id,
@@ -412,6 +436,7 @@ async def build_conversational_request_layout(
             limit_first=first_limit,
             limit_recent=recent_limit,
             exclude_message_id=exclude_message_id,
+            current_user_content=history_user_content,
         )
     else:
         canonical_history = list(history)

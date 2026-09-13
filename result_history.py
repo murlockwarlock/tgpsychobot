@@ -125,17 +125,32 @@ async def resolve_topic_entry_state(
     return False
 
 
+VISION_HISTORY_MARKERS = ("[Изображение]", "[Фото для анализа]")
+
+
+def _is_vision_history_marker(content: str | None) -> bool:
+    if not content:
+        return False
+    return content.strip().startswith(VISION_HISTORY_MARKERS)
+
+
 def select_ai_history_messages(
     messages: list[Any],
     limit_first: int,
     limit_recent: int,
+    *,
+    pending_user_content: str | None = None,
 ) -> list[AIHistoryMessage]:
     """Select and turn-group conversational history without mutating persistent ORM rows."""
 
     # 1. Read-only normalization into immutable AIHistoryMessage value objects
     normalized: list[AIHistoryMessage] = []
+    last_consecutive_user_content: str | None = None
+
     for message in messages:
-        if message.role == TEST_RESULT_ROLE:
+        role = getattr(message, "role", None)
+        if role == TEST_RESULT_ROLE:
+            last_consecutive_user_content = None
             normalized.append(AIHistoryMessage(
                 role="user",
                 content=f"[РЕЗУЛЬТАТЫ ПРОЙДЕННОГО ТЕСТА]\n{getattr(message, 'content', '') or ''}",
@@ -143,7 +158,8 @@ def select_ai_history_messages(
                 topic=getattr(message, "topic", None),
                 source_role=TEST_RESULT_ROLE,
             ))
-        elif message.role == SYSTEM_EVENT_ROLE:
+        elif role == SYSTEM_EVENT_ROLE:
+            last_consecutive_user_content = None
             normalized.append(AIHistoryMessage(
                 role="user",  # provider-facing role
                 content=getattr(message, "content", "") or "",
@@ -151,7 +167,8 @@ def select_ai_history_messages(
                 topic=getattr(message, "topic", None),
                 source_role=SYSTEM_EVENT_ROLE,  # technical role retained
             ))
-        elif message.role == "assistant":
+        elif role == "assistant":
+            last_consecutive_user_content = None
             raw = getattr(message, "content", None) or getattr(message, "ai_context_content", None) or ""
             clean_content, _, _ = extract_service_data(raw)
             if not clean_content or not clean_content.strip():
@@ -163,22 +180,53 @@ def select_ai_history_messages(
                 topic=getattr(message, "topic", None),
                 source_role="assistant",
             ))
-        elif message.role == "user":
-            normalized.append(AIHistoryMessage(
-                role="user",
-                content=getattr(message, "ai_context_content", None) or getattr(message, "content", "") or "",
-                topic_id=getattr(message, "topic_id", None),
-                topic=getattr(message, "topic", None),
-                source_role="user",
-            ))
+        elif role == "user":
+            content = getattr(message, "ai_context_content", None) or getattr(message, "content", "") or ""
+            if _is_vision_history_marker(content):
+                last_consecutive_user_content = None
+                normalized.append(AIHistoryMessage(
+                    role="user",
+                    content=content,
+                    topic_id=getattr(message, "topic_id", None),
+                    topic=getattr(message, "topic", None),
+                    source_role="user",
+                ))
+            else:
+                if (
+                    last_consecutive_user_content is not None
+                    and content.strip() == last_consecutive_user_content.strip()
+                ):
+                    continue
+                normalized.append(AIHistoryMessage(
+                    role="user",
+                    content=content,
+                    topic_id=getattr(message, "topic_id", None),
+                    topic=getattr(message, "topic", None),
+                    source_role="user",
+                ))
+                last_consecutive_user_content = content
         else:
+            last_consecutive_user_content = None
             normalized.append(AIHistoryMessage(
-                role=getattr(message, "role", "user"),
+                role=role or "user",
                 content=getattr(message, "content", "") or "",
                 topic_id=getattr(message, "topic_id", None),
                 topic=getattr(message, "topic", None),
-                source_role=getattr(message, "role", "user"),
+                source_role=role or "user",
             ))
+
+    raw_tail_is_genuine_user = bool(messages and getattr(messages[-1], "role", None) == "user")
+    if (
+        pending_user_content is not None
+        and raw_tail_is_genuine_user
+        and normalized
+        and normalized[-1].role == "user"
+        and normalized[-1].source_role == "user"
+        and not _is_vision_history_marker(normalized[-1].content)
+        and not _is_vision_history_marker(pending_user_content)
+        and normalized[-1].content.strip() == pending_user_content.strip()
+    ):
+        normalized.pop()
 
     # 2. Turn grouping using source_role to identify logical boundaries
     turns: list[list[AIHistoryMessage]] = []
