@@ -344,7 +344,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(OPENAI_CHAT_MAX_TOKENS, 16384)
         self.assertEqual(CLAUDE_CHAT_MAX_TOKENS, 16384)
         self.assertEqual(GEMINI_CHAT_MAX_TOKENS, 16384)
-        self.assertEqual(DEEPSEEK_CHAT_MAX_TOKENS, 16384)
+        self.assertEqual(DEEPSEEK_CHAT_MAX_TOKENS, 65536)
 
     # -------------------------------------------------------------------------
     # 10. Telegram Fallback -> OpenAI (actual outbound payload uses 16384)
@@ -576,7 +576,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             resp = await ai_integration.generate_response(user_id=7001, user_prompt="Вопрос к DeepSeek TG")
             self.assertEqual(resp, "TG DeepSeek OK")
 
-        self.assertEqual(captured_tg[0]["max_tokens"], 16384)
+        self.assertEqual(captured_tg[0]["max_tokens"], 65536)
         self.assertEqual(captured_tg[0]["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
 
         captured_max = []
@@ -588,7 +588,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             resp = await max_ai.get_ai_response(7001, "Вопрос к DeepSeek MAX", track_user_activity=True)
             self.assertEqual(resp, "MAX DeepSeek OK")
 
-        self.assertEqual(captured_max[0]["max_tokens"], 16384)
+        self.assertEqual(captured_max[0]["max_tokens"], 65536)
         self.assertEqual(captured_max[0]["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
 
     # -------------------------------------------------------------------------

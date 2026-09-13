@@ -597,7 +597,7 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tg_log_data["provider"], "Deepseek")
             self.assertNotIn("sk-", tg_log_data.get("endpoint", ""))
             self.assertEqual(tg_log_data["payload"]["model"], "deepseek-v4-flash")
-            self.assertEqual(tg_log_data["payload"]["max_tokens"], 16384)
+            self.assertEqual(tg_log_data["payload"]["max_tokens"], 65536)
             self.assertEqual(tg_log_data["payload"]["messages"], captured_tg[0]["messages"])
 
         # MAX actual get_ai_response
@@ -619,7 +619,7 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(max_log_data["provider"], "Deepseek")
             self.assertNotIn("sk-", max_log_data.get("endpoint", ""))
             self.assertEqual(max_log_data["payload"]["model"], "deepseek-v4-flash")
-            self.assertEqual(max_log_data["payload"]["max_tokens"], 16384)
+            self.assertEqual(max_log_data["payload"]["max_tokens"], 65536)
             self.assertEqual(max_log_data["payload"]["messages"], captured_max[0]["messages"])
 
         # Compare normalized common semantic request between TG and MAX
@@ -628,8 +628,8 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload_tg["model"], "deepseek-v4-flash")
         self.assertEqual(payload_max["model"], "deepseek-v4-flash")
-        self.assertEqual(payload_tg["max_tokens"], 16384)
-        self.assertEqual(payload_max["max_tokens"], 16384)
+        self.assertEqual(payload_tg["max_tokens"], 65536)
+        self.assertEqual(payload_max["max_tokens"], 65536)
 
         msgs_tg = payload_tg["messages"]
         msgs_max = payload_max["messages"]
