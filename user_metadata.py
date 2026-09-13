@@ -154,6 +154,18 @@ def _repair_json_payload(raw_json: str) -> dict[str, Any] | None:
     return None
 
 
+SELF_CLOSING_DATA_RE = re.compile(
+    r"<DATA(?:\s+[^>]*)?\s*/>",
+    re.IGNORECASE,
+)
+
+UNMATCHED_DATA_OPENER_RE = re.compile(
+    r"(?P<fence>^[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*\r?\n\s*)?"
+    r"(?P<tag><DATA(?:\s*>|\s+[^>\r\n]*(?:>|\r?\n|$)|[ \t]*(?:\r?\n|$))|\[DATA\])",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def extract_service_data(text: str | None) -> tuple[str, list[ServiceDataBlock], int]:
     """Extract legacy ``[DATA]`` and the unified ``<DATA>`` JSON envelope."""
     raw_text = text or ""
@@ -175,6 +187,24 @@ def extract_service_data(text: str | None) -> tuple[str, list[ServiceDataBlock],
         )
 
     visible_text = DATA_BLOCK_RE.sub("", raw_text)
+
+    self_closing_matches = list(SELF_CLOSING_DATA_RE.finditer(visible_text))
+    if self_closing_matches:
+        invalid_count += len(self_closing_matches)
+        visible_text = SELF_CLOSING_DATA_RE.sub("", visible_text)
+
+    unmatched_match = UNMATCHED_DATA_OPENER_RE.search(visible_text)
+    if unmatched_match:
+        start_pos = unmatched_match.start()
+        fence_part = unmatched_match.group("fence")
+        if fence_part:
+            prefix = visible_text[:unmatched_match.start()]
+            fence_count = len(re.findall(r"^[ \t]*`{3,}", prefix, re.MULTILINE))
+            if fence_count % 2 == 1 and not re.search(r"`{3,}[a-zA-Z0-9_-]+", fence_part):
+                start_pos = unmatched_match.start("tag")
+        visible_text = visible_text[:start_pos]
+        invalid_count += 1
+
     visible_text = re.sub(r"</?DATA(?:\s[^>]*)?>|\[/?DATA\]", "", visible_text, flags=re.IGNORECASE)
     visible_text = re.sub(r"[ \t]+\n", "\n", visible_text)
     visible_text = re.sub(r"\n{3,}", "\n\n", visible_text).strip()

@@ -425,3 +425,122 @@ class MaxDataServiceParityTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(max_ai, "_analyze_openai", AsyncMock(return_value=mock_vision_3)):
             res_vis_empty = await max_ai.analyze_image(self.user_id, b"fake_bytes", "Опиши фото")
         self.assertEqual(res_vis_empty, "")
+
+    # -----------------------------------------------------------------------
+    # 14. Phase A1 truncated DATA boundary flow
+    # -----------------------------------------------------------------------
+    async def test_max_truncated_data_flow_boundary_contract(self):
+        broken_provider_response = (
+            "Нормальный ответ MAX.\n"
+            "<DATA>\n"
+            '{"metadata":{"x":'
+        )
+
+        # 1. Call real max_ai.get_ai_response() with only provider dispatch mocked.
+        with patch.object(max_ai, "_dispatch_provider", AsyncMock(return_value=broken_provider_response)):
+            result = await max_ai.get_ai_response(self.user_id, "Вопрос MAX 1")
+
+        self.assertEqual(result, "Нормальный ответ MAX.")
+
+        # 2. Query actual AILog from DB.
+        async with self.sessions() as session:
+            ai_logs = (
+                await session.execute(
+                    select(AILog).where(AILog.user_id == self.user_id).order_by(AILog.id.desc())
+                )
+            ).scalars().all()
+            self.assertGreaterEqual(len(ai_logs), 1)
+            self.assertEqual(ai_logs[0].raw_response, broken_provider_response)
+            self.assertEqual(ai_logs[0].clean_text, "Нормальный ответ MAX.")
+
+        # 3. Drive real common.run_ai_dialogue() with the same broken-provider response.
+        client = _MockMaxApiClient()
+        with patch.object(max_ai, "_dispatch_provider", AsyncMock(return_value=broken_provider_response)):
+            await common.run_ai_dialogue(client, chat_id=12345, user_id=self.user_id, prompt_text="Вопрос диалога")
+
+        # Query actual assistant DBMessage.
+        async with self.sessions() as session:
+            messages = (
+                await session.execute(
+                    select(DBMessage).where(DBMessage.user_id == self.user_id, DBMessage.role == "assistant").order_by(DBMessage.id.desc())
+                )
+            ).scalars().all()
+            self.assertGreaterEqual(len(messages), 1)
+            last_msg = messages[0]
+            self.assertEqual(last_msg.content, "Нормальный ответ MAX.")
+            self.assertNotIn("<DATA", last_msg.content)
+            self.assertNotIn('{"metadata"', last_msg.content)
+
+        # 4. Inspect the mocked MAX client terminal visible output.
+        self.assertEqual(len(client.edited_messages), 1)
+        client_text = client.edited_messages[0]["text"]
+        self.assertEqual(client_text, "Нормальный ответ MAX.")
+        self.assertNotIn("<DATA", client_text)
+        self.assertNotIn('{"metadata"', client_text)
+
+        # 5. Execute a SECOND real conversational turn.
+        captured_layouts = []
+        async def _capture_turn2(config, layout, request_capture=None, *args, **kwargs):
+            captured_layouts.append(layout)
+            return "Ответ 2 MAX."
+
+        with patch.object(max_ai, "_dispatch_provider", _capture_turn2):
+            await common.run_ai_dialogue(client, chat_id=12345, user_id=self.user_id, prompt_text="Второй вопрос диалога")
+
+        self.assertEqual(len(captured_layouts), 1)
+        layout = captured_layouts[0]
+        assistant_history = [msg.content for msg in layout.history if getattr(msg, "role", None) == "assistant"]
+        self.assertEqual(assistant_history, ["Нормальный ответ MAX."])
+        self.assertEqual(assistant_history.count("Нормальный ответ MAX."), 1)
+        self.assertTrue(all("<DATA" not in content for content in assistant_history))
+        self.assertTrue(all('{"metadata"' not in content for content in assistant_history))
+
+    # -----------------------------------------------------------------------
+    # 15. Phase A1 DATA-only truncated variant boundary contract
+    # -----------------------------------------------------------------------
+    async def test_max_data_only_truncated_variant_boundary_contract(self):
+        broken_data_only_response = (
+            "<DATA>\n"
+            '{"metadata":{"x":'
+        )
+
+        # 1. Call real max_ai.get_ai_response() with only provider dispatch mocked.
+        with patch.object(max_ai, "_dispatch_provider", AsyncMock(return_value=broken_data_only_response)):
+            result = await max_ai.get_ai_response(self.user_id, "Вопрос DATA-only")
+
+        self.assertEqual(result, "")
+
+        # 2. Query actual AILog from DB.
+        async with self.sessions() as session:
+            ai_logs = (
+                await session.execute(
+                    select(AILog).where(AILog.user_id == self.user_id).order_by(AILog.id.desc())
+                )
+            ).scalars().all()
+            self.assertGreaterEqual(len(ai_logs), 1)
+            self.assertEqual(ai_logs[0].raw_response, broken_data_only_response)
+            self.assertEqual(ai_logs[0].clean_text, "")
+
+        # 3. Drive real common.run_ai_dialogue() with the broken data-only response.
+        client = _MockMaxApiClient()
+        with patch.object(max_ai, "_dispatch_provider", AsyncMock(return_value=broken_data_only_response)):
+            await common.run_ai_dialogue(client, chat_id=12345, user_id=self.user_id, prompt_text="Вопрос диалога DATA-only")
+
+        # 4. Execute a second real conversational turn and capture AIRequestLayout.
+        captured_layouts = []
+        async def _capture_turn2(config, layout, request_capture=None, *args, **kwargs):
+            captured_layouts.append(layout)
+            return "Ответ после DATA-only."
+
+        with patch.object(max_ai, "_dispatch_provider", _capture_turn2):
+            await common.run_ai_dialogue(client, chat_id=12345, user_id=self.user_id, prompt_text="Следующий вопрос")
+
+        self.assertEqual(len(captured_layouts), 1)
+        layout = captured_layouts[0]
+        # Prove: no raw DATA assistant content reaches the next real request layout/history.
+        for msg in layout.history:
+            content = getattr(msg, "content", "")
+            self.assertNotIn("<DATA", content)
+            self.assertNotIn('{"metadata"', content)
+            if getattr(msg, "role", None) == "assistant":
+                self.assertNotEqual(content, broken_data_only_response)

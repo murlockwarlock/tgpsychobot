@@ -25,6 +25,32 @@ def _nested_get(data: dict[str, Any] | None, *path: str) -> Any:
     return current
 
 
+def extract_sent_message_id(payload: Any) -> str | None:
+    """Extract canonical message ID (mid) from MAX API message responses.
+
+    Approved compatibility shapes:
+    1. message.body.mid (canonical real MAX API shape)
+    2. message.mid (legacy mock shape)
+    3. body.mid (alternative body shape)
+    4. mid (root shape)
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    candidates = [
+        _nested_get(payload, "message", "body", "mid"),
+        _nested_get(payload, "message", "mid"),
+        _nested_get(payload, "body", "mid"),
+        payload.get("mid"),
+    ]
+    for cand in candidates:
+        if cand is not None:
+            cand_str = str(cand).strip()
+            if cand_str:
+                return cand_str
+    return None
+
+
 @dataclass(slots=True)
 class Sender:
     user_id: int

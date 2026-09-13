@@ -156,7 +156,7 @@ def select_ai_history_messages(
             clean_content, _, _ = extract_service_data(raw)
             normalized.append(AIHistoryMessage(
                 role="assistant",
-                content=clean_content if clean_content else raw,
+                content=clean_content,
                 topic_id=getattr(message, "topic_id", None),
                 topic=getattr(message, "topic", None),
                 source_role="assistant",
