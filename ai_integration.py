@@ -53,9 +53,12 @@ from error_reporting import (
 from vector_store import search_relevant_chunks
 from user_metadata import extract_service_data
 from provider_models import (
+    CLAUDE_CHAT_MAX_TOKENS,
     DEEPSEEK_CHAT_MAX_TOKENS,
     DEFAULT_KIE_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+    GEMINI_CHAT_MAX_TOKENS,
+    OPENAI_CHAT_MAX_TOKENS,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
@@ -800,7 +803,7 @@ async def _call_gemini_api(
             raise AIResponseError("Gemini request history must end with a user message")
 
         generation_config: dict[str, Any] = {
-            "maxOutputTokens": 4096,
+            "maxOutputTokens": GEMINI_CHAT_MAX_TOKENS,
         }
         if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
             generation_config["temperature"] = temperature
@@ -1207,7 +1210,7 @@ async def _call_claude_api(
 
         payload: dict[str, Any] = {
             "model": target_model,
-            "max_tokens": 4096,
+            "max_tokens": CLAUDE_CHAT_MAX_TOKENS,
             "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
@@ -1529,6 +1532,7 @@ async def _call_openai_api(
     *,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_completion_tokens: int = 4096,
 ):
     try:
         if not api_key:
@@ -1548,7 +1552,7 @@ async def _call_openai_api(
         payload: dict[str, Any] = {
             "model": target_model,
             "messages": build_openai_chat_messages(layout),
-            "max_completion_tokens": 4096,
+            "max_completion_tokens": max_completion_tokens,
         }
         if not target_model.startswith("gpt-5.6"):
             payload["temperature"] = temperature
@@ -1772,7 +1776,19 @@ async def get_ai_response(
 
 
             if p_key == 'openai':
-                response_text = await _call_openai_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
+                response_text = await _call_openai_api(
+                    p_api_key,
+                    p_model,
+                    list(request_layout.history),
+                    "",
+                    formatted_body,
+                    temperature,
+                    timeout=timeout,
+                    request_capture=request_capture,
+                    request_layout=request_layout,
+                    activity_tracker=activity_tracker,
+                    max_completion_tokens=OPENAI_CHAT_MAX_TOKENS,
+                )
             elif p_key in ['anthropic', 'claude']:
                 response_text = await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
             elif p_key == 'gemini':
@@ -1782,7 +1798,19 @@ async def get_ai_response(
             elif p_key == 'deepseek':
                 response_text = await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
             elif p_key == 'xai':
-                response_text = await _call_openai_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=request_capture, request_layout=request_layout, activity_tracker=activity_tracker)
+                response_text = await _call_openai_api(
+                    p_api_key,
+                    p_model,
+                    list(request_layout.history),
+                    "",
+                    formatted_body,
+                    temperature,
+                    timeout=timeout,
+                    request_capture=request_capture,
+                    request_layout=request_layout,
+                    activity_tracker=activity_tracker,
+                    max_completion_tokens=4096,
+                )
             else:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
             return _validate_text_response(response_text, provider=p_key)
