@@ -21,11 +21,17 @@ from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
 
 STATE_FILE = os.environ.get("PSYCHOBOTS_MONITOR_STATE", "/tmp/psychobots_monitor_state.json")
 REPEAT_ALERT_SECONDS = int(os.environ.get("PSYCHOBOTS_MONITOR_REPEAT_SECONDS", str(6 * 60 * 60)))
-DEFAULT_STUCK_REPEAT_SECONDS = 6 * 60 * 60
+DEFAULT_STUCK_REPEAT_SECONDS = 0
 STUCK_REPEAT_SECONDS = int(
     os.environ.get("PSYCHOBOTS_MONITOR_STUCK_REPEAT_SECONDS", str(DEFAULT_STUCK_REPEAT_SECONDS))
 )
-STUCK_MAX_AGE_HOURS = int(os.environ.get("PSYCHOBOTS_MONITOR_STUCK_MAX_AGE_HOURS", "0"))
+DEFAULT_STUCK_MAX_AGE_HOURS = 24
+STUCK_MAX_AGE_HOURS = int(
+    os.environ.get(
+        "PSYCHOBOTS_MONITOR_STUCK_MAX_AGE_HOURS",
+        str(DEFAULT_STUCK_MAX_AGE_HOURS),
+    )
+)
 STUCK_GRACE_SECONDS = int(os.environ.get("PSYCHOBOTS_MONITOR_STUCK_GRACE_SECONDS", "180"))
 DEFAULT_LOCK_FILE = "/tmp/psychobots_monitor.lock"
 
@@ -481,7 +487,9 @@ async def check_stuck_dialogues(
                 is_in_cooldown = False
                 if incident_key in state["stuck_dialogues"]:
                     last_alerted = state["stuck_dialogues"][incident_key].get("last_alerted_at", 0)
-                    if (int(time.time()) - last_alerted) < STUCK_REPEAT_SECONDS:
+                    if STUCK_REPEAT_SECONDS <= 0:
+                        is_in_cooldown = True
+                    elif (int(time.time()) - last_alerted) < STUCK_REPEAT_SECONDS:
                         is_in_cooldown = True
 
                 if not is_in_cooldown:
