@@ -167,3 +167,1180 @@ def test_get_candidate_alert_tokens_fallback_when_preferred_not_found(monkeypatc
 
     assert tokens == ["token_someone04", "token_veraveda"]
 
+
+# ==============================================================================
+# Incident B1-F: Stuck AI Dialogue Watchdog Tests
+# ==============================================================================
+
+
+def test_make_safe_db_key_strips_credentials():
+    url = "postgresql+asyncpg://admin_user:secret_pass%40123@db.example.com:5433/bot_prod_db"
+    safe_key = monitor.make_safe_db_key(url)
+    assert safe_key == "db.example.com:5433/bot_prod_db"
+    assert "admin_user" not in safe_key
+    assert "secret_pass" not in safe_key
+
+
+def test_make_safe_db_key_handles_ipv6_with_colons():
+    url = "postgresql://user:pass@[2001:db8::1]:5432/bot_db"
+    safe_key = monitor.make_safe_db_key(url)
+    assert safe_key == "[2001:db8::1]:5432/bot_db"
+    assert "user" not in safe_key
+    assert "pass" not in safe_key
+
+
+def test_group_apps_by_db_deduplicates_shared_databases():
+    apps = [
+        {"name": "tg_app1", "db_url": "postgresql://u1:p1@10.0.0.1:5432/shared_db"},
+        {"name": "max_app1", "db_url": "postgresql://u2:p2@10.0.0.1:5432/shared_db"},
+        {"name": "tg_app2", "db_url": "postgresql://u3:p3@10.0.0.2:5432/other_db"},
+    ]
+    groups = monitor.group_apps_by_db(apps)
+    assert len(groups) == 2
+    assert len(groups["10.0.0.1:5432/shared_db"]) == 2
+    assert len(groups["10.0.0.2:5432/other_db"]) == 1
+
+
+def test_format_age_deterministic():
+    assert monitor.format_age(0) == "0м"
+    assert monitor.format_age(45) == "0м"
+    assert monitor.format_age(120) == "2м"
+    assert monitor.format_age(3600) == "1ч"
+    assert monitor.format_age(3660) == "1ч1м"
+    assert monitor.format_age(86400) == "1д"
+    assert monitor.format_age(90060) == "1д1ч1м"
+
+
+def test_make_incident_key_scoping():
+    assert (
+        monitor.make_incident_key("host:5432/db", 10, 1, "reset", None)
+        == "host:5432/db:10:1"
+    )
+    assert (
+        monitor.make_incident_key("host:5432/db", 10, 1, "global", None)
+        == "host:5432/db:10:1"
+    )
+    assert (
+        monitor.make_incident_key("host:5432/db", 10, 1, "topic", 42)
+        == "host:5432/db:10:1:topic:42"
+    )
+    assert (
+        monitor.make_incident_key("host:5432/db", 10, 1, "topic", None)
+        == "host:5432/db:10:1:topic:null"
+    )
+
+
+def test_format_stuck_alert_contains_no_message_content():
+    cand = {
+        "user_id": 12345,
+        "dialogue_id": 2,
+        "incident_scope_kind": "topic",
+        "incident_topic_id": 10,
+        "unanswered_count": 3,
+        "first_unanswered_at": monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+        - monitor.timedelta(minutes=15),
+    }
+    group_apps = [{"name": "tg_bot_alpha"}, {"name": "max_bot_beta"}]
+    text = monitor.format_stuck_alert(cand, group_apps)
+
+    assert "12345" in text
+    assert "tg_bot_alpha" in text and "max_bot_beta" in text
+    assert "тема 10" in text
+    assert "3" in text
+    assert "15м назад" in text
+    assert "password" not in text
+    assert "content" not in text
+
+
+def test_format_stuck_alert_displays_max_raw_id():
+    cand = {
+        "user_id": 100_000_123_456,
+        "dialogue_id": 1,
+        "incident_scope_kind": "reset",
+        "incident_topic_id": None,
+        "unanswered_count": 2,
+        "first_unanswered_at": monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+        - monitor.timedelta(minutes=5),
+    }
+    group_apps = [{"name": "max_bot"}]
+    text = monitor.format_stuck_alert(cand, group_apps)
+
+    assert "100000123456" in text
+    assert "MAX raw: 123456" in text
+
+
+def test_single_instance_lock_prevents_concurrent_runs(tmp_path):
+    lock_file = str(tmp_path / "test.lock")
+    lock1 = monitor.SingleInstanceLock(lock_file)
+    lock2 = monitor.SingleInstanceLock(lock_file)
+
+    with lock1 as acq1:
+        assert acq1 is True
+        with lock2 as acq2:
+            assert acq2 is False
+
+    with lock2 as acq2_after:
+        assert acq2_after is True
+
+
+@pytest.mark.asyncio
+async def test_get_effective_memory_mode_canonical_id_1():
+    class FakeConn:
+        def __init__(self, table_exists=True, row_id1=None):
+            self.table_exists = table_exists
+            self.row_id1 = row_id1
+
+        async def fetchval(self, sql):
+            assert "to_regclass" in sql
+            return "public.ai_config" if self.table_exists else None
+
+        async def fetchrow(self, sql):
+            assert "WHERE id = 1" in sql
+            return self.row_id1
+
+    # Table missing
+    with pytest.raises(RuntimeError, match="Table 'ai_config' is missing"):
+        await monitor.get_effective_memory_mode(FakeConn(table_exists=False))
+
+    # id=1 missing
+    with pytest.raises(RuntimeError, match="Canonical row AIConfig.*id=1.*is missing"):
+        await monitor.get_effective_memory_mode(FakeConn(table_exists=True, row_id1=None))
+
+    # Valid modes
+    conn_topic = FakeConn(
+        True, {"memory_mode": "topic", "preserve_topic_context": False}
+    )
+    assert await monitor.get_effective_memory_mode(conn_topic) == "topic"
+
+    conn_global = FakeConn(
+        True, {"memory_mode": "global", "preserve_topic_context": False}
+    )
+    assert await monitor.get_effective_memory_mode(conn_global) == "global"
+
+    conn_reset = FakeConn(
+        True, {"memory_mode": "reset", "preserve_topic_context": True}
+    )
+    assert await monitor.get_effective_memory_mode(conn_reset) == "reset"
+
+    # Fallback from invalid/empty mode
+    conn_fallback_topic = FakeConn(
+        True, {"memory_mode": "custom_invalid", "preserve_topic_context": True}
+    )
+    assert await monitor.get_effective_memory_mode(conn_fallback_topic) == "topic"
+
+    conn_fallback_reset = FakeConn(
+        True, {"memory_mode": None, "preserve_topic_context": False}
+    )
+    assert await monitor.get_effective_memory_mode(conn_fallback_reset) == "reset"
+
+
+@pytest.mark.asyncio
+async def test_get_suppressed_max_user_ids_fail_closed():
+    class FakeConn:
+        def __init__(self, table_exists=True, should_raise=False):
+            self.table_exists = table_exists
+            self.should_raise = should_raise
+
+        async def fetchval(self, sql):
+            if self.should_raise:
+                raise ConnectionError("DB dropped")
+            return "public.max_bot_states" if self.table_exists else None
+
+        async def fetch(self, sql):
+            if self.should_raise:
+                raise ConnectionError("DB dropped")
+            return [{"user_id": 100_000_000_001}, {"user_id": 100_000_000_002}]
+
+    # Table absent -> normal empty set
+    res = await monitor.get_suppressed_max_user_ids(FakeConn(table_exists=False))
+    assert res == set()
+
+    # Table present -> returns IDs
+    res = await monitor.get_suppressed_max_user_ids(FakeConn(table_exists=True))
+    assert res == {100_000_000_001, 100_000_000_002}
+
+    # Query fails -> exception propagates (fail closed)
+    with pytest.raises(ConnectionError):
+        await monitor.get_suppressed_max_user_ids(FakeConn(should_raise=True))
+
+
+@pytest.mark.asyncio
+async def test_fetch_stuck_dialogue_episodes_sql_generation():
+    recorded_sql = {}
+    recorded_params = {}
+
+    class FakeConn:
+        async def fetch(self, sql, *params):
+            recorded_sql["query"] = sql
+            recorded_params["params"] = params
+            return []
+
+    # 1. Topic mode query verification
+    await monitor.fetch_stuck_dialogue_episodes(
+        FakeConn(),
+        effective_memory_mode="topic",
+        max_age_hours=24,
+        grace_seconds=180,
+    )
+
+    query = recorded_sql["query"]
+    params = recorded_params["params"]
+
+    # PostgreSQL specific syntax assertions
+    assert "IS DISTINCT FROM 'user'" in query
+    assert "t.tail_role = 'user'" in query
+    assert "s.unanswered_count >= 2" in query
+    assert "DISTINCT ON (m.user_id, m.dialogue_id)" in query
+
+    # Scope condition matching build_history_scope in all 3 CTEs
+    assert "m.topic_id IS NOT DISTINCT FROM u.current_topic_id" in query
+    assert query.count("m.topic_id IS NOT DISTINCT FROM u.current_topic_id") == 3
+
+    # Dynamic lookback clause
+    assert "AND m_last.timestamp >= $2" in query
+    assert len(params) == 2
+
+    # 2. Reset / Global mode query verification (no topic clause)
+    await monitor.fetch_stuck_dialogue_episodes(
+        FakeConn(),
+        effective_memory_mode="reset",
+        max_age_hours=0,
+        grace_seconds=180,
+    )
+    query_reset = recorded_sql["query"]
+    params_reset = recorded_params["params"]
+    assert "m.topic_id IS NOT DISTINCT FROM u.current_topic_id" not in query_reset
+    assert "AND m_last.timestamp >= $" not in query_reset
+    assert len(params_reset) == 1
+
+
+# ==============================================================================
+# End-to-End Watchdog Lifecycle & State Machine Tests
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_check_stuck_dialogues_active_stuck_alert_and_cooldown(monkeypatch):
+    state = {"log_offsets": {"/path.log": 123}, "alerts": {}, "stuck_dialogues": {}}
+    apps = [
+        {
+            "name": "tg_bot",
+            "db_url": "postgresql://u:p@localhost:5432/test_db",
+            "token": "tok1",
+            "owner_ids": [999],
+        }
+    ]
+
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_episodes = [
+        {
+            "user_id": 101,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 2,
+            "first_unanswered_id": 10,
+            "last_unanswered_id": 11,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=4),
+            "is_grace_elapsed": True,
+        }
+    ]
+
+    class FakeConn:
+        async def close(self):
+            pass
+
+    async def fake_connect(dsn, timeout):
+        return FakeConn()
+
+    async def fake_get_mode(conn):
+        return "reset"
+
+    async def fake_get_episodes(conn, mode, max_age_hours, grace_seconds):
+        return mock_episodes
+
+    async def fake_get_max_users(conn):
+        return set()
+
+    sent_alerts = []
+
+    async def fake_send_alert(alert_apps, text):
+        sent_alerts.append((alert_apps, text))
+        return True
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_get_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_get_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_get_max_users)
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    all_issues = []
+    # Run 1: Should alert and commit state
+    alerts_sent = await monitor.check_stuck_dialogues(apps, state, all_issues)
+    assert alerts_sent == 1
+    assert len(sent_alerts) == 1
+    assert "101" in sent_alerts[0][1]
+    assert all_issues == []
+
+    inc_key = "localhost:5432/test_db:101:1"
+    assert inc_key in state["stuck_dialogues"]
+    entry = state["stuck_dialogues"][inc_key]
+    assert entry["user_id"] == 101
+    assert entry["last_count"] == 2
+    assert state["log_offsets"] == {"/path.log": 123}
+
+    # Run 2: Immediately running again within 6h cooldown -> no duplicate alert
+    sent_alerts.clear()
+    alerts_sent_2 = await monitor.check_stuck_dialogues(apps, state, all_issues)
+    assert alerts_sent_2 == 0
+    assert len(sent_alerts) == 0
+    assert inc_key in state["stuck_dialogues"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_retry_retains_cooldown_and_no_alert(monkeypatch):
+    now_ts = int(monitor.time.time())
+    inc_key = "localhost:5432/test_db:101:1"
+    state = {
+        "stuck_dialogues": {
+            inc_key: {
+                "db_key": "localhost:5432/test_db",
+                "user_id": 101,
+                "dialogue_id": 1,
+                "incident_scope_kind": "reset",
+                "incident_topic_id": None,
+                "first_alerted_at": now_ts - 600,
+                "last_alerted_at": now_ts - 600,
+                "last_count": 2,
+                "first_id": 10,
+                "last_id": 11,
+            }
+        }
+    }
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    # User sends fresh retry 20 seconds ago:
+    # In Stage A it is returned (suffix count = 3)
+    # But is_grace_elapsed is False!
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_episodes = [
+        {
+            "user_id": 101,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 3,
+            "first_unanswered_id": 10,
+            "last_unanswered_id": 12,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=10),
+            "last_unanswered_at": now_utc - monitor.timedelta(seconds=20),
+            "is_grace_elapsed": False,  # Fresh retry!
+        }
+    ]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout):
+        return FakeConn()
+
+    async def fake_mode(c):
+        return "reset"
+
+    async def fake_episodes(conn, mode, max_age_hours=0, grace_seconds=180):
+        return mock_episodes
+
+    async def fake_max(c):
+        return set()
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_max)
+
+    sent_alerts = []
+
+    async def spy_send(a, t):
+        sent_alerts.append(t)
+        return True
+
+    monkeypatch.setattr(monitor, "send_alert", spy_send)
+
+    # Run: fresh retry must NOT alert, and MUST NOT delete cooldown entry!
+    alerts = await monitor.check_stuck_dialogues(apps, state, [])
+    assert alerts == 0
+    assert len(sent_alerts) == 0
+    assert inc_key in state["stuck_dialogues"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_removes_state_when_episode_resolved(monkeypatch):
+    inc_key = "localhost:5432/test_db:101:1"
+    state = {
+        "stuck_dialogues": {
+            inc_key: {
+                "db_key": "localhost:5432/test_db",
+                "user_id": 101,
+                "dialogue_id": 1,
+                "incident_scope_kind": "reset",
+                "incident_topic_id": None,
+                "first_alerted_at": 1000,
+                "last_alerted_at": 1000,
+            }
+        }
+    }
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout):
+        return FakeConn()
+
+    async def fake_mode(c):
+        return "reset"
+
+    async def fake_empty_episodes(*args, **kwargs):
+        return []
+
+    async def fake_empty_max(c):
+        return set()
+
+    # Episode resolved: assistant responded -> Stage A returns empty list!
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_empty_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_empty_max)
+
+    await monitor.check_stuck_dialogues(apps, state, [])
+    assert inc_key not in state["stuck_dialogues"]
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_does_not_commit_cooldown(monkeypatch):
+    state = {"stuck_dialogues": {}}
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_episodes = [
+        {
+            "user_id": 101,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 2,
+            "first_unanswered_id": 1,
+            "last_unanswered_id": 2,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=4),
+            "is_grace_elapsed": True,
+        }
+    ]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout):
+        return FakeConn()
+
+    async def fake_mode(c):
+        return "reset"
+
+    async def fake_get_episodes(*args, **kwargs):
+        return mock_episodes
+
+    async def fake_empty_max(c):
+        return set()
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_get_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_empty_max)
+
+    # Delivery fails:
+    async def fake_failing_send(a, t):
+        return False
+
+    monkeypatch.setattr(monitor, "send_alert", fake_failing_send)
+
+    alerts = await monitor.check_stuck_dialogues(apps, state, [])
+    assert alerts == 0
+    inc_key = "localhost:5432/test_db:101:1"
+    assert inc_key not in state["stuck_dialogues"]
+
+
+@pytest.mark.asyncio
+async def test_db_query_failure_preserves_state_and_emits_issue(monkeypatch):
+    inc_key = "localhost:5432/test_db:101:1"
+    state = {
+        "stuck_dialogues": {
+            inc_key: {
+                "db_key": "localhost:5432/test_db",
+                "user_id": 101,
+                "dialogue_id": 1,
+                "incident_scope_kind": "reset",
+                "incident_topic_id": None,
+            }
+        }
+    }
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    async def failing_connect(d, timeout):
+        raise ConnectionRefusedError("PostgreSQL down")
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", failing_connect)
+
+    all_issues = []
+    await monitor.check_stuck_dialogues(apps, state, all_issues)
+
+    # State key must remain preserved!
+    assert inc_key in state["stuck_dialogues"]
+    assert len(all_issues) == 1
+    assert "stuck dialogue check failed" in all_issues[0][1][0]
+
+
+@pytest.mark.asyncio
+async def test_max_state_query_failure_fails_closed(monkeypatch):
+    inc_key = "localhost:5432/test_db:101:1"
+    state = {
+        "stuck_dialogues": {
+            inc_key: {
+                "db_key": "localhost:5432/test_db",
+                "user_id": 101,
+                "dialogue_id": 1,
+                "incident_scope_kind": "reset",
+                "incident_topic_id": None,
+            }
+        }
+    }
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout):
+        return FakeConn()
+
+    async def fake_mode(c):
+        return "reset"
+
+    async def fake_empty_episodes(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_empty_episodes)
+
+    # MAX state query crashes:
+    async def failing_max_check(conn):
+        raise RuntimeError("Corrupted max_bot_states")
+
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", failing_max_check)
+
+    all_issues = []
+    alerts = await monitor.check_stuck_dialogues(apps, state, all_issues)
+    assert alerts == 0
+    # State key preserved on error
+    assert inc_key in state["stuck_dialogues"]
+    assert len(all_issues) == 1
+    assert "Corrupted max_bot_states" in all_issues[0][1][0]
+
+
+@pytest.mark.asyncio
+async def test_max_state_active_suppresses_stage_b_but_preserves_stage_a(monkeypatch):
+    state = {"stuck_dialogues": {}}
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_episodes = [
+        {
+            "user_id": 101,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 2,
+            "first_unanswered_id": 1,
+            "last_unanswered_id": 2,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=4),
+            "is_grace_elapsed": True,
+        }
+    ]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout):
+        return FakeConn()
+
+    async def fake_mode(c):
+        return "reset"
+
+    async def fake_get_episodes(*args, **kwargs):
+        return mock_episodes
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_get_episodes)
+
+    # User 101 is actively in a test flow:
+    async def fake_max_suppressed(c):
+        return {101}
+
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_max_suppressed)
+
+    sent_alerts = []
+
+    async def spy_send(a, t):
+        sent_alerts.append(t)
+        return True
+
+    monkeypatch.setattr(monitor, "send_alert", spy_send)
+
+    alerts = await monitor.check_stuck_dialogues(apps, state, [])
+    assert alerts == 0
+    assert len(sent_alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_topic_same_dialogue_id_distinct_incidents(monkeypatch):
+    # Two topics sharing dialogue_id = 5 must have distinct keys and not suppress each other
+    now_ts = int(monitor.time.time())
+    key_topic_10 = "localhost:5432/test_db:101:5:topic:10"
+    state = {
+        "stuck_dialogues": {
+            key_topic_10: {
+                "db_key": "localhost:5432/test_db",
+                "user_id": 101,
+                "dialogue_id": 5,
+                "incident_scope_kind": "topic",
+                "incident_topic_id": 10,
+                "first_alerted_at": now_ts - 100,
+                "last_alerted_at": now_ts - 100,
+            }
+        }
+    }
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    # User switched to topic 20 (also dialogue_id 5) and is stuck there:
+    mock_episodes = [
+        {
+            "user_id": 101,
+            "dialogue_id": 5,
+            "current_topic_id": 20,
+            "incident_scope_kind": "topic",
+            "incident_topic_id": 20,
+            "unanswered_count": 2,
+            "first_unanswered_id": 50,
+            "last_unanswered_id": 51,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=4),
+            "is_grace_elapsed": True,
+        }
+    ]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout):
+        return FakeConn()
+
+    async def fake_mode(c):
+        return "topic"
+
+    async def fake_get_episodes(*args, **kwargs):
+        return mock_episodes
+
+    async def fake_empty_max(c):
+        return set()
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_get_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_empty_max)
+
+    sent_alerts = []
+
+    async def spy_send(a, t):
+        sent_alerts.append(t)
+        return True
+
+    monkeypatch.setattr(monitor, "send_alert", spy_send)
+
+    alerts = await monitor.check_stuck_dialogues(apps, state, [])
+    # Topic 20 must alert as a NEW incident!
+    assert alerts == 1
+    key_topic_20 = "localhost:5432/test_db:101:5:topic:20"
+    assert key_topic_20 in state["stuck_dialogues"]
+    # Topic 10 was cleaned up by recovery since it is no longer the active Stage A episode!
+    assert key_topic_10 not in state["stuck_dialogues"]
+
+
+@pytest.mark.asyncio
+async def test_alert_routing_uses_all_apps_and_labels_group_apps(monkeypatch):
+    apps = [
+        {
+            "name": "tg_affected_bot",
+            "db_url": "postgresql://u:p@localhost:5432/db1",
+            "token": "tok_affected",
+            "owner_ids": [100],
+        },
+        {
+            "name": "tg_alert_router_bot",
+            "db_url": "postgresql://u:p@localhost:5432/db2",
+            "token": "tok_preferred",
+            "owner_ids": [200],
+        },
+    ]
+
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_alert_router_bot")
+
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_episodes_db1 = [
+        {
+            "user_id": 555,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 2,
+            "first_unanswered_id": 1,
+            "last_unanswered_id": 2,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=4),
+            "is_grace_elapsed": True,
+        }
+    ]
+
+    class FakeConn:
+        def __init__(self, db_url): self.db_url = db_url
+        async def close(self): pass
+
+    async def fake_connect(dsn, timeout):
+        return FakeConn(dsn)
+
+    async def fake_mode(c):
+        return "reset"
+
+    async def mock_fetch(conn, mode, max_age_hours, grace_seconds):
+        if "db1" in conn.db_url:
+            return mock_episodes_db1
+        return []
+
+    async def fake_empty_max(c):
+        return set()
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", mock_fetch)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_empty_max)
+
+    sent_calls = []
+
+    async def spy_send_alert(delivered_apps, text):
+        sent_calls.append((delivered_apps, text))
+        return True
+
+    monkeypatch.setattr(monitor, "send_alert", spy_send_alert)
+
+    state = {}
+    await monitor.check_stuck_dialogues(apps, state, [])
+
+    assert len(sent_calls) == 1
+    delivered_apps, text = sent_calls[0]
+
+    # Delivery routing uses all apps (so preferred bot is available)
+    assert len(delivered_apps) == 2
+    assert {a["name"] for a in delivered_apps} == {"tg_affected_bot", "tg_alert_router_bot"}
+
+    # Incident text labels only affected group app
+    assert "tg_affected_bot" in text
+    assert "tg_alert_router_bot" not in text
+
+
+@pytest.mark.asyncio
+async def test_run_check_exit_codes(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+
+    async def fake_nl(s):
+        return []
+
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: [])
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_nl)
+
+    # Clean run -> exit 0
+    res = await monitor.run_check(False)
+    assert res == 0
+
+    # Overlapping run -> exit 0 immediately
+    with monitor.SingleInstanceLock(lock_file):
+        res_overlap = await monitor.run_check(False)
+        assert res_overlap == 0
+
+
+@pytest.mark.asyncio
+async def test_db_a_failure_does_not_stop_db_b(monkeypatch):
+    apps = [
+        {"name": "bot_a", "db_url": "postgresql://u:p@10.0.0.1:5432/db_a", "token": "t_a", "owner_ids": [1]},
+        {"name": "bot_b", "db_url": "postgresql://u:p@10.0.0.2:5432/db_b", "token": "t_b", "owner_ids": [2]},
+    ]
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_episodes_b = [
+        {
+            "user_id": 202,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 2,
+            "first_unanswered_id": 1,
+            "last_unanswered_id": 2,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=4),
+            "is_grace_elapsed": True,
+        }
+    ]
+
+    class FakeConn:
+        def __init__(self, dsn):
+            self.dsn = dsn
+        async def close(self):
+            pass
+
+    async def fake_connect(dsn, timeout):
+        return FakeConn(dsn)
+
+    async def fake_mode(c):
+        return "reset"
+
+    async def fake_episodes(conn, mode, *args, **kwargs):
+        if "db_a" in conn.dsn:
+            raise ConnectionError("db_a failed query")
+        return mock_episodes_b
+
+    async def fake_max(conn):
+        return set()
+
+    sent_alerts = []
+    async def fake_send(a, t):
+        sent_alerts.append(t)
+        return True
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_max)
+    monkeypatch.setattr(monitor, "send_alert", fake_send)
+
+    all_issues = []
+    state = {}
+    alerts = await monitor.check_stuck_dialogues(apps, state, all_issues)
+
+    # db_a failed -> emitted to all_issues
+    assert len(all_issues) == 1
+    assert "db_a failed query" in all_issues[0][1][0]
+    # db_b succeeded -> alert sent
+    assert alerts == 1
+    assert len(sent_alerts) == 1
+    assert "202" in sent_alerts[0]
+
+
+@pytest.mark.asyncio
+async def test_cooldown_not_bypassed_by_count_or_age_change(monkeypatch):
+    now_ts = int(monitor.time.time())
+    inc_key = "localhost:5432/test_db:101:1"
+    state = {
+        "stuck_dialogues": {
+            inc_key: {
+                "db_key": "localhost:5432/test_db",
+                "user_id": 101,
+                "dialogue_id": 1,
+                "incident_scope_kind": "reset",
+                "incident_topic_id": None,
+                "first_alerted_at": now_ts - 1000,
+                "last_alerted_at": now_ts - 1000,
+                "last_count": 2,
+                "first_id": 1,
+                "last_id": 2,
+            }
+        }
+    }
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    # User now has 4 unanswered messages (count and age changed), but 6h cooldown has not passed
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_episodes = [
+        {
+            "user_id": 101,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 4,
+            "first_unanswered_id": 1,
+            "last_unanswered_id": 4,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=30),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "is_grace_elapsed": True,
+        }
+    ]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout): return FakeConn()
+    async def fake_mode(c): return "reset"
+    async def fake_episodes(*args, **kwargs): return mock_episodes
+    async def fake_max(c): return set()
+
+    sent_alerts = []
+    async def fake_send(a, t):
+        sent_alerts.append(t)
+        return True
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_max)
+    monkeypatch.setattr(monitor, "send_alert", fake_send)
+
+    alerts = await monitor.check_stuck_dialogues(apps, state, [])
+    assert alerts == 0
+    assert len(sent_alerts) == 0
+    # State remains intact
+    assert inc_key in state["stuck_dialogues"]
+
+
+@pytest.mark.asyncio
+async def test_new_episode_alerts_immediately_after_genuine_recovery(monkeypatch):
+    inc_key = "localhost:5432/test_db:101:1"
+    now_ts = int(monitor.time.time())
+    state = {
+        "stuck_dialogues": {
+            inc_key: {
+                "db_key": "localhost:5432/test_db",
+                "user_id": 101,
+                "dialogue_id": 1,
+                "incident_scope_kind": "reset",
+                "incident_topic_id": None,
+                "first_alerted_at": now_ts - 300,
+                "last_alerted_at": now_ts - 300,
+            }
+        }
+    }
+    apps = [{"name": "bot", "db_url": "postgresql://u:p@localhost:5432/test_db", "token": "t", "owner_ids": [1]}]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout): return FakeConn()
+    async def fake_mode(c): return "reset"
+    async def fake_max(c): return set()
+
+    sent_alerts = []
+    async def fake_send(a, t):
+        sent_alerts.append(t)
+        return True
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_max)
+    monkeypatch.setattr(monitor, "send_alert", fake_send)
+
+    # Step 1: Episode is resolved (Stage A returns empty)
+    async def fake_empty(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_empty)
+
+    await monitor.check_stuck_dialogues(apps, state, [])
+    assert inc_key not in state["stuck_dialogues"]
+
+    # Step 2: Later, a brand new stuck episode occurs for the same user
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_new_episode = [
+        {
+            "user_id": 101,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 2,
+            "first_unanswered_id": 20,
+            "last_unanswered_id": 21,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=10),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "is_grace_elapsed": True,
+        }
+    ]
+    async def fake_new_ep(*args, **kwargs): return mock_new_episode
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_new_ep)
+
+    alerts = await monitor.check_stuck_dialogues(apps, state, [])
+    # Must alert immediately because previous episode genuinely recovered and state was cleared!
+    assert alerts == 1
+    assert len(sent_alerts) == 1
+    assert inc_key in state["stuck_dialogues"]
+
+
+@pytest.mark.asyncio
+async def test_shared_db_scanned_once_and_single_alert(monkeypatch):
+    apps = [
+        {"name": "tg_app1", "db_url": "postgresql://u:p@10.0.0.1:5432/shared_db", "token": "t1", "owner_ids": [1]},
+        {"name": "max_app1", "db_url": "postgresql://u:p@10.0.0.1:5432/shared_db", "token": "t2", "owner_ids": [1]},
+    ]
+    scan_count = 0
+    now_utc = monitor.datetime.now(monitor.timezone.utc).replace(tzinfo=None)
+    mock_episodes = [
+        {
+            "user_id": 303,
+            "dialogue_id": 1,
+            "current_topic_id": None,
+            "incident_scope_kind": "reset",
+            "incident_topic_id": None,
+            "unanswered_count": 2,
+            "first_unanswered_id": 1,
+            "last_unanswered_id": 2,
+            "first_unanswered_at": now_utc - monitor.timedelta(minutes=5),
+            "last_unanswered_at": now_utc - monitor.timedelta(minutes=4),
+            "is_grace_elapsed": True,
+        }
+    ]
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(d, timeout): return FakeConn()
+    async def fake_mode(c): return "reset"
+    async def fake_max(c): return set()
+
+    async def fake_episodes(*args, **kwargs):
+        nonlocal scan_count
+        scan_count += 1
+        return mock_episodes
+
+    sent_alerts = []
+    async def fake_send(a, t):
+        sent_alerts.append(t)
+        return True
+
+    monkeypatch.setattr(monitor.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_max)
+    monkeypatch.setattr(monitor, "send_alert", fake_send)
+
+    state = {}
+    alerts = await monitor.check_stuck_dialogues(apps, state, [])
+
+    # Shared DB scanned exactly ONCE
+    assert scan_count == 1
+    # Exactly ONE alert sent
+    assert alerts == 1
+    assert len(sent_alerts) == 1
+    # Alert text lists both bots sharing the DB
+    assert "tg_app1" in sent_alerts[0]
+    assert "max_app1" in sent_alerts[0]
+
+
+@pytest.mark.asyncio
+async def test_run_check_exit_code_isolation_scenarios(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+
+    async def fake_nl(s): return []
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_nl)
+
+    # Scenario 1: Only stuck dialogue -> exit 0
+    apps = [{"name": "bot1", "status": "online", "db_url": "postgresql://u:p@localhost:5432/db", "token": "t", "owner_ids": [1]}]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    async def mock_check_stuck_alert(a, s, all_issues):
+        # Simulate stuck alert sent, but NO infra issues
+        return 1
+
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", mock_check_stuck_alert)
+    exit_code_clean = await monitor.run_check(False)
+    assert exit_code_clean == 0
+
+    # Scenario 2: Stuck dialogue + infra issue -> exit 1
+    async def mock_check_stuck_with_infra(a, s, all_issues):
+        all_issues.append(("bot1", ["DB: schema missing column"]))
+        return 1
+
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", mock_check_stuck_with_infra)
+    sent_infra_alerts = []
+    async def fake_send(a, t):
+        sent_infra_alerts.append(t)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send)
+
+    exit_code_infra = await monitor.run_check(False)
+    assert exit_code_infra == 1
+    assert len(sent_infra_alerts) == 1
+    assert "Psychobots monitor detected issues" in sent_infra_alerts[0]
+
+
+def test_backward_compatible_state_loading_and_saving(tmp_path):
+    state_file = tmp_path / "monitor_state.json"
+    legacy_content = '{"log_offsets": {"/var/log/app.log": 9999}, "alerts": {"key1": 123456}}'
+    state_file.write_text(legacy_content)
+
+    loaded = monitor.load_state(str(state_file))
+    assert loaded["log_offsets"] == {"/var/log/app.log": 9999}
+    assert loaded["alerts"] == {"key1": 123456}
+    assert loaded["stuck_dialogues"] == {}
+
+    # Mutate stuck_dialogues
+    loaded["stuck_dialogues"]["db:1:1"] = {"user_id": 1}
+    monitor.save_state(loaded, str(state_file))
+
+    reloaded = monitor.load_state(str(state_file))
+    assert reloaded["log_offsets"] == {"/var/log/app.log": 9999}
+    assert reloaded["alerts"] == {"key1": 123456}
+    assert reloaded["stuck_dialogues"]["db:1:1"] == {"user_id": 1}
+
+
+@pytest.mark.asyncio
+async def test_watchdog_is_strictly_read_only():
+    # Verify that all SQL queries in the watchdog are SELECT only
+    captured_queries = []
+
+    class FakeConn:
+        async def fetch(self, sql, *args):
+            captured_queries.append(sql)
+            return []
+        async def fetchval(self, sql, *args):
+            captured_queries.append(sql)
+            return "public.max_bot_states"
+        async def fetchrow(self, sql, *args):
+            captured_queries.append(sql)
+            return {"memory_mode": "reset", "preserve_topic_context": False}
+
+    conn = FakeConn()
+    await monitor.get_effective_memory_mode(conn)
+    await monitor.get_suppressed_max_user_ids(conn)
+    await monitor.fetch_stuck_dialogue_episodes(conn, "topic", 24, 180)
+    await monitor.fetch_stuck_dialogue_episodes(conn, "reset", 0, 180)
+
+    forbidden_mutations = ["INSERT ", "UPDATE ", "DELETE ", "DROP ", "ALTER ", "TRUNCATE "]
+    for q in captured_queries:
+        for verb in forbidden_mutations:
+            assert verb not in q.upper(), f"Watchdog SQL must not contain mutation verb {verb}"
+
+
+
