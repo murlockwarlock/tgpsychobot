@@ -16,14 +16,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import aiohttp
 import asyncpg
 
-try:
-    from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
-except ImportError:
-    def is_max_user_id(user_id: int | None) -> bool:
-        return user_id is not None and int(user_id) >= 100_000_000_000
-
-    def raw_max_user_id(user_id: int) -> int:
-        return int(user_id) - 100_000_000_000
+from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
 
 
 STATE_FILE = os.environ.get("PSYCHOBOTS_MONITOR_STATE", "/tmp/psychobots_monitor_state.json")
@@ -34,7 +27,13 @@ STUCK_REPEAT_SECONDS = int(
 )
 STUCK_MAX_AGE_HOURS = int(os.environ.get("PSYCHOBOTS_MONITOR_STUCK_MAX_AGE_HOURS", "0"))
 STUCK_GRACE_SECONDS = int(os.environ.get("PSYCHOBOTS_MONITOR_STUCK_GRACE_SECONDS", "180"))
-LOCK_FILE = os.environ.get("PSYCHOBOTS_MONITOR_LOCK_FILE", "/tmp/psychobots_monitor.lock")
+DEFAULT_LOCK_FILE = "/tmp/psychobots_monitor.lock"
+
+
+def get_lock_file_path() -> str:
+    return os.environ.get("PSYCHOBOTS_MONITOR_LOCK_FILE", DEFAULT_LOCK_FILE)
+
+
 LOG_READ_LIMIT = int(os.environ.get("PSYCHOBOTS_MONITOR_LOG_READ_LIMIT", str(250_000)))
 ALERT_BOT_PM2_NAME = os.environ.get("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new").strip()
 ALERT_BOT_TOKEN = os.environ.get("PSYCHOBOTS_ALERT_BOT_TOKEN", "").strip()
@@ -57,16 +56,20 @@ NL_XRAY_PORTS = tuple(
 
 
 class SingleInstanceLock:
-    def __init__(self, lock_path: str = LOCK_FILE):
-        self.lock_path = lock_path
+    def __init__(self, lock_path: str | None = None):
+        self.lock_path = lock_path or get_lock_file_path()
         self.fd = None
 
     def __enter__(self):
         try:
             self.fd = open(self.lock_path, "a+")
+        except Exception:
+            raise
+
+        try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
-        except (BlockingIOError, OSError):
+        except BlockingIOError:
             if self.fd:
                 try:
                     self.fd.close()
@@ -74,6 +77,31 @@ class SingleInstanceLock:
                     pass
                 self.fd = None
             return False
+        except OSError as e:
+            import errno
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                if self.fd:
+                    try:
+                        self.fd.close()
+                    except Exception:
+                        pass
+                    self.fd = None
+                return False
+            if self.fd:
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
+                self.fd = None
+            raise
+        except Exception:
+            if self.fd:
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
+                self.fd = None
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.fd:
@@ -224,12 +252,6 @@ async def fetch_stuck_dialogue_episodes(
     grace_cutoff_utc = now_utc - timedelta(seconds=grace_seconds)
     params = [grace_cutoff_utc]
 
-    max_age_clause = ""
-    if max_age_hours > 0:
-        max_age_cutoff_utc = now_utc - timedelta(hours=max_age_hours)
-        params.append(max_age_cutoff_utc)
-        max_age_clause = f"AND m_last.timestamp >= ${len(params)}"
-
     sql = f"""
     WITH active_users AS (
         SELECT id AS user_id, current_dialogue_id, current_topic_id
@@ -280,26 +302,36 @@ async def fetch_stuck_dialogue_episodes(
     JOIN messages m_last ON m_last.id = s.last_unanswered_id
     WHERE t.tail_role = 'user'
       AND s.unanswered_count >= 2
-      {max_age_clause}
     ;
     """
     rows = await conn.fetch(sql, *params)
     results = []
+    scope_kind = "topic" if effective_memory_mode == "topic" else "dialogue"
+    max_age_cutoff = (
+        now_utc - timedelta(hours=max_age_hours) if max_age_hours > 0 else None
+    )
     for r in rows:
         topic_val = int(r["current_topic_id"]) if r["current_topic_id"] is not None else None
+        last_at = r["last_unanswered_at"]
+        is_within_max_age = True
+        if max_age_cutoff is not None and last_at is not None:
+            is_within_max_age = (last_at >= max_age_cutoff)
+
         results.append(
             {
                 "user_id": int(r["user_id"]),
                 "dialogue_id": int(r["dialogue_id"]),
                 "current_topic_id": topic_val,
-                "incident_scope_kind": effective_memory_mode,
-                "incident_topic_id": topic_val if effective_memory_mode == "topic" else None,
+                "memory_mode": effective_memory_mode,
+                "incident_scope_kind": scope_kind,
+                "incident_topic_id": topic_val if scope_kind == "topic" else None,
                 "unanswered_count": int(r["unanswered_count"]),
                 "first_unanswered_id": int(r["first_unanswered_id"]),
                 "last_unanswered_id": int(r["last_unanswered_id"]),
                 "first_unanswered_at": r["first_unanswered_at"],
-                "last_unanswered_at": r["last_unanswered_at"],
+                "last_unanswered_at": last_at,
                 "is_grace_elapsed": bool(r["is_grace_elapsed"]),
+                "is_within_max_age": is_within_max_age,
             }
         )
     return results
@@ -342,21 +374,30 @@ async def check_stuck_dialogues(
 
         active_identities = set()
         for ep in episodes:
+            ep_kind = ep.get("incident_scope_kind")
+            if ep_kind in ("reset", "global") or not ep_kind:
+                ep_kind = "dialogue"
             ep_identity = (
                 safe_db_key,
                 ep["user_id"],
                 ep["dialogue_id"],
-                ep["incident_scope_kind"],
+                ep_kind,
                 ep["incident_topic_id"],
             )
             active_identities.add(ep_identity)
 
-            if ep["is_grace_elapsed"] and ep["user_id"] not in suppressed_user_ids:
+            is_alert_eligible = (
+                ep["is_grace_elapsed"]
+                and ep.get("is_within_max_age", True)
+                and ep["user_id"] not in suppressed_user_ids
+            )
+
+            if is_alert_eligible:
                 incident_key = make_incident_key(
                     safe_db_key,
                     ep["user_id"],
                     ep["dialogue_id"],
-                    ep["incident_scope_kind"],
+                    ep_kind,
                     ep["incident_topic_id"],
                 )
                 is_in_cooldown = False
@@ -377,8 +418,9 @@ async def check_stuck_dialogues(
                             "db_key": safe_db_key,
                             "user_id": ep["user_id"],
                             "dialogue_id": ep["dialogue_id"],
-                            "incident_scope_kind": ep["incident_scope_kind"],
+                            "incident_scope_kind": ep_kind,
                             "incident_topic_id": ep["incident_topic_id"],
+                            "memory_mode": ep.get("memory_mode"),
                             "first_alerted_at": first_alerted_at,
                             "last_alerted_at": now_ts,
                             "last_count": ep["unanswered_count"],
@@ -390,11 +432,15 @@ async def check_stuck_dialogues(
         keys_to_delete = []
         for k, entry in state["stuck_dialogues"].items():
             if entry.get("db_key") == safe_db_key:
+                entry_kind = entry.get("incident_scope_kind")
+                if entry_kind in ("reset", "global") or not entry_kind:
+                    entry_kind = "dialogue"
+
                 entry_identity = (
                     safe_db_key,
                     entry.get("user_id"),
                     entry.get("dialogue_id"),
-                    entry.get("incident_scope_kind", "reset"),
+                    entry_kind,
                     entry.get("incident_topic_id"),
                 )
                 if entry_identity not in active_identities:
@@ -796,8 +842,8 @@ async def send_alert(apps: list[dict], text: str) -> bool:
     return False
 
 
-async def run_check(include_existing_log_errors: bool) -> int:
-    with SingleInstanceLock() as acquired:
+async def run_check(include_existing_log_errors: bool, lock_path: str | None = None) -> int:
+    with SingleInstanceLock(lock_path) as acquired:
         if not acquired:
             print("Psychobots monitor already running; exiting cleanly.")
             return 0
