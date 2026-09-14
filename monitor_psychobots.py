@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -11,10 +14,26 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import aiohttp
+import asyncpg
+
+from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
 
 
 STATE_FILE = os.environ.get("PSYCHOBOTS_MONITOR_STATE", "/tmp/psychobots_monitor_state.json")
 REPEAT_ALERT_SECONDS = int(os.environ.get("PSYCHOBOTS_MONITOR_REPEAT_SECONDS", str(6 * 60 * 60)))
+DEFAULT_STUCK_REPEAT_SECONDS = 6 * 60 * 60
+STUCK_REPEAT_SECONDS = int(
+    os.environ.get("PSYCHOBOTS_MONITOR_STUCK_REPEAT_SECONDS", str(DEFAULT_STUCK_REPEAT_SECONDS))
+)
+STUCK_MAX_AGE_HOURS = int(os.environ.get("PSYCHOBOTS_MONITOR_STUCK_MAX_AGE_HOURS", "0"))
+STUCK_GRACE_SECONDS = int(os.environ.get("PSYCHOBOTS_MONITOR_STUCK_GRACE_SECONDS", "180"))
+DEFAULT_LOCK_FILE = "/tmp/psychobots_monitor.lock"
+
+
+def get_lock_file_path() -> str:
+    return os.environ.get("PSYCHOBOTS_MONITOR_LOCK_FILE", DEFAULT_LOCK_FILE)
+
+
 LOG_READ_LIMIT = int(os.environ.get("PSYCHOBOTS_MONITOR_LOG_READ_LIMIT", str(250_000)))
 ALERT_BOT_PM2_NAME = os.environ.get("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new").strip()
 ALERT_BOT_TOKEN = os.environ.get("PSYCHOBOTS_ALERT_BOT_TOKEN", "").strip()
@@ -34,6 +53,402 @@ NL_XRAY_PORTS = tuple(
     for port in os.environ.get("PSYCHOBOTS_NL_XRAY_PORTS", "2053,2069").split(",")
     if port.strip()
 )
+
+
+class SingleInstanceLock:
+    def __init__(self, lock_path: str | None = None):
+        self.lock_path = lock_path or get_lock_file_path()
+        self.fd = None
+
+    def __enter__(self):
+        try:
+            self.fd = open(self.lock_path, "a+")
+        except Exception:
+            raise
+
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if self.fd:
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
+                self.fd = None
+            return False
+        except OSError as e:
+            import errno
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                if self.fd:
+                    try:
+                        self.fd.close()
+                    except Exception:
+                        pass
+                    self.fd = None
+                return False
+            if self.fd:
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
+                self.fd = None
+            raise
+        except Exception:
+            if self.fd:
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
+                self.fd = None
+            raise
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self.fd.close()
+            except Exception:
+                pass
+            self.fd = None
+
+
+def make_safe_db_key(db_url: str) -> str:
+    parsed = urlsplit(make_dsn(db_url))
+    host = parsed.hostname or "localhost"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = parsed.port or 5432
+    dbname = parsed.path.lstrip("/")
+    return f"{host}:{port}/{dbname}"
+
+
+def group_apps_by_db(apps: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for app in apps:
+        db_url = app.get("db_url")
+        if not db_url:
+            continue
+        safe_key = make_safe_db_key(db_url)
+        groups[safe_key].append(app)
+    return groups
+
+
+def format_age(seconds: float | int) -> str:
+    total_seconds = max(0, int(seconds))
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}д")
+    if hours > 0:
+        parts.append(f"{hours}ч")
+    if minutes > 0 or not parts:
+        parts.append(f"{minutes}м")
+    return "".join(parts)
+
+
+def make_incident_key(
+    safe_db_key: str,
+    user_id: int,
+    dialogue_id: int,
+    scope_kind: str,
+    topic_id: int | None,
+) -> str:
+    if scope_kind == "topic":
+        topic_str = "null" if topic_id is None else str(topic_id)
+        return f"{safe_db_key}:{user_id}:{dialogue_id}:topic:{topic_str}"
+    return f"{safe_db_key}:{user_id}:{dialogue_id}"
+
+
+def format_stuck_alert(cand: dict, group_apps: list[dict]) -> str:
+    bot_names = " / ".join(sorted({app.get("name", "unknown") for app in group_apps})) or "unknown"
+    user_id = cand["user_id"]
+    if is_max_user_id(user_id):
+        raw_id = raw_max_user_id(user_id)
+        user_str = f"{user_id} (MAX raw: {raw_id})"
+    else:
+        user_str = f"{user_id}"
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    first_at = cand.get("first_unanswered_at")
+    if isinstance(first_at, datetime):
+        age_str = f"{format_age((now_utc - first_at).total_seconds())} назад"
+    else:
+        age_str = "неизвестно когда"
+
+    count = cand["unanswered_count"]
+    topic_info = ""
+    if cand.get("incident_scope_kind") == "topic":
+        tid = cand.get("incident_topic_id")
+        topic_info = f", тема {tid}" if tid is not None else ", главная тема"
+
+    return (
+        f"🚨 <b>Завис AI-диалог</b>\n"
+        f"Пользователь ID: <code>{user_str}</code>\n"
+        f"Бот: <b>{bot_names}</b>\n"
+        f"Диалог ID: <code>{cand['dialogue_id']}</code>{topic_info}\n"
+        f"Неотвеченных сообщений: <b>{count}</b> (первое {age_str})"
+    )
+
+
+def sanitize_db_error(exc: Exception) -> str:
+    msg = f"{type(exc).__name__}: {exc}"
+    return re.sub(r":[^:@]+@", ":***@", msg)
+
+
+async def get_effective_memory_mode(conn) -> str:
+    has_table = await conn.fetchval(
+        "SELECT to_regclass('public.ai_config')"
+    )
+    if not has_table:
+        raise RuntimeError("Table 'ai_config' is missing")
+
+    row = await conn.fetchrow(
+        "SELECT memory_mode, preserve_topic_context FROM ai_config WHERE id = 1"
+    )
+    if not row:
+        raise RuntimeError("Canonical row AIConfig(id=1) is missing in 'ai_config'")
+
+    raw_mode = row["memory_mode"]
+    if raw_mode in ("reset", "topic", "global"):
+        return raw_mode
+
+    preserve_topic = bool(row["preserve_topic_context"])
+    return "topic" if preserve_topic else "reset"
+
+
+async def get_suppressed_max_user_ids(conn) -> set[int]:
+    has_table = await conn.fetchval(
+        "SELECT to_regclass('public.max_bot_states')"
+    )
+    if not has_table:
+        return set()
+
+    rows = await conn.fetch("SELECT user_id FROM max_bot_states")
+    return {int(r["user_id"]) for r in rows if r["user_id"] is not None}
+
+
+async def fetch_stuck_dialogue_episodes(
+    conn,
+    effective_memory_mode: str,
+    max_age_hours: int = STUCK_MAX_AGE_HOURS,
+    grace_seconds: int = STUCK_GRACE_SECONDS,
+) -> list[dict]:
+    if effective_memory_mode == "topic":
+        scope_condition = (
+            "m.user_id = u.user_id AND m.dialogue_id = u.current_dialogue_id "
+            "AND m.topic_id IS NOT DISTINCT FROM u.current_topic_id"
+        )
+    else:
+        scope_condition = "m.user_id = u.user_id AND m.dialogue_id = u.current_dialogue_id"
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    grace_cutoff_utc = now_utc - timedelta(seconds=grace_seconds)
+    params = [grace_cutoff_utc]
+
+    sql = f"""
+    WITH active_users AS (
+        SELECT id AS user_id, current_dialogue_id, current_topic_id
+        FROM users
+    ),
+    latest_non_user AS (
+        SELECT m.user_id, m.dialogue_id, MAX(m.id) AS last_boundary_id
+        FROM messages m
+        JOIN active_users u ON {scope_condition}
+        WHERE m.role IS DISTINCT FROM 'user'
+        GROUP BY m.user_id, m.dialogue_id
+    ),
+    unanswered_suffix AS (
+        SELECT
+            m.user_id,
+            m.dialogue_id,
+            COUNT(*) AS unanswered_count,
+            MIN(m.id) AS first_unanswered_id,
+            MAX(m.id) AS last_unanswered_id
+        FROM messages m
+        JOIN active_users u ON {scope_condition}
+        LEFT JOIN latest_non_user b ON m.user_id = b.user_id AND m.dialogue_id = b.dialogue_id
+        WHERE m.role = 'user'
+          AND (b.last_boundary_id IS NULL OR m.id > b.last_boundary_id)
+        GROUP BY m.user_id, m.dialogue_id
+    ),
+    active_dialogue_tails AS (
+        SELECT DISTINCT ON (m.user_id, m.dialogue_id)
+            m.user_id, m.dialogue_id, m.id AS tail_id, m.role AS tail_role
+        FROM messages m
+        JOIN active_users u ON {scope_condition}
+        ORDER BY m.user_id, m.dialogue_id, m.id DESC
+    )
+    SELECT
+        s.user_id,
+        s.dialogue_id,
+        u.current_topic_id,
+        s.unanswered_count,
+        s.first_unanswered_id,
+        s.last_unanswered_id,
+        m_first.timestamp AS first_unanswered_at,
+        m_last.timestamp AS last_unanswered_at,
+        (m_last.timestamp <= $1) AS is_grace_elapsed
+    FROM unanswered_suffix s
+    JOIN active_users u ON s.user_id = u.user_id AND s.dialogue_id = u.current_dialogue_id
+    JOIN active_dialogue_tails t ON s.user_id = t.user_id AND s.dialogue_id = t.dialogue_id
+    JOIN messages m_first ON m_first.id = s.first_unanswered_id
+    JOIN messages m_last ON m_last.id = s.last_unanswered_id
+    WHERE t.tail_role = 'user'
+      AND s.unanswered_count >= 2
+    ;
+    """
+    rows = await conn.fetch(sql, *params)
+    results = []
+    scope_kind = "topic" if effective_memory_mode == "topic" else "dialogue"
+    max_age_cutoff = (
+        now_utc - timedelta(hours=max_age_hours) if max_age_hours > 0 else None
+    )
+    for r in rows:
+        topic_val = int(r["current_topic_id"]) if r["current_topic_id"] is not None else None
+        last_at = r["last_unanswered_at"]
+        is_within_max_age = True
+        if max_age_cutoff is not None and last_at is not None:
+            is_within_max_age = (last_at >= max_age_cutoff)
+
+        results.append(
+            {
+                "user_id": int(r["user_id"]),
+                "dialogue_id": int(r["dialogue_id"]),
+                "current_topic_id": topic_val,
+                "memory_mode": effective_memory_mode,
+                "incident_scope_kind": scope_kind,
+                "incident_topic_id": topic_val if scope_kind == "topic" else None,
+                "unanswered_count": int(r["unanswered_count"]),
+                "first_unanswered_id": int(r["first_unanswered_id"]),
+                "last_unanswered_id": int(r["last_unanswered_id"]),
+                "first_unanswered_at": r["first_unanswered_at"],
+                "last_unanswered_at": last_at,
+                "is_grace_elapsed": bool(r["is_grace_elapsed"]),
+                "is_within_max_age": is_within_max_age,
+            }
+        )
+    return results
+
+
+async def check_stuck_dialogues(
+    apps: list[dict],
+    state: dict,
+    all_issues: list,
+) -> int:
+    import asyncpg
+
+    state.setdefault("stuck_dialogues", {})
+    db_groups = group_apps_by_db(apps)
+    alerts_sent = 0
+
+    for safe_db_key, group_apps in db_groups.items():
+        sample_app = group_apps[0]
+        conn = None
+        try:
+            conn = await asyncpg.connect(make_dsn(sample_app["db_url"]), timeout=10)
+            effective_mode = await get_effective_memory_mode(conn)
+            episodes = await fetch_stuck_dialogue_episodes(
+                conn,
+                effective_mode,
+                max_age_hours=STUCK_MAX_AGE_HOURS,
+                grace_seconds=STUCK_GRACE_SECONDS,
+            )
+            suppressed_user_ids = await get_suppressed_max_user_ids(conn)
+        except Exception as exc:
+            err_msg = f"DB: {safe_db_key} stuck dialogue check failed: {sanitize_db_error(exc)}"
+            all_issues.append((sample_app["name"], [err_msg]))
+            continue
+        finally:
+            if conn:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+
+        active_identities = set()
+        for ep in episodes:
+            ep_kind = ep.get("incident_scope_kind")
+            if ep_kind in ("reset", "global") or not ep_kind:
+                ep_kind = "dialogue"
+            ep_identity = (
+                safe_db_key,
+                ep["user_id"],
+                ep["dialogue_id"],
+                ep_kind,
+                ep["incident_topic_id"],
+            )
+            active_identities.add(ep_identity)
+
+            is_alert_eligible = (
+                ep["is_grace_elapsed"]
+                and ep.get("is_within_max_age", True)
+                and ep["user_id"] not in suppressed_user_ids
+            )
+
+            if is_alert_eligible:
+                incident_key = make_incident_key(
+                    safe_db_key,
+                    ep["user_id"],
+                    ep["dialogue_id"],
+                    ep_kind,
+                    ep["incident_topic_id"],
+                )
+                is_in_cooldown = False
+                if incident_key in state["stuck_dialogues"]:
+                    last_alerted = state["stuck_dialogues"][incident_key].get("last_alerted_at", 0)
+                    if (int(time.time()) - last_alerted) < STUCK_REPEAT_SECONDS:
+                        is_in_cooldown = True
+
+                if not is_in_cooldown:
+                    alert_text = format_stuck_alert(ep, group_apps)
+                    delivered = await send_alert(apps, alert_text)
+                    if delivered:
+                        alerts_sent += 1
+                        now_ts = int(time.time())
+                        existing_entry = state["stuck_dialogues"].get(incident_key, {})
+                        first_alerted_at = existing_entry.get("first_alerted_at", now_ts)
+                        state["stuck_dialogues"][incident_key] = {
+                            "db_key": safe_db_key,
+                            "user_id": ep["user_id"],
+                            "dialogue_id": ep["dialogue_id"],
+                            "incident_scope_kind": ep_kind,
+                            "incident_topic_id": ep["incident_topic_id"],
+                            "memory_mode": ep.get("memory_mode"),
+                            "first_alerted_at": first_alerted_at,
+                            "last_alerted_at": now_ts,
+                            "last_count": ep["unanswered_count"],
+                            "first_id": ep["first_unanswered_id"],
+                            "last_id": ep["last_unanswered_id"],
+                        }
+                        print(f"Stuck dialogue alert sent: user {ep['user_id']} in {sample_app['name']}")
+
+        keys_to_delete = []
+        for k, entry in state["stuck_dialogues"].items():
+            if entry.get("db_key") == safe_db_key:
+                entry_kind = entry.get("incident_scope_kind")
+                if entry_kind in ("reset", "global") or not entry_kind:
+                    entry_kind = "dialogue"
+
+                entry_identity = (
+                    safe_db_key,
+                    entry.get("user_id"),
+                    entry.get("dialogue_id"),
+                    entry_kind,
+                    entry.get("incident_topic_id"),
+                )
+                if entry_identity not in active_identities:
+                    keys_to_delete.append(k)
+        for k in keys_to_delete:
+            del state["stuck_dialogues"][k]
+
+    return alerts_sent
 
 CRITICAL_COLUMNS = {
     "users": {
@@ -95,17 +510,24 @@ LOG_ERROR_RE = re.compile(
 )
 
 
-def load_state() -> dict:
+def load_state(path: str | Path | None = None) -> dict:
+    target = Path(path) if path is not None else Path(os.environ.get("PSYCHOBOTS_MONITOR_STATE", STATE_FILE))
     try:
-        return json.loads(Path(STATE_FILE).read_text(encoding="utf-8"))
+        state = json.loads(target.read_text(encoding="utf-8"))
     except Exception:
-        return {"log_offsets": {}, "alerts": {}}
+        state = {}
+    state.setdefault("log_offsets", {})
+    state.setdefault("alerts", {})
+    state.setdefault("stuck_dialogues", {})
+    return state
 
 
-def save_state(state: dict) -> None:
-    path = Path(STATE_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_state(state: dict, path: str | Path | None = None) -> None:
+    target = Path(path) if path is not None else Path(os.environ.get("PSYCHOBOTS_MONITOR_STATE", STATE_FILE))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, target)
 
 
 def run_pm2_jlist() -> list[dict]:
@@ -378,12 +800,12 @@ def get_candidate_alert_tokens(apps: list[dict]) -> list[str]:
     return tokens
 
 
-async def send_alert(apps: list[dict], text: str) -> None:
+async def send_alert(apps: list[dict], text: str) -> bool:
     recipients = sorted({owner_id for app in apps for owner_id in app["owner_ids"]})
     tokens = get_candidate_alert_tokens(apps)
     if not recipients or not tokens:
         print("No notification recipients or bot tokens found")
-        return
+        return False
 
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as http:
@@ -415,50 +837,58 @@ async def send_alert(apps: list[dict], text: str) -> None:
                 except Exception:
                     continue
             if delivered:
-                return
+                return True
     print("Failed to deliver Telegram alert")
+    return False
 
 
-async def run_check(include_existing_log_errors: bool) -> int:
-    state = load_state()
-    apps = get_bot_apps()
-    all_issues = []
+async def run_check(include_existing_log_errors: bool, lock_path: str | None = None) -> int:
+    with SingleInstanceLock(lock_path) as acquired:
+        if not acquired:
+            print("Psychobots monitor already running; exiting cleanly.")
+            return 0
 
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as http:
-        for app in apps:
-            issues = []
-            if app["status"] != "online":
-                issues.append(f"PM2: status is {app['status']}")
-            issues.extend(await check_db_schema(app))
-            issues.extend(await check_telegram(app, http))
-            issues.extend(await check_payment_webhooks(app, http))
-            issues.extend(read_new_log_errors(app, state, include_existing_log_errors))
-            if issues:
-                all_issues.append((app["name"], issues))
+        state = load_state()
+        apps = get_bot_apps()
+        all_issues = []
 
-        nl_issues = await check_nl_infrastructure(http)
-        if nl_issues:
-            all_issues.append(("nl_infrastructure", nl_issues))
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as http:
+            for app in apps:
+                issues = []
+                if app["status"] != "online":
+                    issues.append(f"PM2: status is {app['status']}")
+                issues.extend(await check_db_schema(app))
+                issues.extend(await check_telegram(app, http))
+                issues.extend(await check_payment_webhooks(app, http))
+                issues.extend(read_new_log_errors(app, state, include_existing_log_errors))
+                if issues:
+                    all_issues.append((app["name"], issues))
 
-    flat_issues = [f"{name}: {issue}" for name, issues in all_issues for issue in issues]
-    if should_alert(flat_issues, state):
-        lines = ["🚨 <b>Psychobots monitor detected issues</b>"]
-        for name, issues in all_issues:
-            lines.append(f"\n<b>{name}</b>")
-            for issue in issues[:8]:
-                lines.append(f"• {issue}")
-        await send_alert(apps, "\n".join(lines))
+            nl_issues = await check_nl_infrastructure(http)
+            if nl_issues:
+                all_issues.append(("nl_infrastructure", nl_issues))
 
-    save_state(state)
-    if all_issues:
-        for name, issues in all_issues:
-            print(f"{name}:")
-            for issue in issues:
-                print(f"  - {issue}")
-        return 1
-    print("OK")
-    return 0
+        await check_stuck_dialogues(apps, state, all_issues)
+
+        flat_issues = [f"{name}: {issue}" for name, issues in all_issues for issue in issues]
+        if should_alert(flat_issues, state):
+            lines = ["🚨 <b>Psychobots monitor detected issues</b>"]
+            for name, issues in all_issues:
+                lines.append(f"\n<b>{name}</b>")
+                for issue in issues[:8]:
+                    lines.append(f"• {issue}")
+            await send_alert(apps, "\n".join(lines))
+
+        save_state(state)
+        if all_issues:
+            for name, issues in all_issues:
+                print(f"{name}:")
+                for issue in issues:
+                    print(f"  - {issue}")
+            return 1
+        print("OK")
+        return 0
 
 
 def main() -> None:
