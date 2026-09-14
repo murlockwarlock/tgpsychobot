@@ -116,24 +116,101 @@ class SingleInstanceLock:
             self.fd = None
 
 
+SUPPORTED_POSTGRES_SCHEMES = frozenset({"postgresql", "postgres", "postgresql+asyncpg"})
+
+
+def classify_and_parse_db_url(
+    db_url: str,
+) -> tuple[str, str | None, str | None, str | None]:
+    """Classifies database URL into one of three categories:
+
+    - ("supported", safe_db_key, normalized_connection_dsn, None)
+    - ("malformed_or_unsupported_pg", None, None, static_sanitized_reason)
+    - ("unsupported_backend", None, None, None)
+    """
+    if not db_url or not isinstance(db_url, str):
+        return ("unsupported_backend", None, None, None)
+
+    raw_lower = db_url.strip().lower()
+    is_intended_pg = raw_lower.startswith(
+        ("postgres:", "postgresql:", "postgresql+", "postgres+", "postgresql//", "postgres//")
+    )
+
+    try:
+        parsed = urlsplit(db_url)
+    except Exception:
+        if is_intended_pg:
+            return ("malformed_or_unsupported_pg", None, None, "invalid URL syntax")
+        return ("unsupported_backend", None, None, None)
+
+    scheme = (parsed.scheme or "").lower()
+    if not scheme:
+        if is_intended_pg:
+            return ("malformed_or_unsupported_pg", None, None, "invalid URL syntax")
+        return ("unsupported_backend", None, None, None)
+
+    if scheme in SUPPORTED_POSTGRES_SCHEMES:
+        try:
+            port = parsed.port
+        except ValueError:
+            return ("malformed_or_unsupported_pg", None, None, "invalid port")
+
+        if port is not None and not (1 <= port <= 65535):
+            return ("malformed_or_unsupported_pg", None, None, "invalid port")
+
+        host = parsed.hostname
+        if not host:
+            return ("malformed_or_unsupported_pg", None, None, "missing host")
+
+        dbname = parsed.path.lstrip("/")
+        if not dbname:
+            return ("malformed_or_unsupported_pg", None, None, "missing database name")
+
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        effective_port = port or 5432
+        safe_key = f"{host}:{effective_port}/{dbname}"
+
+        conn_scheme = "postgresql" if scheme in ("postgresql", "postgresql+asyncpg") else "postgres"
+        normalized_dsn = urlunsplit(
+            (conn_scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment)
+        )
+        return ("supported", safe_key, normalized_dsn, None)
+
+    if scheme.startswith("postgresql+") or scheme.startswith("postgres+"):
+        return ("malformed_or_unsupported_pg", None, None, "unsupported PostgreSQL driver scheme")
+
+    return ("unsupported_backend", None, None, None)
+
+
 def make_safe_db_key(db_url: str) -> str:
-    parsed = urlsplit(make_dsn(db_url))
-    host = parsed.hostname or "localhost"
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    port = parsed.port or 5432
-    dbname = parsed.path.lstrip("/")
-    return f"{host}:{port}/{dbname}"
+    status, safe_key, _, reason = classify_and_parse_db_url(db_url)
+    if status == "supported" and safe_key:
+        return safe_key
+    raise ValueError(f"Cannot generate safe DB key: {reason or 'unsupported backend'}")
 
 
-def group_apps_by_db(apps: list[dict]) -> dict[str, list[dict]]:
+def group_apps_by_db(
+    apps: list[dict],
+    malformed_issues: list | None = None,
+) -> dict[str, list[dict]]:
     groups: dict[str, list[dict]] = defaultdict(list)
     for app in apps:
         db_url = app.get("db_url")
         if not db_url:
             continue
-        safe_key = make_safe_db_key(db_url)
-        groups[safe_key].append(app)
+        status, safe_key, normalized_dsn, reason = classify_and_parse_db_url(db_url)
+        if status == "supported" and safe_key and normalized_dsn:
+            app_copy = dict(app)
+            app_copy["normalized_db_url"] = normalized_dsn
+            groups[safe_key].append(app_copy)
+        elif status == "malformed_or_unsupported_pg":
+            if malformed_issues is not None:
+                app_name = app.get("name", "unknown")
+                malformed_issues.append(
+                    (app_name, [f"DB: malformed PostgreSQL DATABASE_URL: {reason}"])
+                )
+        # status == "unsupported_backend": silently ignored
     return groups
 
 
@@ -345,14 +422,15 @@ async def check_stuck_dialogues(
     import asyncpg
 
     state.setdefault("stuck_dialogues", {})
-    db_groups = group_apps_by_db(apps)
+    db_groups = group_apps_by_db(apps, malformed_issues=all_issues)
     alerts_sent = 0
 
     for safe_db_key, group_apps in db_groups.items():
         sample_app = group_apps[0]
         conn = None
         try:
-            conn = await asyncpg.connect(make_dsn(sample_app["db_url"]), timeout=10)
+            target_dsn = sample_app["normalized_db_url"]
+            conn = await asyncpg.connect(target_dsn, timeout=10)
             effective_mode = await get_effective_memory_mode(conn)
             episodes = await fetch_stuck_dialogue_episodes(
                 conn,
