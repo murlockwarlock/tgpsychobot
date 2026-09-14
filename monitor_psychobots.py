@@ -132,17 +132,20 @@ def classify_and_parse_db_url(
         return ("unsupported_backend", None, None, None)
 
     raw_lower = db_url.strip().lower()
+    is_intended_pg = raw_lower.startswith(
+        ("postgres:", "postgresql:", "postgresql+", "postgres+", "postgresql//", "postgres//")
+    )
 
     try:
         parsed = urlsplit(db_url)
     except Exception:
-        if raw_lower.startswith(("postgres:", "postgresql:", "postgresql+", "postgres+")):
+        if is_intended_pg:
             return ("malformed_or_unsupported_pg", None, None, "invalid URL syntax")
         return ("unsupported_backend", None, None, None)
 
     scheme = (parsed.scheme or "").lower()
     if not scheme:
-        if raw_lower.startswith(("postgres:", "postgresql:", "postgresql+", "postgres+")):
+        if is_intended_pg:
             return ("malformed_or_unsupported_pg", None, None, "invalid URL syntax")
         return ("unsupported_backend", None, None, None)
 
@@ -426,7 +429,7 @@ async def check_stuck_dialogues(
         sample_app = group_apps[0]
         conn = None
         try:
-            target_dsn = sample_app.get("normalized_db_url") or make_dsn(sample_app["db_url"])
+            target_dsn = sample_app["normalized_db_url"]
             conn = await asyncpg.connect(target_dsn, timeout=10)
             effective_mode = await get_effective_memory_mode(conn)
             episodes = await fetch_stuck_dialogue_episodes(
@@ -651,9 +654,6 @@ def parse_owner_ids(value: str) -> list[int]:
 
 
 def make_dsn(db_url: str) -> str:
-    status, _, normalized_dsn, _ = classify_and_parse_db_url(db_url)
-    if status == "supported" and normalized_dsn:
-        return normalized_dsn
     return db_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 

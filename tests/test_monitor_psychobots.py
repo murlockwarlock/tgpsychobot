@@ -1649,6 +1649,20 @@ def test_classify_and_parse_db_url_malformed_postgres():
         assert dsn is None
         assert reason in ("missing host", "invalid URL syntax", "unsupported PostgreSQL driver scheme")
 
+    # obvious malformed PostgreSQL prefix without colon (e.g. postgresql//host/db)
+    for url in ("postgresql//host/db", "postgres//host/db"):
+        status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(url)
+        assert status == "malformed_or_unsupported_pg"
+        assert safe_key is None
+        assert dsn is None
+        assert reason == "invalid URL syntax"
+
+        # Verify when passed through grouping it emits sanitized infrastructure issue and does not group
+        issues = []
+        groups = monitor.group_apps_by_db([{"name": "bad_bot", "db_url": url}], malformed_issues=issues)
+        assert len(groups) == 0
+        assert any(name == "bad_bot" and "invalid URL syntax" in msgs[0] for name, msgs in issues)
+
 
 def test_security_credential_bearing_malformed_url_sanitization():
     url = "postgresql://secret_user:super_secret_pwd@localhost:invalid_port/secret_db"
@@ -1810,6 +1824,34 @@ async def test_unsupported_pg_driver_never_reaches_asyncpg(monkeypatch):
 
     assert connected is False
     assert any(name == "bot_psycopg" and "unsupported PostgreSQL driver scheme" in msgs[0] for name, msgs in all_issues)
+
+
+@pytest.mark.asyncio
+async def test_b1f_connection_path_does_not_call_make_dsn(monkeypatch):
+    def boom(url):
+        raise RuntimeError("make_dsn should not be called by valid B1-F connection path!")
+
+    monkeypatch.setattr(monitor, "make_dsn", boom)
+
+    connected_dsns = []
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(dsn, timeout):
+        connected_dsns.append(dsn)
+        return FakeConn()
+
+    monkeypatch.setattr("asyncpg.connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", lambda c: asyncio.sleep(0, result="reset"))
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", lambda *args, **kwargs: asyncio.sleep(0, result=[]))
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", lambda c: asyncio.sleep(0, result=set()))
+
+    apps = [{"name": "bot1", "db_url": "postgresql+asyncpg://usr:pwd@localhost:5432/db1", "token": "t", "owner_ids": [1]}]
+    await monitor.check_stuck_dialogues(apps, {}, [])
+    assert len(connected_dsns) == 1
+    assert connected_dsns[0] == "postgresql://usr:pwd@localhost:5432/db1"
+
 
 
 
