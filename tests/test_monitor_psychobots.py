@@ -1527,5 +1527,291 @@ async def test_reset_and_global_share_incident_identity_and_cooldown(monkeypatch
     assert inc_key in state["stuck_dialogues"]
 
 
+# =====================================================================
+# B1-F.1: PostgreSQL-only Backend Filtering, Classifier & Sanitization Tests
+# =====================================================================
+
+
+def test_classify_and_parse_db_url_supported_schemes():
+    # 1. postgresql://
+    status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(
+        "postgresql://myuser:mypass@localhost:5432/mydb"
+    )
+    assert status == "supported"
+    assert safe_key == "localhost:5432/mydb"
+    assert dsn == "postgresql://myuser:mypass@localhost:5432/mydb"
+    assert reason is None
+
+    # 2. postgres://
+    status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(
+        "postgres://myuser:mypass@localhost:5432/mydb"
+    )
+    assert status == "supported"
+    assert safe_key == "localhost:5432/mydb"
+    assert dsn == "postgres://myuser:mypass@localhost:5432/mydb"
+    assert reason is None
+
+    # 3. postgresql+asyncpg:// -> normalized to postgresql://
+    status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(
+        "postgresql+asyncpg://myuser:mypass@localhost:5432/mydb"
+    )
+    assert status == "supported"
+    assert safe_key == "localhost:5432/mydb"
+    assert dsn == "postgresql://myuser:mypass@localhost:5432/mydb"
+    assert reason is None
+
+    # 4. mixed-case POSTGRESQL+ASYNCPG:// -> normalized to postgresql://
+    status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(
+        "POSTGRESQL+ASYNCPG://myuser:mypass@localhost:5432/mydb"
+    )
+    assert status == "supported"
+    assert safe_key == "localhost:5432/mydb"
+    assert dsn == "postgresql://myuser:mypass@localhost:5432/mydb"
+    assert reason is None
+
+    # 5. mixed-case PostgreSQL:// -> normalized
+    status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(
+        "PostgreSQL://myuser:mypass@localhost:5432/mydb"
+    )
+    assert status == "supported"
+    assert safe_key == "localhost:5432/mydb"
+    assert dsn == "postgresql://myuser:mypass@localhost:5432/mydb"
+    assert reason is None
+
+
+def test_classify_and_parse_db_url_unsupported_pg_driver():
+    for scheme in ("postgresql+psycopg", "postgresql+psycopg2", "postgresql+unknown", "POSTGRESQL+PSYCOPG"):
+        url = f"{scheme}://user:pass@localhost:5432/mydb"
+        status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(url)
+        assert status == "malformed_or_unsupported_pg"
+        assert safe_key is None
+        assert dsn is None
+        assert reason == "unsupported PostgreSQL driver scheme"
+
+
+def test_classify_and_parse_db_url_non_postgres_backends():
+    non_pg_urls = [
+        "sqlite:///path/to/db.sqlite",
+        "sqlite+aiosqlite:///./darimiru_bot.db",
+        "mysql://user:pass@localhost/mydb",
+        "mysql+aiomysql://user:pass@localhost/mydb",
+        "",
+        None,
+    ]
+    for url in non_pg_urls:
+        status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(url)
+        assert status == "unsupported_backend"
+        assert safe_key is None
+        assert dsn is None
+        assert reason is None
+
+
+def test_classify_and_parse_db_url_malformed_postgres():
+    # missing host
+    for url in ("postgresql:///mydb", "postgresql://:5432/mydb"):
+        status, safe_key, dsn, reason = monitor.classify_and_parse_db_url(url)
+        assert status == "malformed_or_unsupported_pg"
+        assert dsn is None
+        assert reason == "missing host"
+
+    # invalid nonnumeric port
+    status, _, dsn, reason = monitor.classify_and_parse_db_url("postgresql://localhost:not_a_port/mydb")
+    assert status == "malformed_or_unsupported_pg"
+    assert dsn is None
+    assert reason == "invalid port"
+
+    # port out of range (0 or >65535)
+    status, _, dsn, reason = monitor.classify_and_parse_db_url("postgresql://localhost:0/mydb")
+    assert status == "malformed_or_unsupported_pg"
+    assert reason == "invalid port"
+
+    status, _, dsn, reason = monitor.classify_and_parse_db_url("postgresql://localhost:70000/mydb")
+    assert status == "malformed_or_unsupported_pg"
+    assert reason == "invalid port"
+
+    # missing database name
+    for url in ("postgresql://localhost:5432/", "postgresql://localhost:5432"):
+        status, _, dsn, reason = monitor.classify_and_parse_db_url(url)
+        assert status == "malformed_or_unsupported_pg"
+        assert dsn is None
+        assert reason == "missing database name"
+
+    # invalid URL syntax (e.g. unclosed bracket)
+    status, _, dsn, reason = monitor.classify_and_parse_db_url("postgresql://[invalid_ipv6/mydb")
+    assert status == "malformed_or_unsupported_pg"
+    assert dsn is None
+    assert reason == "invalid URL syntax"
+
+    # obvious malformed PostgreSQL prefix
+    for url in ("postgresql:", "postgres://", "postgresql+broken"):
+        status, _, dsn, reason = monitor.classify_and_parse_db_url(url)
+        assert status == "malformed_or_unsupported_pg"
+        assert dsn is None
+        assert reason in ("missing host", "invalid URL syntax", "unsupported PostgreSQL driver scheme")
+
+
+def test_security_credential_bearing_malformed_url_sanitization():
+    url = "postgresql://secret_user:super_secret_pwd@localhost:invalid_port/secret_db"
+    issues = []
+    groups = monitor.group_apps_by_db(
+        [{"name": "broken_bot", "db_url": url}],
+        malformed_issues=issues,
+    )
+    assert len(groups) == 0
+    assert len(issues) == 1
+    app_name, issue_list = issues[0]
+    assert app_name == "broken_bot"
+    assert issue_list == ["DB: malformed PostgreSQL DATABASE_URL: invalid port"]
+
+    # Strict check: credentials and raw URL are completely absent from issue output
+    issue_blob = str(issues)
+    assert "secret_user" not in issue_blob
+    assert "super_secret_pwd" not in issue_blob
+    assert "secret_db" not in issue_blob
+    assert url not in issue_blob
+
+
+def test_make_safe_db_key_hardening():
+    # Valid PostgreSQL and IPv6
+    key = monitor.make_safe_db_key("postgresql://user:pass@[2001:db8::1]:5432/my_db")
+    assert key == "[2001:db8::1]:5432/my_db"
+
+    # SQLite must raise ValueError, NEVER produce fake localhost:5432 key
+    with pytest.raises(ValueError) as exc_info:
+        monitor.make_safe_db_key("sqlite+aiosqlite:///./darimiru_bot.db")
+    assert "Cannot generate safe DB key" in str(exc_info.value)
+    assert "localhost:5432" not in str(exc_info.value)
+
+    # Malformed PostgreSQL must raise ValueError
+    with pytest.raises(ValueError) as exc_info:
+        monitor.make_safe_db_key("postgresql://localhost:invalid/my_db")
+    assert "invalid port" in str(exc_info.value)
+
+
+def test_group_apps_by_db_filtering_and_shared_db():
+    apps = [
+        {"name": "tg_bot", "db_url": "postgresql://u:p@localhost:5432/shared_db"},
+        {"name": "max_bot", "db_url": "postgresql+asyncpg://u:p@localhost:5432/shared_db"},
+        {"name": "darimiru_bot", "db_url": "sqlite+aiosqlite:///./darimiru_bot.db"},
+        {"name": "broken_bot", "db_url": "postgresql+psycopg://u:p@localhost:5432/other_db"},
+    ]
+    issues = []
+    groups = monitor.group_apps_by_db(apps, malformed_issues=issues)
+
+    # Only shared_db is grouped
+    assert len(groups) == 1
+    assert "localhost:5432/shared_db" in groups
+    assert len(groups["localhost:5432/shared_db"]) == 2
+    assert groups["localhost:5432/shared_db"][0]["name"] == "tg_bot"
+    assert groups["localhost:5432/shared_db"][1]["name"] == "max_bot"
+
+    # Normalized DSN was attached to the apps in the group
+    assert groups["localhost:5432/shared_db"][0]["normalized_db_url"] == "postgresql://u:p@localhost:5432/shared_db"
+    assert groups["localhost:5432/shared_db"][1]["normalized_db_url"] == "postgresql://u:p@localhost:5432/shared_db"
+
+    # darimiru_bot produces no issue
+    assert not any(app == "darimiru_bot" for app, _ in issues)
+
+    # broken_bot produces sanitized issue
+    assert any(app == "broken_bot" and "unsupported PostgreSQL driver scheme" in msg[0] for app, msg in issues)
+
+
+@pytest.mark.asyncio
+async def test_mixed_execution_in_check_stuck_dialogues(monkeypatch):
+    connected_dsns = []
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(dsn, timeout):
+        connected_dsns.append(dsn)
+        return FakeConn()
+
+    async def fake_mode(c): return "reset"
+    async def fake_episodes(*args, **kwargs): return []
+    async def fake_max(c): return set()
+
+    monkeypatch.setattr("asyncpg.connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", fake_mode)
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", fake_episodes)
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", fake_max)
+
+    apps = [
+        {"name": "tg_valid", "db_url": "postgresql+asyncpg://u:p@localhost:5432/valid_db", "token": "t", "owner_ids": [1]},
+        {"name": "darimiru_bot", "db_url": "sqlite+aiosqlite:///./darimiru_bot.db", "token": "t", "owner_ids": [1]},
+        {"name": "broken_bot", "db_url": "postgresql+psycopg://u:p@localhost:5432/broken_db", "token": "t", "owner_ids": [1]},
+    ]
+
+    all_issues = []
+    state = {}
+    alerts = await monitor.check_stuck_dialogues(apps, state, all_issues)
+    assert alerts == 0
+
+    # Prove only valid PostgreSQL called asyncpg.connect
+    assert len(connected_dsns) == 1
+    assert connected_dsns[0] == "postgresql://u:p@localhost:5432/valid_db"
+
+    # Prove darimiru_bot created no B1-F issue and no asyncpg call
+    assert not any(name == "darimiru_bot" for name, _ in all_issues)
+
+    # Prove broken_bot created exactly sanitized issue
+    broken_issues = [msgs for name, msgs in all_issues if name == "broken_bot"]
+    assert len(broken_issues) == 1
+    assert "unsupported PostgreSQL driver scheme" in broken_issues[0][0]
+
+    # Prove no incident entries created for darimiru_bot or broken_bot
+    assert len(state["stuck_dialogues"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_asyncpg_connect_receives_normalized_dsn_actual_flow(monkeypatch):
+    connected_dsns = []
+
+    class FakeConn:
+        async def close(self): pass
+
+    async def fake_connect(dsn, timeout):
+        connected_dsns.append(dsn)
+        return FakeConn()
+
+    monkeypatch.setattr("asyncpg.connect", fake_connect)
+    monkeypatch.setattr(monitor, "get_effective_memory_mode", lambda c: asyncio.sleep(0, result="reset"))
+    monkeypatch.setattr(monitor, "fetch_stuck_dialogue_episodes", lambda *args, **kwargs: asyncio.sleep(0, result=[]))
+    monkeypatch.setattr(monitor, "get_suppressed_max_user_ids", lambda c: asyncio.sleep(0, result=set()))
+
+    # 1. postgresql+asyncpg://
+    apps1 = [{"name": "bot1", "db_url": "postgresql+asyncpg://usr:pwd@localhost:5432/db1", "token": "t", "owner_ids": [1]}]
+    await monitor.check_stuck_dialogues(apps1, {}, [])
+    assert len(connected_dsns) == 1
+    assert connected_dsns[0] == "postgresql://usr:pwd@localhost:5432/db1"
+
+    # 2. mixed-case POSTGRESQL+ASYNCPG://
+    apps2 = [{"name": "bot2", "db_url": "POSTGRESQL+ASYNCPG://usr:pwd@localhost:5432/db2", "token": "t", "owner_ids": [1]}]
+    await monitor.check_stuck_dialogues(apps2, {}, [])
+    assert len(connected_dsns) == 2
+    assert connected_dsns[1] == "postgresql://usr:pwd@localhost:5432/db2"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_pg_driver_never_reaches_asyncpg(monkeypatch):
+    connected = False
+
+    async def fake_connect(dsn, timeout):
+        nonlocal connected
+        connected = True
+        return None
+
+    monkeypatch.setattr("asyncpg.connect", fake_connect)
+
+    apps = [{"name": "bot_psycopg", "db_url": "postgresql+psycopg://usr:pwd@localhost:5432/db", "token": "t", "owner_ids": [1]}]
+    all_issues = []
+    state = {}
+    await monitor.check_stuck_dialogues(apps, state, all_issues)
+
+    assert connected is False
+    assert any(name == "bot_psycopg" and "unsupported PostgreSQL driver scheme" in msgs[0] for name, msgs in all_issues)
+
+
+
 
 
