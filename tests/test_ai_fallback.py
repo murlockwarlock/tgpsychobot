@@ -650,4 +650,4 @@ async def test_process_buffered_messages_reports_both_attempts_once_and_replies_
     assert notify.await_args.kwargs["title"] == "Не удалось получить ответ ИИ"
     assert notify.await_args.kwargs["provider_attempts"] == service_error.provider_attempts
     assert bot.send_message.await_count == 1
-    assert "Попробуйте" in bot.send_message.await_args.kwargs["text"]
+    assert "Ой. Нейросеть сейчас перегружена" in bot.send_message.await_args.kwargs["text"]

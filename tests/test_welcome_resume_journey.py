@@ -2265,7 +2265,7 @@ async def test_choice_img_hidden_real_process_buffered_messages_and_stale_drop(d
 @pytest.mark.parametrize(
     "error_cls,error_text_needle",
     [
-        (handlers.AIServiceError, "Упс..."),
+        (handlers.AIServiceError, "Ой. Нейросеть сейчас перегружена"),
         (RuntimeError, "Произошла ошибка"),
     ],
 )

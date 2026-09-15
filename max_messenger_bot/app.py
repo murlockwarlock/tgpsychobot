@@ -35,6 +35,7 @@ from .keyboards import inline_keyboard, main_menu_row
 from .identity import is_max_user_id
 from response_buttons import MAIN_TOPIC_ACTIONS, build_ai_button_system_message, split_action_callback_data
 from .storage import StateStore, init_storage
+from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
 
 
 configure_logging()
@@ -160,6 +161,27 @@ class MaxBotApplication:
         self.user_tasks[user_id] = task
         task.add_done_callback(lambda t: self.user_tasks.pop(user_id, None) if self.user_tasks.get(user_id) is t else None)
         _track_task(self.background_tasks, task)
+
+    def spawn_ai_user_task(self, user_id: int, coro, lease: SingleFlightLease) -> None:
+        lock = self._user_locks.setdefault(user_id, asyncio.Lock())
+
+        async def runner() -> None:
+            try:
+                async with lock:
+                    await coro
+            finally:
+                single_flight.release(lease)
+
+        try:
+            task = asyncio.create_task(runner())
+            self.user_tasks[user_id] = task
+            task.add_done_callback(lambda t: self.user_tasks.pop(user_id, None) if self.user_tasks.get(user_id) is t else None)
+            _track_task(self.background_tasks, task)
+        except BaseException:
+            single_flight.release(lease)
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            raise
 
     async def handle_update(self, update: dict[str, Any]) -> None:
         update_type = update.get("update_type") or update.get("type") or ""
@@ -590,10 +612,18 @@ class MaxBotApplication:
 
             # Handle media attachments
             if message.media_type in {"audio", "video"} and message.media_token:
-                self.spawn_user_task(message.sender.user_id, self._handle_voice(message))
+                lease = single_flight.try_claim("max", message.sender.user_id)
+                if lease is None:
+                    await self.client.send_message(chat_id=message.chat_id, text=AI_BUSY_MESSAGE)
+                    return
+                self.spawn_ai_user_task(message.sender.user_id, self._handle_voice(message), lease)
                 return
             if message.media_type in {"image", "photo"} and message.media_token:
-                self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=""))
+                lease = single_flight.try_claim("max", message.sender.user_id)
+                if lease is None:
+                    await self.client.send_message(chat_id=message.chat_id, text=AI_BUSY_MESSAGE)
+                    return
+                self.spawn_ai_user_task(message.sender.user_id, self._handle_image(message, caption=""), lease)
                 return
             if message.media_type == "file" and message.media_token:
                 await self.client.send_message(chat_id=message.chat_id, text="📎 Файлы пока не поддерживаются в этом боте.")
@@ -679,9 +709,17 @@ class MaxBotApplication:
             return
         # If user sent image with caption, handle as vision
         if message.media_type in {"image", "photo"} and message.media_token:
-            self.spawn_user_task(message.sender.user_id, self._handle_image(message, caption=text))
+            lease = single_flight.try_claim("max", message.sender.user_id)
+            if lease is None:
+                await self.client.send_message(chat_id=message.chat_id, text=AI_BUSY_MESSAGE)
+                return
+            self.spawn_ai_user_task(message.sender.user_id, self._handle_image(message, caption=text), lease)
             return
-        self.spawn_user_task(message.sender.user_id, common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text, self.states))
+        lease = single_flight.try_claim("max", message.sender.user_id)
+        if lease is None:
+            await self.client.send_message(chat_id=message.chat_id, text=AI_BUSY_MESSAGE)
+            return
+        self.spawn_ai_user_task(message.sender.user_id, common.run_ai_dialogue(self.client, message.chat_id, message.sender.user_id, text, self.states), lease)
 
     async def _read_text_attachment(self, message: IncomingMessage) -> str | None:
         try:
@@ -822,9 +860,14 @@ class MaxBotApplication:
             async with async_session_maker() as session:
                 user = await session.get(User, user_id, options=[selectinload(User.subscription)])
             if user and await common.ensure_access_before_chat(self.client, chat_id, user):
-                self.spawn_user_task(
+                lease = single_flight.try_claim("max", user_id)
+                if lease is None:
+                    await self.client.send_message(chat_id=chat_id, text=AI_BUSY_MESSAGE)
+                    return
+                self.spawn_ai_user_task(
                     user_id,
                     common.run_ai_dialogue(self.client, chat_id, user_id, prompt, self.states),
+                    lease,
                 )
             return
         if data == "cancel_test":

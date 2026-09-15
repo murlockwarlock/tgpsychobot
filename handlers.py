@@ -286,11 +286,14 @@ from universal_tests import (
     validate_formulas,
 )
 
+from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
+
 router = Router()
 log = logging.getLogger(__name__)
 plog = logging.getLogger("payment_events")
 user_locks = {}
 user_message_buffers = {}
+user_message_buffer_leases: dict[int, SingleFlightLease] = {}
 user_processing_tasks = {}
 user_isolated_turn_queues = {}
 user_scheduling_locks = {}
@@ -2231,7 +2234,7 @@ async def process_buffered_messages(
             return
         await bot.send_message(
             chat_id=user_id,
-            text="Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут.",
+            text="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
         )
     except Exception as e:
         if typing_task: typing_task.cancel()
@@ -2296,6 +2299,7 @@ def _schedule_telegram_drain_runner_locked(
             while True:
                 work_item = None
                 is_isolated = False
+                normal_lease = None
                 async with _get_user_scheduling_lock(user_id):
                     isolated_queue = user_isolated_turn_queues.get(user_id)
                     if isolated_queue and len(isolated_queue) > 0:
@@ -2304,34 +2308,40 @@ def _schedule_telegram_drain_runner_locked(
                     elif user_message_buffers.get(user_id) and len(user_message_buffers[user_id]) > 0:
                         is_isolated = False
                         work_item = True
+                        normal_lease = user_message_buffer_leases.pop(user_id, None)
                     else:
                         break
 
-                if is_isolated:
-                    if isinstance(work_item, ScopedAIKickoff):
-                        await process_buffered_messages(
-                            user_id,
-                            bot,
-                            state,
-                            isolated_prompt=work_item.synthetic_prompt,
-                            visible_user_text=None,
-                            scoped_kickoff=work_item,
-                        )
+                try:
+                    if is_isolated:
+                        if isinstance(work_item, ScopedAIKickoff):
+                            await process_buffered_messages(
+                                user_id,
+                                bot,
+                                state,
+                                isolated_prompt=work_item.synthetic_prompt,
+                                visible_user_text=None,
+                                scoped_kickoff=work_item,
+                            )
+                        else:
+                            await process_buffered_messages(
+                                user_id,
+                                bot,
+                                state,
+                                isolated_prompt=work_item,
+                                visible_user_text=None,
+                            )
                     else:
                         await process_buffered_messages(
                             user_id,
                             bot,
                             state,
-                            isolated_prompt=work_item,
-                            visible_user_text=None,
                         )
-                else:
-                    await process_buffered_messages(
-                        user_id,
-                        bot,
-                        state,
-                    )
-                    break
+                        break
+                finally:
+                    if normal_lease:
+                        single_flight.release(normal_lease)
+                        normal_lease = None
         finally:
             if _drain_runner_before_cleanup_hook is not None:
                 hook_res = _drain_runner_before_cleanup_hook(user_id)
@@ -2340,6 +2350,9 @@ def _schedule_telegram_drain_runner_locked(
             async with _get_user_scheduling_lock(user_id):
                 if user_processing_tasks.get(user_id) is this_task:
                     user_processing_tasks.pop(user_id, None)
+                leftover_lease = user_message_buffer_leases.pop(user_id, None)
+                if leftover_lease:
+                    single_flight.release(leftover_lease)
                 has_isolated = bool(user_isolated_turn_queues.get(user_id) and len(user_isolated_turn_queues[user_id]) > 0)
                 cur_buf = user_message_buffers.get(user_id)
                 has_new_buffer = bool(cur_buf and len(cur_buf) > 0)
@@ -2682,25 +2695,32 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
             logging.warning(f"Unknown service action in Telegram: {action}")
             return
 
-    # Generic AI path — does NOT pre-claim! _prepare_ai_button_submission is the claim owner.
+    # Generic AI path — check single-flight BEFORE button consumption
+    lease = single_flight.try_claim("telegram", user_id)
+    if lease is None:
+        await callback.answer(AI_BUSY_MESSAGE, show_alert=True)
+        return
+
     accepted, button_text = await _prepare_ai_button_submission(
         callback,
         bot,
         callback_data,
         acknowledge=True,
     )
-    if not accepted:
+    if not accepted or not isinstance(button_text, str) or not button_text:
+        single_flight.release(lease)
         return
 
-    if not isinstance(button_text, str) or not button_text:
-        return
-    user_message_buffers[user_id] = [build_ai_button_system_message(button_text, action)]
-    await process_buffered_messages(
-        user_id,
-        bot,
-        state,
-        visible_user_text=button_text,
-    )
+    try:
+        user_message_buffers[user_id] = [build_ai_button_system_message(button_text, action)]
+        await process_buffered_messages(
+            user_id,
+            bot,
+            state,
+            visible_user_text=button_text,
+        )
+    finally:
+        single_flight.release(lease)
 
 
 @router.callback_query(F.data.startswith("card_select_"))
@@ -6745,7 +6765,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             exception=e,
         )
         await _send_processing_error(
-            "Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
+            "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
         )
     except Exception as e:
         provider, model = _resolve_ai_provider_model(ai_config, "chat")
@@ -6861,7 +6881,14 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
                         return
 
     if prompt_text:
-        await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
+        lease = single_flight.try_claim("telegram", user_id)
+        if lease is None:
+            await callback.message.answer(AI_BUSY_MESSAGE)
+            return
+        try:
+            await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
+        finally:
+            single_flight.release(lease)
     else:
         await callback.message.answer("Спасибо! Теперь вы можете задать свой вопрос.")
 
@@ -8362,7 +8389,14 @@ async def _resume_after_profile_onboarding(
 
     prompt_text = data.get("initial_prompt")
     if prompt_text:
-        await process_user_prompt(message, user_id, prompt_text, bot, state)
+        lease = single_flight.try_claim("telegram", user_id)
+        if lease is None:
+            await message.answer(AI_BUSY_MESSAGE)
+            return
+        try:
+            await process_user_prompt(message, user_id, prompt_text, bot, state)
+        finally:
+            single_flight.release(lease)
 
 
 async def _continue_profile_onboarding(
@@ -14896,6 +14930,11 @@ async def _create_robokassa_invoice_impl(callback: CallbackQuery, state: FSMCont
 async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
 
+    lease = single_flight.try_claim("telegram", user_id)
+    if lease is None:
+        await message.answer(AI_BUSY_MESSAGE)
+        return
+
     async with async_session_maker() as session:
         ai_config = await session.get(AIConfig, 1)
         if not ai_config:
@@ -14905,11 +14944,13 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
         transcription_provider = ai_config.transcription_provider
 
     if transcription_provider == 'None':
+        single_flight.release(lease)
         await message.answer(
             "Извините, но распознавание голосовых сообщений в данный момент отключено администратором.")
         return
 
     if message.voice.duration > max_duration_sec:
+        single_flight.release(lease)
         max_duration_minutes = max_duration_sec / 60
         if max_duration_minutes.is_integer():
             minutes_str = f"{int(max_duration_minutes)}"
@@ -14922,157 +14963,160 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
         )
         return
 
-    thinking_msg = await message.answer("🤖 Распознаю ваше голосовое сообщение...")
-
     try:
-        file_info = await bot.get_file(message.voice.file_id)
-        file_bytes_io = await bot.download_file(file_info.file_path)
-        file_bytes = file_bytes_io.read()
-
-        filename = f"{message.voice.file_id}.ogg"
-
-        prompt_text = await transcribe_voice_message(file_bytes, filename)
-
-        if prompt_text.startswith("❌ Ошибка:"):
-            await thinking_msg.edit_text(prompt_text)
-            return
+        thinking_msg = await message.answer("🤖 Распознаю ваше голосовое сообщение...")
 
         try:
-            escaped_prompt = html.escape(prompt_text)
-            chunks = split_message(escaped_prompt, 4000)
-            italicized_chunks = [f"<i>{chunk}</i>" for chunk in chunks]
+            file_info = await bot.get_file(message.voice.file_id)
+            file_bytes_io = await bot.download_file(file_info.file_path)
+            file_bytes = file_bytes_io.read()
 
-            first_chunk_to_send = italicized_chunks[0]
-            if len(first_chunk_to_send) > 4096:
-                first_chunk_to_send = f"<i>{chunks[0][:4000]}</i>"
+            filename = f"{message.voice.file_id}.ogg"
 
-            await thinking_msg.edit_text(first_chunk_to_send)
+            prompt_text = await transcribe_voice_message(file_bytes, filename)
 
-            if len(italicized_chunks) > 1:
-                for chunk in italicized_chunks[1:]:
+            if prompt_text.startswith("❌ Ошибка:"):
+                await thinking_msg.edit_text(prompt_text)
+                return
+
+            try:
+                escaped_prompt = html.escape(prompt_text)
+                chunks = split_message(escaped_prompt, 4000)
+                italicized_chunks = [f"<i>{chunk}</i>" for chunk in chunks]
+
+                first_chunk_to_send = italicized_chunks[0]
+                if len(first_chunk_to_send) > 4096:
+                    first_chunk_to_send = f"<i>{chunks[0][:4000]}</i>"
+
+                await thinking_msg.edit_text(first_chunk_to_send)
+
+                if len(italicized_chunks) > 1:
+                    for chunk in italicized_chunks[1:]:
+                        await _safe_send_html(
+                            lambda text, pm: message.answer(text, parse_mode=pm),
+                            chunk,
+                        )
+                        await asyncio.sleep(0.3)
+
+            except TelegramBadRequest as e:
+                await thinking_msg.delete()
+                logging.warning(f"Failed to edit transcription text: {e}. Sending as new messages.")
+                escaped_prompt = html.escape(prompt_text)
+                chunks = split_message(escaped_prompt, 4000)
+                italicized_chunks = [f"<i>{chunk}</i>" for chunk in chunks]
+
+                for chunk in italicized_chunks:
                     await _safe_send_html(
                         lambda text, pm: message.answer(text, parse_mode=pm),
                         chunk,
                     )
                     await asyncio.sleep(0.3)
 
-        except TelegramBadRequest as e:
-            await thinking_msg.delete()
-            logging.warning(f"Failed to edit transcription text: {e}. Sending as new messages.")
-            escaped_prompt = html.escape(prompt_text)
-            chunks = split_message(escaped_prompt, 4000)
-            italicized_chunks = [f"<i>{chunk}</i>" for chunk in chunks]
-
-            for chunk in italicized_chunks:
-                await _safe_send_html(
-                    lambda text, pm: message.answer(text, parse_mode=pm),
-                    chunk,
-                )
-                await asyncio.sleep(0.3)
-
-    except InsufficientBalanceError as e:
-        provider, model = _resolve_ai_provider_model(ai_config, "transcription")
-        await _report_ai_failure(
-            bot,
-            title="Критическая ошибка API транскрибации",
-            user=message.from_user,
-            provider=provider,
-            model=model,
-            stage="voice_transcription_balance",
-            details=str(e),
-            extra={"duration_sec": message.voice.duration},
-            exception=e,
-            include_traceback=False,
-        )
-        await thinking_msg.edit_text(
-            "К сожалению, сервис транскрибации временно недоступен из-за технической проблемы. Мы уже работаем над ее решением.")
-        return
-    except AIServiceError as e:
-        provider, model = _resolve_ai_provider_model(ai_config, "transcription")
-        await _report_ai_failure(
-            bot,
-            title="Сбой транскрибации",
-            user=message.from_user,
-            provider=provider,
-            model=model,
-            stage="voice_transcription",
-            details=str(e),
-            extra={"duration_sec": message.voice.duration},
-            exception=e,
-            include_traceback=False,
-        )
-        await thinking_msg.edit_text(
-            "Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
-        )
-        return
-    except Exception as e:
-        provider, model = _resolve_ai_provider_model(ai_config, "transcription")
-        await _report_ai_failure(
-            bot,
-            title="Непредвиденная ошибка обработки голосового",
-            user=message.from_user,
-            provider=provider,
-            model=model,
-            stage="voice_handler_unexpected",
-            details=str(e),
-            extra={"duration_sec": message.voice.duration},
-            exception=e,
-            include_traceback=False,
-        )
-        await thinking_msg.edit_text(
-            "Произошла непредвиденная ошибка при обработке аудио. Попробуйте ещё раз через несколько минут.")
-        return
-
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id, options=[selectinload(User.subscription)])
-
-        if not user:
-            user = User(id=user_id, username=message.from_user.username, first_name=message.from_user.full_name,
-                        is_admin=await is_admin(user_id))
-            session.add(user)
-            await session.flush()
-        else:
-            user.username = message.from_user.username
-            user.first_name = message.from_user.full_name
-
-        await _sync_user_birthdate_from_telegram(bot, user)
-        await session.commit()
-        await session.refresh(user, ['subscription'])
-
-        sub_config = await session.get(SubscriptionConfig, 1)
-        subscriptions_active = sub_config.subscriptions_enabled if sub_config else True
-
-        is_user_admin = await is_admin(user_id)
-        if not is_user_admin and subscriptions_active:
-            if not user.subscription or user.subscription.end_date < datetime.utcnow():
-                await thinking_msg.delete()
-                await message.answer(
-                    "Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="Начать пользоваться ботом",
-                                              callback_data="show_subscription_info_from_chat")]
-                    ])
-                )
-                return
-
-        if await _request_profile_onboarding_if_needed(message, state, user, initial_prompt=prompt_text):
+        except InsufficientBalanceError as e:
+            provider, model = _resolve_ai_provider_model(ai_config, "transcription")
+            await _report_ai_failure(
+                bot,
+                title="Критическая ошибка API транскрибации",
+                user=message.from_user,
+                provider=provider,
+                model=model,
+                stage="voice_transcription_balance",
+                details=str(e),
+                extra={"duration_sec": message.voice.duration},
+                exception=e,
+                include_traceback=False,
+            )
+            await thinking_msg.edit_text(
+                "К сожалению, сервис транскрибации временно недоступен из-за технической проблемы. Мы уже работаем над ее решением.")
+            return
+        except AIServiceError as e:
+            provider, model = _resolve_ai_provider_model(ai_config, "transcription")
+            await _report_ai_failure(
+                bot,
+                title="Сбой транскрибации",
+                user=message.from_user,
+                provider=provider,
+                model=model,
+                stage="voice_transcription",
+                details=str(e),
+                extra={"duration_sec": message.voice.duration},
+                exception=e,
+                include_traceback=False,
+            )
+            await thinking_msg.edit_text(
+                "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
+            )
+            return
+        except Exception as e:
+            provider, model = _resolve_ai_provider_model(ai_config, "transcription")
+            await _report_ai_failure(
+                bot,
+                title="Непредвиденная ошибка обработки голосового",
+                user=message.from_user,
+                provider=provider,
+                model=model,
+                stage="voice_handler_unexpected",
+                details=str(e),
+                extra={"duration_sec": message.voice.duration},
+                exception=e,
+                include_traceback=False,
+            )
+            await thinking_msg.edit_text(
+                "Произошла непредвиденная ошибка при обработке аудио. Попробуйте ещё раз через несколько минут.")
             return
 
-        if not user.accepted_disclaimer:
-            disclaimer_content = await get_content_from_db("disclaimer")
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id, options=[selectinload(User.subscription)])
 
-            if disclaimer_content.get('is_visible', True):
-                await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-                await state.update_data(initial_prompt=prompt_text)
-                text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                await message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
-                return
+            if not user:
+                user = User(id=user_id, username=message.from_user.username, first_name=message.from_user.full_name,
+                            is_admin=await is_admin(user_id))
+                session.add(user)
+                await session.flush()
             else:
-                stmt = update(User).where(User.id == user_id).values(accepted_disclaimer=True)
-                await session.execute(stmt)
-                await session.commit()
+                user.username = message.from_user.username
+                user.first_name = message.from_user.full_name
 
-    await process_user_prompt(message, user_id, prompt_text, bot, state)
+            await _sync_user_birthdate_from_telegram(bot, user)
+            await session.commit()
+            await session.refresh(user, ['subscription'])
+
+            sub_config = await session.get(SubscriptionConfig, 1)
+            subscriptions_active = sub_config.subscriptions_enabled if sub_config else True
+
+            is_user_admin = await is_admin(user_id)
+            if not is_user_admin and subscriptions_active:
+                if not user.subscription or user.subscription.end_date < datetime.utcnow():
+                    await thinking_msg.delete()
+                    await message.answer(
+                        "Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="Начать пользоваться ботом",
+                                                  callback_data="show_subscription_info_from_chat")]
+                        ])
+                    )
+                    return
+
+            if await _request_profile_onboarding_if_needed(message, state, user, initial_prompt=prompt_text):
+                return
+
+            if not user.accepted_disclaimer:
+                disclaimer_content = await get_content_from_db("disclaimer")
+
+                if disclaimer_content.get('is_visible', True):
+                    await state.set_state(UserStates.awaiting_disclaimer_acceptance)
+                    await state.update_data(initial_prompt=prompt_text)
+                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
+                    await message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                    return
+                else:
+                    stmt = update(User).where(User.id == user_id).values(accepted_disclaimer=True)
+                    await session.execute(stmt)
+                    await session.commit()
+
+            await process_user_prompt(message, user_id, prompt_text, bot, state)
+    finally:
+        single_flight.release(lease)
 
 
 @router.callback_query(F.data == "set_audio_limit")
@@ -15866,7 +15910,14 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
             return
 
         if prompt_text:
-            await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
+            lease = single_flight.try_claim("telegram", user_id)
+            if lease is None:
+                await callback.message.answer(AI_BUSY_MESSAGE)
+                return
+            try:
+                await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
+            finally:
+                single_flight.release(lease)
         return
 
     await state.set_state(UserStates.awaiting_age)
@@ -17808,6 +17859,11 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
                 payload_text = content.action_btn_payload
 
     if payload_text:
+        lease = single_flight.try_claim("telegram", user_id)
+        if lease is None:
+            await callback.answer(AI_BUSY_MESSAGE, show_alert=True)
+            return
+
         await callback.answer()
         await callback.message.edit_reply_markup(reply_markup=None)
         await _clear_card_spread_state(user_id)
@@ -17818,6 +17874,7 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
             user,
             initial_prompt=payload_text,
         ):
+            single_flight.release(lease)
             return
 
         mock_message = type('obj', (object,), {
@@ -17830,7 +17887,10 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
 
         await callback.message.answer(html.escape(payload_text))
 
-        await process_user_prompt(mock_message, user_id, payload_text, bot, state)
+        try:
+            await process_user_prompt(mock_message, user_id, payload_text, bot, state)
+        finally:
+            single_flight.release(lease)
     else:
         await callback.answer("Действие не назначено.", show_alert=True)
 
@@ -18420,18 +18480,23 @@ def format_ai_response_to_html(text: str) -> str:
 @router.message(F.photo, StateFilter(None))
 async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    processing_msg = None
-    typing_task = None
-
-    async def keep_typing():
-        try:
-            while True:
-                await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-                await asyncio.sleep(4.5)
-        except asyncio.CancelledError:
-            pass
+    lease = single_flight.try_claim("telegram", user_id)
+    if lease is None:
+        await message.answer(AI_BUSY_MESSAGE)
+        return
 
     try:
+        processing_msg = None
+        typing_task = None
+
+        async def keep_typing():
+            try:
+                while True:
+                    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+                    await asyncio.sleep(4.5)
+            except asyncio.CancelledError:
+                pass
+
         # =========================================================================
         # Transaction A: Validate scope, persist current user photo message, commit
         # =========================================================================
@@ -18831,7 +18896,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             except Exception:
                 pass
         await message.answer(
-            "Упс... У нас что-то сломалось. Мы уже сообщили нашим создателям. Попробуйте вернуться и повторить через несколько минут."
+            "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
         )
         await _report_ai_failure(
             bot,
@@ -18863,6 +18928,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             exception=e,
         )
         await message.answer("Произошла ошибка при обработке фото.")
+    finally:
+        single_flight.release(lease)
 
 
 @router.callback_query(F.data.startswith("admin_topic_media_"), StateFilter('*'))
@@ -19115,6 +19182,10 @@ async def show_referral_from_sub(callback: CallbackQuery, bot: Bot):
 async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
 
+    if single_flight.is_busy("telegram", user_id):
+        await message.answer(AI_BUSY_MESSAGE)
+        return
+
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.subscription)])
 
@@ -19163,6 +19234,10 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
                 await session.commit()
 
     async with _get_user_scheduling_lock(user_id):
+        if single_flight.is_busy("telegram", user_id):
+            await message.answer(AI_BUSY_MESSAGE)
+            return
+
         if user_id not in user_message_buffers:
             user_message_buffers[user_id] = []
 
