@@ -1820,44 +1820,55 @@ async def get_ai_response(
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
 
 
-            if p_key == 'openai':
-                response_text = await _call_openai_api(
-                    p_api_key,
-                    p_model,
-                    list(request_layout.history),
-                    "",
-                    formatted_body,
-                    temperature,
-                    timeout=timeout,
-                    request_capture=capture_dict,
-                    request_layout=request_layout,
-                    activity_tracker=activity_tracker,
-                    max_completion_tokens=OPENAI_CHAT_MAX_TOKENS,
-                )
-            elif p_key in ['anthropic', 'claude']:
-                response_text = await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
-            elif p_key == 'gemini':
-                response_text = await _call_gemini_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
-            elif p_key == 'kie':
-                response_text = await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
-            elif p_key == 'deepseek':
-                response_text = await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
-            elif p_key == 'xai':
-                response_text = await _call_openai_api(
-                    p_api_key,
-                    p_model,
-                    list(request_layout.history),
-                    "",
-                    formatted_body,
-                    temperature,
-                    timeout=timeout,
-                    request_capture=capture_dict,
-                    request_layout=request_layout,
-                    activity_tracker=activity_tracker,
-                    max_completion_tokens=4096,
-                )
-            else:
-                raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
+            async def _invoke():
+                if p_key == 'openai':
+                    return await _call_openai_api(
+                        p_api_key,
+                        p_model,
+                        list(request_layout.history),
+                        "",
+                        formatted_body,
+                        temperature,
+                        timeout=timeout,
+                        request_capture=capture_dict,
+                        request_layout=request_layout,
+                        activity_tracker=activity_tracker,
+                        max_completion_tokens=OPENAI_CHAT_MAX_TOKENS,
+                    )
+                elif p_key in ['anthropic', 'claude']:
+                    return await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
+                elif p_key == 'gemini':
+                    return await _call_gemini_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
+                elif p_key == 'kie':
+                    return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
+                elif p_key == 'deepseek':
+                    return await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
+                elif p_key == 'xai':
+                    return await _call_openai_api(
+                        p_api_key,
+                        p_model,
+                        list(request_layout.history),
+                        "",
+                        formatted_body,
+                        temperature,
+                        timeout=timeout,
+                        request_capture=capture_dict,
+                        request_layout=request_layout,
+                        activity_tracker=activity_tracker,
+                        max_completion_tokens=4096,
+                    )
+                else:
+                    raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
+
+            try:
+                response_text = await asyncio.wait_for(_invoke(), timeout=timeout)
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.TimeoutError, TimeoutError) as timeout_exc:
+                err = AIServiceError(f"AI provider {p_key} timed out after {timeout}s")
+                err.classification = "timeout"
+                raise err from timeout_exc
+
             return _validate_text_response(response_text, provider=p_key)
 
         successful_log_id: int | None = None
@@ -2174,6 +2185,7 @@ async def get_ai_response(
                     if fallback_classification == "configuration"
                     else "BOTH_FAILED"
                 )
+                service_err.classification = getattr(fb_err, "classification", fallback_classification)
                 raise service_err from fb_err
 
         automation_result = None

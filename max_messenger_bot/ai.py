@@ -945,74 +945,86 @@ async def _dispatch_provider(
         else _legacy_layout(messages, request_layout)
     )
 
-    if provider == "openai":
-        if not ai_config.openai_api_key:
-            raise AIServiceError("OpenAI API key не задан")
-        result = await _call_openai(
-            ai_config.openai_api_key,
-            ai_config.openai_model,
-            [],
-            temperature,
-            request_layout=layout,
-            request_capture=request_capture,
-            activity_tracker=activity_tracker,
-        )
-    elif provider in {"claude", "anthropic"}:
-        claude_key = getattr(ai_config, "claude_api_key", None) or getattr(ai_config, "anthropic_api_key", None)
-        if not claude_key:
-            raise AIServiceError("Claude API key не задан")
-        result = await _call_claude(
-            claude_key,
-            ai_config.claude_model,
-            [],
-            layout.stable_system_prompt,
-            temperature,
-            request_layout=layout,
-            request_capture=request_capture,
-            activity_tracker=activity_tracker,
-        )
-    elif provider == "gemini":
-        if not ai_config.gemini_api_key:
-            raise AIServiceError("Gemini API key не задан")
-        result = await _call_gemini(
-            ai_config.gemini_api_key,
-            ai_config.gemini_model,
-            [],
-            layout.stable_system_prompt,
-            temperature,
-            request_layout=layout,
-            request_capture=request_capture,
-            activity_tracker=activity_tracker,
-        )
-    elif provider == "deepseek":
-        if not ai_config.deepseek_api_key:
-            raise AIServiceError("DeepSeek API key не задан")
-        result = await _call_deepseek(
-            ai_config.deepseek_api_key,
-            ai_config.deepseek_model,
-            [],
-            temperature,
-            request_layout=layout,
-            request_capture=request_capture,
-            activity_tracker=activity_tracker,
-        )
-    elif provider == "kie":
-        if not ai_config.kie_api_key:
-            raise AIServiceError("KIE API key не задан")
-        base_url = _get_kie_base_url(ai_config)
-        result = await _call_kie_text_chat(
-            ai_config.kie_api_key,
-            base_url,
-            ai_config.kie_model or "gemini-3-flash",
-            [],
-            layout.stable_system_prompt,
-            temperature,
-            request_layout=layout,
-            request_capture=request_capture,
-            activity_tracker=activity_tracker,
-        )
-    else:
-        raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
+    timeout = float(getattr(ai_config, "fallback_timeout", 60) or 60.0)
+
+    async def _invoke():
+        if provider == "openai":
+            if not ai_config.openai_api_key:
+                raise AIServiceError("OpenAI API key не задан")
+            return await _call_openai(
+                ai_config.openai_api_key,
+                ai_config.openai_model,
+                [],
+                temperature,
+                request_layout=layout,
+                request_capture=request_capture,
+                activity_tracker=activity_tracker,
+            )
+        elif provider in {"claude", "anthropic"}:
+            claude_key = getattr(ai_config, "claude_api_key", None) or getattr(ai_config, "anthropic_api_key", None)
+            if not claude_key:
+                raise AIServiceError("Claude API key не задан")
+            return await _call_claude(
+                claude_key,
+                ai_config.claude_model,
+                [],
+                layout.stable_system_prompt,
+                temperature,
+                request_layout=layout,
+                request_capture=request_capture,
+                activity_tracker=activity_tracker,
+            )
+        elif provider == "gemini":
+            if not ai_config.gemini_api_key:
+                raise AIServiceError("Gemini API key не задан")
+            return await _call_gemini(
+                ai_config.gemini_api_key,
+                ai_config.gemini_model,
+                [],
+                layout.stable_system_prompt,
+                temperature,
+                request_layout=layout,
+                request_capture=request_capture,
+                activity_tracker=activity_tracker,
+            )
+        elif provider == "deepseek":
+            if not ai_config.deepseek_api_key:
+                raise AIServiceError("DeepSeek API key не задан")
+            return await _call_deepseek(
+                ai_config.deepseek_api_key,
+                ai_config.deepseek_model,
+                [],
+                temperature,
+                request_layout=layout,
+                request_capture=request_capture,
+                activity_tracker=activity_tracker,
+            )
+        elif provider == "kie":
+            if not ai_config.kie_api_key:
+                raise AIServiceError("KIE API key не задан")
+            base_url = _get_kie_base_url(ai_config)
+            return await _call_kie_text_chat(
+                ai_config.kie_api_key,
+                base_url,
+                ai_config.kie_model or "gemini-3-flash",
+                [],
+                layout.stable_system_prompt,
+                temperature,
+                request_layout=layout,
+                request_capture=request_capture,
+                activity_tracker=activity_tracker,
+            )
+        else:
+            raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
+
+    try:
+        result = await asyncio.wait_for(_invoke(), timeout=timeout)
+    except asyncio.CancelledError:
+        raise
+    except (asyncio.TimeoutError, TimeoutError) as timeout_exc:
+        err = AIServiceError(f"AI provider {provider} timed out after {timeout}s")
+        err.classification = "timeout"
+        raise err from timeout_exc
     return _validate_text_response(result, provider=provider)
 
 
@@ -1258,37 +1270,39 @@ async def get_ai_response(
                 if fb_api_key:
                     log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
                     fb_start = time.monotonic()
-                    try:
+                    fb_timeout = float(getattr(ai_config, "fallback_timeout", 60) or 60.0)
+
+                    async def _invoke_fb():
                         if fb_key == "openai":
-                            result = await _call_openai(
+                            return await _call_openai(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         elif fb_key in {"claude", "anthropic"}:
-                            result = await _call_claude(
+                            return await _call_claude(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         elif fb_key == "gemini":
-                            result = await _call_gemini(
+                            return await _call_gemini(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         elif fb_key == "deepseek":
-                            result = await _call_deepseek(
+                            return await _call_deepseek(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                             )
                         elif fb_key == "kie":
-                            result = await _call_kie_text_chat(
+                            return await _call_kie_text_chat(
                                 fb_api_key, _get_kie_base_url(ai_config), fb_model, [],
                                 stable_system_prompt, temperature,
                                 request_layout=request_layout,
@@ -1297,6 +1311,17 @@ async def get_ai_response(
                             )
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
+
+                    try:
+                        try:
+                            result = await asyncio.wait_for(_invoke_fb(), timeout=fb_timeout)
+                        except asyncio.CancelledError:
+                            raise
+                        except (asyncio.TimeoutError, TimeoutError) as timeout_exc:
+                            err = AIServiceError(f"Fallback AI provider {fb_provider} timed out after {fb_timeout}s")
+                            err.classification = "timeout"
+                            raise err from timeout_exc
+
                         result = _validate_text_response(result, provider=fb_key)
                         fb_latency = int((time.monotonic() - fb_start) * 1000)
                         actual_provider, actual_model = _extract_effective_provider_and_model(
@@ -1382,6 +1407,7 @@ async def get_ai_response(
                             f"Основной провайдер ({ai_config.provider}) и резервный ({fb_provider}) недоступны"
                         )
                         service_err.ai_log_ids = ai_log_ids
+                        service_err.classification = getattr(fb_err, "classification", fb_err_meta["error_classification"])
                         raise service_err from fb_err
 
             if not fallback_succeeded:
