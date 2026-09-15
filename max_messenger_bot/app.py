@@ -1975,6 +1975,23 @@ class MaxBotApplication:
                     return
                 await admin_ai_service.save_fallback_model(self.client, chat_id, provider, model_name)
                 return
+            if data == "admin_ai_toggle_vision_fallback":
+                await admin_ai_service.toggle_vision_fallback(self.client, chat_id)
+                return
+            if data == "admin_ai_vision_fallback_models":
+                await admin_ai_service.show_vision_fallback_models(self.client, chat_id)
+                return
+            if data.startswith("admin_ai_set_vision_fallback_provider_"):
+                await admin_ai_service.set_vision_fallback_provider(self.client, chat_id, data.replace("admin_ai_set_vision_fallback_provider_", "", 1))
+                return
+            if data.startswith("admin_ai_save_vision_fallback_"):
+                payload = data.replace("admin_ai_save_vision_fallback_", "", 1)
+                provider, separator, model_name = payload.partition("_")
+                if not separator:
+                    await self.client.send_message(chat_id=chat_id, text="Недопустимая модель. Настройки не изменены.")
+                    return
+                await admin_ai_service.save_vision_fallback_model(self.client, chat_id, provider, model_name)
+                return
             if data == "admin_ai_set_kie_threshold":
                 await admin_ai_service.start_set_kie_threshold(self.client, self.states, chat_id, user_id)
                 return

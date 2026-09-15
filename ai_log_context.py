@@ -107,6 +107,30 @@ async def record_ai_attempt_log(
         except Exception:
             diag_str = str(diagnostics)
 
+    if isinstance(error_classification, (tuple, list)):
+        error_classification = str(error_classification[0]) if error_classification else None
+    elif error_classification is not None and not isinstance(error_classification, str):
+        error_classification = str(error_classification)
+
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        finish_reason = str(finish_reason)
+
+    req_type_norm = (request_type or "chat").strip().lower()
+    if req_type_norm == "vision":
+        from vision_reliability import sanitize_vision_text
+        if payload_str:
+            payload_str = sanitize_vision_text(payload_str)
+        if resp_str:
+            resp_str = sanitize_vision_text(resp_str)
+        if err_msg_str:
+            err_msg_str = sanitize_vision_text(err_msg_str)
+        if diag_str:
+            diag_str = sanitize_vision_text(diag_str)
+        if raw_response:
+            raw_response = sanitize_vision_text(raw_response)
+        if clean_text:
+            clean_text = sanitize_vision_text(clean_text)
+
     ai_log = AILog(
         user_id=user_id,
         request_type=(request_type or "chat").strip().lower(),

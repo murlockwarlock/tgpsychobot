@@ -359,9 +359,10 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await handlers.handle_photo_message(mock_msg, state=None, bot=mock_bot)
 
         async with self.sessions() as session:
-            # Neither AILog nor AutomationConversationState committed
+            # In A3, attempt row is recorded in isolated audit session and survives
             logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001))).all()
-            self.assertEqual(len(logs), 0)
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0].status, "success")
 
             conv_state = await automation_engine.get_conversation_automation_state(
                 session, user_id=7001, dialogue_id=1, topic_id=1
@@ -644,11 +645,14 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gemini-2.5-flash", attempt_models)
 
         async with self.sessions() as session:
-            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001))).all()
-            self.assertEqual(len(logs), 1)
-            ai_log = logs[0]
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001).order_by(AILog.attempt_no))).all()
+            self.assertEqual(len(logs), 2)
+            self.assertEqual(logs[0].model, "gemini-3-flash")
+            self.assertEqual(logs[0].status, "error")
+            ai_log = logs[1]
             self.assertEqual(ai_log.provider, "KIE")
             self.assertEqual(ai_log.model, "gemini-2.5-flash")
+            self.assertEqual(ai_log.status, "success")
             captured = json.loads(ai_log.request_payload)
             self.assertEqual(captured["provider"], "KIE")
             self.assertEqual(captured["payload"]["model"], "gemini-2.5-flash")

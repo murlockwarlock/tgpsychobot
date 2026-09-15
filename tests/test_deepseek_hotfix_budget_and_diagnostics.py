@@ -769,9 +769,9 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 image_bytes=b"fake_image_bytes",
                 prompt="Describe",
             )
-        self.assertEqual(openai_vision_captured[0]["max_completion_tokens"], 4096)
+        self.assertEqual(openai_vision_captured[0]["max_completion_tokens"], 16384)
 
-        # 2. Telegram Claude Vision: max_tokens == 4096
+        # 2. Telegram Claude Vision: max_tokens == 16384
         claude_vision_captured = []
         mock_v_claude_client = AsyncMock()
         mock_v_msg = MagicMock()
@@ -790,9 +790,9 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 image_bytes=b"fake_image_bytes",
                 prompt="Describe",
             )
-        self.assertEqual(claude_vision_captured[0]["max_tokens"], 4096)
+        self.assertEqual(claude_vision_captured[0]["max_tokens"], 16384)
 
-        # 3. Telegram Gemini Vision: generationConfig.maxOutputTokens == 4096
+        # 3. Telegram Gemini Vision: generationConfig.maxOutputTokens == 16384
         gemini_vision_captured = []
         class FakeGeminiVisionResponse:
             status_code = 200
@@ -813,7 +813,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 image_bytes=b"fake_image_bytes",
                 prompt="Describe",
             )
-        self.assertEqual(gemini_vision_captured[0]["json"]["generationConfig"]["maxOutputTokens"], 4096)
+        self.assertEqual(gemini_vision_captured[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
         self.assertNotIn("extra_body", gemini_vision_captured[0]["json"])
 
     # -------------------------------------------------------------------------

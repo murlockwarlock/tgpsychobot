@@ -311,6 +311,7 @@ _SELECTABLE_MODEL_CATALOGS = {
     "chat": SELECTABLE_CHAT_MODELS,
     "fallback": SELECTABLE_FALLBACK_MODELS,
     "vision": SELECTABLE_VISION_MODELS,
+    "vision_fallback": SELECTABLE_VISION_MODELS,
     "image_gen": SELECTABLE_IMAGE_GEN_MODELS,
     "image_generation": SELECTABLE_IMAGE_GEN_MODELS,
     "image_edit": SELECTABLE_IMAGE_EDIT_MODELS,
@@ -319,6 +320,7 @@ _SELECTABLE_MODEL_CATALOGS = {
 
 _CAPABILITY_CHANNELS = frozenset({
     "vision",
+    "vision_fallback",
     "image_gen",
     "image_generation",
     "image_edit",
@@ -332,6 +334,7 @@ _TELEGRAM_MODEL_CALLBACK_CHANNEL_CODES = {
     "chat": "c",
     "fallback": "f",
     "vision": "v",
+    "vision_fallback": "w",
     "image_gen": "g",
     "image_edit": "e",
     "transcription": "t",
@@ -616,3 +619,22 @@ def inspect_deepseek_response(
 
     clean_content = visible_str if visible_present else None
     return clean_content, diagnostics
+
+
+# ==========================================
+# 8. VISION TOKEN BUDGETS (SINGLE SOURCE OF TRUTH)
+# ==========================================
+
+KIE_VISION_INITIAL_MAX_TOKENS: int = 4096
+DIRECT_VISION_MAX_TOKENS: int = 16384
+
+
+def get_provider_vision_max_tokens(provider: str | None) -> int:
+    """Return max token budget for vision requests by provider."""
+    p_name = canonical_provider_name(provider)
+    if p_name == PROVIDER_KIE:
+        return KIE_VISION_INITIAL_MAX_TOKENS
+    if p_name in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI):
+        return DIRECT_VISION_MAX_TOKENS
+    raise ValueError(f"Unknown or unsupported vision provider: {provider}")
+
