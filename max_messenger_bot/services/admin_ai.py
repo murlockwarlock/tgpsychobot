@@ -129,10 +129,28 @@ async def set_provider(client: MaxApiClient, chat_id: int, provider: str) -> Non
     await show_settings(client, chat_id)
 
 
+VISION_FALLBACK_PROVIDERS = ["OpenAI", "Gemini", "Claude", "KIE"]
+
+
+def _vision_fallback_model_for_provider(config: AIConfig, provider: str | None) -> str:
+    if not provider:
+        return "—"
+    selectable = get_selectable_models(provider, channel="vision_fallback")
+    current_fb_provider = getattr(config, "vision_fallback_provider", None)
+    current_fb_model = getattr(config, "vision_fallback_model", None)
+    if current_fb_provider == provider and current_fb_model in selectable:
+        return current_fb_model
+    try:
+        return get_default_model(provider, channel="vision_fallback")
+    except Exception:
+        return "—"
+
+
 def _build_keys_keyboard(config) -> list:
     img_gen_enabled = getattr(config, 'allow_image_generation', False)
     img_edit_enabled = getattr(config, 'allow_image_edit', False)
     fallback_enabled = getattr(config, 'allow_fallback', False)
+    vision_fallback_enabled = getattr(config, 'allow_vision_fallback', False)
     memory = normalize_memory_mode(config)
     rows = [
         [callback_button(f"Deepseek: {_mask(config.deepseek_api_key)}", "admin_ai_key_Deepseek"),
@@ -150,6 +168,8 @@ def _build_keys_keyboard(config) -> list:
          callback_button(f"⏱ Лимит аудио: {config.max_voice_duration_sec}с", "admin_ai_set_audio_limit")],
         [callback_button(f"👁 Vision: {config.vision_provider}/{config.vision_model}", "admin_ai_toggle_vision"),
          callback_button("🔤 Vision модель", "admin_ai_vision_models")],
+        [callback_button(f"🔄👁 {'✅' if vision_fallback_enabled else '❌'} {_provider_model(config.vision_fallback_provider, config.vision_fallback_model or _vision_fallback_model_for_provider(config, config.vision_fallback_provider))}", "admin_ai_toggle_vision_fallback")],
+        [callback_button("🔤 Фолбэк Vision провайдер/модель", "admin_ai_vision_fallback_models")],
         [callback_button(_status_model_button("🎨 Генерация", img_gen_enabled, config.image_generation_provider, config.image_generation_model), "admin_ai_toggle_image_generation")],
         [callback_button("🔤 Модель генерации", "admin_ai_image_generation_models")],
         [callback_button(_status_model_button("✏️ Редактирование", img_edit_enabled, config.image_edit_provider, config.image_edit_model), "admin_ai_toggle_image_edit")],
@@ -171,9 +191,11 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
     img_gen_enabled = getattr(config, 'allow_image_generation', False)
     img_edit_enabled = getattr(config, 'allow_image_edit', False)
     fallback_enabled = getattr(config, 'allow_fallback', False)
+    vision_fallback_enabled = getattr(config, 'allow_vision_fallback', False)
     img_gen = _provider_model(config.image_generation_provider, config.image_generation_model)
     img_edit = _provider_model(config.image_edit_provider, config.image_edit_model)
     fallback_info = _provider_model(config.fallback_provider, config.fallback_model or _fallback_model_for_provider(config, config.fallback_provider))
+    vision_fallback_info = _provider_model(config.vision_fallback_provider, config.vision_fallback_model or _vision_fallback_model_for_provider(config, config.vision_fallback_provider))
     kie_key = config.kie_api_key
     kie_threshold = config.kie_credit_alert_threshold
     text = (
@@ -186,7 +208,8 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
         f"<b>Режим памяти:</b> {html.escape(memory_mode_label(current_memory_mode))}\n\n"
         f"🎨 <b>Генерация изображений:</b> {'✅' if img_gen_enabled else '❌'} / {html.escape(img_gen)}\n"
         f"✏️ <b>Редактирование изображений:</b> {'✅' if img_edit_enabled else '❌'} / {html.escape(img_edit)}\n"
-        f"🔄 <b>Фолбэк:</b> {'✅' if fallback_enabled else '❌'} / {html.escape(fallback_info)}\n\n"
+        f"🔄 <b>Фолбэк:</b> {'✅' if fallback_enabled else '❌'} / {html.escape(fallback_info)}\n"
+        f"🔄👁 <b>Vision фолбэк:</b> {'✅' if vision_fallback_enabled else '❌'} / {html.escape(vision_fallback_info)}\n\n"
         "Ниже доступны смена моделей, лимитов контекста и vision/audio-параметров."
     )
     await client.send_message(
@@ -643,6 +666,68 @@ async def save_fallback_model(client: MaxApiClient, chat_id: int, provider: str,
             return
         config.fallback_provider = provider
         config.fallback_model = normalized_model
+        await session.commit()
+    await show_keys(client, chat_id)
+
+
+async def toggle_vision_fallback(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        config.allow_vision_fallback = not bool(config.allow_vision_fallback)
+        await session.commit()
+    await show_keys(client, chat_id)
+
+
+async def show_vision_fallback_models(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    current_provider = config.vision_fallback_provider or ""
+    rows = [
+        [callback_button(f"{'✅ ' if p == current_provider else ''}{p}", f"admin_ai_set_vision_fallback_provider_{p}")]
+        for p in VISION_FALLBACK_PROVIDERS
+    ]
+    rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
+    await client.send_message(
+        chat_id=chat_id,
+        text="Выберите провайдер фолбэка для Vision.",
+        attachments=inline_keyboard(rows),
+    )
+
+
+async def set_vision_fallback_provider(client: MaxApiClient, chat_id: int, provider: str) -> None:
+    provider = canonical_provider_name(provider)
+    try:
+        default_model = get_default_model(provider, channel="vision_fallback")
+        normalized_model = validate_model_selection(provider, default_model, channel="vision_fallback")
+    except ModelUnavailableError:
+        await _reject_model_selection(client, chat_id)
+        return
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        config.vision_fallback_provider = provider
+        config.vision_fallback_model = normalized_model
+        await session.commit()
+        current_model = config.vision_fallback_model
+    models = list(get_selectable_models(provider, channel="vision_fallback"))
+    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_save_vision_fallback_{provider}_{m}")] for m in models]
+    rows.append([callback_button("◀️ Назад", "admin_ai_vision_fallback_models")])
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"Выберите модель фолбэка Vision для {provider}.",
+        attachments=inline_keyboard(rows),
+    )
+
+
+async def save_vision_fallback_model(client: MaxApiClient, chat_id: int, provider: str, model_name: str) -> None:
+    provider = canonical_provider_name(provider)
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        try:
+            normalized_model = validate_model_selection(provider, model_name, channel="vision_fallback")
+        except ModelUnavailableError:
+            await _reject_model_selection(client, chat_id)
+            return
+        config.vision_fallback_provider = provider
+        config.vision_fallback_model = normalized_model
         await session.commit()
     await show_keys(client, chat_id)
 

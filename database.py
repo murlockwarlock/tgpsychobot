@@ -227,6 +227,9 @@ class AIConfig(Base):
     use_proxy = Column(Boolean, default=True, nullable=False)
     fallback_timeout = Column(Integer, default=60, nullable=False)
     system_prompt_updated_at = Column(DateTime, nullable=True)
+    allow_vision_fallback = Column(Boolean, default=False, nullable=False)
+    vision_fallback_provider = Column(String, nullable=True)
+    vision_fallback_model = Column(String, nullable=True)
 
 
 
@@ -1227,6 +1230,12 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN fallback_model VARCHAR"))
             if 'allow_fallback' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_fallback BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'allow_vision_fallback' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_vision_fallback BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'vision_fallback_provider' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN vision_fallback_provider VARCHAR"))
+            if 'vision_fallback_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN vision_fallback_model VARCHAR"))
             if 'allow_image_generation' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_image_generation BOOLEAN DEFAULT FALSE NOT NULL"))
             if 'allow_image_edit' not in ai_columns:

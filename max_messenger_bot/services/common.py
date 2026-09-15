@@ -1204,6 +1204,7 @@ def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None
 async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id: int, image_bytes: bytes, caption: str) -> None:
     """Run AI vision analysis on the provided image bytes."""
     from ..ai import analyze_image
+    from vision_reliability import VisionExecutionContext
 
     log.info("AI vision requested user_id=%s chat_id=%s", user_id, chat_id)
     prompt = caption or "Опиши это изображение подробно."
@@ -1212,8 +1213,22 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Анализирую изображение...")
     thinking_message_id = extract_sent_message_id(thinking)
 
+    execution_context = VisionExecutionContext(
+        user_id=user_id,
+        chat_id=chat_id,
+        platform="max",
+        bot_name="MaxBot",
+        bot=None,
+    )
+
     try:
-        response_text = await analyze_image(user_id, image_bytes, prompt, exclude_message_id=user_msg_id)
+        response_text = await analyze_image(
+            user_id,
+            image_bytes,
+            prompt,
+            exclude_message_id=user_msg_id,
+            execution_context=execution_context,
+        )
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ при анализе изображения")
 
