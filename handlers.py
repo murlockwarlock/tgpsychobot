@@ -2343,23 +2343,26 @@ def _schedule_telegram_drain_runner_locked(
                         single_flight.release(normal_lease)
                         normal_lease = None
         finally:
-            if _drain_runner_before_cleanup_hook is not None:
-                hook_res = _drain_runner_before_cleanup_hook(user_id)
-                if asyncio.iscoroutine(hook_res):
-                    await hook_res
-            async with _get_user_scheduling_lock(user_id):
-                if user_processing_tasks.get(user_id) is this_task:
-                    user_processing_tasks.pop(user_id, None)
-                leftover_lease = user_message_buffer_leases.pop(user_id, None)
-                if leftover_lease:
-                    single_flight.release(leftover_lease)
-                has_isolated = bool(user_isolated_turn_queues.get(user_id) and len(user_isolated_turn_queues[user_id]) > 0)
-                cur_buf = user_message_buffers.get(user_id)
-                has_new_buffer = bool(cur_buf and len(cur_buf) > 0)
-                if has_isolated or has_new_buffer:
-                    active_task = user_processing_tasks.get(user_id)
-                    if not active_task or active_task.done():
-                        _schedule_telegram_drain_runner_locked(user_id, bot, state, initial_delay=0.0)
+            try:
+                if _drain_runner_before_cleanup_hook is not None:
+                    hook_res = _drain_runner_before_cleanup_hook(user_id)
+                    if asyncio.iscoroutine(hook_res):
+                        await hook_res
+            finally:
+                async with _get_user_scheduling_lock(user_id):
+                    if user_processing_tasks.get(user_id) is this_task:
+                        user_processing_tasks.pop(user_id, None)
+                    has_isolated = bool(user_isolated_turn_queues.get(user_id) and len(user_isolated_turn_queues[user_id]) > 0)
+                    cur_buf = user_message_buffers.get(user_id)
+                    has_new_buffer = bool(cur_buf and len(cur_buf) > 0)
+                    if has_isolated or has_new_buffer:
+                        active_task = user_processing_tasks.get(user_id)
+                        if not active_task or active_task.done():
+                            _schedule_telegram_drain_runner_locked(user_id, bot, state, initial_delay=0.0)
+                    else:
+                        leftover_lease = user_message_buffer_leases.pop(user_id, None)
+                        if leftover_lease:
+                            single_flight.release(leftover_lease)
 
     this_task = asyncio.create_task(drain_runner())
     user_processing_tasks[user_id] = this_task
@@ -2701,17 +2704,15 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         await callback.answer(AI_BUSY_MESSAGE, show_alert=True)
         return
 
-    accepted, button_text = await _prepare_ai_button_submission(
-        callback,
-        bot,
-        callback_data,
-        acknowledge=True,
-    )
-    if not accepted or not isinstance(button_text, str) or not button_text:
-        single_flight.release(lease)
-        return
-
     try:
+        accepted, button_text = await _prepare_ai_button_submission(
+            callback,
+            bot,
+            callback_data,
+            acknowledge=True,
+        )
+        if not accepted or not isinstance(button_text, str) or not button_text:
+            return
         user_message_buffers[user_id] = [build_ai_button_system_message(button_text, action)]
         await process_buffered_messages(
             user_id,
@@ -14935,35 +14936,33 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
         await message.answer(AI_BUSY_MESSAGE)
         return
 
-    async with async_session_maker() as session:
-        ai_config = await session.get(AIConfig, 1)
-        if not ai_config:
-            ai_config = AIConfig()
-
-        max_duration_sec = ai_config.max_voice_duration_sec
-        transcription_provider = ai_config.transcription_provider
-
-    if transcription_provider == 'None':
-        single_flight.release(lease)
-        await message.answer(
-            "Извините, но распознавание голосовых сообщений в данный момент отключено администратором.")
-        return
-
-    if message.voice.duration > max_duration_sec:
-        single_flight.release(lease)
-        max_duration_minutes = max_duration_sec / 60
-        if max_duration_minutes.is_integer():
-            minutes_str = f"{int(max_duration_minutes)}"
-        else:
-            minutes_str = f"{max_duration_minutes:.1f}"
-
-        await message.answer(
-            f"К сожалению, слишком длинное голосовое сообщение ({message.voice.duration} сек.).\n"
-            f"Попробуйте ещё раз, максимум до {minutes_str} минут(ы)."
-        )
-        return
-
     try:
+        async with async_session_maker() as session:
+            ai_config = await session.get(AIConfig, 1)
+            if not ai_config:
+                ai_config = AIConfig()
+
+            max_duration_sec = ai_config.max_voice_duration_sec
+            transcription_provider = ai_config.transcription_provider
+
+        if transcription_provider == 'None':
+            await message.answer(
+                "Извините, но распознавание голосовых сообщений в данный момент отключено администратором.")
+            return
+
+        if message.voice.duration > max_duration_sec:
+            max_duration_minutes = max_duration_sec / 60
+            if max_duration_minutes.is_integer():
+                minutes_str = f"{int(max_duration_minutes)}"
+            else:
+                minutes_str = f"{max_duration_minutes:.1f}"
+
+            await message.answer(
+                f"К сожалению, слишком длинное голосовое сообщение ({message.voice.duration} сек.).\n"
+                f"Попробуйте ещё раз, максимум до {minutes_str} минут(ы)."
+            )
+            return
+
         thinking_msg = await message.answer("🤖 Распознаю ваше голосовое сообщение...")
 
         try:
@@ -17864,30 +17863,29 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
             await callback.answer(AI_BUSY_MESSAGE, show_alert=True)
             return
 
-        await callback.answer()
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await _clear_card_spread_state(user_id)
-
-        if await _request_profile_onboarding_if_needed(
-            callback.message,
-            state,
-            user,
-            initial_prompt=payload_text,
-        ):
-            single_flight.release(lease)
-            return
-
-        mock_message = type('obj', (object,), {
-            'from_user': callback.from_user,
-            'text': payload_text,
-            'chat': callback.message.chat,
-            'answer': callback.message.answer,
-            'delete': callback.message.delete
-        })()
-
-        await callback.message.answer(html.escape(payload_text))
-
         try:
+            await callback.answer()
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await _clear_card_spread_state(user_id)
+
+            if await _request_profile_onboarding_if_needed(
+                callback.message,
+                state,
+                user,
+                initial_prompt=payload_text,
+            ):
+                return
+
+            mock_message = type('obj', (object,), {
+                'from_user': callback.from_user,
+                'text': payload_text,
+                'chat': callback.message.chat,
+                'answer': callback.message.answer,
+                'delete': callback.message.delete
+            })()
+
+            await callback.message.answer(html.escape(payload_text))
+
             await process_user_prompt(mock_message, user_id, payload_text, bot, state)
         finally:
             single_flight.release(lease)
@@ -19182,10 +19180,6 @@ async def show_referral_from_sub(callback: CallbackQuery, bot: Bot):
 async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
 
-    if single_flight.is_busy("telegram", user_id):
-        await message.answer(AI_BUSY_MESSAGE)
-        return
-
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.subscription)])
 
@@ -19233,17 +19227,30 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
                 await session.execute(stmt)
                 await session.commit()
 
+    busy = False
     async with _get_user_scheduling_lock(user_id):
-        if single_flight.is_busy("telegram", user_id):
-            await message.answer(AI_BUSY_MESSAGE)
-            return
+        lease = single_flight.try_claim("telegram", user_id)
+        if lease is None:
+            busy = True
+        else:
+            try:
+                if user_id not in user_message_buffers:
+                    user_message_buffers[user_id] = []
+                user_message_buffers[user_id].append(message.text)
+                user_message_buffer_leases[user_id] = lease
+                _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.8)
+            except BaseException:
+                user_message_buffer_leases.pop(user_id, None)
+                if user_id in user_message_buffers:
+                    user_message_buffers[user_id].pop()
+                    if not user_message_buffers[user_id]:
+                        user_message_buffers.pop(user_id, None)
+                single_flight.release(lease)
+                raise
 
-        if user_id not in user_message_buffers:
-            user_message_buffers[user_id] = []
-
-        user_message_buffers[user_id].append(message.text)
-
-        _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.8)
+    if busy:
+        await message.answer(AI_BUSY_MESSAGE)
+        return
 
 
 @router.callback_query(F.data == "admin_export_mode_start")

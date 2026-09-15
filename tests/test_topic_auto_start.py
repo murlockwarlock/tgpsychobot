@@ -93,14 +93,23 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
         handlers.user_message_buffers.clear()
+        handlers.user_message_buffer_leases.clear()
         handlers.user_isolated_turn_queues.clear()
         handlers.user_processing_tasks.clear()
         handlers.user_scheduling_locks.clear()
         handlers.user_locks.clear()
+        handlers.single_flight.clear()
 
     async def asyncTearDown(self):
         for p in reversed(self.patches):
             p.stop()
+        handlers.user_message_buffers.clear()
+        handlers.user_message_buffer_leases.clear()
+        handlers.user_isolated_turn_queues.clear()
+        handlers.user_processing_tasks.clear()
+        handlers.user_scheduling_locks.clear()
+        handlers.user_locks.clear()
+        handlers.single_flight.clear()
         await self.engine.dispose()
 
     def _make_mock_bot(self):
@@ -277,7 +286,7 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ai_prompts[1], "Вопрос после завершения раннера")
 
     async def test_telegram_drain_race_identical_message_during_provider_call(self):
-        """Ordinary user sends 'да' -> provider starts & blocks -> user sends identical 'да' -> second message is automatically processed."""
+        """Ordinary user sends 'да' -> provider starts & blocks -> user sends identical 'да' -> second message gets busy copy, single AI turn runs."""
         async with self.session_factory() as session:
             user = User(id=115, first_name="Echo", name="Echo", gender="male", age="27", accepted_disclaimer=True, current_dialogue_id=1, current_topic_id=None)
             session.add(user)
@@ -301,58 +310,67 @@ class TopicAutoStartUnitAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
             return f"Ответ {len(ai_prompts)}"
 
         with patch("handlers.ai_integration.generate_response", side_effect=fake_generate_response):
-            # 1. Ordinary Telegram user sends "да"
+            # 1. First real handle_ai_chat("да") -> claims slot -> provider starts and blocks
             msg1 = MagicMock()
             msg1.from_user = SimpleNamespace(id=115, username="echo", full_name="Echo")
             msg1.chat = SimpleNamespace(id=115)
             msg1.text = "да"
+            msg1.answer = AsyncMock()
             await handlers.handle_ai_chat(msg1, state, bot)
 
             # 2. Provider call starts and blocks AFTER first buffer has been popped
             await turn1_started.wait()
 
-            # Verify buffer 1 was popped
+            # Verify buffer 1 was popped and slot is busy
             self.assertNotIn(115, handlers.user_message_buffers)
+            self.assertTrue(handlers.single_flight.is_busy("telegram", 115))
 
-            # 3. While provider is blocked, same user sends EXACT SAME text "да"
+            # 3. While provider is blocked: second real handle_ai_chat("да")
             msg2 = MagicMock()
             msg2.from_user = SimpleNamespace(id=115, username="echo", full_name="Echo")
             msg2.chat = SimpleNamespace(id=115)
             msg2.text = "да"
+            msg2.answer = AsyncMock()
             await handlers.handle_ai_chat(msg2, state, bot)
 
-            # Verify new buffer contains ["да"]
-            self.assertEqual(handlers.user_message_buffers.get(115), ["да"])
+            # BEFORE releasing provider:
+            # -> second gets exact AI_BUSY_MESSAGE
+            # -> second is NOT in user_message_buffers.
+            msg2.answer.assert_called_once_with(handlers.AI_BUSY_MESSAGE)
+            self.assertNotIn(115, handlers.user_message_buffers)
 
             # 4. Release first provider call
             turn1_proceed.set()
 
-            # 5. Wait for all background runner processing to finish
+            # 5. Drain all background runner processing to finish
             while handlers._has_user_turn_work(115) or (115 in handlers.user_processing_tasks and not handlers.user_processing_tasks[115].done()):
                 task = handlers.user_processing_tasks.get(115)
                 if task:
                     await task
                 await asyncio.sleep(0.01)
 
-        # Assert: Exactly 2 AI turns with identical text "да"
-        self.assertEqual(ai_prompts, ["да", "да"])
+        # 6. Assert: exactly ONE AI prompt
+        self.assertEqual(ai_prompts, ["да"])
 
-        # Expected DB order: user "да", assistant "Ответ 1", user "да", assistant "Ответ 2"
+        # 7. DB: exactly 2 conversation rows: user "да", assistant "Ответ 1"
         async with self.session_factory() as session:
             msgs = (await session.execute(select(DBMessage).where(DBMessage.user_id == 115).order_by(DBMessage.id.asc()))).scalars().all()
-            self.assertEqual(len(msgs), 4)
+            self.assertEqual(len(msgs), 2)
             self.assertEqual(msgs[0].role, "user")
             self.assertEqual(msgs[0].content, "да")
             self.assertEqual(msgs[1].role, "assistant")
             self.assertEqual(msgs[1].content, "Ответ 1")
-            self.assertEqual(msgs[2].role, "user")
-            self.assertEqual(msgs[2].content, "да")
-            self.assertEqual(msgs[3].role, "assistant")
-            self.assertEqual(msgs[3].content, "Ответ 2")
 
-        # Assert no pending buffers and no active runner tasks
+        # 8. No delayed second turn.
+        # 9. No remaining:
+        #    user_message_buffers
+        #    user_message_buffer_leases
+        #    user_processing_tasks
+        #    single_flight busy slot
         self.assertNotIn(115, handlers.user_message_buffers)
+        self.assertNotIn(115, handlers.user_message_buffer_leases)
         self.assertNotIn(115, handlers.user_processing_tasks)
+        self.assertFalse(handlers.single_flight.is_busy("telegram", 115))
 
     async def test_telegram_stale_pending_topic_after_topic_switch(self):
         """TG: User selects Topic B -> disclaimer pending -> user switches to Topic C -> accept disclaimer does NOT start Topic B."""

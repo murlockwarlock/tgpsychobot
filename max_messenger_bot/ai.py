@@ -1407,6 +1407,7 @@ async def get_ai_response(
                             f"Основной провайдер ({ai_config.provider}) и резервный ({fb_provider}) недоступны"
                         )
                         service_err.ai_log_ids = ai_log_ids
+                        service_err.classification = getattr(fb_err, "classification", fb_err_meta["error_classification"])
                         raise service_err from fb_err
 
             if not fallback_succeeded:
