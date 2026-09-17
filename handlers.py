@@ -108,6 +108,8 @@ from max_messenger_bot.identity import (
     max_username,
     raw_max_user_id,
 )
+from vision_reliability import VisionExecutionContext
+
 
 
 def _display_client_id(user_id: int) -> int:
@@ -329,6 +331,9 @@ async def handle_compact_model_callback(callback: CallbackQuery):
         elif channel == "vision":
             config.vision_provider = provider
             config.vision_model = normalized_model
+        elif channel == "vision_fallback":
+            config.vision_fallback_provider = provider
+            config.vision_fallback_model = normalized_model
         elif channel == "image_gen":
             config.image_generation_provider = provider
             config.image_generation_model = normalized_model
@@ -341,8 +346,9 @@ async def handle_compact_model_callback(callback: CallbackQuery):
         await session.commit()
 
     await callback.answer(f"✅ Модель изменена на {normalized_model}")
-    if channel in {"chat", "fallback"}:
+    if channel in {"chat", "fallback", "vision_fallback"}:
         await admin_ai_keys_models(callback)
+
 
 _AI_BUTTON_CLAIMS_MAX = 2048
 _ai_button_claims: OrderedDict[tuple[int, int], None] = OrderedDict()
@@ -4383,6 +4389,11 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     fb_model = getattr(config, 'fallback_model', None) if config else None
     allow_fallback = bool(getattr(config, 'allow_fallback', False)) if config else False
     use_proxy = getattr(config, 'use_proxy', True) if config else True
+    allow_vision_fallback = bool(getattr(config, 'allow_vision_fallback', False)) if config else False
+    vision_fallback_provider = getattr(config, 'vision_fallback_provider', None) if config else None
+    vision_fallback_model = getattr(config, 'vision_fallback_model', None) if config else None
+    if vision_fallback_provider:
+        vision_fallback_model = _display_capability_model(vision_fallback_provider, vision_fallback_model, "vision_fallback")
     api_keys = {
         'Deepseek': getattr(config, 'deepseek_api_key', None) if config else None,
         'Claude': getattr(config, 'claude_api_key', None) if config else None,
@@ -4415,9 +4426,13 @@ async def admin_ai_keys_models(callback: CallbackQuery):
             allow_fallback=allow_fallback,
             use_proxy=use_proxy,
             api_keys=api_keys,
+            allow_vision_fallback=allow_vision_fallback,
+            vision_fallback_provider=vision_fallback_provider,
+            vision_fallback_model=vision_fallback_model,
         ),
         parse_mode="HTML",
     )
+
 
 
 @router.callback_query(F.data == "admin_toggle_vision")
@@ -4847,6 +4862,76 @@ async def save_fallback_model(callback: CallbackQuery):
 
     await callback.answer(f"✅ Резервная модель: {normalized_model}")
     await admin_ai_keys_models(callback)
+
+
+@router.callback_query(F.data == "admin_toggle_vision_fallback")
+async def admin_toggle_vision_fallback(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
+            return
+
+        config.allow_vision_fallback = not bool(config.allow_vision_fallback)
+        await session.commit()
+        enabled = config.allow_vision_fallback
+
+    action = "включен" if enabled else "выключен"
+    await callback.answer(f"✅ Резерв фото: {action}")
+    await admin_ai_keys_models(callback)
+
+
+@router.callback_query(F.data == "admin_change_vision_fallback_provider")
+async def admin_change_vision_fallback_provider(callback: CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    for p in [PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE]:
+        builder.button(text=p, callback_data=f"admin_set_vision_fallback_provider_{p}")
+    builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
+    builder.adjust(2)
+
+    await callback.message.edit_text("Выберите резервного провайдера для фото (Vision):", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin_set_vision_fallback_provider_"))
+async def admin_set_vision_fallback_provider(callback: CallbackQuery):
+    provider = callback.data.replace("admin_set_vision_fallback_provider_", "", 1)
+    canonical = canonical_provider_name(provider)
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
+            return
+        config.vision_fallback_provider = canonical
+        default_model = get_default_model(canonical, channel="vision_fallback")
+        config.vision_fallback_model = validate_model_selection(canonical, default_model, channel="vision_fallback")
+        await session.commit()
+
+    await callback.answer(f"✅ Резервный провайдер фото: {canonical}")
+    await admin_ai_keys_models(callback)
+
+
+@router.callback_query(F.data == "admin_change_vision_fallback_model")
+async def admin_change_vision_fallback_model(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        provider = getattr(config, 'vision_fallback_provider', None)
+
+    if not provider:
+        await callback.answer("Сначала выберите резервного провайдера фото.", show_alert=True)
+        return
+
+    models = list(get_selectable_models(provider, channel="vision_fallback"))
+    builder = InlineKeyboardBuilder()
+    for m in models:
+        builder.button(
+            text=m,
+            callback_data=build_telegram_model_callback_data(provider, "vision_fallback", m),
+        )
+    builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
+    builder.adjust(1)
+
+    await callback.message.edit_text(f"Выберите резервную модель фото для {provider}:", reply_markup=builder.as_markup())
+
 
 
 @router.message(AdminStates.set_api_key)
@@ -18634,6 +18719,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             vision_provider = getattr(ai_config, "vision_provider", "Vision") or "Vision"
             vision_model = getattr(ai_config, "vision_model", "Vision") or "Vision"
             topic_name = user.current_topic.name if user.current_topic else None
+            user_username = getattr(user, "username", None)
+            user_full_name = getattr(user, "name", None) or getattr(user, "first_name", None)
             user_ai_debug = getattr(user, "ai_debug_enabled", False)
 
         # =========================================================================
@@ -18647,6 +18734,19 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             track_user_activity=True,
         )
 
+        execution_context = VisionExecutionContext(
+            user_id=user_id,
+            username=user_username,
+            full_name=user_full_name,
+            dialogue_id=current_dialogue_id,
+            topic_id=current_topic_id,
+            topic_name=topic_name,
+            platform="telegram",
+            chat_id=message.chat.id,
+            bot_name=getattr(bot, "name", "PsychoBot") or "PsychoBot",
+            bot=bot,
+        )
+
         request_capture = {}
         started_at = time.monotonic()
         analysis_result = await ai_integration.analyze_image_content(
@@ -18656,6 +18756,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             request_capture=request_capture,
             request_layout=request_layout,
             activity_tracker=activity_tracker,
+            execution_context=execution_context,
         )
         latency_ms = int((time.monotonic() - started_at) * 1000)
 
@@ -18667,34 +18768,15 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         )
 
         # =========================================================================
-        # Transaction C: Atomic DATA + AILog persistence
+        # Transaction C: Atomic DATA persistence (AILog attempts managed by orchestrator)
         # =========================================================================
         visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
 
-        async with async_session_maker() as session:
-            user = await session.get(User, user_id)
-            if not user:
-                raise AIServiceError(f"User {user_id} not found")
-
-            ai_log = AILog(
-                user_id=user_id,
-                provider=actual_provider,
-                model=actual_model,
-                prompt_summary=vision_user_prompt,
-                request_payload=json.dumps(request_capture, ensure_ascii=False, indent=2),
-                raw_response=analysis_result,
-                clean_text=visible_text,
-                latency_ms=latency_ms,
-            )
-            apply_ai_log_context(
-                ai_log,
-                platform="telegram",
-                topic_id=current_topic_id,
-                topic_name=topic_name,
-            )
-            session.add(ai_log)
-
-            if service_blocks:
+        if service_blocks:
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                if not user:
+                    raise AIServiceError(f"User {user_id} not found")
                 try:
                     await apply_service_data_blocks(
                         session,
@@ -18706,13 +18788,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     await session.commit()
                 except Exception as exc:
                     await session.rollback()
-                    logging.exception("Failed to commit service data and AILog for user %s: %s", user_id, exc)
+                    logging.exception("Failed to commit service data for user %s: %s", user_id, exc)
                     raise AIServiceError(f"Ошибка сохранения служебных данных ИИ: {exc}") from exc
-            else:
-                try:
-                    await session.commit()
-                except Exception:
-                    logging.exception("Could not save vision AILog entry for user %s", user_id)
 
         # Process automation events after successful DATA commit
         if service_blocks:
@@ -18725,7 +18802,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         if bot is not None and user_ai_debug:
             try:
                 debug_msg = (
-                    f"🐛 <b>[AI DEBUG LOG]</b> #{ai_log.id}\n"
+                    f"🐛 <b>[AI DEBUG LOG]</b>\n"
                     f"🤖 <b>Провайдер:</b> {html.escape(actual_provider)} | <b>Модель:</b> {html.escape(actual_model)}\n"
                     f"⏱ <b>Время ответа:</b> {latency_ms / 1000:.2f} сек\n"
                     f"👤 <b>Пользователь:</b> ID {user_id}\n\n"
@@ -18735,6 +18812,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 await bot.send_message(chat_id=user_id, text=debug_msg, parse_mode="HTML")
             except Exception as exc:
                 logging.warning("Could not send live AI debug message to user %s: %s", user_id, exc)
+
 
         # Stop typing indicator
         if typing_task:
@@ -18896,16 +18974,17 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         await message.answer(
             "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
         )
-        await _report_ai_failure(
-            bot,
-            title="Сбой анализа изображения",
-            user=message.from_user,
-            provider=vision_provider,
-            model=vision_model,
-            stage="photo_handler",
-            details=str(e),
-            exception=e,
-        )
+        if not getattr(e, "admin_alert_handled", False):
+            await _report_ai_failure(
+                bot,
+                title="Сбой анализа изображения",
+                user=message.from_user,
+                provider=vision_provider,
+                model=vision_model,
+                stage="photo_handler",
+                details=str(e),
+                exception=e,
+            )
     except Exception as e:
         if typing_task:
             typing_task.cancel()

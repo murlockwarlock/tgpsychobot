@@ -270,7 +270,10 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                             fallback_provider: str | None = None, fallback_model: str | None = None,
                             allow_fallback: bool = False,
                             use_proxy: bool = True,
-                            api_keys: dict[str, str | None] | None = None):
+                            api_keys: dict[str, str | None] | None = None,
+                            allow_vision_fallback: bool = False,
+                            vision_fallback_provider: str | None = None,
+                            vision_fallback_model: str | None = None):
     def short_model(model: str, limit: int = 16) -> str:
         if len(model) <= limit:
             return model
@@ -321,6 +324,13 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                    callback_data="admin_toggle_vision")
     builder.button(text=f"Модель: {short_model(current_vision_model)}", callback_data="admin_change_vision_model")
 
+    v_fb_status = "✅ ВКЛ" if allow_vision_fallback else "❌ ВЫКЛ"
+    builder.button(text=f"🛡 Резерв фото: {v_fb_status}", callback_data="admin_toggle_vision_fallback")
+    v_fb_prov_label = f"Пров: {vision_fallback_provider}" if vision_fallback_provider else "Пров: не задан"
+    builder.button(text=v_fb_prov_label, callback_data="admin_change_vision_fallback_provider")
+    v_fb_model_label = f"Модель: {short_model(vision_fallback_model)}" if vision_fallback_model else "Модель: не задана"
+    builder.button(text=v_fb_model_label, callback_data="admin_change_vision_fallback_model")
+
     builder.button(text=f"🖼 Ген: {image_generation_provider}",
                    callback_data="admin_toggle_image_generation")
     builder.button(text=f"Модель: {short_model(image_generation_model)}", callback_data="admin_change_image_generation_model")
@@ -329,19 +339,15 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                    callback_data="admin_toggle_image_edit")
     builder.button(text=f"Модель: {short_model(image_edit_model)}", callback_data="admin_change_image_edit_model")
 
-    timeout_val = getattr(ai_config, "fallback_timeout", 60) if 'ai_config' in locals() else 60
-    # Wait, ai_config is not passed! I can't do this easily. I will just pass it to the button text?
-    # No, I can't read ai_config here.
     builder.button(text="⏱️ Таймаут ИИ", callback_data="set_ai_timeout")
-
     builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
 
     # Layout: keys 2+2+1, models 2+2+1, context 2, audio+limit 2,
-    # KIE+temp 2, mem 1, proxy 1, fallback 1 (or 1+1), vision 2, gen 2, edit 2, timeout 1, back 1
+    # KIE+temp 2, mem 1, proxy 1, fallback 1 (or 1+1), vision 2, vision_fb 1+2, gen 2, edit 2, timeout 1, back 1
     if fallback_provider:
-        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 1, 1)
+        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 1, 1, 1, 1, 2, 1, 2, 2, 2, 1, 1)
     else:
-        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 1, 1, 1, 2, 2, 2, 1, 1)
+        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 1, 1, 1, 2, 1, 2, 2, 2, 1, 1)
     return builder.as_markup()
 
 

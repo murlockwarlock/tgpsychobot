@@ -37,8 +37,10 @@ from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, get_memory_mode,
 from result_history import ai_history_role_filter, select_ai_history_messages
 from error_reporting import (
     classify_ai_error,
+    classify_external_error,
     exception_summary,
     extract_error_metadata,
+    send_ai_fallback_used_alert,
     send_output_budget_exhausted_alert,
     send_terminal_ai_failure_alert,
 )
@@ -48,18 +50,37 @@ from provider_models import (
     DEEPSEEK_CHAT_MAX_TOKENS,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     GEMINI_CHAT_MAX_TOKENS,
+    KIE_VISION_INITIAL_MAX_TOKENS,
     OPENAI_CHAT_MAX_TOKENS,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
     PROVIDER_KIE,
     PROVIDER_OPENAI,
+    ModelUnavailableError,
     ensure_model_available,
     get_default_model,
+    get_provider_vision_max_tokens,
+    get_selectable_models,
     inspect_deepseek_response,
     is_retired_model,
     normalize_deepseek_model,
     should_omit_claude_sampling,
+    validate_model_selection,
+)
+from vision_reliability import (
+    VisionDeadlineTracker,
+    VisionExecutionContext,
+    attach_error_metadata,
+    build_vision_httpx_timeout,
+    order_kie_vision_candidates,
+    resolve_effective_vision_fallback,
+    run_coro_with_timeout,
+    sanitize_vision_request_payload,
+    sanitize_vision_text,
+    should_retry_kie_vision_model,
+    should_retry_kie_vision_upload,
+    should_use_vision_provider_fallback,
 )
 from ai_request_context import (
     AIRequestLayout,
@@ -516,15 +537,34 @@ def _validate_kie_json_response(status_code: int, payload: dict, *, context: str
         else str(payload)
     )
     detail = str(raw_detail).strip() or f"HTTP {status_code} без описания"
+    try:
+        import json
+        payload_str = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
+    except Exception:
+        payload_str = str(payload)
+
     if status_code != 200:
+        code_val = payload.get("code") if isinstance(payload, dict) else None
         if is_kie_insufficient_balance(status_code, payload):
-            raise InsufficientBalanceError(f"KIE API Error: {detail}")
-        raise AIServiceError(f"{context}: status={status_code} message={detail}")
+            err = InsufficientBalanceError(f"KIE API Error: {detail}")
+        else:
+            err = AIServiceError(f"{context}: status={status_code} message={detail}")
+        err.http_status = status_code
+        err.provider_code = code_val
+        err.provider_response_payload = payload_str
+        raise err
+
     code = payload.get("code")
     if code not in (None, 200, "200"):
         if is_kie_insufficient_balance(status_code, payload):
-            raise InsufficientBalanceError(f"KIE API Error: {detail}")
-        raise AIServiceError(f"{context}: {detail}")
+            err = InsufficientBalanceError(f"KIE API Error: {detail}")
+        else:
+            err = AIServiceError(f"{context}: {detail}")
+        err.http_status = 200
+        err.provider_code = code
+        err.provider_response_payload = payload_str
+        raise err
+
     return payload.get("data") if isinstance(payload.get("data"), dict) else payload
 
 
@@ -559,15 +599,45 @@ def _extract_kie_task_result(task_payload: dict) -> dict:
     return {}
 
 
-async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: bytes, filename: str, upload_path: str) -> str:
+async def _upload_file_to_kie(
+    api_key: str,
+    upload_base_url: str,
+    file_bytes: bytes,
+    filename: str,
+    upload_path: str,
+    *,
+    timeout: float | None = None,
+    activity_tracker: ActivityTracker | None = None,
+) -> str:
     url = f"{upload_base_url}/api/file-stream-upload"
     files = {"file": (filename, file_bytes, mimetypes.guess_type(filename)[0] or "application/octet-stream")}
     form_data = {"uploadPath": upload_path, "fileName": filename}
     headers = {"Authorization": f"Bearer {api_key}"}
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before KIE upload: %s", act_err)
+    client_timeout = build_vision_httpx_timeout(timeout) if timeout is not None else 120.0
     try:
-        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=client_timeout, trust_env=False) as client:
             response = await client.post(url, headers=headers, data=form_data, files=files)
-        payload = response.json()
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+
+        if response.status_code >= 400:
+            err = AIServiceError(f"Ошибка загрузки файла в KIE (HTTP {response.status_code}): {response.text}")
+            err.http_status = response.status_code
+            if isinstance(payload, dict) and "code" in payload:
+                err.provider_code = payload.get("code")
+            err.provider_response_payload = response.text
+            from error_reporting import classify_external_error
+            code, _ = classify_external_error(err)
+            err.classification = code
+            raise err
+
         data_payload = _validate_kie_json_response(response.status_code, payload, context="KIE upload failed")
         file_url = data_payload.get("downloadUrl") or data_payload.get("fileUrl")
         if not file_url:
@@ -576,8 +646,140 @@ async def _upload_file_to_kie(api_key: str, upload_base_url: str, file_bytes: by
     except (AIServiceError, InsufficientBalanceError):
         raise
     except Exception as e:
-        logging.error("KIE upload error", exc_info=e)
+        log.error("KIE upload error: %s", e)
         raise AIServiceError(f"Ошибка загрузки файла в KIE: {exception_summary(e)}") from e
+
+
+async def _call_kie_vision_inference(
+    api_key: str,
+    base_url: str,
+    model: str,
+    file_url: str,
+    system_prompt: str,
+    prompt: str,
+    temperature: float = 0.7,
+    *,
+    request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
+    timeout: float = 25.0,
+    request_capture: dict | None = None,
+) -> str:
+    target_model = (model or "").strip()
+    ensure_model_available(PROVIDER_KIE, target_model, channel="vision")
+    layout = request_layout or AIRequestLayout(
+        stable_system_prompt=neutralize_stable_prompt(system_prompt),
+        history=normalize_request_messages(()),
+    )
+    layout = layout.with_current_user_content([
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": file_url}},
+    ])
+    payload = {
+        "model": target_model,
+        "messages": build_openai_chat_messages(layout),
+        "max_tokens": KIE_VISION_INITIAL_MAX_TOKENS,
+        "temperature": temperature,
+        "stream": False,
+    }
+    endpoint = f"{_kie_model_base_url(base_url, target_model)}/chat/completions"
+    _capture_ai_request(request_capture, provider="KIE", endpoint=endpoint, payload=payload)
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception as act_err:
+            log.warning("Failed to mark activity before outbound call: %s", act_err)
+    httpx_timeout = build_vision_httpx_timeout(timeout)
+    async with httpx.AsyncClient(timeout=httpx_timeout, trust_env=False) as client:
+        response = await client.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+        )
+
+    try:
+        resp_json = response.json()
+    except Exception:
+        resp_json = {}
+
+    if response.status_code >= 400:
+        err = AIServiceError(f"KIE multimodal API error (HTTP {response.status_code}): {response.text}")
+        err.http_status = response.status_code
+        if isinstance(resp_json, dict) and "code" in resp_json:
+            err.provider_code = resp_json.get("code")
+        err.provider_response_payload = response.text
+        raise err
+
+    response_payload = _validate_kie_json_response(
+        response.status_code, resp_json,
+        context="Ошибка обращения к KIE multimodal API",
+    )
+
+    choices = response_payload.get("choices") if isinstance(response_payload, dict) else []
+    first_choice = choices[0] if (choices and isinstance(choices, list)) else {}
+    finish_reason = first_choice.get("finish_reason") if isinstance(first_choice, dict) else None
+    usage_data = response_payload.get("usage") if isinstance(response_payload, dict) else None
+    provider_code_val = resp_json.get("code") if isinstance(resp_json, dict) else None
+
+    safe_resp_payload = None
+    try:
+        import json
+        safe_resp_payload = json.dumps(response_payload, ensure_ascii=False) if isinstance(response_payload, dict) else str(response_payload)
+    except Exception:
+        safe_resp_payload = None
+
+    if request_capture is not None:
+        request_capture["http_status"] = response.status_code
+        request_capture["finish_reason"] = finish_reason
+        if usage_data is not None:
+            request_capture["usage"] = usage_data
+        if provider_code_val is not None:
+            request_capture["provider_code"] = provider_code_val
+        if safe_resp_payload is not None:
+            request_capture["provider_response_payload"] = safe_resp_payload
+
+    diag_meta = {"usage": usage_data, "provider_code": provider_code_val} if (usage_data or provider_code_val) else None
+
+    if not choices or not isinstance(choices, list):
+        raise attach_error_metadata(
+            AIResponseError("KIE multimodal request returned empty choices"),
+            classification="empty_response",
+            http_status=response.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if finish_reason in {"content_filter", "safety"}:
+        raise attach_error_metadata(
+            AIServiceError("KIE vision response rejected by safety filter"),
+            classification="provider_rejection",
+            finish_reason=finish_reason,
+            http_status=response.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if finish_reason == "length":
+        raise attach_error_metadata(
+            AIResponseError("KIE vision response exceeded token budget"),
+            classification="output_budget_exhausted",
+            finish_reason="length",
+            http_status=response.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    text = _extract_kie_chat_text(response_payload)
+    if not text or not text.strip():
+        raise attach_error_metadata(
+            AIResponseError("KIE multimodal request returned empty content"),
+            classification="empty_response",
+            finish_reason=finish_reason,
+            http_status=response.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+    return text
 
 
 async def _create_kie_task(api_key: str, base_url: str, model: str, input_payload: dict) -> str:
@@ -771,30 +973,29 @@ async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, mod
         raise AIServiceError(f"Ошибка при транскрибации (KIE API): {exception_summary(e)}") from e
 
 
-async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, *, activity_tracker: ActivityTracker | None = None) -> str:
+async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float = 0.7, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, *, activity_tracker: ActivityTracker | None = None, timeout: float = 25.0) -> str:
     ensure_model_available(PROVIDER_KIE, model, channel="vision")
     try:
         file_url = await _upload_file_to_kie(
             api_key, upload_base_url, image_bytes,
             _guess_filename(image_bytes, "vision_input", "jpg"), "images",
+            timeout=timeout,
+            activity_tracker=activity_tracker,
         )
         layout = request_layout or AIRequestLayout(
             stable_system_prompt=system_prompt,
             shared_instructions=shared_instructions,
             history=normalize_request_messages(history),
         )
-        layout = layout.with_current_user_content([
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": file_url}},
-            ])
-        return await _call_kie_multimodal(
+        return await _call_kie_vision_inference(
             api_key, base_url, model,
+            file_url,
             system_prompt,
-            layout.current_user_content,
+            prompt,
             temperature=temperature,
-            channel="vision",
             request_layout=layout,
             activity_tracker=activity_tracker,
+            timeout=timeout,
         )
     except (InsufficientBalanceError, AIServiceError):
         raise
@@ -1629,9 +1830,20 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
 # Image Analysis (Vision)
 # ---------------------------------------------------------------------------
 
-async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
-    import httpx
-
+async def _analyze_gemini(
+    api_key: str,
+    model: str,
+    image_bytes: bytes,
+    system_prompt: str,
+    prompt: str,
+    temperature: float,
+    history: list = None,
+    shared_instructions: tuple[str, ...] = (),
+    request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
+    timeout: float = 25.0,
+    request_capture: dict | None = None,
+) -> str:
     b64_data = base64.b64encode(image_bytes).decode()
     target_model = model or "gemini-3.7-flash"
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="vision")
@@ -1643,11 +1855,11 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
         history=normalize_request_messages(history),
     )
     layout = layout.with_current_user_content([
-            {"text": prompt},
-            {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
-        ])
+        {"text": prompt},
+        {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
+    ])
     contents = build_gemini_contents(layout)
-    generation_config: dict = {"maxOutputTokens": 4096}
+    generation_config: dict = {"maxOutputTokens": get_provider_vision_max_tokens(PROVIDER_GEMINI)}
     if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
         generation_config["temperature"] = temperature
 
@@ -1658,65 +1870,273 @@ async def _analyze_gemini(api_key: str, model: str, image_bytes: bytes, system_p
         },
         "generationConfig": generation_config,
     }
+    _capture_ai_request(request_capture, provider="Gemini", endpoint=url, payload=payload)
     if activity_tracker is not None:
         try:
             await activity_tracker.mark_outbound_attempt_once()
         except Exception as act_err:
             log.warning("Failed to mark activity before outbound call: %s", act_err)
-    async with httpx.AsyncClient(timeout=60.0, transport=_build_gemini_proxy_transport()) as http:
+    httpx_timeout = build_vision_httpx_timeout(timeout)
+    async with httpx.AsyncClient(timeout=httpx_timeout, transport=_build_gemini_proxy_transport()) as http:
         resp = await http.post(url, json=payload, headers={"Content-Type": "application/json"})
         resp.raise_for_status()
         data = resp.json()
+
     candidates = data.get("candidates", [])
+    cand = candidates[0] if candidates else {}
+    finish_reason = cand.get("finishReason")
+    usage_meta = data.get("usageMetadata")
+
+    safe_resp_payload = None
+    try:
+        import json
+        safe_resp_payload = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        safe_resp_payload = None
+
+    if request_capture is not None:
+        request_capture["http_status"] = resp.status_code
+        request_capture["finish_reason"] = finish_reason
+        if usage_meta:
+            request_capture["usage"] = usage_meta
+        if safe_resp_payload is not None:
+            request_capture["provider_response_payload"] = safe_resp_payload
+
+    diag_meta = {"usage": usage_meta} if usage_meta else None
+
     if not candidates:
-        raise AIServiceError("Gemini vision returned empty candidates")
-    return candidates[0]["content"]["parts"][0]["text"]
+        prompt_feedback = data.get("promptFeedback", {})
+        block_reason = prompt_feedback.get("blockReason")
+        if block_reason:
+            raise attach_error_metadata(
+                AIServiceError(f"Gemini vision blocked prompt: {block_reason}"),
+                classification="provider_rejection",
+                finish_reason=block_reason,
+                http_status=resp.status_code,
+                diagnostics=diag_meta,
+                provider_response_payload=safe_resp_payload,
+            )
+        raise attach_error_metadata(
+            AIResponseError("Gemini vision returned empty candidates"),
+            classification="empty_response",
+            http_status=resp.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if finish_reason in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"}:
+        raise attach_error_metadata(
+            AIServiceError(f"Gemini vision response rejected: {finish_reason}"),
+            classification="provider_rejection",
+            finish_reason=finish_reason,
+            http_status=resp.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if finish_reason == "MAX_TOKENS":
+        raise attach_error_metadata(
+            AIResponseError("Gemini vision response exceeded token budget"),
+            classification="output_budget_exhausted",
+            finish_reason="MAX_TOKENS",
+            http_status=resp.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    parts = cand.get("content", {}).get("parts", [])
+    if not parts or not parts[0].get("text"):
+        raise attach_error_metadata(
+            AIResponseError("Gemini vision returned empty text"),
+            classification="empty_response",
+            finish_reason=finish_reason,
+            http_status=resp.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+    text = parts[0]["text"]
+    if "Ошибка: Не удалось получить текст из ответа Gemini Vision." in text:
+        raise attach_error_metadata(
+            AIResponseError("Gemini vision returned internal fallback text"),
+            classification="empty_response",
+            finish_reason=finish_reason,
+            http_status=resp.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+    if not text.strip():
+        raise attach_error_metadata(
+            AIResponseError("Gemini vision returned whitespace text"),
+            classification="empty_response",
+            finish_reason=finish_reason,
+            http_status=resp.status_code,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+    return text
 
 
-async def _analyze_openai(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
+async def _analyze_openai(
+    api_key: str,
+    model: str,
+    image_bytes: bytes,
+    system_prompt: str,
+    prompt: str,
+    temperature: float,
+    history: list = None,
+    shared_instructions: tuple[str, ...] = (),
+    request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
+    timeout: float = 25.0,
+    request_capture: dict | None = None,
+) -> str:
     target_model = model or "gpt-5.6-terra"
     ensure_model_available(PROVIDER_OPENAI, target_model, channel="vision")
     b64_data = base64.b64encode(image_bytes).decode()
-    client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1"))
+    base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        max_retries=0,
+        timeout=timeout,
+    )
     layout = request_layout or AIRequestLayout(
         stable_system_prompt=system_prompt,
         shared_instructions=shared_instructions,
         history=normalize_request_messages(history),
     )
     layout = layout.with_current_user_content([
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
-        ])
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
+    ])
     payload: dict = {
         "model": target_model,
         "messages": build_openai_chat_messages(layout),
-        "max_completion_tokens": 4096,
+        "max_completion_tokens": get_provider_vision_max_tokens(PROVIDER_OPENAI),
     }
     if not target_model.startswith("gpt-5.6"):
         payload["temperature"] = temperature
+    _capture_ai_request(request_capture, provider="OpenAI", endpoint=f"{base_url.rstrip('/')}/chat/completions", payload=payload)
     if activity_tracker is not None:
         try:
             await activity_tracker.mark_outbound_attempt_once()
         except Exception as act_err:
             log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.chat.completions.create(**payload)
-    return response.choices[0].message.content or ""
+
+    choices = getattr(response, "choices", None)
+    choice = choices[0] if choices else None
+    finish_reason = getattr(choice, "finish_reason", None) if choice else None
+    msg = getattr(choice, "message", None) if choice else None
+    refusal = getattr(msg, "refusal", None) if msg else None
+    content = (getattr(msg, "content", "") or "") if msg else ""
+
+    usage_dict = None
+    usage_obj = getattr(response, "usage", None)
+    if usage_obj is not None:
+        try:
+            usage_dict = usage_obj.model_dump()
+        except Exception:
+            usage_dict = getattr(usage_obj, "__dict__", str(usage_obj))
+
+    safe_resp_payload = None
+    try:
+        import json
+        safe_resp = {
+            "id": getattr(response, "id", None),
+            "model": getattr(response, "model", None),
+            "choices": [{"finish_reason": finish_reason, "message": {"content": content}}],
+            "usage": usage_dict,
+        }
+        safe_resp_payload = json.dumps(safe_resp, ensure_ascii=False)
+    except Exception:
+        safe_resp_payload = None
+
+    if request_capture is not None:
+        request_capture["http_status"] = 200
+        request_capture["finish_reason"] = finish_reason
+        if usage_dict is not None:
+            request_capture["usage"] = usage_dict
+        if safe_resp_payload is not None:
+            request_capture["provider_response_payload"] = safe_resp_payload
+
+    diag_meta = {"usage": usage_dict} if usage_dict else None
+
+    if not choices:
+        raise attach_error_metadata(
+            AIResponseError("OpenAI vision returned empty choices"),
+            classification="empty_response",
+            http_status=200,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    has_refusal = isinstance(refusal, str) and bool(refusal.strip())
+    is_content_filter = (finish_reason == "content_filter")
+    if has_refusal or is_content_filter:
+        rejection_detail = refusal if has_refusal else finish_reason
+        raise attach_error_metadata(
+            AIServiceError(f"OpenAI vision response blocked: {rejection_detail}"),
+            classification="provider_rejection",
+            finish_reason="content_filter" if is_content_filter else "refusal",
+            http_status=200,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if finish_reason == "length":
+        raise attach_error_metadata(
+            AIResponseError("OpenAI vision response exceeded token budget"),
+            classification="output_budget_exhausted",
+            finish_reason="length",
+            http_status=200,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if not content or not content.strip():
+        raise attach_error_metadata(
+            AIResponseError("OpenAI vision returned empty or whitespace text"),
+            classification="empty_response",
+            finish_reason=str(finish_reason) if finish_reason else None,
+            http_status=200,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+    return content
 
 
-async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_prompt: str, prompt: str, temperature: float, history: list = None, shared_instructions: tuple[str, ...] = (), request_layout: AIRequestLayout | None = None, activity_tracker: ActivityTracker | None = None) -> str:
+async def _analyze_claude(
+    api_key: str,
+    model: str,
+    image_bytes: bytes,
+    system_prompt: str,
+    prompt: str,
+    temperature: float,
+    history: list = None,
+    shared_instructions: tuple[str, ...] = (),
+    request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
+    timeout: float = 25.0,
+    request_capture: dict | None = None,
+) -> str:
     target_model = model or "claude-sonnet-5"
     ensure_model_available(PROVIDER_CLAUDE, target_model, channel="vision")
     b64_data = base64.b64encode(image_bytes).decode()
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    client = anthropic.AsyncAnthropic(
+        api_key=api_key,
+        max_retries=0,
+        timeout=timeout,
+    )
     layout = request_layout or AIRequestLayout(
         stable_system_prompt=system_prompt,
         shared_instructions=shared_instructions,
         history=normalize_request_messages(history),
     )
     layout = layout.with_current_user_content([
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_data}},
-            {"type": "text", "text": prompt},
-        ])
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_data}},
+        {"type": "text", "text": prompt},
+    ])
     claude_messages = [
         {"role": message.role, "content": message.content}
         for message in layout.history
@@ -1724,19 +2144,95 @@ async def _analyze_claude(api_key: str, model: str, image_bytes: bytes, system_p
     claude_messages.append({"role": "user", "content": layout.current_user_content})
     payload: dict = {
         "model": target_model,
-        "max_tokens": 4096,
+        "max_tokens": get_provider_vision_max_tokens(PROVIDER_CLAUDE),
         "system": build_anthropic_system(layout),
         "messages": claude_messages,
     }
     if not should_omit_claude_sampling(target_model):
         payload["temperature"] = temperature
+    _capture_ai_request(request_capture, provider="Claude", endpoint="https://api.anthropic.com/v1/messages", payload=payload)
     if activity_tracker is not None:
         try:
             await activity_tracker.mark_outbound_attempt_once()
         except Exception as act_err:
             log.warning("Failed to mark activity before outbound call: %s", act_err)
     response = await client.messages.create(**payload)
-    return response.content[0].text
+
+    stop_reason = getattr(response, "stop_reason", None)
+    usage_dict = None
+    usage_obj = getattr(response, "usage", None)
+    if usage_obj is not None:
+        try:
+            usage_dict = usage_obj.model_dump()
+        except Exception:
+            usage_dict = getattr(usage_obj, "__dict__", str(usage_obj))
+
+    first_block = response.content[0] if getattr(response, "content", None) else None
+    content = (getattr(first_block, "text", "") or "") if first_block else ""
+
+    safe_resp_payload = None
+    try:
+        import json
+        safe_resp = {
+            "id": getattr(response, "id", None),
+            "model": getattr(response, "model", None),
+            "stop_reason": stop_reason,
+            "usage": usage_dict,
+            "content": [{"type": "text", "text": content}] if content else [],
+        }
+        safe_resp_payload = json.dumps(safe_resp, ensure_ascii=False)
+    except Exception:
+        safe_resp_payload = None
+
+    if request_capture is not None:
+        request_capture["http_status"] = 200
+        request_capture["finish_reason"] = stop_reason
+        if usage_dict is not None:
+            request_capture["usage"] = usage_dict
+        if safe_resp_payload is not None:
+            request_capture["provider_response_payload"] = safe_resp_payload
+
+    diag_meta = {"usage": usage_dict} if usage_dict else None
+
+    if not response or not getattr(response, "content", None):
+        raise attach_error_metadata(
+            AIResponseError("Claude vision returned empty content"),
+            classification="empty_response",
+            http_status=200,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if stop_reason in {"refusal", "safety"}:
+        raise attach_error_metadata(
+            AIServiceError("Claude vision request refused by model"),
+            classification="provider_rejection",
+            finish_reason=stop_reason,
+            http_status=200,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if stop_reason == "max_tokens":
+        raise attach_error_metadata(
+            AIResponseError("Claude vision response exceeded token budget"),
+            classification="output_budget_exhausted",
+            finish_reason="max_tokens",
+            http_status=200,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+
+    if not content or not content.strip():
+        raise attach_error_metadata(
+            AIResponseError("Claude vision returned empty or whitespace text"),
+            classification="empty_response",
+            finish_reason=str(stop_reason) if stop_reason else None,
+            http_status=200,
+            diagnostics=diag_meta,
+            provider_response_payload=safe_resp_payload,
+        )
+    return content
 
 
 async def analyze_image(
@@ -1746,6 +2242,7 @@ async def analyze_image(
     *,
     activity_tracker: ActivityTracker | None = None,
     exclude_message_id: int | None = None,
+    execution_context: VisionExecutionContext | None = None,
 ) -> str:
     """Analyze image with the configured vision provider."""
     async with async_session_maker() as session:
@@ -1763,8 +2260,39 @@ async def analyze_image(
         if not getattr(config, "vision_provider", None) or config.vision_provider == "None":
             raise AIServiceError("Обработка изображений отключена администратором")
 
-        provider = (config.vision_provider or "Gemini").strip()
-        temperature = _resolve_temperature(config)
+        primary_provider = (config.vision_provider or "Gemini").strip()
+        if primary_provider not in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE):
+            err = AIServiceError(f"Неподдерживаемый провайдер для vision: {primary_provider}")
+            err.classification = "configuration"
+            raise err
+
+        configured_model = getattr(config, "vision_model", None)
+        if configured_model and is_retired_model(configured_model):
+            primary_model = get_default_model(primary_provider, channel="vision")
+        else:
+            primary_model = configured_model or get_default_model(primary_provider, channel="vision")
+
+        try:
+            ensure_model_available(primary_provider, primary_model, channel="vision")
+        except Exception as exc:
+            err = AIServiceError(f"Недопустимая модель vision {configured_model} для {primary_provider}: {exc}")
+            err.classification = "configuration"
+            raise err from exc
+
+        primary_api_key = None
+        if primary_provider == PROVIDER_OPENAI:
+            primary_api_key = config.openai_api_key or os.getenv('OPENAI_API_KEY')
+        elif primary_provider == PROVIDER_CLAUDE:
+            primary_api_key = config.claude_api_key
+        elif primary_provider == PROVIDER_GEMINI:
+            primary_api_key = config.gemini_api_key
+        elif primary_provider == PROVIDER_KIE:
+            primary_api_key = getattr(config, "kie_api_key", None)
+
+        if not primary_api_key:
+            err = AIServiceError(f"API ключ для {primary_provider} (Vision) не установлен.")
+            err.classification = "configuration"
+            raise err
 
         active_dialogue_id = user.current_dialogue_id
         active_topic_id = user.current_topic_id
@@ -1809,70 +2337,784 @@ async def analyze_image(
             modality_instructions=(photo_instructions,),
         )
 
-    if provider == "Gemini":
-        api_key = config.gemini_api_key
-        if not api_key:
-            raise AIServiceError("API ключ Gemini для vision не задан")
-        raw_result = await _analyze_gemini(
-            api_key,
-            config.vision_model or "gemini-3.7-flash",
-            image_bytes,
-            request_layout.stable_system_prompt,
-            prompt,
-            temperature,
-            history=list(request_layout.history),
-            request_layout=request_layout,
-            activity_tracker=activity_tracker,
+    if execution_context is not None:
+        execution_context = VisionExecutionContext(
+            user_id=user.id,
+            chat_id=execution_context.chat_id,
+            dialogue_id=active_dialogue_id,
+            topic_id=active_topic_id,
+            topic_name=getattr(user.current_topic, "name", None) if user.current_topic else None,
+            platform="max",
+            bot_name=execution_context.bot_name or "MaxBot",
+            bot=execution_context.bot,
+            full_name=getattr(user, "name", None) or getattr(user, "first_name", None),
+            username=getattr(user, "username", None),
         )
-    elif provider in {"Claude", "Anthropic"}:
-        api_key = config.claude_api_key
-        if not api_key:
-            raise AIServiceError("API ключ Claude для vision не задан")
-        raw_result = await _analyze_claude(
-            api_key,
-            config.vision_model or "claude-sonnet-5",
-            image_bytes,
-            request_layout.stable_system_prompt,
-            prompt,
-            temperature,
-            history=list(request_layout.history),
-            request_layout=request_layout,
-            activity_tracker=activity_tracker,
+
+    deadline_tracker = VisionDeadlineTracker(total_deadline_sec=85.0)
+    primary_provider = (config.vision_provider or "Gemini").strip()
+    primary_model = config.vision_model or get_default_model(primary_provider, channel="vision")
+    temperature = _resolve_temperature(config)
+
+    allow_fallback = bool(getattr(config, "allow_vision_fallback", False))
+    fallback_provider = getattr(config, "vision_fallback_provider", None)
+    fallback_model = getattr(config, "vision_fallback_model", None)
+    eff_allow_fallback, fb_provider, fb_model = resolve_effective_vision_fallback(
+        primary_provider,
+        allow_fallback,
+        fallback_provider,
+        fallback_model,
+    )
+
+    attempts: list[dict] = []
+    last_exception: Exception | None = None
+    raw_result: str | None = None
+    recovered_by_model_retry: bool = False
+    recovered_by_provider_fallback: bool = False
+    output_budget_exhausted_occurred: bool = False
+
+    def _classify_vision_error(exc: Exception | None) -> str:
+        if exc is None:
+            return "unknown"
+        res = classify_external_error(exc)
+        return str(res[0]) if isinstance(res, (tuple, list)) else str(res)
+
+    attempt_counter = 0
+    request_group_id = str(uuid.uuid4())
+
+    def _record_attempt_summary(
+        provider: str,
+        model: str,
+        success: bool,
+        error: str | None = None,
+        classification: str | None = None,
+        stage: str | None = None,
+        attempt_role: str | None = None,
+        fallback_kind: str | None = None,
+    ) -> None:
+        status = "success" if success else "error"
+        if attempt_role is None:
+            if stage == "provider_fallback":
+                attempt_role = "fallback"
+                fallback_kind = fallback_kind or "provider"
+            elif stage in ("inference_retry", "kie_alternate_model"):
+                attempt_role = "fallback"
+                fallback_kind = fallback_kind or "model"
+            else:
+                attempt_role = "primary"
+        attempts.append({
+            "provider": provider,
+            "model": model,
+            "status": status,
+            "classification": classification,
+            "error": sanitize_vision_text(error) if error else None,
+            "attempt_no": len(attempts) + 1,
+            "attempt_role": attempt_role,
+            "fallback_kind": fallback_kind,
+            "stage": stage,
+            "success": success,
+        })
+
+    async def _record_attempt_log(
+        provider: str,
+        model: str,
+        success: bool,
+        error_msg: str | None,
+        classification: Any | None,
+        duration_ms: int,
+        http_status: int | None,
+        request_payload: dict | None,
+        raw_response: str | None,
+        diagnostics: dict | None = None,
+        *,
+        finish_reason: str | None = None,
+        provider_response_payload: str | None = None,
+    ):
+        nonlocal attempt_counter
+        if execution_context is None:
+            return
+        attempt_counter += 1
+
+        if finish_reason is None and isinstance(request_payload, dict):
+            finish_reason = request_payload.get("finish_reason")
+        if http_status is None and isinstance(request_payload, dict):
+            http_status = request_payload.get("http_status")
+        if provider_response_payload is None and isinstance(request_payload, dict):
+            provider_response_payload = request_payload.get("provider_response_payload")
+
+        if diagnostics is None:
+            diagnostics = {}
+        if isinstance(diagnostics, dict) and isinstance(request_payload, dict):
+            for k in ("usage", "finish_reason", "provider_code"):
+                if k in request_payload and k not in diagnostics:
+                    diagnostics[k] = request_payload[k]
+
+        sanitized_payload = sanitize_vision_request_payload(request_payload)
+        sanitized_response = sanitize_vision_text(raw_response)
+        sanitized_error = sanitize_vision_text(error_msg)
+        sanitized_diag = sanitize_vision_request_payload(diagnostics) if diagnostics else None
+        sanitized_resp_payload = sanitize_vision_text(provider_response_payload) if provider_response_payload else None
+
+        eff_cls = (
+            str(classification[0])
+            if isinstance(classification, (tuple, list))
+            else (str(classification) if classification else None)
         )
-    elif provider == "KIE":
-        api_key = getattr(config, "kie_api_key", None)
-        if not api_key:
+        stage = diagnostics.get("stage") if isinstance(diagnostics, dict) else None
+        if stage == "provider_fallback":
+            role = "fallback"
+            if isinstance(diagnostics, dict) and "fallback_kind" not in diagnostics:
+                diagnostics["fallback_kind"] = "provider"
+        elif stage in ("inference_retry", "kie_alternate_model"):
+            role = "fallback"
+            if isinstance(diagnostics, dict) and "fallback_kind" not in diagnostics:
+                diagnostics["fallback_kind"] = "model"
+        else:
+            role = "primary"
+
+        status = "success" if success else "error"
+        clean_text = raw_response if success else None
+        if finish_reason is None and isinstance(diagnostics, dict):
+            finish_reason = diagnostics.get("finish_reason")
+
+        async with async_session_maker() as audit_session:
+            await record_ai_attempt_log(
+                audit_session,
+                user_id=execution_context.user_id,
+                dialogue_id=execution_context.dialogue_id,
+                topic_id=execution_context.topic_id,
+                topic_name=execution_context.topic_name,
+                platform=execution_context.platform,
+                request_type="vision",
+                provider=provider,
+                model=model,
+                prompt_summary=prompt[:100] if prompt else None,
+                request_capture=sanitized_payload,
+                raw_response=sanitized_response,
+                clean_text=clean_text,
+                latency_ms=duration_ms,
+                status=status,
+                request_group_id=request_group_id,
+                attempt_no=attempt_counter,
+                attempt_role=role,
+                error_message=sanitized_error,
+                error_classification=eff_cls,
+                http_status=http_status,
+                finish_reason=finish_reason,
+                diagnostics=sanitized_diag,
+                provider_response_payload=sanitized_resp_payload,
+            )
+
+    async def _execute_provider_call(
+        call_provider: str,
+        call_model: str,
+        stage_budget: float,
+        *,
+        file_url: str | None = None,
+        request_capture: dict | None = None,
+    ) -> str:
+        prov = call_provider.strip()
+        if prov == PROVIDER_GEMINI:
+            api_key = config.gemini_api_key
+            if not api_key:
+                raise AIServiceError("API ключ Gemini для vision не задан")
+            return await _analyze_gemini(
+                api_key,
+                call_model,
+                image_bytes,
+                request_layout.stable_system_prompt,
+                prompt,
+                temperature,
+                history=list(request_layout.history),
+                request_layout=request_layout,
+                activity_tracker=activity_tracker,
+                timeout=stage_budget,
+                request_capture=request_capture,
+            )
+        elif prov in {PROVIDER_CLAUDE, "Anthropic"}:
+            api_key = config.claude_api_key
+            if not api_key:
+                raise AIServiceError("API ключ Claude для vision не задан")
+            return await _analyze_claude(
+                api_key,
+                call_model,
+                image_bytes,
+                request_layout.stable_system_prompt,
+                prompt,
+                temperature,
+                history=list(request_layout.history),
+                request_layout=request_layout,
+                activity_tracker=activity_tracker,
+                timeout=stage_budget,
+                request_capture=request_capture,
+            )
+        elif prov == PROVIDER_KIE:
+            api_key = getattr(config, "kie_api_key", None)
+            if not api_key:
+                raise AIServiceError("API ключ KIE для vision не задан")
+            if not file_url:
+                raise AIServiceError("KIE vision requires uploaded file URL")
+            return await _call_kie_vision_inference(
+                api_key,
+                _get_kie_base_url(config),
+                call_model,
+                file_url,
+                request_layout.stable_system_prompt,
+                prompt,
+                temperature,
+                request_layout=request_layout,
+                activity_tracker=activity_tracker,
+                timeout=stage_budget,
+                request_capture=request_capture,
+            )
+        elif prov == PROVIDER_OPENAI:
+            api_key = config.openai_api_key or os.getenv('OPENAI_API_KEY')
+            if not api_key:
+                raise AIServiceError("API ключ OpenAI для vision не задан")
+            return await _analyze_openai(
+                api_key,
+                call_model,
+                image_bytes,
+                request_layout.stable_system_prompt,
+                prompt,
+                temperature,
+                history=list(request_layout.history),
+                request_layout=request_layout,
+                activity_tracker=activity_tracker,
+                timeout=stage_budget,
+                request_capture=request_capture,
+            )
+        else:
+            err = AIServiceError(f"Неподдерживаемый провайдер для vision: {prov}")
+            err.classification = "configuration"
+            raise err
+
+    # --- PRIMARY ATTEMPT(S) ---
+    if primary_provider == PROVIDER_KIE:
+        kie_api_key = getattr(config, "kie_api_key", None)
+        if not kie_api_key:
             raise AIServiceError("API ключ KIE для vision не задан")
-        model = config.vision_model or "gemini-3-flash"
-        raw_result = await _analyze_kie(
-            api_key,
-            _get_kie_base_url(config),
-            _get_kie_upload_base_url(config),
-            model,
-            image_bytes,
-            request_layout.stable_system_prompt,
-            prompt,
-            temperature,
-            history=list(request_layout.history),
-            request_layout=request_layout,
-            activity_tracker=activity_tracker,
+        candidates = order_kie_vision_candidates(
+            primary_model,
+            selectable_models=get_selectable_models(PROVIDER_KIE, "vision"),
         )
+        upload_base_url = _get_kie_upload_base_url(config)
+        upload_stage_cap = 20.0
+        upload_start = time.monotonic()
+        file_url: str | None = None
+        upload_err: Exception | None = None
+
+        for upload_attempt_idx in range(2):
+            rem_upload = upload_stage_cap - (time.monotonic() - upload_start)
+            if rem_upload < 3.0 or deadline_tracker.remaining_time() <= 5.0:
+                break
+            up_budget = deadline_tracker.stage_budget(max_stage_budget=rem_upload, reserve_sec=5.0, min_required=3.0)
+            if up_budget < 3.0:
+                break
+            t0 = time.monotonic()
+            try:
+                file_url = await run_coro_with_timeout(
+                    _upload_file_to_kie(
+                        kie_api_key,
+                        upload_base_url,
+                        image_bytes,
+                        _guess_filename(image_bytes, "vision_input", "jpg"),
+                        "images",
+                        timeout=up_budget,
+                        activity_tracker=activity_tracker,
+                    ),
+                    timeout_sec=up_budget,
+                )
+                upload_err = None
+                break
+            except Exception as exc:
+                t_spent = int((time.monotonic() - t0) * 1000)
+                classification = _classify_vision_error(exc)
+                attach_error_metadata(exc, classification=classification, stage="kie_upload")
+                upload_err = exc
+                if upload_attempt_idx == 0 and should_retry_kie_vision_upload(classification):
+                    log.warning("KIE upload transient failure (%s), retrying upload once...", exc)
+                    continue
+                break
+
+        if file_url is None:
+            up_cls = _classify_vision_error(upload_err) if upload_err else "timeout"
+            meta = extract_error_metadata(upload_err) if upload_err else {}
+            _record_attempt_summary(
+                PROVIDER_KIE,
+                candidates[0] if candidates else primary_model,
+                False,
+                error=str(upload_err or "KIE upload timeout"),
+                classification=up_cls,
+                stage="kie_upload",
+            )
+            await _record_attempt_log(
+                PROVIDER_KIE,
+                candidates[0] if candidates else primary_model,
+                False,
+                str(upload_err or "KIE upload timeout"),
+                up_cls,
+                int((time.monotonic() - upload_start) * 1000),
+                meta.get("http_status"),
+                None,
+                None,
+                {"stage": "kie_upload", "inference_http_started": False},
+                finish_reason=meta.get("finish_reason"),
+                provider_response_payload=meta.get("provider_response_payload"),
+            )
+            last_exception = upload_err or AIServiceError("Не удалось загрузить изображение в KIE")
+        else:
+            # Inference on Candidate 1
+            cand1 = candidates[0]
+            stage_budget = deadline_tracker.stage_budget(max_stage_budget=25.0, reserve_sec=5.0, min_required=3.0)
+            t0 = time.monotonic()
+            cand1_capture = {}
+            cand1_diag = {"stage": "inference"}
+            try:
+                raw_result = await run_coro_with_timeout(
+                    _execute_provider_call(PROVIDER_KIE, cand1, stage_budget, file_url=file_url, request_capture=cand1_capture),
+                    timeout_sec=stage_budget,
+                )
+                dur = int((time.monotonic() - t0) * 1000)
+                _record_attempt_summary(PROVIDER_KIE, cand1, True, stage="inference")
+                for k in ("usage", "finish_reason", "provider_code"):
+                    if k in cand1_capture:
+                        cand1_diag[k] = cand1_capture[k]
+                await _record_attempt_log(
+                    PROVIDER_KIE,
+                    cand1,
+                    True,
+                    None,
+                    None,
+                    dur,
+                    cand1_capture.get("http_status") or 200,
+                    cand1_capture,
+                    raw_result,
+                    cand1_diag,
+                    finish_reason=cand1_capture.get("finish_reason"),
+                    provider_response_payload=cand1_capture.get("provider_response_payload"),
+                )
+            except Exception as exc:
+                dur = int((time.monotonic() - t0) * 1000)
+                classification = _classify_vision_error(exc)
+                if classification == "output_budget_exhausted":
+                    output_budget_exhausted_occurred = True
+                attach_error_metadata(exc, classification=classification, stage="inference")
+                meta = extract_error_metadata(exc)
+                _record_attempt_summary(
+                    PROVIDER_KIE,
+                    cand1,
+                    False,
+                    error=str(exc),
+                    classification=classification,
+                    stage="inference",
+                )
+                for k in ("usage", "finish_reason", "provider_code"):
+                    if k in cand1_capture:
+                        cand1_diag[k] = cand1_capture[k]
+                    elif k in meta:
+                        cand1_diag[k] = meta[k]
+                await _record_attempt_log(
+                    PROVIDER_KIE,
+                    cand1,
+                    False,
+                    str(exc),
+                    classification,
+                    dur,
+                    meta.get("http_status") or cand1_capture.get("http_status"),
+                    cand1_capture,
+                    None,
+                    cand1_diag,
+                    finish_reason=meta.get("finish_reason") or cand1_capture.get("finish_reason"),
+                    provider_response_payload=meta.get("provider_response_payload") or cand1_capture.get("provider_response_payload"),
+                )
+                last_exception = exc
+
+                # Same-KIE candidate 2 retry
+                if len(candidates) > 1 and should_retry_kie_vision_model(classification):
+                    cand2 = candidates[1]
+                    if deadline_tracker.remaining_time() > 5.0:
+                        cand2_budget = deadline_tracker.stage_budget(max_stage_budget=20.0, reserve_sec=5.0, min_required=3.0)
+                        if cand2_budget >= 3.0:
+                            log.info("Retrying KIE vision with alternate model %s (reusing file_url)", cand2)
+                            t2_start = time.monotonic()
+                            cand2_capture = {}
+                            cand2_diag = {"stage": "inference_retry", "fallback_kind": "model"}
+                            try:
+                                raw_result = await run_coro_with_timeout(
+                                    _execute_provider_call(PROVIDER_KIE, cand2, cand2_budget, file_url=file_url, request_capture=cand2_capture),
+                                    timeout_sec=cand2_budget,
+                                )
+                                dur2 = int((time.monotonic() - t2_start) * 1000)
+                                recovered_by_model_retry = True
+                                _record_attempt_summary(PROVIDER_KIE, cand2, True, stage="inference_retry", fallback_kind="model")
+                                for k in ("usage", "finish_reason", "provider_code"):
+                                    if k in cand2_capture:
+                                        cand2_diag[k] = cand2_capture[k]
+                                await _record_attempt_log(
+                                    PROVIDER_KIE,
+                                    cand2,
+                                    True,
+                                    None,
+                                    None,
+                                    dur2,
+                                    cand2_capture.get("http_status") or 200,
+                                    cand2_capture,
+                                    raw_result,
+                                    cand2_diag,
+                                    finish_reason=cand2_capture.get("finish_reason"),
+                                    provider_response_payload=cand2_capture.get("provider_response_payload"),
+                                )
+                            except Exception as exc2:
+                                dur2 = int((time.monotonic() - t2_start) * 1000)
+                                cls2 = _classify_vision_error(exc2)
+                                if cls2 == "output_budget_exhausted":
+                                    output_budget_exhausted_occurred = True
+                                attach_error_metadata(exc2, classification=cls2, stage="inference_retry")
+                                meta2 = extract_error_metadata(exc2)
+                                _record_attempt_summary(
+                                    PROVIDER_KIE,
+                                    cand2,
+                                    False,
+                                    error=str(exc2),
+                                    classification=cls2,
+                                    stage="inference_retry",
+                                    fallback_kind="model",
+                                    attempt_role="fallback",
+                                )
+                                for k in ("usage", "finish_reason", "provider_code"):
+                                    if k in cand2_capture:
+                                        cand2_diag[k] = cand2_capture[k]
+                                    elif k in meta2:
+                                        cand2_diag[k] = meta2[k]
+                                await _record_attempt_log(
+                                    PROVIDER_KIE,
+                                    cand2,
+                                    False,
+                                    str(exc2),
+                                    cls2,
+                                    dur2,
+                                    meta2.get("http_status") or cand2_capture.get("http_status"),
+                                    cand2_capture,
+                                    None,
+                                    cand2_diag,
+                                    finish_reason=meta2.get("finish_reason") or cand2_capture.get("finish_reason"),
+                                    provider_response_payload=meta2.get("provider_response_payload") or cand2_capture.get("provider_response_payload"),
+                                )
+                                last_exception = exc2
+
     else:
-        # Default: OpenAI
-        api_key = config.openai_api_key
-        if not api_key:
-            raise AIServiceError("API ключ OpenAI для vision не задан")
-        raw_result = await _analyze_openai(
-            api_key,
-            config.vision_model or "gpt-5.6-terra",
-            image_bytes,
-            request_layout.stable_system_prompt,
-            prompt,
-            temperature,
-            history=list(request_layout.history),
-            request_layout=request_layout,
-            activity_tracker=activity_tracker,
-        )
+        # Direct provider (OpenAI, Claude, Gemini)
+        stage_budget = deadline_tracker.stage_budget(max_stage_budget=25.0, reserve_sec=5.0, min_required=3.0)
+        t0 = time.monotonic()
+        prim_capture = {}
+        prim_diag = {"stage": "inference"}
+        try:
+            raw_result = await run_coro_with_timeout(
+                _execute_provider_call(primary_provider, primary_model, stage_budget, request_capture=prim_capture),
+                timeout_sec=stage_budget,
+            )
+            dur = int((time.monotonic() - t0) * 1000)
+            _record_attempt_summary(primary_provider, primary_model, True, stage="inference")
+            for k in ("usage", "finish_reason", "provider_code"):
+                if k in prim_capture:
+                    prim_diag[k] = prim_capture[k]
+            await _record_attempt_log(
+                primary_provider,
+                primary_model,
+                True,
+                None,
+                None,
+                dur,
+                prim_capture.get("http_status") or 200,
+                prim_capture,
+                raw_result,
+                prim_diag,
+                finish_reason=prim_capture.get("finish_reason"),
+                provider_response_payload=prim_capture.get("provider_response_payload"),
+            )
+        except Exception as exc:
+            dur = int((time.monotonic() - t0) * 1000)
+            classification = _classify_vision_error(exc)
+            if classification == "output_budget_exhausted":
+                output_budget_exhausted_occurred = True
+            attach_error_metadata(exc, classification=classification, stage="inference")
+            meta = extract_error_metadata(exc)
+            _record_attempt_summary(
+                primary_provider,
+                primary_model,
+                False,
+                error=str(exc),
+                classification=classification,
+                stage="inference",
+            )
+            for k in ("usage", "finish_reason", "provider_code"):
+                if k in prim_capture:
+                    prim_diag[k] = prim_capture[k]
+                elif k in meta:
+                    prim_diag[k] = meta[k]
+            await _record_attempt_log(
+                primary_provider,
+                primary_model,
+                False,
+                str(exc),
+                classification,
+                dur,
+                meta.get("http_status") or prim_capture.get("http_status"),
+                prim_capture,
+                None,
+                prim_diag,
+                finish_reason=meta.get("finish_reason") or prim_capture.get("finish_reason"),
+                provider_response_payload=meta.get("provider_response_payload") or prim_capture.get("provider_response_payload"),
+            )
+            last_exception = exc
+
+    # --- PROVIDER FALLBACK STAGE ---
+    fallback_attempted = False
+    fb_eligible = False
+    fb_budget = 0.0
+    if raw_result is None and eff_allow_fallback and fb_provider and fb_model and last_exception is not None:
+        is_diff = str(fb_provider).strip().lower() != str(primary_provider).strip().lower()
+        is_supported = str(fb_provider).strip() in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE)
+        is_valid_model = bool(fb_model)
+        try:
+            if is_valid_model and is_supported:
+                validate_model_selection(fb_provider, fb_model, channel="vision_fallback")
+            else:
+                is_valid_model = False
+        except Exception:
+            is_valid_model = False
+
+        has_key = False
+        if fb_provider == PROVIDER_KIE:
+            has_key = bool(getattr(config, "kie_api_key", None))
+        elif fb_provider == PROVIDER_GEMINI:
+            has_key = bool(getattr(config, "gemini_api_key", None))
+        elif fb_provider in (PROVIDER_CLAUDE, "Anthropic"):
+            has_key = bool(getattr(config, "claude_api_key", None))
+        elif fb_provider == PROVIDER_OPENAI:
+            has_key = bool(getattr(config, "openai_api_key", None) or os.getenv("OPENAI_API_KEY"))
+
+        last_cls = _classify_vision_error(last_exception)
+        primary_tokens = get_provider_vision_max_tokens(primary_provider)
+        fallback_tokens = get_provider_vision_max_tokens(fb_provider) if is_supported else 0
+
+        if is_diff and is_supported and is_valid_model and has_key and should_use_vision_provider_fallback(last_cls, primary_tokens, fallback_tokens):
+            fb_budget = deadline_tracker.stage_budget(max_stage_budget=15.0, reserve_sec=5.0, min_required=3.0)
+            if fb_budget >= 3.0:
+                fb_eligible = True
+
+    if fb_eligible:
+        fallback_attempted = True
+        log.info("Attempting vision provider fallback to %s/%s with budget %.1fs", fb_provider, fb_model, fb_budget)
+        t_fb = time.monotonic()
+        fb_stage_cap = 15.0
+        fb_capture = {}
+        fb_diag = {"stage": "provider_fallback", "fallback_kind": "provider"}
+        try:
+            if fb_provider == PROVIDER_KIE:
+                fb_file_url = None
+                fb_upload_err = None
+                for fb_up_attempt in range(2):
+                    elapsed = time.monotonic() - t_fb
+                    rem_stage = fb_stage_cap - elapsed
+                    if rem_stage < 3.0 or deadline_tracker.remaining_time() <= 5.0:
+                        if fb_upload_err is not None:
+                            raise fb_upload_err
+                        raise AIServiceError("Недостаточно времени для загрузки в KIE (fallback)")
+                    fb_upload_budget = deadline_tracker.stage_budget(max_stage_budget=rem_stage, reserve_sec=5.0, min_required=3.0)
+                    if fb_upload_budget < 3.0:
+                        if fb_upload_err is not None:
+                            raise fb_upload_err
+                        raise AIServiceError("Недостаточно времени для загрузки в KIE (fallback)")
+                    try:
+                        fb_file_url = await run_coro_with_timeout(
+                            _upload_file_to_kie(
+                                getattr(config, "kie_api_key", None),
+                                _get_kie_upload_base_url(config),
+                                image_bytes,
+                                _guess_filename(image_bytes, "vision_fb", "jpg"),
+                                "images",
+                                timeout=fb_upload_budget,
+                                activity_tracker=activity_tracker,
+                            ),
+                            timeout_sec=fb_upload_budget,
+                        )
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as up_exc:
+                        fb_upload_err = up_exc
+                        if fb_up_attempt == 0:
+                            up_cls = _classify_vision_error(up_exc)
+                            if should_retry_kie_vision_upload(up_cls):
+                                rem_after_err = fb_stage_cap - (time.monotonic() - t_fb)
+                                rem_tracker = deadline_tracker.stage_budget(max_stage_budget=rem_after_err, reserve_sec=5.0, min_required=3.0)
+                                if rem_after_err >= 3.0 and rem_tracker >= 3.0:
+                                    log.info("Retrying KIE provider fallback upload after transient error: %s", up_exc)
+                                    continue
+                        raise up_exc
+
+                if not fb_file_url:
+                    if fb_upload_err:
+                        raise fb_upload_err
+                    raise AIServiceError("Не удалось получить URL файла KIE для fallback")
+
+                fb_spent_after_up = time.monotonic() - t_fb
+                fb_inf_rem = fb_stage_cap - fb_spent_after_up
+                if fb_inf_rem < 3.0:
+                    raise AIServiceError("Недостаточно времени для инференса KIE (fallback)")
+                fb_inf_budget = deadline_tracker.stage_budget(max_stage_budget=fb_inf_rem, reserve_sec=5.0, min_required=3.0)
+                if fb_inf_budget < 3.0:
+                    raise AIServiceError("Недостаточно времени для инференса KIE (fallback)")
+                raw_result = await run_coro_with_timeout(
+                    _execute_provider_call(
+                        fb_provider,
+                        fb_model,
+                        fb_inf_budget,
+                        file_url=fb_file_url,
+                        request_capture=fb_capture,
+                    ),
+                    timeout_sec=fb_inf_budget,
+                )
+            else:
+                raw_result = await run_coro_with_timeout(
+                    _execute_provider_call(fb_provider, fb_model, fb_budget, request_capture=fb_capture),
+                    timeout_sec=fb_budget,
+                )
+
+            dur_fb = int((time.monotonic() - t_fb) * 1000)
+            recovered_by_provider_fallback = True
+            _record_attempt_summary(fb_provider, fb_model, True, stage="provider_fallback", fallback_kind="provider")
+            for k in ("usage", "finish_reason", "provider_code"):
+                if k in fb_capture:
+                    fb_diag[k] = fb_capture[k]
+            await _record_attempt_log(
+                fb_provider,
+                fb_model,
+                True,
+                None,
+                None,
+                dur_fb,
+                fb_capture.get("http_status") or 200,
+                fb_capture,
+                raw_result,
+                fb_diag,
+                finish_reason=fb_capture.get("finish_reason"),
+                provider_response_payload=fb_capture.get("provider_response_payload"),
+            )
+
+            if execution_context is not None:
+                try:
+                    await send_ai_fallback_used_alert(
+                        bot=execution_context.bot,
+                        primary_provider=primary_provider,
+                        primary_model=primary_model,
+                        fallback_provider=fb_provider,
+                        fallback_model=fb_model,
+                        failure_reason=str(last_exception),
+                        user=execution_context,
+                        dialogue_id=execution_context.dialogue_id,
+                        topic_id=execution_context.topic_id,
+                        topic_name=execution_context.topic_name,
+                        request_type="vision",
+                        attempts=attempts,
+                        platform=execution_context.platform,
+                    )
+                except Exception as alert_err:
+                    log.warning("Failed to send fallback alert: %s", alert_err)
+
+        except Exception as fb_exc:
+            dur_fb = int((time.monotonic() - t_fb) * 1000)
+            fb_cls = _classify_vision_error(fb_exc)
+            if fb_cls == "output_budget_exhausted":
+                output_budget_exhausted_occurred = True
+            attach_error_metadata(fb_exc, classification=fb_cls, stage="provider_fallback")
+            fb_meta = extract_error_metadata(fb_exc)
+            _record_attempt_summary(
+                fb_provider,
+                fb_model,
+                False,
+                error=str(fb_exc),
+                classification=fb_cls,
+                stage="provider_fallback",
+                fallback_kind="provider",
+            )
+            for k in ("usage", "finish_reason", "provider_code"):
+                if k in fb_capture:
+                    fb_diag[k] = fb_capture[k]
+                elif k in fb_meta:
+                    fb_diag[k] = fb_meta[k]
+            await _record_attempt_log(
+                fb_provider,
+                fb_model,
+                False,
+                str(fb_exc),
+                fb_cls,
+                dur_fb,
+                fb_meta.get("http_status") or fb_capture.get("http_status"),
+                fb_capture,
+                None,
+                fb_diag,
+                finish_reason=fb_meta.get("finish_reason") or fb_capture.get("finish_reason"),
+                provider_response_payload=fb_meta.get("provider_response_payload") or fb_capture.get("provider_response_payload"),
+            )
+            last_exception = fb_exc
+
+    # --- OUTCOME HANDLING ---
+    if raw_result is None:
+        last_cls = _classify_vision_error(last_exception) if last_exception else "unknown"
+        if execution_context is not None and last_exception is not None:
+            try:
+                if last_cls == "output_budget_exhausted" and not fallback_attempted:
+                    await send_output_budget_exhausted_alert(
+                        bot=execution_context.bot,
+                        user=execution_context,
+                        dialogue_id=execution_context.dialogue_id,
+                        topic_id=execution_context.topic_id,
+                        topic_name=execution_context.topic_name,
+                        provider=primary_provider,
+                        model=primary_model,
+                        details=str(last_exception),
+                        exception=last_exception,
+                        request_type="vision",
+                        attempts=attempts,
+                        platform=execution_context.platform,
+                    )
+                else:
+                    await send_terminal_ai_failure_alert(
+                        bot=execution_context.bot,
+                        title="Терминальный сбой анализа изображения",
+                        user=execution_context,
+                        dialogue_id=execution_context.dialogue_id,
+                        topic_id=execution_context.topic_id,
+                        topic_name=execution_context.topic_name,
+                        provider=primary_provider,
+                        model=primary_model,
+                        stage="vision_orchestrator",
+                        classification=last_cls,
+                        details=str(last_exception),
+                        exception=last_exception,
+                        request_type="vision",
+                        attempts=attempts,
+                        platform=execution_context.platform,
+                    )
+                last_exception.admin_alert_handled = True
+            except Exception as alert_err:
+                log.warning("Failed to send terminal vision alert: %s", alert_err)
+
+        if isinstance(last_exception, AIServiceError):
+            final_exc = last_exception
+        elif last_exception is not None:
+            final_exc = AIServiceError(f"Анализ изображения не удался: {last_exception}")
+            final_exc.__cause__ = last_exception
+        else:
+            final_exc = AIServiceError("Анализ изображения не удался")
+
+        attach_error_metadata(final_exc, classification=last_cls, stage="vision_orchestrator")
+        if execution_context is not None:
+            final_exc.admin_alert_handled = True
+        raise final_exc
 
     visible_text, service_blocks, invalid_data_blocks = extract_service_data(raw_result)
     if invalid_data_blocks:

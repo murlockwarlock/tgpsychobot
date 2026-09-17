@@ -114,21 +114,45 @@ _ERROR_CLASS_DESCRIPTIONS = {
 }
 
 
+def _extract_transport_http_status(exception: Exception, *, include_context: bool = True) -> int | None:
+    for item in exception_chain(exception, include_context=include_context):
+        resp = getattr(item, "response", None)
+        if resp is not None:
+            sc = getattr(resp, "status_code", None)
+            if isinstance(sc, int) and 100 <= sc <= 599:
+                return sc
+        for attr in ("http_status", "status_code", "status"):
+            val = getattr(item, attr, None)
+            if isinstance(val, int) and 100 <= val <= 599:
+                return val
+    return None
+
+
+def _extract_provider_code(exception: Exception, *, include_context: bool = True) -> int | str | None:
+    for item in exception_chain(exception, include_context=include_context):
+        code = getattr(item, "provider_code", None)
+        if code is not None:
+            return code
+        content = getattr(item, "content", None)
+        if isinstance(content, dict):
+            c = content.get("code") or content.get("provider_code")
+            if c is not None:
+                return c
+    return None
+
+
 def _exception_status_codes(exception: Exception, *, include_context: bool = True) -> set[int]:
     codes: set[int] = set()
     for item in exception_chain(exception, include_context=include_context):
-        candidates = [getattr(item, "status_code", None), getattr(item, "status", None)]
+        candidates = [getattr(item, "status_code", None), getattr(item, "status", None), getattr(item, "http_status", None)]
         response = getattr(item, "response", None)
         if response is not None:
             candidates.extend([getattr(response, "status_code", None), getattr(response, "status", None)])
-        content = getattr(item, "content", None)
-        if isinstance(content, dict):
-            candidates.extend([content.get("status_code"), content.get("status"), content.get("code")])
         for candidate in candidates:
             try:
-                if isinstance(candidate, int):
+                if isinstance(candidate, int) and 100 <= candidate <= 599:
                     codes.add(candidate)
-                elif isinstance(candidate, str) and candidate.isdigit():
+                elif isinstance(candidate, str) and candidate.isdigit() and 100 <= int(candidate) <= 599:
                     codes.add(int(candidate))
             except (TypeError, ValueError):
                 continue
@@ -141,7 +165,7 @@ def classify_external_error(
     *,
     include_context: bool = True,
 ) -> tuple[str, str]:
-    """Classify an external-call failure using the complete exception chain."""
+    """Classify an external-call failure using the complete exception chain with deterministic precedence."""
     if exception is None:
         return "unknown", _ERROR_CLASS_DESCRIPTIONS["unknown"]
 
@@ -149,8 +173,79 @@ def classify_external_error(
     type_text = " ".join(type(item).__name__ for item in chain).lower()
     error_text = " ".join(str(item) for item in chain).lower()
     combined = f"{type_text} {error_text}"
+    transport_status = _extract_transport_http_status(exception, include_context=include_context)
     status_codes = _exception_status_codes(exception, include_context=include_context)
+    if transport_status is not None:
+        status_codes.add(transport_status)
 
+    # 1. Transport Timeout Wrapping (Highest Precedence)
+    # Incident invariant: ReadTimeout -> SSLWantReadError MUST classify as "timeout", not "network_ssl".
+    if (
+        any(marker in combined for marker in ("timeouterror", "readtimeout", "connecttimeout", "apitimeouterror"))
+        or any(type(item).__name__.lower() in ("timeouterror", "readtimeout", "connecttimeout", "apitimeouterror") for item in chain)
+        or "timeout" in combined
+        or "timed out" in combined
+    ):
+        code = "timeout"
+        return code, _ERROR_CLASS_DESCRIPTIONS[code]
+
+    # 2. Authoritative Explicit Classification Attribute
+    for item in [exception] + chain:
+        explicit_cls = getattr(item, "classification", None)
+        if explicit_cls and explicit_cls in _ERROR_CLASS_DESCRIPTIONS:
+            code = explicit_cls
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+
+    # 3. Transport HTTP Status (Non-2xx is authoritative over body provider_code)
+    # Conflict rule: HTTP 503 + provider_code 402 -> provider_5xx (transport status wins)
+    if transport_status is not None and transport_status != 200:
+        if 500 <= transport_status < 600:
+            code = "provider_5xx"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif transport_status == 429:
+            code = "rate_limit"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif transport_status == 401:
+            code = "auth"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif transport_status == 403:
+            if any(m in combined for m in ("api key", "unauthorized", "invalid key", "authentication")):
+                code = "auth"
+            else:
+                code = "forbidden_geo"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif transport_status == 402:
+            code = "insufficient_balance_quota"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif transport_status in {400, 409, 422}:
+            code = "provider_rejection"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+
+    # 4. Body Provider Code (authoritative when transport HTTP is 200 or absent)
+    # Conflict rule: HTTP 200 + provider_code 402 -> insufficient_balance_quota
+    provider_code = _extract_provider_code(exception, include_context=include_context)
+    if provider_code is not None:
+        p_code_str = str(provider_code).strip()
+        if p_code_str == "401":
+            code = "auth"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif p_code_str == "402":
+            code = "insufficient_balance_quota"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif p_code_str == "403":
+            code = "forbidden_geo"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif p_code_str == "429":
+            code = "rate_limit"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif p_code_str in {"400", "409", "422"}:
+            code = "provider_rejection"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+        elif p_code_str in {"500", "502", "503", "504"}:
+            code = "provider_5xx"
+            return code, _ERROR_CLASS_DESCRIPTIONS[code]
+
+    # 5. Standalone SSL & Connection Exceptions
     if any(marker in combined for marker in (
         "sslerror",
         "ssl:",
@@ -158,14 +253,10 @@ def classify_external_error(
         "certificate verify failed",
         "unexpected_eof",
         "wrong version number",
+        "sslwantreaderror",
+        "sslwantwriteerror",
     )):
         code = "network_ssl"
-    elif (
-        any(marker in combined for marker in ("timeouterror", "readtimeout", "connecttimeout", "apitimeouterror"))
-        or "timeout" in combined
-        or "timed out" in combined
-    ):
-        code = "timeout"
     elif any(marker in combined for marker in (
         "connecterror",
         "connectionerror",
@@ -178,6 +269,8 @@ def classify_external_error(
         "networkerror",
     )):
         code = "network_connection"
+
+    # 6. Generic Type / Keyword Heuristics
     elif (
         status_codes & {401}
         or any(marker in combined for marker in (
@@ -245,10 +338,7 @@ def classify_external_error(
         ))
     ):
         code = "provider_5xx"
-    elif (
-        getattr(exception, "classification", None) == "output_budget_exhausted"
-        or any(marker in combined for marker in ("output budget exhausted", "output_budget_exhausted"))
-    ):
+    elif any(marker in combined for marker in ("output budget exhausted", "output_budget_exhausted")):
         code = "output_budget_exhausted"
     elif any(marker in combined for marker in (
         "empty response",
@@ -543,9 +633,7 @@ def extract_error_metadata(
 
     http_status = getattr(exception, "http_status", None)
     if http_status is None:
-        status_codes = _exception_status_codes(exception)
-        if status_codes:
-            http_status = next((s for s in status_codes if 200 <= s < 600), None)
+        http_status = _extract_transport_http_status(exception)
 
     finish_reason = getattr(exception, "finish_reason", None)
     diagnostics = getattr(exception, "diagnostics", None)
@@ -613,12 +701,19 @@ async def _dispatch_admin_alert_text(bot: Bot | None, text: str) -> bool:
 async def send_terminal_ai_failure_alert(
     bot: Bot | None = None,
     *,
-    platform: str,
-    user_id: int | None,
+    platform: str = "telegram",
+    user_id: int | None = None,
+    user: Any | None = None,
     chat_id: int | None = None,
     bot_name: str | None = None,
-    primary_provider: str,
-    primary_model: str,
+    request_type: str = "chat",
+    primary_provider: str | None = None,
+    primary_model: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    title: str | None = None,
+    stage: str | None = None,
+    details: str | None = None,
     fallback_provider: str | None = None,
     fallback_model: str | None = None,
     exception: Exception | None = None,
@@ -626,15 +721,43 @@ async def send_terminal_ai_failure_alert(
     error_type: str | None = None,
     error_message: str | None = None,
     ai_log_ids: Sequence[int | str] | None = None,
+    provider_attempts: Sequence[dict[str, Any]] | None = None,
+    attempts: Sequence[dict[str, Any]] | None = None,
+    dialogue_id: int | None = None,
+    topic_id: int | None = None,
+    topic_name: str | None = None,
+    username: str | None = None,
+    full_name: str | None = None,
 ) -> bool:
     """Send realtime terminal AI failure alert to Telegram admins with 30m cooldown."""
-    platform_norm = "MAX" if platform.lower() == "max" else "Telegram"
+    if user is not None:
+        user_id = getattr(user, "user_id", None) or getattr(user, "id", None) or user_id
+        chat_id = getattr(user, "chat_id", None) or chat_id
+        username = getattr(user, "username", None) or username
+        full_name = getattr(user, "full_name", None) or getattr(user, "name", None) or full_name
+        platform = getattr(user, "platform", platform) or platform
+        dialogue_id = getattr(user, "dialogue_id", None) or dialogue_id
+        topic_id = getattr(user, "topic_id", None) or topic_id
+        topic_name = getattr(user, "topic_name", None) or topic_name
+
+    primary_provider = primary_provider or provider or "unknown"
+    primary_model = primary_model or model or "—"
+    provider_attempts = provider_attempts or attempts
+    error_message = error_message or details
+
+    platform_norm = "MAX" if platform and platform.lower() == "max" else "Telegram"
     b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
     cls_str = classification or "provider_failure"
     primary_p = primary_provider or "primary"
     fb_p = fallback_provider or "none"
 
-    fingerprint = f"{platform_norm}:{b_name}:{primary_p}:{fb_p}:{cls_str}"
+    if request_type == "vision":
+        fingerprint = f"vision:{platform_norm}:{b_name}:{primary_p}:{fb_p}:{cls_str}"
+        alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ при анализе изображения</b>\n\n"
+    else:
+        fingerprint = f"{platform_norm}:{b_name}:{primary_p}:{fb_p}:{cls_str}"
+        alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
+
     if not _terminal_failure_cooldown.should_send(fingerprint):
         return False
 
@@ -642,7 +765,11 @@ async def send_terminal_ai_failure_alert(
     chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
 
     err_type_str = error_type or (type(exception).__name__ if exception is not None else "AIServiceError")
-    err_msg_str = error_message or sanitize_secret_values(str(exception) if exception is not None else "Unknown error")
+    raw_err = error_message or (str(exception) if exception is not None else "Unknown error")
+    if request_type == "vision":
+        from vision_reliability import sanitize_vision_request_payload
+        raw_err = sanitize_vision_request_payload(raw_err)
+    err_msg_str = sanitize_secret_values(str(raw_err))
     err_msg_short = _shorten(err_msg_str, 500)
 
     if ai_log_ids:
@@ -656,13 +783,27 @@ async def send_terminal_ai_failure_alert(
     if fallback_provider:
         fb_lines = f"Fallback: {html.escape(fallback_provider)} / {html.escape(fallback_model or '—')} ❌\n"
 
+    attempts_block = ""
+    if provider_attempts:
+        lines = []
+        for att in provider_attempts:
+            p = att.get("provider", "Unknown")
+            m = att.get("model", "—")
+            st = att.get("status", "UNKNOWN")
+            cls = att.get("classification")
+            mark = "✅" if st in ("SUCCESS", "success", True) else "❌"
+            cls_info = f" ({cls})" if cls else ""
+            lines.append(f"• {html.escape(str(p))} / {html.escape(str(m))} {mark}{cls_info}")
+        attempts_block = "\nПопытки:\n" + "\n".join(lines) + "\n"
+
     text = (
-        f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
+        f"{alert_title}"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
         f"{id_label}\n"
         f"{chat_line}"
         f"Primary: {html.escape(primary_provider)} / {html.escape(primary_model)} ❌\n"
-        f"{fb_lines}\n"
+        f"{fb_lines}"
+        f"{attempts_block}\n"
         f"Ошибка:\n"
         f"<code>{html.escape(err_type_str)}</code> / <code>{html.escape(err_msg_short)}</code>\n\n"
         f"Классификация:\n"
@@ -676,32 +817,60 @@ async def send_terminal_ai_failure_alert(
 async def send_output_budget_exhausted_alert(
     bot: Bot | None = None,
     *,
-    platform: str,
-    user_id: int | None,
+    platform: str = "telegram",
+    user_id: int | None = None,
+    user: Any | None = None,
+    chat_id: int | None = None,
     bot_name: str | None = None,
+    request_type: str = "chat",
     provider: str = "Deepseek",
-    model: str,
+    model: str = "",
     finish_reason: str = "length",
     visible_content_length: int = 0,
     reasoning_content_length: int = 0,
     max_tokens: int | str = "65536",
     ai_log_id: int | str | None = None,
+    details: str | None = None,
+    exception: Exception | None = None,
+    attempts: Sequence[dict[str, Any]] | None = None,
+    provider_attempts: Sequence[dict[str, Any]] | None = None,
+    dialogue_id: int | None = None,
+    topic_id: int | None = None,
+    topic_name: str | None = None,
+    username: str | None = None,
+    full_name: str | None = None,
 ) -> bool:
-    """Send alert when DeepSeek exhaust output budget on reasoning tokens (30m cooldown)."""
-    platform_norm = "MAX" if platform.lower() == "max" else "Telegram"
+    """Send alert when AI provider exhausts output budget on tokens (30m cooldown)."""
+    if user is not None:
+        user_id = getattr(user, "user_id", None) or getattr(user, "id", None) or user_id
+        chat_id = getattr(user, "chat_id", None) or chat_id
+        username = getattr(user, "username", None) or username
+        full_name = getattr(user, "full_name", None) or getattr(user, "name", None) or full_name
+        platform = getattr(user, "platform", platform) or platform
+
+    platform_norm = "MAX" if platform and platform.lower() == "max" else "Telegram"
     b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
 
-    fingerprint = f"{b_name}:{provider}:{model}:output_budget_exhausted"
+    if request_type == "vision":
+        fingerprint = f"vision:{b_name}:{provider}:{model}:output_budget_exhausted"
+        title = f"⚠️ <b>[Vision] {html.escape(provider)} исчерпал output budget</b>\n\n"
+    else:
+        fingerprint = f"{b_name}:{provider}:{model}:output_budget_exhausted"
+        title = f"⚠️ <b>[AI] {html.escape(provider)} исчерпал output budget</b>\n\n"
+
     if not _output_budget_cooldown.should_send(fingerprint):
         return False
 
     ai_log_str = f"#{ai_log_id}" if ai_log_id is not None and str(ai_log_id).isdigit() else (str(ai_log_id) if ai_log_id else "не удалось сохранить")
+    id_label = f"User ID: <code>{user_id if user_id is not None else 'не указан'}</code>\n"
+    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
 
     text = (
-        f"⚠️ <b>[AI] {html.escape(provider)} исчерпал output budget</b>\n\n"
+        f"{title}"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
         f"Платформа: <b>{platform_norm}</b>\n"
-        f"User ID: <code>{user_id if user_id is not None else 'не указан'}</code>\n"
+        f"{id_label}"
+        f"{chat_line}"
         f"Model: <code>{html.escape(model)}</code>\n"
         f"finish_reason: <code>{html.escape(finish_reason)}</code>\n"
         f"visible_content_length: <code>{visible_content_length}</code>\n"
@@ -711,4 +880,92 @@ async def send_output_budget_exhausted_alert(
     )
 
     return await _dispatch_admin_alert_text(bot, text)
+
+
+async def send_ai_fallback_used_alert(
+    bot: Bot | None = None,
+    *,
+    platform: str = "telegram",
+    user_id: int | None = None,
+    user: Any | None = None,
+    chat_id: int | None = None,
+    bot_name: str | None = None,
+    request_type: str = "chat",
+    primary_provider: str | None = None,
+    primary_model: str | None = None,
+    failed_provider: str | None = None,
+    failed_model: str | None = None,
+    fallback_provider: str = "",
+    fallback_model: str | None = None,
+    primary_error: str | Exception | None = None,
+    reason: str | Exception | None = None,
+    failure_reason: str | Exception | None = None,
+    ai_log_ids: Sequence[int | str] | None = None,
+    provider_attempts: Sequence[dict[str, Any]] | None = None,
+    attempts: Sequence[dict[str, Any]] | None = None,
+    dialogue_id: int | None = None,
+    topic_id: int | None = None,
+    topic_name: str | None = None,
+    username: str | None = None,
+    full_name: str | None = None,
+) -> bool:
+    """Send realtime notification that reserve AI provider was used successfully."""
+    if user is not None:
+        user_id = getattr(user, "user_id", None) or getattr(user, "id", None) or user_id
+        chat_id = getattr(user, "chat_id", None) or chat_id
+        username = getattr(user, "username", None) or username
+        full_name = getattr(user, "full_name", None) or getattr(user, "name", None) or full_name
+        platform = getattr(user, "platform", platform) or platform
+
+    primary_provider = primary_provider or failed_provider or "Unknown"
+    primary_model = primary_model or failed_model or "—"
+    primary_error = primary_error or reason or failure_reason
+    fallback_model = fallback_model or ""
+    platform_norm = "MAX" if platform.lower() == "max" else "Telegram"
+    b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
+    id_label = f"MAX ID: <code>{user_id}</code>" if platform_norm == "MAX" else f"Telegram ID: <code>{user_id}</code>"
+    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
+
+    raw_err = str(primary_error) if primary_error is not None else "Не зафиксирована"
+    if request_type == "vision":
+        from vision_reliability import sanitize_vision_request_payload
+        raw_err = sanitize_vision_request_payload(raw_err)
+    err_str = sanitize_secret_values(str(raw_err))
+    err_short = _shorten(err_str, 300)
+
+    title_type = "при анализе изображения" if request_type == "vision" else "в текстовом диалоге"
+
+    eff_attempts = provider_attempts or attempts
+    attempts_block = ""
+    if eff_attempts:
+        lines = []
+        for att in eff_attempts:
+            p = att.get("provider", "Unknown")
+            m = att.get("model", "—")
+            st = att.get("status", "UNKNOWN")
+            cls = att.get("classification")
+            mark = "✅" if (st in ("SUCCESS", "success", True) or str(st).upper() == "SUCCESS") else "❌"
+            cls_info = f" ({cls})" if cls else ""
+            lines.append(f"• {html.escape(str(p))} / {html.escape(str(m))} {mark}{cls_info}")
+        attempts_block = "\nПопытки:\n" + "\n".join(lines) + "\n"
+
+    ai_log_line = ""
+    if ai_log_ids:
+        logs_str = ", ".join(f"#{i}" if str(i).isdigit() else str(i) for i in ai_log_ids)
+        ai_log_line = f"\nAI Log IDs: {logs_str}"
+
+    text = (
+        f"ℹ️ <b>[{platform_norm}] Использован резервный AI-провайдер {title_type}</b>\n\n"
+        f"Бот: <code>{html.escape(b_name)}</code>\n"
+        f"{id_label}\n"
+        f"{chat_line}"
+        f"Основной: {html.escape(primary_provider)} / {html.escape(primary_model or '—')} ❌\n"
+        f"Резервный: {html.escape(fallback_provider)} / {html.escape(fallback_model or '—')} ✅\n"
+        f"{attempts_block}"
+        f"Причина переключения:\n"
+        f"<code>{html.escape(err_short)}</code>\n"
+        f"{ai_log_line}"
+    )
+    return await _dispatch_admin_alert_text(bot, text)
+
 

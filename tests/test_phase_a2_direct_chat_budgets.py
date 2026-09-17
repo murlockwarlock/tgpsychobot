@@ -641,9 +641,9 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             resp = await ai_integration.analyze_image_content(b"fake_image", prompt="Describe")
             self.assertEqual(resp, "TG V OpenAI OK")
 
-        self.assertEqual(captured_tg_v_openai[0]["max_completion_tokens"], 4096)
+        self.assertEqual(captured_tg_v_openai[0]["max_completion_tokens"], 16384)
 
-        # Telegram Claude Vision: 4096
+        # Telegram Claude Vision: 16384
         mock_client = AsyncMock()
         mock_msg = MagicMock()
         mock_part = MagicMock()
@@ -667,9 +667,9 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(resp, "TG V Claude OK")
 
-        self.assertEqual(captured_tg_v_claude[0]["max_tokens"], 4096)
+        self.assertEqual(captured_tg_v_claude[0]["max_tokens"], 16384)
 
-        # Telegram Gemini Vision: 4096
+        # Telegram Gemini Vision: 16384
         captured_tg_v_gemini = []
         class FakeGeminiClient:
             async def __aenter__(self):
@@ -694,13 +694,13 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(resp, "TG V Gemini OK")
 
-        self.assertEqual(captured_tg_v_gemini[0]["json"]["generationConfig"]["maxOutputTokens"], 4096)
+        self.assertEqual(captured_tg_v_gemini[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
 
     # -------------------------------------------------------------------------
-    # 23, 24, 25. MAX Vision Remains 4096
+    # 23, 24, 25. MAX Direct Vision is 16384 (A3)
     # -------------------------------------------------------------------------
     async def test_max_vision_budgets_remain_4096(self):
-        # MAX OpenAI Vision: 4096
+        # MAX OpenAI Vision: 16384
         captured_max_v_openai = []
         async def fake_v_openai(**kwargs):
             captured_max_v_openai.append(kwargs)
@@ -717,9 +717,9 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(resp, "MAX V OpenAI OK")
 
-        self.assertEqual(captured_max_v_openai[0]["max_completion_tokens"], 4096)
+        self.assertEqual(captured_max_v_openai[0]["max_completion_tokens"], 16384)
 
-        # MAX Claude Vision: 4096
+        # MAX Claude Vision: 16384
         captured_max_v_claude = []
         async def fake_v_claude(**kwargs):
             captured_max_v_claude.append(kwargs)
@@ -740,9 +740,9 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(resp, "MAX V Claude OK")
 
-        self.assertEqual(captured_max_v_claude[0]["max_tokens"], 4096)
+        self.assertEqual(captured_max_v_claude[0]["max_tokens"], 16384)
 
-        # MAX Gemini Vision: 4096
+        # MAX Gemini Vision: 16384
         captured_max_v_gemini = []
         async def fake_v_gemini(url, *args, **kwargs):
             captured_max_v_gemini.append(kwargs)
@@ -765,7 +765,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(resp, "MAX V Gemini OK")
 
-        self.assertEqual(captured_max_v_gemini[0]["json"]["generationConfig"]["maxOutputTokens"], 4096)
+        self.assertEqual(captured_max_v_gemini[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
 
     # -------------------------------------------------------------------------
     # 26, 27, 28. request_capture & AILog Schemas Unchanged & Value Reflection
