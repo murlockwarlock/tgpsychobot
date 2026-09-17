@@ -622,7 +622,22 @@ async def _upload_file_to_kie(
     try:
         async with httpx.AsyncClient(timeout=client_timeout, trust_env=False) as client:
             response = await client.post(url, headers=headers, data=form_data, files=files)
-        payload = response.json()
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+
+        if response.status_code >= 400:
+            err = AIServiceError(f"Ошибка загрузки файла в KIE (HTTP {response.status_code}): {response.text}")
+            err.http_status = response.status_code
+            if isinstance(payload, dict) and "code" in payload:
+                err.provider_code = payload.get("code")
+            err.provider_response_payload = response.text
+            from error_reporting import classify_external_error
+            code, _ = classify_external_error(err)
+            err.classification = code
+            raise err
+
         data_payload = _validate_kie_json_response(response.status_code, payload, context="KIE upload failed")
         file_url = data_payload.get("downloadUrl") or data_payload.get("fileUrl")
         if not file_url:
@@ -631,7 +646,7 @@ async def _upload_file_to_kie(
     except (AIServiceError, InsufficientBalanceError):
         raise
     except Exception as e:
-        logging.error("KIE upload error", exc_info=e)
+        log.error("KIE upload error: %s", e)
         raise AIServiceError(f"Ошибка загрузки файла в KIE: {exception_summary(e)}") from e
 
 
@@ -2246,17 +2261,21 @@ async def analyze_image(
             raise AIServiceError("Обработка изображений отключена администратором")
 
         primary_provider = (config.vision_provider or "Gemini").strip()
-        primary_model = config.vision_model or get_default_model(primary_provider, channel="vision")
-
         if primary_provider not in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE):
             err = AIServiceError(f"Неподдерживаемый провайдер для vision: {primary_provider}")
             err.classification = "configuration"
             raise err
 
+        configured_model = getattr(config, "vision_model", None)
+        if configured_model and is_retired_model(configured_model):
+            primary_model = get_default_model(primary_provider, channel="vision")
+        else:
+            primary_model = configured_model or get_default_model(primary_provider, channel="vision")
+
         try:
             ensure_model_available(primary_provider, primary_model, channel="vision")
         except Exception as exc:
-            err = AIServiceError(f"Недопустимая модель vision {primary_model} для {primary_provider}: {exc}")
+            err = AIServiceError(f"Недопустимая модель vision {configured_model} для {primary_provider}: {exc}")
             err.classification = "configuration"
             raise err from exc
 
@@ -2549,7 +2568,7 @@ async def analyze_image(
                 request_capture=request_capture,
             )
         elif prov == PROVIDER_OPENAI:
-            api_key = config.openai_api_key
+            api_key = config.openai_api_key or os.getenv('OPENAI_API_KEY')
             if not api_key:
                 raise AIServiceError("API ключ OpenAI для vision не задан")
             return await _analyze_openai(
@@ -2874,7 +2893,7 @@ async def analyze_image(
         elif fb_provider in (PROVIDER_CLAUDE, "Anthropic"):
             has_key = bool(getattr(config, "claude_api_key", None))
         elif fb_provider == PROVIDER_OPENAI:
-            has_key = bool(getattr(config, "openai_api_key", None))
+            has_key = bool(getattr(config, "openai_api_key", None) or os.getenv("OPENAI_API_KEY"))
 
         last_cls = _classify_vision_error(last_exception)
         primary_tokens = get_provider_vision_max_tokens(primary_provider)

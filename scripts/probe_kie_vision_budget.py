@@ -31,6 +31,21 @@ TINY_PNG_BYTES = (
 )
 
 
+import re
+
+_URL_OR_MEDIA_PATTERN = re.compile(
+    r"https?:\/\/[^\s\"'<>]+|data:image\/[^\s\"'<>]+|(?:[A-Za-z0-9+/_-]{4}){16,}={0,2}",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_probe_diagnostic(val: object) -> str:
+    if val is None:
+        return ""
+    text = str(val)
+    return _URL_OR_MEDIA_PATTERN.sub("<redacted_url_or_payload>", text)
+
+
 async def probe_kie_vision(
     api_key: str,
     base_url: str,
@@ -59,9 +74,12 @@ async def probe_kie_vision(
             resp = await client.post(upload_url, headers=headers, data=form_data, files=files)
         upload_lat = time.monotonic() - t0
         print(f"Upload HTTP status: {resp.status_code} (latency: {upload_lat:.3f}s)")
-        upload_json = resp.json()
+        try:
+            upload_json = resp.json()
+        except Exception:
+            upload_json = {}
     except Exception as exc:
-        print(f"FAILED: Upload error: {exc}")
+        print(f"FAILED: Upload error: {type(exc).__name__}: {_sanitize_probe_diagnostic(exc)}")
         return 1
 
     file_url = None
@@ -75,7 +93,7 @@ async def probe_kie_vision(
             file_url = upload_json.get("downloadUrl") or upload_json.get("fileUrl")
 
     if not file_url:
-        print(f"FAILED: Upload returned no file URL. Response: {upload_json}")
+        print(f"FAILED: Upload returned no file URL (HTTP {resp.status_code})")
         return 1
 
     print("Upload successful.")
@@ -110,9 +128,12 @@ async def probe_kie_vision(
             resp = await client.post(inf_url, headers=headers, json=payload)
         inf_lat = time.monotonic() - t1
         print(f"Inference HTTP status: {resp.status_code} (latency: {inf_lat:.3f}s)")
-        resp_json = resp.json()
+        try:
+            resp_json = resp.json()
+        except Exception:
+            resp_json = {}
     except Exception as exc:
-        print(f"FAILED: Inference error: {exc}")
+        print(f"FAILED: Inference error: {type(exc).__name__}: {_sanitize_probe_diagnostic(exc)}")
         return 1
 
     choices = resp_json.get("choices") or []
@@ -143,7 +164,7 @@ async def probe_kie_vision(
         print("Probe status: OUTPUT BUDGET EXHAUSTED (finish_reason=length)")
         return 0
     else:
-        print(f"Probe status: UNEXPECTED RESPONSE (code={resp_json.get('code')}, msg={resp_json.get('msg')})")
+        print(f"Probe status: UNEXPECTED RESPONSE (code={resp_json.get('code')}, msg={_sanitize_probe_diagnostic(resp_json.get('msg'))})")
         return 1
 
 

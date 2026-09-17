@@ -14,6 +14,7 @@ import io
 import json
 import os
 import ssl
+import sys
 import time
 import unittest
 from types import SimpleNamespace
@@ -132,61 +133,65 @@ class VisionClassificationPrecedenceTests(unittest.TestCase):
         self.assertEqual(code, "empty_response")
 
 
-class KIEStructuredBodyCodeParserTests(unittest.TestCase):
-    """Section 7: KIE structured body-code parser tests for HTTP 200 with error codes."""
+class KIEStructuredBodyCodeParserTests(unittest.IsolatedAsyncioTestCase):
+    """Section 4: Real KIE inference path tests with generic HTTP 200 body codes."""
 
-    def test_kie_body_code_402_payment_required(self):
-        for validate_fn in (tg_validate_kie_json_response, max_validate_kie_json_response):
-            with self.assertRaises(Exception) as ctx:
-                validate_fn(200, {"code": 402, "msg": "Insufficient balance or quota"}, context="KIE vision inference")
-            err = ctx.exception
-            self.assertEqual(getattr(err, "http_status", None), 200)
-            self.assertEqual(getattr(err, "provider_code", None), 402)
-            self.assertIn("Insufficient balance or quota", str(getattr(err, "provider_response_payload", "")))
-            code, _ = classify_external_error(err)
-            self.assertEqual(code, "insufficient_balance_quota")
+    async def test_kie_body_codes_real_inference_path(self):
+        cases = [
+            (402, "A", "insufficient_balance_quota"),
+            (429, "B", "rate_limit"),
+            (500, "C", "provider_5xx"),
+            (400, "D", "provider_rejection"),
+            (422, "E", "provider_rejection"),
+        ]
+        from ai_integration import _call_kie_vision_inference as tg_call_kie
+        from max_messenger_bot.ai import _call_kie_vision_inference as max_call_kie
 
-    def test_kie_body_code_429_rate_limit(self):
-        for validate_fn in (tg_validate_kie_json_response, max_validate_kie_json_response):
-            with self.assertRaises(Exception) as ctx:
-                validate_fn(200, {"code": 429, "message": "Too many requests, slow down"}, context="KIE vision inference")
-            err = ctx.exception
-            self.assertEqual(getattr(err, "http_status", None), 200)
-            self.assertEqual(getattr(err, "provider_code", None), 429)
-            code, _ = classify_external_error(err)
-            self.assertEqual(code, "rate_limit")
+        for code, letter, expected_cls in cases:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            resp_data = {"code": code, "msg": f"provider response {letter}"}
+            mock_resp.json.return_value = resp_data
+            mock_resp.text = json.dumps(resp_data)
 
-    def test_kie_body_code_500_server_error(self):
-        for validate_fn in (tg_validate_kie_json_response, max_validate_kie_json_response):
-            with self.assertRaises(Exception) as ctx:
-                validate_fn(200, {"code": 500, "msg": "Internal Server Error"}, context="KIE vision inference")
-            err = ctx.exception
-            self.assertEqual(getattr(err, "http_status", None), 200)
-            self.assertEqual(getattr(err, "provider_code", None), 500)
-            code, _ = classify_external_error(err)
-            self.assertEqual(code, "provider_5xx")
+            # 1. Telegram
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_resp
+                with self.assertRaises(Exception) as ctx:
+                    await tg_call_kie(
+                        api_key="fake-kie-key",
+                        base_url="https://api.kie.ai",
+                        model="gemini-3-flash",
+                        file_url="https://files.kie.ai/tmp/test.jpg",
+                        prompt="test prompt",
+                    )
+                err = ctx.exception
+                self.assertEqual(getattr(err, "http_status", None), 200)
+                self.assertEqual(getattr(err, "provider_code", None), code)
+                cls, _ = classify_external_error(err)
+                self.assertEqual(cls, expected_cls, f"TG: expected {expected_cls} for code {code}, got {cls}")
 
-    def test_kie_body_code_400_and_422_rejection(self):
-        for validate_fn in (tg_validate_kie_json_response, max_validate_kie_json_response):
-            with self.assertRaises(Exception) as ctx:
-                validate_fn(200, {"code": 400, "msg": "Bad request payload"}, context="KIE vision inference")
-            err = ctx.exception
-            self.assertEqual(getattr(err, "http_status", None), 200)
-            self.assertEqual(getattr(err, "provider_code", None), 400)
-            code, _ = classify_external_error(err)
-            self.assertEqual(code, "provider_rejection")
-
-            with self.assertRaises(Exception) as ctx:
-                validate_fn(200, {"code": 422, "msg": "Unprocessable entity parameters"}, context="KIE vision inference")
-            err2 = ctx.exception
-            self.assertEqual(getattr(err2, "http_status", None), 200)
-            self.assertEqual(getattr(err2, "provider_code", None), 422)
-            code2, _ = classify_external_error(err2)
-            self.assertEqual(code2, "provider_rejection")
+            # 2. MAX
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_resp
+                with self.assertRaises(Exception) as ctx:
+                    await max_call_kie(
+                        api_key="fake-kie-key",
+                        base_url="https://api.kie.ai",
+                        model="gemini-3-flash",
+                        file_url="https://files.kie.ai/tmp/test.jpg",
+                        system_prompt="sys",
+                        prompt="test prompt",
+                    )
+                err = ctx.exception
+                self.assertEqual(getattr(err, "http_status", None), 200)
+                self.assertEqual(getattr(err, "provider_code", None), code)
+                cls, _ = classify_external_error(err)
+                self.assertEqual(cls, expected_cls, f"MAX: expected {expected_cls} for code {code}, got {cls}")
 
 
 class VisionMediaRedactionPersistenceTests(unittest.IsolatedAsyncioTestCase):
-    """Section 8: Real DB persistence media redaction test with 4 sentinels."""
+    """Section 10: Real DB persistence media redaction test with realistic media structures."""
 
     async def asyncSetUp(self):
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
@@ -197,11 +202,16 @@ class VisionMediaRedactionPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.engine.dispose()
 
-    async def test_real_db_persistence_redacts_all_four_sentinels(self):
-        sentinel_b64 = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA="
-        sentinel_raw = "SECRET_IMAGE_SENTINEL_BASE64"
-        sentinel_media = "SECRET_MEDIA"
-        sentinel_sig = "SECRET_SIGNATURE"
+    async def test_real_db_persistence_redacts_generic_media_structures(self):
+        marker_uri = "MARKER_URI_PAYLOAD_9999"
+        marker_raw = "MARKER_RAW_CHUNK_8888"
+        marker_kie = "MARKER_KIE_TEMP_7777"
+        marker_sig = "MARKER_SIGNED_S3_6666"
+
+        realistic_b64_uri = f"data:image/jpeg;base64,{marker_uri}" + ("A" * 64)
+        realistic_raw_b64 = f"{marker_raw}" + ("B" * 60) + "=="
+        realistic_kie_url = f"https://files.kie.ai/temp/{marker_kie}.jpg"
+        realistic_signed_url = f"https://s3.amazonaws.com/bucket/image.png?X-Amz-Signature={marker_sig}&token=abc"
 
         async with self.sessions() as session:
             await record_ai_attempt_log(
@@ -211,23 +221,23 @@ class VisionMediaRedactionPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 request_type="vision",
                 provider="OpenAI",
                 model="gpt-5.6-terra",
-                prompt_summary=f"User prompt with {sentinel_sig}",
+                prompt_summary=f"User prompt mentioning {realistic_signed_url}",
                 request_capture={
-                    "image_url": sentinel_b64,
-                    "secret_token": sentinel_raw,
-                    "nested": {"media": sentinel_media},
+                    "image_url": realistic_b64_uri,
+                    "file_url": realistic_kie_url,
+                    "secret_chunk": realistic_raw_b64,
                 },
-                raw_response=f"Answer mentioning {sentinel_sig} and {sentinel_b64}",
+                raw_response=f"Answer mentioning {realistic_signed_url} and {realistic_b64_uri}",
                 clean_text="Clean answer text",
                 latency_ms=500,
                 status="error",
-                error_message=f"Failed due to {sentinel_raw} and {sentinel_media}",
+                error_message=f"Failed due to {realistic_raw_b64} and {realistic_kie_url}",
                 diagnostics={
-                    "error_detail": sentinel_raw,
-                    "sig": sentinel_sig,
-                    "uri": sentinel_b64,
+                    "error_detail": realistic_raw_b64,
+                    "sig": realistic_signed_url,
+                    "uri": realistic_b64_uri,
                 },
-                provider_response_payload=f"{sentinel_raw} {sentinel_sig} {sentinel_media}",
+                provider_response_payload=json.dumps({"url": realistic_signed_url, "data": realistic_raw_b64}),
             )
             await session.commit()
 
@@ -244,24 +254,33 @@ class VisionMediaRedactionPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ]
             for col in columns_to_check:
                 if col is not None:
-                    self.assertNotIn(sentinel_raw, col, f"Sentinel '{sentinel_raw}' leaked into DB: {col}")
-                    self.assertNotIn(sentinel_media, col, f"Sentinel '{sentinel_media}' leaked into DB: {col}")
-                    self.assertNotIn(sentinel_sig, col, f"Sentinel '{sentinel_sig}' leaked into DB: {col}")
-                    self.assertNotIn(sentinel_b64, col, f"Base64 data URI leaked into DB: {col}")
-                    self.assertNotIn("/9j/4AAQSkZJRgABAQEA", col, f"Raw base64 leaked into DB: {col}")
+                    self.assertNotIn(marker_uri, col, f"Marker '{marker_uri}' leaked: {col}")
+                    self.assertNotIn(marker_raw, col, f"Marker '{marker_raw}' leaked: {col}")
+                    self.assertNotIn(marker_kie, col, f"Marker '{marker_kie}' leaked: {col}")
+                    self.assertNotIn(marker_sig, col, f"Marker '{marker_sig}' leaked: {col}")
+                    self.assertNotIn(realistic_b64_uri, col, f"Data URI leaked: {col}")
+                    self.assertNotIn(realistic_raw_b64, col, f"Raw base64 leaked: {col}")
+                    self.assertNotIn(realistic_kie_url, col, f"KIE URL leaked: {col}")
+                    self.assertNotIn(realistic_signed_url, col, f"Signed URL leaked: {col}")
 
 
 class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
-    """Section 9: Alert media redaction test patching _dispatch_admin_alert_text."""
+    """Section 10: Alert media redaction test patching _dispatch_admin_alert_text."""
 
     def setUp(self):
         _terminal_failure_cooldown._last_sent.clear()
+        _output_budget_cooldown._last_sent.clear()
 
     async def test_alert_media_redaction_terminal_and_fallback(self):
-        sentinel_b64 = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA="
-        sentinel_raw = "SECRET_IMAGE_SENTINEL_BASE64"
-        sentinel_media = "SECRET_MEDIA"
-        sentinel_sig = "SECRET_SIGNATURE"
+        marker_uri = "ALERT_MARKER_URI_1111"
+        marker_raw = "ALERT_MARKER_RAW_2222"
+        marker_kie = "ALERT_MARKER_KIE_3333"
+        marker_sig = "ALERT_MARKER_SIG_4444"
+
+        realistic_b64_uri = f"data:image/jpeg;base64,{marker_uri}" + ("A" * 64)
+        realistic_raw_b64 = f"{marker_raw}" + ("B" * 60) + "=="
+        realistic_kie_url = f"https://files.kie.ai/temp/{marker_kie}.jpg"
+        realistic_signed_url = f"https://s3.amazonaws.com/bucket/image.png?X-Amz-Signature={marker_sig}&token=xyz"
 
         mock_bot = MagicMock()
         mock_user = SimpleNamespace(id=9999, full_name="Secret User", username="secretuser")
@@ -279,26 +298,29 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
                 model="gpt-5.6-terra",
                 stage="vision_inference",
                 classification="provider_rejection",
-                details=f"Failure with {sentinel_raw} and {sentinel_media} and {sentinel_sig} {sentinel_b64}",
-                exception=AIServiceError(f"Exception containing {sentinel_raw} and {sentinel_sig}"),
+                details=f"Failure with {realistic_raw_b64} and {realistic_kie_url} and {realistic_signed_url} {realistic_b64_uri}",
+                exception=AIServiceError(f"Exception containing {realistic_raw_b64} and {realistic_signed_url}"),
                 request_type="vision",
                 attempts=[
                     {
                         "provider": "OpenAI",
                         "model": "gpt-5.6-terra",
                         "status": "error",
-                        "error": f"Attempt error with {sentinel_media} and {sentinel_b64}",
+                        "error": f"Attempt error with {realistic_kie_url} and {realistic_b64_uri}",
                     }
                 ],
             )
 
             self.assertTrue(mock_dispatch.called)
             alert_text = mock_dispatch.call_args[0][1]
-            self.assertNotIn(sentinel_raw, alert_text)
-            self.assertNotIn(sentinel_media, alert_text)
-            self.assertNotIn(sentinel_sig, alert_text)
-            self.assertNotIn(sentinel_b64, alert_text)
-            self.assertNotIn("/9j/4AAQSkZJRgABAQEA", alert_text)
+            self.assertNotIn(marker_uri, alert_text)
+            self.assertNotIn(marker_raw, alert_text)
+            self.assertNotIn(marker_kie, alert_text)
+            self.assertNotIn(marker_sig, alert_text)
+            self.assertNotIn(realistic_b64_uri, alert_text)
+            self.assertNotIn(realistic_raw_b64, alert_text)
+            self.assertNotIn(realistic_kie_url, alert_text)
+            self.assertNotIn(realistic_signed_url, alert_text)
 
             mock_dispatch.reset_mock()
 
@@ -309,7 +331,7 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
                 primary_model="gpt-5.6-terra",
                 fallback_provider="KIE",
                 fallback_model="gemini-3-flash",
-                failure_reason=f"Failed due to {sentinel_raw} and {sentinel_sig} with {sentinel_b64}",
+                failure_reason=f"Failed due to {realistic_raw_b64} and {realistic_signed_url} with {realistic_b64_uri}",
                 user=mock_user,
                 dialogue_id=1,
                 request_type="vision",
@@ -318,31 +340,66 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
                         "provider": "OpenAI",
                         "model": "gpt-5.6-terra",
                         "status": "error",
-                        "error": f"Failed with {sentinel_media}",
+                        "error": f"Failed with {realistic_kie_url}",
                     }
                 ],
             )
 
             self.assertTrue(mock_dispatch.called)
             fallback_alert_text = mock_dispatch.call_args[0][1]
-            self.assertNotIn(sentinel_raw, fallback_alert_text)
-            self.assertNotIn(sentinel_media, fallback_alert_text)
-            self.assertNotIn(sentinel_sig, fallback_alert_text)
-            self.assertNotIn(sentinel_b64, fallback_alert_text)
-            self.assertNotIn("/9j/4AAQSkZJRgABAQEA", fallback_alert_text)
+            self.assertNotIn(marker_uri, fallback_alert_text)
+            self.assertNotIn(marker_raw, fallback_alert_text)
+            self.assertNotIn(marker_kie, fallback_alert_text)
+            self.assertNotIn(marker_sig, fallback_alert_text)
+            self.assertNotIn(realistic_b64_uri, fallback_alert_text)
+            self.assertNotIn(realistic_raw_b64, fallback_alert_text)
+            self.assertNotIn(realistic_kie_url, fallback_alert_text)
+            self.assertNotIn(realistic_signed_url, fallback_alert_text)
+
+            mock_dispatch.reset_mock()
+
+            # 3. Test output-budget alert
+            await send_output_budget_exhausted_alert(
+                bot=mock_bot,
+                provider="OpenAI",
+                model="gpt-5.6-terra",
+                max_tokens=16384,
+                finish_reason="length",
+                user=mock_user,
+                dialogue_id=1,
+                request_type="vision",
+                details=f"Exhausted on {realistic_kie_url} with {realistic_raw_b64}",
+            )
+            self.assertTrue(mock_dispatch.called)
+            budget_alert_text = mock_dispatch.call_args[0][1]
+            self.assertNotIn(marker_uri, budget_alert_text)
+            self.assertNotIn(marker_raw, budget_alert_text)
+            self.assertNotIn(marker_kie, budget_alert_text)
+            self.assertNotIn(marker_sig, budget_alert_text)
 
 
 class VisionPolicyAndFallbackTests(unittest.TestCase):
     """Test shared policy helpers in vision_reliability.py."""
 
     def test_order_kie_vision_candidates_primary_first(self):
-        candidates = order_kie_vision_candidates("gemini-3-flash")
-        self.assertEqual(candidates[0], "gemini-3-flash")
-        self.assertIn("gemini-2.5-flash", candidates)
+        from provider_models import get_selectable_models, PROVIDER_KIE
+        catalog = list(get_selectable_models(PROVIDER_KIE, "vision"))
+        self.assertTrue(len(catalog) >= 2)
+        m1, m2 = catalog[0], catalog[1]
 
-        candidates_rev = order_kie_vision_candidates("gemini-2.5-flash")
-        self.assertEqual(candidates_rev[0], "gemini-2.5-flash")
-        self.assertIn("gemini-3-flash", candidates_rev)
+        candidates = order_kie_vision_candidates(m1)
+        self.assertEqual(candidates[0], m1)
+        self.assertIn(m2, candidates)
+
+        candidates_rev = order_kie_vision_candidates(m2)
+        self.assertEqual(candidates_rev[0], m2)
+        self.assertIn(m1, candidates_rev)
+
+        # Empty catalog check: does not invent alternate models
+        candidates_empty = order_kie_vision_candidates("some-custom-model", selectable_models=[])
+        self.assertEqual(candidates_empty, ["some-custom-model"])
+        candidates_none = order_kie_vision_candidates("", selectable_models=[])
+        self.assertEqual(candidates_none, [])
 
     def test_should_retry_kie_vision_upload(self):
         self.assertTrue(should_retry_kie_vision_upload("timeout"))
@@ -616,6 +673,7 @@ class VisionOrchestrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """Test full Telegram and MAX vision orchestration lifecycles."""
 
     async def asyncSetUp(self):
+        AIConfig.__table__.c.vision_model.nullable = True
         self.engine = create_async_engine(
             "sqlite+aiosqlite:///:memory:",
             poolclass=StaticPool,
@@ -658,6 +716,7 @@ class VisionOrchestrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
     async def asyncTearDown(self):
+        AIConfig.__table__.c.vision_model.nullable = False
         handlers.async_session_maker = self._orig_handlers_sessions
         ai_integration.async_session_maker = self._orig_ai_sessions
         max_ai.async_session_maker = self._orig_max_ai_sessions
@@ -1330,6 +1389,7 @@ class VisionOrchestrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
             cfg.vision_provider = "UnknownProviderXYZ"
+            cfg.vision_model = None
             await session.commit()
 
         tracker = ActivityTracker(self.sessions, user_id=7001 + MAX_ID_OFFSET, topic_id=1, track_user_activity=True)
@@ -1348,13 +1408,6 @@ class VisionOrchestrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(err_ctx.exception.classification, "configuration")
             mock_http.assert_not_called()
             mock_openai.assert_not_called()
-
-        self.assertFalse(tracker._marked)
-        async with self.sessions() as session:
-            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001 + MAX_ID_OFFSET))).all()
-            self.assertEqual(len(logs), 0)
-            activities = (await session.scalars(select(UserAIActivity).where(UserAIActivity.user_id == 7001 + MAX_ID_OFFSET))).all()
-            self.assertEqual(len(activities), 0)
 
         self.assertFalse(tracker._marked)
         async with self.sessions() as session:
@@ -1547,9 +1600,441 @@ class VisionOrchestrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     execution_context=ctx,
                 )
 
+    async def test_max_real_upload_file_to_kie_non_json_503(self):
+        """REAL max_messenger_bot.ai._upload_file_to_kie() on non-JSON HTTP 503 classifies as provider_5xx with http_status 503."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        mock_resp.text = "<html>temporary outage</html>"
+        mock_resp.json.side_effect = json.JSONDecodeError("Expecting value", "<html>", 0)
+
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = mock_resp
+            with self.assertRaises(max_ai.AIServiceError) as err_ctx:
+                await max_ai._upload_file_to_kie(
+                    api_key="fake-key",
+                    upload_base_url="https://upload.kie.ai",
+                    file_bytes=b"fake-bytes",
+                    filename="photo.jpg",
+                    upload_path="images",
+                )
+            exc = err_ctx.exception
+            self.assertEqual(getattr(exc, "http_status", None), 503)
+            self.assertEqual(getattr(exc, "classification", None), "provider_5xx")
+
+    async def test_max_real_kie_upload_503_fallback_orchestration_retry_success(self):
+        """Drive provider-fallback orchestration: attempt 1 non-JSON HTTP 503 -> retry attempt 2 succeeds -> inference succeeds. Real _upload_file_to_kie."""
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.allow_vision_fallback = True
+            cfg.vision_fallback_provider = "KIE"
+            cfg.vision_fallback_model = "gemini-3-flash"
+            await session.commit()
+
+        ctx = VisionExecutionContext(
+            user_id=7001 + MAX_ID_OFFSET,
+            dialogue_id=1,
+            topic_id=1,
+            platform="max",
+            bot=None,
+        )
+
+        async def fake_openai_fail(**kwargs):
+            raise httpx.ReadTimeout("Primary OpenAI timeout")
+
+        upload_http_calls = 0
+        inference_http_calls = 0
+
+        async def fake_httpx_post(url, *args, **kwargs):
+            nonlocal upload_http_calls, inference_http_calls
+            if "file-stream-upload" in str(url):
+                upload_http_calls += 1
+                if upload_http_calls == 1:
+                    resp = MagicMock()
+                    resp.status_code = 503
+                    resp.text = "<html>temporary outage</html>"
+                    resp.json.side_effect = json.JSONDecodeError("Expecting value", "<html>", 0)
+                    return resp
+                else:
+                    resp = MagicMock()
+                    resp.status_code = 200
+                    resp.json.return_value = {"code": 200, "data": {"downloadUrl": "https://files.kie.ai/tmp/recovered.jpg"}}
+                    resp.text = json.dumps({"code": 200, "data": {"downloadUrl": "https://files.kie.ai/tmp/recovered.jpg"}})
+                    return resp
+            else:
+                inference_http_calls += 1
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.json.return_value = {"choices": [{"message": {"content": "KIE recovered inference output"}}]}
+                resp.text = json.dumps({"choices": [{"message": {"content": "KIE recovered inference output"}}]})
+                return resp
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_openai_fail), \
+             patch("httpx.AsyncClient.post", side_effect=fake_httpx_post), \
+             patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock):
+            res = await max_ai.analyze_image(
+                user_id=7001 + MAX_ID_OFFSET,
+                image_bytes=b"fake-image",
+                prompt="describe image",
+                execution_context=ctx,
+            )
+            self.assertEqual(res, "KIE recovered inference output")
+
+        self.assertEqual(upload_http_calls, 2)
+        self.assertEqual(inference_http_calls, 1)
+        async with self.sessions() as session:
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001 + MAX_ID_OFFSET).order_by(AILog.id))).all()
+            self.assertEqual(len(logs), 2)
+            self.assertEqual(logs[0].provider, "OpenAI")
+            self.assertEqual(logs[0].status, "error")
+            self.assertEqual(logs[1].provider, "KIE")
+            self.assertEqual(logs[1].status, "success")
+            self.assertEqual(logs[1].attempt_role, "fallback")
+
+    async def test_max_openai_env_key_parity(self):
+        """OpenAI primary vision accepts OPENAI_API_KEY from environment when config key is None."""
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.openai_api_key = None
+            await session.commit()
+
+        ctx = VisionExecutionContext(user_id=7001 + MAX_ID_OFFSET, dialogue_id=1, topic_id=1, platform="max", bot=None)
+
+        fake_resp = MagicMock()
+        fake_choice = MagicMock()
+        fake_choice.finish_reason = "stop"
+        fake_choice.message.content = "OpenAI Env Key Success"
+        fake_choice.message.refusal = None
+        fake_resp.choices = [fake_choice]
+        fake_usage = None
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "env-test-key"}), \
+             patch("openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock) as mock_create:
+            mock_create.return_value = fake_resp
+            res = await max_ai.analyze_image(
+                user_id=7001 + MAX_ID_OFFSET,
+                image_bytes=b"fake-bytes",
+                prompt="Analyze",
+                execution_context=ctx,
+            )
+            self.assertEqual(res, "OpenAI Env Key Success")
+            mock_create.assert_called_once()
+
+        async with self.sessions() as session:
+            logs = (await session.scalars(select(AILog).where(AILog.user_id == 7001 + MAX_ID_OFFSET))).all()
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0].status, "success")
+            self.assertNotEqual(logs[0].error_classification, "configuration")
+
+    async def test_probe_output_never_leaks_temp_url_or_payload(self):
+        """Probe diagnostic script never prints temp media URLs, download URLs, or provider payloads."""
+        from scripts.probe_kie_vision_budget import probe_kie_vision
+
+        leak_url = "https://files.kie.ai/temp/DO_NOT_PRINT.jpg"
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.json.return_value = {"code": 400, "msg": f"Upload rejected {leak_url}"}
+
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_resp
+                rc = await probe_kie_vision(
+                    api_key="fake-key",
+                    base_url="https://api.kie.ai",
+                    upload_base_url="https://upload.kie.ai",
+                    model="gemini-3-flash",
+                )
+                self.assertEqual(rc, 1)
+        finally:
+            sys.stdout = old_stdout
+
+        out = buf.getvalue()
+        self.assertNotIn("DO_NOT_PRINT", out)
+        self.assertNotIn(leak_url, out)
+
+    async def test_telegram_fallback_15s_aggregate_budget_skips_inference(self):
+        """Telegram KIE provider fallback: when upload consumes stage time leaving <3s, inference is NOT called."""
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.allow_vision_fallback = True
+            cfg.vision_fallback_provider = "KIE"
+            cfg.vision_fallback_model = "gemini-3-flash"
+            await session.commit()
+
+        ctx = VisionExecutionContext(user_id=7001, dialogue_id=1, topic_id=1, platform="telegram", bot=None)
+
+        async def fake_openai_timeout(**kwargs):
+            raise httpx.ReadTimeout("OpenAI timeout")
+
+        curr_time = [100.0]
+
+        def fake_monotonic():
+            return curr_time[0]
+
+        upload_calls = 0
+        async def fake_upload(*args, **kwargs):
+            nonlocal upload_calls
+            upload_calls += 1
+            # Advance time by 13.0 seconds during upload
+            curr_time[0] += 13.0
+            return "https://files.kie.ai/tmp/too_late.jpg"
+
+        inference_mock = AsyncMock()
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_openai_timeout), \
+             patch("time.monotonic", side_effect=fake_monotonic), \
+             patch("ai_integration._upload_file_to_kie", side_effect=fake_upload), \
+             patch("ai_integration._call_kie_vision_inference", new=inference_mock), \
+             patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock):
+            with self.assertRaises(AIServiceError) as err_ctx:
+                await analyze_image_content(b"fake_image_bytes", prompt="Analyze", execution_context=ctx)
+
         self.assertEqual(upload_calls, 1)
+        inference_mock.assert_not_called()
+
+    async def test_max_fallback_15s_aggregate_budget_skips_inference(self):
+        """MAX KIE provider fallback: when upload consumes stage time leaving <3s, inference is NOT called."""
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.allow_vision_fallback = True
+            cfg.vision_fallback_provider = "KIE"
+            cfg.vision_fallback_model = "gemini-3-flash"
+            await session.commit()
+
+        ctx = VisionExecutionContext(user_id=7001 + MAX_ID_OFFSET, dialogue_id=1, topic_id=1, platform="max", bot=None)
+
+        async def fake_openai_timeout(**kwargs):
+            raise httpx.ReadTimeout("OpenAI timeout")
+
+        curr_time = [200.0]
+
+        def fake_monotonic():
+            return curr_time[0]
+
+        upload_calls = 0
+        async def fake_upload(*args, **kwargs):
+            nonlocal upload_calls
+            upload_calls += 1
+            curr_time[0] += 13.0
+            return "https://files.kie.ai/tmp/too_late_max.jpg"
+
+        inference_mock = AsyncMock()
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=fake_openai_timeout), \
+             patch("time.monotonic", side_effect=fake_monotonic), \
+             patch("max_messenger_bot.ai._upload_file_to_kie", side_effect=fake_upload), \
+             patch("max_messenger_bot.ai._call_kie_vision_inference", new=inference_mock), \
+             patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock):
+            with self.assertRaises((AIServiceError, max_ai.AIServiceError)):
+                await max_ai.analyze_image(
+                    user_id=7001 + MAX_ID_OFFSET,
+                    image_bytes=b"fake_image_bytes",
+                    prompt="MAX prompt",
+                    execution_context=ctx,
+                )
+
+        self.assertEqual(upload_calls, 1)
+        inference_mock.assert_not_called()
+
+    async def test_max_vision_openai_metadata_persistence_success(self):
+        """MAX OpenAI vision success persists finish_reason, usage, and provider_response_payload to AILog."""
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.openai_api_key = "test-openai-key"
+            cfg.allow_vision_fallback = False
+            await session.commit()
+
+        ctx = VisionExecutionContext(user_id=7001 + MAX_ID_OFFSET, dialogue_id=1, topic_id=1, platform="max", bot=None)
+
+        fake_resp = MagicMock()
+        fake_choice = MagicMock()
+        fake_choice.finish_reason = "stop"
+        fake_choice.message.content = "OpenAI Analysis Done"
+        fake_choice.message.refusal = None
+        fake_resp.choices = [fake_choice]
+        fake_usage = MagicMock()
+        fake_usage.model_dump.return_value = {"prompt_tokens": 15, "completion_tokens": 40, "total_tokens": 55}
+        fake_resp.usage = fake_usage
+        fake_resp.id = "chatcmpl-max-openai-1"
+        fake_resp.model = "gpt-5.6-terra"
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock) as mock_create:
+            mock_create.return_value = fake_resp
+            res = await max_ai.analyze_image(
+                user_id=7001 + MAX_ID_OFFSET,
+                image_bytes=b"fake-bytes",
+                prompt="Describe",
+                execution_context=ctx,
+            )
+            self.assertEqual(res, "OpenAI Analysis Done")
+
+        async with self.sessions() as session:
+            row = (await session.scalars(select(AILog).where(AILog.user_id == 7001 + MAX_ID_OFFSET))).first()
+            self.assertIsNotNone(row)
+            self.assertEqual(row.provider, "OpenAI")
+            self.assertEqual(row.status, "success")
+            diag = json.loads(row.diagnostics_json)
+            self.assertEqual(diag.get("finish_reason"), "stop")
+            self.assertEqual(diag.get("usage", {}).get("completion_tokens"), 40)
+            self.assertIsNotNone(row.provider_response_payload)
+            self.assertIn("chatcmpl-max-openai-1", row.provider_response_payload)
+
+    async def test_max_vision_claude_metadata_persistence_success(self):
+        """MAX Claude vision success persists stop_reason as finish_reason and usage to AILog."""
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "Claude"
+            cfg.vision_model = "claude-sonnet-5"
+            cfg.claude_api_key = "test-claude-key"
+            cfg.allow_vision_fallback = False
+            await session.commit()
+
+        ctx = VisionExecutionContext(user_id=7001 + MAX_ID_OFFSET, dialogue_id=1, topic_id=1, platform="max", bot=None)
+
+        fake_resp = MagicMock()
+        fake_resp.id = "msg_claude_max_1"
+        fake_resp.model = "claude-sonnet-5"
+        fake_resp.stop_reason = "end_turn"
+        fake_block = MagicMock()
+        fake_block.type = "text"
+        fake_block.text = "Claude Analysis Done"
+        fake_resp.content = [fake_block]
+        fake_usage = MagicMock()
+        fake_usage.model_dump.return_value = {"input_tokens": 20, "output_tokens": 50}
+        fake_resp.usage = fake_usage
+
+        with patch("anthropic.resources.messages.AsyncMessages.create", new_callable=AsyncMock) as mock_create:
+            mock_create.return_value = fake_resp
+            res = await max_ai.analyze_image(
+                user_id=7001 + MAX_ID_OFFSET,
+                image_bytes=b"fake-bytes",
+                prompt="Describe",
+                execution_context=ctx,
+            )
+            self.assertEqual(res, "Claude Analysis Done")
+
+        async with self.sessions() as session:
+            row = (await session.scalars(select(AILog).where(AILog.user_id == 7001 + MAX_ID_OFFSET))).first()
+            self.assertIsNotNone(row)
+            self.assertEqual(row.provider, "Claude")
+            self.assertEqual(row.status, "success")
+            diag = json.loads(row.diagnostics_json)
+            self.assertEqual(diag.get("finish_reason"), "end_turn")
+            self.assertEqual(diag.get("usage", {}).get("output_tokens"), 50)
+            self.assertIsNotNone(row.provider_response_payload)
+            self.assertIn("msg_claude_max_1", row.provider_response_payload)
+
+    async def test_max_vision_gemini_metadata_persistence_success(self):
+        """MAX Gemini vision success persists finishReason and usageMetadata to AILog."""
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "Gemini"
+            cfg.vision_model = "gemini-3.7-flash"
+            cfg.gemini_api_key = "test-gemini-key"
+            cfg.allow_vision_fallback = False
+            await session.commit()
+
+        ctx = VisionExecutionContext(user_id=7001 + MAX_ID_OFFSET, dialogue_id=1, topic_id=1, platform="max", bot=None)
+
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        gemini_payload = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "Gemini Analysis Done"}]},
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 18,
+                "candidatesTokenCount": 60,
+                "totalTokenCount": 78,
+            },
+        }
+        fake_resp.json.return_value = gemini_payload
+
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = fake_resp
+            res = await max_ai.analyze_image(
+                user_id=7001 + MAX_ID_OFFSET,
+                image_bytes=b"fake-bytes",
+                prompt="Describe",
+                execution_context=ctx,
+            )
+            self.assertEqual(res, "Gemini Analysis Done")
+
+        async with self.sessions() as session:
+            row = (await session.scalars(select(AILog).where(AILog.user_id == 7001 + MAX_ID_OFFSET))).first()
+            self.assertIsNotNone(row)
+            self.assertEqual(row.provider, "Gemini")
+            self.assertEqual(row.status, "success")
+            diag = json.loads(row.diagnostics_json)
+            self.assertEqual(diag.get("finish_reason"), "STOP")
+            self.assertEqual(diag.get("usage", {}).get("candidatesTokenCount"), 60)
+            self.assertIsNotNone(row.provider_response_payload)
+
+    async def test_max_vision_openai_output_budget_exhausted_metadata_persistence(self):
+        """MAX OpenAI vision length failure persists status=error, classification=output_budget_exhausted, finish_reason=length, and usage without returning partial text."""
+        async with self.sessions() as session:
+            cfg = await session.get(AIConfig, 1)
+            cfg.vision_provider = "OpenAI"
+            cfg.vision_model = "gpt-5.6-terra"
+            cfg.openai_api_key = "test-openai-key"
+            cfg.allow_vision_fallback = False
+            await session.commit()
+
+        ctx = VisionExecutionContext(user_id=7001 + MAX_ID_OFFSET, dialogue_id=1, topic_id=1, platform="max", bot=None)
+
+        fake_resp = MagicMock()
+        fake_choice = MagicMock()
+        fake_choice.finish_reason = "length"
+        fake_choice.message.content = "Incomplete partial sentence that exceeded output budget"
+        fake_choice.message.refusal = None
+        fake_resp.choices = [fake_choice]
+        fake_usage = MagicMock()
+        fake_usage.model_dump.return_value = {"prompt_tokens": 10, "completion_tokens": 16384, "total_tokens": 16394}
+        fake_resp.usage = fake_usage
+        fake_resp.id = "chatcmpl-max-length"
+        fake_resp.model = "gpt-5.6-terra"
+
+        with patch("openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock) as mock_create, \
+             patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock):
+            mock_create.return_value = fake_resp
+            with self.assertRaises((AIServiceError, max_ai.AIServiceError)) as err_ctx:
+                await max_ai.analyze_image(
+                    user_id=7001 + MAX_ID_OFFSET,
+                    image_bytes=b"fake-bytes",
+                    prompt="Describe",
+                    execution_context=ctx,
+                )
+            self.assertEqual(err_ctx.exception.classification, "output_budget_exhausted")
+
+        async with self.sessions() as session:
+            row = (await session.scalars(select(AILog).where(AILog.user_id == 7001 + MAX_ID_OFFSET))).first()
+            self.assertIsNotNone(row)
+            self.assertEqual(row.provider, "OpenAI")
+            self.assertEqual(row.status, "error")
+            self.assertEqual(row.error_classification, "output_budget_exhausted")
+            diag = json.loads(row.diagnostics_json)
+            self.assertEqual(diag.get("finish_reason"), "length")
+            self.assertEqual(diag.get("usage", {}).get("completion_tokens"), 16384)
+            self.assertIsNotNone(row.provider_response_payload)
+            self.assertIn("chatcmpl-max-length", row.provider_response_payload)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

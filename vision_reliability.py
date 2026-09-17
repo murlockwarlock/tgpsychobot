@@ -166,8 +166,8 @@ def attach_error_metadata(
 
 # Regex patterns for media redaction
 _BASE64_DATA_URI_PATTERN = re.compile(r"data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=_-]+", re.IGNORECASE)
-_RAW_BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{4}){16,}={0,2}|SECRET_IMAGE_SENTINEL_BASE64")
-_KIE_MEDIA_URL_PATTERN = re.compile(r"https?:\/\/[^\s\"'<>]+(?:\/upload\/|\/files\/|\/temp\/|\/file-stream-upload|\/images\/)[^\s\"'<>]+", re.IGNORECASE)
+_RAW_BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/_-]{4}){16,}={0,2}")
+_KIE_MEDIA_URL_PATTERN = re.compile(r"https?:\/\/[^\s\"'<>]+(?:\/upload\/|\/files\/|\/temp\/|\/download\/|\/file-stream-upload|\/images\/)[^\s\"'<>]+", re.IGNORECASE)
 _SIGNED_MEDIA_URL_PATTERN = re.compile(
     r"https?:\/\/[^\s\"'<>]+\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^\s\"'<>]*)?|https?:\/\/[^\s\"'<>]*?(?:X-Amz-Signature|signature=|sig=|token=)[^\s\"'<>]*", re.IGNORECASE
 )
@@ -193,14 +193,8 @@ def sanitize_vision_request_payload(payload: Any) -> Any:
             payload = _KIE_MEDIA_URL_PATTERN.sub("<redacted_kie_media_url>", payload)
         if _SIGNED_MEDIA_URL_PATTERN.search(payload):
             payload = _SIGNED_MEDIA_URL_PATTERN.sub("<redacted_media_url>", payload)
-        # 3. Check base64 chunks & sentinels
-        if "SECRET_IMAGE_SENTINEL_BASE64" in payload:
-            payload = payload.replace("SECRET_IMAGE_SENTINEL_BASE64", "<redacted_base64_data>")
-        if "SECRET_MEDIA" in payload:
-            payload = payload.replace("SECRET_MEDIA", "<redacted_media>")
-        if "SECRET_SIGNATURE" in payload:
-            payload = payload.replace("SECRET_SIGNATURE", "<redacted_signature>")
-        if len(payload) > 100 and _RAW_BASE64_PATTERN.search(payload):
+        # 3. Check long standard or URL-safe base64 chunks
+        if _RAW_BASE64_PATTERN.search(payload):
             payload = _RAW_BASE64_PATTERN.sub("<redacted_base64_data>", payload)
         return payload
 
@@ -309,9 +303,9 @@ def order_kie_vision_candidates(
     """
     if selectable_models is None:
         try:
-            from provider_models import PROVIDER_KIE, SELECTABLE_VISION_MODELS
-            catalog = list(SELECTABLE_VISION_MODELS.get(PROVIDER_KIE, ()))
-        except ImportError:
+            from provider_models import PROVIDER_KIE, get_selectable_models
+            catalog = list(get_selectable_models(PROVIDER_KIE, "vision"))
+        except Exception:
             catalog = []
     else:
         catalog = [str(m).strip() for m in selectable_models if str(m).strip()]
@@ -328,9 +322,6 @@ def order_kie_vision_candidates(
         if m not in candidates:
             candidates.append(m)
             break
-
-    if not candidates:
-        candidates.append(p or "gemini-2.5-flash")
 
     return candidates
 
