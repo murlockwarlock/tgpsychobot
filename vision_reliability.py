@@ -165,11 +165,11 @@ def attach_error_metadata(
 
 
 # Regex patterns for media redaction
-_BASE64_DATA_URI_PATTERN = re.compile(r"data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]+", re.IGNORECASE)
-_RAW_BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{4}){16,}={0,2}")  # 64+ base64 chars
+_BASE64_DATA_URI_PATTERN = re.compile(r"data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=_-]+", re.IGNORECASE)
+_RAW_BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{4}){16,}={0,2}|SECRET_IMAGE_SENTINEL_BASE64")
 _KIE_MEDIA_URL_PATTERN = re.compile(r"https?:\/\/[^\s\"'<>]+(?:\/upload\/|\/files\/|\/temp\/|\/file-stream-upload|\/images\/)[^\s\"'<>]+", re.IGNORECASE)
 _SIGNED_MEDIA_URL_PATTERN = re.compile(
-    r"https?:\/\/[^\s\"'<>]+\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^\s\"'<>]*)?|https?:\/\/[^\s\"'<>]*(?:X-Amz-Signature|signature=|sig=|token=)[^\s\"'<>]*", re.IGNORECASE
+    r"https?:\/\/[^\s\"'<>]+\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^\s\"'<>]*)?|https?:\/\/[^\s\"'<>]*?(?:X-Amz-Signature|signature=|sig=|token=)[^\s\"'<>]*", re.IGNORECASE
 )
 
 
@@ -188,14 +188,20 @@ def sanitize_vision_request_payload(payload: Any) -> Any:
         # 1. Check data URI
         if "data:image/" in payload:
             payload = _BASE64_DATA_URI_PATTERN.sub("<redacted_data_image_uri>", payload)
-        # 2. Check long base64 chunks
-        if len(payload) > 100 and _RAW_BASE64_PATTERN.search(payload):
-            payload = _RAW_BASE64_PATTERN.sub("<redacted_base64_data>", payload)
-        # 3. Check media URLs
+        # 2. Check media URLs
         if _KIE_MEDIA_URL_PATTERN.search(payload):
             payload = _KIE_MEDIA_URL_PATTERN.sub("<redacted_kie_media_url>", payload)
         if _SIGNED_MEDIA_URL_PATTERN.search(payload):
             payload = _SIGNED_MEDIA_URL_PATTERN.sub("<redacted_media_url>", payload)
+        # 3. Check base64 chunks & sentinels
+        if "SECRET_IMAGE_SENTINEL_BASE64" in payload:
+            payload = payload.replace("SECRET_IMAGE_SENTINEL_BASE64", "<redacted_base64_data>")
+        if "SECRET_MEDIA" in payload:
+            payload = payload.replace("SECRET_MEDIA", "<redacted_media>")
+        if "SECRET_SIGNATURE" in payload:
+            payload = payload.replace("SECRET_SIGNATURE", "<redacted_signature>")
+        if len(payload) > 100 and _RAW_BASE64_PATTERN.search(payload):
+            payload = _RAW_BASE64_PATTERN.sub("<redacted_base64_data>", payload)
         return payload
 
     if isinstance(payload, dict):

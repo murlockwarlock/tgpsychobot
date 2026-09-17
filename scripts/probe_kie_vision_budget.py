@@ -36,7 +36,7 @@ async def probe_kie_vision(
     base_url: str,
     upload_base_url: str,
     model: str,
-    max_tokens: int = 4096,
+    max_tokens: int = 16384,
 ) -> int:
     print("=" * 60)
     print("KIE Vision Diagnostic Probe")
@@ -78,19 +78,23 @@ async def probe_kie_vision(
         print(f"FAILED: Upload returned no file URL. Response: {upload_json}")
         return 1
 
-    print("Upload successful. File URL: <redacted_file_url>")
+    print("Upload successful.")
 
     # 2. Inference stage
     print(f"\n[Stage 2] Running multimodal inference with model {model}...")
     inf_url = f"{base_url.rstrip('/')}/{model}/v1/chat/completions"
 
+    prompt_text = (
+        "Produce a numbered synthetic sequence of repeated neutral tokens for at least 5000 completion tokens. "
+        "Do not summarize. Do not stop early voluntarily."
+    )
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Describe this synthetic probe image in one concise sentence."},
+                    {"type": "text", "text": prompt_text},
                     {"type": "image_url", "image_url": {"url": file_url}},
                 ],
             }
@@ -126,11 +130,10 @@ async def probe_kie_vision(
     print(f"- Finish reason: {finish_reason}")
     print(f"- Token usage: {usage}")
     print(f"- Output text length: {len(output_text)} characters")
-    print(f"- Output preview: {output_text[:200]}")
     print(f"- Total probe duration: {(time.monotonic() - t0):.3f}s")
     print("=" * 60)
 
-    if resp.status_code == 200 and finish_reason != "length" and output_text:
+    if resp.status_code == 200 and output_text:
         if comp_tokens > 4096:
             print(f"Probe status: ELEVATION EVIDENCE OBSERVED (completion_tokens={comp_tokens} > 4096)")
         else:
@@ -150,7 +153,7 @@ def main() -> None:
     parser.add_argument("--base-url", default=os.getenv("KIE_BASE_URL", "https://api.kie.ai"), help="KIE Base URL")
     parser.add_argument("--upload-url", default=os.getenv("KIE_UPLOAD_BASE_URL", "https://upload.kie.ai"), help="KIE Upload Base URL")
     parser.add_argument("--model", default="gemini-3-flash", help="KIE multimodal model name")
-    parser.add_argument("--max-tokens", type=int, default=4096, help="Initial max tokens budget")
+    parser.add_argument("--max-tokens", type=int, default=16384, help="Initial max tokens budget")
 
     args = parser.parse_args()
 

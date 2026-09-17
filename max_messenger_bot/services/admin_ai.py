@@ -151,6 +151,8 @@ def _build_keys_keyboard(config) -> list:
     img_edit_enabled = getattr(config, 'allow_image_edit', False)
     fallback_enabled = getattr(config, 'allow_fallback', False)
     vision_fallback_enabled = getattr(config, 'allow_vision_fallback', False)
+    vision_fb_provider = getattr(config, 'vision_fallback_provider', None)
+    vision_fb_model = getattr(config, 'vision_fallback_model', None) or _vision_fallback_model_for_provider(config, vision_fb_provider)
     memory = normalize_memory_mode(config)
     rows = [
         [callback_button(f"Deepseek: {_mask(config.deepseek_api_key)}", "admin_ai_key_Deepseek"),
@@ -168,7 +170,7 @@ def _build_keys_keyboard(config) -> list:
          callback_button(f"⏱ Лимит аудио: {config.max_voice_duration_sec}с", "admin_ai_set_audio_limit")],
         [callback_button(f"👁 Vision: {config.vision_provider}/{config.vision_model}", "admin_ai_toggle_vision"),
          callback_button("🔤 Vision модель", "admin_ai_vision_models")],
-        [callback_button(f"🔄👁 {'✅' if vision_fallback_enabled else '❌'} {_provider_model(config.vision_fallback_provider, config.vision_fallback_model or _vision_fallback_model_for_provider(config, config.vision_fallback_provider))}", "admin_ai_toggle_vision_fallback")],
+        [callback_button(f"🔄👁 {'✅' if vision_fallback_enabled else '❌'} {_provider_model(vision_fb_provider, vision_fb_model)}", "admin_ai_toggle_vision_fallback")],
         [callback_button("🔤 Фолбэк Vision провайдер/модель", "admin_ai_vision_fallback_models")],
         [callback_button(_status_model_button("🎨 Генерация", img_gen_enabled, config.image_generation_provider, config.image_generation_model), "admin_ai_toggle_image_generation")],
         [callback_button("🔤 Модель генерации", "admin_ai_image_generation_models")],
@@ -195,7 +197,9 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
     img_gen = _provider_model(config.image_generation_provider, config.image_generation_model)
     img_edit = _provider_model(config.image_edit_provider, config.image_edit_model)
     fallback_info = _provider_model(config.fallback_provider, config.fallback_model or _fallback_model_for_provider(config, config.fallback_provider))
-    vision_fallback_info = _provider_model(config.vision_fallback_provider, config.vision_fallback_model or _vision_fallback_model_for_provider(config, config.vision_fallback_provider))
+    vision_fb_provider = getattr(config, 'vision_fallback_provider', None)
+    vision_fb_model = getattr(config, 'vision_fallback_model', None) or _vision_fallback_model_for_provider(config, vision_fb_provider)
+    vision_fallback_info = _provider_model(vision_fb_provider, vision_fb_model)
     kie_key = config.kie_api_key
     kie_threshold = config.kie_credit_alert_threshold
     text = (
