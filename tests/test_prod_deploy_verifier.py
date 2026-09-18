@@ -173,6 +173,169 @@ def test_log_append_ignores_history_and_detects_new_error(tmp_path):
         _remove_baseline(baseline_path)
 
 
+def test_historical_chat_not_found_is_ignored(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text(
+        "aiogram.exceptions.TelegramBadRequest: Telegram server says - Bad Request: chat not found\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_new_chat_not_found_is_nonfatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "Traceback (most recent call last):\n"
+                "  await bot.send_message(chat_id=123)\n"
+                "aiogram.exceptions.TelegramBadRequest: chat not found\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_other_telegram_bad_request_remains_fatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "Traceback (most recent call last):\n"
+                "aiogram.exceptions.TelegramBadRequest: message is not modified\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_ERROR
+    assert result.reason == "startup_error"
+
+
+def test_recoverable_network_error_is_nonfatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "Traceback (most recent call last):\n"
+                "  await bot.get_updates()\n"
+                "ConnectionResetError: [Errno 104] Connection reset by peer\n"
+                "aiogram.exceptions.TelegramNetworkError: HTTP Client says - ClientOSError\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_CLEAN
+    healthy_snapshot = {process["name"]: process}
+    assert validate_pm2_snapshot(healthy_snapshot, [process["name"]]) == []
+    assert validate_pm2_stability(healthy_snapshot, healthy_snapshot, [process["name"]]) == []
+
+
+def test_unclassified_telegram_network_error_remains_fatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "Traceback (most recent call last):\n"
+                "aiogram.exceptions.TelegramNetworkError: unexpected network failure\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_ERROR
+    assert result.reason == "startup_error"
+
+
+def test_candidate_name_error_remains_fatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "Traceback (most recent call last):\n"
+                "NameError: name 'bot' is not defined\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_ERROR
+    assert result.reason == "startup_error"
+
+
+def test_migration_traceback_remains_fatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "Traceback (most recent call last):\n"
+                "sqlalchemy.exc.IntegrityError: migration failed\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_ERROR
+    assert result.reason == "startup_error"
+
+
+def test_repeated_network_failures_with_restart_instability_fail(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    first = {"psy5d_new": _process(restart_time=4)}
+    second = {"psy5d_new": _process(pid=202, restart_time=6)}
+    network_traceback = (
+        "Traceback (most recent call last):\n"
+        "ConnectionResetError: [Errno 104] Connection reset by peer\n"
+        "aiogram.exceptions.TelegramNetworkError: HTTP Client says - ClientOSError\n"
+    )
+
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(network_traceback + network_traceback)
+        log_result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    stability_errors = validate_pm2_stability(first, second, ["psy5d_new"])
+
+    assert log_result.status == LOG_CLEAN
+    assert stability_errors == [
+        "pid_changed:psy5d_new",
+        "restart_count_changed:psy5d_new",
+    ]
+
+
 def test_log_identity_change_is_indeterminate_not_historical_error(tmp_path):
     log_path = tmp_path / "bot-error.log"
     log_path.write_text("old Traceback (most recent call last)\n", encoding="utf-8")

@@ -32,12 +32,43 @@ DB_CHECK_TIMEOUT_SECONDS = 10.0
 DB_DISPOSE_TIMEOUT_SECONDS = 2.0
 DB_CHECK_CONCURRENCY = 4
 MAX_LOG_SCAN_BYTES = 256 * 1024
+TRACEBACK_MARKER = "Traceback (most recent call last)"
+TELEGRAM_BAD_REQUEST_RE = re.compile(r"\bTelegramBadRequest\b", re.IGNORECASE)
+CHAT_NOT_FOUND_RE = re.compile(
+    r"(?:\bTelegramBadRequest\b|Telegram server says\s*-\s*Bad Request:)"
+    r"[^\n]*\bchat not found\b",
+    re.IGNORECASE,
+)
+TELEGRAM_NETWORK_RE = re.compile(r"\bTelegramNetworkError\b", re.IGNORECASE)
+RECOVERABLE_NETWORK_EXCEPTION_RE = re.compile(
+    r"^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\.)*"
+    r"(?:ConnectionResetError|ClientOSError|ClientConnectorError|"
+    r"ServerDisconnectedError|TimeoutError)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+RECOVERABLE_TELEGRAM_NETWORK_RE = re.compile(
+    r"^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\.)*TelegramNetworkError\b[^\n]*"
+    r"(?:ConnectionResetError|ClientOSError|ClientConnectorError|"
+    r"ServerDisconnectedError|TimeoutError)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 STARTUP_ERROR_RE = re.compile(
-    r"Traceback \(most recent call last\)"
-    r"|ModuleNotFoundError"
+    r"ModuleNotFoundError"
     r"|ImportError"
     r"|SyntaxError"
+    r"|NameError"
+    r"|AttributeError"
+    r"|IntegrityError"
     r"|sqlalchemy\.(?:exc\.)?(?:OperationalError|ProgrammingError)",
+    re.IGNORECASE,
+)
+STARTUP_CONTEXT_FAILURE_RE = re.compile(
+    r"(?:database|migration|scheduler|handler(?:[- ]registration)?|"
+    r"translation(?:[- ]cache)?|locale|start[_ -]?intent|benefit[_ -]?grant)"
+    r"[^\n]{0,120}(?:error|exception|failed|failure|could not|unable)"
+    r"|(?:error|exception|failed|failure|could not|unable)[^\n]{0,120}"
+    r"(?:database|migration|scheduler|handler(?:[- ]registration)?|"
+    r"translation(?:[- ]cache)?|locale|start[_ -]?intent|benefit[_ -]?grant)",
     re.IGNORECASE,
 )
 
@@ -51,6 +82,48 @@ class LogCheckResult:
 LOG_CLEAN = "clean"
 LOG_ERROR = "error"
 LOG_INDETERMINATE = "indeterminate"
+
+
+def _is_recoverable_network_log(block: str) -> bool:
+    return (
+        RECOVERABLE_NETWORK_EXCEPTION_RE.search(block) is not None
+        or RECOVERABLE_TELEGRAM_NETWORK_RE.search(block) is not None
+    )
+
+
+def _is_chat_not_found_log(block: str) -> bool:
+    lines = block.splitlines()
+    bad_request_lines = [
+        line for line in lines if TELEGRAM_BAD_REQUEST_RE.search(line)
+    ]
+    if bad_request_lines:
+        return all(CHAT_NOT_FOUND_RE.search(line) for line in bad_request_lines)
+    return any(CHAT_NOT_FOUND_RE.search(line) for line in lines)
+
+
+def classify_log_window(content: str) -> LogCheckResult:
+    if not content:
+        return LogCheckResult(LOG_CLEAN)
+    if STARTUP_ERROR_RE.search(content) or STARTUP_CONTEXT_FAILURE_RE.search(content):
+        return LogCheckResult(LOG_ERROR, "startup_error")
+
+    blocks = content.split(TRACEBACK_MARKER)
+    for block in blocks[1:]:
+        if TELEGRAM_BAD_REQUEST_RE.search(block):
+            if _is_chat_not_found_log(block):
+                continue
+            return LogCheckResult(LOG_ERROR, "startup_error")
+        if _is_chat_not_found_log(block):
+            continue
+        if _is_recoverable_network_log(block):
+            continue
+        return LogCheckResult(LOG_ERROR, "startup_error")
+
+    if TELEGRAM_BAD_REQUEST_RE.search(content) and not _is_chat_not_found_log(content):
+        return LogCheckResult(LOG_ERROR, "startup_error")
+    if TELEGRAM_NETWORK_RE.search(content) and not _is_recoverable_network_log(content):
+        return LogCheckResult(LOG_ERROR, "startup_error")
+    return LogCheckResult(LOG_CLEAN)
 
 
 def parse_names(value: str) -> list[str]:
@@ -344,9 +417,7 @@ def recent_startup_error(
                 os.close(file_descriptor)
             except OSError:
                 pass
-    if STARTUP_ERROR_RE.search(content.decode(errors="ignore")) is not None:
-        return LogCheckResult(LOG_ERROR, "startup_error")
-    return LogCheckResult(LOG_CLEAN)
+    return classify_log_window(content.decode(errors="ignore"))
 
 
 async def _dispose_engine(engine) -> bool:
