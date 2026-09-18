@@ -108,6 +108,7 @@ class User(Base):
     promo_codes = relationship("PromoCode", secondary=user_promo_association, back_populates="users")
     referred_by = Column(BigInteger, nullable=True)
     tg_user_id = Column(BigInteger, nullable=True)
+    telegram_language_code = Column(String(8), nullable=True)
     # JSON as text keeps the schema open for arbitrary prompt-defined fields.
     metadata_json = Column(Text, default="{}", nullable=False)
 
@@ -358,6 +359,42 @@ class UserSubscription(Base):
     discount_percent = Column(Integer, default=0, nullable=False)
 
 
+class TelegramStartIntent(Base):
+    __tablename__ = 'telegram_start_intents'
+
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    new_user_eligible = Column(Boolean, default=False, nullable=False)
+    acquisition_referrer_id = Column(BigInteger, nullable=True)
+    acquisition_payload = Column(Text, nullable=True)
+    navigation_payload = Column(Text, nullable=True)
+    status = Column(String(32), default='awaiting_language', nullable=False)
+    lease_token = Column(String(64), nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    deferred_test_key = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+
+
+
+
+class SubscriptionBenefitGrant(Base):
+    __tablename__ = 'subscription_benefit_grants'
+    __table_args__ = (
+        UniqueConstraint('grant_key', name='uq_subscription_benefit_grant_key'),
+        Index('idx_subscription_benefit_grant_beneficiary', 'beneficiary_user_id'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    grant_key = Column(String(255), nullable=False)
+    grant_type = Column(String(64), nullable=False)
+    beneficiary_user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    source_user_id = Column(BigInteger, nullable=True)
+    days = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class PromoCode(Base):
     __tablename__ = 'promo_codes'
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -466,6 +503,7 @@ class TestSession(Base):
     invocation_dialogue_id = Column(Integer, nullable=True)
     invocation_platform = Column(String, nullable=True)
     question_message_id = Column(BigInteger, nullable=True)
+    deferred_launch_key = Column(String(255), nullable=True)
     secret_answers = Column(Text, nullable=True)
     is_finished = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -565,6 +603,26 @@ class BotGeneralConfig(Base):
     profile_collect_age = Column(Boolean, default=False, nullable=False)
     ai_processing_message_enabled = Column(Boolean, default=False, nullable=False)
     ai_processing_message_text = Column(String(200), default="Думаю...", nullable=False)
+    telegram_default_language = Column(String(8), default="ru", nullable=False)
+    telegram_language_selection_enabled = Column(Boolean, default=False, nullable=False)
+    telegram_enabled_languages = Column(Text, default='["ru"]', nullable=False)
+    translations_revision = Column(Integer, default=0, nullable=False)
+
+
+class BotTranslation(Base):
+    __tablename__ = 'bot_translations'
+    __table_args__ = (
+        UniqueConstraint('locale', 'translation_key', name='uq_bot_translation_locale_key'),
+        Index('idx_bot_translation_locale', 'locale'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    locale = Column(String(8), nullable=False)
+    translation_key = Column(String(255), nullable=False)
+    text = Column(Text, nullable=False)
+    source_hash = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 DEFAULT_AI_PROCESSING_MESSAGE_TEXT = "Думаю..."
@@ -1074,6 +1132,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN metadata_json TEXT DEFAULT '{}' NOT NULL"))
             if 'ai_debug_enabled' not in user_columns:
                 sync_conn.execute(text("ALTER TABLE users ADD COLUMN ai_debug_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
+            if 'telegram_language_code' not in user_columns:
+                sync_conn.execute(text("ALTER TABLE users ADD COLUMN telegram_language_code VARCHAR(8)"))
 
             followup_columns = [c['name'] for c in insp.get_columns('followup_campaigns')]
             if 'stage_mode' not in followup_columns:
@@ -1145,6 +1205,26 @@ async def init_db():
                 sync_conn.execute(text(
                     "ALTER TABLE bot_general_config "
                     "ADD COLUMN ai_processing_message_text VARCHAR(200) DEFAULT 'Думаю...' NOT NULL"
+                ))
+            if 'telegram_default_language' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN telegram_default_language VARCHAR(8) DEFAULT 'ru' NOT NULL"
+                ))
+            if 'telegram_language_selection_enabled' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN telegram_language_selection_enabled BOOLEAN DEFAULT FALSE NOT NULL"
+                ))
+            if 'telegram_enabled_languages' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN telegram_enabled_languages TEXT DEFAULT '[\"ru\"]' NOT NULL"
+                ))
+            if 'translations_revision' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN translations_revision INTEGER DEFAULT 0 NOT NULL"
                 ))
 
             ai_log_columns = [c['name'] for c in insp.get_columns('ai_logs')]
@@ -1258,6 +1338,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN invocation_platform VARCHAR"))
             if 'question_message_id' not in test_session_columns:
                 sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN question_message_id BIGINT"))
+            if 'deferred_launch_key' not in test_session_columns:
+                sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN deferred_launch_key VARCHAR(255)"))
 
             sync_conn.execute(text("""
                 INSERT INTO test_attempts (
@@ -1452,6 +1534,10 @@ async def init_db():
                 profile_collect_age=bool(getattr(test_conf, 'profile_collect_age', False)),
                 ai_processing_message_enabled=False,
                 ai_processing_message_text=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
+                telegram_default_language='ru',
+                telegram_language_selection_enabled=False,
+                telegram_enabled_languages='["ru"]',
+                translations_revision=0,
             )
             session.add(general_conf)
         else:
@@ -1459,6 +1545,14 @@ async def init_db():
                 general_conf.ai_processing_message_enabled = False
             if getattr(general_conf, 'ai_processing_message_text', None) is None:
                 general_conf.ai_processing_message_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+            if getattr(general_conf, 'telegram_default_language', None) is None:
+                general_conf.telegram_default_language = 'ru'
+            if getattr(general_conf, 'telegram_language_selection_enabled', None) is None:
+                general_conf.telegram_language_selection_enabled = False
+            if getattr(general_conf, 'telegram_enabled_languages', None) is None:
+                general_conf.telegram_enabled_languages = '["ru"]'
+            if getattr(general_conf, 'translations_revision', None) is None:
+                general_conf.translations_revision = 0
 
         # Seed default content sections for new bots (won't overwrite existing)
         default_content = [
@@ -1897,4 +1991,3 @@ class PaymentNotificationOutbox(Base):
     delivered_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-

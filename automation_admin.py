@@ -52,6 +52,7 @@ from followups import (
     send_followup_step,
 )
 from time_helpers import format_msk
+from translation_pack_manager import commit_readiness_critical_mutation, translation_coordination_lock
 
 
 import logging
@@ -588,22 +589,23 @@ async def _show_automation_handlers(
 async def topic_automation_handler_unlink(callback: CallbackQuery):
     topic_id, handler_id = map(int, callback.data.rsplit("_", 2)[-2:])
     async with async_session_maker() as session:
-        item = await session.get(AutomationHandler, handler_id)
-        if item is not None and not item.all_topics:
-            await session.execute(
-                delete(event_handler_topic_association).where(
-                    event_handler_topic_association.c.handler_id == handler_id,
-                    event_handler_topic_association.c.topic_id == topic_id,
+        async with translation_coordination_lock(session):
+            item = await session.get(AutomationHandler, handler_id)
+            if item is not None and not item.all_topics:
+                await session.execute(
+                    delete(event_handler_topic_association).where(
+                        event_handler_topic_association.c.handler_id == handler_id,
+                        event_handler_topic_association.c.topic_id == topic_id,
+                    )
                 )
-            )
-            remaining_topics = await session.scalar(
-                select(func.count()).select_from(event_handler_topic_association).where(
-                    event_handler_topic_association.c.handler_id == handler_id
+                remaining_topics = await session.scalar(
+                    select(func.count()).select_from(event_handler_topic_association).where(
+                        event_handler_topic_association.c.handler_id == handler_id
+                    )
                 )
-            )
-            if not remaining_topics and not item.include_main_dialogue:
-                item.is_active = False
-            await session.commit()
+                if not remaining_topics and not item.include_main_dialogue:
+                    item.is_active = False
+                await session.commit()
     await _answer_callback(callback, "Обработчик отвязан от темы.")
     callback.data = f"topic_automation_handlers_{topic_id}"
     await topic_automation_handlers(callback)
@@ -740,7 +742,7 @@ async def automation_handler_toggle(callback: CallbackQuery, state: FSMContext |
             await _answer_callback(callback, "Сначала выберите область, добавьте условие и действие.", show_alert=True)
             return
         item.is_active = not item.is_active
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await _show_handler(callback.message, handler_id, state=state)
 
 
@@ -1168,7 +1170,7 @@ async def automation_action_edit_received(message: Message, state: FSMContext):
         if action:
             for key, val in updates.items():
                 setattr(action, key, val)
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await message.answer("✅ Действие успешно обновлено!")
@@ -1254,7 +1256,7 @@ async def automation_action_received(message: Message, state: FSMContext):
             select(func.count(AutomationAction.id)).where(AutomationAction.handler_id == data["handler_id"])
         ) or 0
         session.add(AutomationAction(sort_order=order, **values))
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     return_topic_id = data.get("automation_return_topic_id")
     await _reset_navigation_context(state, "automation_return_topic_id", return_topic_id)
     await message.answer("✅ Действие добавлено.")
@@ -1267,10 +1269,11 @@ async def automation_action_delete(callback: CallbackQuery):
     handler_id_raw, action_id_raw = parts[3], parts[4]
     await _answer_callback(callback)
     async with async_session_maker() as session:
-        action = await session.get(AutomationAction, int(action_id_raw))
-        if action and action.handler_id == int(handler_id_raw):
-            await session.delete(action)
-            await session.commit()
+        async with translation_coordination_lock(session):
+            action = await session.get(AutomationAction, int(action_id_raw))
+            if action and action.handler_id == int(handler_id_raw):
+                await session.delete(action)
+                await session.commit()
     callback.data = f"automation_actions_{handler_id_raw}"
     await automation_actions(callback)
 
@@ -1292,10 +1295,11 @@ async def automation_handler_delete_yes(callback: CallbackQuery, state: FSMConte
     handler_id = int(callback.data.rsplit("_", 1)[1])
     return_topic_id = await _navigation_topic_id(state, "automation_return_topic_id")
     async with async_session_maker() as session:
-        item = await session.get(AutomationHandler, handler_id)
-        if item:
-            await session.delete(item)
-            await session.commit()
+        async with translation_coordination_lock(session):
+            item = await session.get(AutomationHandler, handler_id)
+            if item:
+                await session.delete(item)
+                await session.commit()
     await _show_automation_handlers(callback, state=state, topic_id=return_topic_id)
 
 
@@ -1427,22 +1431,23 @@ async def _show_followup_campaigns(
 async def topic_followup_campaign_unlink(callback: CallbackQuery):
     topic_id, campaign_id = map(int, callback.data.rsplit("_", 2)[-2:])
     async with async_session_maker() as session:
-        item = await session.get(FollowupCampaign, campaign_id)
-        if item is not None and not item.all_topics:
-            await session.execute(
-                delete(followup_campaign_topic_association).where(
-                    followup_campaign_topic_association.c.campaign_id == campaign_id,
-                    followup_campaign_topic_association.c.topic_id == topic_id,
+        async with translation_coordination_lock(session):
+            item = await session.get(FollowupCampaign, campaign_id)
+            if item is not None and not item.all_topics:
+                await session.execute(
+                    delete(followup_campaign_topic_association).where(
+                        followup_campaign_topic_association.c.campaign_id == campaign_id,
+                        followup_campaign_topic_association.c.topic_id == topic_id,
+                    )
                 )
-            )
-            remaining_topics = await session.scalar(
-                select(func.count()).select_from(followup_campaign_topic_association).where(
-                    followup_campaign_topic_association.c.campaign_id == campaign_id
+                remaining_topics = await session.scalar(
+                    select(func.count()).select_from(followup_campaign_topic_association).where(
+                        followup_campaign_topic_association.c.campaign_id == campaign_id
+                    )
                 )
-            )
-            if not remaining_topics and not item.include_main_dialogue:
-                item.is_active = False
-            await session.commit()
+                if not remaining_topics and not item.include_main_dialogue:
+                    item.is_active = False
+                await session.commit()
     await _answer_callback(callback, "Цепочка отвязана от темы.")
     callback.data = f"topic_followup_campaigns_{topic_id}"
     await topic_followup_campaigns(callback)
@@ -2225,7 +2230,7 @@ async def followup_toggle(callback: CallbackQuery, state: FSMContext | None = No
             await _answer_callback(callback, "Сначала выберите область и добавьте шаг.", show_alert=True)
             return
         item.is_active = not item.is_active
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await _show_campaign(callback.message, campaign_id, state=state)
 
 
@@ -2463,7 +2468,7 @@ async def followup_step_received(message: Message, state: FSMContext):
         else:
             values["message_text"] = body.strip()
         session.add(FollowupStep(**values))
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     return_topic_id = data.get("followup_return_topic_id")
     await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Шаг добавлен.")
@@ -2493,7 +2498,7 @@ async def followup_step_edit_received(message: Message, state: FSMContext):
             step.ai_instruction = body
         else:
             step.message_text = body
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     return_topic_id = data.get("followup_return_topic_id")
     await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Шаг обновлён.")
@@ -2511,47 +2516,48 @@ async def followup_step_delete(callback: CallbackQuery, state: FSMContext | None
     campaign_id_raw, step_id_raw = callback.data.split("_")[-2:]
     blocked = False
     async with async_session_maker() as session:
-        step = await session.scalar(
-            select(FollowupStep)
-            .where(
-                FollowupStep.id == int(step_id_raw),
-                FollowupStep.campaign_id == int(campaign_id_raw),
-            )
-            .with_for_update()
-        )
-        if step:
-            sent_count = await session.scalar(
-                select(func.count(FollowupDelivery.id)).where(FollowupDelivery.step_id == step.id)
-            ) or 0
-            protected_attempt_count = await session.scalar(
-                select(func.count(FollowupDeliveryAttempt.id)).where(
-                    FollowupDeliveryAttempt.step_id == step.id,
-                    FollowupDeliveryAttempt.status.in_(
-                        (
-                            FOLLOWUP_ATTEMPT_CLAIMED,
-                            FOLLOWUP_ATTEMPT_RETRYABLE,
-                            FOLLOWUP_ATTEMPT_UNCERTAIN,
-                            FOLLOWUP_ATTEMPT_DELIVERED,
-                            FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED,
-                        )
-                    ),
+        async with translation_coordination_lock(session):
+            step = await session.scalar(
+                select(FollowupStep)
+                .where(
+                    FollowupStep.id == int(step_id_raw),
+                    FollowupStep.campaign_id == int(campaign_id_raw),
                 )
-            ) or 0
-            if sent_count or protected_attempt_count:
-                blocked = True
-            else:
-                await session.delete(step)
-                await session.flush()
-                remaining = (
-                    await session.execute(
-                        select(FollowupStep)
-                        .where(FollowupStep.campaign_id == int(campaign_id_raw))
-                        .order_by(FollowupStep.sort_order, FollowupStep.id)
+                .with_for_update()
+            )
+            if step:
+                sent_count = await session.scalar(
+                    select(func.count(FollowupDelivery.id)).where(FollowupDelivery.step_id == step.id)
+                ) or 0
+                protected_attempt_count = await session.scalar(
+                    select(func.count(FollowupDeliveryAttempt.id)).where(
+                        FollowupDeliveryAttempt.step_id == step.id,
+                        FollowupDeliveryAttempt.status.in_(
+                            (
+                                FOLLOWUP_ATTEMPT_CLAIMED,
+                                FOLLOWUP_ATTEMPT_RETRYABLE,
+                                FOLLOWUP_ATTEMPT_UNCERTAIN,
+                                FOLLOWUP_ATTEMPT_DELIVERED,
+                                FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED,
+                            )
+                        ),
                     )
-                ).scalars().all()
-                for index, item in enumerate(remaining):
-                    item.sort_order = index
-                await session.commit()
+                ) or 0
+                if sent_count or protected_attempt_count:
+                    blocked = True
+                else:
+                    await session.delete(step)
+                    await session.flush()
+                    remaining = (
+                        await session.execute(
+                            select(FollowupStep)
+                            .where(FollowupStep.campaign_id == int(campaign_id_raw))
+                            .order_by(FollowupStep.sort_order, FollowupStep.id)
+                        )
+                    ).scalars().all()
+                    for index, item in enumerate(remaining):
+                        item.sort_order = index
+                    await session.commit()
     if blocked:
         await _answer_callback(
             callback,
@@ -2659,8 +2665,9 @@ async def followup_delete_yes(callback: CallbackQuery, state: FSMContext | None 
     campaign_id = int(callback.data.rsplit("_", 1)[1])
     return_topic_id = await _navigation_topic_id(state, "followup_return_topic_id")
     async with async_session_maker() as session:
-        item = await session.get(FollowupCampaign, campaign_id)
-        if item:
-            await session.delete(item)
-            await session.commit()
+        async with translation_coordination_lock(session):
+            item = await session.get(FollowupCampaign, campaign_id)
+            if item:
+                await session.delete(item)
+                await session.commit()
     await _show_followup_campaigns(callback, state=state, topic_id=return_topic_id)

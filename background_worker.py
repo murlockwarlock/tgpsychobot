@@ -9,15 +9,16 @@ from sqlalchemy.orm import selectinload
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
-from database import (async_session_maker, IndexingQueue, KnowledgeBase, Mailing, User,
+from database import (async_session_maker, BotGeneralConfig, IndexingQueue, KnowledgeBase, Mailing, User,
                       UserSubscription, Message as DBMessage)
 from file_parser import parse_file
-from mailing_utils import get_mailing_audience_label, send_mailing_content
+from mailing_utils import get_mailing_audience_label, render_mailing_text, send_mailing_content
 from result_history import non_technical_role_filter
 from time_helpers import utc_now
 from vector_store import delete_document_vectors, update_vector_index
 import keyboards as kb
 from error_reporting import notify_admins_about_error
+from translation_service import refresh_translation_cache, resolve_effective_locale, translate
 class DailyLimitError(Exception):
     pass
 
@@ -286,6 +287,7 @@ async def process_mailings(bot: Bot):
     while True:
         await asyncio.sleep(15)
         try:
+            await refresh_translation_cache(async_session_maker)
             async with async_session_maker() as session:
                 now = utc_now()
                 stale_stmt = select(Mailing).where(
@@ -332,6 +334,8 @@ async def process_mailings(bot: Bot):
                 if not mailing:
                     continue
 
+                general_config = await session.get(BotGeneralConfig, 1)
+
                 mailing.status = 'sending'
                 mailing.start_time = now
                 await session.commit()
@@ -376,12 +380,27 @@ async def process_mailings(bot: Bot):
 
                     for user_id in user_ids:
                         try:
-                            await send_mailing_content(bot, user_id, mailing)
+                            target_user = await session.get(User, user_id)
+                            locale = resolve_effective_locale(
+                                getattr(target_user, "telegram_language_code", None),
+                                getattr(general_config, "telegram_default_language", "ru"),
+                                bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+                                getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+                                platform="max" if user_id >= 100_000_000_000 else "telegram",
+                            )
+                            localized_text = translate(
+                                f"mailing.{mailing.id}.text",
+                                locale,
+                                fallback=mailing.text,
+                                source=mailing.text or "",
+                            )
+                            rendered_text = render_mailing_text(localized_text, target_user)
+                            await send_mailing_content(bot, user_id, mailing, rendered_text=rendered_text)
                             success_count += 1
                         except TelegramRetryAfter as e:
                             await asyncio.sleep(e.retry_after)
                             try:
-                                await send_mailing_content(bot, user_id, mailing)
+                                await send_mailing_content(bot, user_id, mailing, rendered_text=rendered_text)
                                 success_count += 1
                             except Exception:
                                 failure_count += 1

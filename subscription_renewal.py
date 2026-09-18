@@ -906,6 +906,8 @@ async def finalize_yookassa_payment_success(
             payload = {
                 "user_id": effective_uid,
                 "amount": effective_amount,
+                "paid_plan_id": effective_plan_id,
+                "current_plan_id": user_sub.plan_id if user_sub else None,
                 "paid_plan_name": "",
                 "current_plan_name": "",
                 "payment_id": payment_id,
@@ -1004,6 +1006,8 @@ async def finalize_yookassa_payment_success(
             payload = {
                 "user_id": effective_uid,
                 "amount": effective_amount,
+                "paid_plan_id": rec_details.get("paid_plan_id"),
+                "current_plan_id": rec_details.get("current_plan_id"),
                 "paid_plan_name": rec_details.get("paid_plan_name", ""),
                 "current_plan_name": rec_details.get("current_plan_name", ""),
                 "payment_id": payment_id,
@@ -1043,6 +1047,8 @@ async def finalize_yookassa_payment_success(
             payload = {
                 "user_id": effective_uid,
                 "amount": effective_amount,
+                "paid_plan_id": rec_details.get("paid_plan_id"),
+                "current_plan_id": rec_details.get("current_plan_id"),
                 "paid_plan_name": rec_details.get("paid_plan_name", ""),
                 "current_plan_name": rec_details.get("current_plan_name", ""),
                 "payment_id": payment_id,
@@ -1111,6 +1117,7 @@ async def finalize_yookassa_payment_success(
             end_str = format_msk(user_sub.end_date, "%d.%m.%Y %H:%M") if user_sub and user_sub.end_date else ""
             payload = {
                 "user_id": effective_uid,
+                "plan_id": paid_ptc.id if paid_ptc else effective_plan_id,
                 "plan_name": getattr(paid_ptc, "name", ""),
                 "amount": effective_amount,
                 "end_date_msk": end_str,
@@ -1144,6 +1151,8 @@ async def finalize_yookassa_payment_success(
             payload = {
                 "user_id": effective_uid,
                 "amount": effective_amount,
+                "paid_plan_id": rec_details.get("paid_plan_id"),
+                "current_plan_id": rec_details.get("current_plan_id"),
                 "paid_plan_name": rec_details.get("paid_plan_name", ""),
                 "current_plan_name": rec_details.get("current_plan_name", ""),
                 "payment_id": payment_id,

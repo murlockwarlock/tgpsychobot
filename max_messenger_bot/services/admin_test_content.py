@@ -17,6 +17,7 @@ from ..keyboards import (
 )
 from ..legacy import CaseStudy, TestQuestion, async_session_maker
 from ..storage import StateStore
+from translation_pack_manager import commit_readiness_critical_mutation, translation_coordination_lock
 
 
 PAGE_SIZE = 10
@@ -126,7 +127,7 @@ async def create_question(client: MaxApiClient, states: StateStore, chat_id: int
             sort_order=total + 1,
         )
         session.add(question)
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
         question_id = question.id
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="✅ Вопрос создан.")
@@ -154,7 +155,7 @@ async def save_question_text(client: MaxApiClient, states: StateStore, chat_id: 
             await client.send_message(chat_id=chat_id, text="Вопрос не найден.")
             return
         question.text = question_text
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_question_editor(client, chat_id, question_id)
 
@@ -237,10 +238,11 @@ async def delete_question(client: MaxApiClient, chat_id: int, question_id: int) 
         if not question:
             await client.send_message(chat_id=chat_id, text="Вопрос не найден.")
             return
-        await session.execute(delete(TestQuestion).where(TestQuestion.id == question_id))
-        await session.flush()
-        await _normalize_question_sort_order(session)
-        await session.commit()
+        async with translation_coordination_lock(session):
+            await session.execute(delete(TestQuestion).where(TestQuestion.id == question_id))
+            await session.flush()
+            await _normalize_question_sort_order(session)
+            await session.commit()
     await client.send_message(chat_id=chat_id, text="✅ Вопрос удалён.")
     await list_questions(client, chat_id)
 

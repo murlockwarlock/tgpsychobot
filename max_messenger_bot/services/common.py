@@ -35,6 +35,7 @@ from memory_mode import normalize_memory_mode, start_new_dialogue
 from response_buttons import ResponseButton, build_action_callback_data, extract_response_buttons, extract_test_start_directive
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
+from telegram_start_service import grant_subscription_days
 
 
 log = get_bot_logger("common")
@@ -432,75 +433,68 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
             if 0 < referrer_id < MAX_ID_OFFSET:
                 referrer_id += MAX_ID_OFFSET
             if referrer_id and referrer_id != user_id:
-                referrer = await session.get(User, referrer_id, options=[selectinload(User.subscription)])
-                if referrer:
+                locked_users = (
+                    await session.execute(
+                        select(User)
+                        .where(User.id.in_(sorted({user_id, referrer_id})))
+                        .order_by(User.id.asc())
+                        .with_for_update()
+                        .options(selectinload(User.subscription))
+                    )
+                ).scalars().all()
+                locked_by_id = {locked.id: locked for locked in locked_users}
+                user = locked_by_id.get(user_id)
+                referrer = locked_by_id.get(referrer_id)
+                if user and referrer:
+                    is_new_trial_needed = user.subscription is None
                     now = utc_now()
                     user.referred_by = referrer_id
-                    if sub_config.referral_bonus_days_referral > 0:
-                        session.add(
-                            UserSubscription(
-                                user_id=user.id,
-                                plan_id=None,
-                                start_date=now,
-                                end_date=now + timedelta(days=sub_config.referral_bonus_days_referral),
-                                auto_renewal=False,
-                                payment_provider="Trial Referral",
-                                payment_attempt_count=0,
-                                discount_percent=0,
-                            )
-                        )
+                    referee_granted = await grant_subscription_days(
+                        session,
+                        grant_key=f"max_registration_referee:{user.id}",
+                        grant_type="registration_referee",
+                        beneficiary_user_id=user.id,
+                        source_user_id=referrer_id,
+                        days=sub_config.referral_bonus_days_referral,
+                        payment_provider="Trial Referral",
+                        now=now,
+                    )
+                    if referee_granted:
                         welcome_bonus_text = (
                             f"🎁 <b>Вам начислено {sub_config.referral_bonus_days_referral} бонусных дн.</b>\n"
                             "Регистрация выполнена по пригласительной ссылке."
                         )
                         is_new_trial_needed = False
-                    if sub_config.referral_bonus_days_referrer > 0:
-                        if referrer.subscription and referrer.subscription.end_date > now:
-                            referrer.subscription.end_date += timedelta(days=sub_config.referral_bonus_days_referrer)
-                        elif referrer.subscription:
-                            referrer.subscription.plan_id = None
-                            referrer.subscription.start_date = now
-                            referrer.subscription.end_date = now + timedelta(days=sub_config.referral_bonus_days_referrer)
-                            referrer.subscription.payment_provider = "Trial Referral Bonus"
-                            referrer.subscription.auto_renewal = False
-                            referrer.subscription.payment_attempt_count = 0
-                        else:
-                            session.add(
-                                UserSubscription(
-                                    user_id=referrer_id,
-                                    plan_id=None,
-                                    start_date=now,
-                                    end_date=now + timedelta(days=sub_config.referral_bonus_days_referrer),
-                                    auto_renewal=False,
-                                    payment_provider="Trial Referral Bonus",
-                                    payment_attempt_count=0,
-                                    discount_percent=0,
-                                )
-                            )
-                        referrer_notification = (
-                            referrer_id,
-                            sub_config.referral_bonus_days_referrer,
-                        )
+                    referrer_granted = await grant_subscription_days(
+                        session,
+                        grant_key=f"max_registration_referrer:{user.id}:{referrer_id}",
+                        grant_type="registration_referrer",
+                        beneficiary_user_id=referrer_id,
+                        source_user_id=user.id,
+                        days=sub_config.referral_bonus_days_referrer,
+                        payment_provider="Trial Referral Bonus",
+                        now=now,
+                    )
+                    if referrer_granted:
+                        referrer_notification = (referrer_id, sub_config.referral_bonus_days_referrer)
                     await session.commit()
 
         if is_new_trial_needed and sub_config and sub_config.subscriptions_enabled and sub_config.welcome_bonus_days > 0:
             now = utc_now()
-            session.add(
-                UserSubscription(
-                    user_id=user.id,
-                    plan_id=None,
-                    start_date=now,
-                    end_date=now + timedelta(days=sub_config.welcome_bonus_days),
-                    auto_renewal=False,
-                    payment_provider="Trial Welcome",
-                    payment_attempt_count=0,
-                    discount_percent=0,
+            welcome_granted = await grant_subscription_days(
+                session,
+                grant_key=f"max_welcome:{user.id}",
+                grant_type="welcome",
+                beneficiary_user_id=user.id,
+                days=sub_config.welcome_bonus_days,
+                payment_provider="Trial Welcome",
+                now=now,
+            )
+            if welcome_granted:
+                welcome_bonus_text = (
+                    f"🎁 <b>Вам начислен приветственный бонус!</b>\n"
+                    f"Бесплатный доступ на {sub_config.welcome_bonus_days} дн."
                 )
-            )
-            welcome_bonus_text = (
-                f"🎁 <b>Вам начислен приветственный бонус!</b>\n"
-                f"Бесплатный доступ на {sub_config.welcome_bonus_days} дн."
-            )
             await session.commit()
 
     if referrer_notification:

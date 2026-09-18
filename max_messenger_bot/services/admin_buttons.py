@@ -8,6 +8,7 @@ from ..api import MaxApiClient
 from ..keyboards import admin_button_editor_keyboard, admin_buttons_keyboard
 from ..legacy import Content, ContentMedia, async_session_maker
 from ..storage import MaxContentMedia, StateStore
+from translation_pack_manager import commit_readiness_critical_mutation, translation_coordination_lock
 
 
 EXCLUDED_KEYS = {"test_intro", "secret_test_outro", "disclaimer", "test_results", "test_button"}
@@ -81,7 +82,7 @@ async def save_title(client: MaxApiClient, states: StateStore, chat_id: int, use
             await client.send_message(chat_id=chat_id, text="Кнопка не найдена.")
             return
         button.button_title = title
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_button_editor(client, chat_id, button_key)
 
@@ -108,7 +109,7 @@ async def create_button(client: MaxApiClient, states: StateStore, chat_id: int, 
                 sort_order=max_order + 1,
             )
         )
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text=f"✅ Кнопка «{title}» создана.")
     await show_button_editor(client, chat_id, key)
@@ -119,7 +120,7 @@ async def toggle_visibility(client: MaxApiClient, chat_id: int, button_key: str)
         button = await session.get(Content, button_key)
         if button:
             button.is_visible = not bool(button.is_visible)
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await show_button_editor(client, chat_id, button_key)
 
 
@@ -147,11 +148,12 @@ async def delete_button(client: MaxApiClient, chat_id: int, button_key: str) -> 
         if not button:
             await client.send_message(chat_id=chat_id, text="Кнопка не найдена.")
             return
-        await session.execute(delete(ContentMedia).where(ContentMedia.content_key == button_key))
-        await session.execute(delete(MaxContentMedia).where(MaxContentMedia.content_key == button_key))
-        await session.execute(delete(Content).where(Content.key == button_key))
-        await session.flush()
-        await _normalize_sort_order(session)
-        await session.commit()
+        async with translation_coordination_lock(session):
+            await session.execute(delete(ContentMedia).where(ContentMedia.content_key == button_key))
+            await session.execute(delete(MaxContentMedia).where(MaxContentMedia.content_key == button_key))
+            await session.execute(delete(Content).where(Content.key == button_key))
+            await session.flush()
+            await _normalize_sort_order(session)
+            await session.commit()
     await client.send_message(chat_id=chat_id, text="✅ Кнопка удалена.")
     await show_buttons(client, chat_id)

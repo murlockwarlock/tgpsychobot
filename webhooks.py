@@ -39,6 +39,7 @@ from notification_outbox import (
     get_canonical_key_for_yookassa_success,
     get_canonical_key_for_yookassa_cancellation,
 )
+from telegram_start_service import grant_subscription_days
 
 import os
 import re
@@ -530,6 +531,7 @@ async def handle_yookassa_webhook(request: web.Request):
             purchase_key = get_canonical_key_for_yookassa_success(payment_id, user_id, "success", is_recurring=False)
             purchase_payload = {
                 "user_id": user_id,
+                "plan_id": plan_id,
                 "plan_name": plan_name_for_notif,
                 "amount": plan_price_for_notif,
                 "payment_id": payment_id,
@@ -543,6 +545,13 @@ async def handle_yookassa_webhook(request: web.Request):
                 ref_config = await session.get(SubscriptionConfig, 1)
                 if ref_config and ref_config.referral_enabled:
                     if ref_config.referral_pay_bonus_enabled and ref_config.referral_pay_bonus_days > 0:
+                        referral_lock_ids = sorted({user_id, paying_user.referred_by})
+                        await session.execute(
+                            select(User.id)
+                            .where(User.id.in_(referral_lock_ids))
+                            .order_by(User.id.asc())
+                            .with_for_update()
+                        )
                         already_paid = False
                         if ref_config.referral_pay_bonus_first_only:
                             prev_count = await session.scalar(
@@ -552,44 +561,28 @@ async def handle_yookassa_webhook(request: web.Request):
                             already_paid = prev_count > 0
                         if not already_paid:
                             bonus_days = ref_config.referral_pay_bonus_days
-                            referrer_sub = await session.scalar(
-                                select(UserSubscription).where(
-                                    UserSubscription.user_id == paying_user.referred_by
-                                )
+                            granted = await grant_subscription_days(
+                                session,
+                                grant_key=f"paid_referrer:Yookassa:{payment_id}:{paying_user.referred_by}",
+                                grant_type="paid_referrer",
+                                beneficiary_user_id=paying_user.referred_by,
+                                source_user_id=user_id,
+                                days=bonus_days,
+                                payment_provider="Trial Referral Pay Bonus",
                             )
-                            now_b = datetime.utcnow()
-                            if referrer_sub and referrer_sub.end_date > now_b:
-                                referrer_sub.end_date += timedelta(days=bonus_days)
-                            elif referrer_sub:
-                                referrer_sub.plan_id = None
-                                referrer_sub.start_date = now_b
-                                referrer_sub.end_date = now_b + timedelta(days=bonus_days)
-                                referrer_sub.payment_provider = 'Trial Referral Pay Bonus'
-                                referrer_sub.auto_renewal = False
-                                referrer_sub.payment_attempt_count = 0
-                            else:
-                                session.add(UserSubscription(
-                                    user_id=paying_user.referred_by,
-                                    plan_id=None,
-                                    start_date=now_b,
-                                    end_date=now_b + timedelta(days=bonus_days),
-                                    auto_renewal=False,
-                                    payment_provider='Trial Referral Pay Bonus',
-                                    payment_attempt_count=0,
-                                    discount_percent=0
-                                ))
-                            referrer_bonus_user_id = paying_user.referred_by
-                            referrer_bonus_days = bonus_days
+                            if granted:
+                                referrer_bonus_user_id = paying_user.referred_by
+                                referrer_bonus_days = bonus_days
 
-                            ref_key = f"yookassa:payment:{payment_id}:{paying_user.referred_by}:referral_bonus"
-                            ref_payload = {
-                                "user_id": paying_user.referred_by,
-                                "bonus_days": bonus_days,
-                                "referred_user_id": user_id,
-                            }
-                            await enqueue_outbox_event(
-                                session, ref_key, "Yookassa", paying_user.referred_by, "referral_bonus", ref_payload, payment_id=payment_id
-                            )
+                                ref_key = f"yookassa:payment:{payment_id}:{paying_user.referred_by}:referral_bonus"
+                                ref_payload = {
+                                    "user_id": paying_user.referred_by,
+                                    "bonus_days": bonus_days,
+                                    "referred_user_id": user_id,
+                                }
+                                await enqueue_outbox_event(
+                                    session, ref_key, "Yookassa", paying_user.referred_by, "referral_bonus", ref_payload, payment_id=payment_id
+                                )
 
                     session.add(ReferralPaymentLog(
                         referrer_id=paying_user.referred_by,
@@ -996,6 +989,7 @@ async def handle_robokassa_result(request: web.Request):
             rk_key = build_canonical_outbox_key("robokassa", "payment", inv_id, payment_user_id, rk_event_type)
             rk_payload = {
                 "user_id": payment_user_id,
+                "plan_id": payment.plan_id,
                 "amount": payment_amount_for_notif,
                 "plan_name": plan_name_for_notif,
                 "end_date_msk": end_date_msk,
@@ -1016,6 +1010,13 @@ async def handle_robokassa_result(request: web.Request):
                 ref_config_rk = await session.get(SubscriptionConfig, 1)
                 if ref_config_rk and ref_config_rk.referral_enabled:
                     if ref_config_rk.referral_pay_bonus_enabled and ref_config_rk.referral_pay_bonus_days > 0:
+                        referral_lock_ids_rk = sorted({payment_user_id, paying_user_rk.referred_by})
+                        await session.execute(
+                            select(User.id)
+                            .where(User.id.in_(referral_lock_ids_rk))
+                            .order_by(User.id.asc())
+                            .with_for_update()
+                        )
                         already_paid_rk = False
                         if ref_config_rk.referral_pay_bonus_first_only:
                             prev_count_rk = await session.scalar(
@@ -1025,49 +1026,33 @@ async def handle_robokassa_result(request: web.Request):
                             already_paid_rk = prev_count_rk > 0
                         if not already_paid_rk:
                             bonus_days_rk = ref_config_rk.referral_pay_bonus_days
-                            referrer_sub_rk = await session.scalar(
-                                select(UserSubscription).where(
-                                    UserSubscription.user_id == paying_user_rk.referred_by
-                                )
-                            )
-                            now_rk = datetime.utcnow()
-                            if referrer_sub_rk and referrer_sub_rk.end_date > now_rk:
-                                referrer_sub_rk.end_date += timedelta(days=bonus_days_rk)
-                            elif referrer_sub_rk:
-                                referrer_sub_rk.plan_id = None
-                                referrer_sub_rk.start_date = now_rk
-                                referrer_sub_rk.end_date = now_rk + timedelta(days=bonus_days_rk)
-                                referrer_sub_rk.payment_provider = 'Trial Referral Pay Bonus'
-                                referrer_sub_rk.auto_renewal = False
-                                referrer_sub_rk.payment_attempt_count = 0
-                            else:
-                                session.add(UserSubscription(
-                                    user_id=paying_user_rk.referred_by,
-                                    plan_id=None,
-                                    start_date=now_rk,
-                                    end_date=now_rk + timedelta(days=bonus_days_rk),
-                                    auto_renewal=False,
-                                    payment_provider='Trial Referral Pay Bonus',
-                                    payment_attempt_count=0,
-                                    discount_percent=0
-                                ))
-                            referrer_bonus_user_id_rk = paying_user_rk.referred_by
-                            referrer_bonus_days_rk = bonus_days_rk
-                            ref_key_rk = f"robokassa:payment:{inv_id}:{paying_user_rk.referred_by}:referral_bonus"
-                            ref_payload_rk = {
-                                "user_id": paying_user_rk.referred_by,
-                                "bonus_days": bonus_days_rk,
-                                "referred_user_id": payment_user_id,
-                            }
-                            await enqueue_outbox_event(
+                            granted_rk = await grant_subscription_days(
                                 session,
-                                ref_key_rk,
-                                "Robokassa",
-                                paying_user_rk.referred_by,
-                                "referral_bonus",
-                                ref_payload_rk,
-                                payment_id=str(inv_id),
+                                grant_key=f"paid_referrer:Robokassa:{inv_id}:{paying_user_rk.referred_by}",
+                                grant_type="paid_referrer",
+                                beneficiary_user_id=paying_user_rk.referred_by,
+                                source_user_id=payment_user_id,
+                                days=bonus_days_rk,
+                                payment_provider="Trial Referral Pay Bonus",
                             )
+                            if granted_rk:
+                                referrer_bonus_user_id_rk = paying_user_rk.referred_by
+                                referrer_bonus_days_rk = bonus_days_rk
+                                ref_key_rk = f"robokassa:payment:{inv_id}:{paying_user_rk.referred_by}:referral_bonus"
+                                ref_payload_rk = {
+                                    "user_id": paying_user_rk.referred_by,
+                                    "bonus_days": bonus_days_rk,
+                                    "referred_user_id": payment_user_id,
+                                }
+                                await enqueue_outbox_event(
+                                    session,
+                                    ref_key_rk,
+                                    "Robokassa",
+                                    paying_user_rk.referred_by,
+                                    "referral_bonus",
+                                    ref_payload_rk,
+                                    payment_id=str(inv_id),
+                                )
                     session.add(ReferralPaymentLog(
                         referrer_id=paying_user_rk.referred_by,
                         referred_user_id=payment_user_id,

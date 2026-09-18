@@ -13,6 +13,7 @@ from ..keyboards import admin_payment_keys_keyboard, admin_payment_settings_keyb
 from ..logging_utils import get_payments_logger
 from ..legacy import RobokassaPayment, SubscriptionConfig, SubscriptionPlan, User, UserSubscription, YookassaPayment, async_session_maker
 from ..storage import StateStore
+from translation_pack_manager import commit_readiness_critical_mutation
 
 
 log = get_payments_logger("admin")
@@ -65,7 +66,7 @@ async def toggle_subscriptions(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
         config.subscriptions_enabled = not config.subscriptions_enabled
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
         log.info("Subscriptions toggled enabled=%s", config.subscriptions_enabled)
     await show_settings(client, chat_id)
 

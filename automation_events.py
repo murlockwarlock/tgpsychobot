@@ -28,6 +28,7 @@ from database import (
 )
 from memory_mode import MEMORY_MODE_GLOBAL, get_memory_mode
 from user_metadata import append_metadata_records, merge_metadata
+from translation_service import refresh_translation_cache, resolve_user_effective_locale, translate
 
 
 log = logging.getLogger(__name__)
@@ -153,12 +154,9 @@ def _render_metadata_value(value: Any, *, event: AutomationEvent, user: User) ->
 
 async def _execute_action(session, bot, event, handler, action, user) -> None:
     if action.action_type == "send_message":
-        text = render_message_template(action.message_template or "", event=event, user=user)
         event_id = event.id
         handler_id = handler.id
         action_id = action.id
-        if not text:
-            raise ValueError("Пустой шаблон сообщения")
         if action.recipient_type == "all_admins":
             recipients = sorted(await get_all_admin_ids())
         elif action.recipient_type == "selected_user" and action.recipient_user_id:
@@ -177,6 +175,24 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
             if delivered:
                 continue
             try:
+                if action.recipient_type == "selected_user":
+                    recipient = await session.get(User, recipient_id)
+                    recipient_locale = await resolve_user_effective_locale(
+                        session,
+                        recipient or recipient_id,
+                        platform="max" if recipient_id >= 100_000_000_000 else "telegram",
+                    )
+                    template = translate(
+                        f"automation_action.{action.id}.message_template",
+                        recipient_locale,
+                        fallback=action.message_template or "",
+                        source=action.message_template or "",
+                    ) or ""
+                else:
+                    template = action.message_template or ""
+                text = render_message_template(template, event=event, user=user)
+                if not text:
+                    raise ValueError("Пустой шаблон сообщения")
                 await bot.send_message(recipient_id, text)
                 session.add(AutomationMessageDelivery(
                     event_id=event_id,
@@ -239,6 +255,10 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
 
 async def process_pending_events(bot, *, limit: int = 100, user_id: int | None = None) -> int:
     """Process pending events once; successful actions are never repeated."""
+    try:
+        await refresh_translation_cache(async_session_maker)
+    except Exception:
+        log.warning("Could not refresh translation cache before automation processing", exc_info=True)
     processed_count = 0
     async with async_session_maker() as session:
         stale_claim_before = datetime.utcnow() - timedelta(minutes=10)

@@ -13,6 +13,7 @@ from ..models import IncomingMessage
 from ..storage import StateStore
 from file_parser import parse_formulas_file, parse_questions_file
 from universal_tests import json_dumps, json_loads, validate_test_definition
+from translation_pack_manager import commit_readiness_critical_mutation, translation_coordination_lock
 
 
 async def show_menu(client: MaxApiClient, chat_id: int) -> None:
@@ -43,7 +44,7 @@ async def toggle_status(client: MaxApiClient, chat_id: int) -> None:
         btn = await session.get(Content, "test_button")
         if btn:
             btn.is_visible = config.is_enabled
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await show_menu(client, chat_id)
 
 
@@ -203,7 +204,7 @@ async def receive_test_file(client: MaxApiClient, states: StateStore, message: I
                 config = await session.get(TestConfig, 1)
                 config.formulas_json = json_dumps(formulas) if formulas else None
                 config.formulas_enabled = bool(formulas)
-                await session.commit()
+                await commit_readiness_critical_mutation(session)
             result_text = f"✅ Загружено вопросов: {len(questions_data)}. Формул: {len(formulas)}."
         await states.clear(message.sender.user_id)
         await client.send_message(chat_id=message.chat_id, text=result_text)
@@ -274,15 +275,16 @@ async def save_secret_question(client: MaxApiClient, states: StateStore, chat_id
     async with async_session_maker() as session:
         count = await session.scalar(select(func.count(SecretTestQuestion.id))) or 0
         session.add(SecretTestQuestion(text=question_text, sort_order=count + 1))
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_secret_questions(client, chat_id)
 
 
 async def delete_secret_question(client: MaxApiClient, chat_id: int, question_id: int) -> None:
     async with async_session_maker() as session:
-        await session.execute(delete(SecretTestQuestion).where(SecretTestQuestion.id == question_id))
-        await session.commit()
+        async with translation_coordination_lock(session):
+            await session.execute(delete(SecretTestQuestion).where(SecretTestQuestion.id == question_id))
+            await session.commit()
     await show_secret_questions(client, chat_id)
 
 

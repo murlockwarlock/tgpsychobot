@@ -104,6 +104,7 @@ from kie_chat import (
     is_kie_insufficient_balance,
 )
 from subscription_context import active_subscription_flag
+from translation_service import resolve_user_effective_locale
 from ai_request_context import (
     AIRequestLayout,
     AIRequestMessage,
@@ -782,6 +783,7 @@ async def generate_response(
     activity_tracker: ActivityTracker | None = None,
     minutes_since_last_visit: int | None = None,
     minutes_since_last_message: int | None = None,
+    preferred_response_locale: str | None = None,
 ) -> str:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -805,6 +807,7 @@ async def generate_response(
         activity_tracker=activity_tracker,
         minutes_since_last_visit=minutes_since_last_visit,
         minutes_since_last_message=minutes_since_last_message,
+        preferred_response_locale=preferred_response_locale,
     )
 
 
@@ -1771,6 +1774,7 @@ async def get_ai_response(
     activity_tracker: ActivityTracker | None = None,
     minutes_since_last_visit: int | None = None,
     minutes_since_last_message: int | None = None,
+    preferred_response_locale: str | None = None,
 ) -> str:
     async with async_session_maker() as session:
         user_result = await session.execute(
@@ -1912,6 +1916,15 @@ async def get_ai_response(
             subscription_config=subscription_config,
             memory_mode=get_memory_mode(ai_config),
             service_capabilities=TELEGRAM_CAPABILITIES,
+            preferred_response_locale=(
+                preferred_response_locale
+                if preferred_response_locale is not None
+                else await resolve_user_effective_locale(
+                    session,
+                    user,
+                    platform="max" if user.id >= 100_000_000_000 else "telegram",
+                )
+            ),
         )
 
         request_group_id = uuid.uuid4().hex[:12]

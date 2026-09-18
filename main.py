@@ -13,7 +13,7 @@ from aiogram.client.default import DefaultBotProperties
 from config import BOT_TOKEN, OWNER_IDS
 from handlers import router
 from automation_admin import router as automation_admin_router
-from database import init_db
+from database import async_session_maker, init_db
 from background_worker import process_queue, process_mailings
 from scheduler import check_subscriptions, check_kie_credit_balance
 from notification_outbox import process_payment_notification_outbox
@@ -25,12 +25,13 @@ from bot_commands import (
     build_command_sets,
     build_user_commands,
     get_admin_ids_for_command_scope,
-    refresh_chat_commands,
+    refresh_commands_for_user,
     refresh_default_commands,
 )
 from telegram_client import create_telegram_bot
 from automation_events import process_pending_events
 from followups import FollowupActivityMiddleware, process_due_followups
+from translation_service import refresh_translation_cache
 
 WEB_SERVER_HOST = '0.0.0.0'
 APP_PORT = int(os.environ.get('APP_PORT', 8080))
@@ -124,6 +125,10 @@ async def _configure_telegram_delivery(bot: Bot, dispatcher: Dispatcher) -> str:
 async def on_startup(bot: Bot, dispatcher: Dispatcher):
     logging.info("Configuring startup...")
     await init_db()
+    try:
+        await refresh_translation_cache(async_session_maker)
+    except Exception as exc:
+        logging.warning("Could not refresh Telegram translation cache at startup: %s", exc)
 
     try:
         user_commands, admin_commands, command_flags = await build_command_sets()
@@ -160,7 +165,7 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
 
     for admin_id in all_admin_ids:
         try:
-            await refresh_chat_commands(bot, admin_id, admin_commands)
+            await refresh_commands_for_user(bot, admin_id, True)
         except Exception as e:
             logging.warning(f"Could not set admin commands for {admin_id}: {e}")
 

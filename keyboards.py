@@ -3,10 +3,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from database import (
     async_session_maker,
+    BotGeneralConfig,
     Content,
     SubscriptionConfig,
     TestConfig,
     Topic,
+    User,
 )
 from config import OWNER_IDS
 from datetime import timezone, timedelta, date
@@ -15,14 +17,50 @@ from memory_mode import memory_mode_label
 from time_helpers import format_msk, to_msk
 from provider_models import build_telegram_model_callback_data
 from max_messenger_bot.identity import is_max_user_id, max_client_list_label
+from translation_service import (
+    LOCALE_LABELS,
+    normalize_enabled_languages,
+    resolve_effective_locale,
+    translate,
+)
 
 
 def should_show_test_button(test_config) -> bool:
     return bool(test_config and test_config.is_enabled)
 
 
+def language_selection_keyboard(enabled_languages):
+    builder = InlineKeyboardBuilder()
+    for locale in normalize_enabled_languages(enabled_languages):
+        builder.button(
+            text=LOCALE_LABELS[locale],
+            callback_data=f"select_telegram_language:{locale}",
+        )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def language_settings_keyboard(enabled_languages):
+    builder = InlineKeyboardBuilder()
+    for locale in normalize_enabled_languages(enabled_languages):
+        builder.button(
+            text=LOCALE_LABELS[locale],
+            callback_data=f"settings_select_language:{locale}",
+        )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 async def main_client_keyboard(user_id: int | None = None):
     async with async_session_maker() as session:
+        user = await session.get(User, user_id) if user_id is not None else None
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
         stmt = select(Content).where(
             Content.is_visible == True,
             Content.button_title != None,
@@ -35,11 +73,23 @@ async def main_client_keyboard(user_id: int | None = None):
 
         subscriptions_active = sub_config.subscriptions_enabled if sub_config else True
         topics_active = sub_config.topics_enabled if sub_config else True
-        topics_btn_name = sub_config.topics_btn_name if sub_config else "📚 Темы диалога"
+        topics_btn_source = sub_config.topics_btn_name if sub_config else "📚 Темы диалога"
+        topics_btn_name = translate(
+            f"subscription_config.{sub_config.id}.topics_btn_name" if sub_config else "ui.button.topics",
+            locale,
+            fallback=topics_btn_source,
+            source=topics_btn_source,
+        )
         topics_on_top = sub_config.topics_btn_on_top if sub_config else False
         change_name_active = sub_config.change_name_button_enabled if sub_config else True
         referral_active = sub_config.referral_enabled if sub_config else False
-        referral_btn_name = sub_config.referral_btn_name if sub_config else "👥 Пригласить друзей"
+        referral_btn_source = sub_config.referral_btn_name if sub_config else "👥 Пригласить друзей"
+        referral_btn_name = translate(
+            f"subscription_config.{sub_config.id}.referral_btn_name" if sub_config else "ui.button.referral",
+            locale,
+            fallback=referral_btn_source,
+            source=referral_btn_source,
+        )
 
         test_config = await session.get(TestConfig, 1)
         test_active = should_show_test_button(test_config)
@@ -54,22 +104,42 @@ async def main_client_keyboard(user_id: int | None = None):
         keyboard_rows.append([KeyboardButton(text=topics_btn_name)])
 
     content_rows = [
-        [KeyboardButton(text=btn.button_title) for btn in buttons[i:i + 2]]
+        [
+            KeyboardButton(
+                text=translate(
+                    f"content.{btn.key}.button_title",
+                    locale,
+                    fallback=btn.button_title,
+                    source=btn.button_title,
+                )
+            )
+            for btn in buttons[i:i + 2]
+        ]
         for i in range(0, len(buttons), 2)
     ]
     keyboard_rows.extend(content_rows)
 
     topic_rows = [
-        [KeyboardButton(text=topic.name) for topic in menu_topics[i:i + 2]]
+        [
+            KeyboardButton(
+                text=translate(
+                    f"topic.{topic.id}.name",
+                    locale,
+                    fallback=topic.name,
+                    source=topic.name,
+                )
+            )
+            for topic in menu_topics[i:i + 2]
+        ]
         for i in range(0, len(menu_topics), 2)
     ]
     keyboard_rows.extend(topic_rows)
 
     static_row = []
     if test_active:
-        static_row.append(KeyboardButton(text="📝 Пройти тест"))
+        static_row.append(KeyboardButton(text=translate("ui.button.test", locale, fallback="📝 Пройти тест")))
     if subscriptions_active:
-        static_row.append(KeyboardButton(text="⭐️ Подписка"))
+        static_row.append(KeyboardButton(text=translate("ui.button.subscription", locale, fallback="⭐️ Подписка")))
 
     if static_row:
         keyboard_rows.append(static_row)
@@ -86,8 +156,8 @@ async def main_client_keyboard(user_id: int | None = None):
 
     bottom_row = []
     if change_name_active:
-        bottom_row.append(KeyboardButton(text="⚙️ Настройки"))
-    bottom_row.append(KeyboardButton(text="🗑️ Новый диалог"))
+        bottom_row.append(KeyboardButton(text=translate("ui.button.settings", locale, fallback="⚙️ Настройки")))
+    bottom_row.append(KeyboardButton(text=translate("ui.button.new_dialogue", locale, fallback="🗑️ Новый диалог")))
     keyboard_rows.append(bottom_row)
 
     full_keyboard = [row for row in keyboard_rows if row]
@@ -188,7 +258,39 @@ def admin_general_settings_keyboard(config):
         text="🎨 Медиаколлекции основного диалога",
         callback_data="admin_main_collections_page_0",
     )
+    builder.button(text="🌐 Языки", callback_data="admin_language_settings")
     builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_language_settings_keyboard(config, readiness=None):
+    builder = InlineKeyboardBuilder()
+    enabled = set(normalize_enabled_languages(getattr(config, "telegram_enabled_languages", '["ru"]')))
+    default_locale = getattr(config, "telegram_default_language", "ru") or "ru"
+    selector_enabled = bool(getattr(config, "telegram_language_selection_enabled", False))
+    readiness = readiness or {}
+
+    builder.button(
+        text=f"Выбор языка: {'✅ включён' if selector_enabled else '❌ выключен'}",
+        callback_data="admin_language_toggle_selector",
+    )
+    for locale in ("ru", "en", "pt"):
+        status = "✅" if locale in enabled else "❌"
+        default_mark = " ⭐️" if locale == default_locale else ""
+        ready_mark = " готов" if locale == "ru" or readiness.get(locale, {}).get("ready") else " не готов"
+        builder.button(
+            text=f"{LOCALE_LABELS[locale]}: {status}{default_mark}{ready_mark}",
+            callback_data=f"admin_language_toggle_{locale}",
+        )
+        builder.button(
+            text=f"Сделать {LOCALE_LABELS[locale]} языком по умолчанию",
+            callback_data=f"admin_language_default_{locale}",
+        )
+    builder.button(text="📤 Экспорт пакета", callback_data="admin_translation_export")
+    builder.button(text="📥 Импорт пакета", callback_data="admin_translation_import")
+    builder.button(text="🔎 Аудит готовности", callback_data="admin_translation_audit")
+    builder.button(text="⬅️ Назад к общим настройкам", callback_data="admin_general_settings")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -580,30 +682,33 @@ def fixed_pagination_rows(page: int, total_pages: int, callback_for_page) -> lis
         ],
     ]
 
-def confirm_delete_history_keyboard(token: str = ""):
+def confirm_delete_history_keyboard(token: str = "", locale: str = "ru"):
     builder = InlineKeyboardBuilder()
     confirm_data = f"delete_history_confirm:{token}" if token else "delete_history_confirm"
     cancel_data = f"delete_history_cancel:{token}" if token else "delete_history_cancel"
-    builder.button(text="🗑️ Да, удалить", callback_data=confirm_data)
-    builder.button(text="❌ Отмена", callback_data=cancel_data)
+    builder.button(text=translate("ui.dialogue.confirm_delete", locale, fallback="🗑️ Да, удалить"), callback_data=confirm_data)
+    builder.button(text=translate("ui.dialogue.cancel_with_icon", locale, fallback="❌ Отмена"), callback_data=cancel_data)
     return builder.as_markup()
 
 
-def topic_reset_options_keyboard(token: str = ""):
+def topic_reset_options_keyboard(token: str = "", locale: str = "ru"):
     builder = InlineKeyboardBuilder()
     keep_data = f"reset_topic_keep:{token}" if token else "reset_topic_keep"
     to_main_data = f"reset_topic_to_main:{token}" if token else "reset_topic_to_main"
     cancel_data = f"delete_history_cancel:{token}" if token else "delete_history_cancel"
-    builder.button(text="Начать новый диалог в данной теме", callback_data=keep_data)
-    builder.button(text="Перейти в основной диалог", callback_data=to_main_data)
-    builder.button(text="Отмена", callback_data=cancel_data)
+    builder.button(text=translate("ui.dialogue.new_topic", locale, fallback="Начать новый диалог в данной теме"), callback_data=keep_data)
+    builder.button(text=translate("ui.dialogue.main_topic", locale, fallback="Перейти в основной диалог"), callback_data=to_main_data)
+    builder.button(text=translate("ui.dialogue.cancel", locale, fallback="Отмена"), callback_data=cancel_data)
     builder.adjust(1)
     return builder.as_markup()
 
 
-def confirm_disclaimer_keyboard():
+def confirm_disclaimer_keyboard(locale: str = "ru"):
     builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Я понимаю и принимаю", callback_data="disclaimer_accepted")
+    builder.button(
+        text=translate("ui.profile.disclaimer_accept", locale, fallback="✅ Я понимаю и принимаю"),
+        callback_data="disclaimer_accepted",
+    )
     return builder.as_markup()
 
 
@@ -663,14 +768,30 @@ def prompt_block_keyboard(download_callback: str):
     return builder.as_markup()
 
 
-def select_topic_keyboard(topics: list, current_topic_id: int | None):
+def select_topic_keyboard(topics: list, current_topic_id: int | None, locale: str = "ru"):
     builder = InlineKeyboardBuilder()
     for topic in topics:
-        text = f"✅ {topic.name}" if topic.id == current_topic_id else topic.name
+        topic_name = translate(
+            f"topic.{topic.id}.name",
+            locale,
+            fallback=topic.name,
+            source=topic.name,
+        )
+        text = f"✅ {topic_name}" if topic.id == current_topic_id else topic_name
         builder.button(text=text, callback_data=f"select_topic_{topic.id}")
     builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="🏠 Перейти в основной диалог", callback_data="reset_topic"))
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="topic_select_cancel"))
+    builder.row(
+        InlineKeyboardButton(
+            text=translate("ui.topics.main_button", locale, fallback="🏠 Перейти в основной диалог"),
+            callback_data="reset_topic",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=translate("ui.topics.cancel", locale, fallback="❌ Отмена"),
+            callback_data="topic_select_cancel",
+        )
+    )
     return builder.as_markup()
 
 
@@ -775,19 +896,38 @@ def assign_kb_to_topic_keyboard(topic_id: int, all_files: list, assigned_file_id
     return builder.as_markup()
 
 
-def subscription_info_keyboard(sub_info: dict | None, referral_info: dict | None = None):
+def subscription_info_keyboard(
+    sub_info: dict | None,
+    referral_info: dict | None = None,
+    locale: str = "ru",
+):
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Оформить/Сменить тариф", callback_data="sub_select_plan")
+    builder.button(
+        text=translate("ui.subscription.choose_plan", locale, fallback="💳 Оформить/Сменить тариф"),
+        callback_data="sub_select_plan",
+    )
     if sub_info and sub_info.get('allow_auto_renewal', True):
         if sub_info['auto_renewal']:
-            builder.button(text="❌ Отменить автопродление", callback_data="sub_toggle_renewal")
+            builder.button(
+                text=translate("ui.subscription.cancel_renewal", locale, fallback="❌ Отменить автопродление"),
+                callback_data="sub_toggle_renewal",
+            )
         else:
-            builder.button(text="✅ Включить автопродление", callback_data="sub_toggle_renewal")
-    builder.button(text="🎁 Ввести промокод", callback_data="sub_enter_promo")
+            builder.button(
+                text=translate("ui.subscription.enable_renewal", locale, fallback="✅ Включить автопродление"),
+                callback_data="sub_toggle_renewal",
+            )
+    builder.button(
+        text=translate("ui.subscription.enter_promo", locale, fallback="🎁 Ввести промокод"),
+        callback_data="sub_enter_promo",
+    )
 
     if referral_info and referral_info.get('enabled'):
+        referral_key = referral_info.get("translation_key")
+        referral_source = referral_info.get("sub_btn_name", "🤝 Бонус за приглашение")
         builder.button(
-            text=referral_info.get('sub_btn_name', '🤝 Бонус за приглашение'),
+            text=translate(referral_key, locale, fallback=referral_source, source=referral_source)
+            if referral_key else referral_source,
             callback_data="referral_sub_info"
         )
 
@@ -803,25 +943,48 @@ def confirm_client_action_keyboard(confirm_callback: str, cancel_callback: str):
     return builder.as_markup()
 
 
-def subscription_retry_keyboard():
+def subscription_retry_keyboard(locale: str = "ru"):
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Списать сейчас", callback_data="sub_retry_now")
-    builder.button(text="🔄 Отменить и оформить заново", callback_data="sub_cancel_retry")
-    builder.button(text="🎁 Ввести промокод", callback_data="sub_enter_promo")
+    builder.button(text=translate("ui.subscription.retry_now", locale, fallback="💳 Списать сейчас"), callback_data="sub_retry_now")
+    builder.button(text=translate("ui.subscription.cancel_retry", locale, fallback="🔄 Отменить и оформить заново"), callback_data="sub_cancel_retry")
+    builder.button(text=translate("ui.subscription.enter_promo", locale, fallback="🎁 Ввести промокод"), callback_data="sub_enter_promo")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def subscription_pending_keyboard():
+def subscription_pending_keyboard(locale: str = "ru"):
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔄 Проверить статус", callback_data="sub_retry_now")
-    builder.button(text="🔄 Отменить и оформить заново", callback_data="sub_cancel_retry")
-    builder.button(text="🎁 Ввести промокод", callback_data="sub_enter_promo")
+    builder.button(text=translate("ui.subscription.check_status", locale, fallback="🔄 Проверить статус"), callback_data="sub_retry_now")
+    builder.button(text=translate("ui.subscription.cancel_retry", locale, fallback="🔄 Отменить и оформить заново"), callback_data="sub_cancel_retry")
+    builder.button(text=translate("ui.subscription.enter_promo", locale, fallback="🎁 Ввести промокод"), callback_data="sub_enter_promo")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def plan_selection_keyboard(plans: list, global_discount_percent: int = 0, user_promos: list = None):
+def _localized_plan_name(plan, locale: str) -> str:
+    return translate(
+        f"plan.{plan.id}.name",
+        locale,
+        fallback=plan.name,
+        source=plan.name,
+    )
+
+
+def _localized_duration_unit(plan, locale: str) -> str:
+    key = "ui.subscription.days" if plan.duration_unit == "days" else "ui.subscription.months"
+    return translate(key, locale, fallback="дн." if plan.duration_unit == "days" else "мес.")
+
+
+def _localized_rubles(locale: str) -> str:
+    return translate("ui.subscription.rubles", locale, fallback="руб.")
+
+
+def plan_selection_keyboard(
+    plans: list,
+    global_discount_percent: int = 0,
+    user_promos: list = None,
+    locale: str = "ru",
+):
     if user_promos is None:
         user_promos = []
 
@@ -829,9 +992,9 @@ def plan_selection_keyboard(plans: list, global_discount_percent: int = 0, user_
 
     for plan in plans:
         price = plan.price
-        text = f"{plan.name}"
+        text = _localized_plan_name(plan, locale)
 
-        duration_unit_text = "дн." if plan.duration_unit == 'days' else "мес."
+        duration_unit_text = _localized_duration_unit(plan, locale)
         text += f" ({plan.duration_value} {duration_unit_text})"
 
         plan_discount_percent = global_discount_percent
@@ -854,10 +1017,10 @@ def plan_selection_keyboard(plans: list, global_discount_percent: int = 0, user_
             has_discount = True
             price = price * (1 - plan_discount_percent / 100)
 
-        text += f" - {price:.2f} руб."
+        text += f" - {price:.2f} {_localized_rubles(locale)}"
 
         if plan.is_trial and plan.upgrades_to_plan:
-            upgrade_duration_unit_text = "дн." if plan.upgrades_to_plan.duration_unit == 'days' else "мес."
+            upgrade_duration_unit_text = _localized_duration_unit(plan.upgrades_to_plan, locale)
 
             upgrade_price = plan.upgrades_to_plan.price
             upgrade_plan_id = plan.upgrades_to_plan.id
@@ -880,18 +1043,36 @@ def plan_selection_keyboard(plans: list, global_discount_percent: int = 0, user_
             if upgrade_plan_discount_percent > 0:
                 upgrade_price = upgrade_price * (1 - upgrade_plan_discount_percent / 100)
 
-            text += f" (далее {upgrade_price:.2f} руб./{plan.upgrades_to_plan.duration_value} {upgrade_duration_unit_text})"
+            text += translate(
+                "ui.subscription.upgrade_note",
+                locale,
+                fallback=" (далее {price:.2f} {rubles}/{duration} {unit})",
+            ).format(
+                price=upgrade_price,
+                rubles=_localized_rubles(locale),
+                duration=plan.upgrades_to_plan.duration_value,
+                unit=upgrade_duration_unit_text,
+            )
 
         if has_discount:
-            text += f" (со ск. {int(plan_discount_percent)}%)"
+            text += translate(
+                "ui.subscription.discount_short",
+                locale,
+                fallback=" (со ск. {percent}%)",
+            ).format(percent=int(plan_discount_percent))
 
         builder.button(text=text, callback_data=f"sub_pay_{plan.id}")
-    builder.button(text="⬅️ Назад", callback_data="back_to_sub_info")
+    builder.button(text=translate("ui.button.back", locale, fallback="⬅️ Назад"), callback_data="back_to_sub_info")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def promo_plan_selection_keyboard(plans: list, global_discount_percent: int = 0, user_promos: list = None):
+def promo_plan_selection_keyboard(
+    plans: list,
+    global_discount_percent: int = 0,
+    user_promos: list = None,
+    locale: str = "ru",
+):
     if user_promos is None:
         user_promos = []
 
@@ -899,9 +1080,9 @@ def promo_plan_selection_keyboard(plans: list, global_discount_percent: int = 0,
 
     for plan in plans:
         price = plan.price
-        text = f"{plan.name}"
+        text = _localized_plan_name(plan, locale)
 
-        duration_unit_text = "дн." if plan.duration_unit == 'days' else "мес."
+        duration_unit_text = _localized_duration_unit(plan, locale)
         text += f" ({plan.duration_value} {duration_unit_text})"
 
         plan_discount_percent = global_discount_percent
@@ -924,10 +1105,10 @@ def promo_plan_selection_keyboard(plans: list, global_discount_percent: int = 0,
             has_discount = True
             price = price * (1 - plan_discount_percent / 100)
 
-        text += f" - {price:.2f} руб."
+        text += f" - {price:.2f} {_localized_rubles(locale)}"
 
         if plan.is_trial and plan.upgrades_to_plan:
-            upgrade_duration_unit_text = "дн." if plan.upgrades_to_plan.duration_unit == 'days' else "мес."
+            upgrade_duration_unit_text = _localized_duration_unit(plan.upgrades_to_plan, locale)
 
             upgrade_price = plan.upgrades_to_plan.price
             upgrade_plan_id = plan.upgrades_to_plan.id
@@ -950,10 +1131,23 @@ def promo_plan_selection_keyboard(plans: list, global_discount_percent: int = 0,
             if upgrade_plan_discount_percent > 0:
                 upgrade_price = upgrade_price * (1 - upgrade_plan_discount_percent / 100)
 
-            text += f" (далее {upgrade_price:.2f} руб./{plan.upgrades_to_plan.duration_value} {upgrade_duration_unit_text})"
+            text += translate(
+                "ui.subscription.upgrade_note",
+                locale,
+                fallback=" (далее {price:.2f} {rubles}/{duration} {unit})",
+            ).format(
+                price=upgrade_price,
+                rubles=_localized_rubles(locale),
+                duration=plan.upgrades_to_plan.duration_value,
+                unit=upgrade_duration_unit_text,
+            )
 
         if has_discount:
-            text += f" (со ск. {int(plan_discount_percent)}%)"
+            text += translate(
+                "ui.subscription.discount_short",
+                locale,
+                fallback=" (со ск. {percent}%)",
+            ).format(percent=int(plan_discount_percent))
 
         builder.button(text=text, callback_data=f"sub_pay_{plan.id}")
 
@@ -961,7 +1155,7 @@ def promo_plan_selection_keyboard(plans: list, global_discount_percent: int = 0,
     return builder.as_markup()
 
 
-async def payment_provider_keyboard(plan_id: int, final_price: float):
+async def payment_provider_keyboard(plan_id: int, final_price: float, locale: str = "ru"):
     builder = InlineKeyboardBuilder()
 
     async with async_session_maker() as session:
@@ -975,7 +1169,10 @@ async def payment_provider_keyboard(plan_id: int, final_price: float):
         if config.robokassa_merchant_login and config.robokassa_password_1:
             builder.button(text="Robokassa", callback_data=f"pay_robokassa_{plan_id}_{final_price}")
 
-    builder.button(text="⬅️ Назад к выбору тарифа", callback_data="sub_select_plan")
+    builder.button(
+        text=translate("ui.subscription.back_to_plans", locale, fallback="⬅️ Назад к выбору тарифа"),
+        callback_data="sub_select_plan",
+    )
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1326,7 +1523,12 @@ def test_answer_keyboard():
     return builder.as_markup()
 
 
-def universal_test_answer_keyboard(options, horizontal: bool = False, question_index: int = 0):
+def universal_test_answer_keyboard(
+    options,
+    horizontal: bool = False,
+    question_index: int = 0,
+    exit_text: str = "❌ Выйти из теста",
+):
     from universal_tests import answer_callback_data
 
     builder = InlineKeyboardBuilder()
@@ -1338,13 +1540,16 @@ def universal_test_answer_keyboard(options, horizontal: bool = False, question_i
         builder.adjust(row_width)
     else:
         builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="❌ Выйти из теста", callback_data="cancel_test"))
+    builder.row(InlineKeyboardButton(text=exit_text, callback_data="cancel_test"))
     return builder.as_markup()
 
 
-def case_study_confirmation_keyboard():
+def case_study_confirmation_keyboard(locale: str = "ru"):
     builder = InlineKeyboardBuilder()
-    builder.button(text="Поехали дальше", callback_data="test_confirm_case")
+    builder.button(
+        text=translate("ui.test.case_continue", locale, fallback="Поехали дальше"),
+        callback_data="test_confirm_case",
+    )
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1357,31 +1562,77 @@ def test_prompt_keyboard(download_callback: str = "download_test_prompt"):
     return builder.as_markup()
 
 
-def gender_selection_keyboard(is_test: bool = False):
+def gender_selection_keyboard(is_test: bool = False, locale: str = "ru"):
     builder = InlineKeyboardBuilder()
-    builder.button(text="👨 Мужской", callback_data="gender_male")
-    builder.button(text="👩 Женский", callback_data="gender_female")
+    builder.button(
+        text=translate("ui.settings.male", locale, fallback="👨 Мужской"),
+        callback_data="gender_male",
+    )
+    builder.button(
+        text=translate("ui.settings.female", locale, fallback="👩 Женский"),
+        callback_data="gender_female",
+    )
     builder.adjust(2)
     if is_test:
-        builder.row(InlineKeyboardButton(text="❌ Выйти из теста", callback_data="cancel_test"))
+        builder.row(InlineKeyboardButton(
+            text=translate("ui.test.exit", locale, fallback="❌ Выйти из теста"),
+            callback_data="cancel_test",
+        ))
     return builder.as_markup()
 
 
-def user_settings_keyboard(user):
+def user_settings_keyboard(user, locale: str = "ru"):
     builder = InlineKeyboardBuilder()
 
-    builder.button(text="✏️ Изменить имя", callback_data="settings_change_name")
+    builder.button(
+        text=translate("ui.settings.change_name", locale, fallback="✏️ Изменить имя"),
+        callback_data="settings_change_name",
+    )
 
-    gender_label = "👨 Мужской" if user.gender == 'male' else ("👩 Женский" if user.gender == 'female' else "❓ Не указан")
-    builder.button(text=f"👤 Пол: {gender_label}", callback_data="settings_change_gender")
+    gender_label = (
+        translate("ui.settings.male", locale, fallback="👨 Мужской")
+        if user.gender == "male"
+        else (
+            translate("ui.settings.female", locale, fallback="👩 Женский")
+            if user.gender == "female"
+            else translate("ui.settings.gender_unknown", locale, fallback="❓ Не указан")
+        )
+    )
+    builder.button(
+        text=translate(
+            "ui.settings.gender_button",
+            locale,
+            fallback=f"👤 Пол: {gender_label}",
+        ).format(gender=gender_label),
+        callback_data="settings_change_gender",
+    )
 
-    age_label = user.age if user.age else "Не указан"
-    builder.button(text=f"🎂 Возраст: {age_label}", callback_data="settings_change_age")
+    age_label = user.age if user.age else translate("ui.settings.not_specified_age", locale, fallback="Не указан")
+    builder.button(
+        text=translate(
+            "ui.settings.age_button",
+            locale,
+            fallback=f"🎂 Возраст: {age_label}",
+        ).format(age=age_label),
+        callback_data="settings_change_age",
+    )
 
-    length_label = "📏 Обычный" if getattr(user, 'response_length', 'normal') != 'short' else "📏 Короткий"
-    builder.button(text=f"Длина ответов: {length_label}", callback_data="settings_toggle_length")
+    length_label = translate(
+        "ui.settings.length_normal" if getattr(user, "response_length", "normal") != "short" else "ui.settings.length_short",
+        locale,
+        fallback="📏 Обычный" if getattr(user, "response_length", "normal") != "short" else "📏 Короткий",
+    )
+    builder.button(
+        text=translate(
+            "ui.settings.length_button",
+            locale,
+            fallback=f"Длина ответов: {length_label}",
+        ).format(length=length_label),
+        callback_data="settings_toggle_length",
+    )
 
-    builder.button(text="❌ Закрыть", callback_data="settings_close")
+    builder.button(text=translate("ui.settings.language", locale, fallback="🌐 Язык"), callback_data="settings_change_language")
+    builder.button(text=translate("ui.settings.close", locale, fallback="❌ Закрыть"), callback_data="settings_close")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1767,10 +2018,13 @@ def admin_referral_referrer_detail_keyboard(referrer_id: int, page: int, total_p
     return builder.as_markup()
 
 
-def referral_template_share_keyboard(share_url: str):
+def referral_template_share_keyboard(share_url: str, locale: str = "ru"):
     """Кнопка «Поделиться» под каждым шаблоном приглашения (открывает диалог контактов)."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="📤 Поделиться", url=share_url)
+    builder.button(
+        text=translate("ui.referral.share", locale, fallback="📤 Поделиться"),
+        url=share_url,
+    )
     return builder.as_markup()
 
 

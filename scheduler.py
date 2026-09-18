@@ -4,8 +4,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from database import (async_session_maker, UserSubscription, SubscriptionPlan, SubscriptionConfig, User,
+from aiogram.types import InlineKeyboardMarkup
+from database import (async_session_maker, BotGeneralConfig, UserSubscription, SubscriptionPlan, SubscriptionConfig, User,
                       RobokassaPayment, PromoCode, YookassaPayment, AIConfig, get_all_admin_ids,
                       YookassaRecurringAttempt)
 from ai_integration import get_kie_remaining_credits, AIServiceError
@@ -58,7 +58,7 @@ from subscription_renewal import (
     mask_payment_method_id,
 )
 from time_helpers import format_msk, to_msk
-from notification_transport import send_notification_transport
+from notification_transport import build_subscribe_keyboard, send_notification_transport
 from notification_outbox import (
     NotificationPolicy,
     dispatch_outbox_by_key,
@@ -66,6 +66,14 @@ from notification_outbox import (
     build_canonical_outbox_key,
     get_canonical_key_for_yookassa_success,
     get_canonical_key_for_yookassa_cancellation,
+)
+from translation_service import (
+    refresh_translation_cache,
+    resolve_effective_locale,
+    resolve_user_effective_locale,
+    normalize_locale,
+    translate,
+    translation_cache,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +84,51 @@ EXPIRATION_DEDUP_WINDOW = timedelta(hours=2)
 UTC = timezone.utc
 MSK = timezone(timedelta(hours=3))
 _kie_credit_error_alert_cooldown = AlertCooldown(timedelta(hours=3))
+
+
+def _scheduler_locale_for_key(user, general_config, key: str) -> str:
+    if getattr(user, "id", 0) >= 100_000_000_000:
+        return "ru"
+    locale = resolve_effective_locale(
+        getattr(user, "telegram_language_code", None),
+        getattr(general_config, "telegram_default_language", "ru") if general_config else "ru",
+        bool(getattr(general_config, "telegram_language_selection_enabled", False)) if general_config else False,
+        getattr(general_config, "telegram_enabled_languages", '["ru"]') if general_config else '["ru"]',
+    )
+    if locale == "ru":
+        return "ru"
+    if (locale, key) in translation_cache.snapshot.translations:
+        return locale
+    default_locale = normalize_locale(
+        getattr(general_config, "telegram_default_language", "ru") if general_config else "ru"
+    ) or "ru"
+    if default_locale != "ru" and (default_locale, key) in translation_cache.snapshot.translations:
+        return default_locale
+    return "ru"
+
+
+def _localize_scheduler_notification(
+    user,
+    general_config,
+    key: str,
+    fallback: str,
+    values: dict,
+) -> str:
+    locale = _scheduler_locale_for_key(user, general_config, key)
+    if locale == "ru":
+        return fallback
+    template = translate(
+        key,
+        locale,
+        default_locale=getattr(general_config, "telegram_default_language", "ru") if general_config else "ru",
+        fallback=fallback,
+    )
+    if not template:
+        return fallback
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return fallback
 
 def _sanitize_log_value(value, limit: int = 2000) -> str:
     text = sanitize_secret_values(str(value)).replace("\r", " ").replace("\n", " ").strip()
@@ -212,6 +265,18 @@ async def _send_deduplicated_notification(
 ) -> bool:
     if _was_recent_notification_logged(recipient_id, key, now, window):
         return False
+    if reply_markup and any(
+        getattr(button, "callback_data", None) == "show_subscription_info_from_chat"
+        for row in getattr(reply_markup, "inline_keyboard", ())
+        for button in row
+    ):
+        async with async_session_maker() as session:
+            locale = await resolve_user_effective_locale(
+                session,
+                recipient_id,
+                platform="max" if recipient_id >= 100_000_000_000 else "telegram",
+            )
+        reply_markup = build_subscribe_keyboard(locale)
     delivered = await send_notification_transport(bot, recipient_id, text, reply_markup=reply_markup)
     target_logger = logger or plog
     if delivered:
@@ -367,11 +432,20 @@ async def disable_auto_renewal_after_failed_attempts(
 
     if not skip_user_message:
         try:
+            locale = await resolve_user_effective_locale(
+                session,
+                sub.user_id,
+                platform="max" if sub.user_id >= 100_000_000_000 else "telegram",
+            )
             await send_notification_transport(
                 bot,
                 sub.user_id,
-                "Ваша подписка истекла. Не удалось списать средства после 3 попыток — автопродление отключено.\n\nПродлите подписку вручную в меню.",
-                reply_markup=subscribe_kb,
+                translate(
+                    "notification.final_decline",
+                    locale,
+                    fallback="Ваша подписка истекла. Не удалось списать средства после 3 попыток — автопродление отключено.\n\nПродлите подписку вручную в меню.",
+                ),
+                reply_markup=build_subscribe_keyboard(locale),
             )
         except Exception:
             pass
@@ -457,6 +531,10 @@ async def check_subscriptions(bot: Bot):
     patch_bot_send_message(bot)
     log.info("Running subscription check...")
     now = datetime.utcnow()
+    try:
+        await refresh_translation_cache(async_session_maker)
+    except Exception:
+        log.warning("Could not refresh translation cache before subscription check", exc_info=True)
 
     try:
         await process_birthday_mailings(bot, now=now)
@@ -475,12 +553,9 @@ async def check_subscriptions(bot: Bot):
     lookback_cutoff = now - timedelta(days=30)
     notification_threshold = now - timedelta(hours=1, minutes=15)
 
-    subscribe_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оформить подписку", callback_data="show_subscription_info_from_chat")]
-    ])
-
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
+        general_config = await session.get(BotGeneralConfig, 1)
         if not config:
             return
 
@@ -761,6 +836,14 @@ async def check_subscriptions(bot: Bot):
                     selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans)])
                 if not user:
                     continue
+                user_locale = resolve_effective_locale(
+                    getattr(user, "telegram_language_code", None),
+                    getattr(general_config, "telegram_default_language", "ru") if general_config else "ru",
+                    bool(getattr(general_config, "telegram_language_selection_enabled", False)) if general_config else False,
+                    getattr(general_config, "telegram_enabled_languages", '["ru"]') if general_config else '["ru"]',
+                    platform="max" if user.id >= 100_000_000_000 else "telegram",
+                )
+                user_subscribe_kb = build_subscribe_keyboard(user_locale)
 
                 user_ref = user.first_name or ""
                 if user.username:
@@ -805,11 +888,41 @@ async def check_subscriptions(bot: Bot):
                         else:
                             time_display = "менее часа"
 
-                        message_text = f"Ваш пробный период истекает {date_str} (через {time_display})."
+                        discount_line = ""
                         if discount > 0:
-                            message_text += f"\n\nОформите подписку, чтобы сохранить скидку {discount}%!"
+                            discount_line = f"\n\nОформите подписку, чтобы сохранить скидку {discount}%!"
                         else:
-                            message_text += "\n\nОформите подписку для продолжения работы."
+                            discount_line = "\n\nОформите подписку для продолжения работы."
+                        trial_line_locale = _scheduler_locale_for_key(
+                            user,
+                            general_config,
+                            "notification.trial_expiring",
+                        )
+                        trial_line_key = (
+                            "notification.trial_discount_keep"
+                            if discount > 0
+                            else "notification.trial_continue"
+                        )
+                        trial_line_source = discount_line
+                        discount_line = translate(
+                            trial_line_key,
+                            trial_line_locale,
+                            default_locale=getattr(general_config, "telegram_default_language", "ru") if general_config else "ru",
+                            fallback=trial_line_source,
+                        ).format(discount=discount)
+                        fallback_text = f"Ваш пробный период истекает {date_str} (через {time_display}).{discount_line}"
+                        message_text = _localize_scheduler_notification(
+                            user,
+                            general_config,
+                            "notification.trial_expiring",
+                            fallback_text,
+                            {
+                                "date_str": date_str,
+                                "time_display": time_display,
+                                "discount_line": discount_line,
+                                "discount": discount,
+                            },
+                        )
 
                     elif sub.auto_renewal and sub.plan:
                         plan_to_charge = sub.plan.upgrades_to_plan if (
@@ -828,11 +941,28 @@ async def check_subscriptions(bot: Bot):
                                     current_discount = global_promo.discount_percent
 
                             price = plan_to_charge.price * (1 - current_discount / 100)
-                            message_text = f"Напоминаем: {date_str} продление тарифа «{plan_to_charge.name}» на сумму {price:.2f} руб."
+                            fallback_text = f"Напоминаем: {date_str} продление тарифа «{plan_to_charge.name}» на сумму {price:.2f} руб."
+                            localized_plan_name = translate(
+                                f"plan.{plan_to_charge.id}.name",
+                                user_locale,
+                                fallback=plan_to_charge.name,
+                                source=plan_to_charge.name,
+                            )
+                            message_text = _localize_scheduler_notification(
+                                user,
+                                general_config,
+                                "notification.renewal_reminder",
+                                fallback_text,
+                                {
+                                    "date_str": date_str,
+                                    "plan_name": localized_plan_name,
+                                    "price": price,
+                                },
+                            )
 
                 if message_text:
                     try:
-                        reply_markup = subscribe_kb if is_trial_promo else None
+                        reply_markup = user_subscribe_kb if is_trial_promo else None
                         plan_marker = sub.plan.id if sub.plan else "trial"
                         reminder_kind = "trial_reminder" if is_trial_promo else "renewal_reminder"
                         reminder_key = f"{reminder_kind}:{sub.id}:{plan_marker}:{reminder_bucket}"
@@ -858,10 +988,16 @@ async def check_subscriptions(bot: Bot):
                                     await _send_deduplicated_notification(
                                         bot,
                                         sub.user_id,
-                                        "Пробный период завершен. Выберите тариф для продолжения.",
+                                        _localize_scheduler_notification(
+                                            user,
+                                            general_config,
+                                            "notification.trial_finished",
+                                            "Пробный период завершен. Выберите тариф для продолжения.",
+                                            {},
+                                        ),
                                         f"trial_finished:{sub.id}",
                                         now,
-                                        reply_markup=subscribe_kb,
+                                        reply_markup=user_subscribe_kb,
                                         window=timedelta(hours=6),
                                     )
                                 except Exception:
@@ -882,10 +1018,16 @@ async def check_subscriptions(bot: Bot):
                                     await _send_deduplicated_notification(
                                         bot,
                                         sub.user_id,
-                                        "Подписка истекла. Продлите её в меню.",
+                                        _localize_scheduler_notification(
+                                            user,
+                                            general_config,
+                                            "notification.subscription_expired",
+                                            "Подписка истекла. Продлите её в меню.",
+                                            {},
+                                        ),
                                         f"expired:{sub.id}:{plan_name_exp}",
                                         now,
-                                        reply_markup=subscribe_kb,
+                                        reply_markup=user_subscribe_kb,
                                     )
                                 except Exception:
                                     pass
@@ -949,6 +1091,7 @@ async def check_subscriptions(bot: Bot):
                             key = build_canonical_outbox_key("robokassa", "payment", pending_inv_id, sub.user_id, "renewal_success")
                             payload = {
                                 "user_id": sub.user_id,
+                                "plan_id": ptc_ok.id if plan_ok else None,
                                 "amount": ok_amount,
                                 "plan_name": ok_plan_name,
                                 "end_date_msk": _format_msk(sub.end_date, '%d.%m.%Y %H:%M'),
@@ -990,7 +1133,7 @@ async def check_subscriptions(bot: Bot):
                                 payload = {"user_id": sub.user_id, "action": "final_decline", "provider": "Robokassa"}
                                 await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, "final_decline", payload, payment_id=str(pending_inv_id))
                                 await disable_auto_renewal_after_failed_attempts(
-                                    session, bot, sub, user_ref, plan_name_op, subscribe_kb, config, all_admin_ids, skip_user_message=True
+                                    session, bot, sub, user_ref, plan_name_op, user_subscribe_kb, config, all_admin_ids, skip_user_message=True
                                 )
                                 await dispatch_outbox_by_key(bot, key)
                                 continue
@@ -1032,7 +1175,7 @@ async def check_subscriptions(bot: Bot):
                                     payload = {"user_id": sub.user_id, "action": "final_decline", "provider": "Robokassa"}
                                     await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, "final_decline", payload, payment_id=str(pending_inv_id))
                                     await disable_auto_renewal_after_failed_attempts(
-                                        session, bot, sub, user_ref, plan_name_to, subscribe_kb, config, all_admin_ids, skip_user_message=True
+                                        session, bot, sub, user_ref, plan_name_to, user_subscribe_kb, config, all_admin_ids, skip_user_message=True
                                     )
                                     await dispatch_outbox_by_key(bot, key)
                                     continue
@@ -1063,7 +1206,7 @@ async def check_subscriptions(bot: Bot):
                         if sub.payment_attempt_count >= 3:
                             plan_name_3att = sub.plan.name if sub.plan else (sub.payment_provider or "Trial")
                             await disable_auto_renewal_after_failed_attempts(
-                                session, bot, sub, user_ref, plan_name_3att, subscribe_kb, config, all_admin_ids
+                                session, bot, sub, user_ref, plan_name_3att, user_subscribe_kb, config, all_admin_ids
                             )
                         continue
 
@@ -1338,10 +1481,16 @@ async def check_subscriptions(bot: Bot):
                             await _send_deduplicated_notification(
                                 bot,
                                 sub.user_id,
-                                "⏳ Запрос автопродления ЮKassa принят и ожидает подтверждения банка.",
+                                _localize_scheduler_notification(
+                                    user,
+                                    general_config,
+                                    "notification.yookassa_pending",
+                                    "⏳ Запрос автопродления ЮKassa принят и ожидает подтверждения банка.",
+                                    {},
+                                ),
                                 f"yk_pending:{sub.id}:{res.payment_id or att.idempotency_key}",
                                 now,
-                                reply_markup=subscribe_kb,
+                                reply_markup=user_subscribe_kb,
                                 window=timedelta(days=1),
                             )
                             if config and config.notifications_enabled:
@@ -1361,10 +1510,16 @@ async def check_subscriptions(bot: Bot):
                             await _send_deduplicated_notification(
                                 bot,
                                 sub.user_id,
-                                "Платёжный шлюз ЮKassa обрабатывает запрос. Мы проверяем статус операции.",
+                                _localize_scheduler_notification(
+                                    user,
+                                    general_config,
+                                    "notification.yookassa_unknown",
+                                    "Платёжный шлюз ЮKassa обрабатывает запрос. Мы проверяем статус операции.",
+                                    {},
+                                ),
                                 f"yk_unknown:{sub.id}:{att.idempotency_key}",
                                 now,
-                                reply_markup=subscribe_kb,
+                                reply_markup=user_subscribe_kb,
                                 window=timedelta(days=1),
                             )
 
@@ -1375,10 +1530,16 @@ async def check_subscriptions(bot: Bot):
                             await _send_deduplicated_notification(
                                 bot,
                                 sub.user_id,
-                                "Платёжный шлюз ЮKassa временно недоступен. Эта ошибка не засчитана как попытка списания.\n\nПовторим запрос позже.",
+                                _localize_scheduler_notification(
+                                    user,
+                                    general_config,
+                                    "notification.provider_error",
+                                    "Платёжный шлюз ЮKassa временно недоступен. Эта ошибка не засчитана как попытка списания.\n\nПовторим запрос позже.",
+                                    {},
+                                ),
                                 f"yk_provider_error:{sub.id}:{att.idempotency_key}",
                                 now,
-                                reply_markup=subscribe_kb,
+                                reply_markup=user_subscribe_kb,
                                 window=timedelta(days=1),
                             )
 
@@ -1446,7 +1607,7 @@ async def check_subscriptions(bot: Bot):
                                 )
                                 if auto_off or att_count >= 3:
                                     await disable_auto_renewal_after_failed_attempts(
-                                        session, bot, sub, user_ref, plan_to_charge.name, subscribe_kb, config, all_admin_ids, skip_user_message=True
+                                        session, bot, sub, user_ref, plan_to_charge.name, user_subscribe_kb, config, all_admin_ids, skip_user_message=True
                                     )
                                     continue
 
@@ -1485,11 +1646,25 @@ async def check_subscriptions(bot: Bot):
                                 await _send_deduplicated_notification(
                                     bot,
                                     sub.user_id,
-                                    f"⏳ Попытка автопродления подписки «{plan_to_charge.name}» на сумму {final_price:.2f} руб.\n\n"
-                                    f"Если деньги не спишутся в течение нескольких часов — проверьте, что карта активна и разрешены интернет-платежи.",
+                                    _localize_scheduler_notification(
+                                        user,
+                                        general_config,
+                                        "notification.robokassa_pending",
+                                        f"⏳ Попытка автопродления подписки «{plan_to_charge.name}» на сумму {final_price:.2f} руб.\n\n"
+                                        f"Если деньги не спишутся в течение нескольких часов — проверьте, что карта активна и разрешены интернет-платежи.",
+                                        {
+                                            "plan_name": translate(
+                                                f"plan.{plan_to_charge.id}.name",
+                                                user_locale,
+                                                fallback=plan_to_charge.name,
+                                                source=plan_to_charge.name,
+                                            ),
+                                            "price": final_price,
+                                        },
+                                    ),
                                     f"rk_request_pending:{sub.id}:{new_payment.id}",
                                     now,
-                                    reply_markup=kb.subscription_pending_keyboard(),
+                                    reply_markup=kb.subscription_pending_keyboard(user_locale),
                                     window=timedelta(days=1),
                                 )
                             except Exception:
@@ -1570,7 +1745,7 @@ async def check_subscriptions(bot: Bot):
                                 payload = {"user_id": sub.user_id, "action": "final_decline", "provider": "Robokassa"}
                                 await enqueue_outbox_event(session, key, "Robokassa", sub.user_id, "final_decline", payload, payment_id=str(new_payment.id))
                                 await disable_auto_renewal_after_failed_attempts(
-                                    session, bot, sub, user_ref, plan_to_charge.name, subscribe_kb, config, all_admin_ids, skip_user_message=True
+                                    session, bot, sub, user_ref, plan_to_charge.name, user_subscribe_kb, config, all_admin_ids, skip_user_message=True
                                 )
                                 await dispatch_outbox_by_key(bot, key)
                                 continue

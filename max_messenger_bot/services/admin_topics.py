@@ -13,6 +13,7 @@ from ..legacy import SubscriptionConfig, Topic, async_session_maker
 from ..storage import StateStore
 from topic_management import delete_topic_with_dependencies
 from ..time_utils import format_msk
+from translation_pack_manager import commit_readiness_critical_mutation
 
 
 def _topic_url(client: MaxApiClient, topic_id: int) -> str | None:
@@ -103,7 +104,7 @@ async def create_topic(client: MaxApiClient, states: StateStore, chat_id: int, u
     async with async_session_maker() as session:
         topic = Topic(name=name, is_active=True, show_in_list=True, show_in_main_menu=False)
         session.add(topic)
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
         topic_id = topic.id
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text=f"✅ Тема «{html.escape(name)}» создана.")
@@ -118,7 +119,7 @@ async def toggle_topics_enabled(client: MaxApiClient, chat_id: int) -> None:
             session.add(config)
             await session.flush()
         config.topics_enabled = not config.topics_enabled
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await list_topics(client, chat_id)
 
 
@@ -151,7 +152,7 @@ async def save_topics_button_name(client: MaxApiClient, states: StateStore, chat
             session.add(config)
             await session.flush()
         config.topics_btn_name = name
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await list_topics(client, chat_id)
 
@@ -177,7 +178,7 @@ async def save_name(client: MaxApiClient, states: StateStore, chat_id: int, user
             await client.send_message(chat_id=chat_id, text="Тема не найдена.")
             return
         topic.name = name
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_topic_editor(client, chat_id, topic_id)
 
@@ -251,7 +252,7 @@ async def save_intro(client: MaxApiClient, states: StateStore, chat_id: int, use
             await client.send_message(chat_id=chat_id, text="Тема не найдена.")
             return
         topic.start_message = text
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_topic_editor(client, chat_id, topic_id)
 
@@ -261,7 +262,7 @@ async def toggle_active(client: MaxApiClient, chat_id: int, topic_id: int) -> No
         topic = await session.get(Topic, topic_id)
         if topic:
             topic.is_active = not topic.is_active
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await show_topic_editor(client, chat_id, topic_id)
 
 
@@ -279,7 +280,7 @@ async def toggle_menu(client: MaxApiClient, chat_id: int, topic_id: int) -> None
         topic = await session.get(Topic, topic_id)
         if topic:
             topic.show_in_main_menu = not topic.show_in_main_menu
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await show_topic_editor(client, chat_id, topic_id)
 
 
@@ -288,7 +289,7 @@ async def toggle_list(client: MaxApiClient, chat_id: int, topic_id: int) -> None
         topic = await session.get(Topic, topic_id)
         if topic:
             topic.show_in_list = not topic.show_in_list
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await show_topic_editor(client, chat_id, topic_id)
 
 
