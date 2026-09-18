@@ -14,7 +14,7 @@ import zipfile
 import time
 from collections import OrderedDict, deque
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 import inspect
 import ai_integration
@@ -30,6 +30,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select, func, update, delete, or_, and_, cast, String, desc
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile
@@ -47,6 +48,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      MediaCollection, media_collection_items, topic_collection_association,
                      main_dialogue_collection_association,
                      ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationDialogueState, AutomationEvent,
+                     TelegramStartIntent, SubscriptionBenefitGrant,
                      DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_MAX_LENGTH)
 from aiogram.types import LabeledPrice
 import keyboards as kb
@@ -267,7 +269,33 @@ from subscription_dates import extend_subscription_end_date
 from subscription_retry_policy import can_retry_manually, can_retry_now, get_next_retry_at
 from subscription_context import active_subscription_flag, should_include_subscription_status
 from topic_management import delete_topic_with_dependencies
-from bot_commands import refresh_commands_for_user
+from bot_commands import build_command_sets, refresh_commands_for_user, refresh_default_commands
+from telegram_start_service import (
+    claim_language_resume_lease,
+    complete_language_selection,
+    grant_subscription_days,
+    language_selection_enabled_for_user,
+    mark_start_intent_completed,
+    parse_referral_payload,
+    record_start_intent,
+)
+from translation_service import (
+    LOCALE_LABELS,
+    normalize_enabled_languages,
+    normalize_locale,
+    resolve_effective_locale,
+    resolve_user_effective_locale,
+    translate,
+)
+from translation_pack_manager import (
+    TranslationPackValidationError,
+    audit_translation_readiness,
+    commit_readiness_critical_mutation,
+    export_translation_pack,
+    import_translation_pack,
+    translation_coordination_lock,
+)
+from translation_registry import build_translation_registry
 from card_spreads import extract_numbered_spread_definition
 from universal_tests import (
     build_result_handoff_prompt,
@@ -300,6 +328,141 @@ user_processing_tasks = {}
 user_isolated_turn_queues = {}
 user_scheduling_locks = {}
 NAVIGATION_MENU_HINT = "Нажмите на кнопку или воспользуйтесь меню для навигации"
+
+
+async def _maybe_defer_start_for_language(
+    message: Message,
+    args: str | None,
+    actor=None,
+) -> tuple[bool, bool]:
+    actor = actor or message.from_user
+    user_id = actor.id
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        user = await session.get(User, user_id)
+        created_user = user is None
+        if created_user:
+            user = User(
+                id=user_id,
+                username=actor.username,
+                first_name=actor.full_name,
+                is_admin=user_id in OWNER_IDS,
+            )
+            session.add(user)
+            await session.flush()
+
+        intent = await session.get(TelegramStartIntent, user_id)
+        if created_user or intent is not None:
+            intent = await record_start_intent(
+                session,
+                user_id=user_id,
+                args=args,
+                new_user_eligible=created_user,
+            )
+
+        should_gate = bool(
+            config
+            and intent
+            and language_selection_enabled_for_user(
+                selector_enabled=bool(getattr(config, "telegram_language_selection_enabled", False)),
+                enabled_languages=getattr(config, "telegram_enabled_languages", '["ru"]'),
+                user_language=getattr(user, "telegram_language_code", None),
+                intent_new_user_eligible=bool(intent.new_user_eligible),
+            )
+            and intent.status == "awaiting_language"
+        )
+        await session.commit()
+
+        if should_gate:
+            selection_locale = resolve_effective_locale(
+                None,
+                getattr(config, "telegram_default_language", "ru"),
+                True,
+                getattr(config, "telegram_enabled_languages", '["ru"]'),
+            )
+            await message.answer(
+                translate(
+                    "ui.language_selection_prompt",
+                    selection_locale,
+                    fallback="Пожалуйста, выберите язык:",
+                ),
+                reply_markup=kb.language_selection_keyboard(
+                    getattr(config, "telegram_enabled_languages", '["ru"]')
+                ),
+            )
+            return True, bool(intent.new_user_eligible)
+
+        return False, bool(
+            intent
+            and intent.new_user_eligible
+            and intent.status != "completed"
+        )
+
+
+async def _apply_registration_referral(
+    session,
+    *,
+    user: User,
+    referrer_id: int | None,
+    bonus_messages: list[str],
+    locale: str = "ru",
+) -> tuple[int, int] | None:
+    if not referrer_id:
+        return None
+    sub_config = await session.get(SubscriptionConfig, 1)
+    if not sub_config or not sub_config.referral_enabled:
+        return None
+    lock_ids = sorted({user.id, referrer_id})
+    locked_users = (
+        await session.execute(
+        select(User.id)
+        .add_columns(User.referred_by)
+        .where(User.id.in_(lock_ids))
+        .order_by(User.id.asc())
+        .with_for_update()
+        .execution_options(populate_existing=True)
+        )
+    ).all()
+    locked_by_id = {row.id: row.referred_by for row in locked_users}
+    if referrer_id not in locked_by_id:
+        return None
+    current_referrer_id = locked_by_id.get(user.id)
+    if current_referrer_id and current_referrer_id != referrer_id:
+        return None
+    user.referred_by = current_referrer_id or referrer_id
+    now = datetime.utcnow()
+    referee_granted = await grant_subscription_days(
+        session,
+        grant_key=f"registration_referee:{user.id}",
+        grant_type="registration_referee",
+        beneficiary_user_id=user.id,
+        source_user_id=user.referred_by,
+        days=sub_config.referral_bonus_days_referral,
+        payment_provider="Trial Referral",
+        now=now,
+    )
+    if referee_granted:
+        bonus_messages.append(
+            translate(
+                "ui.referral.registration_bonus",
+                locale,
+                fallback="🎁 <b>Вам начислено {days} бонусных дн.</b> за регистрацию по пригласительной ссылке!",
+            ).format(days=sub_config.referral_bonus_days_referral)
+        )
+
+    referrer_granted = await grant_subscription_days(
+        session,
+        grant_key=f"registration_referrer:{user.id}:{user.referred_by}",
+        grant_type="registration_referrer",
+        beneficiary_user_id=user.referred_by,
+        source_user_id=user.id,
+        days=sub_config.referral_bonus_days_referrer,
+        payment_provider="Trial Referral Bonus",
+        now=now,
+    )
+    if referrer_granted:
+        return referrer_id, sub_config.referral_bonus_days_referrer
+    return None
 
 
 @router.callback_query(F.data.startswith(TELEGRAM_MODEL_CALLBACK_PREFIX))
@@ -497,7 +660,12 @@ async def _echo_ai_button_label(
 ) -> None:
     if not isinstance(button_text, str) or not button_text:
         return
-    acknowledgement = f"Ответ принят: {button_text}"
+    locale = await _get_user_locale(callback.from_user.id)
+    acknowledgement = translate(
+        "ui.ai.button_accepted",
+        locale,
+        fallback="Ответ принят: {button_text}",
+    ).format(button_text=button_text)
     message = getattr(callback, "message", None)
     answer = getattr(message, "answer", None)
     try:
@@ -661,6 +829,16 @@ async def _resolve_card_spread_rounds(
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        try:
+            general_config = await session.get(BotGeneralConfig, 1)
+        except OperationalError:
+            general_config = None
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
         topic = await session.get(Topic, topic_id)
         if not user or not topic or not topic.system_prompt:
             return explicit_rounds
@@ -941,6 +1119,7 @@ class AdminStates(StatesGroup):
     set_referral_sub_btn_name = State()
     add_referral_template = State()
     edit_referral_template = State()
+    upload_translation_pack = State()
 
 
 class UserStates(StatesGroup):
@@ -959,19 +1138,42 @@ class TestButtonFilter(Filter):
         if not message.text:
             return False
         async with async_session_maker() as session:
-            stmt = select(Content.button_title).where(Content.key == "test_button").limit(1)
-            title = await session.scalar(stmt)
-            if not title:
-                title = "📝 Пройти тест"
-            return message.text == title
+            user = await session.get(User, message.from_user.id)
+            config = await session.get(BotGeneralConfig, 1)
+            locale = resolve_effective_locale(
+                getattr(user, "telegram_language_code", None),
+                getattr(config, "telegram_default_language", "ru"),
+                bool(getattr(config, "telegram_language_selection_enabled", False)),
+                getattr(config, "telegram_enabled_languages", '["ru"]'),
+            )
+            title = await session.scalar(select(Content.button_title).where(Content.key == "test_button").limit(1))
+            return message.text == translate(
+                "content.test_button.button_title",
+                locale,
+                fallback=title or "📝 Пройти тест",
+                source=title or "",
+            )
 
 
 class TopicsButtonFilter(Filter):
     async def __call__(self, message: Message) -> bool:
         if not message.text: return False
         async with async_session_maker() as session:
+            user = await session.get(User, message.from_user.id)
+            general_config = await session.get(BotGeneralConfig, 1)
             config = await session.get(SubscriptionConfig, 1)
-            btn_name = config.topics_btn_name if config else "📚 Темы диалога"
+            locale = resolve_effective_locale(
+                getattr(user, "telegram_language_code", None),
+                getattr(general_config, "telegram_default_language", "ru"),
+                bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+                getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            )
+            btn_name = translate(
+                f"subscription_config.{config.id}.topics_btn_name" if config else "ui.button.topics",
+                locale,
+                fallback=config.topics_btn_name if config else "📚 Темы диалога",
+                source=config.topics_btn_name if config else "📚 Темы диалога",
+            )
             return message.text == btn_name
 
 class ReferralButtonFilter(Filter):
@@ -979,10 +1181,71 @@ class ReferralButtonFilter(Filter):
         if not message.text:
             return False
         async with async_session_maker() as session:
+            user = await session.get(User, message.from_user.id)
+            general_config = await session.get(BotGeneralConfig, 1)
             config = await session.get(SubscriptionConfig, 1)
             if not config or not config.referral_enabled:
                 return False
-            return message.text == config.referral_btn_name
+            locale = resolve_effective_locale(
+                getattr(user, "telegram_language_code", None),
+                getattr(general_config, "telegram_default_language", "ru"),
+                bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+                getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            )
+            return message.text == translate(
+                f"subscription_config.{config.id}.referral_btn_name",
+                locale,
+                fallback=config.referral_btn_name,
+                source=config.referral_btn_name,
+            )
+
+
+class SubscriptionButtonFilter(Filter):
+    async def __call__(self, message: Message) -> bool:
+        if not message.text:
+            return False
+        async with async_session_maker() as session:
+            user = await session.get(User, message.from_user.id)
+            config = await session.get(BotGeneralConfig, 1)
+            locale = resolve_effective_locale(
+                getattr(user, "telegram_language_code", None),
+                getattr(config, "telegram_default_language", "ru"),
+                bool(getattr(config, "telegram_language_selection_enabled", False)),
+                getattr(config, "telegram_enabled_languages", '["ru"]'),
+            )
+        return message.text == translate("ui.button.subscription", locale, fallback="⭐️ Подписка")
+
+
+class SettingsButtonFilter(Filter):
+    async def __call__(self, message: Message) -> bool:
+        if not message.text:
+            return False
+        async with async_session_maker() as session:
+            user = await session.get(User, message.from_user.id)
+            config = await session.get(BotGeneralConfig, 1)
+            locale = resolve_effective_locale(
+                getattr(user, "telegram_language_code", None),
+                getattr(config, "telegram_default_language", "ru"),
+                bool(getattr(config, "telegram_language_selection_enabled", False)),
+                getattr(config, "telegram_enabled_languages", '["ru"]'),
+            )
+        return message.text == translate("ui.button.settings", locale, fallback="⚙️ Настройки")
+
+
+class NewDialogueButtonFilter(Filter):
+    async def __call__(self, message: Message) -> bool:
+        if not message.text:
+            return False
+        async with async_session_maker() as session:
+            user = await session.get(User, message.from_user.id)
+            config = await session.get(BotGeneralConfig, 1)
+            locale = resolve_effective_locale(
+                getattr(user, "telegram_language_code", None),
+                getattr(config, "telegram_default_language", "ru"),
+                bool(getattr(config, "telegram_language_selection_enabled", False)),
+                getattr(config, "telegram_enabled_languages", '["ru"]'),
+            )
+        return message.text == translate("ui.button.new_dialogue", locale, fallback="🗑️ Новый диалог")
 
 
 class DynamicButtonFilter(Filter):
@@ -990,14 +1253,29 @@ class DynamicButtonFilter(Filter):
         if not message.text:
             return False
         async with async_session_maker() as session:
-            stmt = select(Content.key).where(Content.button_title == message.text, Content.is_visible == True).limit(1)
-            result = await session.scalar(stmt)
-            if result == "test_button":
-                return False
-            return result is not None
+            user = await session.get(User, message.from_user.id)
+            config = await session.get(BotGeneralConfig, 1)
+            locale = resolve_effective_locale(
+                getattr(user, "telegram_language_code", None),
+                getattr(config, "telegram_default_language", "ru"),
+                bool(getattr(config, "telegram_language_selection_enabled", False)),
+                getattr(config, "telegram_enabled_languages", '["ru"]'),
+            )
+            rows = (await session.execute(select(Content).where(Content.is_visible == True))).scalars().all()
+            return any(
+                item.key != "test_button"
+                and message.text == translate(
+                    f"content.{item.key}.button_title",
+                    locale,
+                    fallback=item.button_title,
+                    source=item.button_title,
+                )
+                for item in rows
+                if item.button_title
+            )
 
 
-async def _is_reserved_user_menu_text(text: str) -> bool:
+async def _is_reserved_user_menu_text(text: str, user_id: int | None = None) -> bool:
     clean_text = (text or "").strip()
     if not clean_text:
         return False
@@ -1012,24 +1290,77 @@ async def _is_reserved_user_menu_text(text: str) -> bool:
     }
 
     async with async_session_maker() as session:
+        user = await session.get(User, user_id) if user_id is not None else None
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
+        reserved_texts.update({
+            translate("ui.button.settings", locale, fallback="⚙️ Настройки"),
+            translate("ui.button.new_dialogue", locale, fallback="🗑️ Новый диалог"),
+            translate("ui.button.subscription", locale, fallback="⭐️ Подписка"),
+            translate("ui.button.test", locale, fallback="📝 Пройти тест"),
+            translate("ui.button.topics", locale, fallback="📚 Темы диалога"),
+            translate("ui.button.referral", locale, fallback="👥 Пригласить друзей"),
+        })
         config = await session.get(SubscriptionConfig, 1)
         if config:
-            reserved_texts.add(config.topics_btn_name or "📚 Темы диалога")
+            topics_source = config.topics_btn_name or "📚 Темы диалога"
+            reserved_texts.add(translate(
+                f"subscription_config.{config.id}.topics_btn_name",
+                locale,
+                fallback=topics_source,
+                source=topics_source,
+            ))
             if config.referral_enabled:
-                reserved_texts.add(config.referral_btn_name or "👥 Пригласить друзей")
+                referral_source = config.referral_btn_name or "👥 Пригласить друзей"
+                reserved_texts.add(translate(
+                    f"subscription_config.{config.id}.referral_btn_name",
+                    locale,
+                    fallback=referral_source,
+                    source=referral_source,
+                ))
+                referral_sub_source = config.referral_sub_btn_name or "🤝 Бонус за приглашение"
+                reserved_texts.add(translate(
+                    f"subscription_config.{config.id}.referral_sub_btn_name",
+                    locale,
+                    fallback=referral_sub_source,
+                    source=referral_sub_source,
+                ))
 
-        content_titles = await session.execute(
-            select(Content.button_title).where(
-                Content.button_title.isnot(None),
-                Content.is_visible == True,
+        content_rows = (
+            await session.execute(
+                select(Content).where(
+                    Content.button_title.isnot(None),
+                    Content.is_visible == True,
+                )
             )
-        )
-        reserved_texts.update(title for title in content_titles.scalars().all() if title)
+        ).scalars().all()
+        for content in content_rows:
+            reserved_texts.add(content.button_title)
+            reserved_texts.add(translate(
+                f"content.{content.key}.button_title",
+                locale,
+                fallback=content.button_title,
+                source=content.button_title,
+            ))
 
-        topic_names = await session.execute(
-            select(Topic.name).where(Topic.is_active == True, Topic.show_in_list == True)
-        )
-        reserved_texts.update(name for name in topic_names.scalars().all() if name)
+        topic_rows = (
+            await session.execute(
+                select(Topic).where(Topic.is_active == True, Topic.show_in_list == True)
+            )
+        ).scalars().all()
+        for topic in topic_rows:
+            reserved_texts.add(topic.name)
+            reserved_texts.add(translate(
+                f"topic.{topic.id}.name",
+                locale,
+                fallback=topic.name,
+                source=topic.name,
+            ))
 
     return clean_text in reserved_texts
 
@@ -1154,6 +1485,7 @@ async def _send_ai_processing_message(
     config: BotGeneralConfig | None,
     *,
     reply_markup=None,
+    locale: str = "ru",
 ):
     if not config or not bool(getattr(config, "ai_processing_message_enabled", False)):
         return None
@@ -1165,6 +1497,18 @@ async def _send_ai_processing_message(
     if not isinstance(text, str) or not text.strip():
         logging.warning("AI processing message is enabled without usable text")
         return None
+    source_text = text
+    localized_text = translate(
+        f"bot_general_config.{getattr(config, 'id', 1)}.ai_processing_message_text",
+        locale,
+        fallback=source_text,
+        source=source_text,
+    ) or source_text
+    if localized_text == source_text and source_text == DEFAULT_AI_PROCESSING_MESSAGE_TEXT:
+        localized_text = translate("ui.ai.processing_default", locale, fallback=source_text)
+    if localized_text != source_text:
+        entities = None
+    text = localized_text
     try:
         if entities:
             message_kwargs = Text.from_entities(text, entities).as_kwargs()
@@ -1447,6 +1791,7 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
         if not user:
             return response_text
 
+        locale = await resolve_user_effective_locale(session, user)
         topic_id = user.current_topic_id
         media_scope = await load_media_scope(session, topic_id, include_media_ids=False)
 
@@ -1523,7 +1868,10 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                 )
                 card_ids = [c.id for c in cards]
                 kb_markup = keyboards.card_selection_keyboard(category, card_ids)
-                await message.answer("Выбери карту, которая тебе откликается:", reply_markup=kb_markup)
+                await message.answer(
+                    translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                    reply_markup=kb_markup,
+                )
 
         choice_hidden_matches = re.findall(r"\[CHOICE_IMG_HIDDEN:\s*(.+?)\s*\|\s*(\d+)(?:\s*\|\s*(\d+))?\]", response_text)
         for match in choice_hidden_matches:
@@ -1564,7 +1912,10 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                     )
                 card_ids = [c.id for c in cards]
                 kb_markup = keyboards.card_selection_keyboard(cat_stripped, card_ids)
-                await message.answer("Выбери карту, которая тебе откликается:", reply_markup=kb_markup)
+                await message.answer(
+                    translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                    reply_markup=kb_markup,
+                )
 
         show_matches = [
             _parse_show_img_directive(payload)
@@ -1667,9 +2018,10 @@ async def _send_generated_response(bot: Bot, user_id: int, text: str) -> None:
     presentation = await _prepare_telegram_response_buttons(user_id, button_rows)
     text_markup = _telegram_response_text_markup(presentation)
     if not clean_text and (text_markup or presentation.inline_markup):
+        locale = await _get_user_locale(user_id)
         await bot.send_message(
             chat_id=user_id,
-            text="Выберите действие:",
+            text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
             reply_markup=text_markup,
         )
         return
@@ -1691,16 +2043,39 @@ async def _send_generated_response(bot: Bot, user_id: int, text: str) -> None:
 async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContext | None):
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
+        user = await session.get(User, user_id)
+        try:
+            general_config = await session.get(BotGeneralConfig, 1)
+        except OperationalError:
+            general_config = None
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
         if config and not config.is_enabled and not await is_admin(user_id):
-            await bot.send_message(chat_id=user_id, text="⚠️ Тестирование в данный момент отключено.")
+            await bot.send_message(
+                chat_id=user_id,
+                text=translate(
+                    "ui.test.disabled",
+                    locale,
+                    fallback="⚠️ Тестирование в данный момент отключено.",
+                ),
+            )
             return
 
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
         if not questions:
-            await bot.send_message(chat_id=user_id, text="⚠️ Тест временно недоступен: вопросы еще не загружены.")
+            await bot.send_message(
+                chat_id=user_id,
+                text=translate(
+                    "ui.test.unavailable",
+                    locale,
+                    fallback="⚠️ Тест временно недоступен: вопросы еще не загружены.",
+                ),
+            )
             return
-
-        user = await session.get(User, user_id)
 
     async def answer(text, **kwargs):
         return await bot.send_message(chat_id=user_id, text=text, **kwargs)
@@ -1713,11 +2088,12 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
         message_proxy,
         state,
         user,
+        bot,
         resume_test=True,
     ):
         return
 
-    await _send_configured_test_intro(bot, user_id)
+    await _send_configured_test_intro(bot, user_id, user_id)
     if state is not None:
         await start_psych_test(message_proxy, state, user_id)
         return
@@ -1735,12 +2111,36 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
         ))
         await session.commit()
     question = questions[0]
-    options = get_answer_options(question)
-    text = build_question_text(question, 0, len(questions), getattr(config, "show_progress", True))
+    question_text, comment, options = _localized_test_question(question, locale)
+    text = build_question_text(
+        question,
+        0,
+        len(questions),
+        getattr(config, "show_progress", True),
+        question_text=question_text,
+        comment=comment,
+        answer_options=options,
+        question_heading=translate(
+            "ui.test.question_heading",
+            locale,
+            fallback="<b>Вопрос {current} из {total}</b>",
+        ),
+        free_text_hint=translate(
+            "ui.test.free_text_hint",
+            locale,
+            fallback="Напишите свой ответ или выберите из предложенных ниже.",
+        ),
+        text_answer_hint=translate(
+            "ui.test.text_answer_hint",
+            locale,
+            fallback="Напишите ответ сообщением.",
+        ),
+    )
     reply_markup = kb.universal_test_answer_keyboard(
         options,
         question_buttons_are_horizontal(question),
         0,
+        exit_text=translate("ui.test.exit", locale, fallback="❌ Выйти из теста"),
     ) if options else None
     await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
 
@@ -1824,10 +2224,12 @@ async def process_buffered_messages(
         async with async_session_maker() as session:
             ai_config = await session.get(AIConfig, 1)
             general_config = await session.get(BotGeneralConfig, 1)
+            locale = await resolve_user_effective_locale(session, user_id)
         processing_message = await _send_ai_processing_message(
             bot,
             user_id,
             general_config,
+            locale=locale,
         )
 
         exclude_message_id = scoped_kickoff.navigation_message_id if scoped_kickoff is not None else None
@@ -1953,7 +2355,11 @@ async def process_buffered_messages(
                         image_data = await ai_integration.generate_image(image_prompt)
                         if not await _check_scope_guard():
                             return
-                        await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(image_data, filename="gen.png"), caption="✨ Готово!")
+                        await bot.send_photo(
+                            chat_id=user_id,
+                            photo=BufferedInputFile(image_data, filename="gen.png"),
+                            caption=translate("ui.ai.image_ready", locale, fallback="✨ Готово!"),
+                        )
                     except Exception as e:
                         if not await _check_scope_guard():
                             return
@@ -1970,7 +2376,10 @@ async def process_buffered_messages(
                             exception=e,
                         )
                         if await _check_scope_guard():
-                            await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=translate("ui.ai.image_failed", locale, fallback="😔 Не удалось сгенерировать изображение."),
+                            )
                     finally:
                         upload_task.cancel()
                 if response_text_markup and not response_buttons_sent:
@@ -1978,7 +2387,7 @@ async def process_buffered_messages(
                         return
                     await bot.send_message(
                         chat_id=user_id,
-                        text="Выберите действие:",
+                        text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
                         reply_markup=response_text_markup,
                     )
             else:
@@ -2000,7 +2409,7 @@ async def process_buffered_messages(
                         return
                     await bot.send_message(
                         chat_id=user_id,
-                        text="Выберите действие:",
+                        text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
                         reply_markup=response_text_markup,
                     )
 
@@ -2098,7 +2507,7 @@ async def process_buffered_messages(
                         return
                     await bot.send_message(
                         chat_id=user_id,
-                        text="Выбери карту, которая тебе откликается:",
+                        text=translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
                         reply_markup=keyboards.card_selection_keyboard(cat, [c.id for c in cards]),
                     )
 
@@ -2144,7 +2553,7 @@ async def process_buffered_messages(
                         return
                     await bot.send_message(
                         chat_id=user_id,
-                        text="Выбери карту, которая тебе откликается:",
+                        text=translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
                         reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]),
                     )
             if not await _check_scope_guard():
@@ -2240,7 +2649,11 @@ async def process_buffered_messages(
             return
         await bot.send_message(
             chat_id=user_id,
-            text="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+            text=translate(
+                "ui.ai.overloaded",
+                locale,
+                fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+            ),
         )
     except Exception as e:
         if typing_task: typing_task.cancel()
@@ -2260,7 +2673,11 @@ async def process_buffered_messages(
             return
         await bot.send_message(
             chat_id=user_id,
-            text="Произошла ошибка при обработке сообщения.",
+            text=translate(
+                "ui.ai.processing_failed",
+                locale,
+                fallback="Произошла ошибка при обработке сообщения.",
+            ),
         )
     finally:
         await _cancel_task(typing_task)
@@ -2458,18 +2875,35 @@ async def render_static_content_telegram(
     async with async_session_maker() as session:
         stmt = select(Content).where(Content.key == content_key).options(selectinload(Content.media))
         content_obj = await session.scalar(stmt)
+        user = await session.get(User, user_id)
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
     main_kb = await kb.main_client_keyboard(user_id)
     if not content_obj:
         if is_start:
-            await bot.send_message(chat_id, "Приветствие не задано.", reply_markup=main_kb)
+            await bot.send_message(
+                chat_id,
+                translate("ui.content.not_configured", locale, fallback="Приветствие не задано."),
+                reply_markup=main_kb,
+            )
             return True
         return False
 
     if not is_start and not is_menu and not content_obj.is_visible:
         return False
 
-    raw_text = content_obj.text_content or ""
+    raw_text = translate(
+        f"content.{content_obj.key}.text_content",
+        locale,
+        fallback=content_obj.text_content or "",
+        source=content_obj.text_content or "",
+    ) or ""
     clean_text, parsed_rows = extract_response_buttons(raw_text)
     clean_text = clean_text.strip() if clean_text else ""
 
@@ -2478,7 +2912,12 @@ async def render_static_content_telegram(
         inline_kb = _telegram_response_buttons_markup(parsed_rows)
     elif content_obj.action_btn_text and content_obj.action_btn_payload:
         inline_kb = kb.action_button_keyboard(
-            content_obj.action_btn_text,
+            translate(
+                f"content.{content_obj.key}.action_btn_text",
+                locale,
+                fallback=content_obj.action_btn_text,
+                source=content_obj.action_btn_text,
+            ),
             "start_action" if is_start else "content_action",
         )
 
@@ -2495,7 +2934,11 @@ async def render_static_content_telegram(
             await bot.send_video(chat_id, item.file_id, caption=clean_text, reply_markup=caption_markup, parse_mode="HTML")
         if inline_kb:
             await asyncio.sleep(0.3)
-            await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+            await bot.send_message(
+                chat_id,
+                translate("ui.navigation.menu_hint", locale, fallback=NAVIGATION_MENU_HINT),
+                reply_markup=main_kb,
+            )
         return True
 
     text_chunks = split_html_text(clean_text, 4000) if clean_text else []
@@ -2551,7 +2994,11 @@ async def render_static_content_telegram(
                 else:
                     await _send_media_batch(None)
                     await asyncio.sleep(0.3)
-                    await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+                    await bot.send_message(
+                        chat_id,
+                        translate("ui.navigation.menu_hint", locale, fallback=NAVIGATION_MENU_HINT),
+                        reply_markup=main_kb,
+                    )
                 return True
             await _send_media_batch(None)
             await asyncio.sleep(0.2)
@@ -2559,7 +3006,11 @@ async def render_static_content_telegram(
         if inline_kb:
             await _send_text_chunks(inline_kb)
             await asyncio.sleep(0.3)
-            await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+            await bot.send_message(
+                chat_id,
+                translate("ui.navigation.menu_hint", locale, fallback=NAVIGATION_MENU_HINT),
+                reply_markup=main_kb,
+            )
         else:
             await _send_text_chunks(main_kb)
     else:  # text_top
@@ -2569,7 +3020,11 @@ async def render_static_content_telegram(
                 await asyncio.sleep(0.2)
                 await _send_media_batch(None)
             await asyncio.sleep(0.3)
-            await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+            await bot.send_message(
+                chat_id,
+                translate("ui.navigation.menu_hint", locale, fallback=NAVIGATION_MENU_HINT),
+                reply_markup=main_kb,
+            )
         else:
             if media:
                 if text_chunks:
@@ -2580,7 +3035,11 @@ async def render_static_content_telegram(
                 else:
                     await _send_media_batch(None)
                     await asyncio.sleep(0.3)
-                    await bot.send_message(chat_id, NAVIGATION_MENU_HINT, reply_markup=main_kb)
+                    await bot.send_message(
+                        chat_id,
+                        translate("ui.navigation.menu_hint", locale, fallback=NAVIGATION_MENU_HINT),
+                        reply_markup=main_kb,
+                    )
             else:
                 await _send_text_chunks(main_kb)
 
@@ -2665,7 +3124,11 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
             await ask_delete_history(message_proxy, state)
             return
         if action in ("main_menu", "svc:menu"):
-            await callback.message.answer(NAVIGATION_MENU_HINT, reply_markup=await kb.main_client_keyboard(user_id))
+            locale = await _get_user_locale(user_id)
+            await callback.message.answer(
+                translate("ui.navigation.menu_hint", locale, fallback=NAVIGATION_MENU_HINT),
+                reply_markup=await kb.main_client_keyboard(user_id),
+            )
             return
         if action in ("subscription", "svc:subscription"):
             message_proxy = SimpleNamespace(
@@ -2694,7 +3157,14 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
             await render_static_content_telegram(bot, callback.message.chat.id, user_id, "start_message", is_start=True)
             return
         if action == "svc:continue":
-            await callback.message.answer("Введите ваше сообщение для начала/продолжения диалога:")
+            locale = await _get_user_locale(user_id)
+            await callback.message.answer(
+                translate(
+                    "ui.navigation.continue_prompt",
+                    locale,
+                    fallback="Введите ваше сообщение для начала/продолжения диалога:",
+                )
+            )
             return
         if action.startswith("svc:content:"):
             content_key = action[12:]
@@ -2707,7 +3177,10 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
     # Generic AI path — check single-flight BEFORE button consumption
     lease = single_flight.try_claim("telegram", user_id)
     if lease is None:
-        await callback.answer(AI_BUSY_MESSAGE, show_alert=True)
+        await callback.answer(
+            translate("ui.ai.busy", await _get_user_locale(user_id), fallback=AI_BUSY_MESSAGE),
+            show_alert=True,
+        )
         return
 
     try:
@@ -2738,7 +3211,15 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
     spread = await _get_card_spread_state(user_id)
     pending_card_ids = spread.get('pending_card_ids', []) if spread else []
     if pending_card_ids and card_id not in pending_card_ids:
-        await callback.answer("Эта карта уже не участвует в текущем выборе.", show_alert=True)
+        locale = await _get_user_locale(user_id)
+        await callback.answer(
+            translate(
+                "ui.card.stale_choice",
+                locale,
+                fallback="Эта карта уже не участвует в текущем выборе.",
+            ),
+            show_alert=True,
+        )
         return
 
     # A card interpretation performs database work and a slow AI call below.
@@ -2755,6 +3236,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        locale = await resolve_user_effective_locale(session, user or user_id)
         spread_topic_id = spread.get('topic_id') if spread else (user.current_topic_id if user else None)
         media_scope = await load_media_scope(session, spread_topic_id, include_media_ids=False)
         media = await session.scalar(
@@ -2765,10 +3247,12 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
         )
         if media:
             if media.file_name == '_back':
-                await callback.message.answer("Эта техническая рубашка не должна выбираться.")
+                await callback.message.answer(
+                    translate("ui.card.invalid_back", locale, fallback="Эта техническая рубашка не должна выбираться.")
+                )
                 return
 
-            caption = f"<b>Твой выбор подтвержден.</b>\n\n{media.description or ''}"
+            caption = f"<b>{translate('ui.card.selected', locale, fallback='Твой выбор подтвержден.')}</b>\n\n{media.description or ''}"
             await callback.message.answer_photo(
                 photo=media.file_id,
                 caption=caption,
@@ -2827,7 +3311,11 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 )
                 await bot.send_message(
                     chat_id=user_id,
-                    text="Не удалось получить интерпретацию карты. Попробуйте выбрать карту ещё раз через несколько минут.",
+                    text=translate(
+                        "ui.card.interpretation_failed",
+                        locale,
+                        fallback="Не удалось получить интерпретацию карты. Попробуйте выбрать карту ещё раз через несколько минут.",
+                    ),
                 )
             final_spread_file_ids = await _advance_card_spread_after_selection(
                 bot=bot,
@@ -2836,10 +3324,19 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 selected_file_id=media.file_id,
             )
         else:
-            await callback.message.answer("Ошибка: карта не найдена. Попробуйте начать выбор заново.")
+            await callback.message.answer(
+                translate(
+                    "ui.card.not_found",
+                    locale,
+                    fallback="Ошибка: карта не найдена. Попробуйте начать выбор заново.",
+                )
+            )
 
     if len(final_spread_file_ids) > 1:
-        await bot.send_message(chat_id=user_id, text="Твой расклад целиком:")
+        await bot.send_message(
+            chat_id=user_id,
+            text=translate("ui.card.spread_heading", locale, fallback="Твой расклад целиком:"),
+        )
         await send_card_album(
             bot,
             user_id,
@@ -2931,17 +3428,23 @@ async def _advance_card_spread_after_selection(
                     context="process_card_selection.next_cards",
                 )
 
+            locale = await _get_user_locale(user_id)
             await bot.send_message(
                 chat_id=user_id,
-                text="Выбери следующую карту:",
+                text=translate("ui.card.next_selection_prompt", locale, fallback="Выбери следующую карту:"),
                 reply_markup=keyboards.card_selection_keyboard(spread['category'], [card.id for card in next_cards]),
             )
             return []
     except Exception:
         log.exception("Failed to continue card spread user_id=%s card_id=%s", user_id, card_id)
+        locale = await _get_user_locale(user_id)
         await bot.send_message(
             chat_id=user_id,
-            text="Не удалось показать следующие карты. Попробуй выбрать карту ещё раз или начни расклад заново.",
+            text=translate(
+                "ui.card.next_failed",
+                locale,
+                fallback="Не удалось показать следующие карты. Попробуй выбрать карту ещё раз или начни расклад заново.",
+            ),
         )
         return []
 
@@ -2956,6 +3459,7 @@ async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
         return False
 
     async with async_session_maker() as session:
+        locale = await resolve_user_effective_locale(session, user_id)
         media_scope = await load_media_scope(session, spread.get('topic_id'), include_media_ids=False)
         result = await session.execute(
             select(MediaLibrary).where(
@@ -2988,7 +3492,11 @@ async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
     await send_card_album(bot, user_id, file_ids, context=context)
     await bot.send_message(
         chat_id=user_id,
-        text=f"Сейчас раунд {current_round} из {total_rounds}. Выбери одну из карт кнопкой ниже:",
+        text=translate(
+            "ui.card.round_prompt",
+            locale,
+            fallback="Сейчас раунд {current_round} из {total_rounds}. Выбери одну из карт кнопкой ниже:",
+        ).format(current_round=current_round, total_rounds=total_rounds),
         reply_markup=keyboards.card_selection_keyboard(spread['category'], [card.id for card in cards]),
     )
     return True
@@ -3466,16 +3974,22 @@ async def cmd_ref(message: Message, bot: Bot):
         await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
         await _send_referral_templates(message.chat.id, ref_link, bot)
     else:
-        await message.answer("Реферальная программа недоступна.")
+        await message.answer(
+            translate(
+                "ui.referral.unavailable",
+                await _get_user_locale(message.from_user.id),
+                fallback="Реферальная программа недоступна.",
+            )
+        )
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     if not await is_admin(message.from_user.id):
-        user_help_text = (
-            "👋 Здравствуйте! Я ваш персональный ИИ-помощник.\n\n"
-            "Просто напишите ваш вопрос в этот чат, и я постараюсь на него ответить. "
-            "Вы можете использовать кнопки внизу для навигации по основным разделам или для управления диалогом."
+        user_help_text = translate(
+            "ui.help.user",
+            await _get_user_locale(message.from_user.id),
+            fallback="👋 Здравствуйте! Я ваш персональный ИИ-помощник.\n\nПросто напишите ваш вопрос в этот чат, и я постараюсь на него ответить. Вы можете использовать кнопки внизу для навигации по основным разделам или для управления диалогом.",
         )
         await message.answer(user_help_text)
         return
@@ -3526,6 +4040,96 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
     resume_state_data = await state.get_data()
     resumed_new_user = bool(resume_state_data.get("_resume_start_new_user"))
     await state.clear()
+    args = command.args if command else None
+    gated, intent_new_user = await _maybe_defer_start_for_language(message, args)
+    if gated:
+        return
+    await _run_start_business(
+        message,
+        state,
+        bot,
+        args=args,
+        resumed_new_user=resumed_new_user or intent_new_user,
+    )
+
+
+@router.callback_query(F.data.startswith("select_telegram_language:"))
+async def select_telegram_language(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    locale = normalize_locale((callback.data or "").split(":", 1)[-1])
+    current_locale = await _get_user_locale(callback.from_user.id)
+    if locale is None:
+        await callback.answer(
+            translate("ui.language.invalid", current_locale, fallback="Недопустимый язык."),
+            show_alert=True,
+        )
+        return
+
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        enabled_languages = normalize_enabled_languages(
+            getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]'
+        )
+        if locale not in enabled_languages:
+            await callback.answer(
+                translate("ui.language.unavailable", current_locale, fallback="Этот язык сейчас недоступен."),
+                show_alert=True,
+            )
+            return
+
+        lease = await claim_language_resume_lease(session, user_id=callback.from_user.id)
+        if lease is None:
+            await callback.answer(
+                translate("ui.language.already_processed", current_locale, fallback="Выбор языка уже обработан."),
+                show_alert=True,
+            )
+            return
+
+        intent = await session.get(TelegramStartIntent, callback.from_user.id)
+        if (
+            intent is None
+            or not intent.new_user_eligible
+            or not await complete_language_selection(
+                session,
+                user_id=callback.from_user.id,
+                locale=locale,
+                lease_token=lease.token,
+            )
+        ):
+            await session.rollback()
+            await callback.answer(
+                translate(
+                    "ui.language.resume_error",
+                    current_locale,
+                    fallback="Не удалось продолжить регистрацию. Повторите /start.",
+                ),
+                show_alert=True,
+            )
+            return
+        start_args = intent.navigation_payload
+        await session.commit()
+
+    await callback.answer()
+    await _run_start_business(
+        callback.message,
+        state,
+        bot,
+        args=start_args,
+        resumed_new_user=bool(intent.new_user_eligible),
+        actor=callback.from_user,
+    )
+
+
+async def _run_start_business(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    args: str | None = None,
+    resumed_new_user: bool = False,
+    actor=None,
+):
+    actor = actor or message.from_user
+    user_id = actor.id
     bonus_messages = []
 
     async def send_bonus_messages(reply_markup=None):
@@ -3537,51 +4141,58 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
             )
 
     async with async_session_maker() as session:
-        user = await session.get(User, message.from_user.id)
+        user = await session.get(User, user_id)
         is_new_user = False
         if not user:
             is_new_user = True
             new_user = User(
-                id=message.from_user.id,
-                username=message.from_user.username,
-                first_name=message.from_user.full_name,
-                is_admin=await is_admin(message.from_user.id)
+                id=user_id,
+                username=actor.username,
+                first_name=actor.full_name,
+                is_admin=await is_admin(user_id)
             )
             session.add(new_user)
             await session.flush()
             user = new_user
         else:
-            user.username = message.from_user.username
-            user.first_name = message.from_user.full_name
+            user.username = actor.username
+            user.first_name = actor.full_name
         await _sync_user_birthdate_from_telegram(bot, user)
-        is_admin_user_for_commands = bool(user.is_admin or message.from_user.id in OWNER_IDS)
-        if is_new_user:
+        is_admin_user_for_commands = bool(user.is_admin or user_id in OWNER_IDS)
+        business_new_user = is_new_user or resumed_new_user
+        start_intent = await session.get(TelegramStartIntent, user_id)
+        start_intent_exists = start_intent is not None
+        start_locale = await resolve_user_effective_locale(session, user)
+
+        async def complete_start_intent_if_safe(*, allow_test: bool = False):
+            if start_intent and (allow_test or args != "test") and start_intent.status != "completed":
+                await mark_start_intent_completed(session, user_id)
+                await session.commit()
+
+        if business_new_user:
             sub_config = await session.get(SubscriptionConfig, 1)
             if sub_config and sub_config.welcome_bonus_days > 0 and sub_config.subscriptions_enabled:
                 now = datetime.utcnow()
-                end_date = now + timedelta(days=sub_config.welcome_bonus_days)
-                new_sub = UserSubscription(
-                    user_id=user.id,
-                    plan_id=None,
-                    start_date=now,
-                    end_date=end_date,
-                    auto_renewal=False,
-                    payment_provider='Trial Welcome',
-                    payment_attempt_count=0,
-                    discount_percent=0
+                granted = await grant_subscription_days(
+                    session,
+                    grant_key=f"welcome:{user.id}",
+                    grant_type="welcome",
+                    beneficiary_user_id=user.id,
+                    days=sub_config.welcome_bonus_days,
+                    payment_provider="Trial Welcome",
+                    now=now,
                 )
-                session.add(new_sub)
-                session.add(TrialUsageHistory(
-                    user_id=user.id,
-                    plan_id=None,
-                    used_at=now
-                ))
-                bonus_messages.append(
-                    f"🎁 <b>Вам начислен приветственный бонус!</b>\n"
-                    f"Бесплатный доступ ко всем функциям на {sub_config.welcome_bonus_days} дн."
-                )
+                if granted:
+                    session.add(TrialUsageHistory(user_id=user.id, plan_id=None, used_at=now))
+                    bonus_messages.append(
+                        translate(
+                            "ui.start.welcome_bonus",
+                            start_locale,
+                            fallback="🎁 <b>Вам начислен приветственный бонус!</b>\nБесплатный доступ ко всем функциям на {days} дн.",
+                        ).format(days=sub_config.welcome_bonus_days)
+                    )
         await session.commit()
-        await refresh_commands_for_user(bot, message.from_user.id, is_admin_user_for_commands)
+        await refresh_commands_for_user(bot, user_id, is_admin_user_for_commands)
 
         profile_config = await session.get(BotGeneralConfig, 1)
         if missing_profile_fields(profile_config, user):
@@ -3592,30 +4203,60 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 message,
                 state,
                 user,
+                bot,
                 resume_start=True,
-                resume_start_args=command.args if command else None,
-                resume_start_new_user=is_new_user or resumed_new_user,
+                resume_start_args=args,
+                resume_start_new_user=business_new_user,
             ):
                 return
 
-        if command and command.args:
-            args = command.args
+        acquisition_referrer_id = (
+            start_intent.acquisition_referrer_id
+            if start_intent
+            else parse_referral_payload(args, user_id)
+        )
+        if acquisition_referrer_id and business_new_user:
+            referrer_notification = await _apply_registration_referral(
+                session,
+                user=user,
+                referrer_id=acquisition_referrer_id,
+                bonus_messages=bonus_messages,
+                locale=start_locale,
+            )
+            await session.commit()
+            if referrer_notification:
+                referrer_id, referrer_days = referrer_notification
+                try:
+                    referrer_locale = await resolve_user_effective_locale(session, referrer_id)
+                    await bot.send_message(
+                        referrer_id,
+                        translate(
+                            "ui.referral.new_registration",
+                            referrer_locale,
+                            fallback="🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!\nВам начислено <b>{days} бонусных дн.</b> к доступу. Спасибо, что рекомендуете нас!",
+                        ).format(days=referrer_days),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
+        if args:
             if args.startswith("topic_"):
                 try:
                     topic_id = int(args.split("_")[1])
-                    switch_res = await _perform_telegram_topic_switch(message.from_user.id, topic_id)
+                    switch_res = await _perform_telegram_topic_switch(user_id, topic_id)
                     if bonus_messages:
                         await send_bonus_messages()
 
                     await _complete_telegram_topic_entry(
-                        user_id=message.from_user.id,
+                        user_id=user_id,
                         chat_id=message.chat.id,
                         switch_res=switch_res,
                         bot=bot,
                         state=state,
                         message=message,
                     )
+                    await complete_start_intent_if_safe()
                     return
                 except Exception as e:
                     logging.error(f"Error parsing topic deep link: {e}")
@@ -3624,115 +4265,62 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
                 if bonus_messages:
                     await send_bonus_messages()
                 await show_subscription_info(message, state, bot)
+                await complete_start_intent_if_safe()
                 return
 
             elif args == "ref":
                 if bonus_messages:
                     await send_bonus_messages()
-                text, ref_link = await _get_referral_screen_text(message.from_user.id, bot)
+                text, ref_link = await _get_referral_screen_text(user_id, bot)
                 if text:
                     await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
                     await _send_referral_templates(message.chat.id, ref_link, bot)
                 else:
-                    await message.answer("Реферальная программа недоступна.")
+                    await message.answer(
+                        translate(
+                            "ui.referral.unavailable",
+                            await _get_user_locale(user_id),
+                            fallback="Реферальная программа недоступна.",
+                        )
+                    )
+                await complete_start_intent_if_safe()
                 return
 
             elif args == "test":
                 if bonus_messages:
                     await send_bonus_messages()
-                await cmd_start_test(message, state, bot)
+                test_started = await cmd_start_test(
+                    message,
+                    state,
+                    bot,
+                    deferred_launch_key=(
+                        start_intent.deferred_test_key
+                        if resumed_new_user
+                        and start_intent
+                        and start_intent.status == "awaiting_profile"
+                        else None
+                    ),
+                )
+                if test_started:
+                    await complete_start_intent_if_safe(allow_test=True)
                 return
 
             elif args.startswith("ref_"):
-                raw = args[4:]
-                ref_id = None
-                try:
-                    ref_id = int(raw)
-                except ValueError:
-                    pass
-
-                if ref_id and ref_id != message.from_user.id and (is_new_user or resumed_new_user):
-                    sub_config_ref = await session.get(SubscriptionConfig, 1)
-                    if sub_config_ref and sub_config_ref.referral_enabled:
-                        referrer = await session.get(User, ref_id)
-                        if referrer:
-                            user.referred_by = ref_id
-                            ref_bonus_days = sub_config_ref.referral_bonus_days_referral
-                            ref_days_for_referrer = sub_config_ref.referral_bonus_days_referrer
-                            now_r = datetime.utcnow()
-
-                            # Bonus to new user: extend existing sub or create new
-                            if ref_bonus_days > 0:
-                                existing_sub = await session.scalar(
-                                    select(UserSubscription).where(UserSubscription.user_id == user.id)
-                                )
-                                if existing_sub:
-                                    existing_sub.end_date += timedelta(days=ref_bonus_days)
-                                else:
-                                    session.add(UserSubscription(
-                                        user_id=user.id,
-                                        plan_id=None,
-                                        start_date=now_r,
-                                        end_date=now_r + timedelta(days=ref_bonus_days),
-                                        auto_renewal=False,
-                                        payment_provider='Trial Referral',
-                                        payment_attempt_count=0,
-                                        discount_percent=0
-                                    ))
-                                bonus_messages.append(
-                                    f"🎁 <b>Вам начислено {ref_bonus_days} бонусных дн.</b> "
-                                    f"за регистрацию по пригласительной ссылке!"
-                                )
-
-                            # Bonus to referrer: extend their sub or create new
-                            if ref_days_for_referrer > 0:
-                                referrer_sub = await session.scalar(
-                                    select(UserSubscription).where(UserSubscription.user_id == ref_id)
-                                )
-                                if referrer_sub and referrer_sub.end_date > now_r:
-                                    referrer_sub.end_date += timedelta(days=ref_days_for_referrer)
-                                elif referrer_sub:
-                                    referrer_sub.plan_id = None
-                                    referrer_sub.start_date = now_r
-                                    referrer_sub.end_date = now_r + timedelta(days=ref_days_for_referrer)
-                                    referrer_sub.payment_provider = 'Trial Referral Bonus'
-                                    referrer_sub.auto_renewal = False
-                                    referrer_sub.payment_attempt_count = 0
-                                else:
-                                    session.add(UserSubscription(
-                                        user_id=ref_id,
-                                        plan_id=None,
-                                        start_date=now_r,
-                                        end_date=now_r + timedelta(days=ref_days_for_referrer),
-                                        auto_renewal=False,
-                                        payment_provider='Trial Referral Bonus',
-                                        payment_attempt_count=0,
-                                        discount_percent=0
-                                    ))
-
-                            await session.commit()
-
-                            if ref_days_for_referrer > 0:
-                                try:
-                                    await bot.send_message(
-                                        ref_id,
-                                        f"🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!\n"
-                                        f"Вам начислено <b>{ref_days_for_referrer} бонусных дн.</b> к доступу. "
-                                        f"Спасибо, что рекомендуете нас!",
-                                        parse_mode="HTML"
-                                    )
-                                except Exception:
-                                    pass
-                # No return — fall through to show welcome message
+                pass
 
             else:
-                rendered = await render_static_content_telegram(bot, message.chat.id, message.from_user.id, args)
+                rendered = await render_static_content_telegram(bot, message.chat.id, user_id, args)
                 if rendered:
                     if bonus_messages:
                         await send_bonus_messages()
+                    await complete_start_intent_if_safe()
                     return
 
-    await render_static_content_telegram(bot, message.chat.id, message.from_user.id, "start_message", is_start=True)
+    await render_static_content_telegram(bot, message.chat.id, user_id, "start_message", is_start=True)
+    if start_intent_exists:
+        async with async_session_maker() as completion_session:
+            await mark_start_intent_completed(completion_session, user_id)
+            await completion_session.commit()
     if bonus_messages:
         await asyncio.sleep(0.3)
         await send_bonus_messages()
@@ -3758,6 +4346,13 @@ async def cmd_promo(message: Message, state: FSMContext):
                 selectinload(User.subscription),
                 selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans)
             ]
+        )
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
         )
         is_admin_user = user_id in OWNER_IDS or (user and user.is_admin)
         trial_conditions = [SubscriptionPlan.is_active == True, SubscriptionPlan.is_trial == True]
@@ -3796,7 +4391,11 @@ async def cmd_promo(message: Message, state: FSMContext):
             eligible_plans.append(plan)
 
     if not eligible_plans:
-        await message.answer("К сожалению, в данный момент нет доступных промо-предложений.")
+        await message.answer(translate(
+            "ui.promo.no_offers",
+            locale,
+            fallback="К сожалению, в данный момент нет доступных промо-предложений.",
+        ))
         return
 
     global_discount_percent = 0
@@ -3804,20 +4403,33 @@ async def cmd_promo(message: Message, state: FSMContext):
         global_discount_percent = user_sub.discount_percent
 
     text = (
-        "<b>⭐️ Специальные предложения!</b>\n\n"
-        "«Оформляя пробную подписку, вы соглашаетесь с условиями выбранного тарифа. "
-        "Если для него доступно автопродление, по окончании пробного периода подписка "
-        "автоматически перейдет на обычный тариф (отмена в любое время)».\n\n"
+        translate("ui.promo.heading", locale, fallback="<b>⭐️ Специальные предложения!</b>")
+        + "\n\n"
+        + translate(
+            "ui.promo.terms",
+            locale,
+            fallback="«Оформляя пробную подписку, вы соглашаетесь с условиями выбранного тарифа. Если для него доступно автопродление, по окончании пробного периода подписка автоматически перейдет на обычный тариф (отмена в любое время)».",
+        )
+        + "\n\n"
     )
 
     if user_sub and user_sub.end_date > now and user_sub.plan_id is not None:
-        text += "<b>У вас уже есть активная подписка.</b> Новый пробный тариф добавится к текущему сроку.\n\n"
+        text += translate(
+            "ui.promo.active_notice",
+            locale,
+            fallback="<b>У вас уже есть активная подписка.</b> Новый пробный тариф добавится к текущему сроку.",
+        ) + "\n\n"
 
-    text += "Выберите пробный тариф:"
+    text += translate("ui.promo.choose_trial", locale, fallback="Выберите пробный тариф:")
 
     await message.answer(
         text,
-        reply_markup=kb.promo_plan_selection_keyboard(eligible_plans, global_discount_percent, user_promos)
+        reply_markup=kb.promo_plan_selection_keyboard(
+            eligible_plans,
+            global_discount_percent,
+            user_promos,
+            locale,
+        )
     )
 
 
@@ -5263,30 +5875,60 @@ async def admin_content(callback: CallbackQuery, state: FSMContext):
     )
 
 
-async def get_content_from_db(key: str) -> dict:
+async def get_content_from_db(key: str, user_id: int | None = None) -> dict:
     async with async_session_maker() as session:
         content_obj = await session.get(Content, key, options=[selectinload(Content.media)])
+        user = await session.get(User, user_id) if user_id is not None else None
+        if user_id is not None:
+            try:
+                config = await session.get(BotGeneralConfig, 1)
+            except OperationalError:
+                config = None
+        else:
+            config = None
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(config, "telegram_default_language", "ru"),
+            bool(getattr(config, "telegram_language_selection_enabled", False)),
+            getattr(config, "telegram_enabled_languages", '["ru"]'),
+        )
         if content_obj:
             media_list = [
                 {'type': media.file_type, 'file_id': media.file_id}
                 for media in content_obj.media
             ]
             return {
-                "text": content_obj.text_content,
+                "text": translate(
+                    f"content.{content_obj.key}.text_content",
+                    locale,
+                    fallback=content_obj.text_content,
+                    source=content_obj.text_content or "",
+                ),
                 "media": media_list,
                 "is_visible": content_obj.is_visible,
                 "content_order": content_obj.content_order,
+                "missing": False,
             }
-        return {"text": "Контент не найден.", "media": [], "is_visible": False, "content_order": "media_top"}
+        return {
+            "text": translate(
+                "ui.content.not_found",
+                locale,
+                fallback="Контент не найден.",
+            ),
+            "media": [],
+            "is_visible": False,
+            "content_order": "media_top",
+            "missing": True,
+        }
 
 
-async def _send_configured_test_intro(bot: Bot, chat_id: int) -> bool:
-    content = await get_content_from_db("test_intro")
+async def _send_configured_test_intro(bot: Bot, chat_id: int, user_id: int | None = None) -> bool:
+    content = await get_content_from_db("test_intro", user_id=user_id or chat_id)
     if not content.get("is_visible", True):
         return False
 
     text = (content.get("text") or "").strip()
-    if text == "Контент не найден.":
+    if content.get("missing"):
         text = ""
     media = content.get("media") or []
     if not text and not media:
@@ -5320,8 +5962,29 @@ async def _send_configured_test_intro(bot: Bot, chat_id: int) -> bool:
 @router.message(DynamicButtonFilter(), StateFilter(None))
 async def handle_info_buttons(message: Message):
     async with async_session_maker() as session:
-        stmt = select(Content).where(Content.button_title == message.text).limit(1)
-        content_obj = await session.scalar(stmt)
+        user = await session.get(User, message.from_user.id)
+        config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(config, "telegram_default_language", "ru"),
+            bool(getattr(config, "telegram_language_selection_enabled", False)),
+            getattr(config, "telegram_enabled_languages", '["ru"]'),
+        )
+        content_rows = (await session.execute(select(Content).where(Content.is_visible == True))).scalars().all()
+        content_obj = next(
+            (
+                item
+                for item in content_rows
+                if item.button_title
+                and message.text == translate(
+                    f"content.{item.key}.button_title",
+                    locale,
+                    fallback=item.button_title,
+                    source=item.button_title,
+                )
+            ),
+            None,
+        )
         content_key = content_obj.key if content_obj else None
     if not content_key:
         return
@@ -5650,7 +6313,7 @@ async def save_content(callback: CallbackQuery, state: FSMContext):
                 file_type=media_item['type'],
                 file_id=media_item['file_id']
             ))
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
 
@@ -6298,12 +6961,14 @@ async def view_user_history_page(user_id: int, page: int = 0, original_message: 
 
 @router.message(Command("new_dialogue"))
 @router.message(F.text == "🗑️ Новый диалог")
+@router.message(NewDialogueButtonFilter())
 async def ask_delete_history(message: Message, state: FSMContext):
     token = secrets.token_hex(4)
 
     async with user_locks.setdefault(message.from_user.id, asyncio.Lock()):
         async with async_session_maker() as session:
             user = await session.get(User, message.from_user.id, options=[selectinload(User.current_topic)])
+            locale = await resolve_user_effective_locale(session, user or message.from_user.id)
 
             expected_dialogue_id = user.current_dialogue_id if user else 0
             expected_topic_id = user.current_topic_id if user else None
@@ -6315,19 +6980,34 @@ async def ask_delete_history(message: Message, state: FSMContext):
             )
 
             if user and user.current_topic_id:
-                topic_name = user.current_topic.name if user.current_topic else "Неизвестная тема"
+                topic_name = (
+                    translate(
+                        f"topic.{user.current_topic.id}.name",
+                        locale,
+                        fallback=user.current_topic.name,
+                        source=user.current_topic.name,
+                    )
+                    if user.current_topic
+                    else "Неизвестная тема"
+                )
 
                 await message.answer(
-                    f"Вы находитесь в диалоге: <b>{html.escape(topic_name)}</b>.\n"
-                    "При начале нового диалога или переходе в основной память ИИ будет очищена.\n"
-                    "Выберите подходящее действие.",
-                    reply_markup=kb.topic_reset_options_keyboard(token=token),
+                    translate(
+                        "ui.dialogue.reset_topic_prompt",
+                        locale,
+                        fallback="Вы находитесь в диалоге: <b>{topic_name}</b>.\nПри начале нового диалога или переходе в основной память ИИ будет очищена.\nВыберите подходящее действие.",
+                    ).format(topic_name=html.escape(topic_name)),
+                    reply_markup=kb.topic_reset_options_keyboard(token=token, locale=locale),
                     parse_mode="HTML"
                 )
             else:
                 await message.answer(
-                    "При начале нового диалога память ИИ будет полностью очищена. Вы уверены?",
-                    reply_markup=kb.confirm_delete_history_keyboard(token=token)
+                    translate(
+                        "ui.dialogue.reset_main_prompt",
+                        locale,
+                        fallback="При начале нового диалога память ИИ будет полностью очищена. Вы уверены?",
+                    ),
+                    reply_markup=kb.confirm_delete_history_keyboard(token=token, locale=locale)
                 )
 
 
@@ -6341,7 +7021,14 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
         expected_token = data.get("reset_token")
 
         if not expected_token or expected_token != token:
-            await callback.message.answer("Подтверждение устарело или уже использовано.")
+            locale = await _get_user_locale(callback.from_user.id)
+            await callback.message.answer(
+                translate(
+                    "ui.dialogue.confirmation_stale",
+                    locale,
+                    fallback="Подтверждение устарело или уже использовано.",
+                )
+            )
             return
 
         expected_dialogue_id = data.get("reset_dialogue_id")
@@ -6351,7 +7038,14 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id)
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
-                await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
+                locale = await resolve_user_effective_locale(session, user or callback.from_user.id)
+                await callback.message.answer(
+                    translate(
+                        "ui.dialogue.state_changed",
+                        locale,
+                        fallback="Состояние диалога изменилось. Действие отменено.",
+                    )
+                )
                 return
 
             ai_config = await session.get(AIConfig, 1)
@@ -6367,7 +7061,11 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
         pass
 
     await render_static_content_telegram(bot, callback.from_user.id, callback.from_user.id, "start_message", is_start=True)
-    await bot.send_message(callback.from_user.id, "✅ Память очищена.")
+    locale = await _get_user_locale(callback.from_user.id)
+    await bot.send_message(
+        callback.from_user.id,
+        translate("ui.dialogue.memory_cleared", locale, fallback="✅ Память очищена."),
+    )
 
 
 @router.callback_query(F.data.startswith("delete_history_cancel"))
@@ -6386,7 +7084,10 @@ async def cancel_delete_history(callback: CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except TelegramBadRequest:
         pass
-    await callback.message.answer("Ок. Продолжаем текущий диалог.")
+    locale = await _get_user_locale(callback.from_user.id)
+    await callback.message.answer(
+        translate("ui.dialogue.continue_current", locale, fallback="Ок. Продолжаем текущий диалог.")
+    )
 
 
 @router.message(UserStates.awaiting_name)
@@ -6394,9 +7095,14 @@ async def process_user_name(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     user_name = (message.text or "").strip()
 
-    if len(user_name) > 50 or not user_name or await _is_reserved_user_menu_text(user_name):
+    if len(user_name) > 50 or not user_name or await _is_reserved_user_menu_text(user_name, user_id):
+        locale = await _get_user_locale(user_id)
         await message.answer(
-            "Пожалуйста, напишите имя обычным текстом, без команд и кнопок меню."
+            translate(
+                "ui.profile.invalid_name",
+                locale,
+                fallback="Пожалуйста, напишите имя обычным текстом, без команд и кнопок меню.",
+            )
         )
         return
 
@@ -6411,8 +7117,16 @@ async def process_user_name(message: Message, state: FSMContext, bot: Bot):
         return
 
     is_test = data.get('is_test', False)
+    locale = await _get_user_locale(user_id)
 
-    await message.answer(f"Приятно познакомиться, {html.escape(user_name)}! Укажи свой пол:", reply_markup=kb.gender_selection_keyboard(is_test=is_test))
+    await message.answer(
+        translate(
+            "ui.profile.name_saved",
+            locale,
+            fallback="Приятно познакомиться, {name}! Укажи свой пол:",
+        ).format(name=html.escape(user_name)),
+        reply_markup=kb.gender_selection_keyboard(is_test=is_test, locale=locale),
+    )
     if is_test:
         await state.update_data(is_test=True)
     else:
@@ -6449,7 +7163,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             DBMessage(user_id=user_id, role='user', content=prompt_text, dialogue_id=dialogue_id, topic_id=topic_id))
         await session.commit()
 
-    thinking_msg = await message.answer("🤖 Думаю...")
+    locale = await _get_user_locale(user_id)
+    thinking_msg = await message.answer(translate("ui.ai.thinking", locale, fallback="🤖 Думаю..."))
     thinking_msg_can_be_edited = True
 
     async def _send_processing_error(text: str):
@@ -6569,9 +7284,16 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                                 await asyncio.sleep(0.3)
             elif response_text_markup:
                 if thinking_msg_can_be_edited:
-                    await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
+                    await thinking_msg.edit_text(
+                        translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        reply_markup=response_text_markup,
+                    )
                 else:
-                    await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=response_text_markup)
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        reply_markup=response_text_markup,
+                    )
             elif thinking_msg_can_be_edited:
                 await thinking_msg.delete()
 
@@ -6581,7 +7303,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 await bot.send_photo(
                     chat_id=user_id,
                     photo=BufferedInputFile(image_data, filename="gen.png"),
-                    caption="✨ Готово!",
+                    caption=translate("ui.ai.image_ready", locale, fallback="✨ Готово!"),
                 )
             except Exception as e:
                 gen_provider, gen_model = _resolve_ai_provider_model(ai_config, "image_generation")
@@ -6596,7 +7318,10 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                     extra={"prompt_len": len(image_prompt)},
                     exception=e,
                 )
-                await bot.send_message(chat_id=user_id, text="😔 Не удалось сгенерировать изображение.")
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=translate("ui.ai.image_failed", locale, fallback="😔 Не удалось сгенерировать изображение."),
+                )
             finally:
                 upload_task.cancel()
         else:
@@ -6635,9 +7360,16 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                                 await asyncio.sleep(0.3)
             elif response_text_markup:
                 if thinking_msg_can_be_edited:
-                    await thinking_msg.edit_text("Выберите действие:", reply_markup=response_text_markup)
+                    await thinking_msg.edit_text(
+                        translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        reply_markup=response_text_markup,
+                    )
                 else:
-                    await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=response_text_markup)
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        reply_markup=response_text_markup,
+                    )
             elif thinking_msg_can_be_edited:
                 await thinking_msg.delete()
 
@@ -6727,7 +7459,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                         [c.file_id for c in cards],
                         context="message_handler.choice_spread",
                     )
-                    await bot.send_message(chat_id=user_id, text="Выбери карту, которая тебе откликается:", reply_markup=keyboards.card_selection_keyboard(cat, [c.id for c in cards]))
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                        reply_markup=keyboards.card_selection_keyboard(cat, [c.id for c in cards]),
+                    )
 
             for match in choices_hidden:
                 cat_stripped = match[0].strip()
@@ -6765,7 +7501,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                             [back_media.file_id for _ in cards],
                             context="message_handler.hidden_choice_spread",
                         )
-                    await bot.send_message(chat_id=user_id, text="Выбери карту, которая тебе откликается:", reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]))
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                        reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]),
+                    )
 
             current_card_message_id = None
             if drawn_cards_info:
@@ -6832,7 +7572,13 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             details=str(e),
             exception=e,
         )
-        await _send_processing_error("К сожалению, сервис временно недоступен из-за технической проблемы.")
+        await _send_processing_error(
+            translate(
+                "ui.ai.service_unavailable",
+                locale,
+                fallback="К сожалению, сервис временно недоступен из-за технической проблемы.",
+            )
+        )
     except AIServiceError as e:
         provider, model = _resolve_ai_provider_model(ai_config, "chat")
         await _report_ai_failure(
@@ -6851,7 +7597,11 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             exception=e,
         )
         await _send_processing_error(
-            "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
+            translate(
+                "ui.ai.overloaded",
+                locale,
+                fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+            )
         )
     except Exception as e:
         provider, model = _resolve_ai_provider_model(ai_config, "chat")
@@ -6866,7 +7616,13 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             extra={"prompt_len": len(ai_prompt_text)},
             exception=e,
         )
-        await _send_processing_error("Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.")
+        await _send_processing_error(
+            translate(
+                "ui.ai.unexpected_failed",
+                locale,
+                fallback="Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.",
+            )
+        )
 
 
 @router.callback_query(F.data == "disclaimer_accepted", UserStates.awaiting_disclaimer_acceptance)
@@ -6953,7 +7709,21 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
                             )
                             await session.commit()
                             nav_msg_id = nav_msg.id
-                        await bot.send_message(callback.message.chat.id, f"✅ Продолжаем тему: «{html.escape(topic.name)}».")
+                        locale = await resolve_user_effective_locale(session, user)
+                        translated_topic_name = translate(
+                            f"topic.{topic.id}.name",
+                            locale,
+                            fallback=topic.name,
+                            source=topic.name,
+                        )
+                        await bot.send_message(
+                            callback.message.chat.id,
+                            translate(
+                                "ui.topics.resume",
+                                locale,
+                                fallback="✅ Продолжаем тему: «{topic_name}».",
+                            ).format(topic_name=html.escape(translated_topic_name)),
+                        )
                         await _start_telegram_hidden_kickoff(
                             user_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(pending_topic_id),
                             navigation_message_id=nav_msg_id,
@@ -6969,14 +7739,23 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
     if prompt_text:
         lease = single_flight.try_claim("telegram", user_id)
         if lease is None:
-            await callback.message.answer(AI_BUSY_MESSAGE)
+            await callback.message.answer(
+                translate("ui.ai.busy", await _get_user_locale(user_id), fallback=AI_BUSY_MESSAGE)
+            )
             return
         try:
             await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
         finally:
             single_flight.release(lease)
     else:
-        await callback.message.answer("Спасибо! Теперь вы можете задать свой вопрос.")
+        locale = await _get_user_locale(user_id)
+        await callback.message.answer(
+            translate(
+                "ui.navigation.continue_ready",
+                locale,
+                fallback="Спасибо! Теперь вы можете задать свой вопрос.",
+            )
+        )
 
 
 @router.callback_query(F.data == "admin_clients")
@@ -7950,6 +8729,8 @@ async def cancel_handler(callback: CallbackQuery, state: FSMContext):
         await admin_test_menu(callback)
     elif target_menu_callback_data == "admin_general_settings":
         await admin_general_settings(callback)
+    elif target_menu_callback_data == "admin_language_settings":
+        await admin_language_settings(callback)
     elif target_menu_callback_data == "admin_secret_questions":
         await admin_secret_questions_menu(callback_mock)
     elif target_menu_callback_data == "admin_test_links":
@@ -8048,11 +8829,19 @@ async def _check_telegram_chat_access(session, user_id: int, bot: Bot, chat_id: 
         )
         user = await session.scalar(stmt)
         if not user or not user.subscription or user.subscription.end_date < datetime.utcnow():
+            locale = await resolve_user_effective_locale(session, user or user_id)
             await bot.send_message(
                 chat_id,
-                "Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
+                translate(
+                    "ui.access.subscription_required",
+                    locale,
+                    fallback="Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
+                ),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="Начать пользоваться ботом", callback_data="show_subscription_info_from_chat")]
+                    [InlineKeyboardButton(
+                        text=translate("ui.access.subscription_button", locale, fallback="Начать пользоваться ботом"),
+                        callback_data="show_subscription_info_from_chat",
+                    )]
                 ])
             )
             return False
@@ -8134,6 +8923,14 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
             return TopicSwitchResult("inaccessible")
 
 
+def _localized_disclaimer_text(content: dict, locale: str) -> str:
+    return content.get("text") or translate(
+        "ui.navigation.disclaimer_missing",
+        locale,
+        fallback="Текст дисклеймера не задан.",
+    )
+
+
 async def _complete_telegram_topic_entry(
     user_id: int,
     chat_id: int,
@@ -8142,30 +8939,58 @@ async def _complete_telegram_topic_entry(
     state: FSMContext,
     message: Message | None = None,
 ) -> None:
+    locale = await _get_user_locale(user_id)
     if switch_res.status == "inaccessible":
         if message and hasattr(message, "answer"):
             try:
-                await message.answer("Тема больше недоступна. Выберите другую тему в меню.")
+                await message.answer(
+                    translate(
+                        "ui.topics.unavailable",
+                        locale,
+                        fallback="Тема больше недоступна. Выберите другую тему в меню.",
+                    )
+                )
             except Exception:
-                await bot.send_message(chat_id, "Тема больше недоступна. Выберите другую тему в меню.")
+                await bot.send_message(
+                    chat_id,
+                    translate(
+                        "ui.topics.unavailable",
+                        locale,
+                        fallback="Тема больше недоступна. Выберите другую тему в меню.",
+                    ),
+                )
         else:
-            await bot.send_message(chat_id, "Тема больше недоступна. Выберите другую тему в меню.")
+            await bot.send_message(
+                chat_id,
+                translate(
+                    "ui.topics.unavailable",
+                    locale,
+                    fallback="Тема больше недоступна. Выберите другую тему в меню.",
+                ),
+            )
         return
 
     if switch_res.status == "already_current":
         topic_name = switch_res.topic.name if (switch_res.topic and getattr(switch_res.topic, "name", None)) else ""
+        new_dialogue = translate("ui.button.new_dialogue", locale, fallback="🗑️ Новый диалог")
         if topic_name:
-            text = (
-                f"Вы уже находитесь в теме «{html.escape(topic_name)}».\n\n"
-                "Продолжайте диалог — просто напишите ваш вопрос или сообщение.\n\n"
-                "Если хотите начать эту тему заново, нажмите «🗑️ Новый диалог»."
+            translated_topic_name = translate(
+                f"topic.{switch_res.topic.id}.name",
+                locale,
+                fallback=topic_name,
+                source=topic_name,
             )
+            text = translate(
+                "ui.topics.already_current",
+                locale,
+                fallback="Вы уже находитесь в теме «{topic_name}».\n\nПродолжайте диалог — просто напишите ваш вопрос или сообщение.\n\nЕсли хотите начать эту тему заново, нажмите «{new_dialogue}».",
+            ).format(topic_name=html.escape(translated_topic_name), new_dialogue=new_dialogue)
         else:
-            text = (
-                "Вы уже находитесь в этой теме.\n\n"
-                "Продолжайте диалог — просто напишите ваш вопрос или сообщение.\n\n"
-                "Если хотите начать эту тему заново, нажмите «🗑️ Новый диалог»."
-            )
+            text = translate(
+                "ui.topics.already_current_generic",
+                locale,
+                fallback="Вы уже находитесь в этой теме.\n\nПродолжайте диалог — просто напишите ваш вопрос или сообщение.\n\nЕсли хотите начать эту тему заново, нажмите «{new_dialogue}».",
+            ).format(new_dialogue=new_dialogue)
         if message and hasattr(message, "answer"):
             try:
                 await message.answer(text)
@@ -8191,6 +9016,7 @@ async def _complete_telegram_topic_entry(
         context_msg,
         state,
         user,
+        bot,
         topic_intro_after=switch_res.topic_id,
         topic_intro_dialogue_id=switch_res.dialogue_id,
         topic_intro_welcome_needed=not switch_res.welcome_shown,
@@ -8208,7 +9034,7 @@ async def _complete_telegram_topic_entry(
 
         if switch_res.topic and getattr(switch_res.topic, "auto_start_dialogue", False):
             if not user.accepted_disclaimer:
-                disclaimer_content = await get_content_from_db("disclaimer")
+                disclaimer_content = await get_content_from_db("disclaimer", user_id=user_id)
                 if disclaimer_content.get('is_visible', True):
                     await state.set_state(UserStates.awaiting_disclaimer_acceptance)
                     await state.update_data(
@@ -8217,8 +9043,8 @@ async def _complete_telegram_topic_entry(
                         pending_auto_start_kind="first_entry",
                         pending_auto_start_message_id=switch_res.navigation_message_id,
                     )
-                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                    await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                    text_to_send = _localized_disclaimer_text(disclaimer_content, locale)
+                    await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard(locale))
                     return
                 else:
                     async with async_session_maker() as s_disc:
@@ -8235,7 +9061,7 @@ async def _complete_telegram_topic_entry(
             )
     else:
         if not user.accepted_disclaimer:
-            disclaimer_content = await get_content_from_db("disclaimer")
+            disclaimer_content = await get_content_from_db("disclaimer", user_id=user_id)
             if disclaimer_content.get('is_visible', True):
                 await state.set_state(UserStates.awaiting_disclaimer_acceptance)
                 await state.update_data(
@@ -8244,8 +9070,8 @@ async def _complete_telegram_topic_entry(
                     pending_auto_start_kind="resume",
                     pending_auto_start_message_id=switch_res.navigation_message_id,
                 )
-                text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                text_to_send = _localized_disclaimer_text(disclaimer_content, locale)
+                await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard(locale))
                 return
             else:
                 async with async_session_maker() as s_disc:
@@ -8257,7 +9083,20 @@ async def _complete_telegram_topic_entry(
                 return
 
         raw_topic_name = switch_res.topic.name if (switch_res.topic and getattr(switch_res.topic, "name", None)) else ""
-        await bot.send_message(chat_id, f"✅ Продолжаем тему: «{html.escape(raw_topic_name)}».")
+        translated_topic_name = translate(
+            f"topic.{switch_res.topic.id}.name",
+            locale,
+            fallback=raw_topic_name,
+            source=raw_topic_name,
+        )
+        await bot.send_message(
+            chat_id,
+            translate(
+                "ui.topics.resume",
+                locale,
+                fallback="✅ Продолжаем тему: «{topic_name}».",
+            ).format(topic_name=html.escape(translated_topic_name)),
+        )
 
         from system_events import build_topic_resume_system_message
         synthetic_prompt = switch_res.synthetic_prompt or build_topic_resume_system_message(switch_res.topic.name)
@@ -8292,31 +9131,57 @@ async def _apply_topic_switch(session, user, topic_key: int, memory_mode: str) -
     return False
 
 
-def _topic_switch_message(topic_name: str, restored: bool, memory_mode: str) -> str:
+def _topic_switch_message(topic_name: str, restored: bool, memory_mode: str, locale: str = "ru") -> str:
     if restored:
-        return f"✅ Продолжаем тему: **{topic_name}**."
+        return translate(
+            "ui.topics.switch_restored",
+            locale,
+            fallback="✅ Продолжаем тему: **{topic_name}**.",
+        ).format(topic_name=topic_name)
     if is_global_memory_mode(memory_mode):
-        return (
-            f"✅ Отлично! Мы переключились на тему: **{topic_name}**.\n\n"
-            f"Контекст диалога сохранен. Дальше бот будет использовать промпт текущей темы."
-        )
-    return (
-        f"✅ Отлично! Мы переключились на тему: **{topic_name}**.\n\n"
-        f"Память диалога была очищена. Можете задавать свой вопрос."
-    )
+        return translate(
+            "ui.topics.switch_global",
+            locale,
+            fallback="✅ Отлично! Мы переключились на тему: **{topic_name}**.\n\nКонтекст диалога сохранен. Дальше бот будет использовать промпт текущей темы.",
+        ).format(topic_name=topic_name)
+    return translate(
+        "ui.topics.switch_reset",
+        locale,
+        fallback="✅ Отлично! Мы переключились на тему: **{topic_name}**.\n\nПамять диалога была очищена. Можете задавать свой вопрос.",
+    ).format(topic_name=topic_name)
 
 
 async def _send_topic_intro(bot: Bot, chat_id: int, topic: Topic, restored: bool, memory_mode: str) -> None:
+    locale = await _get_user_locale(chat_id)
+    topic_name = translate(
+        f"topic.{topic.id}.name",
+        locale,
+        fallback=topic.name,
+        source=topic.name,
+    )
     if topic.start_message:
-        text_to_send = topic.start_message
+        text_to_send = translate(
+            f"topic.{topic.id}.start_message",
+            locale,
+            fallback=topic.start_message,
+            source=topic.start_message,
+        )
         parse_mode = "HTML"
     else:
-        text_to_send = _topic_switch_message(topic.name, restored, memory_mode)
+        text_to_send = _topic_switch_message(topic_name, restored, memory_mode, locale)
         parse_mode = "Markdown"
 
     reply_markup = None
     if topic.start_button_text and topic.start_button_payload:
-        reply_markup = kb.action_button_keyboard(topic.start_button_text, "topic_action")
+        reply_markup = kb.action_button_keyboard(
+            translate(
+                f"topic.{topic.id}.start_button_text",
+                locale,
+                fallback=topic.start_button_text,
+                source=topic.start_button_text,
+            ),
+            "topic_action",
+        )
 
     await bot.send_message(
         chat_id,
@@ -8346,7 +9211,15 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
         return True
 
     if not topic or not topic.is_active or not is_topic_accessible(topic, user, chat_id):
-        await bot.send_message(chat_id, "Тема больше недоступна. Выберите другую тему в меню.")
+        locale = await _get_user_locale(chat_id)
+        await bot.send_message(
+            chat_id,
+            translate(
+                "ui.topics.unavailable",
+                locale,
+                fallback="Тема больше недоступна. Выберите другую тему в меню.",
+            ),
+        )
         return True
 
     if welcome_needed:
@@ -8357,7 +9230,7 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
 
         if topic and getattr(topic, "auto_start_dialogue", False):
             if user and not user.accepted_disclaimer:
-                disclaimer_content = await get_content_from_db("disclaimer")
+                disclaimer_content = await get_content_from_db("disclaimer", user_id=chat_id)
                 if disclaimer_content.get('is_visible', True):
                     if state:
                         await state.set_state(UserStates.awaiting_disclaimer_acceptance)
@@ -8367,8 +9240,15 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                             pending_auto_start_kind="first_entry",
                             pending_auto_start_message_id=data.get("topic_intro_navigation_message_id"),
                         )
-                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                    await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                    text_to_send = _localized_disclaimer_text(
+                        disclaimer_content,
+                        await _get_user_locale(chat_id),
+                    )
+                    await bot.send_message(
+                        chat_id,
+                        text_to_send,
+                        reply_markup=kb.confirm_disclaimer_keyboard(await _get_user_locale(chat_id)),
+                    )
                     return True
                 else:
                     async with async_session_maker() as s_disc:
@@ -8386,7 +9266,7 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
             )
     else:
         if user and not user.accepted_disclaimer:
-            disclaimer_content = await get_content_from_db("disclaimer")
+            disclaimer_content = await get_content_from_db("disclaimer", user_id=chat_id)
             if disclaimer_content.get('is_visible', True):
                 if state:
                     await state.set_state(UserStates.awaiting_disclaimer_acceptance)
@@ -8396,8 +9276,15 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                         pending_auto_start_kind="resume",
                         pending_auto_start_message_id=data.get("topic_intro_navigation_message_id"),
                     )
-                text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                await bot.send_message(chat_id, text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                text_to_send = _localized_disclaimer_text(
+                    disclaimer_content,
+                    await _get_user_locale(chat_id),
+                )
+                await bot.send_message(
+                    chat_id,
+                    text_to_send,
+                    reply_markup=kb.confirm_disclaimer_keyboard(await _get_user_locale(chat_id)),
+                )
                 return True
             else:
                 async with async_session_maker() as s_disc:
@@ -8423,7 +9310,21 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
                 )
                 await session.commit()
                 nav_msg_id = nav_msg.id
-        await bot.send_message(chat_id, f"✅ Продолжаем тему: «{html.escape(topic.name)}».")
+        locale = await _get_user_locale(chat_id)
+        translated_topic_name = translate(
+            f"topic.{topic.id}.name",
+            locale,
+            fallback=topic.name,
+            source=topic.name,
+        )
+        await bot.send_message(
+            chat_id,
+            translate(
+                "ui.topics.resume",
+                locale,
+                fallback="✅ Продолжаем тему: «{topic_name}».",
+            ).format(topic_name=html.escape(translated_topic_name)),
+        )
         await _start_telegram_hidden_kickoff(
             chat_id, bot, state, synthetic_prompt, user.current_dialogue_id, int(topic_id),
             navigation_message_id=nav_msg_id,
@@ -8432,16 +9333,32 @@ async def _send_pending_topic_intro(data: dict, bot: Bot, chat_id: int, state: F
     return True
 
 
-async def _send_profile_field_prompt(message: Message, state: FSMContext, field: str) -> None:
+async def _send_profile_field_prompt(
+    message: Message,
+    state: FSMContext,
+    field: str,
+    locale: str = "ru",
+) -> None:
     if field == "name":
         await state.set_state(UserStates.awaiting_name)
-        await message.answer("Прежде чем мы начнем, подскажите, как я могу к вам обращаться?")
+        await message.answer(
+            translate(
+                "ui.profile.name_prompt",
+                locale,
+                fallback="Прежде чем мы начнем, подскажите, как я могу к вам обращаться?",
+            )
+        )
     elif field == "gender":
         await state.set_state(UserStates.awaiting_gender)
-        await message.answer("Укажите ваш пол:", reply_markup=kb.gender_selection_keyboard())
+        await message.answer(
+            translate("ui.profile.gender_prompt", locale, fallback="Укажите ваш пол:"),
+            reply_markup=kb.gender_selection_keyboard(locale=locale),
+        )
     else:
         await state.set_state(UserStates.awaiting_age)
-        await message.answer("Укажите ваш возраст:")
+        await message.answer(
+            translate("ui.profile.age_prompt", locale, fallback="Укажите ваш возраст:")
+        )
 
 
 async def _resume_after_profile_onboarding(
@@ -8454,19 +9371,34 @@ async def _resume_after_profile_onboarding(
     actor=None,
 ) -> None:
     if data.get("resume_start"):
-        resume_message = message
-        if actor is not None and hasattr(message, "model_copy"):
-            resume_message = message.model_copy(update={"from_user": actor})
         await state.update_data(_resume_start_new_user=bool(data.get("resume_start_new_user")))
         start_args = data.get("resume_start_args")
-        command = SimpleNamespace(args=start_args) if start_args else None
-        await cmd_start(resume_message, state, bot, command)
+        gated, intent_new_user = await _maybe_defer_start_for_language(
+            message,
+            start_args,
+            actor=actor,
+        )
+        if gated:
+            return
+        await _run_start_business(
+            message,
+            state,
+            bot,
+            args=start_args,
+            resumed_new_user=bool(data.get("resume_start_new_user")) or intent_new_user,
+            actor=actor,
+        )
         return
 
     if data.get("resume_test"):
         await state.clear()
-        await _send_configured_test_intro(bot, user_id)
-        await start_psych_test(message, state, user_id)
+        await _send_configured_test_intro(bot, user_id, user_id)
+        await start_psych_test(
+            message,
+            state,
+            user_id,
+            deferred_launch_key=data.get("resume_test_launch_key"),
+        )
         return
 
     await state.clear()
@@ -8477,7 +9409,9 @@ async def _resume_after_profile_onboarding(
     if prompt_text:
         lease = single_flight.try_claim("telegram", user_id)
         if lease is None:
-            await message.answer(AI_BUSY_MESSAGE)
+            await message.answer(
+                translate("ui.ai.busy", await _get_user_locale(user_id), fallback=AI_BUSY_MESSAGE)
+            )
             return
         try:
             await process_user_prompt(message, user_id, prompt_text, bot, state)
@@ -8497,18 +9431,24 @@ async def _continue_profile_onboarding(
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(config, "telegram_default_language", "ru"),
+            bool(getattr(config, "telegram_language_selection_enabled", False)),
+            getattr(config, "telegram_enabled_languages", '["ru"]'),
+        )
 
     missing = missing_profile_fields(config, user) if user else []
     if missing:
-        await _send_profile_field_prompt(message, state, missing[0])
+        await _send_profile_field_prompt(message, state, missing[0], locale)
         return
 
     if user and not user.accepted_disclaimer:
-        disclaimer_content = await get_content_from_db("disclaimer")
+        disclaimer_content = await get_content_from_db("disclaimer", user_id=user_id)
         if disclaimer_content.get("is_visible", True):
             await state.set_state(UserStates.awaiting_disclaimer_acceptance)
-            text_to_send = disclaimer_content.get("text") or "Текст дисклеймера не задан."
-            await message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+            text_to_send = _localized_disclaimer_text(disclaimer_content, locale)
+            await message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard(locale))
             return
         async with async_session_maker() as session:
             await session.execute(update(User).where(User.id == user_id).values(accepted_disclaimer=True))
@@ -8521,6 +9461,7 @@ async def _request_profile_onboarding_if_needed(
     message: Message,
     state: FSMContext,
     user: User,
+    bot: Bot,
     *,
     initial_prompt: str | None = None,
     topic_intro_after: int | None = None,
@@ -8533,12 +9474,53 @@ async def _request_profile_onboarding_if_needed(
     resume_start_args: str | None = None,
     resume_start_new_user: bool = False,
     resume_test: bool = False,
+    resume_test_launch_key: str | None = None,
 ) -> bool:
+    recovered_resume_start = False
+    start_intent = None
     async with async_session_maker() as session:
         config = await session.get(BotGeneralConfig, 1)
+        start_intent = await session.get(TelegramStartIntent, user.id)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(config, "telegram_default_language", "ru"),
+            bool(getattr(config, "telegram_language_selection_enabled", False)),
+            getattr(config, "telegram_enabled_languages", '["ru"]'),
+        )
+        if (
+            not resume_start
+            and not resume_test
+            and start_intent
+            and start_intent.status == "awaiting_profile"
+            and start_intent.new_user_eligible
+        ):
+            resume_start = True
+            resume_start_args = start_intent.navigation_payload
+            resume_start_new_user = True
+            recovered_resume_start = True
+        if resume_start:
+            if start_intent and start_intent.status != "completed":
+                start_intent.status = "awaiting_profile"
+                start_intent.lease_token = None
+                start_intent.lease_until = None
+                await session.commit()
 
     missing = missing_profile_fields(config, user)
     if not missing:
+        if recovered_resume_start:
+            await _resume_after_profile_onboarding(
+                {
+                    "resume_start": True,
+                    "resume_start_args": resume_start_args,
+                    "resume_start_new_user": resume_start_new_user,
+                },
+                message,
+                state,
+                bot,
+                user.id,
+                actor=message.from_user,
+            )
+            return True
         return False
 
     state_data = {
@@ -8549,6 +9531,7 @@ async def _request_profile_onboarding_if_needed(
         "resume_start_args": resume_start_args,
         "resume_start_new_user": resume_start_new_user,
         "resume_test": resume_test,
+        "resume_test_launch_key": resume_test_launch_key,
     }
     if topic_intro_after is not None:
         state_data.update({
@@ -8561,7 +9544,7 @@ async def _request_profile_onboarding_if_needed(
         })
 
     await state.update_data(**state_data)
-    await _send_profile_field_prompt(message, state, missing[0])
+    await _send_profile_field_prompt(message, state, missing[0], locale)
     return True
 
 
@@ -8584,10 +9567,17 @@ async def _new_dialogue_update_state(session, user, topic_key: int, memory_mode:
 async def select_topic_menu(message: Message):
     async with async_session_maker() as session:
         user = await session.get(User, message.from_user.id, options=[selectinload(User.current_topic)])
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
-        current_status = "в <b>Основном диалоге</b>"
+        current_status = translate("ui.topics.current_main", locale, fallback="в <b>Основном диалоге</b>")
         if user and user.current_topic:
-            current_status = f"в диалоге: <b>{html.escape(user.current_topic.name)}</b>"
+            current_status = f"в диалоге: <b>{html.escape(translate(f'topic.{user.current_topic.id}.name', locale, fallback=user.current_topic.name))}</b>"
 
         is_admin_user = message.from_user.id in OWNER_IDS or (user and user.is_admin)
         topic_conditions = [Topic.is_active == True, Topic.show_in_list == True]
@@ -8601,18 +9591,30 @@ async def select_topic_menu(message: Message):
         user_topic_id = user.current_topic_id if user else None
 
     if not active_topics:
-        await message.answer("К сожалению, сейчас нет доступных тем для диалога.")
+        await message.answer(
+            translate(
+                "ui.topics.empty",
+                locale,
+                fallback="К сожалению, сейчас нет доступных тем для диалога.",
+            )
+        )
         return
 
     text = (
-        f"Вы находитесь {current_status}.\n"
-        "Выберите подходящую тему для общения.\n"
-        "Бот будет использовать специальные знания и инструкции для ответов по выбранной теме."
+        translate("ui.topics.current_prefix", locale, fallback="Вы находитесь {status}.").format(status=current_status)
+        + "\n"
+        + translate("ui.topics.menu_prompt", locale, fallback="Выберите подходящую тему для общения.")
+        + "\n"
+        + translate(
+            "ui.topics.menu_description",
+            locale,
+            fallback="Бот будет использовать специальные знания и инструкции для ответов по выбранной теме.",
+        )
     )
 
     await message.answer(
         text,
-        reply_markup=kb.select_topic_keyboard(active_topics, user_topic_id),
+        reply_markup=kb.select_topic_keyboard(active_topics, user_topic_id, locale),
         parse_mode="HTML"
     )
 
@@ -8672,11 +9674,15 @@ async def _complete_telegram_main_continuation(
 
         accepted_disclaimer = user.accepted_disclaimer
 
-    await bot.send_message(user_id, "✅ Мы вернулись в основной диалог.")
+    locale = await _get_user_locale(user_id)
+    await bot.send_message(
+        user_id,
+        translate("ui.navigation.main_resume", locale, fallback="✅ Мы вернулись в основной диалог."),
+    )
 
     if not accepted_disclaimer:
         async with async_session_maker() as session_acc:
-            disclaimer_content = await get_content_from_db("disclaimer")
+            disclaimer_content = await get_content_from_db("disclaimer", user_id=user_id)
             if disclaimer_content.get('is_visible', True):
                 if state:
                     await state.set_state(UserStates.awaiting_disclaimer_acceptance)
@@ -8686,8 +9692,12 @@ async def _complete_telegram_main_continuation(
                         pending_auto_start_kind="main_resume",
                         pending_auto_start_message_id=navigation_message_id,
                     )
-                text_to_send_disc = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                await bot.send_message(user_id, text_to_send_disc, reply_markup=kb.confirm_disclaimer_keyboard())
+                text_to_send_disc = _localized_disclaimer_text(disclaimer_content, locale)
+                await bot.send_message(
+                    user_id,
+                    text_to_send_disc,
+                    reply_markup=kb.confirm_disclaimer_keyboard(await _get_user_locale(user_id)),
+                )
                 return
             else:
                 await session_acc.execute(update(User).where(User.id == user_id).values(accepted_disclaimer=True))
@@ -8875,7 +9885,7 @@ async def admin_toggle_topic(callback: CallbackQuery):
         topic = await session.get(Topic, topic_id)
         if topic:
             topic.is_active = not topic.is_active
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await _show_edit_topic_menu(callback.bot, callback.message.chat.id, callback.message.message_id, topic_id)
     await callback.answer()
 
@@ -8995,9 +10005,12 @@ async def admin_edit_topic_name_process(message: Message, state: FSMContext, bot
 
     async with async_session_maker() as session:
         if topic_id:
-            stmt = update(Topic).where(Topic.id == topic_id).values(name=new_name)
-            await session.execute(stmt)
-            await session.commit()
+            topic = await session.get(Topic, topic_id)
+            if topic is None:
+                await message.answer("Тема не найдена.")
+                return
+            topic.name = new_name
+            await commit_readiness_critical_mutation(session)
             action_text = f"✅ Название темы обновлено на «{new_name}»."
 
             if message_id_to_edit:
@@ -9009,7 +10022,7 @@ async def admin_edit_topic_name_process(message: Message, state: FSMContext, bot
         else:
             new_topic = Topic(name=new_name)
             session.add(new_topic)
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
             action_text = f"✅ Тема «{new_name}» создана."
 
             if message_id_to_edit:
@@ -10319,11 +11332,19 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
         user_promos = user.promo_codes if user else []
 
         sub_config_kb = await session.get(SubscriptionConfig, 1)
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
         referral_info = None
         if sub_config_kb and sub_config_kb.referral_enabled:
             referral_info = {
                 'enabled': True,
                 'sub_btn_name': sub_config_kb.referral_sub_btn_name,
+                'translation_key': f"subscription_config.{sub_config_kb.id}.referral_sub_btn_name",
             }
 
     sub_info = None
@@ -10335,20 +11356,49 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
         end_date_msk = user_sub.end_date.astimezone(MSK)
 
         plan = user_sub.plan
-        plan_name_with_duration = "Неизвестный тариф"
+        plan_name_with_duration = translate(
+            "ui.subscription.unknown_plan",
+            locale,
+            fallback="Неизвестный тариф",
+        )
         if plan:
-            duration_unit_text = "дн." if plan.duration_unit == 'days' else "мес."
-            plan_name_with_duration = f"{plan.name} ({plan.duration_value} {duration_unit_text})"
+            plan_name = translate(
+                f"plan.{plan.id}.name",
+                locale,
+                fallback=plan.name,
+                source=plan.name,
+            )
+            duration_unit_text = translate(
+                "ui.subscription.days" if plan.duration_unit == "days" else "ui.subscription.months",
+                locale,
+                fallback="дн." if plan.duration_unit == "days" else "мес.",
+            )
+            plan_name_with_duration = f"{plan_name} ({plan.duration_value} {duration_unit_text})"
 
         plan_allows_renewal = getattr(plan, 'allow_auto_renewal', True) if plan else True
         renewal_line = ""
         if plan_allows_renewal:
-            renewal_line = f"\n<b>Автопродление:</b> {'✅ Включено' if user_sub.auto_renewal else '❌ Выключено'}"
-        text = (
-            f"<b>⭐️ Ваша подписка активна</b>\n\n"
-            f"<b>Тариф:</b> {plan_name_with_duration}\n"
-            f"<b>Действует до:</b> {end_date_msk.strftime('%d.%m.%Y %H:%M')} МСК"
-            f"{renewal_line}"
+            renewal_line = translate(
+                "ui.subscription.renewal_line",
+                locale,
+                fallback="\n<b>Автопродление:</b> {status}",
+            ).format(
+                status=translate(
+                    "ui.subscription.renewal_enabled"
+                    if user_sub.auto_renewal
+                    else "ui.subscription.renewal_disabled",
+                    locale,
+                    fallback="✅ Включено" if user_sub.auto_renewal else "❌ Выключено",
+                )
+            )
+        text = translate(
+            "ui.subscription.active_screen",
+            locale,
+            fallback="<b>⭐️ Ваша подписка активна</b>\n\n<b>Тариф:</b> {plan}\n<b>Действует до:</b> {end_date} МСК{renewal_line}",
+        ).format(
+            plan=plan_name_with_duration,
+            end_date=end_date_msk.strftime('%d.%m.%Y %H:%M'),
+            renewal_line=renewal_line,
         )
 
         plan_to_charge = None
@@ -10384,25 +11434,62 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
                     plan_discount_percent = all_plans_promo.discount_percent
 
             if plan_discount_percent > 0:
-                text += f"\n<b>Ваша скидка:</b> {plan_discount_percent}%"
+                text += translate(
+                    "ui.subscription.discount_line",
+                    locale,
+                    fallback="\n<b>Ваша скидка:</b> {percent}%",
+                ).format(percent=plan_discount_percent)
 
             final_price_to_charge = plan_to_charge.price * (1 - plan_discount_percent / 100)
 
             if plan.is_trial:
-                up_duration_unit = "дн" if plan_to_charge.duration_unit == 'days' else "мес"
-                price_line = f"\n<b>Стоимость основного тарифа"
-                if plan_discount_percent > 0:
-                    price_line += " (со скидкой)"
-                price_line += f":</b> {final_price_to_charge:.2f} руб за {plan_to_charge.duration_value} {up_duration_unit}"
+                up_duration_unit = translate(
+                    "ui.subscription.days" if plan_to_charge.duration_unit == "days" else "ui.subscription.months",
+                    locale,
+                    fallback="дн." if plan_to_charge.duration_unit == "days" else "мес.",
+                ).rstrip(".")
+                discount_suffix = (
+                    translate("ui.subscription.discount_suffix", locale, fallback=" (со скидкой)")
+                    if plan_discount_percent > 0
+                    else ""
+                )
                 if target_plan_allows_renewal:
-                    price_line += " (спишется при включенном автопродлении)"
+                    renewal_note = translate(
+                        "ui.subscription.renewal_charge_note",
+                        locale,
+                        fallback=" (спишется при включенном автопродлении)",
+                    )
                 else:
-                    price_line += " (оформляется вручную после окончания пробного периода)"
+                    renewal_note = translate(
+                        "ui.subscription.manual_trial_note",
+                        locale,
+                        fallback=" (оформляется вручную после окончания пробного периода)",
+                    )
+                price_line = translate(
+                    "ui.subscription.main_price",
+                    locale,
+                    fallback="\n<b>Стоимость основного тарифа{discount_suffix}</b>: {price:.2f} руб за {duration} {unit}{renewal_note}",
+                ).format(
+                    discount_suffix=discount_suffix,
+                    price=final_price_to_charge,
+                    duration=plan_to_charge.duration_value,
+                    unit=up_duration_unit,
+                    renewal_note=renewal_note,
+                )
             else:
-                price_line = f"\n<b>Стоимость"
-                if plan_discount_percent > 0:
-                    price_line += " (со скидкой)"
-                price_line += f":</b> {final_price_to_charge:.2f} руб."
+                discount_suffix = (
+                    translate("ui.subscription.discount_suffix", locale, fallback=" (со скидкой)")
+                    if plan_discount_percent > 0
+                    else ""
+                )
+                price_line = translate(
+                    "ui.subscription.price",
+                    locale,
+                    fallback="\n<b>Стоимость{discount_suffix}</b>: {price:.2f} руб.",
+                ).format(
+                    discount_suffix=discount_suffix,
+                    price=final_price_to_charge,
+                )
 
             text += price_line
 
@@ -10425,7 +11512,10 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
         )
         if is_retry_mode:
             plan = user_sub.plan
-            plan_name = plan.name if plan else "текущий тариф"
+            plan_name = (
+                translate(f"plan.{plan.id}.name", locale, fallback=plan.name, source=plan.name)
+                if plan else "текущий тариф"
+            )
             is_pending_robokassa = (
                 user_sub.payment_provider == 'Robokassa'
                 and user_sub.pending_robokassa_invoice_id is not None
@@ -10446,28 +11536,64 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
             final_price = plan_to_charge.price * (1 - current_discount / 100) if plan_to_charge else 0
             duration_text = ""
             if plan_to_charge:
-                unit = "дн." if plan_to_charge.duration_unit == 'days' else "мес."
+                unit = translate(
+                    "ui.subscription.days" if plan_to_charge.duration_unit == "days" else "ui.subscription.months",
+                    locale,
+                    fallback="дн." if plan_to_charge.duration_unit == "days" else "мес.",
+                )
                 duration_text = f"{plan_to_charge.duration_value} {unit}"
 
-            price_line = f"\n<b>Сумма к списанию:</b> {final_price:.2f} руб." if plan_to_charge else ""
-            duration_line = f"\n<b>Период:</b> {duration_text}" if duration_text else ""
-            attempt_text = f"\n<b>Попыток списания:</b> {user_sub.payment_attempt_count} из 3" if user_sub.payment_attempt_count > 0 else ""
+            price_line = (
+                translate(
+                    "ui.subscription.amount_line",
+                    locale,
+                    fallback="\n<b>Сумма к списанию:</b> {amount:.2f} руб.",
+                ).format(amount=final_price)
+                if plan_to_charge
+                else ""
+            )
+            duration_line = (
+                translate(
+                    "ui.subscription.period_line",
+                    locale,
+                    fallback="\n<b>Период:</b> {period}",
+                ).format(period=duration_text)
+                if duration_text
+                else ""
+            )
+            attempt_text = (
+                translate(
+                    "ui.subscription.attempts_line",
+                    locale,
+                    fallback="\n<b>Попыток списания:</b> {count} из 3",
+                ).format(count=user_sub.payment_attempt_count)
+                if user_sub.payment_attempt_count > 0
+                else ""
+            )
             if is_pending_robokassa:
-                text = (
-                    f"<b>⚠️ Подписка истекла, ожидаем результат автопродления</b>\n\n"
-                    f"<b>Тариф:</b> {plan_name}{duration_line}{price_line}{attempt_text}\n\n"
-                    f"Запрос на списание уже отправлен в Robokassa. Можете проверить статус "
-                    f"или отменить автопродление и оформить подписку заново."
+                text = translate(
+                    "ui.subscription.retry_pending",
+                    locale,
+                    fallback="<b>⚠️ Подписка истекла, ожидаем результат автопродления</b>\n\n<b>Тариф:</b> {plan}{period_line}{amount_line}{attempts_line}\n\nЗапрос на списание уже отправлен в Robokassa. Можете проверить статус или отменить автопродление и оформить подписку заново.",
+                ).format(
+                    plan=plan_name,
+                    period_line=duration_line,
+                    amount_line=price_line,
+                    attempts_line=attempt_text,
                 )
-                reply_markup = kb.subscription_pending_keyboard()
+                reply_markup = kb.subscription_pending_keyboard(locale)
             else:
-                text = (
-                    f"<b>⚠️ Подписка истекла, ожидает оплаты по автопродлению</b>\n\n"
-                    f"<b>Тариф:</b> {plan_name}{duration_line}{price_line}{attempt_text}\n\n"
-                    f"К вашей карте привязан метод оплаты. Можете попробовать списание прямо сейчас "
-                    f"или отменить автопродление и оформить новую подписку."
+                text = translate(
+                    "ui.subscription.retry_waiting",
+                    locale,
+                    fallback="<b>⚠️ Подписка истекла, ожидает оплаты по автопродлению</b>\n\n<b>Тариф:</b> {plan}{period_line}{amount_line}{attempts_line}\n\nК вашей карте привязан метод оплаты. Можете попробовать списание прямо сейчас или отменить автопродление и оформить новую подписку.",
+                ).format(
+                    plan=plan_name,
+                    period_line=duration_line,
+                    amount_line=price_line,
+                    attempts_line=attempt_text,
                 )
-                reply_markup = kb.subscription_retry_keyboard()
+                reply_markup = kb.subscription_retry_keyboard(locale)
             await bot.send_message(chat_id, text, reply_markup=reply_markup)
             return
 
@@ -10485,26 +11611,58 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
                 remaining_days_display = math.ceil(remaining_seconds / 86400)
                 remaining_hours = int(remaining_time.total_seconds() / 3600)
 
-            text = "У вас нет активной подписки.\n"
+            text = translate(
+                "ui.subscription.no_active",
+                locale,
+                fallback="У вас нет активной подписки.\n",
+            )
 
             if remaining_days_display > 1:
-                text += f"\nДоступные бонусные дни: {remaining_days_display}\n"
+                text += translate(
+                    "ui.subscription.bonus_days",
+                    locale,
+                    fallback="\nДоступные бонусные дни: {days}\n",
+                ).format(days=remaining_days_display)
             elif remaining_days_display == 1:
                 if remaining_hours > 0:
-                    text += f"\nДоступные бонусные часы: ~{remaining_hours}\n"
+                    text += translate(
+                        "ui.subscription.bonus_hours",
+                        locale,
+                        fallback="\nДоступные бонусные часы: ~{hours}\n",
+                    ).format(hours=remaining_hours)
                 else:
-                    text += f"\nБонусный доступ скоро закончится.\n"
+                    text += translate(
+                        "ui.subscription.bonus_ending",
+                        locale,
+                        fallback="\nБонусный доступ скоро закончится.\n",
+                    )
             elif remaining_days_display == 0:
-                text += f"\nБонусный доступ скоро закончится.\n"
+                text += translate(
+                    "ui.subscription.bonus_ending",
+                    locale,
+                    fallback="\nБонусный доступ скоро закончится.\n",
+                )
 
             if user_sub.discount_percent > 0:
-                text += f"🔥 У вас есть скидка <b>{user_sub.discount_percent}%</b>, которая <b>сгорит</b>, если не оформить подписку до окончания бонусных дней!\n"
+                text += translate(
+                    "ui.subscription.discount_expiring",
+                    locale,
+                    fallback="🔥 У вас есть скидка <b>{percent}%</b>, которая <b>сгорит</b>, если не оформить подписку до окончания бонусных дней!\n",
+                ).format(percent=user_sub.discount_percent)
 
-            text += "\nОформите подписку, чтобы получить доступ ко всем возможностям бота!"
+            text += translate(
+                "ui.subscription.purchase_prompt",
+                locale,
+                fallback="\nОформите подписку, чтобы получить доступ ко всем возможностям бота!",
+            )
             sub_info = None
 
         else:
-            text = "У вас нет активной подписки.\n"
+            text = translate(
+                "ui.subscription.no_active",
+                locale,
+                fallback="У вас нет активной подписки.\n",
+            )
 
             discount_percent = 0
             if user_sub and user_sub.discount_percent > 0:
@@ -10515,16 +11673,33 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
                     discount_percent = p.discount_percent
 
             if discount_percent > 0:
-                text += f"\nДоступная скидка: {discount_percent} % (применяется к подходящим тарифам)\n"
+                text += translate(
+                    "ui.subscription.available_discount",
+                    locale,
+                    fallback="\nДоступная скидка: {percent} % (применяется к подходящим тарифам)\n",
+                ).format(percent=discount_percent)
 
-            text += "\nОформите ее, чтобы получить доступ ко всем возможностям бота!"
+            text += translate(
+                "ui.subscription.purchase_prompt_short",
+                locale,
+                fallback="\nОформите ее, чтобы получить доступ ко всем возможностям бота!",
+            )
             sub_info = None
 
-    await bot.send_message(chat_id, text, reply_markup=kb.subscription_info_keyboard(sub_info, referral_info=referral_info))
+    await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=kb.subscription_info_keyboard(
+            sub_info,
+            referral_info=referral_info,
+            locale=locale,
+        ),
+    )
 
 
 @router.message(Command("subscription"))
 @router.message(F.text == "⭐️ Подписка")
+@router.message(SubscriptionButtonFilter())
 async def show_subscription_info(message: Message, state: FSMContext, bot: Bot):
     await _send_subscription_info(message.from_user.id, message.chat.id, bot, state)
 
@@ -10541,6 +11716,7 @@ async def back_to_subscription_info(callback: CallbackQuery, state: FSMContext, 
 
 @router.callback_query(F.data == "sub_toggle_renewal")
 async def toggle_subscription_renewal(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    locale = await _get_user_locale(callback.from_user.id)
     async with async_session_maker() as session:
         user_sub = await session.scalar(
             select(UserSubscription)
@@ -10548,7 +11724,10 @@ async def toggle_subscription_renewal(callback: CallbackQuery, state: FSMContext
             .options(selectinload(UserSubscription.plan))
         )
         if not user_sub:
-            await callback.answer("Не удалось найти вашу подписку.", show_alert=True)
+            await callback.answer(
+                translate("ui.subscription.not_found", locale, fallback="Не удалось найти вашу подписку."),
+                show_alert=True,
+            )
             return
 
         user_sub.auto_renewal = not user_sub.auto_renewal
@@ -10558,7 +11737,6 @@ async def toggle_subscription_renewal(callback: CallbackQuery, state: FSMContext
             user_sub.pending_robokassa_invoice_id = None
         await session.commit()
 
-        status_text = "включено" if user_sub.auto_renewal else "отменено"
         user_ref = f"{callback.from_user.first_name or ''}"
         if callback.from_user.username:
             user_ref += f" (@{callback.from_user.username})"
@@ -10569,7 +11747,14 @@ async def toggle_subscription_renewal(callback: CallbackQuery, state: FSMContext
             plog.info(f"ВКЛЮЧЕНИЕ_АВТОПРОДЛ | {user_ref} | {plan_name} | до {end_date_msk}")
         else:
             plog.info(f"ОТМЕНА_АВТОПРОДЛ | {user_ref} | {plan_name} | до {end_date_msk}")
-        await callback.answer(f"Автопродление подписки {status_text}.", show_alert=True)
+        await callback.answer(
+            translate(
+                "ui.subscription.renewal_enabled_alert" if user_sub.auto_renewal else "ui.subscription.renewal_disabled_alert",
+                locale,
+                fallback="Автопродление подписки включено." if user_sub.auto_renewal else "Автопродление подписки отменено.",
+            ),
+            show_alert=True,
+        )
 
     await _send_subscription_info(callback.from_user.id, callback.message.chat.id, bot, state)
     await callback.message.delete()
@@ -10577,6 +11762,7 @@ async def toggle_subscription_renewal(callback: CallbackQuery, state: FSMContext
 
 @router.callback_query(F.data == "sub_cancel_retry")
 async def handle_sub_cancel_retry(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    locale = await _get_user_locale(callback.from_user.id)
     async with async_session_maker() as session:
         user_sub = await session.scalar(
             select(UserSubscription)
@@ -10596,7 +11782,10 @@ async def handle_sub_cancel_retry(callback: CallbackQuery, state: FSMContext, bo
             user_sub.pending_robokassa_invoice_id = None
             await session.commit()
             plog.info(f"ОТМЕНА_АВТОПРОДЛ | {user_ref} | {plan_name} | до {end_date_msk}")
-    await callback.answer("Автопродление отменено.", show_alert=False)
+    await callback.answer(
+        translate("ui.subscription.renewal_cancelled_alert", locale, fallback="Автопродление отменено."),
+        show_alert=False,
+    )
     try:
         await callback.message.delete()
     except TelegramBadRequest:
@@ -10611,6 +11800,22 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
     user_id = callback.from_user.id
     now = datetime.utcnow()
     MSK = timezone(timedelta(hours=3))
+    locale = await _get_user_locale(user_id)
+
+    def subscription_text(key: str, fallback: str, **values):
+        text = translate(key, locale, fallback=fallback)
+        return text.format(**values) if values else text
+
+    async def localized_plan_snapshot(session, plan_id, snapshot_name):
+        plan = await session.get(SubscriptionPlan, plan_id) if plan_id else None
+        if plan:
+            return translate(
+                f"plan.{plan.id}.name",
+                locale,
+                fallback=plan.name,
+                source=plan.name,
+            )
+        return snapshot_name
 
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
@@ -10641,7 +11846,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 user_sub.payment_attempt_count if user_sub else "none",
                 user_sub.pending_robokassa_invoice_id if user_sub else "none",
             )
-            await bot.send_message(user_id, "Невозможно выполнить списание.")
+            await bot.send_message(
+                user_id,
+                subscription_text("ui.subscription.retry_unavailable", "Невозможно выполнить списание."),
+            )
             return
 
         if user_sub.pending_robokassa_invoice_id and config and config.robokassa_password_2:
@@ -10671,7 +11879,14 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 user_sub.last_payment_attempt = None
                 user_sub.pending_robokassa_invoice_id = None
                 await session.commit()
-                await bot.send_message(user_id, f"✅ Подписка продлена до {user_sub.end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M')} МСК.")
+                await bot.send_message(
+                    user_id,
+                    subscription_text(
+                        "ui.subscription.renewed_until",
+                        "✅ Подписка продлена до {end_date} МСК.",
+                        end_date=user_sub.end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M'),
+                    ),
+                )
                 try:
                     await callback.message.delete()
                 except TelegramBadRequest:
@@ -10679,7 +11894,13 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 await _send_subscription_info(user_id, callback.message.chat.id, bot, state)
                 return
             elif op_state == 'pending':
-                await bot.send_message(user_id, "Запрос уже в обработке, ожидайте подтверждения.")
+                await bot.send_message(
+                    user_id,
+                    subscription_text(
+                        "ui.subscription.retry_pending_alert",
+                        "Запрос уже в обработке, ожидайте подтверждения.",
+                    ),
+                )
                 return
             elif op_state == 'failed':
                 # Явный отказ провайдера: очищаем pending и, если это 3-я неудача, отключаем автопродление.
@@ -10698,7 +11919,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         user_ref,
                         user_sub.plan.name if user_sub.plan else "Unknown",
                         InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="💳 Оформить подписку", callback_data="show_subscription_info_from_chat")]
+                            [InlineKeyboardButton(
+                                text=translate("ui.subscription.subscribe", locale, fallback="💳 Оформить подписку"),
+                                callback_data="show_subscription_info_from_chat",
+                            )]
                         ]),
                         config,
                         await get_all_admin_ids(),
@@ -10712,7 +11936,11 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 await session.commit()
                 await bot.send_message(
                     user_id,
-                    f"Банк отклонил списание. Подписка пока активна до {user_sub.end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M МСК')}.",
+                    subscription_text(
+                        "ui.subscription.bank_declined",
+                        "Банк отклонил списание. Подписка пока активна до {end_date}.",
+                        end_date=user_sub.end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M МСК'),
+                    ),
                 )
                 try:
                     await callback.message.delete()
@@ -10725,7 +11953,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 if not has_robokassa_pending_timed_out(user_sub, now):
                     await bot.send_message(
                         user_id,
-                        "Предыдущий запрос ещё не отражён в Robokassa. Подождите до 3 часов.",
+                        subscription_text(
+                            "ui.subscription.robokassa_wait",
+                            "Предыдущий запрос ещё не отражён в Robokassa. Подождите до 3 часов.",
+                        ),
                     )
                     return
 
@@ -10741,7 +11972,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         user_ref,
                         user_sub.plan.name if user_sub.plan else "Unknown",
                         InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="💳 Оформить подписку", callback_data="show_subscription_info_from_chat")]
+                            [InlineKeyboardButton(
+                                text=translate("ui.subscription.subscribe", locale, fallback="💳 Оформить подписку"),
+                                callback_data="show_subscription_info_from_chat",
+                            )]
                         ]),
                         config,
                         await get_all_admin_ids(),
@@ -10759,7 +11993,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 await session.commit()
                 await bot.send_message(
                     user_id,
-                    "Статус платежа в Robokassa не подтвердился. Новый запрос сейчас не отправлялся.",
+                    subscription_text(
+                        "ui.subscription.robokassa_status_unknown",
+                        "Статус платежа в Robokassa не подтвердился. Новый запрос сейчас не отправлялся.",
+                    ),
                 )
                 try:
                     await callback.message.delete()
@@ -10768,20 +12005,29 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 return
 
         if not config:
-            await bot.send_message(user_id, "Ошибка конфигурации.")
+            await bot.send_message(
+                user_id,
+                subscription_text("ui.subscription.configuration_error", "Ошибка конфигурации."),
+            )
             return
 
         if user_sub.payment_provider == 'Robokassa' and not can_retry_manually(user_sub.payment_attempt_count):
             plog.info(f"РУЧНОЙ_РЕТРАЙ_ЗАБЛОКИРОВАН | {callback.from_user.id} | Robokassa | исчерпан лимит попыток")
             await bot.send_message(
                 user_id,
-                "Повторное списание недоступно: исчерпан лимит из 3 попыток.",
+                subscription_text(
+                    "ui.subscription.retry_limit",
+                    "Повторное списание недоступно: исчерпан лимит из 3 попыток.",
+                ),
             )
             return
 
         plan = user_sub.plan
         if not plan:
-            await bot.send_message(user_id, "Тариф не найден.")
+            await bot.send_message(
+                user_id,
+                subscription_text("ui.subscription.plan_not_found", "Тариф не найден."),
+            )
             return
 
         plan_to_charge = plan.upgrades_to_plan if (plan.is_trial and plan.upgrades_to_plan) else plan
@@ -10816,7 +12062,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
             user_sub.pending_robokassa_invoice_id or "none",
         )
 
-        await bot.send_message(user_id, "Отправляем запрос на списание...")
+        await bot.send_message(
+            user_id,
+            subscription_text("ui.subscription.charge_request", "Отправляем запрос на списание..."),
+        )
 
         if user_sub.payment_provider == 'Yookassa':
             if not can_retry_now(
@@ -10840,7 +12089,11 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 )
                 await bot.send_message(
                     user_id,
-                    f"Повторное списание пока недоступно. Следующая попытка после {next_retry_str}.",
+                    subscription_text(
+                        "ui.subscription.retry_after",
+                        "Повторное списание пока недоступно. Следующая попытка после {next_retry}.",
+                        next_retry=next_retry_str,
+                    ),
                 )
                 return
 
@@ -10872,8 +12125,11 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             if reason == "subscription_unresolved":
                                 await bot.send_message(
                                     user_id,
-                                    f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
-                                    f"Платёж отправлен на проверку администратору."
+                                    subscription_text(
+                                        "ui.subscription.manual_subscription_unresolved",
+                                        "⚠️ Мы получили оплату ({amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. Платёж отправлен на проверку администратору.",
+                                        amount=charge_amount,
+                                    )
                                 )
                                 cfg = await session.get(SubscriptionConfig, 1)
                                 if cfg and cfg.notifications_enabled:
@@ -10893,13 +12149,27 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                         except Exception:
                                             pass
                             else:
-                                paid_name = rec_details.get("paid_plan_name", "предыдущий тариф")
-                                curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                                paid_name_snapshot = rec_details.get("paid_plan_name", "предыдущий тариф")
+                                curr_name_snapshot = rec_details.get("current_plan_name", "текущий тариф")
+                                paid_name = await localized_plan_snapshot(
+                                    session,
+                                    rec_details.get("paid_plan_id"),
+                                    paid_name_snapshot,
+                                )
+                                curr_name = await localized_plan_snapshot(
+                                    session,
+                                    rec_details.get("current_plan_id"),
+                                    curr_name_snapshot,
+                                )
                                 await bot.send_message(
                                     user_id,
-                                    f"⚠️ Мы получили оплату ({rec_details.get('amount', final_price):.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                                    f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                                    f"Срок действия текущей подписки не был изменён автоматически."
+                                    subscription_text(
+                                        "ui.subscription.manual_cross_plan",
+                                        "⚠️ Мы получили оплату ({amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». Поскольку сейчас у вас активен тариф «{current_name}», платёж отправлен на проверку администратору. Срок действия текущей подписки не был изменён автоматически.",
+                                        amount=rec_details.get("amount", final_price),
+                                        paid_name=paid_name,
+                                        current_name=curr_name,
+                                    )
                                 )
                                 cfg = await session.get(SubscriptionConfig, 1)
                                 if cfg and cfg.notifications_enabled:
@@ -10909,8 +12179,8 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                                 admin_id,
                                                 f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, Telegram manual replay)\n\n"
                                                 f"Пользователь: {user_ref}\n"
-                                                f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
-                                                f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                                f"Оплачен старый тариф: {paid_name_snapshot} (ID {rec_details.get('paid_plan_id')})\n"
+                                                f"Текущий тариф: {curr_name_snapshot} (ID {rec_details.get('current_plan_id')})\n"
                                                 f"Сумма: {rec_details.get('amount', final_price):.2f} руб\n"
                                                 f"PayId: {res.payment_id}\n"
                                                 f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
@@ -10920,10 +12190,20 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         elif is_new:
                             await bot.send_message(
                                 user_id,
-                                f"✅ Подписка продлена до {(updated_sub or user_sub).end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M')} МСК."
+                                subscription_text(
+                                    "ui.subscription.renewed_until",
+                                    "✅ Подписка продлена до {end_date} МСК.",
+                                    end_date=(updated_sub or user_sub).end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M'),
+                                )
                             )
                         else:
-                            await bot.send_message(user_id, "Платёж уже обработан. Подписка активна.")
+                            await bot.send_message(
+                                user_id,
+                                subscription_text(
+                                    "ui.subscription.payment_processed_active",
+                                    "Платёж уже обработан. Подписка активна.",
+                                ),
+                            )
                         return
                     elif res.outcome == 'deactivate':
                         if res.payment_id:
@@ -10943,15 +12223,27 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             if action in ("historical_canceled", "orphan_canceled"):
                                 await bot.send_message(
                                     user_id,
-                                    "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены."
+                                    subscription_text(
+                                        "ui.subscription.previous_attempt_done",
+                                        "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
+                                    )
                                 )
                             else:
                                 await bot.send_message(
                                     user_id,
-                                    "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa. Оформите подписку вручную."
+                                    subscription_text(
+                                        "ui.subscription.expired_payment_method_manual",
+                                        "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa. Оформите подписку вручную.",
+                                    )
                                 )
                         else:
-                            await bot.send_message(user_id, "Платёж уже обработан. Способ оплаты был отключён.")
+                            await bot.send_message(
+                                user_id,
+                                subscription_text(
+                                    "ui.subscription.payment_processed_method_disabled",
+                                    "Платёж уже обработан. Способ оплаты был отключён.",
+                                ),
+                            )
                         return
                     elif res.outcome in ('declined', 'limit_exceeded'):
                         if res.payment_id:
@@ -10971,17 +12263,33 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             if action in ("historical_canceled", "orphan_canceled"):
                                 await bot.send_message(
                                     user_id,
-                                    "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены."
+                                    subscription_text(
+                                        "ui.subscription.previous_attempt_done",
+                                        "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
+                                    )
                                 )
                             elif action == "unknown_cancellation":
                                 await bot.send_message(
                                     user_id,
-                                    "Не удалось провести оплату (нестандартный ответ банка). Автопродление приостановлено во избежание повторных списаний. Пожалуйста, оформите подписку вручную."
+                                    subscription_text(
+                                        "ui.subscription.unknown_bank_response",
+                                        "Не удалось провести оплату (нестандартный ответ банка). Автопродление приостановлено во избежание повторных списаний. Пожалуйста, оформите подписку вручную.",
+                                    )
                                 )
                             else:
-                                await bot.send_message(user_id, f"Не удалось списать средства ({res.failure_reason or 'отказ банка'}).")
+                                await bot.send_message(
+                                    user_id,
+                                    translate(
+                                        "ui.subscription.charge_declined",
+                                        locale,
+                                        fallback="Не удалось списать средства ({reason}).",
+                                    ).format(reason=res.failure_reason or "отказ банка"),
+                                )
                         else:
-                            await bot.send_message(user_id, "Платёж уже обработан.")
+                            await bot.send_message(
+                                user_id,
+                                subscription_text("ui.subscription.payment_processed", "Платёж уже обработан."),
+                            )
                         return
                     elif res.outcome == 'manual_review':
                         is_new_mr, _ = await transition_attempt_to_manual_review(
@@ -10990,10 +12298,16 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         if is_new_mr:
                             await bot.send_message(
                                 user_id,
-                                "Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню."
+                                subscription_text(
+                                    "ui.subscription.manual_review",
+                                    "Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню.",
+                                ),
                             )
                         else:
-                            await bot.send_message(user_id, "Платёж уже обработан.")
+                            await bot.send_message(
+                                user_id,
+                                subscription_text("ui.subscription.payment_processed", "Платёж уже обработан."),
+                            )
                         return
                     elif res.outcome == 'integration_error':
                         is_new_ie, _ = await finalize_yookassa_attempt_no_payment(
@@ -11002,18 +12316,33 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             sub=user_sub, attempt=att, logger=plog
                         )
                         if is_new_ie:
-                            await bot.send_message(user_id, "Произошла ошибка при обработке запроса. Попробуйте снова позже.")
+                            await bot.send_message(
+                                user_id,
+                                subscription_text(
+                                    "ui.subscription.request_error",
+                                    "Произошла ошибка при обработке запроса. Пожалуйста, попробуйте позже или выберите тариф в меню.",
+                                ),
+                            )
                         else:
-                            await bot.send_message(user_id, "Платёж уже обработан.")
+                            await bot.send_message(
+                                user_id,
+                                subscription_text("ui.subscription.payment_processed", "Платёж уже обработан."),
+                            )
                         return
                     else:
                         await bot.send_message(
                             user_id,
-                            "Предыдущий платёж ещё обрабатывается / проверяется банком. Пожалуйста, подождите завершения операции."
+                            subscription_text(
+                                "ui.subscription.payment_processing",
+                                "Предыдущий платёж ещё обрабатывается / проверяется банком. Пожалуйста, подождите завершения операции.",
+                            )
                         )
                         return
                 else:
-                    await bot.send_message(user_id, "Повторное списание недоступно.")
+                    await bot.send_message(
+                        user_id,
+                        subscription_text("ui.subscription.retry_unavailable_short", "Повторное списание недоступно."),
+                    )
                     return
 
             attempt = claim_res.attempt
@@ -11064,8 +12393,11 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                         if reason == "subscription_unresolved":
                             await bot.send_message(
                                 user_id,
-                                f"⚠️ Мы получили оплату ({charge_amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. "
-                                f"Платёж отправлен на проверку администратору."
+                                subscription_text(
+                                    "ui.subscription.manual_subscription_unresolved",
+                                    "⚠️ Мы получили оплату ({amount:.2f} руб), но не удалось найти вашу подписку для автоматического продления. Платёж отправлен на проверку администратору.",
+                                    amount=charge_amount,
+                                ),
                             )
                             cfg = await session.get(SubscriptionConfig, 1)
                             if cfg and cfg.notifications_enabled:
@@ -11085,13 +12417,27 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                     except Exception:
                                         pass
                         else:
-                            paid_name = rec_details.get("paid_plan_name", plan_to_charge.name)
-                            curr_name = rec_details.get("current_plan_name", "текущий тариф")
+                            paid_name_snapshot = rec_details.get("paid_plan_name", plan_to_charge.name)
+                            curr_name_snapshot = rec_details.get("current_plan_name", "текущий тариф")
+                            paid_name = await localized_plan_snapshot(
+                                session,
+                                rec_details.get("paid_plan_id"),
+                                paid_name_snapshot,
+                            )
+                            curr_name = await localized_plan_snapshot(
+                                session,
+                                rec_details.get("current_plan_id"),
+                                curr_name_snapshot,
+                            )
                             await bot.send_message(
                                 user_id,
-                                f"⚠️ Мы получили оплату ({rec_details.get('amount', final_price):.2f} руб) по вашему предыдущему тарифу «{paid_name}». "
-                                f"Поскольку сейчас у вас активен тариф «{curr_name}», платёж отправлен на проверку администратору. "
-                                f"Срок действия текущей подписки не был изменён автоматически."
+                                subscription_text(
+                                    "ui.subscription.manual_cross_plan",
+                                    "⚠️ Мы получили оплату ({amount:.2f} руб) по вашему предыдущему тарифу «{paid_name}». Поскольку сейчас у вас активен тариф «{current_name}», платёж отправлен на проверку администратору. Срок действия текущей подписки не был изменён автоматически.",
+                                    amount=rec_details.get("amount", final_price),
+                                    paid_name=paid_name,
+                                    current_name=curr_name,
+                                ),
                             )
                             cfg = await session.get(SubscriptionConfig, 1)
                             if cfg and cfg.notifications_enabled:
@@ -11101,8 +12447,8 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                             admin_id,
                                             f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА ТАРИФА (YooKassa, Telegram manual)\n\n"
                                             f"Пользователь: {user_ref}\n"
-                                            f"Оплачен старый тариф: {paid_name} (ID {rec_details.get('paid_plan_id')})\n"
-                                            f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
+                                            f"Оплачен старый тариф: {paid_name_snapshot} (ID {rec_details.get('paid_plan_id')})\n"
+                                            f"Текущий тариф: {curr_name_snapshot} (ID {rec_details.get('current_plan_id')})\n"
                                             f"Сумма: {rec_details.get('amount', final_price):.2f} руб\n"
                                             f"PayId: {res.payment_id}\n"
                                             f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
@@ -11112,7 +12458,11 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     else:
                         await bot.send_message(
                             user_id,
-                            f"✅ Подписка продлена до {(updated_sub or user_sub).end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M')} МСК."
+                            subscription_text(
+                                "ui.subscription.renewed_until",
+                                "✅ Подписка продлена до {end_date} МСК.",
+                                end_date=(updated_sub or user_sub).end_date.astimezone(MSK).strftime('%d.%m.%Y %H:%M'),
+                            ),
                         )
                         cfg = await session.get(SubscriptionConfig, 1)
                         if cfg and cfg.notifications_enabled:
@@ -11125,7 +12475,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                 except Exception:
                                     pass
                 else:
-                    await bot.send_message(user_id, "Платёж уже обработан. Подписка активна.")
+                    await bot.send_message(
+                        user_id,
+                        subscription_text("ui.subscription.payment_processed_active", "Платёж уже обработан. Подписка активна."),
+                    )
 
             elif res.outcome == 'deactivate':
                 if res.payment_id:
@@ -11159,14 +12512,20 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     if action in ("historical_canceled", "orphan_canceled"):
                         await bot.send_message(
                             user_id,
-                            "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены."
+                            subscription_text(
+                                "ui.subscription.previous_attempt_done",
+                                "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
+                            ),
                         )
                         return
                     else:
                         plog.warning(f"АВТОПРОДЛ_ОТКЛ | {user_ref} | причина: deactivate | {plan_to_charge.name}")
                         await bot.send_message(
                             user_id,
-                            "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nОформите подписку вручную."
+                            subscription_text(
+                                "ui.subscription.expired_payment_method",
+                                "Ваша подписка истекла. Сохранённый способ оплаты больше недоступен в ЮKassa (автопродление отключено).\n\nОформите подписку вручную.",
+                            ),
                         )
                         cfg = await session.get(SubscriptionConfig, 1)
                         if cfg and cfg.notifications_enabled:
@@ -11179,7 +12538,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                                 except Exception:
                                     pass
                 else:
-                    await bot.send_message(user_id, "Платёж уже обработан. Способ оплаты был отключён.")
+                    await bot.send_message(
+                        user_id,
+                        subscription_text("ui.subscription.payment_processed_method_disabled", "Платёж уже обработан. Способ оплаты был отключён."),
+                    )
 
             elif res.outcome == 'manual_review':
                 is_new_mr, _ = await transition_attempt_to_manual_review(
@@ -11189,12 +12551,18 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     logger=plog,
                 )
                 if is_new_mr:
-                    await bot.send_message(
-                        user_id,
-                        "Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню."
-                    )
+                        await bot.send_message(
+                            user_id,
+                            subscription_text(
+                                "ui.subscription.manual_review",
+                                "Автопродление приостановлено для ручной проверки. Пожалуйста, оформите подписку заново в меню.",
+                            ),
+                        )
                 else:
-                    await bot.send_message(user_id, "Платёж уже обработан.")
+                        await bot.send_message(
+                            user_id,
+                            subscription_text("ui.subscription.payment_processed", "Платёж уже обработан."),
+                        )
                 return
 
             elif res.outcome == 'integration_error':
@@ -11212,17 +12580,26 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 if is_new_ie:
                     await bot.send_message(
                         user_id,
-                        "Произошла ошибка при обработке запроса. Пожалуйста, попробуйте позже или выберите тариф в меню."
+                        subscription_text(
+                            "ui.subscription.request_error",
+                            "Произошла ошибка при обработке запроса. Пожалуйста, попробуйте позже или выберите тариф в меню.",
+                        ),
                     )
                 else:
-                    await bot.send_message(user_id, "Платёж уже обработан.")
+                    await bot.send_message(
+                        user_id,
+                        subscription_text("ui.subscription.payment_processed", "Платёж уже обработан."),
+                    )
 
             elif res.outcome == 'pending':
                 if res.payment_id:
                     await update_yookassa_attempt_pending(session, attempt.id, res.payment_id)
                 await bot.send_message(
                     user_id,
-                    "Запрос в ЮKassa принят и ожидает подтверждения оплаты. Мы проверяем статус операции."
+                    subscription_text(
+                        "ui.subscription.pending_yookassa",
+                        "Запрос в ЮKassa принят и ожидает подтверждения оплаты. Мы проверяем статус операции.",
+                    ),
                 )
 
             elif res.outcome == 'unknown':
@@ -11231,7 +12608,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 )
                 await bot.send_message(
                     user_id,
-                    "Платёжный шлюз ЮKassa обрабатывает запрос. Мы проверяем статус операции. Попробуйте снова позже."
+                    subscription_text(
+                        "ui.subscription.unknown_yookassa",
+                        "Платёжный шлюз ЮKassa обрабатывает запрос. Мы проверяем статус операции. Попробуйте снова позже.",
+                    ),
                 )
 
             elif res.outcome in ('provider_error', 'rate_limit', 'auth_error'):
@@ -11240,7 +12620,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 )
                 await bot.send_message(
                     user_id,
-                    "ЮKassa временно недоступна. Эта ошибка не засчитана как попытка списания.\n\nПопробуйте снова позже."
+                    subscription_text(
+                        "ui.subscription.provider_yookassa",
+                        "ЮKassa временно недоступна. Эта ошибка не засчитана как попытка списания.\n\nПопробуйте снова позже.",
+                    ),
                 )
 
             else:
@@ -11274,13 +12657,19 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     if action in ("historical_canceled", "orphan_canceled"):
                         await bot.send_message(
                             user_id,
-                            "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены."
+                            subscription_text(
+                                "ui.subscription.previous_attempt_done",
+                                "Предыдущая попытка списания завершена. Текущие настройки вашей подписки сохранены.",
+                            ),
                         )
                         return
                     if action == "unknown_cancellation":
                         await bot.send_message(
                             user_id,
-                            "Не удалось провести оплату (нестандартный ответ банка). Автопродление приостановлено во избежание повторных списаний. Пожалуйста, оформите подписку вручную."
+                            subscription_text(
+                                "ui.subscription.unknown_bank_response",
+                                "Не удалось провести оплату (нестандартный ответ банка). Автопродление приостановлено во избежание повторных списаний. Пожалуйста, оформите подписку вручную.",
+                            ),
                         )
                         return
                     attempt_num = user_sub.payment_attempt_count
@@ -11295,7 +12684,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             user_ref,
                             plan_to_charge.name,
                             InlineKeyboardMarkup(inline_keyboard=[
-                                [InlineKeyboardButton(text="💳 Оформить подписку", callback_data="show_subscription_info_from_chat")]
+                                [InlineKeyboardButton(
+                                    text=translate("ui.subscription.subscribe", locale, fallback="💳 Оформить подписку"),
+                                    callback_data="show_subscription_info_from_chat",
+                                )]
                             ]),
                             config,
                             await get_all_admin_ids(),
@@ -11309,8 +12701,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     if action == "limit_exceeded":
                         await bot.send_message(
                             user_id,
-                            "Не удалось провести списание (превышен лимит по карте). Следующая попытка будет завтра. "
-                            "Вы также можете привязать другую карту в меню.",
+                            subscription_text(
+                                "ui.subscription.limit_exceeded",
+                                "Не удалось провести списание (превышен лимит по карте). Следующая попытка будет завтра. Вы также можете привязать другую карту в меню.",
+                            ),
                         )
                     else:
                         next_retry_at = get_next_retry_at(
@@ -11319,14 +12713,21 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                             retry_not_before=getattr(user_sub, 'retry_not_before', None),
                         )
                         next_retry_str = format_msk(next_retry_at, '%d.%m %H:%M МСК') if next_retry_at else "позже"
-                        user_msg = (
-                            f"Не удалось списать средства (ЮKassa). Повторим попытку {next_retry_str}."
-                            if attempt_num == 1
-                            else f"Не удалось списать средства (ЮKassa). Последняя попытка — {next_retry_str}."
+                        await bot.send_message(
+                            user_id,
+                            subscription_text(
+                                "ui.subscription.retry_failed_1" if attempt_num == 1 else "ui.subscription.retry_failed_2",
+                                "Не удалось списать средства (ЮKassa). Повторим попытку {next_retry}."
+                                if attempt_num == 1
+                                else "Не удалось списать средства (ЮKassa). Последняя попытка — {next_retry}.",
+                                next_retry=next_retry_str,
+                            ),
                         )
-                        await bot.send_message(user_id, user_msg)
                 else:
-                    await bot.send_message(user_id, "Платёж уже обработан.")
+                    await bot.send_message(
+                        user_id,
+                        subscription_text("ui.subscription.payment_processed", "Платёж уже обработан."),
+                    )
 
 
         elif user_sub.payment_provider == 'Robokassa':
@@ -11358,24 +12759,36 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 user_sub.payment_attempt_count += 1
                 user_sub.last_payment_attempt = now
                 await session.commit()
-                await bot.send_message(user_id,
-                                       f"⏳ Запрос на списание отправлен. Ожидайте подтверждения оплаты.")
+                await bot.send_message(
+                    user_id,
+                    subscription_text(
+                        "ui.subscription.robokassa_request_sent",
+                        "⏳ Запрос на списание отправлен. Ожидайте подтверждения оплаты.",
+                    ),
+                )
             elif robokassa_res == 'deactivate':
                 plog.warning(f"АВТОПРОДЛ_ОТКЛ | {user_ref} | причина: deactivate | {plan_to_charge.name}")
                 user_sub.auto_renewal = False
                 user_sub.payment_attempt_count = 0
                 new_payment.status = 'request_deactivated'
                 await session.commit()
-                await bot.send_message(user_id,
-                                       "Не удалось списать средства (Robokassa). Автопродление отключено.\n\nОформите подписку вручную.")
+                await bot.send_message(
+                    user_id,
+                    subscription_text(
+                        "ui.subscription.robokassa_deactivated",
+                        "Не удалось списать средства (Robokassa). Автопродление отключено.\n\nОформите подписку вручную.",
+                    ),
+                )
             elif robokassa_res == 'provider_error':
                 new_payment.status = 'request_provider_error'
                 user_sub.last_payment_attempt = now
                 await session.commit()
                 await bot.send_message(
                     user_id,
-                    "Robokassa временно недоступна. Эта ошибка не засчитана как попытка списания.\n\n"
-                    "Попробуйте снова позже."
+                    subscription_text(
+                        "ui.subscription.robokassa_provider_error",
+                        "Robokassa временно недоступна. Эта ошибка не засчитана как попытка списания.\n\nПопробуйте снова позже.",
+                    )
                 )
             else:
                 attempt_num = user_sub.payment_attempt_count + 1
@@ -11390,7 +12803,10 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                 if attempt_num >= 3:
                     await bot.send_message(
                         user_id,
-                        "Ваша подписка истекла. Не удалось списать средства после 3 попыток — автопродление отключено.\n\nПродлите подписку вручную в меню."
+                        subscription_text(
+                            "ui.subscription.renewal_expired",
+                            "Ваша подписка истекла. Не удалось списать средства после 3 попыток — автопродление отключено.\n\nПродлите подписку вручную в меню.",
+                        )
                     )
                     try:
                         await callback.message.delete()
@@ -11399,11 +12815,20 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
                     return
                 await bot.send_message(
                     user_id,
-                    "Не удалось списать средства (Robokassa). Проверьте состояние карты и попробуйте позже."
+                    subscription_text(
+                        "ui.subscription.robokassa_failed",
+                        "Не удалось списать средства (Robokassa). Проверьте состояние карты и попробуйте позже.",
+                    )
                 )
 
         else:
-            await bot.send_message(user_id, "Провайдер не поддерживает ручное списание.")
+            await bot.send_message(
+                user_id,
+                subscription_text(
+                    "ui.subscription.provider_unsupported",
+                    "Провайдер не поддерживает ручное списание.",
+                ),
+            )
             return
 
     try:
@@ -11415,23 +12840,34 @@ async def handle_sub_retry_now(callback: CallbackQuery, state: FSMContext, bot: 
 
 @router.callback_query(F.data == "sub_enter_promo")
 async def enter_promo_code(callback: CallbackQuery, state: FSMContext):
+    locale = await _get_user_locale(callback.from_user.id)
     await state.set_state(UserStates.awaiting_promo_code)
     await callback.message.edit_text(
-        "Пожалуйста, введите ваш промокод:",
+        translate("ui.promo.prompt", locale, fallback="Пожалуйста, введите ваш промокод:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_sub_info")]
+            [InlineKeyboardButton(
+                text=translate("ui.button.back", locale, fallback="⬅️ Назад"),
+                callback_data="back_to_sub_info",
+            )]
         ])
     )
 
 
 @router.message(UserStates.awaiting_promo_code, F.text)
 async def process_promo_code(message: Message, state: FSMContext, bot: Bot):
+    locale = await _get_user_locale(message.from_user.id)
     if message.text.startswith('/'):
         await state.clear()
         if message.text == "/start":
             await cmd_start(message)
         else:
-            await message.answer("Ввод промокода отменен. Вы можете продолжить общение.")
+            await message.answer(
+                translate(
+                    "ui.promo.cancelled",
+                    locale,
+                    fallback="Ввод промокода отменен. Вы можете продолжить общение.",
+                )
+            )
         return
 
     user_id = message.from_user.id
@@ -11439,7 +12875,10 @@ async def process_promo_code(message: Message, state: FSMContext, bot: Bot):
     now = datetime.utcnow()
 
     back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_sub_info")]
+        [InlineKeyboardButton(
+            text=translate("ui.button.back", locale, fallback="⬅️ Назад"),
+            callback_data="back_to_sub_info",
+        )]
     ])
 
     async with async_session_maker() as session:
@@ -11447,7 +12886,10 @@ async def process_promo_code(message: Message, state: FSMContext, bot: Bot):
                                  options=[selectinload(User.promo_codes), selectinload(User.subscription)])
         if not user:
             await state.clear()
-            await message.answer("Произошла ошибка, не удалось найти ваш профиль.", reply_markup=back_kb)
+            await message.answer(
+                translate("ui.promo.profile_error", locale, fallback="Произошла ошибка, не удалось найти ваш профиль."),
+                reply_markup=back_kb,
+            )
             return
 
         promo_result = await session.execute(
@@ -11460,17 +12902,34 @@ async def process_promo_code(message: Message, state: FSMContext, bot: Bot):
         promo = promo_result.scalar_one_or_none()
 
         if not promo:
-            await message.answer("❌ Промокод не найден, истёк или недействителен. Попробуйте ещё раз или нажмите «Назад».", reply_markup=back_kb)
+            await message.answer(
+                translate(
+                    "ui.promo.invalid",
+                    locale,
+                    fallback="❌ Промокод не найден, истёк или недействителен. Попробуйте ещё раз или нажмите «Назад».",
+                ),
+                reply_markup=back_kb,
+            )
             return
 
         if promo in user.promo_codes:
             await state.clear()
-            await message.answer("❌ Вы уже активировали этот промокод.", reply_markup=back_kb)
+            await message.answer(
+                translate("ui.promo.already_used", locale, fallback="❌ Вы уже активировали этот промокод."),
+                reply_markup=back_kb,
+            )
             return
 
         if promo.discount_percent == 0 and promo.free_days == 0:
             await state.clear()
-            await message.answer("❌ Этот промокод неактивен (0% скидки и 0 дней). Обратитесь к администратору.", reply_markup=back_kb)
+            await message.answer(
+                translate(
+                    "ui.promo.inactive",
+                    locale,
+                    fallback="❌ Этот промокод неактивен (0% скидки и 0 дней). Обратитесь к администратору.",
+                ),
+                reply_markup=back_kb,
+            )
             return
 
         trial_activated = False
@@ -11496,11 +12955,21 @@ async def process_promo_code(message: Message, state: FSMContext, bot: Bot):
                 if promo.discount_percent == 0:
                     await state.clear()
                     await message.answer(
-                        f"ℹ️ Этот промокод даёт пробный период ({promo.free_days} дн.). "
-                        f"Активируйте его после окончания текущей подписки.", reply_markup=back_kb)
+                        translate(
+                            "ui.promo.trial_wait",
+                            locale,
+                            fallback="ℹ️ Этот промокод даёт пробный период ({days} дн.). Активируйте его после окончания текущей подписки.",
+                        ).format(days=promo.free_days),
+                        reply_markup=back_kb,
+                    )
                     return
                 await message.answer(
-                    f"✅ Скидка {promo.discount_percent}% сохранена, но пробный период ({promo.free_days} дн.) нельзя активировать, пока у вас есть другая активная платная подписка.")
+                    translate(
+                        "ui.promo.discount_saved_trial_blocked",
+                        locale,
+                        fallback="✅ Скидка {percent}% сохранена, но пробный период ({days} дн.) нельзя активировать, пока у вас есть другая активная платная подписка.",
+                    ).format(percent=promo.discount_percent, days=promo.free_days)
+                )
             else:
                 user_sub.plan_id = None
                 user_sub.start_date = user_sub.start_date if (
@@ -11561,25 +13030,37 @@ async def process_promo_code(message: Message, state: FSMContext, bot: Bot):
 
             if trial_activated and discount_banked:
                 await message.answer(
-                    f"✅ Вам начислен пробный период: <b>{promo.free_days} дн.</b> (до {end_date_msk_str} МСК).\n\n"
-                    f"🔥 Также вам назначена скидка <b>{promo.discount_percent}%</b>! "
-                    f"Она сохранится для всех автоплатежей, <b>если вы оформите подписку до окончания пробного периода</b>."
+                    translate(
+                        "ui.promo.activated_trial_discount",
+                        locale,
+                        fallback="✅ Вам начислен пробный период: <b>{days} дн.</b> (до {end_date} МСК).\n\n🔥 Также вам назначена скидка <b>{percent}%</b>! Она сохранится для всех автоплатежей, <b>если вы оформите подписку до окончания пробного периода</b>.",
+                    ).format(days=promo.free_days, end_date=end_date_msk_str, percent=promo.discount_percent)
                 )
             elif trial_activated:
                 await message.answer(
-                    f"✅ Пробный период успешно активирован!\n"
-                    f"Вам начислено: <b>{promo.free_days} бесплатных дней</b>.\n"
-                    f"Доступ активен до: {end_date_msk_str} МСК."
+                    translate(
+                        "ui.promo.activated_trial",
+                        locale,
+                        fallback="✅ Пробный период успешно активирован!\nВам начислено: <b>{days} бесплатных дней</b>.\nДоступ активен до: {end_date} МСК.",
+                    ).format(days=promo.free_days, end_date=end_date_msk_str)
                 )
             elif discount_banked:
                 if not is_active_sub:
                     await message.answer(
-                        f"✅ Скидка <b>{promo.discount_percent}%</b> сохранена!\n"
-                        "Она будет автоматически применена при выборе тарифа и всех последующих автоплатежах."
+                        translate(
+                            "ui.promo.saved_discount",
+                            locale,
+                            fallback="✅ Скидка <b>{percent}%</b> сохранена!\nОна будет автоматически применена при выборе тарифа и всех последующих автоплатежах.",
+                        ).format(percent=promo.discount_percent)
                     )
                 else:
                     await message.answer(
-                        f"✅ Скидка <b>{promo.discount_percent}%</b> сохранена! Она будет применена при <b>следующем</b> продлении или смене тарифа.")
+                        translate(
+                            "ui.promo.saved_discount_active",
+                            locale,
+                            fallback="✅ Скидка <b>{percent}%</b> сохранена! Она будет применена при <b>следующем</b> продлении или смене тарифа.",
+                        ).format(percent=promo.discount_percent)
+                    )
 
             if discount_banked and not is_active_sub and not trial_activated:
                 await show_plans_for_subscription(message, state)
@@ -11587,7 +13068,13 @@ async def process_promo_code(message: Message, state: FSMContext, bot: Bot):
                 await _send_subscription_info(user_id, message.chat.id, bot, state)
         else:
             await state.clear()
-            await message.answer("Произошла системная ошибка при активации промокода. Обратитесь в поддержку.")
+            await message.answer(
+                translate(
+                    "ui.promo.activation_error",
+                    locale,
+                    fallback="Произошла системная ошибка при активации промокода. Обратитесь в поддержку.",
+                )
+            )
 
 
 async def show_plans_for_subscription(message_or_callback, state: FSMContext):
@@ -11602,6 +13089,13 @@ async def show_plans_for_subscription(message_or_callback, state: FSMContext):
                 selectinload(User.subscription),
                 selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans)
             ]
+        )
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
         )
         is_admin_user = user_id in OWNER_IDS or (user and user.is_admin)
         plan_conditions = [SubscriptionPlan.is_active == True]
@@ -11647,27 +13141,50 @@ async def show_plans_for_subscription(message_or_callback, state: FSMContext):
     if user_sub:
         global_discount_percent = user_sub.discount_percent
 
-    text = "Выберите подходящий тариф:"
+    text = translate(
+        "ui.subscription.choose_plan_prompt",
+        locale,
+        fallback="Выберите подходящий тариф:",
+    )
 
     if user_sub and user_sub.end_date > now and user_sub.plan_id is not None:
-        text += "\n\n<b>При смене тарифа срок оплаты нового тарифа добавится к текущему (прибавятся неиспользуемые дни).</b>"
+        text += translate(
+            "ui.subscription.switch_notice",
+            locale,
+            fallback="\n\n<b>При смене тарифа срок оплаты нового тарифа добавится к текущему (прибавятся неиспользуемые дни).</b>",
+        )
 
     has_any_discount = global_discount_percent > 0 or any(p.discount_percent > 0 for p in user_promos)
     if has_any_discount:
-        text += f"\n\n<i>У вас есть активные скидки! Они будут применены к подходящим тарифам.</i>"
+        text += translate(
+            "ui.subscription.discount_notice",
+            locale,
+            fallback="\n\n<i>У вас есть активные скидки! Они будут применены к подходящим тарифам.</i>",
+        )
 
     if not eligible_plans:
-        text = "К сожалению, сейчас нет доступных тарифных планов."
+        text = translate(
+            "ui.subscription.no_plans",
+            locale,
+            fallback="К сожалению, сейчас нет доступных тарифных планов.",
+        )
 
     if isinstance(message_or_callback, CallbackQuery):
         await message_or_callback.message.edit_text(text,
                                                     reply_markup=kb.plan_selection_keyboard(eligible_plans,
                                                                                              global_discount_percent,
-                                                                                             user_promos))
+                                                                                             user_promos,
+                                                                                             locale))
     else:
-        await message_or_callback.answer(text, reply_markup=kb.plan_selection_keyboard(eligible_plans,
-                                                                                       global_discount_percent,
-                                                                                       user_promos))
+        await message_or_callback.answer(
+            text,
+            reply_markup=kb.plan_selection_keyboard(
+                eligible_plans,
+                global_discount_percent,
+                user_promos,
+                locale,
+            ),
+        )
 
 
 @router.callback_query(F.data == "sub_select_plan")
@@ -11693,6 +13210,13 @@ async def choose_payment_provider(callback: CallbackQuery, state: FSMContext):
                 selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans)
             ]
         )
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
         user_sub = user.subscription if user else None
         user_promos = user.promo_codes if user else []
 
@@ -11717,13 +13241,24 @@ async def choose_payment_provider(callback: CallbackQuery, state: FSMContext):
     if plan_discount_percent > 0 and not plan.is_trial:
         final_price *= (1 - plan_discount_percent / 100)
 
-    duration_unit_text = "дн." if plan.duration_unit == 'days' else "мес."
+    plan_name = translate(
+        f"plan.{plan.id}.name",
+        locale,
+        fallback=plan.name,
+        source=plan.name,
+    )
+    duration_unit_text = translate(
+        "ui.subscription.days" if plan.duration_unit == "days" else "ui.subscription.months",
+        locale,
+        fallback="дн." if plan.duration_unit == "days" else "мес.",
+    )
+    rubles = translate("ui.subscription.rubles", locale, fallback="руб.")
     text = (
-        f"<b>Тариф:</b> {plan.name} ({plan.duration_value} {duration_unit_text})\n"
-        f"<b>Стоимость:</b> {final_price:.2f} руб.\n"
+        f"{translate('ui.subscription.plan_label', locale, fallback='<b>Тариф:</b>')} {plan_name} ({plan.duration_value} {duration_unit_text})\n"
+        f"{translate('ui.subscription.cost_label', locale, fallback='<b>Стоимость:</b>')} {final_price:.2f} {rubles}\n"
     )
     if plan.description:
-        text += f"{html.escape(plan.description)}\n"
+        text += f"{html.escape(translate(f'plan.{plan.id}.description', locale, fallback=plan.description, source=plan.description))}\n"
     text += "\n"
 
     if plan.is_trial and plan.upgrades_to_plan:
@@ -11751,25 +13286,39 @@ async def choose_payment_provider(callback: CallbackQuery, state: FSMContext):
         if upgrade_plan_discount_percent > 0:
             upgrade_price = upgrade_price * (1 - upgrade_plan_discount_percent / 100)
 
-        upgrade_duration_unit_text = "дн." if upgrade_plan.duration_unit == 'days' else "мес."
+        upgrade_plan_name = translate(
+            f"plan.{upgrade_plan.id}.name",
+            locale,
+            fallback=upgrade_plan.name,
+            source=upgrade_plan.name,
+        )
+        upgrade_duration_unit_text = translate(
+            "ui.subscription.days" if upgrade_plan.duration_unit == "days" else "ui.subscription.months",
+            locale,
+            fallback="дн." if upgrade_plan.duration_unit == "days" else "мес.",
+        )
         if upgrade_plan_allows_renewal:
             text += (
-                f"<b>Далее:</b> {upgrade_price:.2f} руб. / "
+                f"{translate('ui.subscription.next_label', locale, fallback='<b>Далее:</b>')} {upgrade_price:.2f} {rubles} / "
                 f"{upgrade_plan.duration_value} {upgrade_duration_unit_text}\n"
-                f"(автопереход на «{upgrade_plan.name}»)\n\n"
+                f"{translate('ui.subscription.auto_switch_note', locale, fallback='(автопереход на «{plan_name}»)\n\n').format(plan_name=upgrade_plan_name)}"
             )
         else:
             text += (
-                f"<b>После пробного периода:</b> {upgrade_price:.2f} руб. / "
+                f"{translate('ui.subscription.after_trial_label', locale, fallback='<b>После пробного периода:</b>')} {upgrade_price:.2f} {rubles} / "
                 f"{upgrade_plan.duration_value} {upgrade_duration_unit_text}\n"
-                f"(тариф «{upgrade_plan.name}», оформление вручную)\n\n"
+                f"{translate('ui.subscription.manual_plan_note', locale, fallback='(тариф «{plan_name}», оформление вручную)\n\n').format(plan_name=upgrade_plan_name)}"
             )
 
-    text += "Выберите способ оплаты:"
+    text += translate(
+        "ui.subscription.payment_method_prompt",
+        locale,
+        fallback="Выберите способ оплаты:",
+    )
 
     await callback.message.edit_text(
         text,
-        reply_markup=await kb.payment_provider_keyboard(plan_id, final_price)
+        reply_markup=await kb.payment_provider_keyboard(plan_id, final_price, locale)
     )
 
 
@@ -11800,7 +13349,11 @@ async def create_yookassa_invoice(callback: CallbackQuery, state: FSMContext):
         )
         try:
             await callback.message.edit_text(
-                "❌ Не удалось подготовить платёж. Попробуйте ещё раз через несколько минут."
+                translate(
+                    "ui.subscription.yookassa_flow_error",
+                    await _get_user_locale(callback.from_user.id),
+                    fallback="❌ Не удалось подготовить платёж. Попробуйте ещё раз через несколько минут.",
+                )
             )
         except Exception as user_error:
             logging.warning(
@@ -11823,10 +13376,26 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
                 selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans)
             ]
         )
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
     if not plan:
-        await callback.message.edit_text("Тариф не найден.")
+        await callback.message.edit_text(
+            translate("ui.subscription.plan_not_found", locale, fallback="Тариф не найден.")
+        )
         return
+
+    plan_name = translate(
+        f"plan.{plan.id}.name",
+        locale,
+        fallback=plan.name,
+        source=plan.name,
+    )
 
     user_sub = user.subscription if user else None
     user_promos = user.promo_codes if user else []
@@ -11862,7 +13431,12 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
             logger=log,
         )
         await callback.message.edit_text(
-            "❌ Платёжная система временно недоступна. Администратор не настроил ключи API.")
+            translate(
+                "ui.subscription.yookassa_unconfigured",
+                locale,
+                fallback="❌ Платёжная система временно недоступна. Администратор не настроил ключи API.",
+            )
+        )
         return
 
     Configuration.account_id = config.yookassa_shop_id
@@ -11879,7 +13453,11 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
             "return_url": f"https://t.me/{(await callback.bot.get_me()).username}"
         },
         "capture": True,
-        "description": f"Оплата подписки на тариф «{plan.name}»",
+        "description": translate(
+            "ui.payment.subscription_title",
+            locale,
+            fallback=f"Оплата подписки на тариф «{plan_name}»",
+        ).format(plan_name=plan_name),
         "metadata": {
             "user_id": callback.from_user.id,
             "plan_id": plan_id
@@ -11923,7 +13501,11 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
             logger=log,
         )
         await callback.message.edit_text(
-            "❌ Не удалось создать платеж. Похоже, возникла проблема с настройками платежной системы. Мы уже работаем над этим."
+            translate(
+                "ui.subscription.yookassa_auth_error",
+                locale,
+                fallback="❌ Не удалось создать платеж. Похоже, возникла проблема с настройками платежной системы. Мы уже работаем над этим.",
+            )
         )
         return
     except Exception as e:
@@ -11951,7 +13533,12 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
             logger=log,
         )
         await callback.message.edit_text(
-            "❌ Не удалось связаться с платёжным сервисом. Попробуйте ещё раз через несколько минут.")
+            translate(
+                "ui.subscription.payment_service_error",
+                locale,
+                fallback="❌ Не удалось связаться с платёжным сервисом. Попробуйте ещё раз через несколько минут.",
+            )
+        )
         return
 
     try:
@@ -12032,29 +13619,47 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
             sanitize_secret_values(str(log_error)),
         )
 
-    text = "Платёж создан, но не удалось показать ссылку. Обратитесь в поддержку, чтобы не создавать повторный платёж."
+    text = translate(
+        "ui.subscription.payment_created_link_failed",
+        locale,
+        fallback="Платёж создан, но не удалось показать ссылку. Обратитесь в поддержку, чтобы не создавать повторный платёж.",
+    )
     keyboard = None
     try:
         privacy_url = config.privacy_policy_url or "#"
         offer_url = config.offer_agreement_url or "#"
         plan_allows_renewal = getattr(plan, 'allow_auto_renewal', True)
         payment_type_line = (
-            "Регулярная оплата, можно отключить в любой момент"
+            translate(
+                "ui.subscription.payment_recurring",
+                locale,
+                fallback="Регулярная оплата, можно отключить в любой момент",
+            )
             if (plan_allows_renewal or plan.is_trial)
-            else "Разовая оплата"
+            else translate("ui.subscription.payment_one_time", locale, fallback="Разовая оплата")
         )
-        text = (
-            "Ваша ссылка на оплату готова.\n\n"
-            f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>.\n\n"
-            f"<b>Сумма:</b> {price:.2f} руб.\n"
-            f"{payment_type_line}"
+        text = translate(
+            "ui.subscription.payment_link_ready",
+            locale,
+            fallback="Ваша ссылка на оплату готова.\n\nНажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>.\n\n<b>Сумма:</b> {price:.2f} руб.\n{payment_type_line}",
+        ).format(
+            privacy_url=privacy_url,
+            offer_url=offer_url,
+            price=price,
+            payment_type_line=payment_type_line,
         )
         payment_url = payment.confirmation.confirmation_url
         if not payment_url:
             raise ValueError("YooKassa payment confirmation URL is empty")
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", url=payment_url)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sub_pay_{plan_id}_{price}")]
+            [InlineKeyboardButton(
+                text=translate("ui.subscription.payment_provider_yookassa", locale, fallback="💳 Оплатить через ЮKassa"),
+                url=payment_url,
+            )],
+            [InlineKeyboardButton(
+                text=translate("ui.button.back", locale, fallback="⬅️ Назад"),
+                callback_data=f"sub_pay_{plan_id}_{price}",
+            )]
         ])
         await callback.message.edit_text(
             text,
@@ -12147,10 +13752,32 @@ async def create_telegram_pay_invoice(callback: CallbackQuery, state: FSMContext
                 selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans)
             ]
         )
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
     if not plan:
-        await callback.message.edit_text("Тариф не найден.")
+        await callback.message.edit_text(
+            translate("ui.subscription.plan_not_found", locale, fallback="Тариф не найден.")
+        )
         return
+
+    plan_name = translate(
+        f"plan.{plan.id}.name",
+        locale,
+        fallback=plan.name,
+        source=plan.name,
+    )
+    plan_description = translate(
+        f"plan.{plan.id}.description",
+        locale,
+        fallback=plan.description or "",
+        source=plan.description or "",
+    )
 
     user_sub = user.subscription if user else None
     user_promos = user.promo_codes if user else []
@@ -12172,18 +13799,35 @@ async def create_telegram_pay_invoice(callback: CallbackQuery, state: FSMContext
         price *= (1 - discount_percent / 100)
 
     if not config or not config.telegram_pay_token:
-        await callback.message.answer("❌ Оплата через Telegram Pay временно недоступна. Администратор не настроил токен.")
+        await callback.message.answer(
+            translate(
+                "ui.subscription.telegram_pay_unconfigured",
+                locale,
+                fallback="❌ Оплата через Telegram Pay временно недоступна. Администратор не настроил токен.",
+            )
+        )
         return
 
     try:
         await bot.send_invoice(
             chat_id=callback.from_user.id,
-            title=f"Подписка на тариф «{plan.name}»",
-            description=plan.description,
+            title=translate(
+                "ui.payment.subscription_title",
+                locale,
+                fallback=f"Оплата подписки на тариф «{plan_name}»",
+            ).format(plan_name=plan_name),
+            description=plan_description,
             payload=f"sub-plan-{plan_id}-user-{callback.from_user.id}",
             provider_token=config.telegram_pay_token,
             currency="RUB",
-            prices=[LabeledPrice(label=f"Тариф «{plan.name}»", amount=int(price * 100))]
+            prices=[LabeledPrice(
+                label=translate(
+                    "ui.payment.plan_label",
+                    locale,
+                    fallback=f"Тариф «{plan_name}»",
+                ).format(plan_name=plan_name),
+                amount=int(price * 100),
+            )]
         )
     except Exception as e:
         await _safe_notify_admins_about_error(
@@ -12200,12 +13844,17 @@ async def create_telegram_pay_invoice(callback: CallbackQuery, state: FSMContext
             logger=log,
         )
         await callback.message.answer(
-            "❌ Не удалось связаться с платёжным сервисом. Попробуйте ещё раз через несколько минут."
+            translate(
+                "ui.subscription.telegram_pay_error",
+                locale,
+                fallback="❌ Не удалось связаться с платёжным сервисом. Попробуйте ещё раз через несколько минут.",
+            )
         )
 
 
 @router.callback_query(F.data == "sub_cancel_renewal")
 async def cancel_subscription_renewal(callback: CallbackQuery, state: FSMContext):
+    locale = await _get_user_locale(callback.from_user.id)
     user_ref_cr = callback.from_user.first_name or ""
     if callback.from_user.username:
         user_ref_cr += f" (@{callback.from_user.username})"
@@ -12239,7 +13888,10 @@ async def cancel_subscription_renewal(callback: CallbackQuery, state: FSMContext
 
     if result.scalar_one_or_none():
         plog.info(f"ОТМЕНА_АВТОПРОДЛ | {user_ref_cr} | {plan_name_cr} | до {end_date_msk_cr}")
-        await callback.answer("Автопродление подписки отменено.", show_alert=True)
+        await callback.answer(
+            translate("ui.subscription.renewal_cancelled_alert", locale, fallback="Автопродление отменено."),
+            show_alert=True,
+        )
         if notifications_enabled_cr:
             for admin_id in await get_all_admin_ids():
                 try:
@@ -12251,7 +13903,10 @@ async def cancel_subscription_renewal(callback: CallbackQuery, state: FSMContext
                     pass
         await show_subscription_info(callback.message, state)
     else:
-        await callback.answer("Не удалось найти активную подписку.", show_alert=True)
+        await callback.answer(
+            translate("ui.subscription.not_found", locale, fallback="Не удалось найти вашу подписку."),
+            show_alert=True,
+        )
 
 
 @router.callback_query(F.data == "admin_subscriptions")
@@ -12564,7 +14219,7 @@ async def admin_toggle_subscriptions_enabled(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
         config.subscriptions_enabled = not config.subscriptions_enabled
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
         await callback.answer(f"Система подписок {'включена' if config.subscriptions_enabled else 'выключена (бот бесплатный)'}")
         await callback.message.edit_reply_markup(
@@ -12578,7 +14233,7 @@ async def admin_toggle_topics_enabled(callback: CallbackQuery):
         config = await session.get(SubscriptionConfig, 1)
         config.topics_enabled = not config.topics_enabled
         is_enabled = config.topics_enabled
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await callback.answer(f"Темы диалогов {'включены' if is_enabled else 'выключены'}")
     await show_topics_admin_list(callback, 0)
@@ -12667,7 +14322,7 @@ async def process_plan_duration_value(message: Message, state: FSMContext, bot: 
                 duration_unit=data['duration_unit']
             )
             session.add(new_plan)
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
             new_plan_id = new_plan.id
 
         await state.clear()
@@ -12722,7 +14377,7 @@ async def admin_toggle_plan_activity(callback: CallbackQuery, state: FSMContext)
         plan = await session.get(SubscriptionPlan, plan_id)
         if plan:
             plan.is_active = not plan.is_active
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await admin_edit_plan_menu(callback, state)
 
 
@@ -12826,8 +14481,9 @@ async def admin_delete_plan_process(callback: CallbackQuery, state: FSMContext):
             await admin_edit_plan_menu(callback, state)
             return
 
-        await session.execute(delete(SubscriptionPlan).where(SubscriptionPlan.id == plan_id))
-        await session.commit()
+        async with translation_coordination_lock(session):
+            await session.execute(delete(SubscriptionPlan).where(SubscriptionPlan.id == plan_id))
+            await session.commit()
     await callback.answer("Тариф успешно удален.", show_alert=True)
     await admin_plans_list(callback)
 
@@ -13139,6 +14795,14 @@ async def successful_payment_handler(message: Message, bot: Bot, state: FSMConte
         plan = await session.get(SubscriptionPlan, plan_id)
         if not plan:
             return
+        user = await session.get(User, user_id)
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
         if plan.is_trial:
             new_trial_record = TrialUsageHistory(
@@ -13189,7 +14853,20 @@ async def successful_payment_handler(message: Message, bot: Bot, state: FSMConte
 
         await session.commit()
 
-    await bot.send_message(user_id, f"✅ Ваша подписка на тариф «{plan.name}» успешно оформлена!")
+    await bot.send_message(
+        user_id,
+        translate(
+            "notification.purchase_success",
+            locale,
+            fallback="✅ Ваша подписка на тариф «{plan_name}» успешно оформлена!",
+        ).format(plan_name=translate(
+            f"plan.{plan.id}.name",
+            locale,
+            fallback=plan.name,
+            source=plan.name,
+        )),
+        parse_mode="HTML",
+    )
 
     config = await session.get(SubscriptionConfig, 1)
     if config and config.notifications_enabled:
@@ -13274,28 +14951,121 @@ async def process_promo_field_edit(message: Message, state: FSMContext, bot: Bot
 
 @router.message(Command("settings"))
 @router.message(F.text == "⚙️ Настройки")
+@router.message(SettingsButtonFilter())
 async def user_settings_menu(message: Message, state: FSMContext):
     user_id = message.from_user.id
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        locale = await resolve_user_effective_locale(session, user or user_id)
     if not user:
         return
 
-    text = (
-        "⚙️ <b>Настройки</b>\n\n"
-        f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}\n"
-        f"<b>Пол:</b> {'👨 Мужской' if user.gender == 'male' else ('👩 Женский' if user.gender == 'female' else '❓ Не указан')}\n"
-        f"<b>Возраст:</b> {user.age or 'Не указан'}\n"
-        f"<b>Длина ответов:</b> {'📏 Обычный' if getattr(user, 'response_length', 'normal') != 'short' else '📏 Короткий'}\n"
+    await message.answer(
+        _build_user_settings_text(user, locale),
+        reply_markup=kb.user_settings_keyboard(user, locale),
     )
-    await message.answer(text, reply_markup=kb.user_settings_keyboard(user))
+
+
+def _build_user_settings_text(user, locale: str, prefix: str = "") -> str:
+    gender = (
+        translate("ui.settings.male", locale, fallback="👨 Мужской")
+        if user.gender == "male"
+        else (
+            translate("ui.settings.female", locale, fallback="👩 Женский")
+            if user.gender == "female"
+            else translate("ui.settings.gender_unknown", locale, fallback="❓ Не указан")
+        )
+    )
+    response_length = translate(
+        "ui.settings.length_normal" if getattr(user, "response_length", "normal") != "short" else "ui.settings.length_short",
+        locale,
+        fallback="📏 Обычный" if getattr(user, "response_length", "normal") != "short" else "📏 Короткий",
+    )
+    screen = translate(
+        "ui.settings.screen",
+        locale,
+        fallback="⚙️ <b>Настройки</b>\n\n<b>Имя:</b> {name}\n<b>Пол:</b> {gender}\n<b>Возраст:</b> {age}\n<b>Длина ответов:</b> {response_length}\n",
+    )
+    body = screen.format(
+        name=html.escape(user.name or user.first_name or translate("ui.settings.not_specified", locale, fallback="Не указано")),
+        gender=gender,
+        age=html.escape(str(user.age)) if user.age else translate("ui.settings.not_specified", locale, fallback="Не указано"),
+        response_length=response_length,
+    )
+    return f"{prefix}\n\n{body}" if prefix else body
+
+
+async def _get_user_locale(user_id: int) -> str:
+    async with async_session_maker() as session:
+        return await resolve_user_effective_locale(session, user_id)
+
+
+@router.callback_query(F.data == "settings_change_language")
+async def settings_change_language(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        enabled_languages = getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]'
+        locale = await resolve_user_effective_locale(session, callback.from_user.id)
+    await callback.message.edit_text(
+        translate("ui.settings.language_prompt", locale, fallback="Выберите язык:"),
+        reply_markup=kb.language_settings_keyboard(enabled_languages),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settings_select_language:"))
+async def settings_select_language(callback: CallbackQuery):
+    locale = normalize_locale((callback.data or "").split(":", 1)[-1])
+    if locale is None:
+        current_locale = await _get_user_locale(callback.from_user.id)
+        await callback.answer(
+            translate("ui.settings.language_invalid", current_locale, fallback="Недопустимый язык."),
+            show_alert=True,
+        )
+        return
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        enabled_languages = normalize_enabled_languages(
+            getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]'
+        )
+        if locale not in enabled_languages:
+            current_locale = await resolve_user_effective_locale(session, callback.from_user.id)
+            await callback.answer(
+                translate("ui.settings.language_unavailable", current_locale, fallback="Этот язык сейчас недоступен."),
+                show_alert=True,
+            )
+            return
+        user = await session.get(User, callback.from_user.id)
+        if not user:
+            current_locale = await resolve_user_effective_locale(session, callback.from_user.id)
+            await callback.answer(
+                translate("ui.settings.user_not_found", current_locale, fallback="Пользователь не найден."),
+                show_alert=True,
+            )
+            return
+        user.telegram_language_code = locale
+        await session.commit()
+        is_admin_user = bool(user.is_admin or user.id in OWNER_IDS)
+        await refresh_commands_for_user(callback.bot, user.id, is_admin_user)
+    await callback.message.edit_text(
+        translate("ui.settings.language_changed", locale, fallback="✅ Язык изменён."),
+        reply_markup=kb.user_settings_keyboard(user, locale),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "settings_change_name")
 async def settings_change_name_start(callback: CallbackQuery, state: FSMContext):
+    locale = await _get_user_locale(callback.from_user.id)
     await state.set_state(UserStates.awaiting_new_name)
     await state.update_data(is_settings=True, settings_message_id=callback.message.message_id)
-    await callback.message.edit_text("Пожалуйста, введите новое имя, как мне к вам обращаться?")
+    await callback.message.edit_text(
+        translate(
+            "ui.settings.name_prompt",
+            locale,
+            fallback="Пожалуйста, введите новое имя, как мне к вам обращаться?",
+        )
+    )
     await callback.answer()
 
 
@@ -13303,10 +15073,15 @@ async def settings_change_name_start(callback: CallbackQuery, state: FSMContext)
 async def process_new_name(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     user_name = message.text.strip()
+    locale = await _get_user_locale(user_id)
 
-    if len(user_name) > 50 or not user_name or await _is_reserved_user_menu_text(user_name):
+    if len(user_name) > 50 or not user_name or await _is_reserved_user_menu_text(user_name, user_id):
         await message.answer(
-            "Пожалуйста, напишите имя обычным текстом, без команд и кнопок меню."
+            translate(
+                "ui.profile.invalid_name",
+                locale,
+                fallback="Пожалуйста, напишите имя обычным текстом, без команд и кнопок меню.",
+            )
         )
         return
 
@@ -13322,41 +15097,65 @@ async def process_new_name(message: Message, state: FSMContext, bot: Bot):
     if data.get('is_settings'):
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
-        text = (
-            f"✅ Имя изменено на <b>{html.escape(user_name)}</b>\n\n"
-            "⚙️ <b>Настройки</b>\n\n"
-            f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}\n"
-            f"<b>Пол:</b> {'👨 Мужской' if user.gender == 'male' else ('👩 Женский' if user.gender == 'female' else '❓ Не указан')}\n"
-            f"<b>Возраст:</b> {user.age or 'Не указан'}\n"
-            f"<b>Длина ответов:</b> {'📏 Обычный' if getattr(user, 'response_length', 'normal') != 'short' else '📏 Короткий'}\n"
+        text = _build_user_settings_text(
+            user,
+            locale,
+            prefix=translate(
+                "ui.settings.name_changed",
+                locale,
+                fallback="✅ Имя изменено на <b>{name}</b>",
+            ).format(name=html.escape(user_name)),
         )
         settings_msg_id = data.get('settings_message_id')
         if settings_msg_id:
             try:
-                await bot.edit_message_text(text, chat_id=message.chat.id, message_id=settings_msg_id, reply_markup=kb.user_settings_keyboard(user))
+                await bot.edit_message_text(
+                    text,
+                    chat_id=message.chat.id,
+                    message_id=settings_msg_id,
+                    reply_markup=kb.user_settings_keyboard(user, locale),
+                )
             except Exception:
-                await message.answer(text, reply_markup=kb.user_settings_keyboard(user))
+                await message.answer(text, reply_markup=kb.user_settings_keyboard(user, locale))
         else:
-            await message.answer(text, reply_markup=kb.user_settings_keyboard(user))
+            await message.answer(text, reply_markup=kb.user_settings_keyboard(user, locale))
     else:
-        await message.answer(f"Отлично! Теперь я буду называть вас {html.escape(user_name)}. Укажите ваш пол:", reply_markup=kb.gender_selection_keyboard())
+        await message.answer(
+            translate(
+                "ui.profile.name_change_saved",
+                locale,
+                fallback="Отлично! Теперь я буду называть вас {name}. Укажите ваш пол:",
+            ).format(name=html.escape(user_name)),
+            reply_markup=kb.gender_selection_keyboard(locale=locale),
+        )
         await state.update_data(is_name_change=True)
         await state.set_state(UserStates.awaiting_gender)
 
 
 @router.callback_query(F.data == "settings_change_gender")
 async def settings_change_gender(callback: CallbackQuery, state: FSMContext):
+    locale = await _get_user_locale(callback.from_user.id)
     await state.set_state(UserStates.awaiting_gender)
     await state.update_data(is_settings=True)
-    await callback.message.edit_text("Выберите ваш пол:", reply_markup=kb.gender_selection_keyboard())
+    await callback.message.edit_text(
+        translate("ui.settings.gender_prompt", locale, fallback="Выберите ваш пол:"),
+        reply_markup=kb.gender_selection_keyboard(locale=locale),
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data == "settings_change_age")
 async def settings_change_age(callback: CallbackQuery, state: FSMContext):
+    locale = await _get_user_locale(callback.from_user.id)
     await state.set_state(UserStates.awaiting_age)
     await state.update_data(is_settings=True, settings_message_id=callback.message.message_id)
-    await callback.message.edit_text("Введите ваш возраст числом (например, 25):")
+    await callback.message.edit_text(
+        translate(
+            "ui.settings.age_prompt",
+            locale,
+            fallback="Введите ваш возраст числом (например, 25):",
+        )
+    )
     await callback.answer()
 
 
@@ -13366,7 +15165,10 @@ async def settings_toggle_length(callback: CallbackQuery):
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
-            await callback.answer("Пользователь не найден")
+            locale = await resolve_user_effective_locale(session, user_id)
+            await callback.answer(
+                translate("ui.settings.user_not_found", locale, fallback="Пользователь не найден."),
+            )
             return
         new_length = 'short' if getattr(user, 'response_length', 'normal') != 'short' else 'normal'
         stmt = update(User).where(User.id == user_id).values(response_length=new_length)
@@ -13374,17 +15176,23 @@ async def settings_toggle_length(callback: CallbackQuery):
         await session.commit()
         user = await session.get(User, user_id)
 
-    length_text = "📏 Короткий" if new_length == 'short' else "📏 Обычный"
-    text = (
-        f"✅ Длина ответов изменена: {length_text}\n\n"
-        "⚙️ <b>Настройки</b>\n\n"
-        f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}\n"
-        f"<b>Пол:</b> {'👨 Мужской' if user.gender == 'male' else ('👩 Женский' if user.gender == 'female' else '❓ Не указан')}\n"
-        f"<b>Возраст:</b> {user.age or 'Не указан'}\n"
-        f"<b>Длина ответов:</b> {length_text}\n"
+    locale = await _get_user_locale(user_id)
+    length_text = translate(
+        "ui.settings.length_short" if new_length == "short" else "ui.settings.length_normal",
+        locale,
+        fallback="📏 Короткий" if new_length == "short" else "📏 Обычный",
+    )
+    text = _build_user_settings_text(
+        user,
+        locale,
+        prefix=translate(
+            "ui.settings.length_changed",
+            locale,
+            fallback="✅ Длина ответов изменена: {length}",
+        ).format(length=length_text),
     )
     try:
-        await callback.message.edit_text(text, reply_markup=kb.user_settings_keyboard(user))
+        await callback.message.edit_text(text, reply_markup=kb.user_settings_keyboard(user, locale))
     except Exception:
         pass
     await callback.answer()
@@ -13865,7 +15673,7 @@ async def admin_confirm_mailing(callback: CallbackQuery, state: FSMContext):
                 status='pending'
             )
             session.add(new_mailing)
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await callback.message.delete()
@@ -13900,12 +15708,12 @@ async def process_plan_field_edit(message: Message, state: FSMContext, bot: Bot)
         return
 
     async with async_session_maker() as session:
-        await session.execute(
-            update(SubscriptionPlan)
-            .where(SubscriptionPlan.id == plan_id)
-            .values({field: new_value})
-        )
-        await session.commit()
+        plan = await session.get(SubscriptionPlan, plan_id)
+        if plan is None:
+            await message.answer("Тариф не найден.")
+            return
+        setattr(plan, field, new_value)
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await message.delete()
@@ -13940,12 +15748,12 @@ async def process_plan_field_edit_callback(callback: CallbackQuery, state: FSMCo
          return
 
     async with async_session_maker() as session:
-        await session.execute(
-            update(SubscriptionPlan)
-            .where(SubscriptionPlan.id == plan_id)
-            .values({field: new_value})
-        )
-        await session.commit()
+        plan = await session.get(SubscriptionPlan, plan_id)
+        if plan is None:
+            await callback.answer("Тариф не найден.", show_alert=True)
+            return
+        setattr(plan, field, new_value)
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
 
@@ -14131,7 +15939,7 @@ async def admin_toggle_button_visibility(callback: CallbackQuery):
         button = await session.get(Content, button_key)
         if button:
             button.is_visible = not button.is_visible
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await _show_admin_manage_buttons(
         bot=callback.bot,
         chat_id=callback.message.chat.id,
@@ -14156,9 +15964,12 @@ async def admin_process_button_title(message: Message, state: FSMContext, bot: B
 
     if data.get('is_topics_btn'):
         async with async_session_maker() as session:
-            stmt = update(SubscriptionConfig).where(SubscriptionConfig.id == 1).values(topics_btn_name=message.text)
-            await session.execute(stmt)
-            await session.commit()
+            config = await session.get(SubscriptionConfig, 1)
+            if config is None:
+                await message.answer("Настройки не найдены.")
+                return
+            config.topics_btn_name = message.text
+            await commit_readiness_critical_mutation(session)
 
         await state.clear()
         await message.delete()
@@ -14202,9 +16013,10 @@ async def admin_process_button_title(message: Message, state: FSMContext, bot: B
     message_id = data.get('message_id')
 
     async with async_session_maker() as session:
-        stmt = update(Content).where(Content.key == button_key).values(button_title=message.text)
-        await session.execute(stmt)
-        await session.commit()
+        button = await session.get(Content, button_key)
+        if button:
+            button.button_title = message.text
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await message.delete()
@@ -14254,7 +16066,7 @@ async def admin_add_button_title_process(message: Message, state: FSMContext, bo
             sort_order=new_order
         )
         session.add(new_button)
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await message.delete()
@@ -14347,9 +16159,10 @@ async def admin_delete_button_start(callback: CallbackQuery):
 async def admin_delete_button_confirm(callback: CallbackQuery):
     button_key = callback.data.replace("confirm_delete_button_", "")
     async with async_session_maker() as session:
-        await session.execute(delete(ContentMedia).where(ContentMedia.content_key == button_key))
-        await session.execute(delete(Content).where(Content.key == button_key))
-        await session.commit()
+        async with translation_coordination_lock(session):
+            await session.execute(delete(ContentMedia).where(ContentMedia.content_key == button_key))
+            await session.execute(delete(Content).where(Content.key == button_key))
+            await session.commit()
 
     await _show_admin_manage_buttons(
         bot=callback.bot,
@@ -14729,9 +16542,10 @@ async def admin_delete_birthday_template_confirm(callback: CallbackQuery, state:
         ).scalars().all()
 
         if birthday_ids:
-            await session.execute(delete(MailingDeliveryLog).where(MailingDeliveryLog.mailing_id.in_(birthday_ids)))
-            await session.execute(delete(Mailing).where(Mailing.id.in_(birthday_ids)))
-            await session.commit()
+            async with translation_coordination_lock(session):
+                await session.execute(delete(MailingDeliveryLog).where(MailingDeliveryLog.mailing_id.in_(birthday_ids)))
+                await session.execute(delete(Mailing).where(Mailing.id.in_(birthday_ids)))
+                await session.commit()
 
     await state.clear()
     await callback.answer("Шаблон ДР удален.", show_alert=True)
@@ -14749,7 +16563,7 @@ async def admin_toggle_mailing_enabled(callback: CallbackQuery, bot: Bot):
             return
 
         mailing.is_enabled = not mailing.is_enabled
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await admin_mailing_details(callback, bot)
 
@@ -14860,7 +16674,11 @@ async def create_robokassa_invoice(callback: CallbackQuery, state: FSMContext):
         )
         try:
             await callback.message.edit_text(
-                "❌ Не удалось подготовить ссылку на оплату. Попробуйте ещё раз через несколько минут."
+                translate(
+                    "ui.subscription.robokassa_flow_error",
+                    await _get_user_locale(callback.from_user.id),
+                    fallback="❌ Не удалось подготовить ссылку на оплату. Попробуйте ещё раз через несколько минут.",
+                )
             )
         except Exception as user_error:
             logging.warning(
@@ -14883,10 +16701,26 @@ async def _create_robokassa_invoice_impl(callback: CallbackQuery, state: FSMCont
                 selectinload(User.promo_codes).selectinload(PromoCode.applicable_plans)
             ]
         )
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
     if not plan:
-        await callback.message.edit_text("Тариф не найден.")
+        await callback.message.edit_text(
+            translate("ui.subscription.plan_not_found", locale, fallback="Тариф не найден.")
+        )
         return
+
+    plan_name = translate(
+        f"plan.{plan.id}.name",
+        locale,
+        fallback=plan.name,
+        source=plan.name,
+    )
 
     user_sub = user.subscription if user else None
     user_promos = user.promo_codes if user else []
@@ -14931,12 +16765,21 @@ async def _create_robokassa_invoice_impl(callback: CallbackQuery, state: FSMCont
             logger=log,
         )
         await callback.message.edit_text(
-            "❌ Платёжная система Robokassa временно недоступна. Администратор не настроил ключи API.")
+            translate(
+                "ui.subscription.robokassa_unconfigured",
+                locale,
+                fallback="❌ Платёжная система Robokassa временно недоступна. Администратор не настроил ключи API.",
+            )
+        )
         return
 
     if price < 1.0:
         await callback.message.edit_text(
-            "❌ Сумма к оплате меньше 1 руб. — Robokassa не принимает такие платежи. Обратитесь к администратору."
+            translate(
+                "ui.subscription.robokassa_minimum_amount",
+                locale,
+                fallback="❌ Сумма к оплате меньше 1 руб. — Robokassa не принимает такие платежи. Обратитесь к администратору.",
+            )
         )
         return
 
@@ -14957,7 +16800,9 @@ async def _create_robokassa_invoice_impl(callback: CallbackQuery, state: FSMCont
         await session.refresh(new_payment)
         inv_id = new_payment.id
 
-    description = ''.join(c for c in f"Оплата подписки на тариф «{plan.name}»" if ord(c) <= 0xFFFF)
+    description = ''.join(
+        c for c in f"Оплата подписки на тариф «{plan_name}»" if ord(c) <= 0xFFFF
+    )
 
     plan_allows_renewal = getattr(plan, 'allow_auto_renewal', True) if plan else True
 
@@ -14988,25 +16833,37 @@ async def _create_robokassa_invoice_impl(callback: CallbackQuery, state: FSMCont
         consent_line = f"Нажимая «Оплатить», я даю согласие на <a href='{privacy_url}'>обработку персональных данных</a> и принимаю <a href='{offer_url}'>договор оферты</a>."
 
     payment_type_line = (
-        "Регулярная оплата, можно отключить в любой момент"
+        translate(
+            "ui.subscription.payment_recurring",
+            locale,
+            fallback="Регулярная оплата, можно отключить в любой момент",
+        )
         if plan_allows_renewal
-        else "Разовая оплата"
+        else translate("ui.subscription.payment_one_time", locale, fallback="Разовая оплата")
     )
 
-    text = (
-        "Ваша ссылка на оплату готова.\n\n"
-        f"{consent_line}\n\n"
-        f"<b>Сумма:</b> {price:.2f} руб.\n"
-        f"{payment_type_line}\n"
-        f"<b>Счёт действует до:</b> {expires_at_msk}\n\n"
-        "Если срок действия истечёт, по кнопке ниже автоматически откроется новый счёт."
+    text = translate(
+        "ui.subscription.robokassa_payment_link_ready",
+        locale,
+        fallback="Ваша ссылка на оплату готова.\n\n{consent_line}\n\n<b>Сумма:</b> {price:.2f} руб.\n{payment_type_line}\n<b>Счёт действует до:</b> {expires_at}\n\nЕсли срок действия истечёт, по кнопке ниже автоматически откроется новый счёт.",
+    ).format(
+        consent_line=consent_line,
+        price=price,
+        payment_type_line=payment_type_line,
+        expires_at=expires_at_msk,
     )
 
     await callback.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить через Robokassa", url=local_payment_url)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sub_pay_{plan_id}_{price}")]
+            [InlineKeyboardButton(
+                text=translate("ui.subscription.payment_provider_robokassa", locale, fallback="💳 Оплатить через Robokassa"),
+                url=local_payment_url,
+            )],
+            [InlineKeyboardButton(
+                text=translate("ui.button.back", locale, fallback="⬅️ Назад"),
+                callback_data=f"sub_pay_{plan_id}_{price}",
+            )]
         ]),
         disable_web_page_preview=True
     )
@@ -15015,10 +16872,13 @@ async def _create_robokassa_invoice_impl(callback: CallbackQuery, state: FSMCont
 @router.message(F.voice, StateFilter(None))
 async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
+    locale = await _get_user_locale(user_id)
 
     lease = single_flight.try_claim("telegram", user_id)
     if lease is None:
-        await message.answer(AI_BUSY_MESSAGE)
+        await message.answer(
+            translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE)
+        )
         return
 
     try:
@@ -15032,7 +16892,12 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
 
         if transcription_provider == 'None':
             await message.answer(
-                "Извините, но распознавание голосовых сообщений в данный момент отключено администратором.")
+                translate(
+                    "ui.voice.disabled",
+                    locale,
+                    fallback="Извините, но распознавание голосовых сообщений в данный момент отключено администратором.",
+                )
+            )
             return
 
         if message.voice.duration > max_duration_sec:
@@ -15043,12 +16908,17 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 minutes_str = f"{max_duration_minutes:.1f}"
 
             await message.answer(
-                f"К сожалению, слишком длинное голосовое сообщение ({message.voice.duration} сек.).\n"
-                f"Попробуйте ещё раз, максимум до {minutes_str} минут(ы)."
+                translate(
+                    "ui.voice.too_long",
+                    locale,
+                    fallback="К сожалению, слишком длинное голосовое сообщение ({duration} сек.).\nПопробуйте ещё раз, максимум до {minutes} минут(ы).",
+                ).format(duration=message.voice.duration, minutes=minutes_str)
             )
             return
 
-        thinking_msg = await message.answer("🤖 Распознаю ваше голосовое сообщение...")
+        thinking_msg = await message.answer(
+            translate("ui.voice.processing", locale, fallback="🤖 Распознаю ваше голосовое сообщение...")
+        )
 
         try:
             file_info = await bot.get_file(message.voice.file_id)
@@ -15111,7 +16981,12 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 include_traceback=False,
             )
             await thinking_msg.edit_text(
-                "К сожалению, сервис транскрибации временно недоступен из-за технической проблемы. Мы уже работаем над ее решением.")
+                translate(
+                    "ui.voice.balance_error",
+                    locale,
+                    fallback="К сожалению, сервис транскрибации временно недоступен из-за технической проблемы. Мы уже работаем над ее решением.",
+                )
+            )
             return
         except AIServiceError as e:
             provider, model = _resolve_ai_provider_model(ai_config, "transcription")
@@ -15128,7 +17003,11 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 include_traceback=False,
             )
             await thinking_msg.edit_text(
-                "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
+                translate(
+                    "ui.voice.overloaded",
+                    locale,
+                    fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+                )
             )
             return
         except Exception as e:
@@ -15146,7 +17025,12 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 include_traceback=False,
             )
             await thinking_msg.edit_text(
-                "Произошла непредвиденная ошибка при обработке аудио. Попробуйте ещё раз через несколько минут.")
+                translate(
+                    "ui.voice.unexpected_error",
+                    locale,
+                    fallback="Произошла непредвиденная ошибка при обработке аудио. Попробуйте ещё раз через несколько минут.",
+                )
+            )
             return
 
         async with async_session_maker() as session:
@@ -15173,25 +17057,38 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 if not user.subscription or user.subscription.end_date < datetime.utcnow():
                     await thinking_msg.delete()
                     await message.answer(
-                        "Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
+                        translate(
+                            "ui.access.subscription_required",
+                            locale,
+                            fallback="Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
+                        ),
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="Начать пользоваться ботом",
-                                                  callback_data="show_subscription_info_from_chat")]
+                            [InlineKeyboardButton(
+                                text=translate(
+                                    "ui.access.subscription_button",
+                                    locale,
+                                    fallback="Начать пользоваться ботом",
+                                ),
+                                callback_data="show_subscription_info_from_chat",
+                            )]
                         ])
                     )
                     return
 
-            if await _request_profile_onboarding_if_needed(message, state, user, initial_prompt=prompt_text):
+            if await _request_profile_onboarding_if_needed(message, state, user, bot, initial_prompt=prompt_text):
                 return
 
             if not user.accepted_disclaimer:
-                disclaimer_content = await get_content_from_db("disclaimer")
+                disclaimer_content = await get_content_from_db("disclaimer", user_id=user_id)
 
                 if disclaimer_content.get('is_visible', True):
                     await state.set_state(UserStates.awaiting_disclaimer_acceptance)
                     await state.update_data(initial_prompt=prompt_text)
-                    text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                    await message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                    text_to_send = _localized_disclaimer_text(disclaimer_content, locale)
+                    await message.answer(
+                        text_to_send,
+                        reply_markup=kb.confirm_disclaimer_keyboard(await _get_user_locale(user_id)),
+                    )
                     return
                 else:
                     stmt = update(User).where(User.id == user_id).values(accepted_disclaimer=True)
@@ -15779,6 +17676,14 @@ async def reset_client_account_confirm(callback: CallbackQuery):
         await session.execute(delete(DBMessage).where(DBMessage.user_id == user_id))
         await session.execute(delete(UserSubscription).where(UserSubscription.user_id == user_id))
         await session.execute(delete(TrialUsageHistory).where(TrialUsageHistory.user_id == user_id))
+        await session.execute(
+            delete(SubscriptionBenefitGrant).where(
+                or_(
+                    SubscriptionBenefitGrant.beneficiary_user_id == user_id,
+                    SubscriptionBenefitGrant.source_user_id == user_id,
+                )
+            )
+        )
         await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
         await session.execute(delete(TestAttempt).where(TestAttempt.user_id == user_id))
         await session.execute(delete(UserTopicState).where(UserTopicState.user_id == user_id))
@@ -15814,45 +17719,133 @@ def generate_progress_bar(current, total, length=10):
     return f"{bar} {int(percent * 100)}%"
 
 
-async def start_psych_test(message: Message, state: FSMContext, user_id: int):
+def _localized_test_question(question, locale: str):
+    options = []
+    for index, option in enumerate(get_answer_options(question)):
+        options.append(
+            replace(
+                option,
+                text=translate(
+                    f"test_question.{question.id}.option.{index}.text",
+                    locale,
+                    fallback=option.text,
+                    source=option.text,
+                ),
+                button_text=translate(
+                    f"test_question.{question.id}.option.{index}.button_text",
+                    locale,
+                    fallback=option.button_text,
+                    source=option.button_text,
+                ) if option.button_text else None,
+            )
+        )
+    question_text = translate(
+        f"test_question.{question.id}.text",
+        locale,
+        fallback=question.text,
+        source=question.text,
+    )
+    comment = translate(
+        f"test_question.{question.id}.comment",
+        locale,
+        fallback=question.comment or "",
+        source=question.comment or "",
+    )
+    return question_text, comment, options
+
+
+async def _test_locale(session, user_id: int) -> str:
+    user = await session.get(User, user_id)
+    try:
+        config = await session.get(BotGeneralConfig, 1)
+    except OperationalError:
+        config = None
+    return resolve_effective_locale(
+        getattr(user, "telegram_language_code", None),
+        getattr(config, "telegram_default_language", "ru"),
+        bool(getattr(config, "telegram_language_selection_enabled", False)),
+        getattr(config, "telegram_enabled_languages", '["ru"]'),
+    )
+
+
+async def start_psych_test(
+    message: Message,
+    state: FSMContext,
+    user_id: int,
+    deferred_launch_key: str | None = None,
+):
     async with async_session_maker() as session:
         questions_result = await session.execute(
             select(TestQuestion).order_by(TestQuestion.sort_order.asc())
         )
         questions = questions_result.scalars().all()
+        locale = await _test_locale(session, user_id)
 
         if not questions:
-            await message.answer("Ошибка: Вопросы теста не загружены. Обратитесь к администратору.")
-            return
+            await message.answer(
+                translate(
+                    "ui.test.questions_missing",
+                    locale,
+                    fallback="Ошибка: Вопросы теста не загружены. Обратитесь к администратору.",
+                )
+            )
+            return False
 
-        await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
         user = await session.get(User, user_id)
-        new_session = TestSession(
-            user_id=user_id,
-            current_question_index=0,
-            answers="[]",
-            invocation_topic_id=user.current_topic_id if user else None,
-            invocation_dialogue_id=user.current_dialogue_id if user else 1,
-            invocation_platform="telegram",
-            question_message_id=None,
+        existing_session = await session.get(TestSession, user_id)
+        same_deferred_session = bool(
+            deferred_launch_key
+            and existing_session
+            and existing_session.deferred_launch_key == deferred_launch_key
         )
-        session.add(new_session)
+        if not same_deferred_session:
+            await session.execute(delete(TestSession).where(TestSession.user_id == user_id))
+            session.add(
+                TestSession(
+                    user_id=user_id,
+                    current_question_index=0,
+                    answers="[]",
+                    invocation_topic_id=user.current_topic_id if user else None,
+                    invocation_dialogue_id=user.current_dialogue_id if user else 1,
+                    invocation_platform="telegram",
+                    question_message_id=None,
+                    deferred_launch_key=deferred_launch_key,
+                )
+            )
+        if deferred_launch_key:
+            await mark_start_intent_completed(session, user_id)
         await session.commit()
 
+    if same_deferred_session and existing_session and existing_session.is_finished:
+        await state.clear()
+        return True
+
     await state.set_state(UserStates.in_test)
-    await send_next_question(message, user_id, state, None)
+    if not same_deferred_session or not existing_session or not existing_session.is_finished:
+        await send_next_question(message, user_id, state, None)
+    return True
 
 
 async def _process_universal_test_answer(message: Message, user_id: int, state: FSMContext, bot: Bot, callback_data: str):
+    locale = await _get_user_locale(user_id)
     async with async_session_maker() as session:
         test_session = await session.get(TestSession, user_id, with_for_update=True)
         if not test_session or test_session.is_finished:
-            await message.answer("Эта сессия уже завершена или не существует.")
+            await state.clear()
+            await message.answer(
+                translate(
+                    "ui.test.session_finished",
+                    locale,
+                    fallback="Эта сессия уже завершена или не существует.",
+                )
+            )
             return
 
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
         if test_session.current_question_index >= len(questions):
-            await message.answer("Вопросы теста уже закончились.")
+            await message.answer(
+                translate("ui.test.questions_finished", locale, fallback="Вопросы теста уже закончились.")
+            )
             return
 
         question_index = test_session.current_question_index
@@ -15862,7 +17855,15 @@ async def _process_universal_test_answer(message: Message, user_id: int, state: 
             try:
                 answer_record = make_option_answer_record(question, question_index, callback_data)
             except ValueError as exc:
-                await message.answer(str(exc))
+                error_text = str(exc)
+                error_key = {
+                    "Этот вопрос уже закрыт. Ответьте на текущий вопрос.": "ui.test.closed",
+                    "Такого варианта ответа нет.": "ui.test.invalid_option",
+                    "Некорректный вариант ответа.": "ui.test.invalid_callback",
+                }.get(error_text)
+                await message.answer(
+                    translate(error_key, locale, fallback=error_text) if error_key else error_text
+                )
                 return
         else:
             answer_text = callback_data.rsplit("_", 1)[1]
@@ -15885,7 +17886,9 @@ async def _process_universal_test_answer(message: Message, user_id: int, state: 
     if next_index < total_questions:
         await send_next_question(message, user_id, state, bot)
     else:
-        loading_msg = await message.answer("🤖 Спасибо! Анализирую ответы...")
+        loading_msg = await message.answer(
+            translate("ui.test.answer_loading", locale, fallback="🤖 Спасибо! Анализирую ответы...")
+        )
         await finish_test_generation(loading_msg, user_id, answers, questions, state)
 
 
@@ -15900,9 +17903,16 @@ async def process_test_answer(callback: CallbackQuery, state: FSMContext, bot: B
 @router.callback_query(F.data == "cancel_test")
 async def process_cancel_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear()
-    await callback.answer("❌ Тест прерван")
+    locale = await _get_user_locale(callback.from_user.id)
+    await callback.answer(
+        translate("ui.test.cancelled_alert", locale, fallback="❌ Тест прерван")
+    )
     await callback.message.answer(
-        "Тестирование прервано. Возвращаемся в главное меню.",
+        translate(
+            "ui.test.cancelled",
+            locale,
+            fallback="Тестирование прервано. Возвращаемся в главное меню.",
+        ),
         reply_markup=await kb.main_client_keyboard(callback.from_user.id)
     )
     try:
@@ -15915,6 +17925,7 @@ async def process_cancel_test(callback: CallbackQuery, state: FSMContext, bot: B
 async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: Bot):
     gender_code = callback.data.split("_")[-1]
     user_id = callback.from_user.id
+    locale = await _get_user_locale(user_id)
 
     async with async_session_maker() as session:
         stmt = update(User).where(User.id == user_id).values(gender=gender_code)
@@ -15925,11 +17936,20 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
     data = await state.get_data()
     await callback.answer()
 
-    gender_label = "👨 Мужской" if gender_code == "male" else "👩 Женский"
+    gender_label = translate(
+        "ui.settings.male" if gender_code == "male" else "ui.settings.female",
+        locale,
+        fallback="👨 Мужской" if gender_code == "male" else "👩 Женский",
+    )
+    selected_gender_text = translate(
+        "ui.profile.gender_selected",
+        locale,
+        fallback="Пол: {gender} ✅",
+    ).format(gender=gender_label)
 
     if data.get("profile_flow"):
         try:
-            await callback.message.edit_text(f"Пол: {gender_label} ✅")
+            await callback.message.edit_text(selected_gender_text)
         except Exception:
             pass
         await _continue_profile_onboarding(
@@ -15945,16 +17965,17 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
         await state.clear()
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
-        text = (
-            f"✅ Пол изменён: {gender_label}\n\n"
-            "⚙️ <b>Настройки</b>\n\n"
-            f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}\n"
-            f"<b>Пол:</b> {'👨 Мужской' if user.gender == 'male' else ('👩 Женский' if user.gender == 'female' else '❓ Не указан')}\n"
-            f"<b>Возраст:</b> {user.age or 'Не указан'}\n"
-            f"<b>Длина ответов:</b> {'📏 Обычный' if getattr(user, 'response_length', 'normal') != 'short' else '📏 Короткий'}\n"
+        text = _build_user_settings_text(
+            user,
+            locale,
+            prefix=translate(
+                "ui.settings.gender_changed",
+                locale,
+                fallback="✅ Пол изменён: {gender}",
+            ).format(gender=gender_label),
         )
         try:
-            await callback.message.edit_text(text, reply_markup=kb.user_settings_keyboard(user))
+            await callback.message.edit_text(text, reply_markup=kb.user_settings_keyboard(user, locale))
         except Exception:
             pass
         return
@@ -15962,7 +17983,7 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
     if data.get('is_name_change'):
         await state.clear()
         try:
-            await callback.message.edit_text(f"Пол: {gender_label} ✅")
+            await callback.message.edit_text(selected_gender_text)
         except Exception:
             pass
         return
@@ -15970,17 +17991,17 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
     if data.get('is_onboarding'):
         prompt_text = data.get('initial_prompt')
         try:
-            await callback.message.edit_text(f"Пол: {gender_label} ✅")
+            await callback.message.edit_text(selected_gender_text)
         except Exception:
             pass
 
         if not user.accepted_disclaimer:
-            disclaimer_content = await get_content_from_db("disclaimer")
+            disclaimer_content = await get_content_from_db("disclaimer", user_id=user_id)
             if disclaimer_content.get('is_visible', True):
                 await state.set_state(UserStates.awaiting_disclaimer_acceptance)
                 await state.update_data(**data)
-                text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                await callback.message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                text_to_send = _localized_disclaimer_text(disclaimer_content, locale)
+                await callback.message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard(locale))
                 return
             else:
                 async with async_session_maker() as session:
@@ -15996,7 +18017,7 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
         if prompt_text:
             lease = single_flight.try_claim("telegram", user_id)
             if lease is None:
-                await callback.message.answer(AI_BUSY_MESSAGE)
+                await callback.message.answer(translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE))
                 return
             try:
                 await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
@@ -16005,7 +18026,13 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
         return
 
     await state.set_state(UserStates.awaiting_age)
-    await callback.message.answer("А перед началом скажи: сколько тебе лет?")
+    await callback.message.answer(
+        translate(
+            "ui.profile.age_prompt_before_start",
+            locale,
+            fallback="А перед началом скажи: сколько тебе лет?",
+        )
+    )
 
 
 async def send_next_question(message: Message, user_id: int, state: FSMContext, bot: Bot):
@@ -16013,13 +18040,32 @@ async def send_next_question(message: Message, user_id: int, state: FSMContext, 
         test_session = await session.get(TestSession, user_id)
 
         if not test_session:
-            await message.answer("Ошибка: сессия теста не найдена. Попробуйте начать заново: /test")
+            await state.clear()
+            locale = await _test_locale(session, user_id)
+            await message.answer(
+                translate(
+                    "ui.test.session_missing",
+                    locale,
+                    fallback="Ошибка: сессия теста не найдена. Попробуйте начать заново: /test",
+                )
+            )
             return
 
         stmt = select(TestQuestion).order_by(TestQuestion.sort_order.asc())
         result = await session.execute(stmt)
         questions = result.scalars().all()
         config = await session.get(TestConfig, 1)
+        user = await session.get(User, user_id)
+        try:
+            general_config = await session.get(BotGeneralConfig, 1)
+        except OperationalError:
+            general_config = None
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
     total_count = len(questions)
     current_index = test_session.current_question_index
@@ -16030,9 +18076,37 @@ async def send_next_question(message: Message, user_id: int, state: FSMContext, 
         return
 
     question = questions[current_index]
-    options = get_answer_options(question)
-    text = build_question_text(question, current_index, total_count, getattr(config, 'show_progress', True) if config else True)
-    reply_markup = kb.universal_test_answer_keyboard(options, question_buttons_are_horizontal(question), current_index)
+    question_text, comment, options = _localized_test_question(question, locale)
+    text = build_question_text(
+        question,
+        current_index,
+        total_count,
+        getattr(config, 'show_progress', True) if config else True,
+        question_text=question_text,
+        comment=comment,
+        answer_options=options,
+        question_heading=translate(
+            "ui.test.question_heading",
+            locale,
+            fallback="<b>Вопрос {current} из {total}</b>",
+        ),
+        free_text_hint=translate(
+            "ui.test.free_text_hint",
+            locale,
+            fallback="Напишите свой ответ или выберите из предложенных ниже.",
+        ),
+        text_answer_hint=translate(
+            "ui.test.text_answer_hint",
+            locale,
+            fallback="Напишите ответ сообщением.",
+        ),
+    )
+    reply_markup = kb.universal_test_answer_keyboard(
+        options,
+        question_buttons_are_horizontal(question),
+        current_index,
+        exit_text=translate("ui.test.exit", locale, fallback="❌ Выйти из теста"),
+    )
     question_message = await message.answer(text, reply_markup=reply_markup)
     async with async_session_maker() as session:
         await session.execute(
@@ -16046,15 +18120,25 @@ async def send_next_question(message: Message, user_id: int, state: FSMContext, 
 @router.message(UserStates.in_test, F.text)
 async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
+    locale = await _get_user_locale(user_id)
     answer_text = message.text.strip()
     if not answer_text:
-        await message.answer("Пожалуйста, напишите ответ текстом.")
+        await message.answer(
+            translate("ui.test.invalid_text_answer", locale, fallback="Пожалуйста, напишите ответ текстом.")
+        )
         return
 
     async with async_session_maker() as session:
         test_session = await session.get(TestSession, user_id, with_for_update=True)
         if not test_session or test_session.is_finished:
-            await message.answer("Эта сессия уже завершена или не существует.")
+            await state.clear()
+            await message.answer(
+                translate(
+                    "ui.test.session_finished",
+                    locale,
+                    fallback="Эта сессия уже завершена или не существует.",
+                )
+            )
             return
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
         question_index = test_session.current_question_index
@@ -16065,7 +18149,14 @@ async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot
         try:
             answer_record = make_text_answer_record(question, question_index, answer_text)
         except ValueError as exc:
-            await message.answer(str(exc))
+            error_text = str(exc)
+            error_key = {
+                "Пожалуйста, напишите ответ текстом.": "ui.test.text_required",
+                "Пожалуйста, выберите один из вариантов ниже.": "ui.test.choose_option",
+            }.get(error_text)
+            await message.answer(
+                translate(error_key, locale, fallback=error_text) if error_key else error_text
+            )
             return
 
         answers = parse_answers(test_session.answers)
@@ -16089,22 +18180,36 @@ async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot
     if next_index < len(questions):
         await send_next_question(message, user_id, state, bot)
     else:
-        loading_msg = await message.answer("🤖 Спасибо! Анализирую ответы...")
+        loading_msg = await message.answer(
+            translate("ui.test.answer_loading", locale, fallback="🤖 Спасибо! Анализирую ответы...")
+        )
         await finish_test_generation(loading_msg, user_id, answers, questions, state)
 
 
 @router.message(UserStates.awaiting_age)
 async def process_test_age(message: Message, state: FSMContext, bot: Bot):
+    user_id = message.from_user.id
+    locale = await _get_user_locale(user_id)
     if not message.text or not message.text.strip().isdigit():
-        await message.answer("Пожалуйста, введите возраст числом (например, 25).")
+        await message.answer(
+            translate(
+                "ui.profile.invalid_age",
+                locale,
+                fallback="Пожалуйста, введите корректный возраст числом.",
+            )
+        )
         return
 
     age = int(message.text.strip())
     if age < 1 or age > 120:
-        await message.answer("Пожалуйста, введите реальный возраст.")
+        await message.answer(
+            translate(
+                "ui.profile.invalid_age",
+                locale,
+                fallback="Пожалуйста, введите корректный возраст числом.",
+            )
+        )
         return
-
-    user_id = message.from_user.id
 
     data = await state.get_data()
 
@@ -16129,22 +18234,28 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         await message.delete()
 
-        text = (
-            f"✅ Возраст установлен: {age}\n\n"
-            "⚙️ <b>Настройки</b>\n\n"
-            f"<b>Имя:</b> {html.escape(user.name or user.first_name or 'Не указано')}\n"
-            f"<b>Пол:</b> {'👨 Мужской' if user.gender == 'male' else ('👩 Женский' if user.gender == 'female' else '❓ Не указан')}\n"
-            f"<b>Возраст:</b> {user.age or 'Не указан'}\n"
-            f"<b>Длина ответов:</b> {'📏 Обычный' if getattr(user, 'response_length', 'normal') != 'short' else '📏 Короткий'}\n"
+        text = _build_user_settings_text(
+            user,
+            locale,
+            prefix=translate(
+                "ui.settings.age_changed",
+                locale,
+                fallback="✅ Возраст установлен: {age}",
+            ).format(age=age),
         )
         settings_msg_id = data.get('settings_message_id')
         if settings_msg_id:
             try:
-                await bot.edit_message_text(text, chat_id=message.chat.id, message_id=settings_msg_id, reply_markup=kb.user_settings_keyboard(user))
+                await bot.edit_message_text(
+                    text,
+                    chat_id=message.chat.id,
+                    message_id=settings_msg_id,
+                    reply_markup=kb.user_settings_keyboard(user, locale),
+                )
             except Exception:
-                await message.answer(text, reply_markup=kb.user_settings_keyboard(user))
+                await message.answer(text, reply_markup=kb.user_settings_keyboard(user, locale))
         else:
-            await message.answer(text, reply_markup=kb.user_settings_keyboard(user))
+            await message.answer(text, reply_markup=kb.user_settings_keyboard(user, locale))
         return
 
     async with async_session_maker() as session:
@@ -16197,6 +18308,13 @@ async def finish_test_generation(
         user_age = user.age or "Не указан"
         user_gender_raw = user.gender or "unknown"
         user_gender_str = "Женский" if user_gender_raw == 'female' else "Мужской" if user_gender_raw == 'male' else "Не определен"
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
         test_session = await session.get(TestSession, user_id)
         dialogue_id = getattr(test_session, "invocation_dialogue_id", None) or user.current_dialogue_id
@@ -16315,7 +18433,11 @@ async def finish_test_generation(
             )
     except Exception:
         logging.exception("Universal test interpretation failed")
-        interpretation_text = preliminary_interpretation or "Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже."
+        interpretation_text = preliminary_interpretation or translate(
+            "ui.test.interpretation_unavailable",
+            locale,
+            fallback="Интерпретация результата сейчас недоступна. Попробуйте открыть результат позже.",
+        )
 
     visible_interpretation, interpretation_buttons = extract_response_buttons(interpretation_text)
     html_story = markdown_to_html(visible_interpretation or ("Выберите действие:" if interpretation_buttons else ""))
@@ -16356,7 +18478,7 @@ async def finish_test_generation(
     presentation = await _prepare_telegram_response_buttons(user_id, interpretation_buttons)
     reply_markup = presentation.inline_markup
     if secret_test_enabled:
-        case_markup = kb.case_study_confirmation_keyboard()
+        case_markup = kb.case_study_confirmation_keyboard(locale)
         reply_markup = _merge_telegram_inline_markups(reply_markup, case_markup)
 
     await message.edit_text(html_story, reply_markup=reply_markup)
@@ -16381,11 +18503,23 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
         dialogue_id = user.current_dialogue_id
         topic_id = user.current_topic_id
         user_name = user.name if user.name else "Друг"
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
         content_obj = await session.get(Content, "test_results", options=[selectinload(Content.media)])
 
     if content_obj:
-        text_content = content_obj.text_content
+        text_content = translate(
+            "content.test_results.text_content",
+            locale,
+            fallback=content_obj.text_content or "",
+            source=content_obj.text_content or "",
+        )
         media_files = content_obj.media
         content_order = content_obj.content_order
 
@@ -16437,16 +18571,32 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
         if not secret_test_enabled:
             return
         secret_test_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔐 Пройти секретный тест", callback_data="start_secret_test")],
-            [InlineKeyboardButton(text="Сразу на марафон 🚀", url=marathon_url)]
+            [InlineKeyboardButton(
+                text=translate("ui.secret.start_button", locale, fallback="🔐 Пройти секретный тест"),
+                callback_data="start_secret_test",
+            )],
+            [InlineKeyboardButton(
+                text=translate("ui.secret.marathon_button", locale, fallback="Сразу на марафон 🚀"),
+                url=marathon_url,
+            )]
         ])
         await callback.message.answer(
-            "Готовы копнуть глубже и получить личный разбор от меня?",
+            translate(
+                "ui.secret.deep_prompt",
+                locale,
+                fallback="Готовы копнуть глубже и получить личный разбор от меня?",
+            ),
             reply_markup=secret_test_kb
         )
         return
 
-    loading_msg = await callback.message.answer("⏳ Генерирую подробную расшифровку и план действий...")
+    loading_msg = await callback.message.answer(
+        translate(
+            "ui.secret.generating",
+            locale,
+            fallback="⏳ Генерирую подробную расшифровку и план действий...",
+        )
+    )
 
     total_score = 0
     try:
@@ -16534,12 +18684,22 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
 
     if secret_test_enabled:
         secret_test_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔐 Пройти секретный тест", callback_data="start_secret_test")],
-            [InlineKeyboardButton(text="Сразу на марафон 🚀", url=marathon_url)]
+            [InlineKeyboardButton(
+                text=translate("ui.secret.start_button", locale, fallback="🔐 Пройти секретный тест"),
+                callback_data="start_secret_test",
+            )],
+            [InlineKeyboardButton(
+                text=translate("ui.secret.marathon_button", locale, fallback="Сразу на марафон 🚀"),
+                url=marathon_url,
+            )]
         ])
 
         await callback.message.answer(
-            "Готовы копнуть глубже и получить личный разбор от меня?",
+            translate(
+                "ui.secret.deep_prompt",
+                locale,
+                fallback="Готовы копнуть глубже и получить личный разбор от меня?",
+            ),
             reply_markup=secret_test_kb
         )
 
@@ -16549,14 +18709,37 @@ async def start_secret_test_handler(callback: CallbackQuery, state: FSMContext):
     async with async_session_maker() as session:
         questions = (
             await session.execute(select(SecretTestQuestion).order_by(SecretTestQuestion.sort_order))).scalars().all()
+        user = await session.get(User, callback.from_user.id)
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
     if not questions:
-        questions_text = "Вопросы еще не добавлены администратором."
+        questions_text = translate(
+            "ui.secret.not_added",
+            locale,
+            fallback="Вопросы еще не добавлены администратором.",
+        )
     else:
-        questions_text = "<b>🔐 Секретный блок вопросов</b>\n\nОтветь на них максимально честно.\n\n"
+        questions_text = (
+            translate("ui.secret.heading", locale, fallback="<b>🔐 Секретный блок вопросов</b>")
+            + translate(
+                "ui.secret.instructions",
+                locale,
+                fallback="Ответь на них максимально честно.\n\n",
+            )
+        )
         for i, q in enumerate(questions):
-            questions_text += f"{i + 1}️⃣ <i>{q.text}</i>\n\n"
-        questions_text += "👇 <b>Напиши ответы одним сообщением ниже.</b>"
+            questions_text += f"{i + 1}️⃣ <i>{translate(f'secret_test_question.{q.id}.text', locale, fallback=q.text, source=q.text)}</i>\n\n"
+        questions_text += translate(
+            "ui.secret.prompt",
+            locale,
+            fallback="👇 <b>Напиши ответы одним сообщением ниже.</b>",
+        )
 
     await callback.message.edit_text(questions_text)
     await state.set_state(UserStates.secret_test_answering)
@@ -16564,6 +18747,12 @@ async def start_secret_test_handler(callback: CallbackQuery, state: FSMContext):
 
 @router.message(UserStates.secret_test_answering, F.text)
 async def process_secret_answers(message: Message, state: FSMContext):
+    locale = await _get_user_locale(message.from_user.id)
+    if not message.text.strip():
+        await message.answer(
+            translate("ui.secret.empty_answer", locale, fallback="Пожалуйста, напишите ответы.")
+        )
+        return
     async with async_session_maker() as session:
         stmt = update(TestSession).where(TestSession.user_id == message.from_user.id).values(secret_answers=message.text)
         await session.execute(stmt)
@@ -16572,23 +18761,42 @@ async def process_secret_answers(message: Message, state: FSMContext):
 
         config = await session.get(TestConfig, 1)
         marathon_url = config.marathon_url
+        user = await session.get(User, message.from_user.id)
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru"),
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
+            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+        )
 
         content_obj = await session.get(Content, "secret_test_outro", options=[selectinload(Content.media)])
 
-        final_text = "Спасибо за ответы!"
+        final_text = translate("ui.secret.thanks", locale, fallback="Спасибо за ответы!")
         media_files = []
         content_order = 'media_top'
 
         if content_obj:
-            final_text = content_obj.text_content or final_text
+            final_text = translate(
+                "content.secret_test_outro.text_content",
+                locale,
+                fallback=content_obj.text_content or final_text,
+                source=content_obj.text_content or "",
+            ) or final_text
             content_order = content_obj.content_order
             media_files = [
                 {'type': m.file_type, 'file_id': m.file_id} for m in content_obj.media
             ]
 
     final_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 Программа марафона", url=marathon_url)],
-        [InlineKeyboardButton(text="🗣 Продолжить общение", callback_data="continue_dialogue_after_test")]
+        [InlineKeyboardButton(
+            text=translate("ui.secret.program", locale, fallback="🔥 Программа марафона"),
+            url=marathon_url,
+        )],
+        [InlineKeyboardButton(
+            text=translate("ui.secret.continue", locale, fallback="🗣 Продолжить общение"),
+            callback_data="continue_dialogue_after_test",
+        )]
     ])
 
     html_text = markdown_to_html(final_text)
@@ -16638,8 +18846,15 @@ async def process_secret_answers(message: Message, state: FSMContext):
 @router.callback_query(F.data == "continue_dialogue_after_test")
 async def continue_dialogue_handler(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    locale = await _get_user_locale(callback.from_user.id)
     await callback.answer()
-    await callback.message.answer("Я здесь! Мы можем обсудить твои результаты или поговорить на любую другую тему. Слушаю тебя.")
+    await callback.message.answer(
+        translate(
+            "ui.secret.continue_message",
+            locale,
+            fallback="Я здесь! Мы можем обсудить твои результаты или поговорить на любую другую тему. Слушаю тебя.",
+        )
+    )
 
 
 @router.callback_query(F.data == "admin_upload_questions")
@@ -16767,7 +18982,7 @@ async def admin_process_questions_file(message: Message, state: FSMContext, bot:
                 session.add(config)
             config.formulas_json = json_dumps(formulas_data) if formulas_data else None
             config.formulas_enabled = bool(formulas_data)
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
 
         formula_text = f"\nФормул: {len(formulas_data)}" if formulas_data else ""
         await message.answer(f"✅ Успешно загружено {len(questions_data)} вопросов!{formula_text}")
@@ -16906,6 +19121,11 @@ async def get_ai_response_direct(
             topic_id=active_topic_id,
             minutes_since_last_visit=minutes_since_last_visit,
             minutes_since_last_message=minutes_since_last_message,
+            preferred_response_locale=await resolve_user_effective_locale(
+                session,
+                user,
+                platform="telegram",
+            ),
         )
 
         fake_history = [DBMessage(
@@ -16976,19 +19196,37 @@ async def get_ai_response_direct(
 
 @router.message(Command("test"))
 @router.message(TestButtonFilter())
-async def cmd_start_test(message: Message, state: FSMContext, bot: Bot):
+async def cmd_start_test(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    deferred_launch_key: str | None = None,
+):
     user_id = message.from_user.id
+    locale = await _get_user_locale(user_id)
     async with async_session_maker() as session:
         config = await session.get(TestConfig, 1)
         if not config or not config.is_enabled:
             if not await is_admin(user_id):
-                await message.answer("⚠️ Тестирование в данный момент отключено.")
-                return
+                await message.answer(
+                    translate(
+                        "ui.test.disabled",
+                        locale,
+                        fallback="⚠️ Тестирование в данный момент отключено.",
+                    )
+                )
+                return False
 
         questions_exist = await session.scalar(select(func.count(TestQuestion.id)))
         if not questions_exist:
-            await message.answer("⚠️ Тест временно недоступен: вопросы еще не загружены.")
-            return
+            await message.answer(
+                translate(
+                    "ui.test.unavailable",
+                    locale,
+                    fallback="⚠️ Тест временно недоступен: вопросы еще не загружены.",
+                )
+            )
+            return False
 
         user = await session.get(User, user_id)
 
@@ -16996,12 +19234,14 @@ async def cmd_start_test(message: Message, state: FSMContext, bot: Bot):
         message,
         state,
         user,
+        bot,
         resume_test=True,
+        resume_test_launch_key=deferred_launch_key,
     ):
-        return
+        return False
 
-    await _send_configured_test_intro(bot, message.chat.id)
-    await start_psych_test(message, state, user_id)
+    await _send_configured_test_intro(bot, message.chat.id, user_id)
+    return await start_psych_test(message, state, user_id, deferred_launch_key=deferred_launch_key)
 
 
 @router.callback_query(F.data == "admin_test_menu")
@@ -17037,7 +19277,7 @@ async def admin_test_toggle_status(callback: CallbackQuery):
         if btn_content:
             btn_content.is_visible = new_status
 
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await admin_test_menu(callback)
     await callback.answer()
@@ -17110,6 +19350,252 @@ async def admin_general_settings(callback: CallbackQuery, state: FSMContext | No
     )
 
 
+async def _admin_language_config_and_readiness():
+    async with async_session_maker() as session:
+        async with translation_coordination_lock(session):
+            config = await session.get(BotGeneralConfig, 1)
+            if config is None:
+                config = BotGeneralConfig(id=1)
+                session.add(config)
+                await session.flush()
+            registry = await build_translation_registry(session)
+            readiness = await audit_translation_readiness(
+                session,
+                registry,
+                locales=("en", "pt"),
+            )
+            return config, readiness
+
+
+def _language_readiness_summary(readiness, locale: str) -> str:
+    report = readiness.get(locale, {})
+    missing = len(report.get("missing", []))
+    stale = len(report.get("stale", []))
+    if missing == 0 and stale == 0:
+        return "готов"
+    return f"не готов: пропущено {missing}, устарело {stale}"
+
+
+@router.callback_query(F.data == "admin_language_settings")
+async def admin_language_settings(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    config, readiness = await _admin_language_config_and_readiness()
+    enabled = normalize_enabled_languages(config.telegram_enabled_languages)
+    default_locale = normalize_locale(config.telegram_default_language) or "ru"
+    text = (
+        "🌐 <b>Языки Telegram</b>\n\n"
+        f"Язык по умолчанию: <b>{LOCALE_LABELS[default_locale]}</b>\n"
+        f"Выбор языка пользователем: <b>{'включён' if config.telegram_language_selection_enabled else 'выключен'}</b>\n"
+        f"Включены: <b>{', '.join(LOCALE_LABELS[locale] for locale in enabled)}</b>\n\n"
+        f"EN: {_language_readiness_summary(readiness, 'en')}\n"
+        f"PT: {_language_readiness_summary(readiness, 'pt')}"
+    )
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=kb.admin_language_settings_keyboard(
+            config,
+            {locale: readiness.get(locale, {}) for locale in ("en", "pt")},
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_language_toggle_selector")
+async def admin_language_toggle_selector(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        async with translation_coordination_lock(session):
+            config = await session.get(BotGeneralConfig, 1)
+            if config is None:
+                config = BotGeneralConfig(id=1)
+                session.add(config)
+                await session.flush()
+            enabled = normalize_enabled_languages(config.telegram_enabled_languages)
+            new_value = not bool(config.telegram_language_selection_enabled)
+            if new_value and len(enabled) < 2:
+                await callback.answer("Сначала включите EN или PT.", show_alert=True)
+                return
+            config.telegram_language_selection_enabled = new_value
+            await session.commit()
+    await admin_language_settings(callback)
+
+
+@router.callback_query(F.data.startswith("admin_language_default_"))
+async def admin_language_set_default(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    locale = normalize_locale(callback.data.removeprefix("admin_language_default_"))
+    if locale is None:
+        await callback.answer("Неизвестный язык.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        async with translation_coordination_lock(session):
+            config = await session.get(BotGeneralConfig, 1)
+            if config is None:
+                config = BotGeneralConfig(id=1)
+                session.add(config)
+                await session.flush()
+            enabled = normalize_enabled_languages(config.telegram_enabled_languages)
+            if locale not in enabled:
+                await callback.answer("Сначала включите этот язык.", show_alert=True)
+                return
+            if locale != "ru":
+                registry = await build_translation_registry(session)
+                readiness = await audit_translation_readiness(session, registry, locales=(locale,))
+                if not readiness["ready"]:
+                    await callback.answer("Язык нельзя сделать основным: пакет не готов.", show_alert=True)
+                    return
+            config.telegram_default_language = locale
+            await session.commit()
+    user_commands, _, _ = await build_command_sets()
+    await refresh_default_commands(callback.bot, user_commands)
+    await admin_language_settings(callback)
+
+
+@router.callback_query(F.data.startswith("admin_language_toggle_"))
+async def admin_language_toggle_locale(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    locale = normalize_locale(callback.data.removeprefix("admin_language_toggle_"))
+    if locale is None:
+        await callback.answer("Неизвестный язык.", show_alert=True)
+        return
+    if locale == "ru":
+        await callback.answer("Русский язык всегда включён.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        async with translation_coordination_lock(session):
+            config = await session.get(BotGeneralConfig, 1)
+            if config is None:
+                config = BotGeneralConfig(id=1)
+                session.add(config)
+                await session.flush()
+            enabled = list(normalize_enabled_languages(config.telegram_enabled_languages))
+            if locale in enabled:
+                enabled.remove(locale)
+                if config.telegram_default_language == locale:
+                    config.telegram_default_language = "ru"
+            else:
+                registry = await build_translation_registry(session)
+                readiness = await audit_translation_readiness(session, registry, locales=(locale,))
+                if not readiness["ready"]:
+                    await callback.answer(
+                        f"{LOCALE_LABELS[locale]} нельзя включить: пакет переводов не готов.",
+                        show_alert=True,
+                    )
+                    return
+                enabled.append(locale)
+            config.telegram_enabled_languages = json.dumps(
+                [item for item in ("ru", "en", "pt") if item in enabled],
+                ensure_ascii=False,
+            )
+            await session.commit()
+    user_commands, _, _ = await build_command_sets()
+    await refresh_default_commands(callback.bot, user_commands)
+    await admin_language_settings(callback)
+
+
+@router.callback_query(F.data == "admin_translation_audit")
+async def admin_translation_audit(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    config, readiness = await _admin_language_config_and_readiness()
+    enabled = normalize_enabled_languages(config.telegram_enabled_languages)
+    lines = ["🔎 <b>Аудит готовности переводов</b>"]
+    for locale in enabled:
+        if locale == "ru":
+            lines.append("🇷🇺 Русский: канонический источник")
+            continue
+        report = readiness.get(locale, {})
+        lines.append(
+            f"{LOCALE_LABELS[locale]}: {_language_readiness_summary(readiness, locale)}"
+        )
+        if report.get("missing"):
+            lines.append("Примеры отсутствующих: " + ", ".join(report["missing"][:5]))
+        if report.get("stale"):
+            lines.append("Примеры устаревших: " + ", ".join(report["stale"][:5]))
+    if readiness.get("orphaned"):
+        lines.append("Сиротские записи: " + ", ".join(readiness["orphaned"][:5]))
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=kb.back_to_previous_menu("admin_language_settings"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_translation_export")
+async def admin_translation_export(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        async with translation_coordination_lock(session):
+            registry = await build_translation_registry(session)
+            pack = await export_translation_pack(session, registry, locales=("en", "pt"))
+    payload = json.dumps(pack, ensure_ascii=False, indent=2).encode("utf-8")
+    await callback.message.answer_document(
+        BufferedInputFile(payload, filename="telegram_translations.json"),
+        caption="📤 Пакет переводов EN/PT. После редактирования отправьте его через «Импорт пакета».",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_translation_import")
+async def admin_translation_import_start(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.set_state(AdminStates.upload_translation_pack)
+    await callback.message.edit_text(
+        "📥 Отправьте JSON-файл пакета переводов. Запись будет выполнена только после полной проверки.\n\n"
+        "Для отмены нажмите кнопку ниже.",
+        reply_markup=kb.back_to_previous_menu("admin_language_settings"),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.upload_translation_pack, F.document)
+async def admin_translation_import_file(message: Message, state: FSMContext, bot: Bot):
+    if not await is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        file_obj = await bot.get_file(message.document.file_id)
+        file_bytes = await bot.download_file(file_obj.file_path)
+        raw = file_bytes.read() if hasattr(file_bytes, "read") else bytes(file_bytes)
+        pack = json.loads(raw.decode("utf-8"))
+        count = await import_translation_pack(
+            async_session_maker,
+            pack,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TranslationPackValidationError, ValueError) as exc:
+        errors = getattr(exc, "errors", (str(exc),))
+        await message.answer("❌ Пакет отклонён:\n" + "\n".join(f"• {item}" for item in tuple(errors)[:20]))
+        return
+    except Exception:
+        logging.exception("Translation pack import failed")
+        await message.answer("❌ Не удалось импортировать пакет. Переводы не изменены.")
+        return
+    await state.clear()
+    await message.answer(f"✅ Импортировано записей: {count}.")
+    callback_mock = SimpleNamespace(
+        data="admin_language_settings",
+        message=message,
+        from_user=message.from_user,
+        answer=lambda *args, **kwargs: asyncio.sleep(0),
+    )
+    await admin_language_settings(callback_mock)
+
+
 @router.callback_query(F.data == "admin_general_toggle_ai_processing_message")
 async def admin_toggle_ai_processing_message(callback: CallbackQuery):
     async with async_session_maker() as session:
@@ -17129,7 +19615,10 @@ async def admin_toggle_ai_processing_message(callback: CallbackQuery):
             await callback.answer("Сначала задайте текст сообщения ожидания.", show_alert=True)
             return
         config.ai_processing_message_enabled = new_value
-        await session.commit()
+        if hasattr(session, "get_bind"):
+            await commit_readiness_critical_mutation(session)
+        else:
+            await session.commit()
 
     await admin_general_settings(callback)
     await callback.answer()
@@ -17176,7 +19665,10 @@ async def admin_save_ai_processing_message_text(message: Message, state: FSMCont
             )
             session.add(config)
         config.ai_processing_message_text = value
-        await session.commit()
+        if hasattr(session, "get_bind"):
+            await commit_readiness_critical_mutation(session)
+        else:
+            await session.commit()
 
     await state.clear()
     try:
@@ -17231,7 +19723,7 @@ async def admin_test_toggle_secret_test(callback: CallbackQuery):
             config = TestConfig(id=1)
             session.add(config)
         config.secret_test_enabled = not bool(getattr(config, "secret_test_enabled", True))
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await admin_test_menu(callback)
     await callback.answer()
 
@@ -17468,7 +19960,7 @@ async def process_secret_question_text(message: Message, state: FSMContext, bot:
         count = await session.scalar(select(func.count(SecretTestQuestion.id)))
         new_q = SecretTestQuestion(text=text, sort_order=count + 1)
         session.add(new_q)
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await message.delete()
@@ -17495,8 +19987,9 @@ async def process_secret_question_text(message: Message, state: FSMContext, bot:
 async def delete_secret_question(callback: CallbackQuery):
     q_id = int(callback.data.split("_")[-1])
     async with async_session_maker() as session:
-        await session.execute(delete(SecretTestQuestion).where(SecretTestQuestion.id == q_id))
-        await session.commit()
+        async with translation_coordination_lock(session):
+            await session.execute(delete(SecretTestQuestion).where(SecretTestQuestion.id == q_id))
+            await session.commit()
 
     await admin_secret_questions_menu(callback)
 
@@ -17736,7 +20229,7 @@ async def toggle_content_visibility_handler(callback: CallbackQuery, state: FSMC
         if content_obj:
             content_obj.is_visible = not content_obj.is_visible
             is_visible = content_obj.is_visible
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
         else:
             is_visible = False
 
@@ -17792,9 +20285,12 @@ async def process_button_title_general(message: Message, state: FSMContext, bot:
 
     if data.get('is_topics_btn'):
         async with async_session_maker() as session:
-            stmt = update(SubscriptionConfig).where(SubscriptionConfig.id == 1).values(topics_btn_name=message.text)
-            await session.execute(stmt)
-            await session.commit()
+            config = await session.get(SubscriptionConfig, 1)
+            if config is None:
+                await message.answer("Настройки не найдены.")
+                return
+            config.topics_btn_name = message.text
+            await commit_readiness_critical_mutation(session)
 
         await state.clear()
         await message.delete()
@@ -17832,9 +20328,10 @@ async def process_button_title_general(message: Message, state: FSMContext, bot:
     message_id = data['message_id']
 
     async with async_session_maker() as session:
-        stmt = update(Content).where(Content.key == button_key).values(button_title=message.text)
-        await session.execute(stmt)
-        await session.commit()
+        button = await session.get(Content, button_key)
+        if button:
+            button.button_title = message.text
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await message.delete()
@@ -17863,7 +20360,7 @@ async def admin_toggle_topic_display(callback: CallbackQuery):
                 topic.show_in_main_menu = not topic.show_in_main_menu
             elif mode == "list":
                 topic.show_in_list = not topic.show_in_list
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
 
     await _show_edit_topic_menu(callback.bot, callback.message.chat.id, callback.message.message_id, topic_id)
     await callback.answer("Настройки отображения обновлены.")
@@ -17895,16 +20392,28 @@ class TopicDirectButtonFilter(Filter):
     async def __call__(self, message: Message) -> bool | dict:
         if not message.text: return False
         async with async_session_maker() as session:
-            is_admin_user = message.from_user.id in OWNER_IDS
-            if not is_admin_user:
-                user = await session.get(User, message.from_user.id)
-                is_admin_user = bool(user and user.is_admin)
-            conditions = [Topic.is_active == True, Topic.show_in_main_menu == True, Topic.name == message.text]
+            user = await session.get(User, message.from_user.id)
+            config = await session.get(BotGeneralConfig, 1)
+            locale = resolve_effective_locale(
+                getattr(user, "telegram_language_code", None),
+                getattr(config, "telegram_default_language", "ru"),
+                bool(getattr(config, "telegram_language_selection_enabled", False)),
+                getattr(config, "telegram_enabled_languages", '["ru"]'),
+            )
+            is_admin_user = message.from_user.id in OWNER_IDS or bool(user and user.is_admin)
+            conditions = [Topic.is_active == True, Topic.show_in_main_menu == True]
             if not is_admin_user:
                 conditions.append(Topic.admin_only == False)
-            topic = await session.scalar(select(Topic).where(*conditions))
-            if topic:
-                return {'topic_id': topic.id, 'topic_name': topic.name}
+            topics = (await session.execute(select(Topic).where(*conditions))).scalars().all()
+            for topic in topics:
+                topic_name = translate(
+                    f"topic.{topic.id}.name",
+                    locale,
+                    fallback=topic.name,
+                    source=topic.name,
+                )
+                if topic_name == message.text:
+                    return {'topic_id': topic.id, 'topic_name': topic_name}
             return False
 
 
@@ -17929,7 +20438,10 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
-            await callback.answer("Ошибка пользователя.")
+            locale = await resolve_user_effective_locale(session, user_id)
+            await callback.answer(
+                translate("ui.navigation.user_error", locale, fallback="Ошибка пользователя.")
+            )
             return
 
         if user.current_topic_id:
@@ -17945,7 +20457,10 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
     if payload_text:
         lease = single_flight.try_claim("telegram", user_id)
         if lease is None:
-            await callback.answer(AI_BUSY_MESSAGE, show_alert=True)
+            await callback.answer(
+                translate("ui.ai.busy", await _get_user_locale(user_id), fallback=AI_BUSY_MESSAGE),
+                show_alert=True,
+            )
             return
 
         try:
@@ -17957,6 +20472,7 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
                 callback.message,
                 state,
                 user,
+                bot,
                 initial_prompt=payload_text,
             ):
                 return
@@ -17975,7 +20491,14 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
         finally:
             single_flight.release(lease)
     else:
-        await callback.answer("Действие не назначено.", show_alert=True)
+        await callback.answer(
+            translate(
+                "ui.action.unassigned",
+                await _get_user_locale(user_id),
+                fallback="Действие не назначено.",
+            ),
+            show_alert=True,
+        )
 
 
 @router.message(
@@ -17999,8 +20522,12 @@ async def admin_save_topic_extra_fields(message: Message, state: FSMContext, bot
     target_column = column_map.get(current_state)
 
     async with async_session_maker() as session:
-        await session.execute(update(Topic).where(Topic.id == topic_id).values({target_column: value}))
-        await session.commit()
+        topic = await session.get(Topic, topic_id)
+        if topic is None:
+            await message.answer("Тема не найдена.")
+            return
+        setattr(topic, target_column, value)
+        await commit_readiness_critical_mutation(session)
 
     await message.delete()
     await state.clear()
@@ -18019,12 +20546,11 @@ async def clear_topic_btn_handler(callback: CallbackQuery, bot: Bot):
     topic_id = int(callback.data.split("_")[-1])
 
     async with async_session_maker() as session:
-        await session.execute(
-            update(Topic)
-            .where(Topic.id == topic_id)
-            .values(start_button_text=None, start_button_payload=None)
-        )
-        await session.commit()
+        topic = await session.get(Topic, topic_id)
+        if topic:
+            topic.start_button_text = None
+            topic.start_button_payload = None
+            await commit_readiness_critical_mutation(session)
 
     await _show_edit_topic_menu(bot, callback.message.chat.id, callback.message.message_id, topic_id)
     await callback.answer("✅ Кнопка действия для темы удалена.")
@@ -18043,8 +20569,12 @@ async def admin_save_content_btn_fields(message: Message, state: FSMContext, bot
     target_column = "action_btn_text" if current_state == AdminStates.set_content_btn_text else "action_btn_payload"
 
     async with async_session_maker() as session:
-        await session.execute(update(Content).where(Content.key == content_key).values({target_column: value}))
-        await session.commit()
+        content = await session.get(Content, content_key)
+        if content is None:
+            await message.answer("Раздел не найден.")
+            return
+        setattr(content, target_column, value)
+        await commit_readiness_critical_mutation(session)
 
     await message.delete()
 
@@ -18080,12 +20610,11 @@ async def clear_content_btn_handler(callback: CallbackQuery, state: FSMContext, 
     content_key = callback.data.replace("clear_content_btn_", "")
 
     async with async_session_maker() as session:
-        await session.execute(
-            update(Content)
-            .where(Content.key == content_key)
-            .values(action_btn_text=None, action_btn_payload=None)
-        )
-        await session.commit()
+        content = await session.get(Content, content_key)
+        if content:
+            content.action_btn_text = None
+            content.action_btn_payload = None
+            await commit_readiness_critical_mutation(session)
 
     await state.set_state(AdminStates.edit_content)
     current_content = await get_content_from_db(content_key)
@@ -18250,6 +20779,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
     reply_markup = None
     topic_mode_html = "Markdown"
     topic = None
+    topic_locale = "ru"
     dialogue_id = 1
     topic_id = None
 
@@ -18258,7 +20788,14 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
         expected_token = data.get("reset_token")
 
         if not expected_token or expected_token != token:
-            await callback.message.answer("Подтверждение устарело или уже использовано.")
+            locale = await _get_user_locale(callback.from_user.id)
+            await callback.message.answer(
+                translate(
+                    "ui.dialogue.confirmation_stale",
+                    locale,
+                    fallback="Подтверждение устарело или уже использовано.",
+                )
+            )
             return
 
         expected_dialogue_id = data.get("reset_dialogue_id")
@@ -18268,7 +20805,14 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id, options=[selectinload(User.current_topic)])
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
-                await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
+                locale = await resolve_user_effective_locale(session, user or callback.from_user.id)
+                await callback.message.answer(
+                    translate(
+                        "ui.dialogue.state_changed",
+                        locale,
+                        fallback="Состояние диалога изменилось. Действие отменено.",
+                    )
+                )
                 return
 
             ai_config = await session.get(AIConfig, 1)
@@ -18278,16 +20822,36 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
             topic = user.current_topic
             topic_id = user.current_topic_id
             dialogue_id = user.current_dialogue_id
+            topic_locale = await resolve_user_effective_locale(session, user)
 
             nav_msg_id = None
             if topic:
-                text_to_send = f"✅ Диалог в теме «{topic.name}» перезапущен. Память очищена."
+                localized_topic_name = translate(
+                    f"topic.{topic.id}.name",
+                    topic_locale,
+                    fallback=topic.name,
+                    source=topic.name,
+                )
+                text_to_send = f"✅ Диалог в теме «{localized_topic_name}» перезапущен. Память очищена."
                 if topic.start_message:
-                    text_to_send = topic.start_message
+                    text_to_send = translate(
+                        f"topic.{topic.id}.start_message",
+                        topic_locale,
+                        fallback=topic.start_message,
+                        source=topic.start_message,
+                    )
                     topic_mode_html = "HTML"
 
                 if topic.start_button_text and topic.start_button_payload:
-                    reply_markup = kb.action_button_keyboard(topic.start_button_text, "topic_action")
+                    reply_markup = kb.action_button_keyboard(
+                        translate(
+                            f"topic.{topic.id}.start_button_text",
+                            topic_locale,
+                            fallback=topic.start_button_text,
+                            source=topic.start_button_text,
+                        ),
+                        "topic_action",
+                    )
 
                 from system_events import build_topic_auto_start_system_message, record_navigation_system_event
                 synthetic_prompt = build_topic_auto_start_system_message(topic.name)
@@ -18322,7 +20886,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
             async with async_session_maker() as session_acc:
                 user = await session_acc.get(User, callback.from_user.id)
                 if user and not user.accepted_disclaimer:
-                    disclaimer_content = await get_content_from_db("disclaimer")
+                    disclaimer_content = await get_content_from_db("disclaimer", user_id=callback.from_user.id)
                     if disclaimer_content.get('is_visible', True):
                         await state.set_state(UserStates.awaiting_disclaimer_acceptance)
                         await state.update_data(
@@ -18331,8 +20895,12 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
                             pending_auto_start_kind="first_entry",
                             pending_auto_start_message_id=nav_msg_id,
                         )
-                        text_to_send_disc = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                        await bot.send_message(callback.from_user.id, text_to_send_disc, reply_markup=kb.confirm_disclaimer_keyboard())
+                        text_to_send_disc = _localized_disclaimer_text(disclaimer_content, locale)
+                        await bot.send_message(
+                            callback.from_user.id,
+                            text_to_send_disc,
+                            reply_markup=kb.confirm_disclaimer_keyboard(await _get_user_locale(callback.from_user.id)),
+                        )
                         return
                     else:
                         await session_acc.execute(update(User).where(User.id == callback.from_user.id).values(accepted_disclaimer=True))
@@ -18496,11 +21064,25 @@ async def process_reset_topic_to_main(callback: CallbackQuery, state: FSMContext
                     dialogue_id, nav_msg_id = await _transition_to_main_db_locked(session, user)
 
     if status == "stale_token":
-        await callback.message.answer("Подтверждение устарело или уже использовано.")
+        locale = await _get_user_locale(user_id)
+        await callback.message.answer(
+            translate(
+                "ui.dialogue.confirmation_stale",
+                locale,
+                fallback="Подтверждение устарело или уже использовано.",
+            )
+        )
         return
 
     if status == "scope_mismatch":
-        await callback.message.answer("Состояние диалога изменилось. Действие отменено.")
+        locale = await _get_user_locale(user_id)
+        await callback.message.answer(
+            translate(
+                "ui.dialogue.state_changed",
+                locale,
+                fallback="Состояние диалога изменилось. Действие отменено.",
+            )
+        )
         return
 
     try:
@@ -18565,9 +21147,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     lease = single_flight.try_claim("telegram", user_id)
     if lease is None:
-        await message.answer(AI_BUSY_MESSAGE)
+        locale = await _get_user_locale(user_id)
+        await message.answer(translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE))
         return
 
+    locale = "ru"
     try:
         processing_msg = None
         typing_task = None
@@ -18599,6 +21183,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 session.add(user)
                 await session.flush()
 
+            locale = await resolve_user_effective_locale(session, user, platform="telegram")
+
             sub_config = await session.get(SubscriptionConfig, 1)
             subscriptions_active = should_include_subscription_status(sub_config)
             is_user_admin = await is_admin(user_id)
@@ -18606,10 +21192,20 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             if not is_user_admin and subscriptions_active:
                 if not user.subscription or user.subscription.end_date < datetime.utcnow():
                     await message.answer(
-                        "Чтобы отправлять фото и получать разборы, активируйте подписку.",
+                        translate(
+                            "ui.access.photo_subscription_required",
+                            locale,
+                            fallback="Чтобы отправлять фото и получать разборы, активируйте подписку.",
+                        ),
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="💳 Оформить подписку",
-                                                  callback_data="show_subscription_info_from_chat")]
+                            [InlineKeyboardButton(
+                                text=translate(
+                                    "ui.subscription.subscribe",
+                                    locale,
+                                    fallback="💳 Оформить подписку",
+                                ),
+                                callback_data="show_subscription_info_from_chat",
+                            )]
                         ])
                     )
                     return
@@ -18635,7 +21231,9 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         # External Preparation: download photo, start typing indicator
         # =========================================================================
         typing_task = asyncio.create_task(keep_typing())
-        processing_msg = await message.answer("👀 Тщательно изучаю изображение...")
+        processing_msg = await message.answer(
+            translate("ui.ai.image_inspecting", locale, fallback="👀 Тщательно изучаю изображение...")
+        )
 
         photo = message.photo[-1]
         file_info = await bot.get_file(photo.file_id)
@@ -18671,6 +21269,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
 
             ai_config = await session.get(AIConfig, 1)
             sub_config = await session.get(SubscriptionConfig, 1)
+            locale = await resolve_user_effective_locale(session, user_id)
 
             system_prompt_text = ai_integration._load_configured_system_prompt(
                 ai_config,
@@ -18715,6 +21314,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 memory_mode=memory_mode,
                 minutes_since_last_visit=gap_visit,
                 minutes_since_last_message=gap_msg,
+                preferred_response_locale=await resolve_user_effective_locale(
+                    session,
+                    user,
+                    platform="telegram",
+                ),
             )
             vision_provider = getattr(ai_config, "vision_provider", "Vision") or "Vision"
             vision_model = getattr(ai_config, "vision_model", "Vision") or "Vision"
@@ -18861,13 +21465,18 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     part,
                 )
         elif response_text_markup:
-            await message.answer("Выберите действие:", reply_markup=response_text_markup)
+            await message.answer(
+                translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                reply_markup=response_text_markup,
+            )
 
         # Step C: Long secondary image edit/generation with fresh post-generation scope check
         if edit_prompt:
             m_gen_status = None
             try:
-                m_gen_status = await message.answer("🎨 Редактирую ваше фото...")
+                m_gen_status = await message.answer(
+                    translate("ui.ai.editing_image", locale, fallback="🎨 Редактирую ваше фото...")
+                )
             except Exception:
                 pass
             try:
@@ -18897,16 +21506,31 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             if edited_data:
                 upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
                 try:
-                    await message.answer_photo(photo=BufferedInputFile(edited_data, filename="edited.png"), caption="✨ Результат редактирования:")
+                    await message.answer_photo(
+                        photo=BufferedInputFile(edited_data, filename="edited.png"),
+                        caption=translate(
+                            "ui.ai.edited_image",
+                            locale,
+                            fallback="✨ Результат редактирования:",
+                        ),
+                    )
                 finally:
                     upload_task.cancel()
             else:
-                await message.answer("😔 К сожалению, не удалось отредактировать изображение. Возможно, сервис дал сбой или запрос был отклонен фильтрами безопасности.")
+                await message.answer(
+                    translate(
+                        "ui.ai.edit_image_failed",
+                        locale,
+                        fallback="😔 К сожалению, не удалось отредактировать изображение. Возможно, сервис дал сбой или запрос был отклонен фильтрами безопасности.",
+                    )
+                )
 
         elif gen_prompt:
             m_gen_status = None
             try:
-                m_gen_status = await message.answer("🖼 Генерирую новое изображение...")
+                m_gen_status = await message.answer(
+                    translate("ui.ai.generating_image", locale, fallback="🖼 Генерирую новое изображение...")
+                )
             except Exception:
                 pass
             try:
@@ -18936,7 +21560,14 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             if new_img:
                 upload_task = _start_chat_action_loop(bot, message.chat.id, "upload_photo")
                 try:
-                    await message.answer_photo(photo=BufferedInputFile(new_img, filename="generated.png"), caption="✨ Новая генерация:")
+                    await message.answer_photo(
+                        photo=BufferedInputFile(new_img, filename="generated.png"),
+                        caption=translate(
+                            "ui.ai.generated_image",
+                            locale,
+                            fallback="✨ Новая генерация:",
+                        ),
+                    )
                 finally:
                     upload_task.cancel()
 
@@ -18972,7 +21603,11 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             except Exception:
                 pass
         await message.answer(
-            "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
+            translate(
+                "ui.ai.overloaded",
+                locale,
+                fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+            )
         )
         if not getattr(e, "admin_alert_handled", False):
             await _report_ai_failure(
@@ -19004,7 +21639,9 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             details=str(e),
             exception=e,
         )
-        await message.answer("Произошла ошибка при обработке фото.")
+        await message.answer(
+            translate("ui.ai.photo_failed", locale, fallback="Произошла ошибка при обработке фото.")
+        )
     finally:
         single_flight.release(lease)
 
@@ -19236,7 +21873,13 @@ async def show_referral_info(message: Message, bot: Bot):
     """Показывает экран реферальной программы при нажатии кнопки в меню."""
     text, ref_link = await _get_referral_screen_text(message.from_user.id, bot)
     if not text:
-        await message.answer("Реферальная программа недоступна.")
+        await message.answer(
+            translate(
+                "ui.referral.unavailable",
+                await _get_user_locale(message.from_user.id),
+                fallback="Реферальная программа недоступна.",
+            )
+        )
         return
     await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
     await _send_referral_templates(message.chat.id, ref_link, bot)
@@ -19247,7 +21890,13 @@ async def show_referral_from_sub(callback: CallbackQuery, bot: Bot):
     """Показывает экран реферальной программы из меню подписки."""
     text, ref_link = await _get_referral_screen_text(callback.from_user.id, bot)
     if not text:
-        await callback.message.answer("Реферальная программа недоступна.")
+        await callback.message.answer(
+            translate(
+                "ui.referral.unavailable",
+                await _get_user_locale(callback.from_user.id),
+                fallback="Реферальная программа недоступна.",
+            )
+        )
         await callback.answer()
         return
     await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
@@ -19255,9 +21904,30 @@ async def show_referral_from_sub(callback: CallbackQuery, bot: Bot):
     await callback.answer()
 
 
+async def _restore_test_state_from_db(message: Message, state: FSMContext, bot: Bot) -> bool:
+    get_state = getattr(state, "get_state", None)
+    if not callable(get_state):
+        return False
+    current_state = get_state()
+    if inspect.isawaitable(current_state):
+        current_state = await current_state
+    if current_state is not None:
+        return False
+    async with async_session_maker() as session:
+        test_session = await session.get(TestSession, message.from_user.id)
+    if not test_session or test_session.is_finished:
+        return False
+    await state.set_state(UserStates.in_test)
+    await process_test_text_answer(message, state, bot)
+    return True
+
+
 @router.message(F.text, StateFilter(None))
 async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
+    if await _restore_test_state_from_db(message, state, bot):
+        return
+    locale = await _get_user_locale(user_id)
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.subscription)])
@@ -19282,24 +21952,37 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
         if not is_user_admin and subscriptions_active:
             if not user.subscription or user.subscription.end_date < datetime.utcnow():
                 await message.answer(
-                    "Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
+                    translate(
+                        "ui.access.subscription_required",
+                        locale,
+                        fallback="Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
+                    ),
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="Начать пользоваться ботом",
-                                              callback_data="show_subscription_info_from_chat")]
+                        [InlineKeyboardButton(
+                            text=translate(
+                                "ui.access.subscription_button",
+                                locale,
+                                fallback="Начать пользоваться ботом",
+                            ),
+                            callback_data="show_subscription_info_from_chat",
+                        )]
                     ])
                 )
                 return
 
-        if await _request_profile_onboarding_if_needed(message, state, user, initial_prompt=message.text):
+        if await _request_profile_onboarding_if_needed(message, state, user, bot, initial_prompt=message.text):
             return
 
         if not user.accepted_disclaimer:
-            disclaimer_content = await get_content_from_db("disclaimer")
+            disclaimer_content = await get_content_from_db("disclaimer", user_id=user_id)
             if disclaimer_content.get('is_visible', True):
                 await state.set_state(UserStates.awaiting_disclaimer_acceptance)
                 await state.update_data(initial_prompt=message.text)
-                text_to_send = disclaimer_content.get('text') or "Текст дисклеймера не задан."
-                await message.answer(text_to_send, reply_markup=kb.confirm_disclaimer_keyboard())
+                text_to_send = _localized_disclaimer_text(disclaimer_content, locale)
+                await message.answer(
+                    text_to_send,
+                    reply_markup=kb.confirm_disclaimer_keyboard(await _get_user_locale(user_id)),
+                )
                 return
             else:
                 stmt = update(User).where(User.id == user_id).values(accepted_disclaimer=True)
@@ -19328,7 +22011,7 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
                 raise
 
     if busy:
-        await message.answer(AI_BUSY_MESSAGE)
+        await message.answer(translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE))
         return
 
 
@@ -19914,6 +22597,14 @@ async def _get_referral_screen_text(user_id: int, bot: Bot) -> tuple[str | None,
         config = await session.get(SubscriptionConfig, 1)
         if not config or not config.referral_enabled:
             return None, None
+        user = await session.get(User, user_id)
+        general_config = await session.get(BotGeneralConfig, 1)
+        locale = resolve_effective_locale(
+            getattr(user, "telegram_language_code", None),
+            getattr(general_config, "telegram_default_language", "ru") if general_config else "ru",
+            bool(getattr(general_config, "telegram_language_selection_enabled", False)) if general_config else False,
+            getattr(general_config, "telegram_enabled_languages", '["ru"]') if general_config else '["ru"]',
+        )
 
         count_result = await session.execute(
             select(func.count()).select_from(User).where(User.referred_by == user_id)
@@ -19926,36 +22617,75 @@ async def _get_referral_screen_text(user_id: int, bot: Bot) -> tuple[str | None,
     referrer_bonus_lines = []
     if config.referral_bonus_days_referrer > 0:
         referrer_bonus_lines.append(
-            f"• +{config.referral_bonus_days_referrer} дн. при регистрации приглашённого"
+            translate(
+                "ui.referral.referrer.registration",
+                locale,
+                fallback="• +{days} дн. при регистрации приглашённого",
+            ).format(days=config.referral_bonus_days_referrer)
         )
     if config.referral_pay_bonus_enabled and config.referral_pay_bonus_days > 0:
-        pay_period = (
-            "при первой оплате приглашённого"
+        pay_key = (
+            "ui.referral.referrer.first_payment"
             if config.referral_pay_bonus_first_only
-            else "при оплате приглашённого (за каждую оплату)"
+            else "ui.referral.referrer.each_payment"
         )
-        referrer_bonus_lines.append(f"• +{config.referral_pay_bonus_days} дн. {pay_period}")
+        referrer_bonus_lines.append(
+            translate(
+                pay_key,
+                locale,
+                fallback=(
+                    "• +{days} дн. при первой оплате приглашённого"
+                    if config.referral_pay_bonus_first_only
+                    else "• +{days} дн. при оплате приглашённого (за каждую оплату)"
+                ),
+            ).format(days=config.referral_pay_bonus_days)
+        )
     if not referrer_bonus_lines:
-        referrer_bonus_lines.append("• Сейчас бонусы для приглашающего не начисляются")
+        referrer_bonus_lines.append(
+            translate(
+                "ui.referral.referrer.none",
+                locale,
+                fallback="• Сейчас бонусы для приглашающего не начисляются",
+            )
+        )
 
     friend_bonus_lines = []
     if config.referral_bonus_days_referral > 0:
-        friend_bonus_lines.append(f"• +{config.referral_bonus_days_referral} дн. при регистрации по вашей ссылке")
+        friend_bonus_lines.append(
+            translate(
+                "ui.referral.friend.registration",
+                locale,
+                fallback="• +{days} дн. при регистрации по вашей ссылке",
+            ).format(days=config.referral_bonus_days_referral)
+        )
     if not friend_bonus_lines:
-        friend_bonus_lines.append("• Сейчас бонусы для друга не начисляются")
+        friend_bonus_lines.append(
+            translate(
+                "ui.referral.friend.none",
+                locale,
+                fallback="• Сейчас бонусы для друга не начисляются",
+            )
+        )
 
     referrer_bonus_text = "\n".join(referrer_bonus_lines)
     friend_bonus_text = "\n".join(friend_bonus_lines)
 
-    text = (
-        f"🔗 <b>Реферальная программа</b>\n\n"
-        f"Пригласите друга по ссылке и получайте бонусные дни!\n\n"
-        f"🎁 <b>Ваши бонусы:</b>\n"
-        f"{referrer_bonus_text}\n\n"
-        f"🎁 <b>Бонусы вашего друга:</b>\n"
-        f"{friend_bonus_text}\n\n"
-        f"👥 <b>Приглашено:</b> {referral_count} чел.\n\n"
-        f"<b>Ваша ссылка:</b>\n{link}"
+    text = translate(
+        "ui.referral.screen",
+        locale,
+        fallback=(
+            "🔗 <b>Реферальная программа</b>\n\n"
+            "Пригласите друга по ссылке и получайте бонусные дни!\n\n"
+            "🎁 <b>Ваши бонусы:</b>\n{referrer_bonus}\n\n"
+            "🎁 <b>Бонусы вашего друга:</b>\n{friend_bonus}\n\n"
+            "👥 <b>Приглашено:</b> {referral_count} чел.\n\n"
+            "<b>Ваша ссылка:</b>\n{ref_link}"
+        ),
+    ).format(
+        referrer_bonus=referrer_bonus_text,
+        friend_bonus=friend_bonus_text,
+        referral_count=referral_count,
+        ref_link=link,
     )
     return text, link
 
@@ -19973,23 +22703,39 @@ async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
     if not templates:
         return
 
+    locale = await _get_user_locale(chat_id)
+
     await bot.send_message(
         chat_id,
-        "📩 <b>Шаблоны приглашений</b>\n\n"
-        "Я отправлю несколько готовых сообщений ниже отдельными сообщениями. "
-        "Выбери любой и отправь своим друзьям.",
+        translate(
+            "ui.referral.templates.heading",
+            locale,
+            fallback="📩 <b>Шаблоны приглашений</b>",
+        )
+        + "\n\n"
+        + translate(
+            "ui.referral.templates.intro",
+            locale,
+            fallback="Я отправлю несколько готовых сообщений ниже отдельными сообщениями. Выбери любой и отправь своим друзьям.",
+        ),
         parse_mode="HTML",
     )
 
     for tpl in templates:
-        tpl_text = tpl.text.replace("{ref_link}", ref_link)
+        translated_template = translate(
+            f"referral_template.{tpl.id}.text",
+            locale,
+            fallback=tpl.text,
+            source=tpl.text,
+        ) or tpl.text
+        tpl_text = translated_template.replace("{ref_link}", ref_link)
         share_url = f"https://t.me/share/url?url={parse.quote(ref_link)}&text={parse.quote(tpl_text)}"
         await bot.send_message(
             chat_id,
             tpl_text,
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=kb.referral_template_share_keyboard(share_url),
+            reply_markup=kb.referral_template_share_keyboard(share_url, locale),
         )
 
 
@@ -20045,7 +22791,7 @@ async def admin_referral_toggle_enabled(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
         config.referral_enabled = not config.referral_enabled
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
         config_fresh = await session.get(SubscriptionConfig, 1)
 
     await callback.message.edit_reply_markup(reply_markup=kb.admin_referral_settings_keyboard(config_fresh))
@@ -20175,7 +22921,7 @@ async def save_referral_btn_name(message: Message, state: FSMContext):
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
         config.referral_btn_name = name
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await message.answer(f"✅ Название кнопки меню: «{name}»")
@@ -20208,7 +22954,7 @@ async def save_referral_sub_btn_name(message: Message, state: FSMContext):
     async with async_session_maker() as session:
         config = await session.get(SubscriptionConfig, 1)
         config.referral_sub_btn_name = name
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await state.clear()
     await message.answer(f"✅ Название кнопки подписки: «{name}»")
@@ -20414,7 +23160,7 @@ async def admin_ref_tpl_add_save(message: Message, state: FSMContext):
         )
         tpl = ReferralTemplate(text=text, order_num=(max_order or 0) + 1, is_enabled=True)
         session.add(tpl)
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await message.answer("✅ Шаблон добавлен!")
     await _show_referral_templates_admin(message, edit=False)
 
@@ -20479,7 +23225,7 @@ async def admin_ref_tpl_edit_save(message: Message, state: FSMContext):
         tpl = await session.get(ReferralTemplate, tpl_id)
         if tpl:
             tpl.text = new_text
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await message.answer("✅ Шаблон обновлён!")
     await _show_referral_templates_admin(message, edit=False)
 
@@ -20491,7 +23237,7 @@ async def admin_ref_tpl_toggle(callback: CallbackQuery):
         tpl = await session.get(ReferralTemplate, tpl_id)
         if tpl:
             tpl.is_enabled = not tpl.is_enabled
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
             is_enabled = tpl.is_enabled
     status = "✅ Включён" if is_enabled else "❌ Отключён"
     await callback.answer(f"Шаблон {status.lower()}")
@@ -20507,19 +23253,20 @@ async def admin_ref_tpl_toggle(callback: CallbackQuery):
 async def admin_ref_tpl_move_up(callback: CallbackQuery):
     tpl_id = int(callback.data.replace("admin_ref_tpl_up_", ""))
     async with async_session_maker() as session:
-        tpl = await session.get(ReferralTemplate, tpl_id)
-        if not tpl:
-            await callback.answer()
-            return
-        prev = await session.scalar(
-            select(ReferralTemplate)
-            .where(ReferralTemplate.order_num < tpl.order_num)
-            .order_by(ReferralTemplate.order_num.desc())
-            .limit(1)
-        )
-        if prev:
-            tpl.order_num, prev.order_num = prev.order_num, tpl.order_num
-            await session.commit()
+        async with translation_coordination_lock(session):
+            tpl = await session.get(ReferralTemplate, tpl_id)
+            if not tpl:
+                await callback.answer()
+                return
+            prev = await session.scalar(
+                select(ReferralTemplate)
+                .where(ReferralTemplate.order_num < tpl.order_num)
+                .order_by(ReferralTemplate.order_num.desc())
+                .limit(1)
+            )
+            if prev:
+                tpl.order_num, prev.order_num = prev.order_num, tpl.order_num
+                await session.commit()
     await callback.answer("⬆️ Перемещён выше")
     await _show_referral_templates_admin(callback, edit=True)
 
@@ -20528,19 +23275,20 @@ async def admin_ref_tpl_move_up(callback: CallbackQuery):
 async def admin_ref_tpl_move_down(callback: CallbackQuery):
     tpl_id = int(callback.data.replace("admin_ref_tpl_down_", ""))
     async with async_session_maker() as session:
-        tpl = await session.get(ReferralTemplate, tpl_id)
-        if not tpl:
-            await callback.answer()
-            return
-        nxt = await session.scalar(
-            select(ReferralTemplate)
-            .where(ReferralTemplate.order_num > tpl.order_num)
-            .order_by(ReferralTemplate.order_num.asc())
-            .limit(1)
-        )
-        if nxt:
-            tpl.order_num, nxt.order_num = nxt.order_num, tpl.order_num
-            await session.commit()
+        async with translation_coordination_lock(session):
+            tpl = await session.get(ReferralTemplate, tpl_id)
+            if not tpl:
+                await callback.answer()
+                return
+            nxt = await session.scalar(
+                select(ReferralTemplate)
+                .where(ReferralTemplate.order_num > tpl.order_num)
+                .order_by(ReferralTemplate.order_num.asc())
+                .limit(1)
+            )
+            if nxt:
+                tpl.order_num, nxt.order_num = nxt.order_num, tpl.order_num
+                await session.commit()
     await callback.answer("⬇️ Перемещён ниже")
     await _show_referral_templates_admin(callback, edit=True)
 
@@ -20573,10 +23321,11 @@ async def admin_ref_tpl_delete_prompt(callback: CallbackQuery):
 async def admin_ref_tpl_delete_confirm(callback: CallbackQuery):
     tpl_id = int(callback.data.replace("admin_ref_tpl_del_confirm_", ""))
     async with async_session_maker() as session:
-        tpl = await session.get(ReferralTemplate, tpl_id)
-        if tpl:
-            await session.delete(tpl)
-            await session.commit()
+        async with translation_coordination_lock(session):
+            tpl = await session.get(ReferralTemplate, tpl_id)
+            if tpl:
+                await session.delete(tpl)
+                await session.commit()
     await callback.answer("🗑 Шаблон удалён")
     await _show_referral_templates_admin(callback, edit=True)
 

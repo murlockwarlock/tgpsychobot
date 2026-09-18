@@ -8,6 +8,7 @@ from ..api import MaxApiClient
 from ..keyboards import admin_content_editor_keyboard, admin_content_list_keyboard
 from ..legacy import Content, async_session_maker
 from ..storage import MaxContentMedia, StateStore
+from translation_pack_manager import commit_readiness_critical_mutation
 
 
 SYSTEM_TITLES = {
@@ -272,7 +273,7 @@ async def handle_save_content(
                     token=mf["token"],
                 )
             )
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="✅ Изменения успешно сохранены.")
@@ -305,7 +306,7 @@ async def toggle_visibility(
             return
         item.is_visible = not item.is_visible
         is_visible = item.is_visible
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
 
     status_str = "показан" if is_visible else "скрыт"
     await client.send_message(chat_id=chat_id, text=f"Раздел теперь {status_str}.")

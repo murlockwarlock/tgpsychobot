@@ -433,9 +433,16 @@ async def reset_account(client: MaxApiClient, chat_id: int, target_user_id: int)
 async def reset_account_confirmed(client: MaxApiClient, chat_id: int, target_user_id: int) -> None:
     from sqlalchemy import delete as sql_delete
     from sqlalchemy import update as sql_update
+    from database import SubscriptionBenefitGrant
     async with async_session_maker() as session:
         await session.execute(sql_delete(DBMessage).where(DBMessage.user_id == target_user_id))
         await session.execute(sql_delete(UserSubscription).where(UserSubscription.user_id == target_user_id))
+        await session.execute(
+            sql_delete(SubscriptionBenefitGrant).where(
+                (SubscriptionBenefitGrant.beneficiary_user_id == target_user_id)
+                | (SubscriptionBenefitGrant.source_user_id == target_user_id)
+            )
+        )
         await session.execute(
             sql_update(User).where(User.id == target_user_id).values(
                 name=None, gender=None, age=None,

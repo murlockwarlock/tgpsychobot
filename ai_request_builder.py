@@ -43,6 +43,19 @@ from subscription_context import active_subscription_flag
 log = logging.getLogger(__name__)
 
 
+def build_response_language_directive(preferred_response_locale: str | None) -> str:
+    locale = str(preferred_response_locale or "").strip().lower()
+    language = {"en": "English", "pt": "Portuguese"}.get(locale)
+    if language is None:
+        return ""
+    return (
+        "LANGUAGE DIRECTIVE:\n"
+        f"Respond to the user in {language}. Translate only natural-language user-visible text. "
+        "Keep DATA blocks, JSON/schema keys, btn: targets, URLs, SHOW_IMG, GEN_IMG, "
+        "[START_TEST], and internal identifiers byte-for-byte unchanged."
+    )
+
+
 def resolve_context_limit(value: Any, default: int) -> int:
     """Resolve context limit honoring explicit zero, with fallback to default on None/invalid."""
     if value is None or isinstance(value, bool):
@@ -348,6 +361,7 @@ async def build_conversational_request_layout(
     history: Iterable[Any] | None = None,
     modality_instructions: Iterable[str] | None = None,
     service_capabilities: ServiceCapabilities | None = None,
+    preferred_response_locale: str | None = None,
 ) -> AIRequestLayout:
     """Build the single canonical AIRequestLayout for conversational turns (TG & MAX)."""
     effective_memory_mode = memory_mode or get_memory_mode(ai_config)
@@ -394,6 +408,9 @@ async def build_conversational_request_layout(
         minutes_since_last_message=minutes_since_last_message,
     )
     runtime_parts = [client_context, temporal_context]
+    language_directive = build_response_language_directive(preferred_response_locale)
+    if language_directive:
+        runtime_parts.append(language_directive)
     if short_response_instruction and short_response_instruction.strip():
         runtime_parts.append(short_response_instruction.strip())
     elif getattr(user, "response_length", "normal") == "short":
@@ -467,6 +484,7 @@ async def build_isolated_request_layout(
     media_instruction_block: str = "",
     memory_mode: str | None = None,
     service_capabilities: ServiceCapabilities | None = None,
+    preferred_response_locale: str | None = None,
 ) -> AIRequestLayout:
     """Build canonical AIRequestLayout for isolated direct calls (tests, single prompts, etc.)."""
     effective_memory_mode = memory_mode or get_memory_mode(ai_config)
@@ -489,6 +507,9 @@ async def build_isolated_request_layout(
         minutes_since_last_message=minutes_since_last_message,
     )
     runtime_parts = [client_context, temporal_context]
+    language_directive = build_response_language_directive(preferred_response_locale)
+    if language_directive:
+        runtime_parts.append(language_directive)
     if getattr(user, "response_length", "normal") == "short":
         runtime_parts.append(DEFAULT_SHORT_RESPONSE_INSTRUCTION)
 

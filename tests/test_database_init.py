@@ -11,7 +11,7 @@ os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import database
-from database import Base, TelegramPendingAIReply
+from database import Base, BotGeneralConfig, TelegramPendingAIReply, User
 
 
 class _FakeConnection:
@@ -140,6 +140,56 @@ async def test_init_db_still_succeeds_on_sqlite(tmp_path, monkeypatch):
                 )
             )
         assert has_pending_table is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_adds_multilingual_foundation_with_safe_defaults(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'multilingual-foundation.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        await database.init_db()
+        async with engine.connect() as connection:
+            user_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    column["name"] for column in inspect(sync_connection).get_columns("users")
+                }
+            )
+            general_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    column["name"] for column in inspect(sync_connection).get_columns("bot_general_config")
+                }
+            )
+            has_translation_table = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).has_table("bot_translations")
+            )
+            assert has_translation_table is True
+
+        assert "telegram_language_code" in user_columns
+        assert {
+            "telegram_default_language",
+            "telegram_language_selection_enabled",
+            "telegram_enabled_languages",
+            "translations_revision",
+        } <= general_columns
+
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            session.add(User(id=987654321, first_name="Legacy"))
+            await session.commit()
+            user = await session.get(User, 987654321)
+
+        assert config.telegram_default_language == "ru"
+        assert config.telegram_language_selection_enabled is False
+        assert config.telegram_enabled_languages == '["ru"]'
+        assert config.translations_revision == 0
+        assert user.telegram_language_code is None
     finally:
         await engine.dispose()
 

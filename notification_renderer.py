@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-def render_outbox_message(
+def _render_outbox_message_ru(
     event_type: str,
     payload: dict[str, Any],
     recipient_id: int,
@@ -150,3 +150,53 @@ def render_outbox_message(
     # Fallback
     raw_text = payload.get("text", f"Уведомление по платежу ({event_type})")
     return raw_text, payload.get("parse_mode"), payload.get("keyboard_type")
+
+
+def _notification_translation_key(event_type: str, payload: dict[str, Any]) -> str:
+    if event_type.startswith("manual_review_"):
+        return "notification.manual_review"
+    provider = payload.get("provider", "Yookassa")
+    if event_type in {"purchase_success", "renewal_success"} and provider == "Robokassa":
+        return f"notification.{event_type}.robokassa"
+    if event_type == "deactivate" and provider == "Robokassa":
+        return "notification.deactivate.robokassa"
+    if event_type == "provider_error" and provider == "Robokassa":
+        return "notification.provider_error.robokassa"
+    if event_type.startswith("retry_limit"):
+        return "notification.retry_limit"
+    if event_type in {"retry_failed", "retry_failed_1"} and payload.get("attempt_count") == 1:
+        return "notification.retry_failed_1"
+    if event_type in {"retry_failed", "retry_failed_2"} and payload.get("attempt_count") == 2:
+        return "notification.retry_failed_2"
+    if event_type.startswith("retry_failed"):
+        return "notification.retry_failed_1" if payload.get("attempt_count", 1) == 1 else "notification.retry_failed_2"
+    if "cross_plan" in event_type:
+        return "notification.cross_plan"
+    if "subscription_unresolved" in event_type:
+        return "notification.subscription_unresolved"
+    if "paid_plan_unresolved" in event_type:
+        return "notification.paid_plan_unresolved"
+    return f"notification.{event_type}"
+
+
+def render_outbox_message(
+    event_type: str,
+    payload: dict[str, Any],
+    recipient_id: int,
+    *,
+    text_overrides: dict[str, str] | None = None,
+) -> tuple[str, str | None, str | None]:
+    text, parse_mode, keyboard_type = _render_outbox_message_ru(event_type, payload, recipient_id)
+    template = (text_overrides or {}).get(_notification_translation_key(event_type, payload))
+    if not template:
+        return text, parse_mode, keyboard_type
+    values = dict(payload)
+    values.setdefault("plan_name", payload.get("plan_name", ""))
+    values.setdefault("paid_name", payload.get("paid_plan_name", ""))
+    values.setdefault("curr_name", payload.get("current_plan_name", ""))
+    values.setdefault("next_retry", payload.get("next_retry_str", "позже"))
+    values.setdefault("prefix", f"Не удалось списать средства ({payload.get('provider', 'ЮKassa')}).")
+    try:
+        return template.format(**values), parse_mode, keyboard_type
+    except (KeyError, IndexError, ValueError):
+        return text, parse_mode, keyboard_type

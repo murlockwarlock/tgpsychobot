@@ -32,6 +32,7 @@ from automation_events import condition_value_matches, resolve_condition_path
 from memory_mode import MEMORY_MODE_GLOBAL, get_memory_mode
 from response_buttons import ResponseButton, extract_response_buttons
 from user_metadata import extract_service_data, load_metadata
+from translation_service import refresh_translation_cache, resolve_user_effective_locale, translate
 
 
 log = logging.getLogger(__name__)
@@ -431,6 +432,12 @@ async def prepare_followup_step(
     topic_id: int,
 ) -> FollowupStepSendResult:
     validate_followup_step(step)
+    async with async_session_maker() as session:
+        recipient_locale = await resolve_user_effective_locale(
+            session,
+            user,
+            platform="max" if user.id >= 100_000_000_000 else "telegram",
+        )
     if step.message_type == "ai":
         try:
             from ai_integration import get_ai_response
@@ -446,6 +453,7 @@ async def prepare_followup_step(
                 persist_service_data=False,
                 request_type="followup",
                 track_user_activity=False,
+                preferred_response_locale=recipient_locale,
             )
             if not isinstance(text, str) or not text.strip():
                 raise FollowupStepExecutionError("AI вернул пустое догоняющее сообщение")
@@ -459,7 +467,13 @@ async def prepare_followup_step(
         except Exception as exc:
             raise FollowupStepExecutionError("Не удалось подготовить AI-догоняющее сообщение") from exc
 
-    text = step.message_text.strip()
+    locale = recipient_locale
+    text = translate(
+        f"followup_step.{step.id}.message_text",
+        locale,
+        fallback=step.message_text.strip(),
+        source=step.message_text,
+    ) or step.message_text.strip()
     visible_text, response_button_rows = extract_response_buttons(text)
     if not response_button_rows:
         return FollowupStepSendResult(text, text, None)
@@ -747,6 +761,10 @@ class FollowupActivityMiddleware(BaseMiddleware):
     """Record messages and button clicks without coupling handlers to follow-ups."""
 
     async def __call__(self, handler, event, data):
+        try:
+            await refresh_translation_cache(async_session_maker)
+        except Exception:
+            log.warning("Could not refresh translation cache before Telegram update", exc_info=True)
         from_user = getattr(event, "from_user", None)
         callback_data = getattr(event, "data", "") or ""
         fsm_context = data.get("state")
@@ -1375,6 +1393,10 @@ async def _complete_delivery_claim(
 
 async def process_due_followups(bot, *, limit: int = 100) -> int:
     """Deliver due steps and advance each chain exactly once per generation."""
+    try:
+        await refresh_translation_cache(async_session_maker)
+    except Exception:
+        log.warning("Could not refresh translation cache before follow-up processing", exc_info=True)
     now = datetime.utcnow()
     delivered = 0
     run_ids = await _due_followup_ids(now, limit)

@@ -7,6 +7,7 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from translation_service import translate
 
 log = logging.getLogger(__name__)
 
@@ -16,10 +17,13 @@ def clean_html_for_max(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
-def build_subscribe_keyboard() -> InlineKeyboardMarkup:
+def build_subscribe_keyboard(locale: str = "ru") -> InlineKeyboardMarkup:
     """Standard tariff purchase/renewal keyboard."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оформить подписку", callback_data="show_subscription_info_from_chat")]
+        [InlineKeyboardButton(
+            text=translate("ui.subscription.subscribe", locale, fallback="💳 Оформить подписку"),
+            callback_data="show_subscription_info_from_chat",
+        )]
     ])
 
 

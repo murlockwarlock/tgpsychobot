@@ -19,6 +19,7 @@ from ..keyboards import (
 )
 from ..legacy import PromoCode, SubscriptionPlan, UserSubscription, async_session_maker
 from ..storage import StateStore
+from translation_pack_manager import commit_readiness_critical_mutation
 
 
 def _format_duration(plan: SubscriptionPlan) -> str:
@@ -133,7 +134,7 @@ async def save_new_plan_duration_value(client: MaxApiClient, states: StateStore,
             allow_auto_renewal=True,
         )
         session.add(plan)
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
         plan_id = plan.id
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text=f"✅ Тариф «{html.escape(data['name'])}» создан.")
@@ -169,7 +170,7 @@ async def save_plan_name(client: MaxApiClient, states: StateStore, chat_id: int,
             await client.send_message(chat_id=chat_id, text="Тариф не найден.")
             return
         plan.name = name
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_plan_editor(client, chat_id, plan_id)
 
@@ -186,7 +187,7 @@ async def save_plan_description(client: MaxApiClient, states: StateStore, chat_i
             await client.send_message(chat_id=chat_id, text="Тариф не найден.")
             return
         plan.description = text.strip() or None
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_plan_editor(client, chat_id, plan_id)
 
@@ -290,7 +291,7 @@ async def toggle_plan_active(client: MaxApiClient, chat_id: int, plan_id: int) -
         plan = await session.get(SubscriptionPlan, plan_id)
         if plan:
             plan.is_active = not plan.is_active
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await show_plan_editor(client, chat_id, plan_id)
 
 

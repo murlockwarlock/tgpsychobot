@@ -95,20 +95,36 @@ def progress_bar(current: int, total: int, length: int = 10) -> str:
     return f"{'█' * filled}{'░' * (length - filled)} {percent}% ({current}/{total})"
 
 
-def build_question_text(question: Any, index: int, total: int, show_progress: bool = True) -> str:
-    lines = [f"<b>Вопрос {index + 1} из {total}</b>"]
+def build_question_text(
+    question: Any,
+    index: int,
+    total: int,
+    show_progress: bool = True,
+    *,
+    question_text: str | None = None,
+    comment: str | None = None,
+    answer_options: list[AnswerOption] | None = None,
+    question_heading: str | None = None,
+    free_text_hint: str = "Напишите свой ответ или выберите из предложенных ниже.",
+    text_answer_hint: str = "Напишите ответ сообщением.",
+) -> str:
+    heading = question_heading or "<b>Вопрос {current} из {total}</b>"
+    lines = [heading.format(current=index + 1, total=total)]
     if show_progress:
         lines.append(progress_bar(index + 1, total))
     lines.append("")
-    question_text = html.escape(str(getattr(question, "text", "") or ""))
-    lines.append(f"<b>{question_text}</b>")
-    comment = (getattr(question, "comment", None) or "").strip()
-    if comment:
-        lines.extend(["", html.escape(comment)])
-    if get_answer_options(question) and question_accepts_text(question):
-        lines.extend(["", "Напишите свой ответ или выберите из предложенных ниже."])
-    elif not get_answer_options(question):
-        lines.extend(["", "Напишите ответ сообщением."])
+    effective_question_text = html.escape(
+        str(question_text if question_text is not None else getattr(question, "text", "") or "")
+    )
+    lines.append(f"<b>{effective_question_text}</b>")
+    effective_comment = (comment if comment is not None else getattr(question, "comment", None) or "").strip()
+    if effective_comment:
+        lines.extend(["", html.escape(effective_comment)])
+    effective_options = answer_options if answer_options is not None else get_answer_options(question)
+    if effective_options and question_accepts_text(question):
+        lines.extend(["", free_text_hint])
+    elif not effective_options:
+        lines.extend(["", text_answer_hint])
     return "\n".join(lines)
 
 

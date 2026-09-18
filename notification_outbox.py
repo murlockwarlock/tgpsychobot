@@ -13,9 +13,25 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import PaymentNotificationOutbox, SubscriptionConfig, async_session_maker, get_all_admin_ids
+from config import OWNER_IDS
+from database import (
+    BotGeneralConfig,
+    PaymentNotificationOutbox,
+    SubscriptionConfig,
+    SubscriptionPlan,
+    User,
+    async_session_maker,
+    get_all_admin_ids,
+)
 from notification_renderer import render_outbox_message
-from notification_transport import send_notification_transport
+from notification_transport import build_subscribe_keyboard, send_notification_transport
+from translation_service import (
+    normalize_locale,
+    refresh_translation_cache,
+    resolve_effective_locale,
+    translation_cache,
+    translate,
+)
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +53,53 @@ BACKOFF_DELAYS = [
 
 OUTBOX_DELIVERY_TIMEOUT_SECONDS = 150
 OUTBOX_LEASE_SECONDS = 300
+
+
+async def _prepare_outbox_payload(
+    session,
+    recipient_id: int,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str], str]:
+    user = None if recipient_id >= 100_000_000_000 else await session.get(User, recipient_id)
+    config = await session.get(BotGeneralConfig, 1)
+    admin_recipient = bool(recipient_id in OWNER_IDS or getattr(user, "is_admin", False))
+    locale = resolve_effective_locale(
+        None if recipient_id >= 100_000_000_000 else getattr(user, "telegram_language_code", None),
+        getattr(config, "telegram_default_language", "ru") if config else "ru",
+        bool(getattr(config, "telegram_language_selection_enabled", False)) if config else False,
+        getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]',
+        platform="max" if recipient_id >= 100_000_000_000 else "telegram",
+        admin=admin_recipient,
+    )
+    localized = dict(payload)
+    plan_fields = (
+        ("plan_id", "plan_name"),
+        ("paid_plan_id", "paid_plan_name"),
+        ("current_plan_id", "current_plan_name"),
+    )
+    for id_field, name_field in plan_fields:
+        plan_id = localized.get(id_field)
+        plan = await session.get(SubscriptionPlan, plan_id) if plan_id is not None else None
+        if plan is None and localized.get(name_field):
+            plan = await session.scalar(
+                select(SubscriptionPlan).where(SubscriptionPlan.name == localized[name_field]).limit(1)
+            )
+        if plan is not None:
+            localized[name_field] = translate(
+                f"plan.{plan.id}.name",
+                locale,
+                fallback=plan.name,
+                source=plan.name,
+            )
+    overrides = {}
+    if locale != "ru":
+        for key in translation_cache.snapshot.sources:
+            if key.startswith("notification."):
+                translated = translate(key, locale)
+                source = translation_cache.snapshot.sources.get(key)
+                if translated and source and translated != source:
+                    overrides[key] = translated
+    return localized, overrides, locale
 
 
 def get_outbox_backoff(attempt_num: int) -> timedelta:
@@ -147,6 +210,10 @@ async def dispatch_outbox_by_key(
     """
     sm = session_maker or async_session_maker
     try:
+        try:
+            await refresh_translation_cache(sm)
+        except Exception:
+            log.warning("Could not refresh translation cache before outbox dispatch", exc_info=True)
         async with sm() as session:
             token = str(uuid.uuid4())
             lease_duration = timedelta(seconds=OUTBOX_LEASE_SECONDS)
@@ -190,12 +257,34 @@ async def dispatch_outbox_by_key(
                 return False
 
             payload = json.loads(row.event_payload_json)
-            text, parse_mode, keyboard_type = render_outbox_message(row.event_type, payload, row.recipient_id)
+            payload, text_overrides, locale = await _prepare_outbox_payload(
+                session,
+                row.recipient_id,
+                payload,
+            )
+            text, parse_mode, keyboard_type = render_outbox_message(
+                row.event_type,
+                payload,
+                row.recipient_id,
+                text_overrides=text_overrides,
+            )
+            reply_markup = (
+                build_subscribe_keyboard(locale)
+                if keyboard_type == "subscribe"
+                else None
+            )
 
             is_timeout = False
             try:
                 delivered = await asyncio.wait_for(
-                    deliver_func(bot, row.recipient_id, text, keyboard_type=keyboard_type, parse_mode=parse_mode),
+                    deliver_func(
+                        bot,
+                        row.recipient_id,
+                        text,
+                        keyboard_type=keyboard_type,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                    ),
                     timeout=OUTBOX_DELIVERY_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:

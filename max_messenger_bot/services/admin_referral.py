@@ -18,6 +18,7 @@ from ..identity import is_max_user_id, max_communication_name, max_username, raw
 from ..legacy import ReferralPaymentLog, ReferralTemplate, SubscriptionConfig, User, async_session_maker
 from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
+from translation_pack_manager import commit_readiness_critical_mutation
 
 REFERRAL_REFERRERS_PAGE_SIZE = 10
 
@@ -108,7 +109,7 @@ async def toggle_enabled(client: MaxApiClient, chat_id: int) -> None:
         config = await session.get(SubscriptionConfig, 1)
         if config:
             config.referral_enabled = not config.referral_enabled
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await show_settings(client, chat_id)
 
 
@@ -227,7 +228,7 @@ async def save_btn_name(client: MaxApiClient, states: StateStore, chat_id: int, 
         config = await session.get(SubscriptionConfig, 1)
         if config:
             config.referral_btn_name = html.escape(value)
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_settings(client, chat_id)
 
@@ -250,7 +251,7 @@ async def save_sub_btn_name(client: MaxApiClient, states: StateStore, chat_id: i
         config = await session.get(SubscriptionConfig, 1)
         if config:
             config.referral_sub_btn_name = html.escape(value)
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await show_settings(client, chat_id)
 
@@ -292,7 +293,7 @@ async def save_new_template(client: MaxApiClient, states: StateStore, chat_id: i
     async with async_session_maker() as session:
         max_order = await session.scalar(select(func.coalesce(func.max(ReferralTemplate.order_num), -1)))
         session.add(ReferralTemplate(text=value, order_num=(max_order or 0) + 1, is_enabled=True))
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="✅ Шаблон добавлен.")
     await show_templates(client, chat_id)
@@ -336,7 +337,7 @@ async def save_template_edit(client: MaxApiClient, states: StateStore, chat_id: 
         tpl = await session.get(ReferralTemplate, tpl_id)
         if tpl:
             tpl.text = value
-            await session.commit()
+            await commit_readiness_critical_mutation(session)
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="✅ Шаблон обновлён.")
     await show_templates(client, chat_id)
@@ -349,7 +350,7 @@ async def toggle_template(client: MaxApiClient, chat_id: int, tpl_id: int) -> No
             await client.send_message(chat_id=chat_id, text="Шаблон не найден.")
             return
         tpl.is_enabled = not tpl.is_enabled
-        await session.commit()
+        await commit_readiness_critical_mutation(session)
     await show_template_detail(client, chat_id, tpl_id)
 
 
