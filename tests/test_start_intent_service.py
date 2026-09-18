@@ -11,7 +11,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from datetime import datetime, timedelta
 
 import handlers
-from database import Base, SubscriptionBenefitGrant, TelegramStartIntent, TestSession as DBTestSession, User, UserSubscription
+from database import (
+    Base,
+    BotGeneralConfig,
+    SubscriptionBenefitGrant,
+    TelegramStartIntent,
+    TestSession as DBTestSession,
+    User,
+    UserSubscription,
+)
 from handlers import UserStates
 from telegram_start_service import (
     grant_subscription_days,
@@ -176,5 +184,66 @@ async def test_test_session_reconstructs_fsm_after_process_restart(tmp_path, mon
         assert await handlers._restore_test_state_from_db(message, state, bot) is True
         state.set_state.assert_awaited_once_with(UserStates.in_test)
         process_answer.assert_awaited_once_with(message, state, bot)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_topic_entry_passes_bot_when_resuming_completed_profile_start(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'topic-entry-recovery.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(handlers, "async_session_maker", sessions)
+    bot = object()
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=10),
+        chat=SimpleNamespace(id=10),
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace()
+    continuation = AsyncMock()
+    monkeypatch.setattr(handlers, "_resume_after_profile_onboarding", continuation)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add_all([
+                BotGeneralConfig(
+                    id=1,
+                    profile_collect_name=False,
+                    profile_collect_gender=False,
+                    profile_collect_age=False,
+                ),
+                User(
+                    id=10,
+                    first_name="Tester",
+                    name="Test User",
+                    gender="other",
+                    age="30",
+                ),
+                TelegramStartIntent(
+                    user_id=10,
+                    new_user_eligible=True,
+                    navigation_payload="topic_5",
+                    status="awaiting_profile",
+                ),
+            ])
+            await session.commit()
+
+        result = handlers.TopicSwitchResult(
+            "switched",
+            topic_id=5,
+            dialogue_id=1,
+        )
+        await handlers._complete_telegram_topic_entry(
+            user_id=10,
+            chat_id=10,
+            switch_res=result,
+            bot=bot,
+            state=state,
+            message=message,
+        )
+
+        continuation.assert_awaited_once()
+        assert continuation.await_args.args[3] is bot
     finally:
         await engine.dispose()

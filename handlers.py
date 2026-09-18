@@ -2088,6 +2088,7 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
         message_proxy,
         state,
         user,
+        bot,
         resume_test=True,
     ):
         return
@@ -4202,6 +4203,7 @@ async def _run_start_business(
                 message,
                 state,
                 user,
+                bot,
                 resume_start=True,
                 resume_start_args=args,
                 resume_start_new_user=business_new_user,
@@ -9014,6 +9016,7 @@ async def _complete_telegram_topic_entry(
         context_msg,
         state,
         user,
+        bot,
         topic_intro_after=switch_res.topic_id,
         topic_intro_dialogue_id=switch_res.dialogue_id,
         topic_intro_welcome_needed=not switch_res.welcome_shown,
@@ -9458,6 +9461,7 @@ async def _request_profile_onboarding_if_needed(
     message: Message,
     state: FSMContext,
     user: User,
+    bot: Bot,
     *,
     initial_prompt: str | None = None,
     topic_intro_after: int | None = None,
@@ -17071,7 +17075,7 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                     )
                     return
 
-            if await _request_profile_onboarding_if_needed(message, state, user, initial_prompt=prompt_text):
+            if await _request_profile_onboarding_if_needed(message, state, user, bot, initial_prompt=prompt_text):
                 return
 
             if not user.accepted_disclaimer:
@@ -19230,6 +19234,7 @@ async def cmd_start_test(
         message,
         state,
         user,
+        bot,
         resume_test=True,
         resume_test_launch_key=deferred_launch_key,
     ):
@@ -20467,6 +20472,7 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
                 callback.message,
                 state,
                 user,
+                bot,
                 initial_prompt=payload_text,
             ):
                 return
@@ -21964,7 +21970,7 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
                 )
                 return
 
-        if await _request_profile_onboarding_if_needed(message, state, user, initial_prompt=message.text):
+        if await _request_profile_onboarding_if_needed(message, state, user, bot, initial_prompt=message.text):
             return
 
         if not user.accepted_disclaimer:
