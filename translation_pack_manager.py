@@ -29,6 +29,33 @@ class TranslationResourceNotReady(ValueError):
 
 
 _translation_coordination_lock = asyncio.Lock()
+TRANSLATION_PACK_SCHEMA_VERSION = 2
+TRANSLATION_PACK_LOCALES = ("en", "pt")
+
+
+def get_locale_readiness(readiness: dict[str, Any], locale: str) -> dict[str, Any]:
+    if locale == "ru":
+        return {
+            "ready": True,
+            "canonical": True,
+            "translated": 0,
+            "required": 0,
+            "missing": [],
+            "stale": [],
+            "invalid": [],
+        }
+    return readiness.get("locales", {}).get(
+        locale,
+        {
+            "ready": False,
+            "canonical": False,
+            "translated": 0,
+            "required": 0,
+            "missing": [],
+            "stale": [],
+            "invalid": [],
+        },
+    )
 
 
 def validate_translation_pack(
@@ -36,16 +63,33 @@ def validate_translation_pack(
     registry: TranslationRegistry,
     *,
     required_locales: tuple[str, ...] = (),
+    expected_locale: str | None = None,
 ) -> None:
     errors: list[str] = []
     if not isinstance(pack, dict):
         raise TranslationPackValidationError(["pack must be an object"])
-    if pack.get("schema_version") != 1:
-        errors.append("schema_version must be 1")
+    if pack.get("schema_version") != TRANSLATION_PACK_SCHEMA_VERSION:
+        errors.append(f"schema_version must be {TRANSLATION_PACK_SCHEMA_VERSION}")
+    pack_locale = pack.get("locale")
+    if pack_locale not in TRANSLATION_PACK_LOCALES:
+        errors.append(f"unsupported pack locale: {pack_locale}")
+    if expected_locale is not None and expected_locale not in TRANSLATION_PACK_LOCALES:
+        errors.append(f"unsupported expected locale: {expected_locale}")
+    elif expected_locale is not None and pack_locale != expected_locale:
+        errors.append(
+            f"pack locale {pack_locale} does not match expected locale {expected_locale}"
+        )
     entries = pack.get("translations")
     if not isinstance(entries, list):
         errors.append("translations must be a list")
         raise TranslationPackValidationError(errors)
+
+    target_locale = expected_locale or pack_locale
+    effective_required_locales = (
+        (target_locale,)
+        if target_locale in TRANSLATION_PACK_LOCALES
+        else tuple(required_locales)
+    )
 
     seen: Counter[tuple[Any, Any]] = Counter()
     present: set[tuple[str, str]] = set()
@@ -61,8 +105,13 @@ def validate_translation_pack(
         seen[entry_id] += 1
         if seen[entry_id] > 1:
             errors.append(f"duplicate translation entry: {locale}/{key}")
-        if locale not in SUPPORTED_TELEGRAM_LOCALES:
+        if locale != pack_locale:
+            errors.append(f"entry locale does not match pack locale: {locale}/{key}")
+        if locale not in TRANSLATION_PACK_LOCALES:
             errors.append(f"unsupported locale: {locale}")
+            continue
+        if locale == "ru":
+            errors.append("Russian is the canonical source and cannot be imported")
             continue
         source = registry.get(key)
         if source is None:
@@ -89,8 +138,8 @@ def validate_translation_pack(
                 reply_button_values.setdefault(locale, {})[text] = key
         present.add((locale, key))
 
-    for locale in required_locales:
-        if locale not in SUPPORTED_TELEGRAM_LOCALES:
+    for locale in effective_required_locales:
+        if locale not in TRANSLATION_PACK_LOCALES:
             errors.append(f"unsupported required locale: {locale}")
             continue
         for key in registry.required_keys():
@@ -105,31 +154,36 @@ async def export_translation_pack(
     session,
     registry: TranslationRegistry,
     *,
-    locales: tuple[str, ...] = ("en", "pt"),
+    locale: str,
 ) -> dict[str, Any]:
+    if locale not in TRANSLATION_PACK_LOCALES:
+        raise ValueError(f"unsupported translation pack locale: {locale}")
     rows = (
         await session.execute(
             select(BotTranslation.locale, BotTranslation.translation_key, BotTranslation.text)
-            .where(BotTranslation.locale.in_(locales))
+            .where(BotTranslation.locale == locale)
             .order_by(BotTranslation.locale, BotTranslation.translation_key)
         )
     ).all()
     stored = {(locale, key): value for locale, key, value in rows}
     entries = []
-    for locale in locales:
-        for key in registry.keys():
-            source = registry.get(key)
-            if source is None:
-                continue
-            entries.append(
-                {
-                    "locale": locale,
-                    "translation_key": key,
-                    "source_hash": source.source_hash,
-                    "text": stored.get((locale, key), ""),
-                }
-            )
-    return {"schema_version": 1, "translations": entries}
+    for key in registry.keys():
+        source = registry.get(key)
+        if source is None:
+            continue
+        entries.append(
+            {
+                "locale": locale,
+                "translation_key": key,
+                "source_hash": source.source_hash,
+                "text": stored.get((locale, key), ""),
+            }
+        )
+    return {
+        "schema_version": TRANSLATION_PACK_SCHEMA_VERSION,
+        "locale": locale,
+        "translations": entries,
+    }
 
 
 async def _acquire_translation_lock(session) -> None:
@@ -363,9 +417,10 @@ async def commit_readiness_critical_mutation(session) -> None:
                     await session.rollback()
                     details = []
                     for locale in required_locales:
-                        report = readiness.get(locale, {})
+                        report = get_locale_readiness(readiness, locale)
                         details.extend(report.get("missing", [])[:3])
                         details.extend(report.get("stale", [])[:3])
+                        details.extend(report.get("invalid", [])[:3])
                     raise TranslationResourceNotReady(
                         "Translations are required before activation: " + ", ".join(details)
                     )
@@ -378,6 +433,7 @@ async def import_translation_pack(
     *,
     registry: TranslationRegistry | None = None,
     required_locales: tuple[str, ...] | None = None,
+    expected_locale: str | None = None,
 ) -> int:
     from translation_registry import build_translation_registry
 
@@ -385,20 +441,21 @@ async def import_translation_pack(
         async with translation_coordination_lock(session):
             active_registry = registry or await build_translation_registry(session)
             config = await session.get(BotGeneralConfig, 1)
+            pack_locale = pack.get("locale") if isinstance(pack, dict) else None
+            target_locale = expected_locale or pack_locale
             if required_locales is None:
-                required_locales = tuple(
-                    locale
-                    for locale in normalize_enabled_languages(
-                        getattr(config, "telegram_enabled_languages", '["ru"]')
-                        if config
-                        else '["ru"]'
-                    )
-                    if locale != "ru"
+                required_locales = (
+                    (target_locale,)
+                    if target_locale in TRANSLATION_PACK_LOCALES
+                    else ()
                 )
+            elif target_locale in TRANSLATION_PACK_LOCALES and target_locale not in required_locales:
+                required_locales = (*required_locales, target_locale)
             validate_translation_pack(
                 pack,
                 active_registry,
                 required_locales=required_locales,
+                expected_locale=expected_locale,
             )
             entries = pack["translations"]
             bind = session.get_bind()
@@ -481,25 +538,49 @@ async def audit_translation_readiness(
         )
     ).all()
     by_key = {(locale, key): (value, stored_hash) for locale, key, value, stored_hash in rows}
-    missing: dict[str, list[str]] = {}
-    stale: dict[str, list[str]] = {}
+    locale_reports: dict[str, dict[str, Any]] = {}
     for locale in locales:
         if locale == "ru":
+            locale_reports[locale] = get_locale_readiness({}, locale)
             continue
+        missing: list[str] = []
+        stale: list[str] = []
+        invalid: list[str] = []
+        translated = 0
         for key in registry.required_keys():
+            source = registry.get(key)
             row = by_key.get((locale, key))
-            if row is None:
-                missing.setdefault(locale, []).append(key)
-            elif row[1] != registry.get(key).source_hash:
-                stale.setdefault(locale, []).append(key)
+            if row is None or row[0] == "":
+                missing.append(key)
+                continue
+            if not isinstance(row[0], str):
+                invalid.append(key)
+                continue
+            if row[1] != source.source_hash:
+                stale.append(key)
+                continue
+            try:
+                validate_translation_value(source, row[0])
+            except (TypeError, ValueError):
+                invalid.append(key)
+                continue
+            translated += 1
+        locale_reports[locale] = {
+            "ready": not missing and not stale and not invalid,
+            "canonical": False,
+            "translated": translated,
+            "required": len(registry.required_keys()),
+            "missing": missing,
+            "stale": stale,
+            "invalid": invalid,
+        }
     orphaned = sorted(
         f"{locale}/{key}"
         for locale, key in by_key
         if locale not in SUPPORTED_TELEGRAM_LOCALES or registry.get(key) is None
     )
     return {
-        "ready": not missing and not stale,
-        "missing": missing,
-        "stale": stale,
+        "ready": all(report["ready"] for report in locale_reports.values()),
+        "locales": locale_reports,
         "orphaned": orphaned,
     }
