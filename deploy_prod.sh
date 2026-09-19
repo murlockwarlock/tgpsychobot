@@ -236,6 +236,7 @@ else
              --revision '${REVISION}' \
              --pm2-names '${PM2_NAMES}' \
              --root '${REMOTE_DIR}' \
+             --startup-settle-seconds 30 \
              --log-baseline "\$baseline_path""
 fi
 

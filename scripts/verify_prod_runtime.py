@@ -503,6 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--revision")
     parser.add_argument("--pm2-names", required=True)
     parser.add_argument("--root", default=".")
+    parser.add_argument("--startup-settle-seconds", type=float, default=0.0)
     parser.add_argument("--settle-seconds", type=float, default=3.0)
     parser.add_argument("--create-log-baseline", action="store_true")
     parser.add_argument("--baseline-source-names")
@@ -554,6 +555,16 @@ def main() -> int:
         errors.append("pm2_unavailable")
     first_pm2_errors = validate_pm2_snapshot(first_snapshot, expected_names)
     errors.extend(first_pm2_errors)
+
+    if args.startup_settle_seconds > 0:
+        time.sleep(args.startup_settle_seconds)
+        try:
+            first_snapshot = load_pm2_snapshot()
+        except RuntimeError:
+            first_snapshot = {}
+            errors.append("pm2_unavailable_after_startup_settle")
+        first_pm2_errors = validate_pm2_snapshot(first_snapshot, expected_names)
+        errors.extend(first_pm2_errors)
 
     if args.settle_seconds > 0:
         time.sleep(args.settle_seconds)
@@ -625,6 +636,8 @@ def main() -> int:
         )
     )
     print(f"stability={'ok' if not stability_errors else 'failed'}")
+    if stability_errors:
+        print("stability_errors=" + ",".join(stability_errors))
     print(f"migration={'ok' if not migration_errors else 'failed'}")
     if log_indeterminate:
         print("startup_log_indeterminate=" + ",".join(log_indeterminate))
