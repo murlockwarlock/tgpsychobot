@@ -208,6 +208,45 @@ def test_new_chat_not_found_is_nonfatal(tmp_path):
     assert result.status == LOG_CLEAN
 
 
+def test_chat_not_found_with_automation_context_is_nonfatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "ERROR:automation_events:Automation action failed: event=46 handler\n"
+                "Traceback (most recent call last):\n"
+                "RuntimeError: 123: Telegram server says - Bad Request: chat not found\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_chat_not_found_does_not_hide_migration_context_failure(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "ERROR:database:Migration failed\n"
+                "Traceback (most recent call last):\n"
+                "RuntimeError: 123: Telegram server says - Bad Request: chat not found\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_ERROR
+    assert result.reason == "startup_error"
+
+
 def test_other_telegram_bad_request_remains_fatal(tmp_path):
     log_path = tmp_path / "bot-error.log"
     log_path.write_text("historical\n", encoding="utf-8")
@@ -706,6 +745,7 @@ def test_verifier_failure_is_not_masked_by_remote_shell_chain():
     deploy_script = (REPO_ROOT / "deploy_prod.sh").read_text(encoding="utf-8")
     assert "scripts/cutover_bot_instance.py" in deploy_script
     assert "--settle-seconds 3" in deploy_script
+    assert "--startup-settle-seconds 30" in deploy_script
     assert "--allow-rename &&" in deploy_script
     assert 'pm2 delete "\\$legacy_name"' not in deploy_script
 
@@ -760,6 +800,123 @@ def test_main_revision_check_and_pm2_validation(
             assert "revision=failed" in output
     finally:
         _remove_baseline(baseline_path)
+
+
+def test_main_uses_post_reload_snapshot_as_stability_baseline(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    initial = _process(log_path=log_path, pid=101, restart_time=4)
+    settled = _process(log_path=log_path, pid=202, restart_time=5)
+    baseline_path, _ = _baseline_for(tmp_path, initial)
+    (tmp_path / "REVISION").write_text("expected\n", encoding="utf-8")
+    snapshots = iter(
+        [
+            {"psy5d_new": initial},
+            {"psy5d_new": settled},
+            {"psy5d_new": settled},
+        ]
+    )
+    sleeps = []
+
+    monkeypatch.setattr(verifier, "load_pm2_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(verifier.time, "sleep", sleeps.append)
+
+    async def migrations_ok(_snapshot, _expected_names):
+        return 1, []
+
+    monkeypatch.setattr(verifier, "verify_migrations", migrations_ok)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_prod_runtime.py",
+            "--revision",
+            "expected",
+            "--pm2-names",
+            "psy5d_new",
+            "--root",
+            str(tmp_path),
+            "--startup-settle-seconds",
+            "30",
+            "--settle-seconds",
+            "3",
+            "--log-baseline",
+            str(baseline_path),
+        ],
+    )
+
+    try:
+        result = verifier.main()
+        output = capsys.readouterr().out
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result == 0
+    assert "stability=ok" in output
+    assert "verification=ok" in output
+    assert sleeps == [30.0, 3.0]
+
+
+def test_main_fails_for_restart_after_post_reload_baseline(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    initial = _process(log_path=log_path, pid=101, restart_time=4)
+    settled = _process(log_path=log_path, pid=202, restart_time=5)
+    unstable = _process(log_path=log_path, pid=303, restart_time=6)
+    baseline_path, _ = _baseline_for(tmp_path, initial)
+    (tmp_path / "REVISION").write_text("expected\n", encoding="utf-8")
+    snapshots = iter(
+        [
+            {"psy5d_new": initial},
+            {"psy5d_new": settled},
+            {"psy5d_new": unstable},
+        ]
+    )
+
+    monkeypatch.setattr(verifier, "load_pm2_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(verifier.time, "sleep", lambda _seconds: None)
+
+    async def migrations_ok(_snapshot, _expected_names):
+        return 1, []
+
+    monkeypatch.setattr(verifier, "verify_migrations", migrations_ok)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_prod_runtime.py",
+            "--revision",
+            "expected",
+            "--pm2-names",
+            "psy5d_new",
+            "--root",
+            str(tmp_path),
+            "--startup-settle-seconds",
+            "30",
+            "--settle-seconds",
+            "3",
+            "--log-baseline",
+            str(baseline_path),
+        ],
+    )
+
+    try:
+        result = verifier.main()
+        output = capsys.readouterr().out
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result == 1
+    assert "stability=failed" in output
+    assert "stability_errors=pid_changed:psy5d_new,restart_count_changed:psy5d_new" in output
 
 
 def test_baseline_creation_failure_does_not_accept_missing_process():
