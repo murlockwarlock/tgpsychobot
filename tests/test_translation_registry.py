@@ -80,7 +80,8 @@ def test_pack_validation_allows_label_changes_but_preserves_targets():
         TranslationSource("ui.buttons", "[Open](btn:open) | [Docs](https://example.com/docs)"),
     ])
     pack = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "locale": "en",
         "translations": [{
             "locale": "en",
             "translation_key": "ui.buttons",
@@ -97,7 +98,8 @@ def test_pack_validation_rejects_target_changes_without_writes():
         TranslationSource("ui.buttons", "[Open](btn:open)"),
     ])
     pack = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "locale": "en",
         "translations": [{
             "locale": "en",
             "translation_key": "ui.buttons",
@@ -116,7 +118,8 @@ def test_pack_validation_rejects_incomplete_enabled_locale():
         TranslationSource("ui.two", "Two"),
     ])
     pack = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "locale": "en",
         "translations": [{
             "locale": "en",
             "translation_key": "ui.one",
@@ -134,7 +137,8 @@ def test_pack_validation_rejects_incomplete_enabled_locale():
 def test_pack_validation_rejects_empty_required_translation():
     registry = TranslationRegistry([TranslationSource("ui.one", "One")])
     pack = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "locale": "en",
         "translations": [{
             "locale": "en",
             "translation_key": "ui.one",
@@ -154,7 +158,8 @@ def test_pack_validation_rejects_html_link_target_changes():
         TranslationSource("ui.link", '<a href="https://example.com">Открыть</a>')
     ])
     pack = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "locale": "en",
         "translations": [{
             "locale": "en",
             "translation_key": "ui.link",
@@ -170,7 +175,8 @@ def test_pack_validation_rejects_html_link_target_changes():
 def test_pack_validation_enforces_telegram_text_and_caption_limits():
     message_registry = TranslationRegistry([TranslationSource("ui.message", "Текст")])
     message_pack = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "locale": "en",
         "translations": [{
             "locale": "en",
             "translation_key": "ui.message",
@@ -185,7 +191,8 @@ def test_pack_validation_enforces_telegram_text_and_caption_limits():
         TranslationSource("ui.caption", "Подпись", kind="caption"),
     ])
     caption_pack = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "locale": "en",
         "translations": [{
             "locale": "en",
             "translation_key": "ui.caption",

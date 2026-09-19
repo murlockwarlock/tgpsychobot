@@ -266,31 +266,62 @@ def admin_general_settings_keyboard(config):
 
 def admin_language_settings_keyboard(config, readiness=None):
     builder = InlineKeyboardBuilder()
-    enabled = set(normalize_enabled_languages(getattr(config, "telegram_enabled_languages", '["ru"]')))
-    default_locale = getattr(config, "telegram_default_language", "ru") or "ru"
     selector_enabled = bool(getattr(config, "telegram_language_selection_enabled", False))
-    readiness = readiness or {}
 
     builder.button(
-        text=f"Выбор языка: {'✅ включён' if selector_enabled else '❌ выключен'}",
+        text="🟢 Выключить выбор языка" if selector_enabled else "🔴 Включить выбор языка",
         callback_data="admin_language_toggle_selector",
     )
     for locale in ("ru", "en", "pt"):
-        status = "✅" if locale in enabled else "❌"
-        default_mark = " ⭐️" if locale == default_locale else ""
-        ready_mark = " готов" if locale == "ru" or readiness.get(locale, {}).get("ready") else " не готов"
         builder.button(
-            text=f"{LOCALE_LABELS[locale]}: {status}{default_mark}{ready_mark}",
-            callback_data=f"admin_language_toggle_{locale}",
+            text=f"⚙️ {LOCALE_LABELS[locale]}",
+            callback_data=f"admin_language_locale_{locale}",
+        )
+    builder.button(text="🔎 Общий аудит", callback_data="admin_translation_audit")
+    builder.button(text="⬅️ Назад", callback_data="admin_general_settings")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_language_locale_keyboard(config, locale, readiness):
+    builder = InlineKeyboardBuilder()
+    enabled = set(
+        normalize_enabled_languages(
+            getattr(config, "telegram_enabled_languages", '["ru"]')
+        )
+    )
+    default_locale = getattr(config, "telegram_default_language", "ru") or "ru"
+    locale_code = locale.upper()
+
+    if locale in {"en", "pt"}:
+        builder.button(
+            text=f"📤 Экспорт {locale_code}",
+            callback_data=f"admin_translation_export_{locale}",
         )
         builder.button(
-            text=f"Сделать {LOCALE_LABELS[locale]} языком по умолчанию",
-            callback_data=f"admin_language_default_{locale}",
+            text=f"📥 Импорт {locale_code}",
+            callback_data=f"admin_translation_import_{locale}",
         )
-    builder.button(text="📤 Экспорт пакета", callback_data="admin_translation_export")
-    builder.button(text="📥 Импорт пакета", callback_data="admin_translation_import")
-    builder.button(text="🔎 Аудит готовности", callback_data="admin_translation_audit")
-    builder.button(text="⬅️ Назад к общим настройкам", callback_data="admin_general_settings")
+        builder.button(
+            text=f"🔎 Проверить {locale_code}",
+            callback_data=f"admin_translation_audit_{locale}",
+        )
+        if locale in enabled:
+            builder.button(
+                text=f"🚫 Выключить {locale_code}",
+                callback_data=f"admin_language_toggle_{locale}",
+            )
+        elif readiness.get("ready"):
+            builder.button(
+                text=f"✅ Включить {locale_code}",
+                callback_data=f"admin_language_toggle_{locale}",
+            )
+        if locale != default_locale and locale in enabled and readiness.get("ready"):
+            builder.button(
+                text="⭐ По умолчанию",
+                callback_data=f"admin_language_default_{locale}",
+            )
+    builder.button(text="⬅️ Назад", callback_data="admin_language_settings")
     builder.adjust(1)
     return builder.as_markup()
 
