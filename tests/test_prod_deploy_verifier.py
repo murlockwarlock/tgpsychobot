@@ -208,6 +208,45 @@ def test_new_chat_not_found_is_nonfatal(tmp_path):
     assert result.status == LOG_CLEAN
 
 
+def test_chat_not_found_with_automation_context_is_nonfatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "ERROR:automation_events:Automation action failed: event=46 handler\n"
+                "Traceback (most recent call last):\n"
+                "RuntimeError: 123: Telegram server says - Bad Request: chat not found\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_chat_not_found_does_not_hide_migration_context_failure(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("historical\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "ERROR:database:Migration failed\n"
+                "Traceback (most recent call last):\n"
+                "RuntimeError: 123: Telegram server says - Bad Request: chat not found\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_ERROR
+    assert result.reason == "startup_error"
+
+
 def test_other_telegram_bad_request_remains_fatal(tmp_path):
     log_path = tmp_path / "bot-error.log"
     log_path.write_text("historical\n", encoding="utf-8")

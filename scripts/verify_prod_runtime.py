@@ -71,6 +71,11 @@ STARTUP_CONTEXT_FAILURE_RE = re.compile(
     r"translation(?:[- ]cache)?|locale|start[_ -]?intent|benefit[_ -]?grant)",
     re.IGNORECASE,
 )
+FATAL_CONTEXT_MARKER_RE = re.compile(
+    r"database|migration|scheduler|translation(?:[- ]cache)?|locale|"
+    r"start[_ -]?intent|benefit[_ -]?grant|handler[ -]+registration",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -101,22 +106,50 @@ def _is_chat_not_found_log(block: str) -> bool:
     return any(CHAT_NOT_FOUND_RE.search(line) for line in lines)
 
 
+def _is_allowed_delivery_block(block: str) -> bool:
+    if STARTUP_ERROR_RE.search(block):
+        return False
+    context_match = STARTUP_CONTEXT_FAILURE_RE.search(block)
+    if context_match and FATAL_CONTEXT_MARKER_RE.search(context_match.group()):
+        return False
+    return _is_chat_not_found_log(block) or _is_recoverable_network_log(block)
+
+
+def _remove_allowed_delivery_context(
+    parts: list[str],
+    allowed_indexes: set[int],
+) -> str:
+    residual = list(parts)
+    for index in allowed_indexes:
+        context_index = index - 1
+        context = residual[context_index]
+        lines = context.splitlines(keepends=True)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines:
+            context_line = lines[-1]
+            context_match = STARTUP_CONTEXT_FAILURE_RE.search(context_line)
+            if context_match and not FATAL_CONTEXT_MARKER_RE.search(context_match.group()):
+                residual[context_index] = "".join(lines[:-1])
+        residual[index] = ""
+    return "".join(residual)
+
+
 def classify_log_window(content: str) -> LogCheckResult:
     if not content:
         return LogCheckResult(LOG_CLEAN)
-    if STARTUP_ERROR_RE.search(content) or STARTUP_CONTEXT_FAILURE_RE.search(content):
+
+    parts = content.split(TRACEBACK_MARKER)
+    allowed_indexes = {
+        index
+        for index, block in enumerate(parts[1:], start=1)
+        if _is_allowed_delivery_block(block)
+    }
+    if len(allowed_indexes) < len(parts) - 1:
         return LogCheckResult(LOG_ERROR, "startup_error")
 
-    blocks = content.split(TRACEBACK_MARKER)
-    for block in blocks[1:]:
-        if TELEGRAM_BAD_REQUEST_RE.search(block):
-            if _is_chat_not_found_log(block):
-                continue
-            return LogCheckResult(LOG_ERROR, "startup_error")
-        if _is_chat_not_found_log(block):
-            continue
-        if _is_recoverable_network_log(block):
-            continue
+    residual = _remove_allowed_delivery_context(parts, allowed_indexes)
+    if STARTUP_ERROR_RE.search(residual) or STARTUP_CONTEXT_FAILURE_RE.search(residual):
         return LogCheckResult(LOG_ERROR, "startup_error")
 
     if TELEGRAM_BAD_REQUEST_RE.search(content) and not _is_chat_not_found_log(content):
