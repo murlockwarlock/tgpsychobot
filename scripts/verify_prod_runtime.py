@@ -34,7 +34,8 @@ DB_CHECK_TIMEOUT_SECONDS = 10.0
 DB_DISPOSE_TIMEOUT_SECONDS = 2.0
 DB_CHECK_CONCURRENCY = 4
 MAX_LOG_SCAN_BYTES = 256 * 1024
-MAX_LIVE_LOG_SCAN_BYTES = 16 * 1024 * 1024
+MAX_LIVE_LOG_SCAN_BYTES = 128 * 1024 * 1024
+LIVE_LOG_READ_CHUNK_BYTES = 1024 * 1024
 TRACEBACK_MARKER = "Traceback (most recent call last)"
 LOG_TIMESTAMP_RE = re.compile(
     r"^\s*(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
@@ -198,6 +199,15 @@ def _timestamp_from_line(line: str) -> float | None:
     return parsed.timestamp()
 
 
+def _is_timestamped_log_header(line: str) -> bool:
+    match = LOG_TIMESTAMP_RE.match(line)
+    return (
+        match is not None
+        and _timestamp_from_line(line) is not None
+        and LOG_LEVEL_RE.search(line[match.end():]) is not None
+    )
+
+
 def _strip_log_prefix(line: str) -> str:
     match = LOG_TIMESTAMP_RE.match(line)
     value = line[match.end():] if match else line
@@ -234,10 +244,7 @@ def timestamped_log_blocks(content: str) -> list[TimestampedLogBlock]:
 
     for line in content.splitlines(keepends=True):
         line_timestamp = _timestamp_from_line(line)
-        is_log_header = (
-            line_timestamp is not None
-            and LOG_LEVEL_RE.search(line[LOG_TIMESTAMP_RE.match(line).end():]) is not None
-        )
+        is_log_header = line_timestamp is not None and _is_timestamped_log_header(line)
         if current_lines and line_timestamp is not None:
             if not traceback_open:
                 finish_block()
@@ -261,11 +268,15 @@ def timestamped_log_blocks(content: str) -> list[TimestampedLogBlock]:
 
 def _sanitize_excerpt(content: str, matched_rule: str | None) -> str:
     lines = content.splitlines()
+    needles = [matched_rule] if matched_rule else []
+    if matched_rule and ":" in matched_rule:
+        prefix, suffix = matched_rule.split(":", 1)
+        needles.append(suffix if prefix == "startup_context" else prefix)
     selected = next(
         (
             line
             for line in lines
-            if matched_rule and matched_rule.casefold() in line.casefold()
+            if any(needle.casefold() in line.casefold() for needle in needles)
         ),
         None,
     )
@@ -742,6 +753,54 @@ def recent_startup_error(
     return replace(result, log_path=path_value)
 
 
+def _find_process_start_log_boundary(
+    file_descriptor: int,
+    file_size: int,
+    process_start: float,
+) -> int | None:
+    position = file_size
+    scanned = 0
+    trailing = b""
+    while position > 0 and scanned < MAX_LIVE_LOG_SCAN_BYTES:
+        chunk_size = min(
+            LIVE_LOG_READ_CHUNK_BYTES,
+            position,
+            MAX_LIVE_LOG_SCAN_BYTES - scanned,
+        )
+        chunk_start = position - chunk_size
+        os.lseek(file_descriptor, chunk_start, os.SEEK_SET)
+        chunk = os.read(file_descriptor, chunk_size)
+        if len(chunk) != chunk_size:
+            return None
+        data = chunk + trailing
+        lines = data.splitlines(keepends=True)
+        leading = b""
+        if chunk_start > 0 and os.pread(file_descriptor, 1, chunk_start - 1) != b"\n":
+            if lines:
+                leading = lines.pop(0)
+        trailing = leading
+
+        line_offsets: list[tuple[int, bytes]] = []
+        line_offset = chunk_start + len(leading)
+        for line in lines:
+            line_offsets.append((line_offset, line))
+            line_offset += len(line)
+        for line_offset, line in reversed(line_offsets):
+            decoded_line = line.decode(errors="ignore")
+            timestamp = _timestamp_from_line(decoded_line)
+            if (
+                timestamp is not None
+                and timestamp < process_start
+                and _is_timestamped_log_header(decoded_line)
+            ):
+                return line_offset
+
+        scanned += chunk_size
+        position = chunk_start
+
+    return 0 if position == 0 else None
+
+
 def recent_startup_error_since_process_start(
     process: dict[str, Any],
 ) -> LogCheckResult:
@@ -769,8 +828,19 @@ def recent_startup_error_since_process_start(
         ):
             return LogCheckResult(LOG_INDETERMINATE, "identity_changed", log_path=log_path)
 
-        scan_size = min(initial_stat.st_size, MAX_LIVE_LOG_SCAN_BYTES)
-        offset = initial_stat.st_size - scan_size
+        offset = _find_process_start_log_boundary(
+            file_descriptor,
+            initial_stat.st_size,
+            process_start,
+        )
+        if offset is None:
+            return LogCheckResult(
+                LOG_INDETERMINATE,
+                "process_start_boundary_not_found",
+                log_path=log_path,
+                process_start_timestamp=format_timestamp(process_start),
+            )
+        scan_size = initial_stat.st_size - offset
         with os.fdopen(file_descriptor, "rb") as handle:
             file_descriptor = None
             handle.seek(offset)
@@ -799,19 +869,6 @@ def recent_startup_error_since_process_start(
                 pass
 
     decoded = content.decode(errors="ignore")
-    if offset > 0:
-        blocks = timestamped_log_blocks(decoded)
-        if not any(
-            block.timestamp is not None and block.timestamp < process_start
-            for block in blocks
-        ):
-            return LogCheckResult(
-                LOG_INDETERMINATE,
-                "process_start_boundary_not_found",
-                log_path=log_path,
-                process_start_timestamp=format_timestamp(process_start),
-            )
-
     result = classify_candidate_log_window(decoded, process_start)
     return replace(result, log_path=log_path)
 
