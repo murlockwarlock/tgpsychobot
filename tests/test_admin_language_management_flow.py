@@ -217,7 +217,7 @@ async def test_upload_shows_confirmation_then_real_import_updates_readiness(tmp_
 
         preview = upload_message.answer.await_args.args[0]
         assert "Язык: 🇬🇧 English" in preview
-        assert "Записей: 1" in preview
+        assert "Записей в файле: 1" in preview
         assert "Совпадает с этим ботом и базой: ✅" in preview
         assert "Отсутствует: 0" in preview
         assert "Устарело: 0" in preview
