@@ -269,7 +269,11 @@ def admin_language_settings_keyboard(config, readiness=None):
     selector_enabled = bool(getattr(config, "telegram_language_selection_enabled", False))
 
     builder.button(
-        text="🟢 Выключить выбор языка" if selector_enabled else "🔴 Включить выбор языка",
+        text=(
+            "⛔ Запретить пользователям выбирать язык"
+            if selector_enabled
+            else "✅ Разрешить пользователям выбирать язык"
+        ),
         callback_data="admin_language_toggle_selector",
     )
     for locale in ("ru", "en", "pt"):
@@ -277,7 +281,14 @@ def admin_language_settings_keyboard(config, readiness=None):
             text=f"⚙️ {LOCALE_LABELS[locale]}",
             callback_data=f"admin_language_locale_{locale}",
         )
-    builder.button(text="🔎 Общий аудит", callback_data="admin_translation_audit")
+    builder.button(
+        text="🔎 Проверка готовности переводов",
+        callback_data="admin_translation_audit",
+    )
+    builder.button(
+        text="↩️ Вернуть только русский",
+        callback_data="admin_language_ru_only",
+    )
     builder.button(text="⬅️ Назад", callback_data="admin_general_settings")
     builder.adjust(1)
     return builder.as_markup()
@@ -290,7 +301,6 @@ def admin_language_locale_keyboard(config, locale, readiness):
             getattr(config, "telegram_enabled_languages", '["ru"]')
         )
     )
-    default_locale = getattr(config, "telegram_default_language", "ru") or "ru"
     locale_code = locale.upper()
 
     if locale in {"en", "pt"}:
@@ -316,12 +326,62 @@ def admin_language_locale_keyboard(config, locale, readiness):
                 text=f"✅ Включить {locale_code}",
                 callback_data=f"admin_language_toggle_{locale}",
             )
-        if locale != default_locale and locale in enabled and readiness.get("ready"):
-            builder.button(
-                text="⭐ По умолчанию",
-                callback_data=f"admin_language_default_{locale}",
-            )
     builder.button(text="⬅️ Назад", callback_data="admin_language_settings")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_translation_readiness_keyboard():
+    builder = InlineKeyboardBuilder()
+    for locale in ("en", "pt"):
+        locale_code = locale.upper()
+        builder.button(
+            text=f"📤 Экспорт {locale_code}",
+            callback_data=f"admin_translation_export_{locale}",
+        )
+        builder.button(
+            text=f"📥 Импорт {locale_code}",
+            callback_data=f"admin_translation_import_{locale}",
+        )
+    builder.button(text="⬅️ Назад", callback_data="admin_language_settings")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_translation_import_confirmation_keyboard(locale: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"✅ Подтвердить импорт {locale.upper()}",
+        callback_data="admin_translation_import_confirm",
+    )
+    builder.button(
+        text="❌ Отмена",
+        callback_data="admin_translation_import_cancel",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_translation_import_upload_keyboard(locale: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"❌ Отмена импорта {locale.upper()}",
+        callback_data="admin_translation_import_cancel",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_language_ru_only_confirmation_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ Вернуть только русский",
+        callback_data="admin_language_ru_only_confirm",
+    )
+    builder.button(
+        text="❌ Отмена",
+        callback_data="admin_language_ru_only_cancel",
+    )
     builder.adjust(1)
     return builder.as_markup()
 
