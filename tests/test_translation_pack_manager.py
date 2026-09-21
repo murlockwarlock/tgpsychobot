@@ -140,7 +140,7 @@ def test_translation_pack_errors_are_explained_in_russian():
 
     assert any("другого бота" in message for message in messages)
     assert any("изменения русского текста" in message.lower() for message in messages)
-    assert any("формат" in message.lower() for message in messages)
+    assert any("плейсхолдеры" in message.lower() for message in messages)
     assert any("обязательных переводов" in message.lower() for message in messages)
 
 
