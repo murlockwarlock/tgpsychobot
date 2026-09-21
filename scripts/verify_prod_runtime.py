@@ -38,6 +38,9 @@ DB_CHECK_CONCURRENCY = 4
 MAX_LOG_SCAN_BYTES = 256 * 1024
 MAX_LIVE_LOG_SCAN_BYTES = 128 * 1024 * 1024
 LIVE_LOG_READ_CHUNK_BYTES = 1024 * 1024
+MAX_FORWARD_LOG_BYTES = 16 * 1024 * 1024
+MAX_FORWARD_TOTAL_LOG_BYTES = 64 * 1024 * 1024
+FORWARD_LOG_POLL_SECONDS = 10.0
 TRACEBACK_MARKER = "Traceback (most recent call last)"
 LOG_TIMESTAMP_RE = re.compile(
     r"^[ \t]*(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
@@ -605,7 +608,148 @@ def _log_baseline_entry(
         "pid": pid,
         "restart_count": restart_count,
         "pm_uptime": process_start,
+        "status": process_status(process),
     }
+
+
+def capture_forward_log_baseline(
+    snapshot: dict[str, dict[str, Any]],
+    expected_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    captured_at = time.time()
+    baseline: dict[str, dict[str, Any]] = {}
+    for name in expected_names:
+        process = snapshot.get(name)
+        if process is None:
+            raise RuntimeError(f"missing PM2 process for {name}")
+        if process_status(process) != "online":
+            raise RuntimeError(f"PM2 process is not online for {name}")
+        entry = _log_baseline_entry(name, process)
+        entry["captured_at"] = captured_at
+        baseline[name] = entry
+    return baseline
+
+
+def _forward_log_stat(path: str) -> os.stat_result:
+    file_stat = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise RuntimeError("log_not_regular")
+    return file_stat
+
+
+def validate_forward_snapshot(
+    snapshot: dict[str, dict[str, Any]],
+    expected_names: list[str],
+    baseline: dict[str, dict[str, Any]],
+    last_sizes: dict[str, int],
+) -> list[str]:
+    errors = validate_pm2_snapshot(snapshot, expected_names)
+    for name in expected_names:
+        process = snapshot.get(name)
+        entry = baseline.get(name)
+        if process is None or entry is None:
+            continue
+        if process_status(process) != entry["status"]:
+            errors.append(f"status_changed:{name}")
+        if process_pid(process) != entry["pid"]:
+            errors.append(f"pid_changed:{name}")
+        restart_count = process_restart_count(process)
+        if restart_count is None:
+            errors.append(f"restart_count_unavailable:{name}")
+        elif restart_count != entry["restart_count"]:
+            errors.append(f"restart_count_changed:{name}")
+        process_start = pm_process_start_timestamp(process)
+        if process_start is None:
+            errors.append(f"pm_uptime_unavailable:{name}")
+        elif process_start != entry["pm_uptime"]:
+            errors.append(f"pm_uptime_changed:{name}")
+        log_path = pm2_env(process).get("pm_err_log_path")
+        if log_path != entry["path"]:
+            errors.append(f"log_path_changed:{name}")
+            continue
+        try:
+            file_stat = _forward_log_stat(entry["path"])
+        except OSError:
+            errors.append(f"log_unreadable:{name}")
+            continue
+        except RuntimeError as exc:
+            errors.append(f"{exc}:{name}")
+            continue
+        if (file_stat.st_dev, file_stat.st_ino) != (
+            entry["device"],
+            entry["inode"],
+        ):
+            errors.append(f"log_identity_changed:{name}")
+            continue
+        previous_size = last_sizes.get(name, entry["offset"])
+        if file_stat.st_size < previous_size:
+            errors.append(f"log_truncated:{name}")
+            continue
+        last_sizes[name] = file_stat.st_size
+    return errors
+
+
+def read_forward_log_bytes(
+    entry: dict[str, Any],
+    end_offset: int,
+) -> tuple[bytes, str | None]:
+    log_path = entry["path"]
+    start_offset = entry["offset"]
+    if end_offset < start_offset:
+        return b"", "log_truncated"
+    byte_count = end_offset - start_offset
+    if byte_count > MAX_FORWARD_LOG_BYTES:
+        return b"", "forward_log_window_too_large"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            log_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        initial_stat = os.fstat(descriptor)
+        path_stat = _forward_log_stat(log_path)
+        identity = (entry["device"], entry["inode"])
+        if (
+            not stat.S_ISREG(initial_stat.st_mode)
+            or (initial_stat.st_dev, initial_stat.st_ino) != identity
+            or (path_stat.st_dev, path_stat.st_ino) != identity
+        ):
+            return b"", "log_identity_changed"
+        if initial_stat.st_size < end_offset:
+            return b"", "log_truncated"
+        chunks: list[bytes] = []
+        position = start_offset
+        while position < end_offset:
+            chunk_size = min(LIVE_LOG_READ_CHUNK_BYTES, end_offset - position)
+            if hasattr(os, "pread"):
+                chunk = os.pread(descriptor, chunk_size, position)
+            else:
+                os.lseek(descriptor, position, os.SEEK_SET)
+                chunk = os.read(descriptor, chunk_size)
+            if not chunk:
+                return b"", "log_read_incomplete"
+            chunks.append(chunk)
+            position += len(chunk)
+        final_stat = os.fstat(descriptor)
+        final_path_stat = _forward_log_stat(log_path)
+        if (
+            (final_stat.st_dev, final_stat.st_ino) != identity
+            or (final_path_stat.st_dev, final_path_stat.st_ino) != identity
+        ):
+            return b"", "log_identity_changed"
+        if final_stat.st_size < end_offset or final_path_stat.st_size < end_offset:
+            return b"", "log_truncated"
+        return b"".join(chunks), None
+    except OSError:
+        return b"", "log_unreadable"
+    except RuntimeError as exc:
+        return b"", str(exc)
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def create_log_baseline(
@@ -1166,6 +1310,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup-settle-seconds", type=float, default=0.0)
     parser.add_argument("--settle-seconds", type=float, default=3.0)
     parser.add_argument("--verification-only", action="store_true")
+    parser.add_argument("--forward-only", action="store_true")
+    parser.add_argument("--observe-seconds", type=float, default=300.0)
     parser.add_argument("--create-log-baseline", action="store_true")
     parser.add_argument("--baseline-source-names")
     parser.add_argument("--log-baseline")
@@ -1191,9 +1337,345 @@ def print_log_diagnostic(
     print("startup_log_detail=" + json.dumps(detail, ensure_ascii=True, sort_keys=True))
 
 
+def print_forward_log_diagnostic(
+    process_name: str,
+    entry: dict[str, Any],
+    result: LogCheckResult,
+) -> None:
+    detail = {
+        "process": process_name,
+        "log_file": Path(entry["path"]).name,
+        "classification": result.classification or result.status,
+        "first_timestamp": result.first_timestamp,
+        "process_start_timestamp": format_timestamp(entry["pm_uptime"]),
+        "baseline_timestamp": format_timestamp(entry["captured_at"]),
+        "matched_rule": result.matched_rule or result.reason,
+        "excerpt": result.excerpt,
+    }
+    print("forward_log_detail=" + json.dumps(detail, ensure_ascii=True, sort_keys=True))
+
+
+def verify_forward_only(
+    revision: str,
+    root: str,
+    expected_names: list[str],
+    observe_seconds: float = 300.0,
+) -> int:
+    revision_path = Path(root) / "REVISION"
+    try:
+        current_revision = revision_path.read_text().strip()
+    except OSError:
+        current_revision = ""
+    revision_ok = current_revision == revision
+    errors: list[str] = []
+    if not revision_ok:
+        errors.append("revision_mismatch")
+
+    try:
+        initial_snapshot = load_pm2_snapshot()
+    except RuntimeError:
+        initial_snapshot = {}
+        errors.append("pm2_unavailable")
+
+    initial_pm2_errors = validate_pm2_snapshot(initial_snapshot, expected_names)
+    errors.extend(initial_pm2_errors)
+    baseline: dict[str, dict[str, Any]] = {}
+    last_sizes: dict[str, int] = {}
+    stability_errors: list[str] = []
+    fatal_log_names: list[str] = []
+    log_window_failures: list[str] = []
+    log_diagnostics: list[tuple[str, dict[str, Any], LogCheckResult]] = []
+    tolerated_events: list[str] = []
+    bytes_by_process: dict[str, int] = {name: 0 for name in expected_names}
+    window_end_offsets: dict[str, int] = {}
+    log_window_complete = False
+    observation_started = time.monotonic()
+    observation_duration = 0.0
+    final_snapshot = initial_snapshot
+
+    if not initial_pm2_errors:
+        try:
+            baseline = capture_forward_log_baseline(initial_snapshot, expected_names)
+            last_sizes = {
+                name: entry["offset"] for name, entry in baseline.items()
+            }
+            observation_started = time.monotonic()
+        except (OSError, RuntimeError):
+            errors.append("forward_baseline_unavailable")
+            log_window_failures.append("forward_baseline_unavailable")
+
+    if baseline:
+        try:
+            latest_snapshot = load_pm2_snapshot()
+        except RuntimeError:
+            latest_snapshot = {}
+            stability_errors.append("pm2_unavailable_after_baseline")
+        final_snapshot = latest_snapshot
+        stability_errors.extend(
+            validate_forward_snapshot(
+                latest_snapshot,
+                expected_names,
+                baseline,
+                last_sizes,
+            )
+        )
+
+        deadline = observation_started + max(0.0, observe_seconds)
+        while not stability_errors:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(FORWARD_LOG_POLL_SECONDS, remaining))
+            try:
+                latest_snapshot = load_pm2_snapshot()
+            except RuntimeError:
+                latest_snapshot = {}
+                stability_errors.append("pm2_unavailable_during_observation")
+                break
+            final_snapshot = latest_snapshot
+            sample_errors = validate_forward_snapshot(
+                latest_snapshot,
+                expected_names,
+                baseline,
+                last_sizes,
+            )
+            if sample_errors:
+                stability_errors.extend(sample_errors)
+                break
+
+        observation_duration = max(0.0, time.monotonic() - observation_started)
+        if not stability_errors:
+            try:
+                observed_snapshot = load_pm2_snapshot()
+            except RuntimeError:
+                observed_snapshot = {}
+                stability_errors.append("pm2_unavailable_at_observation_end")
+            final_snapshot = observed_snapshot
+            stability_errors.extend(
+                validate_forward_snapshot(
+                    observed_snapshot,
+                    expected_names,
+                    baseline,
+                    last_sizes,
+                )
+            )
+            if not stability_errors:
+                window_end_offsets = last_sizes.copy()
+                for name in expected_names:
+                    entry = baseline[name]
+                    end_offset = window_end_offsets[name]
+                    if (
+                        sum(bytes_by_process.values())
+                        + end_offset
+                        - entry["offset"]
+                        > MAX_FORWARD_TOTAL_LOG_BYTES
+                    ):
+                        log_window_failures.append("forward_total_log_window_too_large")
+                        stability_errors.append("forward_total_log_window_too_large")
+                        break
+                    content, read_error = read_forward_log_bytes(entry, end_offset)
+                    if read_error:
+                        log_window_failures.append(f"{read_error}:{name}")
+                        stability_errors.append(f"{read_error}:{name}")
+                        continue
+                    bytes_by_process[name] = len(content)
+                    result = classify_log_window(content.decode(errors="ignore"))
+                    if result.status == LOG_ERROR:
+                        fatal_log_names.append(name)
+                        log_diagnostics.append(
+                            (
+                                name,
+                                observed_snapshot[name],
+                                replace(
+                                    result,
+                                    log_path=entry["path"],
+                                    classification="fatal_candidate_error",
+                                    process_start_timestamp=format_timestamp(
+                                        entry["pm_uptime"]
+                                    ),
+                                ),
+                            )
+                        )
+                    elif _is_chat_not_found_log(content.decode(errors="ignore")):
+                        tolerated_events.append(f"{name}:chat_not_found")
+                    elif _is_recoverable_network_log(content.decode(errors="ignore")):
+                        tolerated_events.append(f"{name}:recoverable_network")
+
+                log_window_complete = not log_window_failures
+
+                try:
+                    final_snapshot = load_pm2_snapshot()
+                except RuntimeError:
+                    final_snapshot = {}
+                    stability_errors.append("pm2_unavailable_after_log_read")
+                stability_errors.extend(
+                    validate_forward_snapshot(
+                        final_snapshot,
+                        expected_names,
+                        baseline,
+                        last_sizes,
+                    )
+                )
+
+    errors.extend(f"stability:{error}" for error in stability_errors)
+    errors.extend(f"startup_log_error:{name}" for name in fatal_log_names)
+    if log_window_failures:
+        errors.append("startup_log_indeterminate")
+    if stability_errors and not baseline:
+        errors.append("startup_log_indeterminate")
+
+    final_pm2_errors = validate_pm2_snapshot(final_snapshot, expected_names)
+    errors.extend(final_pm2_errors)
+    try:
+        checked_migrations, migration_errors = asyncio.run(
+            verify_migrations(final_snapshot, expected_names)
+        )
+    except Exception:
+        checked_migrations, migration_errors = 0, ["migration_verifier_failed"]
+    errors.extend(migration_errors)
+    expected_telegram_migrations = sum(
+        1
+        for name in expected_names
+        if name in final_snapshot and process_is_telegram(final_snapshot[name])
+    )
+    if checked_migrations != expected_telegram_migrations:
+        errors.append("migration_not_checked")
+
+    classified_log_errors = bool(log_diagnostics)
+    indeterminate_logs = (
+        not log_window_complete or bool(log_window_failures)
+    ) and not classified_log_errors
+    print(f"revision={'ok' if revision_ok else 'failed'}")
+    print(f"runtime={'ok' if not final_pm2_errors else 'failed'}")
+    print(
+        "pm2={} expected={} migrations_checked={} startup_errors={}".format(
+            "ok" if not final_pm2_errors else "failed",
+            len(expected_names),
+            checked_migrations,
+            "found"
+            if classified_log_errors
+            else "indeterminate"
+            if indeterminate_logs
+            else "none",
+        )
+    )
+    print(f"stability={'failed' if stability_errors else 'ok'}")
+    if stability_errors:
+        print("stability_errors=" + ",".join(stability_errors))
+    print(f"migration={'ok' if not migration_errors else 'failed'}")
+    print(f"forward_observation_seconds={observation_duration:.1f}")
+    print(f"forward_log_bytes_scanned={sum(bytes_by_process.values())}")
+    print(
+        "forward_processes="
+        + json.dumps(
+            {
+                name: {
+                    "status": process_status(final_snapshot[name])
+                    if name in final_snapshot
+                    else "missing",
+                    "pid": process_pid(final_snapshot[name])
+                    if name in final_snapshot
+                    else None,
+                    "restart_count": process_restart_count(final_snapshot[name])
+                    if name in final_snapshot
+                    else None,
+                    "pm_uptime": pm_process_start_timestamp(final_snapshot[name])
+                    if name in final_snapshot
+                    else None,
+                    "log_file": Path(baseline[name]["path"]).name
+                    if name in baseline
+                    else None,
+                    "log_device": baseline[name]["device"]
+                    if name in baseline
+                    else None,
+                    "log_inode": baseline[name]["inode"]
+                    if name in baseline
+                    else None,
+                    "log_offset": window_end_offsets.get(name),
+                    "log_bytes": bytes_by_process[name],
+                }
+                for name in expected_names
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+    )
+    if baseline:
+        print(
+            "forward_baseline="
+            + json.dumps(
+                {
+                    name: {
+                        "status": entry["status"],
+                        "pid": entry["pid"],
+                        "restart_count": entry["restart_count"],
+                        "pm_uptime": entry["pm_uptime"],
+                        "log_path": entry["path"],
+                        "device": entry["device"],
+                        "inode": entry["inode"],
+                        "offset": entry["offset"],
+                        "captured_at": entry["captured_at"],
+                    }
+                    for name, entry in baseline.items()
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        )
+    if tolerated_events:
+        print("forward_tolerated_events=" + ",".join(tolerated_events))
+    for process_name, process, result in log_diagnostics:
+        print_forward_log_diagnostic(
+            process_name,
+            baseline[process_name],
+            result,
+        )
+    for failure in log_window_failures:
+        if ":" in failure:
+            process_name = failure.rsplit(":", 1)[-1]
+            entry = baseline.get(process_name)
+            detail = {
+                "process": process_name,
+                "log_file": Path(entry["path"]).name if entry else "unknown",
+                "classification": "verification_indeterminate",
+                "first_timestamp": None,
+                "process_start_timestamp": format_timestamp(entry["pm_uptime"])
+                if entry
+                else None,
+                "matched_rule": failure.rsplit(":", 1)[0],
+                "excerpt": None,
+            }
+            print("forward_log_detail=" + json.dumps(detail, ensure_ascii=True, sort_keys=True))
+    if migration_errors:
+        print("migration_errors=" + ",".join(migration_errors))
+    if errors:
+        print("verification=failed")
+        return 1
+    print("verification=ok")
+    return 0
+
+
 def main() -> int:
     args = build_parser().parse_args()
     expected_names = parse_names(args.pm2_names)
+
+    if args.forward_only:
+        if (
+            not args.verification_only
+            or args.log_baseline
+            or args.create_log_baseline
+            or not args.revision
+            or not math.isfinite(args.observe_seconds)
+            or args.observe_seconds < 0
+        ):
+            print("verification=failed")
+            return 1
+        return verify_forward_only(
+            args.revision,
+            args.root,
+            expected_names,
+            args.observe_seconds,
+        )
 
     if args.create_log_baseline:
         if args.verification_only:
