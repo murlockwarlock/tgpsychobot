@@ -86,6 +86,12 @@ RECOVERABLE_TELEGRAM_NETWORK_RE = re.compile(
     r"ServerDisconnectedError|TimeoutError)\b",
     re.IGNORECASE | re.MULTILINE,
 )
+RECOVERABLE_DISPATCHER_NETWORK_RE = re.compile(
+    r"^[ \t]*ERROR:aiogram\.dispatcher:Failed to fetch updates - "
+    r"TelegramNetworkError: HTTP Client says - "
+    r"(?:ServerDisconnectedError: Server disconnected|Request timeout error)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 STARTUP_ERROR_RE = re.compile(
     r"ModuleNotFoundError"
     r"|ImportError"
@@ -139,6 +145,7 @@ def _is_recoverable_network_log(block: str) -> bool:
     return (
         RECOVERABLE_NETWORK_EXCEPTION_RE.search(block) is not None
         or RECOVERABLE_TELEGRAM_NETWORK_RE.search(block) is not None
+        or RECOVERABLE_DISPATCHER_NETWORK_RE.search(block) is not None
     )
 
 
