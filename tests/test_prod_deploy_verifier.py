@@ -182,6 +182,147 @@ def test_log_append_ignores_history_and_detects_new_error(tmp_path):
         _remove_baseline(baseline_path)
 
 
+def test_forward_baseline_ignores_historical_un_timestamped_traceback(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(
+        b"Traceback (most recent call last):\nNameError: historical failure\n"
+    )
+    process = _process(log_path=log_path)
+    baseline = verifier.capture_forward_log_baseline(
+        {process["name"]: process},
+        [process["name"]],
+    )[process["name"]]
+
+    content, error = verifier.read_forward_log_bytes(
+        baseline,
+        log_path.stat().st_size,
+    )
+
+    assert error is None
+    assert content == b""
+    assert verifier.classify_log_window(content.decode()).status == LOG_CLEAN
+
+
+def test_forward_baseline_fails_for_new_un_timestamped_traceback(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"historical text\n")
+    process = _process(log_path=log_path)
+    baseline = verifier.capture_forward_log_baseline(
+        {process["name"]: process},
+        [process["name"]],
+    )[process["name"]]
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"Traceback (most recent call last):\n"
+            b"  File \"main.py\", line 1\n"
+            b"NameError: candidate failure\n"
+        )
+
+    content, error = verifier.read_forward_log_bytes(baseline, log_path.stat().st_size)
+    result = verifier.classify_log_window(content.decode())
+
+    assert error is None
+    assert result.status == LOG_ERROR
+    assert result.matched_rule == "NameError"
+
+
+def test_forward_baseline_tolerates_new_chat_not_found(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"historical text\n")
+    process = _process(log_path=log_path)
+    baseline = verifier.capture_forward_log_baseline(
+        {process["name"]: process},
+        [process["name"]],
+    )[process["name"]]
+    with log_path.open("ab") as handle:
+        handle.write(b"TelegramBadRequest: chat not found\n")
+
+    content, error = verifier.read_forward_log_bytes(baseline, log_path.stat().st_size)
+
+    assert error is None
+    assert verifier.classify_log_window(content.decode()).status == LOG_CLEAN
+
+
+def test_forward_observation_fails_on_pid_or_restart_change(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"")
+    process = _process(log_path=log_path)
+    snapshot = {process["name"]: process}
+    baseline = verifier.capture_forward_log_baseline(snapshot, [process["name"]])
+    last_sizes = {process["name"]: 0}
+
+    pid_changed = {process["name"]: _process(log_path=log_path, pid=202)}
+    restart_changed = {
+        process["name"]: _process(log_path=log_path, restart_time=5)
+    }
+
+    assert "pid_changed:psy5d_new" in verifier.validate_forward_snapshot(
+        pid_changed,
+        [process["name"]],
+        baseline,
+        last_sizes.copy(),
+    )
+    assert "restart_count_changed:psy5d_new" in verifier.validate_forward_snapshot(
+        restart_changed,
+        [process["name"]],
+        baseline,
+        last_sizes.copy(),
+    )
+
+
+def test_forward_observation_fails_when_process_stops(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"")
+    process = _process(log_path=log_path)
+    snapshot = {process["name"]: process}
+    baseline = verifier.capture_forward_log_baseline(snapshot, [process["name"]])
+
+    stopped = {
+        process["name"]: _process(log_path=log_path, status="stopped", pid=0)
+    }
+    errors = verifier.validate_forward_snapshot(
+        stopped,
+        [process["name"]],
+        baseline,
+        {process["name"]: 0},
+    )
+
+    assert "not_online:psy5d_new" in errors
+    assert "status_changed:psy5d_new" in errors
+
+
+def test_forward_observation_fails_on_log_rotation_or_truncation(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"old bytes\n")
+    process = _process(log_path=log_path)
+    snapshot = {process["name"]: process}
+    baseline = verifier.capture_forward_log_baseline(snapshot, [process["name"]])
+    last_sizes = {process["name"]: log_path.stat().st_size}
+
+    rotated = tmp_path / "rotated.log"
+    rotated.write_bytes(b"replacement file\n")
+    rotated.replace(log_path)
+    rotation_errors = verifier.validate_forward_snapshot(
+        snapshot,
+        [process["name"]],
+        baseline,
+        last_sizes.copy(),
+    )
+    assert "log_identity_changed:psy5d_new" in rotation_errors
+
+    log_path.write_bytes(b"old bytes\n")
+    baseline = verifier.capture_forward_log_baseline(snapshot, [process["name"]])
+    last_sizes = {process["name"]: log_path.stat().st_size}
+    log_path.write_bytes(b"")
+    truncation_errors = verifier.validate_forward_snapshot(
+        snapshot,
+        [process["name"]],
+        baseline,
+        last_sizes,
+    )
+    assert "log_truncated:psy5d_new" in truncation_errors
+
+
 def test_failure_excerpt_redacts_telegram_and_database_credentials():
     excerpt = verifier._sanitize_excerpt(
         "NameError: failed calling https://api.telegram.org/bot123456:abcdefghijklmnopqrstuvwxyz123456/sendMessage "
@@ -1349,6 +1490,120 @@ def test_main_verification_only_does_not_require_log_baseline(
     assert "stability=ok" in output
     assert "startup_errors=none" in output
     assert "verification=ok" in output
+
+
+def test_main_forward_only_passes_without_scanning_historical_logs(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(
+        b"Traceback (most recent call last):\nNameError: historical failure\n"
+    )
+    process = _process(log_path=log_path)
+    snapshot = {process["name"]: process}
+    (tmp_path / "REVISION").write_text("expected\n", encoding="utf-8")
+    monkeypatch.setattr(verifier, "load_pm2_snapshot", lambda: snapshot)
+    monkeypatch.setattr(
+        verifier,
+        "recent_startup_error_since_process_start",
+        lambda _process: pytest.fail("forward-only mode must not scan history"),
+    )
+
+    async def migrations_ok(_snapshot, _expected_names):
+        return 1, []
+
+    monkeypatch.setattr(verifier, "verify_migrations", migrations_ok)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_prod_runtime.py",
+            "--verification-only",
+            "--forward-only",
+            "--observe-seconds",
+            "0",
+            "--revision",
+            "expected",
+            "--pm2-names",
+            "psy5d_new",
+            "--root",
+            str(tmp_path),
+        ],
+    )
+
+    result = verifier.main()
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "startup_errors=none" in output
+    assert "forward_log_bytes_scanned=0" in output
+    assert '"status": "online"' in output
+    assert "verification=ok" in output
+
+
+def test_main_forward_only_reports_new_un_timestamped_traceback(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"old history\n")
+    process = _process(log_path=log_path)
+    snapshot = {process["name"]: process}
+    (tmp_path / "REVISION").write_text("expected\n", encoding="utf-8")
+    calls = 0
+
+    def load_and_append():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            with log_path.open("ab") as handle:
+                handle.write(
+                    b"Traceback (most recent call last):\n"
+                    b"NameError: new candidate failure\n"
+                )
+        return snapshot
+
+    monkeypatch.setattr(verifier, "load_pm2_snapshot", load_and_append)
+    monkeypatch.setattr(
+        verifier,
+        "recent_startup_error_since_process_start",
+        lambda _process: pytest.fail("forward-only mode must not scan history"),
+    )
+
+    async def migrations_ok(_snapshot, _expected_names):
+        return 1, []
+
+    monkeypatch.setattr(verifier, "verify_migrations", migrations_ok)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_prod_runtime.py",
+            "--verification-only",
+            "--forward-only",
+            "--observe-seconds",
+            "0",
+            "--revision",
+            "expected",
+            "--pm2-names",
+            "psy5d_new",
+            "--root",
+            str(tmp_path),
+        ],
+    )
+
+    result = verifier.main()
+    output = capsys.readouterr().out
+
+    assert result == 1
+    assert "startup_errors=found" in output
+    assert '"matched_rule": "NameError"' in output
+    assert '"first_timestamp": null' in output
+    assert '"process": "psy5d_new"' in output
+    assert "verification=failed" in output
 
 
 def test_main_fails_for_restart_after_post_reload_baseline(
