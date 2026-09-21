@@ -365,6 +365,162 @@ def test_live_verification_fails_for_traceback_after_pm_uptime(tmp_path):
     assert result.matched_rule == "ModuleNotFoundError"
 
 
+def test_live_verification_ignores_prestart_traceback_after_log_baseline(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    old_error = datetime(2026, 9, 21, 13, 2, 1, 518000, tzinfo=timezone.utc).timestamp()
+    candidate_start = datetime(2026, 9, 21, 13, 2, 3, 320000, tzinfo=timezone.utc).timestamp()
+    candidate_start_line = datetime.fromtimestamp(candidate_start, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    old_error_line = datetime.fromtimestamp(old_error, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    log_path.write_text(
+        f"{old_error_line} | ERROR | apscheduler | Job failed\n"
+        "Traceback (most recent call last):\n"
+        "RuntimeError: old process scheduler failure\n"
+        f"{candidate_start_line} | INFO | app | new process started\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path, pm_uptime=candidate_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_CLEAN
+    assert result.process_start_timestamp == verifier.format_timestamp(candidate_start)
+
+
+def test_live_verification_attributes_traceback_to_its_first_timestamp(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    old_error = datetime(2026, 9, 21, 13, 2, 1, 518000, tzinfo=timezone.utc).timestamp()
+    candidate_start = datetime(2026, 9, 21, 13, 2, 3, 320000, tzinfo=timezone.utc).timestamp()
+    candidate_error = datetime(2026, 9, 21, 13, 2, 3, 500000, tzinfo=timezone.utc).timestamp()
+    log_path.write_text(
+        f"{verifier.format_timestamp(old_error)} | ERROR | apscheduler | old failure\n"
+        "Traceback (most recent call last):\n"
+        f"{verifier.format_timestamp(candidate_error)} | ERROR | scheduler | File \"scheduler.py\", line 1\n"
+        f"{verifier.format_timestamp(candidate_error)} | ERROR | scheduler | NameError: undefined bot\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path, pm_uptime=candidate_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_live_verification_fails_for_candidate_traceback_with_diagnostic(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    candidate_start = datetime(2026, 9, 21, 13, 2, 3, 320000, tzinfo=timezone.utc).timestamp()
+    candidate_error = datetime(2026, 9, 21, 13, 2, 3, 500000, tzinfo=timezone.utc).timestamp()
+    log_path.write_text(
+        f"{verifier.format_timestamp(candidate_error)} | ERROR | app | Startup failed\n"
+        "Traceback (most recent call last):\n"
+        "NameError: name 'bot' is not defined\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path, pm_uptime=candidate_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_ERROR
+    assert result.classification == "fatal_candidate_error"
+    assert result.first_timestamp == "2026-09-21T13:02:03.500Z"
+    assert result.process_start_timestamp == "2026-09-21T13:02:03.320Z"
+    assert result.matched_rule == "NameError"
+
+
+def test_live_verification_fails_closed_for_unattributed_traceback(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text(
+        "Traceback (most recent call last):\n"
+        "NameError: name 'bot' is not defined\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_INDETERMINATE
+    assert result.reason == "timestamp_unavailable"
+    assert result.matched_rule == "NameError"
+
+
+def test_live_verification_allows_expected_chat_not_found_delivery(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    now = time.time()
+    process_start = now - 1
+    log_path.write_text(
+        f"{verifier.format_timestamp(now)} | ERROR | telegram | "
+        "TelegramBadRequest: Telegram server says - Bad Request: chat not found\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path, pm_uptime=process_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_live_verification_allows_recoverable_telegram_network_traceback(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    now = time.time()
+    process_start = now - 1
+    log_path.write_text(
+        f"{verifier.format_timestamp(now)} | ERROR | telegram | request failed\n"
+        "Traceback (most recent call last):\n"
+        "TelegramNetworkError: ClientOSError: connection reset\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path, pm_uptime=process_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_live_verification_keeps_unclassified_candidate_network_failure_fatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    now = time.time()
+    process_start = now - 1
+    log_path.write_text(
+        f"{verifier.format_timestamp(now)} | ERROR | telegram | request failed\n"
+        "Traceback (most recent call last):\n"
+        "TelegramNetworkError: unexpected transport failure\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path, pm_uptime=process_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_ERROR
+    assert result.classification == "fatal_candidate_error"
+    assert result.matched_rule == "TelegramNetworkError:unclassified"
+
+
+def test_timestamp_boundary_comparison_avoids_datetime_parse_for_iso_z_values():
+    process_start = datetime(2026, 9, 21, 13, 2, 3, 320000, tzinfo=timezone.utc).timestamp()
+    local_clock, local_fraction = verifier._timestamp_threshold_parts(process_start, None)
+    utc_clock, utc_fraction = verifier._timestamp_threshold_parts(process_start, timezone.utc)
+
+    assert verifier._timestamp_bytes_precede_start(
+        b"2026-09-21T13:02:03.319999Z",
+        process_start,
+        local_clock,
+        local_fraction,
+        utc_clock,
+        utc_fraction,
+    )
+    assert not verifier._timestamp_bytes_precede_start(
+        b"2026-09-21T13:02:03.320000Z",
+        process_start,
+        local_clock,
+        local_fraction,
+        utc_clock,
+        utc_fraction,
+    )
+
+
 def test_historical_chat_not_found_is_ignored(tmp_path):
     log_path = tmp_path / "bot-error.log"
     log_path.write_text(
