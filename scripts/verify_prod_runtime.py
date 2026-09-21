@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -14,7 +15,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import inspect, text
@@ -32,7 +34,17 @@ DB_CHECK_TIMEOUT_SECONDS = 10.0
 DB_DISPOSE_TIMEOUT_SECONDS = 2.0
 DB_CHECK_CONCURRENCY = 4
 MAX_LOG_SCAN_BYTES = 256 * 1024
+MAX_LIVE_LOG_SCAN_BYTES = 16 * 1024 * 1024
 TRACEBACK_MARKER = "Traceback (most recent call last)"
+LOG_TIMESTAMP_RE = re.compile(
+    r"^\s*(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
+    r"(?:[,.]\d{1,9})?(?:\s?(?:Z|[+-]\d{2}:?\d{2}))?)"
+)
+LOG_LEVEL_RE = re.compile(r"^\s*\|\s*(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\|", re.IGNORECASE)
+TRACEBACK_END_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Interrupt|Exit|Request)"
+    r"|SystemExit|KeyboardInterrupt|StopIteration):"
+)
 TELEGRAM_BAD_REQUEST_RE = re.compile(r"\bTelegramBadRequest\b", re.IGNORECASE)
 CHAT_NOT_FOUND_RE = re.compile(
     r"(?:\bTelegramBadRequest\b|Telegram server says\s*-\s*Bad Request:)"
@@ -82,6 +94,19 @@ FATAL_CONTEXT_MARKER_RE = re.compile(
 class LogCheckResult:
     status: str
     reason: str | None = None
+    log_path: str | None = None
+    first_timestamp: str | None = None
+    process_start_timestamp: str | None = None
+    classification: str | None = None
+    matched_rule: str | None = None
+    excerpt: str | None = None
+
+
+@dataclass(frozen=True)
+class TimestampedLogBlock:
+    content: str
+    timestamp: float | None
+    timestamp_text: str | None
 
 
 LOG_CLEAN = "clean"
@@ -135,6 +160,167 @@ def _remove_allowed_delivery_context(
     return "".join(residual)
 
 
+def pm_process_start_timestamp(process: dict[str, Any]) -> float | None:
+    value = pm2_env(process).get("pm_uptime")
+    if isinstance(value, bool):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp):
+        return None
+    if timestamp > 100_000_000_000:
+        timestamp /= 1000
+    return timestamp if timestamp >= 1_000_000_000 else None
+
+
+def format_timestamp(timestamp: float | None) -> str | None:
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+
+
+def _timestamp_from_line(line: str) -> tuple[float | None, str | None]:
+    match = LOG_TIMESTAMP_RE.match(line)
+    if match is None:
+        return None, None
+    value = match.group("timestamp").strip().replace(",", ".")
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None, None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.timestamp(), match.group("timestamp")
+
+
+def _strip_log_prefix(line: str) -> str:
+    match = LOG_TIMESTAMP_RE.match(line)
+    value = line[match.end():] if match else line
+    level_match = re.match(
+        r"^\s*\|\s*(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\|\s*",
+        value,
+        re.IGNORECASE,
+    )
+    return value[level_match.end():] if level_match else value
+
+
+def _is_traceback_terminal_line(line: str) -> bool:
+    return TRACEBACK_END_RE.match(_strip_log_prefix(line).rstrip("\r\n")) is not None
+
+
+def timestamped_log_blocks(content: str) -> list[TimestampedLogBlock]:
+    blocks: list[TimestampedLogBlock] = []
+    current_lines: list[str] = []
+    current_timestamp: float | None = None
+    current_timestamp_text: str | None = None
+    traceback_open = False
+
+    def finish_block() -> None:
+        nonlocal current_lines, current_timestamp, current_timestamp_text, traceback_open
+        if current_lines:
+            blocks.append(
+                TimestampedLogBlock(
+                    content="".join(current_lines),
+                    timestamp=current_timestamp,
+                    timestamp_text=current_timestamp_text,
+                )
+            )
+        current_lines = []
+        current_timestamp = None
+        current_timestamp_text = None
+        traceback_open = False
+
+    for line in content.splitlines(keepends=True):
+        line_timestamp, line_timestamp_text = _timestamp_from_line(line)
+        is_log_header = (
+            line_timestamp is not None
+            and LOG_LEVEL_RE.search(line[LOG_TIMESTAMP_RE.match(line).end():]) is not None
+        )
+        if current_lines and line_timestamp is not None:
+            if not traceback_open:
+                finish_block()
+            elif is_log_header and not _is_traceback_terminal_line(line):
+                finish_block()
+            elif TRACEBACK_MARKER in line:
+                finish_block()
+        if not current_lines and line_timestamp is not None:
+            current_timestamp = line_timestamp
+            current_timestamp_text = line_timestamp_text
+        elif current_timestamp is None and line_timestamp is not None:
+            current_timestamp = line_timestamp
+            current_timestamp_text = line_timestamp_text
+        current_lines.append(line)
+        if TRACEBACK_MARKER in line:
+            traceback_open = True
+        elif traceback_open and _is_traceback_terminal_line(line):
+            finish_block()
+
+    finish_block()
+    return blocks
+
+
+def _sanitize_excerpt(content: str, matched_rule: str | None) -> str:
+    lines = content.splitlines()
+    selected = next(
+        (
+            line
+            for line in lines
+            if matched_rule and matched_rule.casefold() in line.casefold()
+        ),
+        None,
+    )
+    if selected is None:
+        selected = next(
+            (line for line in lines if line.strip()),
+            "",
+        )
+    selected = _strip_log_prefix(selected).strip()
+    selected = re.sub(
+        r"(?i)\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{20,}\b",
+        "[REDACTED_TOKEN]",
+        selected,
+    )
+    selected = re.sub(
+        r"(?i)\b(?:chat|user|recipient)[_ ]?id\s*[=: ]\s*\d+",
+        "[REDACTED_ID]",
+        selected,
+    )
+    selected = re.sub(r"(?<![A-Za-z])\d{8,}(?![A-Za-z])", "[REDACTED_ID]", selected)
+    selected = re.sub(
+        r"(?i)\b(?:bot[_ -]?)?(?:token|password|secret|api[_ -]?key)\s*[=: ]\s*\S+",
+        "[REDACTED_SECRET]",
+        selected,
+    )
+    return selected[:240]
+
+
+def _matched_rule(content: str) -> str:
+    startup_match = STARTUP_ERROR_RE.search(content)
+    if startup_match:
+        return startup_match.group(0)
+    context_match = STARTUP_CONTEXT_FAILURE_RE.search(content)
+    if context_match:
+        fatal_context = FATAL_CONTEXT_MARKER_RE.search(context_match.group(0))
+        return (
+            "startup_context:" + fatal_context.group(0)
+            if fatal_context
+            else "startup_context_failure"
+        )
+    if TELEGRAM_BAD_REQUEST_RE.search(content):
+        return "TelegramBadRequest:not_chat_not_found"
+    if TELEGRAM_NETWORK_RE.search(content):
+        return "TelegramNetworkError:unclassified"
+    if TRACEBACK_MARKER in content:
+        return "unclassified_traceback"
+    return "startup_context_failure"
+
+
 def classify_log_window(content: str) -> LogCheckResult:
     if not content:
         return LogCheckResult(LOG_CLEAN)
@@ -146,17 +332,86 @@ def classify_log_window(content: str) -> LogCheckResult:
         if _is_allowed_delivery_block(block)
     }
     if len(allowed_indexes) < len(parts) - 1:
-        return LogCheckResult(LOG_ERROR, "startup_error")
+        rule = _matched_rule(content)
+        return LogCheckResult(
+            LOG_ERROR,
+            "startup_error",
+            matched_rule=rule,
+            excerpt=_sanitize_excerpt(content, rule),
+        )
 
     residual = _remove_allowed_delivery_context(parts, allowed_indexes)
     if STARTUP_ERROR_RE.search(residual) or STARTUP_CONTEXT_FAILURE_RE.search(residual):
-        return LogCheckResult(LOG_ERROR, "startup_error")
+        rule = _matched_rule(residual)
+        return LogCheckResult(
+            LOG_ERROR,
+            "startup_error",
+            matched_rule=rule,
+            excerpt=_sanitize_excerpt(content, rule),
+        )
 
     if TELEGRAM_BAD_REQUEST_RE.search(content) and not _is_chat_not_found_log(content):
-        return LogCheckResult(LOG_ERROR, "startup_error")
+        rule = _matched_rule(content)
+        return LogCheckResult(
+            LOG_ERROR,
+            "startup_error",
+            matched_rule=rule,
+            excerpt=_sanitize_excerpt(content, rule),
+        )
     if TELEGRAM_NETWORK_RE.search(content) and not _is_recoverable_network_log(content):
-        return LogCheckResult(LOG_ERROR, "startup_error")
+        rule = _matched_rule(content)
+        return LogCheckResult(
+            LOG_ERROR,
+            "startup_error",
+            matched_rule=rule,
+            excerpt=_sanitize_excerpt(content, rule),
+        )
     return LogCheckResult(LOG_CLEAN)
+
+
+def classify_candidate_log_window(
+    content: str,
+    process_start: float | None,
+) -> LogCheckResult:
+    if process_start is None:
+        result = classify_log_window(content)
+        if result.status == LOG_CLEAN:
+            return LogCheckResult(LOG_INDETERMINATE, "process_start_unavailable")
+        return LogCheckResult(
+            LOG_INDETERMINATE,
+            "process_start_unavailable",
+            matched_rule=result.matched_rule,
+            excerpt=result.excerpt,
+        )
+
+    for block in timestamped_log_blocks(content):
+        result = classify_log_window(block.content)
+        if result.status == LOG_CLEAN:
+            continue
+        if block.timestamp is None:
+            return LogCheckResult(
+                LOG_INDETERMINATE,
+                "timestamp_unavailable",
+                classification="unattributed_candidate_error",
+                process_start_timestamp=format_timestamp(process_start),
+                matched_rule=result.matched_rule,
+                excerpt=result.excerpt,
+            )
+        if block.timestamp < process_start:
+            continue
+        return LogCheckResult(
+            result.status,
+            result.reason,
+            classification="fatal_candidate_error",
+            first_timestamp=format_timestamp(block.timestamp),
+            process_start_timestamp=format_timestamp(process_start),
+            matched_rule=result.matched_rule,
+            excerpt=result.excerpt,
+        )
+    return LogCheckResult(
+        LOG_CLEAN,
+        process_start_timestamp=format_timestamp(process_start),
+    )
 
 
 def parse_names(value: str) -> list[str]:
@@ -291,11 +546,19 @@ def _log_baseline_entry(
         raise RuntimeError(f"unable to stat PM2 error log for {name}") from exc
     if not stat.S_ISREG(file_stat.st_mode):
         raise RuntimeError(f"PM2 error log is not a regular file for {name}")
+    pid = process_pid(process)
+    restart_count = process_restart_count(process)
+    process_start = pm_process_start_timestamp(process)
+    if pid is None or restart_count is None or process_start is None:
+        raise RuntimeError(f"missing PM2 identity metadata for {name}")
     return {
         "path": log_path,
         "device": file_stat.st_dev,
         "inode": file_stat.st_ino,
         "offset": file_stat.st_size,
+        "pid": pid,
+        "restart_count": restart_count,
+        "pm_uptime": process_start,
     }
 
 
@@ -307,13 +570,16 @@ def create_log_baseline(
     if source_names is not None and len(source_names) != len(expected_names):
         raise RuntimeError("log baseline source names do not match expected names")
     baseline: dict[str, dict[str, Any]] = {}
+    captured_at = time.time()
     for index, name in enumerate(expected_names):
         process = snapshot.get(name)
         if process is None and source_names is not None:
             process = snapshot.get(source_names[index])
         if process is None:
             raise RuntimeError(f"missing PM2 process for {name}")
-        baseline[name] = _log_baseline_entry(name, process)
+        entry = _log_baseline_entry(name, process)
+        entry["captured_at"] = captured_at
+        baseline[name] = entry
 
     file_descriptor, path = tempfile.mkstemp(
         prefix=BASELINE_PREFIX,
@@ -355,7 +621,13 @@ def load_log_baseline(path: str) -> dict[str, dict[str, Any]]:
         path_value = entry.get("path")
         if not isinstance(path_value, str) or not path_value:
             raise RuntimeError("PM2 log baseline has an invalid path")
-        for field in ("device", "inode", "offset"):
+        for field in (
+            "device",
+            "inode",
+            "offset",
+            "pid",
+            "restart_count",
+        ):
             field_value = entry.get(field)
             if (
                 isinstance(field_value, bool)
@@ -363,6 +635,14 @@ def load_log_baseline(path: str) -> dict[str, dict[str, Any]]:
                 or field_value < 0
             ):
                 raise RuntimeError("PM2 log baseline has invalid metadata")
+        for field in ("pm_uptime", "captured_at"):
+            field_value = entry.get(field)
+            if (
+                isinstance(field_value, bool)
+                or not isinstance(field_value, (int, float))
+                or field_value <= 0
+            ):
+                raise RuntimeError("PM2 log baseline has invalid timestamp metadata")
         baseline[name] = entry
     return baseline
 
@@ -450,7 +730,85 @@ def recent_startup_error(
                 os.close(file_descriptor)
             except OSError:
                 pass
-    return classify_log_window(content.decode(errors="ignore"))
+    result = classify_candidate_log_window(
+        content.decode(errors="ignore"),
+        pm_process_start_timestamp(process),
+    )
+    return replace(result, log_path=path_value)
+
+
+def recent_startup_error_since_process_start(
+    process: dict[str, Any],
+) -> LogCheckResult:
+    process_start = pm_process_start_timestamp(process)
+    log_path = pm2_env(process).get("pm_err_log_path")
+    if process_start is None:
+        return LogCheckResult(LOG_INDETERMINATE, "process_start_unavailable")
+    if not isinstance(log_path, str) or not log_path:
+        return LogCheckResult(LOG_INDETERMINATE, "log_path_missing")
+
+    file_descriptor: int | None = None
+    try:
+        file_descriptor = os.open(
+            log_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        initial_stat = os.fstat(file_descriptor)
+        if not stat.S_ISREG(initial_stat.st_mode):
+            return LogCheckResult(LOG_INDETERMINATE, "fd_not_regular", log_path=log_path)
+        initial_path_stat = os.stat(log_path, follow_symlinks=False)
+        identity = (initial_stat.st_dev, initial_stat.st_ino)
+        if (
+            not stat.S_ISREG(initial_path_stat.st_mode)
+            or (initial_path_stat.st_dev, initial_path_stat.st_ino) != identity
+        ):
+            return LogCheckResult(LOG_INDETERMINATE, "identity_changed", log_path=log_path)
+
+        scan_size = min(initial_stat.st_size, MAX_LIVE_LOG_SCAN_BYTES)
+        offset = initial_stat.st_size - scan_size
+        with os.fdopen(file_descriptor, "rb") as handle:
+            file_descriptor = None
+            handle.seek(offset)
+            content = handle.read(scan_size)
+            final_stat = os.fstat(handle.fileno())
+        final_path_stat = os.stat(log_path, follow_symlinks=False)
+        if (
+            len(content) != scan_size
+            or (final_stat.st_dev, final_stat.st_ino) != identity
+            or (final_path_stat.st_dev, final_path_stat.st_ino) != identity
+            or final_stat.st_size != initial_stat.st_size
+            or final_path_stat.st_size != initial_stat.st_size
+        ):
+            return LogCheckResult(
+                LOG_INDETERMINATE,
+                "changed_during_read",
+                log_path=log_path,
+            )
+    except OSError:
+        return LogCheckResult(LOG_INDETERMINATE, "unreadable", log_path=log_path)
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+
+    decoded = content.decode(errors="ignore")
+    if offset > 0:
+        blocks = timestamped_log_blocks(decoded)
+        if not any(
+            block.timestamp is not None and block.timestamp < process_start
+            for block in blocks
+        ):
+            return LogCheckResult(
+                LOG_INDETERMINATE,
+                "process_start_boundary_not_found",
+                log_path=log_path,
+                process_start_timestamp=format_timestamp(process_start),
+            )
+
+    result = classify_candidate_log_window(decoded, process_start)
+    return replace(result, log_path=log_path)
 
 
 async def _dispose_engine(engine) -> bool:
@@ -538,10 +896,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=".")
     parser.add_argument("--startup-settle-seconds", type=float, default=0.0)
     parser.add_argument("--settle-seconds", type=float, default=3.0)
+    parser.add_argument("--verification-only", action="store_true")
     parser.add_argument("--create-log-baseline", action="store_true")
     parser.add_argument("--baseline-source-names")
     parser.add_argument("--log-baseline")
     return parser
+
+
+def print_log_diagnostic(
+    process_name: str,
+    process: dict[str, Any],
+    result: LogCheckResult,
+) -> None:
+    log_path = result.log_path or pm2_env(process).get("pm_err_log_path")
+    detail = {
+        "process": process_name,
+        "log_file": Path(log_path).name if isinstance(log_path, str) else "unknown",
+        "classification": result.classification or result.status,
+        "first_timestamp": result.first_timestamp,
+        "process_start_timestamp": result.process_start_timestamp
+        or format_timestamp(pm_process_start_timestamp(process)),
+        "matched_rule": result.matched_rule or result.reason,
+        "excerpt": result.excerpt,
+    }
+    print("startup_log_detail=" + json.dumps(detail, ensure_ascii=True, sort_keys=True))
 
 
 def main() -> int:
@@ -549,6 +927,9 @@ def main() -> int:
     expected_names = parse_names(args.pm2_names)
 
     if args.create_log_baseline:
+        if args.verification_only:
+            print("log_baseline=failed", file=sys.stderr)
+            return 1
         try:
             snapshot = load_pm2_snapshot()
             source_names = (
@@ -616,9 +997,9 @@ def main() -> int:
     errors.extend(stability_errors)
 
     log_baseline: dict[str, dict[str, Any]] = {}
-    if not args.log_baseline:
+    if not args.verification_only and not args.log_baseline:
         errors.append("log_baseline_required")
-    else:
+    elif args.log_baseline:
         try:
             log_baseline = load_log_baseline(args.log_baseline)
         except RuntimeError:
@@ -626,15 +1007,21 @@ def main() -> int:
 
     log_error_names: list[str] = []
     log_indeterminate: list[str] = []
+    log_diagnostics: list[tuple[str, dict[str, Any], LogCheckResult]] = []
     for name in expected_names:
         process = second_snapshot.get(name)
         if process is None:
             continue
-        result = recent_startup_error(process, log_baseline.get(name))
+        if args.verification_only:
+            result = recent_startup_error_since_process_start(process)
+        else:
+            result = recent_startup_error(process, log_baseline.get(name))
         if result.status == LOG_ERROR:
             log_error_names.append(name)
+            log_diagnostics.append((name, process, result))
         elif result.status == LOG_INDETERMINATE:
             log_indeterminate.append(f"{name}:{result.reason}")
+            log_diagnostics.append((name, process, result))
     if log_error_names:
         errors.append("startup_log_errors:" + ",".join(log_error_names))
     if log_indeterminate:
@@ -656,6 +1043,7 @@ def main() -> int:
         errors.append("migration_not_checked")
 
     print(f"revision={'ok' if revision == args.revision else 'failed'}")
+    print(f"runtime={'ok' if not second_pm2_errors else 'failed'}")
     print(
         "pm2={} expected={} migrations_checked={} startup_errors={}".format(
             "ok" if not second_pm2_errors else "failed",
@@ -674,6 +1062,8 @@ def main() -> int:
     print(f"migration={'ok' if not migration_errors else 'failed'}")
     if log_indeterminate:
         print("startup_log_indeterminate=" + ",".join(log_indeterminate))
+    for process_name, process, result in log_diagnostics:
+        print_log_diagnostic(process_name, process, result)
     if migration_errors:
         print("migration_errors=" + ",".join(migration_errors))
     if errors:
