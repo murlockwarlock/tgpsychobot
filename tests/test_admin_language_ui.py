@@ -177,7 +177,8 @@ def test_overview_shows_bot_default_enabled_and_selector_semantics_in_russian():
 
     assert "Язык по умолчанию: <b>🇷🇺 Русский</b>" in text
     assert "Выбор языка пользователем: <b>Включён</b>" in text
-    assert "Если выключить выбор, все пользователи будут получать ответы на русском" in text
+    assert "Если выбор выключен, все пользователи получают ответы на русском" in text
+    assert "Сохранённые предпочтения при этом не удаляются." in text
     assert "✅ 🇬🇧 English" in text
     assert "✅ 🇵🇹 Português" in text
     assert "🇬🇧 English — готов" in text
