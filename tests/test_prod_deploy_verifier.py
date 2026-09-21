@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import shlex
@@ -40,13 +41,17 @@ def _process(
     database_url="postgresql+asyncpg://db",
     log_path=None,
     script_path="/root/telegram_bots/newbots/main.py",
+    pm_uptime=None,
 ):
+    if pm_uptime is None:
+        pm_uptime = time.time() - 60
     process = {
         "name": name,
         "pm2_env": {
             "status": status,
             "pid": pid,
             "restart_time": restart_time,
+            "pm_uptime": pm_uptime,
             "pm_exec_path": script_path,
             "env": {"DATABASE_URL": database_url},
         },
@@ -129,6 +134,9 @@ def test_log_baselines_are_unique_restricted_and_include_identity(tmp_path):
         assert entry["device"] == log_stat.st_dev
         assert entry["inode"] == log_stat.st_ino
         assert entry["offset"] == log_stat.st_size
+        assert entry["pid"] == 101
+        assert entry["restart_count"] == 4
+        assert entry["pm_uptime"] < entry["captured_at"]
     finally:
         for path in paths:
             _remove_baseline(path)
@@ -165,12 +173,177 @@ def test_log_append_ignores_history_and_detects_new_error(tmp_path):
         assert recent_startup_error(process, baseline).status == LOG_CLEAN
 
         with log_path.open("ab") as handle:
-            handle.write(b"new ModuleNotFoundError: missing\n")
+            timestamp = verifier.format_timestamp(time.time())
+            handle.write(f"{timestamp} | ERROR | test | ModuleNotFoundError: missing\n".encode())
         result = recent_startup_error(process, baseline)
         assert result.status == LOG_ERROR
         assert result.reason == "startup_error"
     finally:
         _remove_baseline(baseline_path)
+
+
+def test_failure_excerpt_redacts_telegram_and_database_credentials():
+    excerpt = verifier._sanitize_excerpt(
+        "NameError: failed calling https://api.telegram.org/bot123456:abcdefghijklmnopqrstuvwxyz123456/sendMessage "
+        "postgresql://admin:topsecret@db.example/app",
+        "NameError",
+    )
+
+    assert "[REDACTED_TOKEN]" in excerpt
+    assert "[REDACTED_DB_URL]" in excerpt
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in excerpt
+    assert "topsecret" not in excerpt
+
+
+def test_old_process_traceback_between_baseline_and_new_pm_uptime_is_ignored(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("baseline\n", encoding="utf-8")
+    old_start = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc).timestamp()
+    old_error = datetime(2026, 9, 21, 13, 2, 1, 518000, tzinfo=timezone.utc).timestamp()
+    candidate_start = datetime(2026, 9, 21, 13, 2, 3, 320000, tzinfo=timezone.utc).timestamp()
+    old_process = _process(log_path=log_path, pm_uptime=old_start)
+    baseline_path, baseline = _baseline_for(tmp_path, old_process)
+    candidate_process = _process(
+        pid=202,
+        restart_time=5,
+        log_path=log_path,
+        pm_uptime=candidate_start,
+    )
+
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{verifier.format_timestamp(old_error)} | ERROR | apscheduler.executors.default | "
+                "Job 'process_pending_events' raised an exception\n"
+                "Traceback (most recent call last):\n"
+                "  File \"scheduler.py\", line 1, in process_pending_events\n"
+                "RuntimeError: translation cache refresh failed\n"
+            )
+        result = recent_startup_error(candidate_process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_traceback_after_new_pm_uptime_is_candidate_error(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("baseline\n", encoding="utf-8")
+    candidate_start = datetime(2026, 9, 21, 13, 2, 3, 320000, tzinfo=timezone.utc).timestamp()
+    candidate_error = datetime(2026, 9, 21, 13, 2, 3, 500000, tzinfo=timezone.utc).timestamp()
+    old_process = _process(log_path=log_path, pm_uptime=candidate_start - 20)
+    baseline_path, baseline = _baseline_for(tmp_path, old_process)
+    candidate_process = _process(
+        pid=202,
+        restart_time=5,
+        log_path=log_path,
+        pm_uptime=candidate_start,
+    )
+
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{verifier.format_timestamp(candidate_error)} | ERROR | app | Startup failed\n"
+                "Traceback (most recent call last):\n"
+                "NameError: name 'bot' is not defined\n"
+            )
+        result = recent_startup_error(candidate_process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_ERROR
+    assert result.first_timestamp == "2026-09-21T13:02:03.500Z"
+    assert result.process_start_timestamp == "2026-09-21T13:02:03.320Z"
+    assert result.matched_rule == "NameError"
+    assert "NameError" in result.excerpt
+
+
+def test_traceback_crossing_candidate_timestamp_keeps_first_timestamp_owner(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("baseline\n", encoding="utf-8")
+    old_error = datetime(2026, 9, 21, 13, 2, 1, 518000, tzinfo=timezone.utc).timestamp()
+    candidate_start = datetime(2026, 9, 21, 13, 2, 3, 320000, tzinfo=timezone.utc).timestamp()
+    old_process = _process(log_path=log_path, pm_uptime=old_error - 60)
+    baseline_path, baseline = _baseline_for(tmp_path, old_process)
+    candidate_process = _process(
+        pid=202,
+        restart_time=5,
+        log_path=log_path,
+        pm_uptime=candidate_start,
+    )
+
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{verifier.format_timestamp(old_error)} | ERROR | apscheduler | Job failed\n"
+                "Traceback (most recent call last):\n"
+                f"{verifier.format_timestamp(candidate_start + 0.1)} File \"scheduler.py\", line 1\n"
+                "NameError: name 'bot' is not defined\n"
+            )
+        result = recent_startup_error(candidate_process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_CLEAN
+
+
+def test_unparsable_candidate_error_timestamp_fails_closed(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("baseline\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, baseline = _baseline_for(tmp_path, process)
+
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "Traceback (most recent call last):\n"
+                "NameError: name 'bot' is not defined\n"
+            )
+        result = recent_startup_error(process, baseline)
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result.status == LOG_INDETERMINATE
+    assert result.reason == "timestamp_unavailable"
+    assert result.matched_rule == "NameError"
+
+
+def test_live_verification_scans_from_pm_uptime_without_reloading(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    now = time.time()
+    process_start = now - 1
+    log_path.write_text(
+        f"{verifier.format_timestamp(now - 2)} | ERROR | apscheduler | old failure\n"
+        "Traceback (most recent call last):\n"
+        "NameError: old process noise\n"
+        f"{verifier.format_timestamp(now)} | INFO | app | process healthy\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path, pm_uptime=process_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_CLEAN
+    assert result.process_start_timestamp == verifier.format_timestamp(process_start)
+
+
+def test_live_verification_fails_for_traceback_after_pm_uptime(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    now = time.time()
+    process_start = now - 2
+    log_path.write_text(
+        f"{verifier.format_timestamp(now - 3)} | INFO | app | old process\n"
+        f"{verifier.format_timestamp(now - 1)} | ERROR | app | startup failed\n"
+        "Traceback (most recent call last):\n"
+        "ModuleNotFoundError: missing module\n",
+        encoding="utf-8",
+    )
+    process = _process(log_path=log_path, pm_uptime=process_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_ERROR
+    assert result.matched_rule == "ModuleNotFoundError"
 
 
 def test_historical_chat_not_found_is_ignored(tmp_path):
@@ -235,7 +408,7 @@ def test_chat_not_found_does_not_hide_migration_context_failure(tmp_path):
     try:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(
-                "ERROR:database:Migration failed\n"
+                f"{verifier.format_timestamp(time.time())} | ERROR | database | Migration failed\n"
                 "Traceback (most recent call last):\n"
                 "RuntimeError: 123: Telegram server says - Bad Request: chat not found\n"
             )
@@ -255,6 +428,7 @@ def test_other_telegram_bad_request_remains_fatal(tmp_path):
     try:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(
+                f"{verifier.format_timestamp(time.time())} | ERROR | telegram | Request failed\n"
                 "Traceback (most recent call last):\n"
                 "aiogram.exceptions.TelegramBadRequest: message is not modified\n"
             )
@@ -297,6 +471,7 @@ def test_unclassified_telegram_network_error_remains_fatal(tmp_path):
     try:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(
+                f"{verifier.format_timestamp(time.time())} | ERROR | telegram | Request failed\n"
                 "Traceback (most recent call last):\n"
                 "aiogram.exceptions.TelegramNetworkError: unexpected network failure\n"
             )
@@ -316,6 +491,7 @@ def test_candidate_name_error_remains_fatal(tmp_path):
     try:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(
+                f"{verifier.format_timestamp(time.time())} | ERROR | app | Startup failed\n"
                 "Traceback (most recent call last):\n"
                 "NameError: name 'bot' is not defined\n"
             )
@@ -335,6 +511,7 @@ def test_migration_traceback_remains_fatal(tmp_path):
     try:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(
+                f"{verifier.format_timestamp(time.time())} | ERROR | database | Migration failed\n"
                 "Traceback (most recent call last):\n"
                 "sqlalchemy.exc.IntegrityError: migration failed\n"
             )
@@ -859,6 +1036,119 @@ def test_main_uses_post_reload_snapshot_as_stability_baseline(
     assert "stability=ok" in output
     assert "verification=ok" in output
     assert sleeps == [30.0, 3.0]
+
+
+def test_main_reports_process_and_sanitized_candidate_log_failure(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text("baseline\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+    baseline_path, _ = _baseline_for(tmp_path, process)
+    (tmp_path / "REVISION").write_text("expected\n", encoding="utf-8")
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"{verifier.format_timestamp(time.time())} | ERROR | app | startup failed\n"
+            "Traceback (most recent call last):\n"
+            "NameError: token=123456:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN\n"
+        )
+    snapshot = {process["name"]: process}
+
+    monkeypatch.setattr(verifier, "load_pm2_snapshot", lambda: snapshot)
+    monkeypatch.setattr(verifier.time, "sleep", lambda _seconds: None)
+
+    async def migrations_ok(_snapshot, _expected_names):
+        return 1, []
+
+    monkeypatch.setattr(verifier, "verify_migrations", migrations_ok)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_prod_runtime.py",
+            "--revision",
+            "expected",
+            "--pm2-names",
+            "psy5d_new",
+            "--root",
+            str(tmp_path),
+            "--settle-seconds",
+            "0",
+            "--log-baseline",
+            str(baseline_path),
+        ],
+    )
+
+    try:
+        result = verifier.main()
+        output = capsys.readouterr().out
+    finally:
+        _remove_baseline(baseline_path)
+
+    assert result == 1
+    assert "startup_errors=found" in output
+    assert '"process": "psy5d_new"' in output
+    assert '"log_file": "bot-error.log"' in output
+    assert '"classification": "fatal_candidate_error"' in output
+    assert '"first_timestamp":' in output
+    assert '"process_start_timestamp":' in output
+    assert '"matched_rule": "NameError"' in output
+    assert "[REDACTED_SECRET]" in output
+    assert "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN" not in output
+
+
+def test_main_verification_only_does_not_require_log_baseline(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    process = _process()
+    snapshot = {process["name"]: process}
+    (tmp_path / "REVISION").write_text("expected\n", encoding="utf-8")
+    monkeypatch.setattr(verifier, "load_pm2_snapshot", lambda: snapshot)
+    monkeypatch.setattr(verifier.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        verifier,
+        "recent_startup_error_since_process_start",
+        lambda _process: verifier.LogCheckResult(
+            LOG_CLEAN,
+            process_start_timestamp=verifier.format_timestamp(
+                verifier.pm_process_start_timestamp(process)
+            ),
+        ),
+    )
+
+    async def migrations_ok(_snapshot, _expected_names):
+        return 1, []
+
+    monkeypatch.setattr(verifier, "verify_migrations", migrations_ok)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_prod_runtime.py",
+            "--verification-only",
+            "--revision",
+            "expected",
+            "--pm2-names",
+            "psy5d_new",
+            "--root",
+            str(tmp_path),
+            "--settle-seconds",
+            "0",
+        ],
+    )
+
+    result = verifier.main()
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "runtime=ok" in output
+    assert "stability=ok" in output
+    assert "startup_errors=none" in output
+    assert "verification=ok" in output
 
 
 def test_main_fails_for_restart_after_post_reload_baseline(
