@@ -721,6 +721,8 @@ PAGE_SIZE = 5
 USER_HISTORY_PAGE_SIZE = 10
 KB_PAGE_SIZE = 6
 ROBOKASSA_INVOICE_LIFETIME = timedelta(hours=2)
+TEST_SESSION_RECOVERY_TTL = timedelta(hours=24)
+TEST_CANCEL_COMMAND_RE = re.compile(r"/cancel(?:@[A-Za-z0-9_]+)?\Z", re.IGNORECASE)
 
 
 def _new_card_spread_state(
@@ -17903,8 +17905,44 @@ async def process_test_answer(callback: CallbackQuery, state: FSMContext, bot: B
     await _process_universal_test_answer(callback.message, user_id, state, bot, callback.data)
 
 
+def _is_test_cancel_text(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+    value = text.strip()
+    if TEST_CANCEL_COMMAND_RE.fullmatch(value):
+        return True
+    return value.casefold() in {"отмена", "стоп", "выйти", "выход"}
+
+
+def _test_session_recovery_expired(test_session, now: datetime | None = None) -> bool:
+    created_at = getattr(test_session, "created_at", None)
+    if not isinstance(created_at, datetime):
+        return True
+    if now is None:
+        now = datetime.now(created_at.tzinfo) if created_at.tzinfo else datetime.utcnow()
+    elif created_at.tzinfo and now.tzinfo is None:
+        now = now.replace(tzinfo=created_at.tzinfo)
+    elif not created_at.tzinfo and now.tzinfo:
+        now = now.replace(tzinfo=None)
+    reference_time = now
+    return created_at > reference_time or created_at < reference_time - TEST_SESSION_RECOVERY_TTL
+
+
+async def _finish_test_session(session, user_id: int, test_session=None) -> bool:
+    if test_session is None:
+        test_session = await session.get(TestSession, user_id, with_for_update=True)
+    if not test_session:
+        return False
+    test_session.is_finished = True
+    test_session.question_message_id = None
+    await session.commit()
+    return True
+
+
 @router.callback_query(F.data == "cancel_test")
 async def process_cancel_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    async with async_session_maker() as session:
+        await _finish_test_session(session, callback.from_user.id)
     await state.clear()
     locale = await _get_user_locale(callback.from_user.id)
     await callback.answer(
@@ -18125,6 +18163,19 @@ async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot
     user_id = message.from_user.id
     locale = await _get_user_locale(user_id)
     answer_text = message.text.strip()
+    if _is_test_cancel_text(answer_text):
+        async with async_session_maker() as session:
+            await _finish_test_session(session, user_id)
+        await state.clear()
+        await message.answer(
+            translate(
+                "ui.test.cancelled",
+                locale,
+                fallback="Тестирование прервано. Возвращаемся в главное меню.",
+            ),
+            reply_markup=await kb.main_client_keyboard(user_id),
+        )
+        return
     if not answer_text:
         await message.answer(
             translate("ui.test.invalid_text_answer", locale, fallback="Пожалуйста, напишите ответ текстом.")
@@ -18157,8 +18208,22 @@ async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot
                 "Пожалуйста, напишите ответ текстом.": "ui.test.text_required",
                 "Пожалуйста, выберите один из вариантов ниже.": "ui.test.choose_option",
             }.get(error_text)
+            reply_markup = None
+            if error_key == "ui.test.choose_option":
+                _, _, localized_options = _localized_test_question(question, locale)
+                reply_markup = kb.universal_test_answer_keyboard(
+                    localized_options,
+                    question_buttons_are_horizontal(question),
+                    question_index,
+                    exit_text=translate(
+                        "ui.test.exit",
+                        locale,
+                        fallback="❌ Выйти из теста",
+                    ),
+                )
             await message.answer(
-                translate(error_key, locale, fallback=error_text) if error_key else error_text
+                translate(error_key, locale, fallback=error_text) if error_key else error_text,
+                reply_markup=reply_markup,
             )
             return
 
@@ -22025,7 +22090,10 @@ async def _restore_test_state_from_db(message: Message, state: FSMContext, bot: 
     if current_state is not None:
         return False
     async with async_session_maker() as session:
-        test_session = await session.get(TestSession, message.from_user.id)
+        test_session = await session.get(TestSession, message.from_user.id, with_for_update=True)
+        if test_session and not test_session.is_finished and _test_session_recovery_expired(test_session):
+            await _finish_test_session(session, message.from_user.id, test_session)
+            return False
     if not test_session or test_session.is_finished:
         return False
     await state.set_state(UserStates.in_test)
