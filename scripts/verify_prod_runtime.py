@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from array import array
+from bisect import bisect_right
 import json
 import math
 import os
@@ -38,8 +40,27 @@ MAX_LIVE_LOG_SCAN_BYTES = 128 * 1024 * 1024
 LIVE_LOG_READ_CHUNK_BYTES = 1024 * 1024
 TRACEBACK_MARKER = "Traceback (most recent call last)"
 LOG_TIMESTAMP_RE = re.compile(
-    r"^\s*(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
-    r"(?:[,.]\d{1,9})?(?:\s?(?:Z|[+-]\d{2}:?\d{2}))?)"
+    r"^[ \t]*(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
+    r"(?:[,.]\d{1,9})?(?:[ \t]?(?:Z|[+-]\d{2}:?\d{2}))?)"
+)
+LOG_HEADER_TIMESTAMP_BYTES_RE = re.compile(
+    rb"(?m)^[ \t]*(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
+    rb"(?:[,.]\d{1,9})?(?:[ \t]?(?:Z|[+-]\d{2}:?\d{2}))?)"
+    rb"(?=[^\r\n]*\|[ \t]*(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)[ \t]*\|)"
+)
+TRACEBACK_MARKER_BYTES_RE = re.compile(re.escape(TRACEBACK_MARKER.encode()))
+CANDIDATE_LOG_HINT_BYTES_RE = re.compile(
+    rb"Traceback \(most recent call last\)"
+    rb"|ModuleNotFoundError|ImportError|SyntaxError|NameError|AttributeError|"
+    rb"IntegrityError|sqlalchemy\.(?:exc\.)?(?:OperationalError|ProgrammingError)"
+    rb"|TelegramBadRequest|TelegramNetworkError"
+    rb"|(?:database|migration|scheduler|handler(?:[- ]registration)?|"
+    rb"translation(?:[- ]cache)?|locale|start[_ -]?intent|benefit[_ -]?grant)"
+    rb"[^\r\n]{0,120}(?:error|exception|failed|failure|could not|unable)"
+    rb"|(?:error|exception|failed|failure|could not|unable)[^\r\n]{0,120}"
+    rb"(?:database|migration|scheduler|handler(?:[- ]registration)?|"
+    rb"translation(?:[- ]cache)?|locale|start[_ -]?intent|benefit[_ -]?grant)",
+    re.IGNORECASE,
 )
 LOG_LEVEL_RE = re.compile(r"^\s*\|\s*(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\|", re.IGNORECASE)
 TRACEBACK_END_RE = re.compile(
@@ -183,11 +204,8 @@ def format_timestamp(timestamp: float | None) -> str | None:
     ).replace("+00:00", "Z")
 
 
-def _timestamp_from_line(line: str) -> float | None:
-    match = LOG_TIMESTAMP_RE.match(line)
-    if match is None:
-        return None
-    value = match.group("timestamp").strip().replace(",", ".")
+def _parse_timestamp_value(value: str) -> float | None:
+    value = value.strip().replace(",", ".")
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     try:
@@ -197,6 +215,11 @@ def _timestamp_from_line(line: str) -> float | None:
     if parsed.tzinfo is None:
         parsed = parsed.astimezone()
     return parsed.timestamp()
+
+
+def _timestamp_from_line(line: str) -> float | None:
+    match = LOG_TIMESTAMP_RE.match(line)
+    return _parse_timestamp_value(match.group("timestamp")) if match else None
 
 
 def _is_timestamped_log_header(line: str) -> bool:
@@ -758,6 +781,11 @@ def _find_process_start_log_boundary(
     file_size: int,
     process_start: float,
 ) -> int | None:
+    local_clock, local_fraction = _timestamp_threshold_parts(process_start, None)
+    utc_clock, utc_fraction = _timestamp_threshold_parts(
+        process_start,
+        timezone.utc,
+    )
     position = file_size
     scanned = 0
     trailing = b""
@@ -773,32 +801,205 @@ def _find_process_start_log_boundary(
         if len(chunk) != chunk_size:
             return None
         data = chunk + trailing
-        lines = data.splitlines(keepends=True)
-        leading = b""
+        search_start = 0
         if chunk_start > 0 and os.pread(file_descriptor, 1, chunk_start - 1) != b"\n":
-            if lines:
-                leading = lines.pop(0)
-        trailing = leading
+            line_end = data.find(b"\n")
+            if line_end < 0:
+                trailing = data
+                search_start = len(data)
+            else:
+                trailing = data[:line_end + 1]
+                search_start = line_end + 1
+        else:
+            trailing = b""
 
-        line_offsets: list[tuple[int, bytes]] = []
-        line_offset = chunk_start + len(leading)
-        for line in lines:
-            line_offsets.append((line_offset, line))
-            line_offset += len(line)
-        for line_offset, line in reversed(line_offsets):
-            decoded_line = line.decode(errors="ignore")
-            timestamp = _timestamp_from_line(decoded_line)
-            if (
-                timestamp is not None
-                and timestamp < process_start
-                and _is_timestamped_log_header(decoded_line)
+        boundary_offset: int | None = None
+        for match in LOG_HEADER_TIMESTAMP_BYTES_RE.finditer(data, search_start):
+            if _timestamp_bytes_precede_start(
+                match.group("timestamp"),
+                process_start,
+                local_clock,
+                local_fraction,
+                utc_clock,
+                utc_fraction,
             ):
-                return line_offset
+                boundary_offset = chunk_start + match.start()
+        if boundary_offset is not None:
+            return boundary_offset
 
         scanned += chunk_size
         position = chunk_start
 
     return 0 if position == 0 else None
+
+
+def _timestamp_threshold_parts(
+    timestamp: float,
+    tz: timezone | None,
+) -> tuple[bytes, bytes]:
+    whole_seconds = math.floor(timestamp)
+    fraction_ns = round((timestamp - whole_seconds) * 1_000_000_000)
+    if fraction_ns >= 1_000_000_000:
+        whole_seconds += 1
+        fraction_ns = 0
+    parsed = datetime.fromtimestamp(whole_seconds, tz)
+    clock = parsed.strftime("%Y-%m-%d %H:%M:%S").encode()
+    return clock, f"{fraction_ns:09d}".encode()
+
+
+def _timestamp_bytes_precede_start(
+    raw_timestamp: bytes,
+    process_start: float,
+    local_clock: bytes,
+    local_fraction: bytes,
+    utc_clock: bytes,
+    utc_fraction: bytes,
+) -> bool:
+    suffix = raw_timestamp[19:]
+    if suffix.endswith(b"Z"):
+        threshold_clock = utc_clock
+        threshold_fraction = utc_fraction
+    elif re.search(rb"[+-]\d{2}:?\d{2}$", suffix):
+        parsed = _parse_timestamp_value(raw_timestamp.decode())
+        return parsed is not None and parsed < process_start
+    else:
+        threshold_clock = local_clock
+        threshold_fraction = local_fraction
+
+    log_clock = raw_timestamp[:19].replace(b"T", b" ")
+    if log_clock != threshold_clock:
+        return log_clock < threshold_clock
+
+    fraction_match = re.match(rb"[.,](\d+)", suffix)
+    log_fraction = fraction_match.group(1)[:9].ljust(9, b"0") if fraction_match else b"0" * 9
+    return log_fraction < threshold_fraction
+
+
+def _timestamped_header_offsets(content: bytes) -> array:
+    return array(
+        "Q",
+        (match.start() for match in LOG_HEADER_TIMESTAMP_BYTES_RE.finditer(content)),
+    )
+
+
+def _log_header_timestamp(content: bytes, offset: int) -> float | None:
+    line_end = content.find(b"\n", offset)
+    if line_end < 0:
+        line_end = len(content)
+    return _timestamp_from_line(content[offset:line_end].decode(errors="ignore"))
+
+
+def _traceback_end_offset(content: bytes, marker_offset: int) -> int:
+    line_end = content.find(b"\n", marker_offset)
+    if line_end < 0:
+        return len(content)
+    cursor = line_end + 1
+    while cursor < len(content):
+        line_end = content.find(b"\n", cursor)
+        if line_end < 0:
+            line_end = len(content)
+        line = content[cursor:line_end].decode(errors="ignore")
+        if _is_traceback_terminal_line(line):
+            return min(line_end + 1, len(content))
+        cursor = line_end + 1
+    return len(content)
+
+
+def _candidate_log_result_for_block(
+    result: LogCheckResult,
+    timestamp: float | None,
+    process_start: float,
+) -> LogCheckResult | None:
+    if result.status == LOG_CLEAN:
+        return None
+    if timestamp is None:
+        return LogCheckResult(
+            LOG_INDETERMINATE,
+            "timestamp_unavailable",
+            classification="unattributed_candidate_error",
+            process_start_timestamp=format_timestamp(process_start),
+            matched_rule=result.matched_rule,
+            excerpt=result.excerpt,
+        )
+    if timestamp < process_start:
+        return None
+    return LogCheckResult(
+        LOG_ERROR,
+        result.reason,
+        classification="fatal_candidate_error",
+        first_timestamp=format_timestamp(timestamp),
+        process_start_timestamp=format_timestamp(process_start),
+        matched_rule=result.matched_rule,
+        excerpt=result.excerpt,
+    )
+
+
+def classify_candidate_log_bytes(
+    content: bytes,
+    process_start: float,
+) -> LogCheckResult:
+    if not CANDIDATE_LOG_HINT_BYTES_RE.search(content):
+        return LogCheckResult(
+            LOG_CLEAN,
+            process_start_timestamp=format_timestamp(process_start),
+        )
+
+    headers = _timestamped_header_offsets(content)
+    trace_ranges: list[tuple[int, int]] = []
+    for marker in TRACEBACK_MARKER_BYTES_RE.finditer(content):
+        header_index = bisect_right(headers, marker.start()) - 1
+        block_start = int(headers[header_index]) if header_index >= 0 else marker.start()
+        block_end = _traceback_end_offset(content, marker.start())
+        timestamp = (
+            _log_header_timestamp(content, int(headers[header_index]))
+            if header_index >= 0
+            else None
+        )
+        result = classify_log_window(content[block_start:block_end].decode(errors="ignore"))
+        candidate = _candidate_log_result_for_block(result, timestamp, process_start)
+        if candidate is not None:
+            return candidate
+        trace_ranges.append((block_start, block_end))
+
+    handled_blocks: set[int] = set()
+    trace_index = 0
+    for match in CANDIDATE_LOG_HINT_BYTES_RE.finditer(content):
+        position = match.start()
+        while trace_index < len(trace_ranges) and trace_ranges[trace_index][1] <= position:
+            trace_index += 1
+        if trace_index < len(trace_ranges):
+            trace_start, trace_end = trace_ranges[trace_index]
+            if trace_start <= position < trace_end:
+                continue
+        if match.group().lower().startswith(b"traceback"):
+            continue
+
+        line_start = content.rfind(b"\n", 0, position) + 1
+        header_index = bisect_right(headers, line_start) - 1
+        if header_index >= 0:
+            block_start = int(headers[header_index])
+            block_end = int(headers[header_index + 1]) if header_index + 1 < len(headers) else len(content)
+            timestamp = _log_header_timestamp(content, block_start)
+        else:
+            block_start = line_start
+            line_end = content.find(b"\n", position)
+            block_end = len(content) if line_end < 0 else line_end + 1
+            timestamp = None
+        if block_start in handled_blocks:
+            continue
+        handled_blocks.add(block_start)
+        if timestamp is not None and timestamp < process_start:
+            continue
+
+        result = classify_log_window(content[block_start:block_end].decode(errors="ignore"))
+        candidate = _candidate_log_result_for_block(result, timestamp, process_start)
+        if candidate is not None:
+            return candidate
+
+    return LogCheckResult(
+        LOG_CLEAN,
+        process_start_timestamp=format_timestamp(process_start),
+    )
 
 
 def recent_startup_error_since_process_start(
@@ -868,8 +1069,7 @@ def recent_startup_error_since_process_start(
             except OSError:
                 pass
 
-    decoded = content.decode(errors="ignore")
-    result = classify_candidate_log_window(decoded, process_start)
+    result = classify_candidate_log_bytes(content, process_start)
     return replace(result, log_path=log_path)
 
 
