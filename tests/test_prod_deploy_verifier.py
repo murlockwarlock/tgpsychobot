@@ -327,6 +327,25 @@ def test_live_verification_scans_from_pm_uptime_without_reloading(tmp_path):
     assert result.process_start_timestamp == verifier.format_timestamp(process_start)
 
 
+def test_live_verification_reads_back_to_prestart_record_boundary(monkeypatch, tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    now = time.time()
+    process_start = now - 10
+    old_record = f"{verifier.format_timestamp(now - 20)} | INFO | app | old process\n"
+    candidate_records = "".join(
+        f"{verifier.format_timestamp(now - 9)} | INFO | app | healthy {index}\n"
+        for index in range(10)
+    )
+    log_path.write_text("x" * 400 + "\n" + old_record + candidate_records, encoding="utf-8")
+    monkeypatch.setattr(verifier, "MAX_LIVE_LOG_SCAN_BYTES", 1024)
+    monkeypatch.setattr(verifier, "LIVE_LOG_READ_CHUNK_BYTES", 128)
+    process = _process(log_path=log_path, pm_uptime=process_start)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_CLEAN
+
+
 def test_live_verification_fails_for_traceback_after_pm_uptime(tmp_path):
     log_path = tmp_path / "bot-error.log"
     now = time.time()
