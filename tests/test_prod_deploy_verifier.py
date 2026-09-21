@@ -182,6 +182,19 @@ def test_log_append_ignores_history_and_detects_new_error(tmp_path):
         _remove_baseline(baseline_path)
 
 
+def test_failure_excerpt_redacts_telegram_and_database_credentials():
+    excerpt = verifier._sanitize_excerpt(
+        "NameError: failed calling https://api.telegram.org/bot123456:abcdefghijklmnopqrstuvwxyz123456/sendMessage "
+        "postgresql://admin:topsecret@db.example/app",
+        "NameError",
+    )
+
+    assert "[REDACTED_TOKEN]" in excerpt
+    assert "[REDACTED_DB_URL]" in excerpt
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in excerpt
+    assert "topsecret" not in excerpt
+
+
 def test_old_process_traceback_between_baseline_and_new_pm_uptime_is_ignored(tmp_path):
     log_path = tmp_path / "bot-error.log"
     log_path.write_text("baseline\n", encoding="utf-8")

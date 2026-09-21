@@ -106,7 +106,6 @@ class LogCheckResult:
 class TimestampedLogBlock:
     content: str
     timestamp: float | None
-    timestamp_text: str | None
 
 
 LOG_CLEAN = "clean"
@@ -183,20 +182,20 @@ def format_timestamp(timestamp: float | None) -> str | None:
     ).replace("+00:00", "Z")
 
 
-def _timestamp_from_line(line: str) -> tuple[float | None, str | None]:
+def _timestamp_from_line(line: str) -> float | None:
     match = LOG_TIMESTAMP_RE.match(line)
     if match is None:
-        return None, None
+        return None
     value = match.group("timestamp").strip().replace(",", ".")
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        return None, None
+        return None
     if parsed.tzinfo is None:
         parsed = parsed.astimezone()
-    return parsed.timestamp(), match.group("timestamp")
+    return parsed.timestamp()
 
 
 def _strip_log_prefix(line: str) -> str:
@@ -218,26 +217,23 @@ def timestamped_log_blocks(content: str) -> list[TimestampedLogBlock]:
     blocks: list[TimestampedLogBlock] = []
     current_lines: list[str] = []
     current_timestamp: float | None = None
-    current_timestamp_text: str | None = None
     traceback_open = False
 
     def finish_block() -> None:
-        nonlocal current_lines, current_timestamp, current_timestamp_text, traceback_open
+        nonlocal current_lines, current_timestamp, traceback_open
         if current_lines:
             blocks.append(
                 TimestampedLogBlock(
                     content="".join(current_lines),
                     timestamp=current_timestamp,
-                    timestamp_text=current_timestamp_text,
                 )
             )
         current_lines = []
         current_timestamp = None
-        current_timestamp_text = None
         traceback_open = False
 
     for line in content.splitlines(keepends=True):
-        line_timestamp, line_timestamp_text = _timestamp_from_line(line)
+        line_timestamp = _timestamp_from_line(line)
         is_log_header = (
             line_timestamp is not None
             and LOG_LEVEL_RE.search(line[LOG_TIMESTAMP_RE.match(line).end():]) is not None
@@ -251,10 +247,8 @@ def timestamped_log_blocks(content: str) -> list[TimestampedLogBlock]:
                 finish_block()
         if not current_lines and line_timestamp is not None:
             current_timestamp = line_timestamp
-            current_timestamp_text = line_timestamp_text
         elif current_timestamp is None and line_timestamp is not None:
             current_timestamp = line_timestamp
-            current_timestamp_text = line_timestamp_text
         current_lines.append(line)
         if TRACEBACK_MARKER in line:
             traceback_open = True
@@ -295,6 +289,17 @@ def _sanitize_excerpt(content: str, matched_rule: str | None) -> str:
     selected = re.sub(
         r"(?i)\b(?:bot[_ -]?)?(?:token|password|secret|api[_ -]?key)\s*[=: ]\s*\S+",
         "[REDACTED_SECRET]",
+        selected,
+    )
+    selected = re.sub(r"(?i)\bbearer\s+\S+", "[REDACTED_AUTH]", selected)
+    selected = re.sub(
+        r"(?i)\b(?:postgres(?:ql)?|mysql|redis)://\S+",
+        "[REDACTED_DB_URL]",
+        selected,
+    )
+    selected = re.sub(
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        "[REDACTED_JWT]",
         selected,
     )
     return selected[:240]
