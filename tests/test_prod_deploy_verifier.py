@@ -479,6 +479,31 @@ def test_live_verification_allows_recoverable_telegram_network_traceback(tmp_pat
     assert result.status == LOG_CLEAN
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ERROR:aiogram.dispatcher:Failed to fetch updates - TelegramNetworkError: "
+        "HTTP Client says - ServerDisconnectedError: Server disconnected",
+        "ERROR:aiogram.dispatcher:Failed to fetch updates - TelegramNetworkError: "
+        "HTTP Client says - Request timeout error",
+    ],
+)
+def test_live_verification_allows_only_known_dispatcher_network_messages(tmp_path, message):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_text(f"{message}\n", encoding="utf-8")
+    process = _process(log_path=log_path)
+
+    result = verifier.recent_startup_error_since_process_start(process)
+
+    assert result.status == LOG_CLEAN
+    assert validate_pm2_snapshot({process["name"]: process}, [process["name"]]) == []
+    assert validate_pm2_stability(
+        {process["name"]: process},
+        {process["name"]: process},
+        [process["name"]],
+    ) == []
+
+
 def test_live_verification_keeps_unclassified_candidate_network_failure_fatal(tmp_path):
     log_path = tmp_path / "bot-error.log"
     now = time.time()
