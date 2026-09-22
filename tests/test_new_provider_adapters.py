@@ -132,7 +132,9 @@ def test_perplexity_payload_uses_official_preset_and_web_search_without_reasonin
     assert payload["preset"] == "medium"
     assert payload["tools"] == [{"type": "web_search"}]
     assert payload["max_output_tokens"] == 2048
-    assert payload["instructions"] == "Отвечай на языке пользователя."
+    assert payload["instructions"].startswith("Отвечай на языке пользователя.")
+    assert "web_search" in payload["instructions"]
+    assert "inline citations" in payload["instructions"]
     assert "system:" not in payload["input"]
     assert "user: Текущий вопрос" in payload["input"]
     assert "reasoning" not in payload

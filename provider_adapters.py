@@ -106,6 +106,8 @@ def build_perplexity_payload(
         raise ProviderAdapterError("Недопустимый режим Perplexity", category="invalid_model")
     instruction_blocks = layout.ordered_instruction_blocks
     instructions = "\n\n".join(block for block in instruction_blocks if block)
+    if instructions:
+        instructions += "\n\nИспользуй web_search для актуальных фактов и добавляй inline citations [n] к утверждениям, основанным на найденных источниках."
     input_parts: list[str] = []
     for message in layout.history:
         content = message.content if isinstance(message.content, str) else json.dumps(message.content, ensure_ascii=False)
