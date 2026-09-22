@@ -1297,11 +1297,20 @@ async def _dispatch_provider(
             if not getattr(ai_config, "perplexity_api_key", None):
                 raise AIServiceError("Perplexity API key не задан")
             try:
+                configured_perplexity_tokens = getattr(ai_config, "max_output_tokens", None)
                 return await call_perplexity(
                     ai_config.perplexity_api_key,
                     layout,
                     ai_config.perplexity_model,
-                    max_output_tokens=getattr(ai_config, "max_output_tokens", None),
+                    max_output_tokens=(
+                        effective_chat_output_tokens(
+                            PROVIDER_PERPLEXITY,
+                            ai_config.perplexity_model,
+                            configured_perplexity_tokens,
+                        )
+                        if configured_perplexity_tokens is not None
+                        else None
+                    ),
                     timeout=timeout,
                     request_capture=request_capture,
                 )

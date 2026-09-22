@@ -18,6 +18,7 @@ from provider_models import (
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
     PROVIDER_OPENAI,
+    PROVIDER_PERPLEXITY,
     effective_chat_output_tokens,
     get_chat_output_token_limit,
     validate_chat_output_tokens,
@@ -82,6 +83,7 @@ def test_output_budget_defaults_and_validation():
         validate_chat_output_tokens(PROVIDER_OPENAI, "gpt-5.6-terra", "0")
     with pytest.raises(ValueError):
         validate_chat_output_tokens(PROVIDER_OPENAI, "gpt-5.6-terra", "not-a-number")
+    assert effective_chat_output_tokens(PROVIDER_PERPLEXITY, "fast", 50000) == 8192
 
 
 def test_admin_exposes_deepseek_thinking_only_for_deepseek():

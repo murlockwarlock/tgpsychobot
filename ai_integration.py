@@ -2055,11 +2055,20 @@ async def get_ai_response(
                         raise _wrap_provider_adapter_error(exc) from exc
                 elif p_key == 'perplexity':
                     try:
+                        configured_perplexity_tokens = getattr(ai_config, "max_output_tokens", None)
                         return await call_perplexity(
                             p_api_key,
                             request_layout,
                             p_model,
-                            max_output_tokens=(getattr(ai_config, "max_output_tokens", None) if getattr(ai_config, "max_output_tokens", None) is not None else None),
+                            max_output_tokens=(
+                                effective_chat_output_tokens(
+                                    PROVIDER_PERPLEXITY,
+                                    p_model,
+                                    configured_perplexity_tokens,
+                                )
+                                if configured_perplexity_tokens is not None
+                                else None
+                            ),
                             timeout=timeout,
                             request_capture=capture_dict,
                         )
