@@ -64,6 +64,7 @@ from provider_models import (
     DEFAULT_KIE_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     GEMINI_CHAT_MAX_TOKENS,
+    effective_chat_output_tokens,
     KIE_VISION_INITIAL_MAX_TOKENS,
     OPENAI_CHAT_MAX_TOKENS,
     PROVIDER_CLAUDE,
@@ -824,6 +825,7 @@ async def _call_gemini_api(
     *,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_output_tokens: int | None = None,
 ) -> str:
     import httpx
     try:
@@ -845,7 +847,7 @@ async def _call_gemini_api(
             raise AIResponseError("Gemini request history must end with a user message")
 
         generation_config: dict[str, Any] = {
-            "maxOutputTokens": GEMINI_CHAT_MAX_TOKENS,
+            "maxOutputTokens": max_output_tokens or GEMINI_CHAT_MAX_TOKENS,
         }
         if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
             generation_config["temperature"] = temperature
@@ -908,6 +910,7 @@ async def _call_kie_chat(
     timeout: float = 120.0,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_output_tokens: int | None = None,
 ) -> str:
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_KIE, target_model, channel="chat")
@@ -928,6 +931,7 @@ async def _call_kie_chat(
             target_model,
             request_layout=layout,
             temperature=temperature,
+            max_output_tokens=max_output_tokens or 4096,
         )
         _capture_ai_request(
             request_capture,
@@ -1256,6 +1260,7 @@ async def _call_claude_api(
     *,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_output_tokens: int | None = None,
 ):
     try:
         if not api_key:
@@ -1280,7 +1285,7 @@ async def _call_claude_api(
 
         payload: dict[str, Any] = {
             "model": target_model,
-            "max_tokens": CLAUDE_CHAT_MAX_TOKENS,
+            "max_tokens": max_output_tokens or CLAUDE_CHAT_MAX_TOKENS,
             "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
@@ -1473,6 +1478,8 @@ async def _call_deepseek_api(
     *,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_output_tokens: int | None = None,
+    thinking_enabled: bool = False,
 ):
     client = None
     try:
@@ -1504,9 +1511,9 @@ async def _call_deepseek_api(
         payload = {
             "model": normalized_model,
             "messages": build_openai_chat_messages(layout),
-            "max_tokens": DEEPSEEK_CHAT_MAX_TOKENS,
+            "max_tokens": max_output_tokens or DEEPSEEK_CHAT_MAX_TOKENS,
             "temperature": temperature,
-            "extra_body": {"thinking": {"type": "disabled"}},
+            "extra_body": {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}},
         }
         _capture_ai_request(
             request_capture,
@@ -1934,6 +1941,25 @@ async def get_ai_response(
         async def _dispatch_call(p_key, p_api_key, p_model, capture_dict: dict):
             use_proxy = getattr(ai_config, 'use_proxy', True)
             timeout = float(getattr(ai_config, "fallback_timeout", 60))
+            normalized_provider = {
+                "openai": PROVIDER_OPENAI,
+                "anthropic": PROVIDER_CLAUDE,
+                "claude": PROVIDER_CLAUDE,
+                "gemini": PROVIDER_GEMINI,
+                "kie": PROVIDER_KIE,
+                "deepseek": PROVIDER_DEEPSEEK,
+                "xai": "xAI",
+            }.get(str(p_key).lower(), p_key)
+            output_tokens = effective_chat_output_tokens(
+                normalized_provider,
+                p_model,
+                getattr(ai_config, "max_output_tokens", None),
+            )
+            thinking_enabled = (
+                bool(getattr(ai_config, "deepseek_thinking_enabled", False))
+                if str(p_key).lower() == "deepseek"
+                else False
+            )
 
             if not str(p_model).startswith(("primary-", "fallback-", "mock-", "test-", "dummy-", "gpt-5.6-turbo")) and not str(p_model).endswith(("-telegram", "-max")):
                 try:
@@ -1970,16 +1996,16 @@ async def get_ai_response(
                         request_capture=capture_dict,
                         request_layout=request_layout,
                         activity_tracker=activity_tracker,
-                        max_completion_tokens=OPENAI_CHAT_MAX_TOKENS,
+                        max_completion_tokens=output_tokens,
                     )
                 elif p_key in ['anthropic', 'claude']:
-                    return await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
+                    return await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
                 elif p_key == 'gemini':
-                    return await _call_gemini_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
+                    return await _call_gemini_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
                 elif p_key == 'kie':
-                    return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
+                    return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
                 elif p_key == 'deepseek':
-                    return await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker)
+                    return await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens, thinking_enabled=thinking_enabled)
                 elif p_key == 'xai':
                     return await _call_openai_api(
                         p_api_key,
@@ -1992,7 +2018,7 @@ async def get_ai_response(
                         request_capture=capture_dict,
                         request_layout=request_layout,
                         activity_tracker=activity_tracker,
-                        max_completion_tokens=4096,
+                        max_completion_tokens=output_tokens,
                     )
                 else:
                     raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
@@ -2111,7 +2137,11 @@ async def get_ai_response(
                     finish_reason=getattr(diag, "finish_reason", "length") if diag else "length",
                     visible_content_length=getattr(diag, "visible_content_length", 0) if diag else 0,
                     reasoning_content_length=getattr(diag, "reasoning_content_length", 0) if diag else 0,
-                    max_tokens=DEEPSEEK_CHAT_MAX_TOKENS,
+                    max_tokens=effective_chat_output_tokens(
+                        primary_prov,
+                        primary_mod,
+                        getattr(ai_config, "max_output_tokens", None),
+                    ),
                     ai_log_id=primary_log_id,
                 )
 
@@ -4007,4 +4037,3 @@ async def analyze_image_content(
             logging.warning("Failed to send vision terminal alert: %s", alert_err)
 
     raise final_exc
-

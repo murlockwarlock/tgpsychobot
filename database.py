@@ -245,6 +245,8 @@ class AIConfig(Base):
     claude_model = Column(String, default='claude-sonnet-5')
     deepseek_model = Column(String, default=DEEPSEEK_DEFAULT_MODEL)
     openai_model = Column(String, default='gpt-5.6-terra')
+    max_output_tokens = Column(Integer, nullable=True)
+    deepseek_thinking_enabled = Column(Boolean, nullable=True)
     max_voice_duration_sec = Column(Integer, default=180, nullable=False)
     transcription_provider = Column(String, default='OpenAI', nullable=False)
     vision_provider = Column(String, default='Gemini', nullable=False)
@@ -1368,6 +1370,10 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN fallback_provider VARCHAR"))
             if 'fallback_model' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN fallback_model VARCHAR"))
+            if 'max_output_tokens' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN max_output_tokens INTEGER"))
+            if 'deepseek_thinking_enabled' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN deepseek_thinking_enabled BOOLEAN"))
             if 'allow_fallback' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_fallback BOOLEAN DEFAULT FALSE NOT NULL"))
             if 'allow_vision_fallback' not in ai_columns:

@@ -53,6 +53,7 @@ from provider_models import (
     GEMINI_CHAT_MAX_TOKENS,
     KIE_VISION_INITIAL_MAX_TOKENS,
     OPENAI_CHAT_MAX_TOKENS,
+    effective_chat_output_tokens,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
@@ -257,6 +258,7 @@ async def _call_openai(
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_completion_tokens: int | None = None,
 ) -> str:
     target_model = model or "gpt-5.6-terra"
     ensure_model_available(PROVIDER_OPENAI, target_model)
@@ -265,7 +267,7 @@ async def _call_openai(
     payload: dict = {
         "model": target_model,
         "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
-        "max_completion_tokens": OPENAI_CHAT_MAX_TOKENS,
+        "max_completion_tokens": max_completion_tokens or OPENAI_CHAT_MAX_TOKENS,
     }
     if not target_model.startswith("gpt-5.6"):
         payload["temperature"] = temperature
@@ -293,6 +295,8 @@ async def _call_deepseek(
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_output_tokens: int | None = None,
+    thinking_enabled: bool = False,
 ) -> str:
     normalized_model = normalize_deepseek_model(model)
     ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
@@ -301,9 +305,9 @@ async def _call_deepseek(
     payload = {
         "model": normalized_model,
         "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
-        "max_tokens": DEEPSEEK_CHAT_MAX_TOKENS,
+        "max_tokens": max_output_tokens or DEEPSEEK_CHAT_MAX_TOKENS,
         "temperature": temperature,
-        "extra_body": {"thinking": {"type": "disabled"}},
+        "extra_body": {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}},
     }
     _capture_ai_request(
         request_capture,
@@ -387,6 +391,7 @@ async def _call_claude(
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_output_tokens: int | None = None,
 ) -> str:
     target_model = model or "claude-sonnet-5"
     ensure_model_available(PROVIDER_CLAUDE, target_model)
@@ -400,7 +405,7 @@ async def _call_claude(
     client = anthropic.AsyncAnthropic(api_key=api_key)
     payload: dict = {
         "model": target_model,
-        "max_tokens": CLAUDE_CHAT_MAX_TOKENS,
+        "max_tokens": max_output_tokens or CLAUDE_CHAT_MAX_TOKENS,
         "system": build_anthropic_system(layout),
         "messages": anthropic_messages,
     }
@@ -442,13 +447,14 @@ async def _call_gemini(
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_output_tokens: int | None = None,
 ) -> str:
     import httpx
 
     target_model = model or "gemini-3.7-flash"
     ensure_model_available(PROVIDER_GEMINI, target_model)
     layout = request_layout or _legacy_layout(messages, system_prompt)
-    generation_config: dict = {"maxOutputTokens": GEMINI_CHAT_MAX_TOKENS}
+    generation_config: dict = {"maxOutputTokens": max_output_tokens or GEMINI_CHAT_MAX_TOKENS}
     if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
         generation_config["temperature"] = temperature
 
@@ -1054,6 +1060,7 @@ async def _call_kie_text_chat(
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
+    max_output_tokens: int | None = None,
 ) -> str:
     """Call KIE text chat using the model's documented protocol."""
     ensure_model_available(PROVIDER_KIE, model, channel="chat")
@@ -1064,6 +1071,7 @@ async def _call_kie_text_chat(
         model,
         request_layout=layout,
         temperature=temperature,
+        max_output_tokens=max_output_tokens or 4096,
     )
     _capture_ai_request(
         request_capture,
@@ -1148,6 +1156,19 @@ async def _dispatch_provider(
     )
 
     timeout = float(getattr(ai_config, "fallback_timeout", 60) or 60.0)
+    output_tokens = effective_chat_output_tokens(
+        ai_config.provider,
+        {
+            "openai": getattr(ai_config, "openai_model", None),
+            "claude": getattr(ai_config, "claude_model", None),
+            "anthropic": getattr(ai_config, "claude_model", None),
+            "gemini": getattr(ai_config, "gemini_model", None),
+            "deepseek": getattr(ai_config, "deepseek_model", None),
+            "kie": getattr(ai_config, "kie_model", None),
+        }.get(provider, None),
+        getattr(ai_config, "max_output_tokens", None),
+    )
+    thinking_enabled = bool(getattr(ai_config, "deepseek_thinking_enabled", False)) if provider == "deepseek" else False
 
     async def _invoke():
         if provider == "openai":
@@ -1161,6 +1182,7 @@ async def _dispatch_provider(
                 request_layout=layout,
                 request_capture=request_capture,
                 activity_tracker=activity_tracker,
+                max_completion_tokens=output_tokens,
             )
         elif provider in {"claude", "anthropic"}:
             claude_key = getattr(ai_config, "claude_api_key", None) or getattr(ai_config, "anthropic_api_key", None)
@@ -1175,6 +1197,7 @@ async def _dispatch_provider(
                 request_layout=layout,
                 request_capture=request_capture,
                 activity_tracker=activity_tracker,
+                max_output_tokens=output_tokens,
             )
         elif provider == "gemini":
             if not ai_config.gemini_api_key:
@@ -1188,6 +1211,7 @@ async def _dispatch_provider(
                 request_layout=layout,
                 request_capture=request_capture,
                 activity_tracker=activity_tracker,
+                max_output_tokens=output_tokens,
             )
         elif provider == "deepseek":
             if not ai_config.deepseek_api_key:
@@ -1200,6 +1224,8 @@ async def _dispatch_provider(
                 request_layout=layout,
                 request_capture=request_capture,
                 activity_tracker=activity_tracker,
+                max_output_tokens=output_tokens,
+                thinking_enabled=thinking_enabled,
             )
         elif provider == "kie":
             if not ai_config.kie_api_key:
@@ -1215,6 +1241,7 @@ async def _dispatch_provider(
                 request_layout=layout,
                 request_capture=request_capture,
                 activity_tracker=activity_tracker,
+                max_output_tokens=output_tokens,
             )
         else:
             raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
@@ -1454,7 +1481,11 @@ async def get_ai_response(
                     finish_reason=getattr(diag, "finish_reason", "length") if diag else "length",
                     visible_content_length=getattr(diag, "visible_content_length", 0) if diag else 0,
                     reasoning_content_length=getattr(diag, "reasoning_content_length", 0) if diag else 0,
-                    max_tokens=DEEPSEEK_CHAT_MAX_TOKENS,
+                    max_tokens=effective_chat_output_tokens(
+                        primary_prov,
+                        primary_mod,
+                        getattr(ai_config, "max_output_tokens", None),
+                    ),
                     ai_log_id=primary_log_id,
                 )
 
@@ -1476,40 +1507,71 @@ async def get_ai_response(
 
                     async def _invoke_fb():
                         if fb_key == "openai":
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
                             return await _call_openai(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
+                                max_completion_tokens=fb_tokens,
                             )
                         elif fb_key in {"claude", "anthropic"}:
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
                             return await _call_claude(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
+                                max_output_tokens=fb_tokens,
                             )
                         elif fb_key == "gemini":
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
                             return await _call_gemini(
                                 fb_api_key, fb_model, [], stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
+                                max_output_tokens=fb_tokens,
                             )
                         elif fb_key == "deepseek":
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
                             return await _call_deepseek(
                                 fb_api_key, fb_model, [], temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
+                                max_output_tokens=fb_tokens,
+                                thinking_enabled=bool(getattr(ai_config, "deepseek_thinking_enabled", False)),
                             )
                         elif fb_key == "kie":
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
                             return await _call_kie_text_chat(
                                 fb_api_key, _get_kie_base_url(ai_config), fb_model, [],
                                 stable_system_prompt, temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
+                                max_output_tokens=fb_tokens,
                             )
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")

@@ -94,10 +94,13 @@ from provider_models import (
     TELEGRAM_MODEL_CALLBACK_PREFIX,
     build_telegram_model_callback_data,
     canonical_provider_name,
+    effective_chat_output_tokens,
+    get_chat_output_token_limit,
     get_default_model,
     get_selectable_models,
     resolve_telegram_model_callback,
     validate_model_selection,
+    validate_chat_output_tokens,
 )
 from knowledge_base_admin import (
     delete_knowledge_base_record,
@@ -1071,6 +1074,7 @@ PROMPT_BLOCKS = {
 
 class AdminStates(StatesGroup):
     set_ai_timeout = State()
+    set_max_output_tokens = State()
     set_api_key = State()
     set_model = State()
     set_system_prompt = State()
@@ -4877,6 +4881,14 @@ async def admin_ai_settings(message: Message | CallbackQuery):
         else:
             model_name = getattr(config, f"{provider.lower()}_model", "не выбрана")
             model_label = "Активная модель"
+        configured_output_tokens = getattr(config, "max_output_tokens", None)
+        effective_output_tokens = effective_chat_output_tokens(provider, model_name, configured_output_tokens)
+        output_tokens_label = (
+            f"По умолчанию (эффективно: {effective_output_tokens})"
+            if configured_output_tokens is None
+            else f"{effective_output_tokens}"
+        )
+        deepseek_thinking_enabled = bool(getattr(config, "deepseek_thinking_enabled", False))
 
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
         vis_provider = config.vision_provider
@@ -4918,7 +4930,14 @@ async def admin_ai_settings(message: Message | CallbackQuery):
 
     text = (f"🤖 <b>Настройки ИИ</b>\n\n"
             f"▫️ Текущий провайдер: <b>{provider}</b>\n"
-            f"▫️ {model_label}: <code>{model_name}</code>\n{fb_text}\n"
+            f"▫️ {model_label}: <code>{model_name}</code>\n"
+            f"▫️ Максимум ответа: <b>{output_tokens_label} токенов</b>\n"
+            + (
+                f"▫️ Thinking DeepSeek: <b>{'включён' if deepseek_thinking_enabled else 'выключен'}</b>\n"
+                if canonical_provider_name(provider) == PROVIDER_DEEPSEEK
+                else ""
+            )
+            + f"{fb_text}\n"
             f"📝 <b>Промпты:</b>\n"
             f"▫️ Основной промпт: <b>{prompt_source}</b>\n"
             f"▫️ Общий блок: <b>{shared_block_status}</b>\n"
@@ -4990,6 +5009,13 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     c_first = config.context_limit_first if config else 2
     c_recent = config.context_limit_recent if config else 10
     temp = getattr(config, 'temperature', 0.7) if config else 0.7
+    current_provider = config.provider if config else PROVIDER_GEMINI
+    if config and canonical_provider_name(current_provider) == PROVIDER_KIE:
+        current_model = getattr(config, 'kie_model', None)
+    else:
+        current_model = getattr(config, f"{str(current_provider).lower()}_model", None) if config else None
+    max_output_tokens = getattr(config, 'max_output_tokens', None) if config else None
+    deepseek_thinking_enabled = bool(getattr(config, 'deepseek_thinking_enabled', False)) if config else False
     memory_mode = get_memory_mode(config) if config else MEMORY_MODE_RESET
     fb_provider = getattr(config, 'fallback_provider', None) if config else None
     fb_model = getattr(config, 'fallback_model', None) if config else None
@@ -5035,9 +5061,91 @@ async def admin_ai_keys_models(callback: CallbackQuery):
             allow_vision_fallback=allow_vision_fallback,
             vision_fallback_provider=vision_fallback_provider,
             vision_fallback_model=vision_fallback_model,
+            current_provider=current_provider,
+            current_model=current_model,
+            max_output_tokens=max_output_tokens,
+            deepseek_thinking_enabled=deepseek_thinking_enabled,
         ),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "toggle_deepseek_thinking")
+async def toggle_deepseek_thinking(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config or canonical_provider_name(config.provider) != PROVIDER_DEEPSEEK:
+            await callback.answer("Режим Thinking доступен только для DeepSeek.", show_alert=True)
+            return
+        config.deepseek_thinking_enabled = not bool(getattr(config, "deepseek_thinking_enabled", False))
+        enabled = bool(config.deepseek_thinking_enabled)
+        await session.commit()
+    await callback.answer(f"Thinking: {'включён' if enabled else 'выключен'}")
+    await admin_ai_keys_models(callback)
+
+
+@router.callback_query(F.data == "set_max_output_tokens")
+async def start_set_max_output_tokens(callback: CallbackQuery, state: FSMContext):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    if not config:
+        await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
+        return
+    provider = config.provider
+    model = (
+        getattr(config, "kie_model", None)
+        if canonical_provider_name(provider) == PROVIDER_KIE
+        else getattr(config, f"{str(provider).lower()}_model", None)
+    )
+    configured = getattr(config, "max_output_tokens", None)
+    effective = effective_chat_output_tokens(provider, model, configured)
+    limit = get_chat_output_token_limit(provider, model)
+    current = (
+        f"{configured} токенов (эффективно: {effective})"
+        if configured is not None
+        else f"По умолчанию (эффективно: {effective})"
+    )
+    await callback.message.edit_text(
+        f"📏 Максимум ответа: {current}.\n\n"
+        f"Введите целое число от 1 до {limit} или отправьте «По умолчанию»:",
+        reply_markup=kb.back_to_previous_menu("admin_ai_keys"),
+    )
+    await state.set_state(AdminStates.set_max_output_tokens)
+
+
+@router.message(AdminStates.set_max_output_tokens, F.text)
+async def save_max_output_tokens(message: Message, state: FSMContext):
+    raw_value = message.text.strip()
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await message.answer("Ошибка: конфигурация ИИ не найдена.")
+            return
+        provider = config.provider
+        model = (
+            getattr(config, "kie_model", None)
+            if canonical_provider_name(provider) == PROVIDER_KIE
+            else getattr(config, f"{str(provider).lower()}_model", None)
+        )
+        if raw_value.casefold() in {"по умолчанию", "по умолчанию.", "default"}:
+            config.max_output_tokens = None
+            await session.commit()
+            saved_value = None
+        else:
+            try:
+                saved_value = validate_chat_output_tokens(provider, model, raw_value)
+            except ValueError as exc:
+                await message.answer(f"❌ {exc}")
+                return
+            config.max_output_tokens = saved_value
+            await session.commit()
+    await state.clear()
+    effective = effective_chat_output_tokens(provider, model, saved_value)
+    configured_label = "По умолчанию" if saved_value is None else f"{saved_value}"
+    await message.answer(
+        f"✅ Максимум ответа сохранён: {configured_label} токенов (эффективно: {effective})."
+    )
+    await admin_ai_settings(message)
 
 
 
@@ -17182,6 +17290,14 @@ async def process_audio_limit(message: Message, state: FSMContext, bot: Bot):
                         'KIE': getattr(config, 'kie_api_key', None) if config else None,
                         'OpenAI': getattr(config, 'openai_api_key', None) if config else None,
                     },
+                    current_provider=config.provider if config else PROVIDER_GEMINI,
+                    current_model=(
+                        getattr(config, 'kie_model', None)
+                        if config and canonical_provider_name(config.provider) == PROVIDER_KIE
+                        else getattr(config, f"{str(config.provider).lower()}_model", None) if config else None
+                    ),
+                    max_output_tokens=getattr(config, 'max_output_tokens', None) if config else None,
+                    deepseek_thinking_enabled=bool(getattr(config, 'deepseek_thinking_enabled', False)) if config else False,
                 )
             )
         except TelegramBadRequest:
@@ -23906,6 +24022,14 @@ async def save_ai_timeout(message: Message, state: FSMContext):
                     'KIE': getattr(conf2, 'kie_api_key', None) if conf2 else None,
                     'OpenAI': getattr(conf2, 'openai_api_key', None) if conf2 else None,
                 },
+                current_provider=conf2.provider if conf2 else PROVIDER_GEMINI,
+                current_model=(
+                    getattr(conf2, 'kie_model', None)
+                    if conf2 and canonical_provider_name(conf2.provider) == PROVIDER_KIE
+                    else getattr(conf2, f"{str(conf2.provider).lower()}_model", None) if conf2 else None
+                ),
+                max_output_tokens=getattr(conf2, 'max_output_tokens', None) if conf2 else None,
+                deepseek_thinking_enabled=bool(getattr(conf2, 'deepseek_thinking_enabled', False)) if conf2 else False,
             )
             await message.answer(text, reply_markup=kb)
             

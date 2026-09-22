@@ -15,7 +15,12 @@ from datetime import timezone, timedelta, date
 from mailing_utils import MAILING_AUDIENCE_LABELS, get_mailing_status_label, is_birthday_mailing
 from memory_mode import memory_mode_label
 from time_helpers import format_msk, to_msk
-from provider_models import build_telegram_model_callback_data
+from provider_models import (
+    build_telegram_model_callback_data,
+    canonical_provider_name,
+    effective_chat_output_tokens,
+    PROVIDER_DEEPSEEK,
+)
 from max_messenger_bot.identity import is_max_user_id, max_client_list_label
 from translation_service import (
     LOCALE_LABELS,
@@ -449,6 +454,9 @@ def ai_settings_keyboard(current_provider: str):
     for name, data in providers.items():
         text = f"✅ {name}" if name == current_provider else name
         builder.button(text=text, callback_data=data)
+    builder.button(text="📏 Изменить максимум ответа", callback_data="set_max_output_tokens")
+    if canonical_provider_name(current_provider) == PROVIDER_DEEPSEEK:
+        builder.button(text="🧠 Изменить Thinking", callback_data="toggle_deepseek_thinking")
     builder.button(text="⚙️ Настроить ключи и модели", callback_data="admin_ai_keys")
     builder.button(text="📝 Изменить системный промпт", callback_data="admin_edit_system_prompt")
     builder.button(text="🧩 Общий блок для тем", callback_data="admin_edit_shared_prompt_block")
@@ -479,7 +487,11 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
                             api_keys: dict[str, str | None] | None = None,
                             allow_vision_fallback: bool = False,
                             vision_fallback_provider: str | None = None,
-                            vision_fallback_model: str | None = None):
+                            vision_fallback_model: str | None = None,
+                            current_provider: str | None = None,
+                            current_model: str | None = None,
+                            max_output_tokens: int | None = None,
+                            deepseek_thinking_enabled: bool | None = None):
     def short_model(model: str, limit: int = 16) -> str:
         if len(model) <= limit:
             return model
@@ -510,6 +522,17 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     threshold_label = int(kie_credit_alert_threshold) if float(kie_credit_alert_threshold).is_integer() else round(kie_credit_alert_threshold, 2)
     builder.button(text=f"💳 KIE порог: {threshold_label}", callback_data="set_kie_credit_threshold")
     builder.button(text=f"🌡️ Температура: {round(temperature, 2)}", callback_data="set_temperature")
+    if current_provider:
+        effective_tokens = effective_chat_output_tokens(current_provider, current_model, max_output_tokens)
+        token_value = (
+            f"По умолчанию (эфф.: {effective_tokens})"
+            if max_output_tokens is None
+            else f"{effective_tokens}"
+        )
+        builder.button(text=f"📏 Макс. ответа: {token_value}", callback_data="set_max_output_tokens")
+        if canonical_provider_name(current_provider) == PROVIDER_DEEPSEEK:
+            thinking_label = "Включён" if bool(deepseek_thinking_enabled) else "Выключен"
+            builder.button(text=f"🧠 Thinking: {thinking_label}", callback_data="toggle_deepseek_thinking")
     builder.button(
         text=f"🧠 Память: {memory_mode_label(memory_mode)}",
         callback_data="toggle_preserve_topic_context"
