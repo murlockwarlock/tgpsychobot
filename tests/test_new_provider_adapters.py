@@ -170,6 +170,13 @@ def test_provider_errors_are_normalized_and_retries_are_bounded():
     assert error.value.classification == "auth"
     assert error.value.http_status == 401
 
+    FakeClient.response = FakeResponse(402, {})
+    with patch("provider_adapters.httpx.AsyncClient", FakeClient):
+        with pytest.raises(ProviderAdapterError) as error:
+            asyncio.run(call_openrouter("secret", layout(), "openai/gpt-5.6-terra"))
+    assert error.value.classification == "quota"
+    assert error.value.http_status == 402
+
 
 def test_provider_rejects_invalid_models_and_malformed_responses():
     with pytest.raises(ProviderAdapterError, match="модель"):

@@ -210,6 +210,8 @@ def _retryable_status(status: int) -> bool:
 def _status_category(status: int) -> str:
     if status in {401, 403}:
         return "auth"
+    if status == 402:
+        return "quota"
     if status == 429:
         return "rate_limit"
     if status in {408, 425}:
