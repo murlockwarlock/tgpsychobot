@@ -140,7 +140,10 @@ async def save_content_value(session, kind: str, resource, field: str, locale: s
         if existing:
             validation_source = TranslationSource(source.translation_key, existing, kind=source.kind)
     if value:
-        validate_translation_value(validation_source, value)
+        try:
+            validate_translation_value(validation_source, value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Текст не сохранён: проверьте длину, форматирование, переменные и адреса кнопок.") from exc
     if kind == "bot_general_config" and len(value) > 200:
         raise ValueError("Максимум 200 символов.")
     if source.kind == "reply_button" and value:
