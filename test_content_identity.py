@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from sqlalchemy import select
 
 from database import TestQuestion, TestSession
-from universal_tests import json_dumps, json_loads
+from universal_tests import get_question_variable, json_dumps, json_loads
 
 
 QUESTION_FIELDS = ("id", "text", "category", "is_reverse", "sort_order", "comment", "variable_name", "allow_custom_answer", "buttons_layout", "answer_options_json")
@@ -41,6 +41,9 @@ def questions_for_session(test_session, live_questions):
 
 async def preserve_active_test_definitions(session) -> None:
     questions = (await session.scalars(select(TestQuestion).order_by(TestQuestion.sort_order, TestQuestion.id))).all()
+    for index, question in enumerate(questions):
+        if not (question.variable_name or "").strip():
+            question.variable_name = get_question_variable(question, index)
     snapshot = question_snapshot(questions)
     active = (await session.scalars(select(TestSession).where(TestSession.is_finished == False, TestSession.question_snapshot == None))).all()
     for test_session in active:

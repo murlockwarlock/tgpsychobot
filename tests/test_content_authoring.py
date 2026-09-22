@@ -154,6 +154,24 @@ def test_active_snapshot_keeps_translations_after_live_question_removal():
 
 
 @pytest.mark.asyncio
+async def test_legacy_implicit_scoring_variables_do_not_follow_question_positions(factory):
+    from test_content_identity import move_question
+    from universal_tests import get_question_variable
+    async with factory() as session:
+        first = Question(id=1, text="Первый", category="general", sort_order=0)
+        second = Question(id=2, text="Второй", category="general", sort_order=1)
+        session.add_all([first, second])
+        await session.commit()
+        assert get_question_variable(first, 0) == "answer_01"
+        assert get_question_variable(second, 1) == "answer_02"
+        await move_question(session, second.id, -1)
+        assert get_question_variable(first, 1) == "answer_01"
+        assert get_question_variable(second, 0) == "answer_02"
+        await create_resource(session, "test_question", "pt", {"text": "Novo"}, {"sort_order": 0})
+        assert get_question_variable(first, 2) == "answer_01"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind,field", [("topic", "name"), ("content", "button_title"), ("plan", "name"), ("test_question", "text"), ("secret_test_question", "text"), ("referral_template", "text"), ("mailing", "text")])
 async def test_portuguese_first_and_russian_added_to_same_resource(factory, kind, field):
     async with factory() as session:
