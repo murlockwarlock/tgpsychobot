@@ -4917,7 +4917,10 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             model_name = getattr(config, "kie_model", "не выбрана")
             model_label = "Активная модель KIE"
         else:
-            model_name = getattr(config, f"{provider.lower()}_model", "не выбрана")
+            model_name = getattr(config, f"{provider.lower()}_model", None)
+            if canonical_provider_name(provider) in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
+                model_name = _display_capability_model(provider, model_name, "chat")
+            model_name = model_name or "не выбрана"
             model_label = "Активная модель"
         configured_output_tokens = getattr(config, "max_output_tokens", None)
         effective_output_tokens = effective_chat_output_tokens(provider, model_name, configured_output_tokens)
