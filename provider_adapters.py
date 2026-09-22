@@ -152,10 +152,13 @@ def build_perplexity_payload(
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
         input_parts.append(f"user: {content}")
+    tools: list[dict[str, Any]] = [{"type": "web_search"}]
+    if preset in {"low", "medium"}:
+        tools.append({"type": "fetch_url", "max_urls": 1})
     payload: dict[str, Any] = {
         "preset": preset,
         "input": "\n\n".join(part for part in input_parts if part),
-        "tools": [{"type": "web_search"}],
+        "tools": tools,
     }
     if instructions:
         payload["instructions"] = instructions
