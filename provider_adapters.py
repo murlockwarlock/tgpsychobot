@@ -104,29 +104,24 @@ def build_perplexity_payload(
 ) -> dict[str, Any]:
     if preset not in PERPLEXITY_MODES:
         raise ProviderAdapterError("Недопустимый режим Perplexity", category="invalid_model")
-    parts: list[str] = []
-    instruction_blocks = (
-        layout.stable_system_prompt,
-        *layout.shared_instructions,
-        *layout.runtime_context,
-        *layout.scenario_context,
-        *layout.request_context,
-        *layout.provider_instruction_blocks,
-    )
-    parts.extend(f"system: {block}" for block in instruction_blocks if block)
+    instruction_blocks = layout.ordered_instruction_blocks
+    instructions = "\n\n".join(block for block in instruction_blocks if block)
+    input_parts: list[str] = []
     for message in layout.history:
         content = message.content if isinstance(message.content, str) else json.dumps(message.content, ensure_ascii=False)
-        parts.append(f"{message.role}: {content}")
+        input_parts.append(f"{message.role}: {content}")
     if layout.current_user_content is not None:
         content = layout.current_user_content
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
-        parts.append(f"user: {content}")
+        input_parts.append(f"user: {content}")
     payload: dict[str, Any] = {
         "preset": preset,
-        "input": "\n\n".join(part for part in parts if part),
+        "input": "\n\n".join(part for part in input_parts if part),
         "tools": [{"type": "web_search"}],
     }
+    if instructions:
+        payload["instructions"] = instructions
     if max_output_tokens is not None:
         payload["max_output_tokens"] = max_output_tokens
     return payload
