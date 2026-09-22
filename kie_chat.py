@@ -85,6 +85,7 @@ def build_kie_chat_request(
     temperature: float = 0.7,
     *,
     request_layout: AIRequestLayout | None = None,
+    max_output_tokens: int = 4096,
 ) -> BuiltKIEChatRequest:
     """Build a KIE request from the canonical semantic layout.
 
@@ -116,7 +117,7 @@ def build_kie_chat_request(
         payload = {
             "model": model,
             "messages": build_openai_chat_messages(request_layout),
-            "max_tokens": 4096,
+            "max_tokens": max_output_tokens,
             "temperature": temperature,
             "stream": False,
         }
@@ -138,7 +139,7 @@ def build_kie_chat_request(
             "model": model,
             "system": build_anthropic_system(request_layout),
             "messages": anthropic_messages,
-            "max_tokens": 4096,
+            "max_tokens": max_output_tokens,
             "temperature": temperature,
             "stream": False,
         }
@@ -159,7 +160,7 @@ def build_kie_chat_request(
             },
             "generationConfig": {
                 "temperature": temperature,
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": max_output_tokens,
             },
         }
     else:  # pragma: no cover - guarded by the authoritative catalog

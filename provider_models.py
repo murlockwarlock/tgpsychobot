@@ -37,6 +37,7 @@ DEEPSEEK_CHAT_MAX_TOKENS = 65536
 OPENAI_CHAT_MAX_TOKENS = 16384
 CLAUDE_CHAT_MAX_TOKENS = 16384
 GEMINI_CHAT_MAX_TOKENS = 16384
+KIE_CHAT_MAX_TOKENS = 4096
 
 KIE_DEFAULT_CHAT_MODEL = "gemini-3-flash"
 
@@ -502,6 +503,57 @@ def get_default_model(provider: str | None, channel: str = "chat") -> str:
     return PROVIDER_DEFAULT_MODELS.get(p_name, "gemini-3.7-flash")
 
 
+def get_chat_output_token_limit(provider: str | None, model: str | None) -> int:
+    p_name = canonical_provider_name(provider)
+    if p_name == PROVIDER_DEEPSEEK:
+        return DEEPSEEK_CHAT_MAX_TOKENS
+    if p_name == PROVIDER_OPENAI:
+        return OPENAI_CHAT_MAX_TOKENS
+    if p_name == PROVIDER_CLAUDE:
+        return CLAUDE_CHAT_MAX_TOKENS
+    if p_name == PROVIDER_GEMINI:
+        return GEMINI_CHAT_MAX_TOKENS
+    if p_name == PROVIDER_KIE:
+        return KIE_CHAT_MAX_TOKENS
+    if p_name == "xAI":
+        return 4096
+    return 4096
+
+
+def effective_chat_output_tokens(
+    provider: str | None,
+    model: str | None,
+    configured_value: int | None,
+) -> int:
+    limit = get_chat_output_token_limit(provider, model)
+    try:
+        value = int(configured_value) if configured_value is not None else None
+    except (TypeError, ValueError):
+        value = None
+    if value is None or value < 1 or value > limit:
+        return limit
+    return value
+
+
+def validate_chat_output_tokens(
+    provider: str | None,
+    model: str | None,
+    value: int | str | None,
+) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Введите целое число токенов.") from exc
+    if parsed < 1:
+        raise ValueError("Минимальное значение — 1 токен.")
+    limit = get_chat_output_token_limit(provider, model)
+    if parsed > limit:
+        raise ValueError(f"Для выбранной модели максимальное значение — {limit} токенов.")
+    return parsed
+
+
 # ==========================================
 # 7. DEEPSEEK RESPONSE INSPECTION & DIAGNOSTICS
 # ==========================================
@@ -637,4 +689,3 @@ def get_provider_vision_max_tokens(provider: str | None) -> int:
     if p_name in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI):
         return DIRECT_VISION_MAX_TOKENS
     raise ValueError(f"Unknown or unsupported vision provider: {provider}")
-
