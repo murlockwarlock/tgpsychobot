@@ -14,6 +14,9 @@ PROVIDER_CLAUDE = "Claude"
 PROVIDER_OPENAI = "OpenAI"
 PROVIDER_DEEPSEEK = "Deepseek"
 PROVIDER_KIE = "KIE"
+PROVIDER_OPENROUTER = "OpenRouter"
+PROVIDER_PERPLEXITY = "Perplexity"
+PROVIDER_DEEPGRAM = "Deepgram"
 
 ALL_PROVIDERS = (
     PROVIDER_GEMINI,
@@ -21,6 +24,15 @@ ALL_PROVIDERS = (
     PROVIDER_OPENAI,
     PROVIDER_DEEPSEEK,
     PROVIDER_KIE,
+    PROVIDER_OPENROUTER,
+    PROVIDER_PERPLEXITY,
+)
+
+ALL_TRANSCRIPTION_PROVIDERS = (
+    PROVIDER_OPENAI,
+    PROVIDER_GEMINI,
+    PROVIDER_KIE,
+    PROVIDER_DEEPGRAM,
 )
 
 DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
@@ -38,6 +50,27 @@ OPENAI_CHAT_MAX_TOKENS = 16384
 CLAUDE_CHAT_MAX_TOKENS = 16384
 GEMINI_CHAT_MAX_TOKENS = 16384
 KIE_CHAT_MAX_TOKENS = 4096
+PERPLEXITY_CHAT_MAX_TOKENS = 128000
+DEEPGRAM_DEFAULT_MODEL = "nova-3"
+PERPLEXITY_MODE_OUTPUT_LIMITS = {
+    "fast": 8192,
+    "low": 32768,
+    "medium": 128000,
+}
+PERPLEXITY_MODE_INFO = {
+    "fast": {
+        "name": "Быстрый поиск",
+        "desc": "Один короткий web-поиск с цитатами.",
+    },
+    "low": {
+        "name": "Обычный поиск",
+        "desc": "Повседневное исследование с актуальными источниками.",
+    },
+    "medium": {
+        "name": "Расширенное исследование",
+        "desc": "Многошаговый поиск по нескольким источникам.",
+    },
+}
 
 KIE_DEFAULT_CHAT_MODEL = "gemini-3-flash"
 
@@ -47,7 +80,45 @@ PROVIDER_DEFAULT_MODELS = {
     PROVIDER_OPENAI: "gpt-5.6-terra",
     PROVIDER_DEEPSEEK: DEEPSEEK_DEFAULT_MODEL,
     PROVIDER_KIE: KIE_DEFAULT_CHAT_MODEL,
+    PROVIDER_OPENROUTER: "openai/gpt-5.6-terra",
+    PROVIDER_PERPLEXITY: "low",
+    PROVIDER_DEEPGRAM: DEEPGRAM_DEFAULT_MODEL,
 }
+
+
+@dataclass(frozen=True)
+class OpenRouterModelSpec:
+    model_id: str
+    friendly_name: str
+    text: bool
+    vision: bool
+    audio_input: bool
+    context_limit: int
+    output_limit: int
+    status: str = "active"
+
+
+OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
+    "openai/gpt-5.6-terra": OpenRouterModelSpec("openai/gpt-5.6-terra", "OpenAI GPT-5.6 Terra", True, True, False, 1050000, 128000),
+    "openai/gpt-5.6-sol": OpenRouterModelSpec("openai/gpt-5.6-sol", "OpenAI GPT-5.6 Sol", True, True, False, 1050000, 128000),
+    "openai/gpt-5.6-luna-pro": OpenRouterModelSpec("openai/gpt-5.6-luna-pro", "OpenAI GPT-5.6 Luna Pro", True, True, False, 1050000, 128000),
+    "google/gemini-3.7-flash": OpenRouterModelSpec("google/gemini-3.7-flash", "Google Gemini 3.7 Flash", True, True, True, 1048576, 65536),
+    "google/gemini-3.8-flash": OpenRouterModelSpec("google/gemini-3.8-flash", "Google Gemini 3.8 Flash", True, True, True, 1048576, 65536),
+    "google/gemini-3.1-pro-preview": OpenRouterModelSpec("google/gemini-3.1-pro-preview", "Google Gemini 3.1 Pro Preview", True, True, True, 1048576, 65536),
+    "anthropic/claude-sonnet-4.6": OpenRouterModelSpec("anthropic/claude-sonnet-4.6", "Anthropic Claude Sonnet 4.6", True, True, False, 1000000, 128000),
+    "anthropic/claude-opus-4.6": OpenRouterModelSpec("anthropic/claude-opus-4.6", "Anthropic Claude Opus 4.6", True, True, False, 1000000, 128000),
+    "anthropic/claude-haiku-4.5": OpenRouterModelSpec("anthropic/claude-haiku-4.5", "Anthropic Claude Haiku 4.5", True, True, False, 200000, 64000),
+    "x-ai/grok-4.7": OpenRouterModelSpec("x-ai/grok-4.7", "xAI Grok 4.7", True, True, False, 500000, 450000),
+    "x-ai/grok-4.6": OpenRouterModelSpec("x-ai/grok-4.6", "xAI Grok 4.6", True, True, False, 500000, 450000),
+    "deepseek/deepseek-v4.1-flash": OpenRouterModelSpec("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", True, True, False, 1048576, 384000),
+    "qwen/qwen3-vl-235b-a22b-instruct": OpenRouterModelSpec("qwen/qwen3-vl-235b-a22b-instruct", "Qwen3 VL 235B Instruct", True, True, False, 262144, 32768),
+    "moonshotai/kimi-k2.6": OpenRouterModelSpec("moonshotai/kimi-k2.6", "Kimi K2.6", True, True, False, 262144, 235929),
+    "mistralai/mistral-medium-3-5": OpenRouterModelSpec("mistralai/mistral-medium-3-5", "Mistral Medium 3.5", True, True, False, 262144, 209715),
+}
+
+OPENROUTER_MODELS = tuple(OPENROUTER_MODEL_SPECS)
+OPENROUTER_VISION_MODELS = tuple(spec.model_id for spec in OPENROUTER_MODEL_SPECS.values() if spec.vision)
+PERPLEXITY_MODES = ("fast", "low", "medium")
 
 DEFAULT_VISION_MODEL = "gemini-3.7-flash"
 DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2"
@@ -119,6 +190,8 @@ SELECTABLE_CHAT_MODELS: dict[str, tuple[str, ...]] = {
         "gemini-3-7-flash",
         "gpt-5-6-luna",
     ),
+    PROVIDER_OPENROUTER: OPENROUTER_MODELS,
+    PROVIDER_PERPLEXITY: PERPLEXITY_MODES,
 }
 
 # Active fallback models offered in Telegram and MAX admin settings
@@ -147,6 +220,8 @@ SELECTABLE_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
         "gemini-3-7-flash",
         "gpt-5-6-luna",
     ),
+    PROVIDER_OPENROUTER: OPENROUTER_MODELS,
+    PROVIDER_PERPLEXITY: PERPLEXITY_MODES,
 }
 
 # Active vision models offered in Telegram and MAX admin settings
@@ -170,6 +245,7 @@ SELECTABLE_VISION_MODELS: dict[str, tuple[str, ...]] = {
         "gemini-2.5-flash",
         "gemini-3-flash",
     ),
+    PROVIDER_OPENROUTER: OPENROUTER_VISION_MODELS,
 }
 
 # Active direct Gemini and KIE text-to-image models.
@@ -207,6 +283,7 @@ SELECTABLE_TRANSCRIPTION_MODELS: dict[str, tuple[str, ...]] = {
     PROVIDER_KIE: (
         DEFAULT_KIE_TRANSCRIPTION_MODEL,
     ),
+    PROVIDER_DEEPGRAM: (DEEPGRAM_DEFAULT_MODEL,),
 }
 
 
@@ -284,7 +361,7 @@ def get_kie_chat_model_spec(model: str | None) -> KIEChatModelSpec:
 
 def _canonical_provider_name(provider: str | None) -> str:
     p = (provider or "").strip()
-    for canonical in ALL_PROVIDERS:
+    for canonical in (*ALL_PROVIDERS, *ALL_TRANSCRIPTION_PROVIDERS):
         if p.lower() == canonical.lower():
             return canonical
     return p
@@ -402,7 +479,7 @@ def ensure_model_available(provider: str | None, model: str | None, channel: str
     channel_name = (channel or "chat").strip().lower()
     normalized = normalize_model_for_provider(p_name, model)
 
-    if p_name not in ALL_PROVIDERS:
+    if p_name not in (*ALL_PROVIDERS, *ALL_TRANSCRIPTION_PROVIDERS):
         raise ModelUnavailableError(
             f"Провайдер '{provider or 'AI'}' не поддерживается. "
             "Выберите провайдера из доступных настроек."
@@ -515,8 +592,11 @@ def get_chat_output_token_limit(provider: str | None, model: str | None) -> int:
         return GEMINI_CHAT_MAX_TOKENS
     if p_name == PROVIDER_KIE:
         return KIE_CHAT_MAX_TOKENS
-    if p_name == "xAI":
-        return 4096
+    if p_name == PROVIDER_OPENROUTER:
+        spec = OPENROUTER_MODEL_SPECS.get((model or "").strip())
+        return spec.output_limit if spec else max(spec.output_limit for spec in OPENROUTER_MODEL_SPECS.values())
+    if p_name == PROVIDER_PERPLEXITY:
+        return PERPLEXITY_MODE_OUTPUT_LIMITS.get((model or "").strip(), PERPLEXITY_CHAT_MAX_TOKENS)
     return 4096
 
 
@@ -681,11 +761,16 @@ KIE_VISION_INITIAL_MAX_TOKENS: int = 4096
 DIRECT_VISION_MAX_TOKENS: int = 16384
 
 
-def get_provider_vision_max_tokens(provider: str | None) -> int:
+def get_provider_vision_max_tokens(provider: str | None, model: str | None = None) -> int:
     """Return max token budget for vision requests by provider."""
     p_name = canonical_provider_name(provider)
     if p_name == PROVIDER_KIE:
         return KIE_VISION_INITIAL_MAX_TOKENS
     if p_name in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI):
         return DIRECT_VISION_MAX_TOKENS
+    if p_name == PROVIDER_OPENROUTER:
+        spec = OPENROUTER_MODEL_SPECS.get((model or "").strip())
+        if not spec or not spec.vision:
+            raise ValueError(f"Модель OpenRouter '{model}' не поддерживает vision")
+        return spec.output_limit
     raise ValueError(f"Unknown or unsupported vision provider: {provider}")

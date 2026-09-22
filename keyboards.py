@@ -448,7 +448,9 @@ def ai_settings_keyboard(current_provider: str):
         "Claude": "ai_provider_Claude",
         "Gemini": "ai_provider_Gemini",
         "KIE": "ai_provider_KIE",
-        "OpenAI": "ai_provider_OpenAI"
+        "OpenAI": "ai_provider_OpenAI",
+        "OpenRouter": "ai_provider_OpenRouter",
+        "Perplexity": "ai_provider_Perplexity",
     }
     builder = InlineKeyboardBuilder()
     for name, data in providers.items():
@@ -481,7 +483,7 @@ def mask_api_key(value: str | None) -> str:
     if not value:
         return "Не задан"
     if len(value) <= 8:
-        return value
+        return "••••"
     return f"{value[:4]}...{value[-4:]}"
 
 
@@ -515,17 +517,26 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     builder.button(text=f"🔑 Gemini: {mask_api_key(api_keys.get('Gemini'))}", callback_data="set_key_Gemini")
     builder.button(text=f"🔑 KIE: {mask_api_key(api_keys.get('KIE'))}", callback_data="set_key_KIE")
     builder.button(text=f"🔑 OpenAI: {mask_api_key(api_keys.get('OpenAI'))}", callback_data="set_key_OpenAI")
+    builder.button(text=f"🔑 OpenRouter: {mask_api_key(api_keys.get('OpenRouter'))}", callback_data="set_key_OpenRouter")
+    builder.button(text=f"🔑 Perplexity: {mask_api_key(api_keys.get('Perplexity'))}", callback_data="set_key_Perplexity")
+    builder.button(text=f"🔑 Deepgram: {mask_api_key(api_keys.get('Deepgram'))}", callback_data="set_key_Deepgram")
 
     builder.button(text="🧠 Deepseek", callback_data="view_models_Deepseek")
     builder.button(text="🧠 Claude", callback_data="view_models_Claude")
     builder.button(text="🧠 Gemini", callback_data="view_models_Gemini")
     builder.button(text="🧠 KIE", callback_data="view_models_KIE")
     builder.button(text="🧠 OpenAI", callback_data="view_models_OpenAI")
+    builder.button(text="🧠 OpenRouter", callback_data="view_models_OpenRouter")
+    builder.button(text="🧠 Perplexity", callback_data="view_models_Perplexity")
 
     builder.button(text=f"📌 Первые: {context_first}", callback_data="set_context_first")
     builder.button(text=f"🔄 Последние: {context_recent}", callback_data="set_context_recent")
 
-    trans_label = f"🗣️ Аудио: {current_transcription_provider}" if current_transcription_provider != 'None' else "🗣️ Аудио: выкл"
+    trans_label = (
+        f"🗣️ Аудио: {current_transcription_provider}"
+        if current_transcription_provider != 'None'
+        else "🗣️ Аудио: выкл"
+    )
     builder.button(text=trans_label, callback_data="admin_toggle_transcription")
     builder.button(text="⏱️ Лимит аудио", callback_data="set_audio_limit")
 

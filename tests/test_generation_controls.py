@@ -18,7 +18,10 @@ from provider_models import (
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
     PROVIDER_OPENAI,
+    PROVIDER_OPENROUTER,
+    PROVIDER_PERPLEXITY,
     effective_chat_output_tokens,
+    get_default_model,
     get_chat_output_token_limit,
     validate_chat_output_tokens,
 )
@@ -82,9 +85,18 @@ def test_output_budget_defaults_and_validation():
         validate_chat_output_tokens(PROVIDER_OPENAI, "gpt-5.6-terra", "0")
     with pytest.raises(ValueError):
         validate_chat_output_tokens(PROVIDER_OPENAI, "gpt-5.6-terra", "not-a-number")
+    assert effective_chat_output_tokens(PROVIDER_PERPLEXITY, "fast", 50000) == 8192
 
 
 def test_admin_exposes_deepseek_thinking_only_for_deepseek():
+    provider_labels = [
+        button.text
+        for row in keyboards.ai_settings_keyboard("OpenRouter").inline_keyboard
+        for button in row
+    ]
+    assert any("OpenRouter" in label for label in provider_labels)
+    assert any("Perplexity" in label for label in provider_labels)
+
     common = dict(
         current_transcription_provider="OpenAI",
         context_first=2,
@@ -115,6 +127,16 @@ def test_admin_exposes_deepseek_thinking_only_for_deepseek():
     openai_markup = keyboards.ai_keys_models_keyboard(current_provider="OpenAI", **common)
     openai_labels = [button.text for row in openai_markup.inline_keyboard for button in row]
     assert not any("Thinking" in label for label in openai_labels)
+    for provider in ("OpenRouter", "Perplexity"):
+        provider_markup = keyboards.ai_keys_models_keyboard(current_provider=provider, **common)
+        provider_labels = [button.text for row in provider_markup.inline_keyboard for button in row]
+        assert any(provider in label for label in provider_labels)
+        assert not any("Thinking" in label for label in provider_labels)
+    deepgram_common = dict(common)
+    deepgram_common["current_transcription_provider"] = "Deepgram"
+    deepgram_markup = keyboards.ai_keys_models_keyboard(current_provider="OpenRouter", **deepgram_common)
+    deepgram_labels = [button.text for row in deepgram_markup.inline_keyboard for button in row]
+    assert any("Deepgram" in label for label in deepgram_labels)
     choice_markup = keyboards.deepseek_thinking_keyboard()
     choices = {
         button.text: button.callback_data
@@ -210,6 +232,70 @@ async def test_openai_uses_shared_budget_without_reasoning(generation_db):
 
 
 @pytest.mark.asyncio
+async def test_openrouter_uses_shared_budget_without_thinking_control(generation_db):
+    sessions = generation_db
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "OpenRouter"
+        config.openrouter_api_key = "openrouter-key"
+        config.openrouter_model = "openai/gpt-5.6-terra"
+        config.max_output_tokens = 7000
+        await session.commit()
+
+    with patch("ai_integration.call_openrouter", AsyncMock(return_value="ok")) as call:
+        assert await ai_integration.generate_response(101, "Проверка OpenRouter") == "ok"
+
+    assert call.await_args.kwargs["max_output_tokens"] == 7000
+    assert "thinking_enabled" not in call.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_perplexity_uses_shared_budget_and_default_when_reset(generation_db):
+    sessions = generation_db
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "Perplexity"
+        config.perplexity_api_key = "perplexity-key"
+        config.perplexity_model = "medium"
+        config.max_output_tokens = 6000
+        await session.commit()
+
+    with patch("ai_integration.call_perplexity", AsyncMock(return_value="Ответ\n\nИсточники:")) as call:
+        assert await ai_integration.generate_response(101, "Проверка Perplexity") == "Ответ\n\nИсточники:"
+
+    assert call.await_args.kwargs["max_output_tokens"] == 6000
+
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        config.max_output_tokens = None
+        await session.commit()
+
+    with patch("ai_integration.call_perplexity", AsyncMock(return_value="Ответ")) as call:
+        assert await ai_integration.generate_response(101, "Проверка Perplexity default") == "Ответ"
+
+    assert call.await_args.kwargs["max_output_tokens"] == 128000
+
+
+@pytest.mark.asyncio
+async def test_new_provider_model_defaults_are_effective_without_backfill(generation_db):
+    sessions = generation_db
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = PROVIDER_OPENROUTER
+        config.openrouter_api_key = "openrouter-key"
+        config.openrouter_model = None
+        await session.commit()
+
+    with patch("ai_integration.call_openrouter", AsyncMock(return_value="ok")) as call:
+        assert await ai_integration.generate_response(101, "Проверка default модели") == "ok"
+
+    assert call.await_args.args[2] == get_default_model(PROVIDER_OPENROUTER)
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        assert config.openrouter_model is None
+
+
+@pytest.mark.asyncio
 async def test_max_deepseek_uses_same_per_bot_settings(generation_db):
     sessions = generation_db
     async with sessions() as session:
@@ -229,3 +315,20 @@ async def test_max_deepseek_uses_same_per_bot_settings(generation_db):
 
     assert captured[0]["max_tokens"] == 9000
     assert captured[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
+@pytest.mark.asyncio
+async def test_max_openrouter_uses_shared_budget(generation_db):
+    sessions = generation_db
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "OpenRouter"
+        config.openrouter_api_key = "openrouter-key"
+        config.openrouter_model = "anthropic/claude-sonnet-4.6"
+        config.max_output_tokens = 5000
+        await session.commit()
+
+    with patch("max_messenger_bot.ai.call_openrouter", AsyncMock(return_value="ok")) as call:
+        assert await max_ai.get_ai_response(101, "Проверка MAX OpenRouter") == "ok"
+
+    assert call.await_args.kwargs["max_output_tokens"] == 5000

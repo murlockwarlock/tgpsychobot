@@ -395,3 +395,34 @@ async def test_telegram_ai_settings_info_shows_fallback_status(monkeypatch, allo
 
     rendered_text = target_message.edit_text.await_args.args[0]
     assert f"▫️ Статус: <b>{status}</b>" in rendered_text
+
+
+@pytest.mark.asyncio
+async def test_telegram_ai_settings_shows_effective_openrouter_default(monkeypatch):
+    config = _ai_settings_config(allow_fallback=False)
+    config.provider = "OpenRouter"
+    config.openrouter_model = None
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _model, _key):
+            return config
+
+    target_message = SimpleNamespace(
+        text=None,
+        reply_markup=None,
+        edit_text=AsyncMock(),
+    )
+    callback = SimpleNamespace(message=target_message)
+    monkeypatch.setattr(handlers, "async_session_maker", lambda: Session())
+
+    await handlers.admin_ai_settings(callback)
+
+    rendered_text = target_message.edit_text.await_args.args[0]
+    assert "<code>openai/gpt-5.6-terra</code>" in rendered_text
+    assert "<code>None</code>" not in rendered_text

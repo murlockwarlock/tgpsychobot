@@ -38,13 +38,9 @@ HISTORY = [
 
 
 def _telegram_primary_models():
-    module = ast.parse(Path("handlers.py").read_text(encoding="utf-8"))
-    assignment = next(
-        node for node in module.body
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "MODELS_INFO" for target in node.targets)
-    )
-    return [name for name in ast.literal_eval(assignment.value)["KIE"] if name != "pricing"]
+    from handlers import MODELS_INFO
+
+    return [name for name in MODELS_INFO["KIE"] if name != "pricing"]
 
 
 def _telegram_fallback_models():

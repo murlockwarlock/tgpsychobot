@@ -233,6 +233,9 @@ class AIConfig(Base):
     deepseek_api_key = Column(String, nullable=True)
     openai_api_key = Column(String, nullable=True)
     kie_api_key = Column(String, nullable=True)
+    openrouter_api_key = Column(String, nullable=True)
+    perplexity_api_key = Column(String, nullable=True)
+    deepgram_api_key = Column(String, nullable=True)
     yandex_api_key = Column(String, nullable=True)
     yandex_folder_id = Column(String, nullable=True)
     gemini_model = Column(String, default='gemini-3.7-flash')
@@ -245,6 +248,8 @@ class AIConfig(Base):
     claude_model = Column(String, default='claude-sonnet-5')
     deepseek_model = Column(String, default=DEEPSEEK_DEFAULT_MODEL)
     openai_model = Column(String, default='gpt-5.6-terra')
+    openrouter_model = Column(String, nullable=True)
+    perplexity_model = Column(String, nullable=True)
     max_output_tokens = Column(Integer, nullable=True)
     deepseek_thinking_enabled = Column(Boolean, nullable=True)
     max_voice_duration_sec = Column(Integer, default=180, nullable=False)
@@ -1342,8 +1347,18 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN service_prompt_block TEXT"))
             if 'kie_api_key' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_api_key VARCHAR"))
+            if 'openrouter_api_key' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN openrouter_api_key VARCHAR"))
+            if 'perplexity_api_key' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN perplexity_api_key VARCHAR"))
+            if 'deepgram_api_key' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN deepgram_api_key VARCHAR"))
             if 'kie_model' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_model VARCHAR DEFAULT 'gemini-3-flash'"))
+            if 'openrouter_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN openrouter_model VARCHAR"))
+            if 'perplexity_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN perplexity_model VARCHAR"))
             if 'kie_base_url' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_base_url VARCHAR DEFAULT 'https://api.kie.ai'"))
             if 'kie_upload_base_url' not in ai_columns:

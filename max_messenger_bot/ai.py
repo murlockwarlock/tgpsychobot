@@ -48,6 +48,7 @@ from error_reporting import (
 from vector_store import search_relevant_chunks
 from provider_models import (
     CLAUDE_CHAT_MAX_TOKENS,
+    DEEPGRAM_DEFAULT_MODEL,
     DEEPSEEK_CHAT_MAX_TOKENS,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     GEMINI_CHAT_MAX_TOKENS,
@@ -59,6 +60,9 @@ from provider_models import (
     PROVIDER_GEMINI,
     PROVIDER_KIE,
     PROVIDER_OPENAI,
+    PROVIDER_OPENROUTER,
+    PROVIDER_PERPLEXITY,
+    PROVIDER_DEEPGRAM,
     ModelUnavailableError,
     ensure_model_available,
     get_default_model,
@@ -69,6 +73,14 @@ from provider_models import (
     normalize_deepseek_model,
     should_omit_claude_sampling,
     validate_model_selection,
+)
+from provider_adapters import (
+    ProviderAdapterError,
+    build_openrouter_vision_layout,
+    call_deepgram,
+    call_openrouter,
+    call_perplexity,
+    normalize_provider_error_classification,
 )
 from vision_reliability import (
     VisionDeadlineTracker,
@@ -118,6 +130,15 @@ class AIResponseError(AIServiceError):
 
 class InsufficientBalanceError(AIServiceError):
     pass
+
+
+def _wrap_provider_adapter_error(exc: ProviderAdapterError) -> AIServiceError:
+    error = AIServiceError(str(exc))
+    error.classification = normalize_provider_error_classification(getattr(exc, "classification", "provider"))
+    error.http_status = getattr(exc, "http_status", None)
+    if getattr(exc, "provider_response_payload", None) is not None:
+        error.provider_response_payload = exc.provider_response_payload
+    return error
 
 
 def _validate_text_response(response_text: object, *, provider: str) -> str:
@@ -525,6 +546,19 @@ def _guess_filename(file_bytes: bytes, fallback_stem: str, fallback_ext: str) ->
     elif header.startswith(b"%PDF"):
         ext = "pdf"
     return f"{fallback_stem}_{uuid.uuid4().hex[:12]}.{ext}"
+
+
+def _guess_image_media_type(file_bytes: bytes) -> str:
+    header = file_bytes[:16]
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith(b"GIF8"):
+        return "image/gif"
+    if header.startswith(b"RIFF") and file_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
 
 
 def _extract_kie_chat_text(payload: dict) -> str:
@@ -1159,16 +1193,22 @@ async def _dispatch_provider(
     )
 
     timeout = float(getattr(ai_config, "fallback_timeout", 60) or 60.0)
+    configured_model = {
+        "openai": getattr(ai_config, "openai_model", None),
+        "claude": getattr(ai_config, "claude_model", None),
+        "anthropic": getattr(ai_config, "claude_model", None),
+        "gemini": getattr(ai_config, "gemini_model", None),
+        "deepseek": getattr(ai_config, "deepseek_model", None),
+        "kie": getattr(ai_config, "kie_model", None),
+        "openrouter": getattr(ai_config, "openrouter_model", None),
+        "perplexity": getattr(ai_config, "perplexity_model", None),
+    }.get(provider)
+    selected_model = configured_model
+    if not selected_model and provider in {PROVIDER_OPENROUTER.lower(), PROVIDER_PERPLEXITY.lower()}:
+        selected_model = get_default_model(provider, channel="chat")
     output_tokens = effective_chat_output_tokens(
         ai_config.provider,
-        {
-            "openai": getattr(ai_config, "openai_model", None),
-            "claude": getattr(ai_config, "claude_model", None),
-            "anthropic": getattr(ai_config, "claude_model", None),
-            "gemini": getattr(ai_config, "gemini_model", None),
-            "deepseek": getattr(ai_config, "deepseek_model", None),
-            "kie": getattr(ai_config, "kie_model", None),
-        }.get(provider, None),
+        selected_model,
         getattr(ai_config, "max_output_tokens", None),
     )
     thinking_enabled = getattr(ai_config, "deepseek_thinking_enabled", None) if provider == "deepseek" else None
@@ -1246,6 +1286,42 @@ async def _dispatch_provider(
                 activity_tracker=activity_tracker,
                 max_output_tokens=output_tokens,
             )
+        elif provider == "openrouter":
+            if not getattr(ai_config, "openrouter_api_key", None):
+                raise AIServiceError("OpenRouter API key не задан")
+            try:
+                return await call_openrouter(
+                    ai_config.openrouter_api_key,
+                    layout,
+                    selected_model,
+                    temperature=temperature,
+                    max_output_tokens=output_tokens,
+                    timeout=timeout,
+                    request_capture=request_capture,
+                    activity_tracker=activity_tracker,
+                )
+            except ProviderAdapterError as exc:
+                raise _wrap_provider_adapter_error(exc) from exc
+        elif provider == "perplexity":
+            if not getattr(ai_config, "perplexity_api_key", None):
+                raise AIServiceError("Perplexity API key не задан")
+            try:
+                configured_perplexity_tokens = getattr(ai_config, "max_output_tokens", None)
+                return await call_perplexity(
+                    ai_config.perplexity_api_key,
+                    layout,
+                    selected_model,
+                    max_output_tokens=effective_chat_output_tokens(
+                        PROVIDER_PERPLEXITY,
+                        selected_model,
+                        configured_perplexity_tokens,
+                    ),
+                    timeout=timeout,
+                    request_capture=request_capture,
+                    activity_tracker=activity_tracker,
+                )
+            except ProviderAdapterError as exc:
+                raise _wrap_provider_adapter_error(exc) from exc
         else:
             raise AIServiceError(f"Неподдерживаемый провайдер ИИ: {ai_config.provider}")
 
@@ -1576,6 +1652,43 @@ async def get_ai_response(
                                 activity_tracker=activity_tracker,
                                 max_output_tokens=fb_tokens,
                             )
+                        elif fb_key == "openrouter":
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
+                            try:
+                                return await call_openrouter(
+                                    fb_api_key,
+                                    request_layout,
+                                    fb_model,
+                                    temperature=temperature,
+                                    max_output_tokens=fb_tokens,
+                                    timeout=fb_timeout,
+                                    request_capture=fallback_capture,
+                                    activity_tracker=activity_tracker,
+                                )
+                            except ProviderAdapterError as exc:
+                                raise _wrap_provider_adapter_error(exc) from exc
+                        elif fb_key == "perplexity":
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
+                            try:
+                                return await call_perplexity(
+                                    fb_api_key,
+                                    request_layout,
+                                    fb_model,
+                                    max_output_tokens=fb_tokens,
+                                    timeout=fb_timeout,
+                                    request_capture=fallback_capture,
+                                    activity_tracker=activity_tracker,
+                                )
+                            except ProviderAdapterError as exc:
+                                raise _wrap_provider_adapter_error(exc) from exc
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
 
@@ -1885,6 +1998,12 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
                 file_bytes,
                 filename,
             )
+    if provider == PROVIDER_DEEPGRAM:
+        api_key = getattr(config, "deepgram_api_key", None)
+        try:
+            return await call_deepgram(api_key, file_bytes, filename, model=DEEPGRAM_DEFAULT_MODEL)
+        except ProviderAdapterError as exc:
+            raise _wrap_provider_adapter_error(exc) from exc
     # Default: OpenAI
     api_key = config.openai_api_key
     if not api_key:
@@ -2327,7 +2446,7 @@ async def analyze_image(
             raise AIServiceError("Обработка изображений отключена администратором")
 
         primary_provider = (config.vision_provider or "Gemini").strip()
-        if primary_provider not in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE):
+        if primary_provider not in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER):
             err = AIServiceError(f"Неподдерживаемый провайдер для vision: {primary_provider}")
             err.classification = "configuration"
             raise err
@@ -2354,6 +2473,8 @@ async def analyze_image(
             primary_api_key = config.gemini_api_key
         elif primary_provider == PROVIDER_KIE:
             primary_api_key = getattr(config, "kie_api_key", None)
+        elif primary_provider == PROVIDER_OPENROUTER:
+            primary_api_key = getattr(config, "openrouter_api_key", None)
 
         if not primary_api_key:
             err = AIServiceError(f"API ключ для {primary_provider} (Vision) не установлен.")
@@ -2650,6 +2771,29 @@ async def analyze_image(
                 timeout=stage_budget,
                 request_capture=request_capture,
             )
+        elif prov == PROVIDER_OPENROUTER:
+            api_key = getattr(config, "openrouter_api_key", None)
+            if not api_key:
+                raise AIServiceError("API ключ OpenRouter для vision не задан")
+            vision_layout = build_openrouter_vision_layout(
+                request_layout,
+                image_bytes,
+                mime_type=_guess_image_media_type(image_bytes),
+                user_instruction=prompt,
+            )
+            try:
+                return await call_openrouter(
+                    api_key,
+                    vision_layout,
+                    call_model,
+                    temperature=temperature,
+                    max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, call_model),
+                    timeout=stage_budget,
+                    request_capture=request_capture,
+                    activity_tracker=activity_tracker,
+                )
+            except ProviderAdapterError as exc:
+                raise _wrap_provider_adapter_error(exc) from exc
         else:
             err = AIServiceError(f"Неподдерживаемый провайдер для vision: {prov}")
             err.classification = "configuration"
@@ -2941,7 +3085,7 @@ async def analyze_image(
     fb_budget = 0.0
     if raw_result is None and eff_allow_fallback and fb_provider and fb_model and last_exception is not None:
         is_diff = str(fb_provider).strip().lower() != str(primary_provider).strip().lower()
-        is_supported = str(fb_provider).strip() in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE)
+        is_supported = str(fb_provider).strip() in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER)
         is_valid_model = bool(fb_model)
         try:
             if is_valid_model and is_supported:
@@ -2960,10 +3104,12 @@ async def analyze_image(
             has_key = bool(getattr(config, "claude_api_key", None))
         elif fb_provider == PROVIDER_OPENAI:
             has_key = bool(getattr(config, "openai_api_key", None) or os.getenv("OPENAI_API_KEY"))
+        elif fb_provider == PROVIDER_OPENROUTER:
+            has_key = bool(getattr(config, "openrouter_api_key", None))
 
         last_cls = _classify_vision_error(last_exception)
-        primary_tokens = get_provider_vision_max_tokens(primary_provider)
-        fallback_tokens = get_provider_vision_max_tokens(fb_provider) if is_supported else 0
+        primary_tokens = get_provider_vision_max_tokens(primary_provider, primary_model)
+        fallback_tokens = get_provider_vision_max_tokens(fb_provider, fb_model) if is_supported else 0
 
         if is_diff and is_supported and is_valid_model and has_key and should_use_vision_provider_fallback(last_cls, primary_tokens, fallback_tokens):
             fb_budget = deadline_tracker.stage_budget(max_stage_budget=15.0, reserve_sec=5.0, min_required=3.0)

@@ -209,6 +209,7 @@ class ApiKeyDisplayTests(unittest.TestCase):
     def test_masks_api_keys_in_telegram_admin_keyboard(self):
         secret = "abcd12345678wxyz"
         self.assertEqual(mask_api_key(secret), "abcd...wxyz")
+        self.assertEqual(mask_api_key("short"), "••••")
 
         markup = ai_keys_models_keyboard(
             current_transcription_provider="OpenAI",

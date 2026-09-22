@@ -89,6 +89,12 @@ from provider_models import (
     PROVIDER_GEMINI,
     PROVIDER_KIE,
     PROVIDER_OPENAI,
+    PROVIDER_OPENROUTER,
+    PROVIDER_PERPLEXITY,
+    PROVIDER_DEEPGRAM,
+    DEEPGRAM_DEFAULT_MODEL,
+    OPENROUTER_MODEL_SPECS,
+    PERPLEXITY_MODE_INFO,
     ModelUnavailableError,
     SELECTABLE_CHAT_MODELS,
     TELEGRAM_MODEL_CALLBACK_PREFIX,
@@ -154,6 +160,8 @@ def _split_model_callback_payload(payload: str) -> tuple[str | None, str]:
         PROVIDER_GEMINI,
         PROVIDER_KIE,
         PROVIDER_OPENAI,
+        PROVIDER_OPENROUTER,
+        PROVIDER_PERPLEXITY,
     }
     if separator and provider in known_providers:
         return provider, model
@@ -1015,7 +1023,33 @@ MODELS_INFO = {
             'desc': 'Компактная быстрая модель OpenAI для простых сценариев.'
         },
         'pricing': '<b>GPT 5.6:</b> Новое поколение OpenAI.'
-    }
+    },
+    "OpenRouter": {
+        **{
+            spec.model_id: {
+                "name": f"OpenRouter · {spec.friendly_name}",
+                "desc": (
+                    f"{spec.friendly_name}: "
+                    + ", ".join(
+                        capability
+                        for capability, enabled in (
+                            ("текст", spec.text),
+                            ("фото", spec.vision),
+                            ("аудио", spec.audio_input),
+                        )
+                        if enabled
+                    )
+                    + "."
+                ),
+            }
+            for spec in OPENROUTER_MODEL_SPECS.values()
+        },
+        "pricing": "<b>OpenRouter:</b> стоимость зависит от выбранной модели и маршрута.",
+    },
+    "Perplexity": {
+        **PERPLEXITY_MODE_INFO,
+        "pricing": "<b>Perplexity:</b> режимы управляются официальными preset-настройками API.",
+    },
 }
 
 # Keep the Telegram primary selector driven by the shared KIE chat catalog.
@@ -1394,6 +1428,8 @@ def _resolve_ai_provider_model(config: AIConfig | None, channel: str) -> tuple[s
     if channel == "chat":
         provider = config.provider
         model = getattr(config, f"{provider.lower()}_model", None) if provider else None
+        if not model and provider in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
+            model = get_default_model(provider, channel="chat")
         return provider, model
     if channel == "transcription":
         provider = config.transcription_provider
@@ -1401,6 +1437,8 @@ def _resolve_ai_provider_model(config: AIConfig | None, channel: str) -> tuple[s
             model = config.gemini_model
         elif provider == "KIE":
             model = getattr(config, "kie_transcription_model", None)
+        elif provider == PROVIDER_DEEPGRAM:
+            model = DEEPGRAM_DEFAULT_MODEL
         else:
             model = "whisper-1" if provider == "OpenAI" else None
         return provider, model
@@ -4879,7 +4917,10 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             model_name = getattr(config, "kie_model", "не выбрана")
             model_label = "Активная модель KIE"
         else:
-            model_name = getattr(config, f"{provider.lower()}_model", "не выбрана")
+            model_name = getattr(config, f"{provider.lower()}_model", None)
+            if canonical_provider_name(provider) in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
+                model_name = _display_capability_model(provider, model_name, "chat")
+            model_name = model_name or "не выбрана"
             model_label = "Активная модель"
         configured_output_tokens = getattr(config, "max_output_tokens", None)
         effective_output_tokens = effective_chat_output_tokens(provider, model_name, configured_output_tokens)
@@ -4891,6 +4932,8 @@ async def admin_ai_settings(message: Message | CallbackQuery):
         deepseek_thinking_enabled = getattr(config, "deepseek_thinking_enabled", None)
 
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
+        if config.transcription_provider == PROVIDER_DEEPGRAM:
+            trans_provider = f"{PROVIDER_DEEPGRAM} / {DEEPGRAM_DEFAULT_MODEL}"
         vis_provider = config.vision_provider
         vis_model = _display_capability_model(vis_provider, config.vision_model, "vision")
         image_gen_provider = getattr(config, 'image_generation_provider', PROVIDER_OPENAI)
@@ -4976,6 +5019,8 @@ async def set_ai_provider(callback: CallbackQuery, bot: Bot):
         PROVIDER_GEMINI,
         PROVIDER_KIE,
         PROVIDER_OPENAI,
+        PROVIDER_OPENROUTER,
+        PROVIDER_PERPLEXITY,
     }:
         await _reject_model_callback(callback)
         return
@@ -4993,6 +5038,8 @@ async def admin_ai_keys_models(callback: CallbackQuery):
         config = await session.get(AIConfig, 1)
 
     trans_provider = config.transcription_provider if config else 'OpenAI'
+    if config and config.transcription_provider == PROVIDER_DEEPGRAM:
+        trans_provider = f"{PROVIDER_DEEPGRAM} / {DEEPGRAM_DEFAULT_MODEL}"
     vis_provider = config.vision_provider if config else PROVIDER_GEMINI
     vis_model = _display_capability_model(
         vis_provider,
@@ -5014,6 +5061,8 @@ async def admin_ai_keys_models(callback: CallbackQuery):
         current_model = getattr(config, 'kie_model', None)
     else:
         current_model = getattr(config, f"{str(current_provider).lower()}_model", None) if config else None
+    if current_provider in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
+        current_model = _display_capability_model(current_provider, current_model, "chat")
     max_output_tokens = getattr(config, 'max_output_tokens', None) if config else None
     deepseek_thinking_enabled = getattr(config, 'deepseek_thinking_enabled', None) if config else None
     memory_mode = get_memory_mode(config) if config else MEMORY_MODE_RESET
@@ -5032,6 +5081,9 @@ async def admin_ai_keys_models(callback: CallbackQuery):
         'Gemini': getattr(config, 'gemini_api_key', None) if config else None,
         'KIE': getattr(config, 'kie_api_key', None) if config else None,
         'OpenAI': getattr(config, 'openai_api_key', None) if config else None,
+        'OpenRouter': getattr(config, 'openrouter_api_key', None) if config else None,
+        'Perplexity': getattr(config, 'perplexity_api_key', None) if config else None,
+        'Deepgram': getattr(config, 'deepgram_api_key', None) if config else None,
     }
     keys_text = "\n".join(
         f"<b>{provider}:</b> <code>{html.escape(kb.mask_api_key(value))}</code>"
@@ -5125,6 +5177,8 @@ async def start_set_max_output_tokens(callback: CallbackQuery, state: FSMContext
         if canonical_provider_name(provider) == PROVIDER_KIE
         else getattr(config, f"{str(provider).lower()}_model", None)
     )
+    if canonical_provider_name(provider) in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
+        model = _display_capability_model(provider, model, "chat")
     configured = getattr(config, "max_output_tokens", None)
     effective = effective_chat_output_tokens(provider, model, configured)
     limit = get_chat_output_token_limit(provider, model)
@@ -5179,7 +5233,7 @@ async def save_max_output_tokens(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "admin_toggle_vision")
 async def admin_toggle_vision(callback: CallbackQuery):
-    _VISION_CYCLE = [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_CLAUDE]
+    _VISION_CYCLE = [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_CLAUDE, PROVIDER_OPENROUTER]
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
@@ -5421,6 +5475,8 @@ async def admin_toggle_transcription(callback: CallbackQuery):
                 channel="transcription",
             )
         elif config.transcription_provider == "KIE":
+            config.transcription_provider = PROVIDER_DEEPGRAM
+        elif config.transcription_provider == PROVIDER_DEEPGRAM:
             config.transcription_provider = "None"
         else:
             config.transcription_provider = "OpenAI"
@@ -5489,7 +5545,7 @@ async def admin_toggle_image_edit(callback: CallbackQuery):
     await admin_ai_keys_models(callback)
 
 
-_FALLBACK_CYCLE = [None, PROVIDER_DEEPSEEK, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENAI]
+_FALLBACK_CYCLE = [None, PROVIDER_DEEPSEEK, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENAI, PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY]
 
 
 @router.callback_query(F.data == "admin_toggle_proxy")
@@ -5626,7 +5682,7 @@ async def admin_toggle_vision_fallback(callback: CallbackQuery):
 @router.callback_query(F.data == "admin_change_vision_fallback_provider")
 async def admin_change_vision_fallback_provider(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
-    for p in [PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE]:
+    for p in [PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER]:
         builder.button(text=p, callback_data=f"admin_set_vision_fallback_provider_{p}")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(2)
@@ -5692,7 +5748,29 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
             await message.answer("Недопустимая модель. Настройки не изменены.")
             return
 
-    column_name = f"{provider.lower()}_api_key" if is_key else f"{provider.lower()}_model"
+    key_fields = {
+        PROVIDER_DEEPSEEK: "deepseek_api_key",
+        PROVIDER_CLAUDE: "claude_api_key",
+        PROVIDER_GEMINI: "gemini_api_key",
+        PROVIDER_KIE: "kie_api_key",
+        PROVIDER_OPENAI: "openai_api_key",
+        PROVIDER_OPENROUTER: "openrouter_api_key",
+        PROVIDER_PERPLEXITY: "perplexity_api_key",
+        PROVIDER_DEEPGRAM: "deepgram_api_key",
+    }
+    model_fields = {
+        PROVIDER_DEEPSEEK: "deepseek_model",
+        PROVIDER_CLAUDE: "claude_model",
+        PROVIDER_GEMINI: "gemini_model",
+        PROVIDER_KIE: "kie_model",
+        PROVIDER_OPENAI: "openai_model",
+        PROVIDER_OPENROUTER: "openrouter_model",
+        PROVIDER_PERPLEXITY: "perplexity_model",
+    }
+    column_name = (key_fields if is_key else model_fields).get(provider)
+    if column_name is None:
+        await message.answer("Недопустимый провайдер. Настройки не изменены.")
+        return
 
     async with async_session_maker() as session:
         stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
@@ -17317,6 +17395,9 @@ async def process_audio_limit(message: Message, state: FSMContext, bot: Bot):
                         'Gemini': getattr(config, 'gemini_api_key', None) if config else None,
                         'KIE': getattr(config, 'kie_api_key', None) if config else None,
                         'OpenAI': getattr(config, 'openai_api_key', None) if config else None,
+                        'OpenRouter': getattr(config, 'openrouter_api_key', None) if config else None,
+                        'Perplexity': getattr(config, 'perplexity_api_key', None) if config else None,
+                        'Deepgram': getattr(config, 'deepgram_api_key', None) if config else None,
                     },
                     current_provider=config.provider if config else PROVIDER_GEMINI,
                     current_model=(
@@ -19283,6 +19364,8 @@ async def get_ai_response_direct(
         model = getattr(ai_config, f"{provider_key}_model", None)
         if provider_key in ['anthropic', 'claude'] and not model:
             model = ai_config.claude_model
+        if not model and provider_key in {PROVIDER_OPENROUTER.lower(), PROVIDER_PERPLEXITY.lower()}:
+            model = get_default_model(provider_key, channel="chat")
 
         if not api_key:
             raise AIServiceError(f"API key for AI provider '{provider}' is not configured.")
@@ -19377,6 +19460,36 @@ async def get_ai_response_direct(
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
             )
+        elif provider_key == 'openrouter':
+            try:
+                response_text = await ai_integration.call_openrouter(
+                    api_key,
+                    request_layout,
+                    model,
+                    max_output_tokens=effective_chat_output_tokens(
+                        PROVIDER_OPENROUTER,
+                        model,
+                        getattr(ai_config, "max_output_tokens", None),
+                    ),
+                    activity_tracker=activity_tracker,
+                )
+            except ai_integration.ProviderAdapterError as exc:
+                raise ai_integration._wrap_provider_adapter_error(exc) from exc
+        elif provider_key == 'perplexity':
+            try:
+                response_text = await ai_integration.call_perplexity(
+                    api_key,
+                    request_layout,
+                    model,
+                    max_output_tokens=effective_chat_output_tokens(
+                        PROVIDER_PERPLEXITY,
+                        model,
+                        getattr(ai_config, "max_output_tokens", None),
+                    ),
+                    activity_tracker=activity_tracker,
+                )
+            except ai_integration.ProviderAdapterError as exc:
+                raise ai_integration._wrap_provider_adapter_error(exc) from exc
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
 
@@ -24049,6 +24162,9 @@ async def save_ai_timeout(message: Message, state: FSMContext):
                     'Gemini': getattr(conf2, 'gemini_api_key', None) if conf2 else None,
                     'KIE': getattr(conf2, 'kie_api_key', None) if conf2 else None,
                     'OpenAI': getattr(conf2, 'openai_api_key', None) if conf2 else None,
+                    'OpenRouter': getattr(conf2, 'openrouter_api_key', None) if conf2 else None,
+                    'Perplexity': getattr(conf2, 'perplexity_api_key', None) if conf2 else None,
+                    'Deepgram': getattr(conf2, 'deepgram_api_key', None) if conf2 else None,
                 },
                 current_provider=conf2.provider if conf2 else PROVIDER_GEMINI,
                 current_model=(
