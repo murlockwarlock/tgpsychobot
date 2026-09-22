@@ -572,6 +572,7 @@ def test_init_db_additively_migrates_general_settings():
                 assert config.profile_collect_gender is True
                 assert config.ai_processing_message_enabled is False
                 assert config.ai_processing_message_text == "Думаю..."
+            await engine.dispose()
 
         asyncio.run(main())
         """

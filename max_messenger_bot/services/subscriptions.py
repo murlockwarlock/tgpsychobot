@@ -200,7 +200,7 @@ async def choose_payment_provider(client: MaxApiClient, chat_id: int, user_id: i
         return
     async with async_session_maker() as session:
         plan = await session.get(SubscriptionPlan, plan_id, options=[selectinload(SubscriptionPlan.upgrades_to_plan)])
-    if not plan:
+    if not plan or not plan.name:
         await client.send_message(chat_id=chat_id, text="Тариф не найден.")
         return
 
@@ -268,7 +268,7 @@ async def create_yookassa_link(client: MaxApiClient, chat_id: int, user_id: int,
         return
     async with async_session_maker() as session:
         plan = await session.get(SubscriptionPlan, plan_id)
-    if not plan or not config.yookassa_shop_id or not config.yookassa_secret_key:
+    if not plan or not plan.name or not config.yookassa_shop_id or not config.yookassa_secret_key:
         await client.send_message(chat_id=chat_id, text="ЮKassa не настроена.")
         return
 
@@ -340,7 +340,7 @@ async def create_robokassa_link(client: MaxApiClient, chat_id: int, user_id: int
         return
     async with async_session_maker() as session:
         plan = await session.get(SubscriptionPlan, plan_id)
-    if not plan or not config.robokassa_merchant_login or not config.robokassa_password_1:
+    if not plan or not plan.name or not config.robokassa_merchant_login or not config.robokassa_password_1:
         await client.send_message(chat_id=chat_id, text="Robokassa не настроена.")
         return
     discount_percent = user.subscription.discount_percent if user.subscription else 0

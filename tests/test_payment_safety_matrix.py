@@ -13,6 +13,20 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import pytest
 import pytest_asyncio
+
+
+@pytest.fixture
+def fixed_checkout_clock(monkeypatch):
+    import webhooks
+
+    class CheckoutClock(datetime):
+        @classmethod
+        def utcnow(cls):
+            return datetime(2026, 9, 15, 12, 0, 0)
+
+    monkeypatch.setattr(webhooks, "datetime", CheckoutClock)
+
+
 from sqlalchemy import delete, select
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -2007,19 +2021,16 @@ async def test_verify_yookassa_recurring_safety_schema_helper():
 
         mock_pg_conn = MagicMock()
         mock_pg_conn.dialect.name = "postgresql"
-        mock_pg_conn.execute.return_value.first.return_value = (
-            "CREATE UNIQUE INDEX idx_unresolved_yookassa_attempt ON yookassa_recurring_attempts (subscription_id) WHERE status IN ('claimed', 'pending', 'unknown')",
-        )
+        catalog = dict(indisunique=True, indisvalid=True, indisready=True, indimmediate=True, indnkeyatts=1, indnatts=1, plain_columns=True, amname="btree", column_name="subscription_id", opcdefault=True, collation_id=0, options=0, predicate="status IN ('claimed', 'pending', 'unknown')")
+        mock_pg_conn.execute.return_value.mappings.return_value.first.return_value = catalog
         verify_yookassa_recurring_safety_schema(mock_pg_conn)
 
         # 1c. Test Postgres with array/ANY syntax passes
-        mock_pg_conn.execute.return_value.first.return_value = (
-            "CREATE UNIQUE INDEX idx_unresolved_yookassa_attempt ON public.yookassa_recurring_attempts USING btree (subscription_id) WHERE ((status)::text = ANY ((ARRAY['claimed'::character varying, 'pending'::character varying, 'unknown'::character varying])::text[]))",
-        )
+        catalog["predicate"] = "((status)::text = ANY ((ARRAY['claimed'::character varying, 'pending'::character varying, 'unknown'::character varying])::text[]))"
         verify_yookassa_recurring_safety_schema(mock_pg_conn)
 
         # 2b. Test Postgres missing index raises
-        mock_pg_conn.execute.return_value.first.return_value = None
+        mock_pg_conn.execute.return_value.mappings.return_value.first.return_value = None
         with pytest.raises(RuntimeError, match="missing in PostgreSQL"):
             verify_yookassa_recurring_safety_schema(mock_pg_conn)
 
@@ -3004,7 +3015,7 @@ async def test_sqlite_wal_concurrent_webhook_vs_caller_canceled():
 
 
 @pytest.mark.asyncio
-async def test_ordinary_yookassa_checkout_happy_path_regression(test_db):
+async def test_ordinary_yookassa_checkout_happy_path_regression(test_db, fixed_checkout_clock):
     """
     Requirement 9 Regression:
     Ordinary YooKassa successful checkout with no unresolved recurring attempts.
@@ -3101,7 +3112,7 @@ async def test_ordinary_yookassa_checkout_happy_path_regression(test_db):
 
 
 @pytest.mark.asyncio
-async def test_ordinary_robokassa_result_url_happy_path_regression(test_db):
+async def test_ordinary_robokassa_result_url_happy_path_regression(test_db, fixed_checkout_clock):
     """
     Requirement 9 Regression:
     Ordinary Robokassa successful ResultURL with no unresolved YooKassa attempts.
@@ -3302,7 +3313,7 @@ async def test_exact_attempt_unresolved_paid_plan_never_substitutes_current_plan
 
 
 @pytest.mark.asyncio
-async def test_webhook_forged_stale_cancel_event_with_verified_succeeded_status(test_db):
+async def test_webhook_forged_stale_cancel_event_with_verified_succeeded_status(test_db, fixed_checkout_clock):
     """
     Blocker 3 Regression:
     Incoming webhook event='payment.canceled', but verified GET from YooKassa has status='succeeded'.
@@ -4038,8 +4049,4 @@ async def test_webhook_orphan_successful_payment_transport_diagnostic(test_db):
     admin_messages = [str(call) for call in mock_bot.send_message.call_args_list]
     diagnostic_found = any("ТРЕБУЕТСЯ РУЧНАЯ СВЕРКА: ПОДПИСКА НЕ НАЙДЕНА" in msg for msg in admin_messages)
     assert diagnostic_found is True
-
-
-
-
 

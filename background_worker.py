@@ -394,6 +394,9 @@ async def process_mailings(bot: Bot):
                                 fallback=mailing.text,
                                 source=mailing.text or "",
                             )
+                            if not localized_text and not mailing.media_file_id:
+                                logging.info("Mailing locale omitted mailing_id=%s locale=%s", mailing.id, locale)
+                                continue
                             rendered_text = render_mailing_text(localized_text, target_user)
                             await send_mailing_content(bot, user_id, mailing, rendered_text=rendered_text)
                             success_count += 1

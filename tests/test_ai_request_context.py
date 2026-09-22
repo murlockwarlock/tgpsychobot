@@ -507,10 +507,10 @@ class AIRequestContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", capture["endpoint"])
 
     async def test_kie_vision_keeps_runtime_context_out_of_user_message(self):
-        multimodal = AsyncMock(return_value="Готово")
+        capture = {}
         with (
             patch.object(ai_integration, "_upload_file_to_kie", AsyncMock(return_value="https://image")),
-            patch.object(ai_integration, "_call_kie_multimodal", multimodal),
+            patch.object(ai_integration.httpx, "AsyncClient", return_value=_HttpClient()),
         ):
             await ai_integration._call_kie_vision(
                 "secret",
@@ -521,10 +521,10 @@ class AIRequestContextTests(unittest.IsolatedAsyncioTestCase):
                 "SYSTEM PROMPT",
                 history=[],
                 request_context="RUNTIME METADATA",
+                request_capture=capture,
             )
 
-        args = multimodal.await_args.args
-        self.assertEqual(args[3], "SYSTEM PROMPT")
-        self.assertNotIn("RUNTIME METADATA", args[4][0]["text"])
-        layout = multimodal.await_args.kwargs["request_layout"]
-        self.assertIn("RUNTIME METADATA", layout.runtime_context)
+        messages = capture["payload"]["messages"]
+        self.assertIn("SYSTEM PROMPT", messages[0]["content"])
+        self.assertNotIn("RUNTIME METADATA", messages[-1]["content"][0]["text"])
+        self.assertTrue(any("RUNTIME METADATA" in str(message["content"]) for message in messages[:-1]))

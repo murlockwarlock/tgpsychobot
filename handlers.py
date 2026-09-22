@@ -1,4 +1,7 @@
 import asyncio
+from content_locales import is_admin_content_key
+from test_content_identity import question_snapshot, questions_for_session
+from content_authoring import admin_value, admin_projection
 import base64
 import math
 import html
@@ -282,6 +285,7 @@ from telegram_start_service import (
 )
 from translation_service import (
     LOCALE_LABELS,
+    SUPPORTED_TELEGRAM_LOCALES,
     normalize_enabled_languages,
     normalize_locale,
     resolve_effective_locale,
@@ -1257,29 +1261,8 @@ class NewDialogueButtonFilter(Filter):
 
 class DynamicButtonFilter(Filter):
     async def __call__(self, message: Message) -> bool:
-        if not message.text:
-            return False
-        async with async_session_maker() as session:
-            user = await session.get(User, message.from_user.id)
-            config = await session.get(BotGeneralConfig, 1)
-            locale = resolve_effective_locale(
-                getattr(user, "telegram_language_code", None),
-                getattr(config, "telegram_default_language", "ru"),
-                bool(getattr(config, "telegram_language_selection_enabled", False)),
-                getattr(config, "telegram_enabled_languages", '["ru"]'),
-            )
-            rows = (await session.execute(select(Content).where(Content.is_visible == True))).scalars().all()
-            return any(
-                item.key != "test_button"
-                and message.text == translate(
-                    f"content.{item.key}.button_title",
-                    locale,
-                    fallback=item.button_title,
-                    source=item.button_title,
-                )
-                for item in rows
-                if item.button_title
-            )
+        from content_menu import resolve_menu
+        return bool(message.text and await resolve_menu(message.from_user.id, message.text, "content", session_maker=async_session_maker))
 
 
 async def _is_reserved_user_menu_text(text: str, user_id: int | None = None) -> bool:
@@ -1501,9 +1484,6 @@ async def _send_ai_processing_message(
     if encoded and not text:
         text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
         entities = None
-    if not isinstance(text, str) or not text.strip():
-        logging.warning("AI processing message is enabled without usable text")
-        return None
     source_text = text
     localized_text = translate(
         f"bot_general_config.{getattr(config, 'id', 1)}.ai_processing_message_text",
@@ -1516,11 +1496,13 @@ async def _send_ai_processing_message(
     if localized_text != source_text:
         entities = None
     text = localized_text
+    if not isinstance(text, str) or not text.strip():
+        return None
     try:
         if entities:
             message_kwargs = Text.from_entities(text, entities).as_kwargs()
         else:
-            message_kwargs = {"text": text, "parse_mode": None}
+            message_kwargs = {"text": text, "parse_mode": "HTML" if localized_text != source_text else None}
         return await bot.send_message(
             chat_id=user_id,
             **message_kwargs,
@@ -1766,6 +1748,7 @@ async def send_show_images(
     file_names: list[str | tuple[str, str]],
     sent_names: set[str] | None = None,
 ) -> int:
+    locale = await resolve_user_effective_locale(session, chat_id)
     sent_count = 0
     sent_names = sent_names if sent_names is not None else set()
     for directive in file_names:
@@ -1781,7 +1764,7 @@ async def send_show_images(
             bot,
             chat_id,
             media.file_id,
-            caption=media.description,
+            caption=translate(f"media_library.{media.id}.description", locale, fallback=media.description, source=media.description or ""),
             parse_mode="HTML",
             context="SHOW_IMG",
         ):
@@ -1833,7 +1816,7 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                     bot,
                     message.chat.id,
                     all_random_cards[0].file_id,
-                    caption=all_random_cards[0].description,
+                    caption=translate(f"media_library.{all_random_cards[0].id}.description", locale, fallback=all_random_cards[0].description, source=all_random_cards[0].description or ""),
                     parse_mode='HTML',
                 )
             else:
@@ -2073,7 +2056,8 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
             return
 
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
-        if not questions:
+        from content_runtime import question_available
+        if not questions or not all(question_available(question, locale) for question in questions):
             await bot.send_message(
                 chat_id=user_id,
                 text=translate(
@@ -2111,6 +2095,7 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
             user_id=user_id,
             current_question_index=0,
             answers="[]",
+            question_snapshot=question_snapshot(questions),
             is_finished=False,
             invocation_topic_id=user.current_topic_id if user else None,
             invocation_dialogue_id=user.current_dialogue_id if user else 1,
@@ -2444,7 +2429,7 @@ async def process_buffered_messages(
                 if media:
                     if not await _check_scope_guard():
                         return
-                    await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=media.description, parse_mode='HTML')
+                    await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=translate(f"media_library.{media.id}.description", locale, fallback=media.description, source=media.description or ""), parse_mode='HTML')
 
             drawn_cards_info = []
             all_random_cards = []
@@ -2467,7 +2452,7 @@ async def process_buffered_messages(
                         bot,
                         user_id,
                         all_random_cards[0].file_id,
-                        caption=all_random_cards[0].description,
+                        caption=translate(f"media_library.{all_random_cards[0].id}.description", locale, fallback=all_random_cards[0].description, source=all_random_cards[0].description or ""),
                         parse_mode='HTML',
                     )
                 else:
@@ -2917,7 +2902,7 @@ async def render_static_content_telegram(
     inline_kb = None
     if parsed_rows:
         inline_kb = _telegram_response_buttons_markup(parsed_rows)
-    elif content_obj.action_btn_text and content_obj.action_btn_payload:
+    elif content_obj.action_btn_payload and translate(f"content.{content_obj.key}.action_btn_text", locale, fallback=content_obj.action_btn_text, source=content_obj.action_btn_text or ""):
         inline_kb = kb.action_button_keyboard(
             translate(
                 f"content.{content_obj.key}.action_btn_text",
@@ -2929,6 +2914,8 @@ async def render_static_content_telegram(
         )
 
     media = list(content_obj.media or [])
+    if not clean_text and not media and not inline_kb:
+        return False
     order = content_obj.content_order or "media_top"
 
     # Single media with short text and media_top: send combined caption
@@ -3259,7 +3246,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 )
                 return
 
-            caption = f"<b>{translate('ui.card.selected', locale, fallback='Твой выбор подтвержден.')}</b>\n\n{media.description or ''}"
+            caption = f"<b>{translate('ui.card.selected', locale, fallback='Твой выбор подтвержден.')}</b>\n\n{translate(f'media_library.{media.id}.description', locale, fallback=media.description or '', source=media.description or '') or ''}"
             await callback.message.answer_photo(
                 photo=media.file_id,
                 caption=caption,
@@ -5904,6 +5891,13 @@ async def get_content_from_db(key: str, user_id: int | None = None) -> dict:
                 {'type': media.file_type, 'file_id': media.file_id}
                 for media in content_obj.media
             ]
+            from admin_authoring_context import content_editing_locale
+            if user_id is None and content_editing_locale.get():
+                return {
+                    "text": await admin_value(session, "content", content_obj, "text_content"),
+                    "media": media_list, "is_visible": content_obj.is_visible,
+                    "content_order": content_obj.content_order, "missing": False,
+                }
             return {
                 "text": translate(
                     f"content.{content_obj.key}.text_content",
@@ -5968,34 +5962,10 @@ async def _send_configured_test_intro(bot: Bot, chat_id: int, user_id: int | Non
 
 @router.message(DynamicButtonFilter(), StateFilter(None))
 async def handle_info_buttons(message: Message):
-    async with async_session_maker() as session:
-        user = await session.get(User, message.from_user.id)
-        config = await session.get(BotGeneralConfig, 1)
-        locale = resolve_effective_locale(
-            getattr(user, "telegram_language_code", None),
-            getattr(config, "telegram_default_language", "ru"),
-            bool(getattr(config, "telegram_language_selection_enabled", False)),
-            getattr(config, "telegram_enabled_languages", '["ru"]'),
-        )
-        content_rows = (await session.execute(select(Content).where(Content.is_visible == True))).scalars().all()
-        content_obj = next(
-            (
-                item
-                for item in content_rows
-                if item.button_title
-                and message.text == translate(
-                    f"content.{item.key}.button_title",
-                    locale,
-                    fallback=item.button_title,
-                    source=item.button_title,
-                )
-            ),
-            None,
-        )
-        content_key = content_obj.key if content_obj else None
-    if not content_key:
-        return
-    await render_static_content_telegram(message.bot, message.chat.id, message.from_user.id, content_key)
+    from content_menu import resolve_menu
+    content_key = await resolve_menu(message.from_user.id, message.text, "content", session_maker=async_session_maker)
+    if content_key is not None:
+        await render_static_content_telegram(message.bot, message.chat.id, message.from_user.id, content_key)
 
 
 @router.callback_query(F.data.startswith("view_models_"))
@@ -7404,7 +7374,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 ).limit(1)
                 media = await session.scalar(stmt)
                 if media:
-                    await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=media.description, parse_mode='HTML')
+                    await bot.send_audio(chat_id=user_id, audio=media.file_id, caption=translate(f"media_library.{media.id}.description", locale, fallback=media.description, source=media.description or ""), parse_mode='HTML')
 
             drawn_cards_info = []
             all_random_cards = []
@@ -7425,7 +7395,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                         bot,
                         user_id,
                         all_random_cards[0].file_id,
-                        caption=all_random_cards[0].description,
+                        caption=translate(f"media_library.{all_random_cards[0].id}.description", locale, fallback=all_random_cards[0].description, source=all_random_cards[0].description or ""),
                         parse_mode='HTML',
                     )
                 else:
@@ -8757,6 +8727,8 @@ async def _show_admin_edit_plan_menu(bot: Bot, chat_id: int, message_id: int, pl
             plan_id,
             options=[selectinload(SubscriptionPlan.upgrades_to_plan)]
         )
+        if plan:
+            plan = await admin_projection(session, "plan", plan)
 
     if not plan:
         await bot.edit_message_text("Тариф не найден.", chat_id=chat_id, message_id=message_id, reply_markup=None)
@@ -8887,6 +8859,9 @@ async def _perform_telegram_topic_switch(user_id: int, topic_id: int) -> TopicSw
             user = await session.get(User, user_id)
             topic = await session.get(Topic, topic_id)
             if not is_topic_accessible(topic, user, user_id):
+                return TopicSwitchResult("inaccessible")
+            locale = await resolve_user_effective_locale(session, user or user_id)
+            if not translate(f"topic.{topic.id}.name", locale, fallback=topic.name, source=topic.name or ""):
                 return TopicSwitchResult("inaccessible")
 
             if user and user.current_topic_id == topic_id:
@@ -9168,7 +9143,7 @@ async def _send_topic_intro(bot: Bot, chat_id: int, topic: Topic, restored: bool
         fallback=topic.name,
         source=topic.name,
     )
-    if topic.start_message:
+    if translate(f"topic.{topic.id}.start_message", locale, fallback=topic.start_message, source=topic.start_message or ""):
         text_to_send = translate(
             f"topic.{topic.id}.start_message",
             locale,
@@ -9181,7 +9156,7 @@ async def _send_topic_intro(bot: Bot, chat_id: int, topic: Topic, restored: bool
         parse_mode = "Markdown"
 
     reply_markup = None
-    if topic.start_button_text and topic.start_button_payload:
+    if topic.start_button_payload and translate(f"topic.{topic.id}.start_button_text", locale, fallback=topic.start_button_text, source=topic.start_button_text or ""):
         reply_markup = kb.action_button_keyboard(
             translate(
                 f"topic.{topic.id}.start_button_text",
@@ -10840,6 +10815,7 @@ async def _collection_media_payload(coll_id: int, media_id: int):
             .where(media_collection_items.c.media_id == media_id)
             .order_by(MediaCollection.name)
         )).scalars().all()
+        media = await admin_projection(session, "media_library", media)
     return media, coll.name, list(collection_names)
 
 
@@ -13266,7 +13242,7 @@ async def choose_payment_provider(callback: CallbackQuery, state: FSMContext):
         f"{translate('ui.subscription.plan_label', locale, fallback='<b>Тариф:</b>')} {plan_name} ({plan.duration_value} {duration_unit_text})\n"
         f"{translate('ui.subscription.cost_label', locale, fallback='<b>Стоимость:</b>')} {final_price:.2f} {rubles}\n"
     )
-    if plan.description:
+    if translate(f"plan.{plan.id}.description", locale, fallback=plan.description, source=plan.description or ""):
         text += f"{html.escape(translate(f'plan.{plan.id}.description', locale, fallback=plan.description, source=plan.description))}\n"
     text += "\n"
 
@@ -15481,12 +15457,21 @@ async def admin_birthday_template_menu(callback: CallbackQuery, state: FSMContex
 @router.callback_query(F.data == "mailing_use_birthday_template", AdminStates.mailing_media_position)
 async def admin_use_birthday_template(callback: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
+    from admin_authoring_context import content_editing_locale
+    template_text = DEFAULT_BIRTHDAY_TEMPLATE
+    if (data.get("authoring_locale") or content_editing_locale.get() or "ru") != "ru":
+        async with async_session_maker() as session:
+            existing = await _get_latest_birthday_mailing(session)
+            template_text = await admin_value(session, "mailing", existing, "text") if existing else ""
+        if not template_text:
+            await callback.answer("Шаблон на выбранном языке ещё не задан. Введите текст сообщения.", show_alert=True)
+            return
     if data.get("audience") != "birthday_today":
         await callback.answer()
         return
 
     if data.get("media_file_id") and not data.get("media_position"):
-        await state.update_data(text=DEFAULT_BIRTHDAY_TEMPLATE)
+        await state.update_data(text=template_text)
         await callback.message.edit_text(
             "<b>Шаг 3:</b> Шаблон подставлен. Теперь выберите порядок отображения медиафайла и текста:",
             reply_markup=kb.mailing_media_position_keyboard("birthday_today"),
@@ -15496,7 +15481,7 @@ async def admin_use_birthday_template(callback: CallbackQuery, state: FSMContext
         await callback.answer("Шаблон подставлен")
         return
 
-    await state.update_data(text=DEFAULT_BIRTHDAY_TEMPLATE, media_position='media_top')
+    await state.update_data(text=template_text, media_position='media_top')
     await show_mailing_preview(callback.message.chat.id, callback.message.message_id, state, bot)
     await callback.answer("Шаблон подставлен")
 
@@ -15525,7 +15510,7 @@ async def admin_process_mailing_content(message: Message, state: FSMContext, bot
         current_text = message.html_text
 
     # For birthday templates, sending media without caption should not block the template flow.
-    if audience == "birthday_today" and current_media_id and not current_text:
+    if audience == "birthday_today" and current_media_id and not current_text and data.get("authoring_locale", "ru") == "ru":
         current_text = DEFAULT_BIRTHDAY_TEMPLATE
 
     await message.delete()
@@ -16204,6 +16189,7 @@ async def _show_edit_topic_menu(bot: Bot, chat_id: int, message_id: int, topic_i
             ).where(topic_collection_association.c.topic_id == topic_id)
         )
         assigned_coll_names = [r[0] for r in coll_res.all()]
+        topic = await admin_projection(session, "topic", topic)
 
     kb_files_count = len(topic.knowledge_base_files)
     colls_info = ", ".join(assigned_coll_names) if assigned_coll_names else "не привязаны"
@@ -16421,6 +16407,7 @@ async def admin_mailing_history(callback: CallbackQuery):
                 .limit(PAGE_SIZE)
             )
             mailings = mailings_result.scalars().all()
+            mailings = [await admin_projection(session, "mailing", item) for item in mailings]
 
             text_to_send = f"📜 История рассылок (стр. {page + 1}/{total_pages})"
             markup_to_send = kb.mailing_history_keyboard(mailings, page, total_pages)
@@ -16449,6 +16436,8 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
     mailing_id = int(callback.data.split("_")[-1])
     async with async_session_maker() as session:
         mailing = await session.get(Mailing, mailing_id)
+        if mailing:
+            mailing = await admin_projection(session, "mailing", mailing)
 
     if not mailing:
         await callback.answer("Рассылка не найдена.", show_alert=True)
@@ -16485,6 +16474,7 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
         text += f"\n\n<b>Переменные:</b> <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
 
     back_keyboard = kb.mailing_details_keyboard(mailing)
+    back_keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="Изменить текст", callback_data=f"ca:view:mailing:{mailing_id}")])
 
     try:
         await callback.message.delete()
@@ -17729,23 +17719,27 @@ def generate_progress_bar(current, total, length=10):
 
 
 def _localized_test_question(question, locale: str):
+    from functools import partial
+    from test_content_identity import translate_question
+    translate = partial(translate_question, question)
     options = []
     for index, option in enumerate(get_answer_options(question)):
+        slot = option.translation_slot if option.translation_slot is not None else str(index)
         options.append(
             replace(
                 option,
                 text=translate(
-                    f"test_question.{question.id}.option.{index}.text",
+                    f"test_question.{question.id}.option.{slot}.text",
                     locale,
                     fallback=option.text,
                     source=option.text,
                 ),
                 button_text=translate(
-                    f"test_question.{question.id}.option.{index}.button_text",
+                    f"test_question.{question.id}.option.{slot}.button_text",
                     locale,
                     fallback=option.button_text,
                     source=option.button_text,
-                ) if option.button_text else None,
+                ),
             )
         )
     question_text = translate(
@@ -17789,8 +17783,9 @@ async def start_psych_test(
         )
         questions = questions_result.scalars().all()
         locale = await _test_locale(session, user_id)
+        from content_runtime import question_available
 
-        if not questions:
+        if not questions or not all(question_available(question, locale) for question in questions):
             await message.answer(
                 translate(
                     "ui.test.questions_missing",
@@ -17814,6 +17809,7 @@ async def start_psych_test(
                     user_id=user_id,
                     current_question_index=0,
                     answers="[]",
+                    question_snapshot=question_snapshot(questions),
                     invocation_topic_id=user.current_topic_id if user else None,
                     invocation_dialogue_id=user.current_dialogue_id if user else 1,
                     invocation_platform="telegram",
@@ -17850,7 +17846,7 @@ async def _process_universal_test_answer(message: Message, user_id: int, state: 
             )
             return
 
-        questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        questions = questions_for_session(test_session, (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all())
         if test_session.current_question_index >= len(questions):
             await message.answer(
                 translate("ui.test.questions_finished", locale, fallback="Вопросы теста уже закончились.")
@@ -18099,6 +18095,7 @@ async def send_next_question(message: Message, user_id: int, state: FSMContext, 
         stmt = select(TestQuestion).order_by(TestQuestion.sort_order.asc())
         result = await session.execute(stmt)
         questions = result.scalars().all()
+        questions = questions_for_session(test_session, questions)
         config = await session.get(TestConfig, 1)
         user = await session.get(User, user_id)
         try:
@@ -18198,7 +18195,7 @@ async def process_test_text_answer(message: Message, state: FSMContext, bot: Bot
                 )
             )
             return
-        questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        questions = questions_for_session(test_session, (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all())
         question_index = test_session.current_question_index
         if question_index >= len(questions):
             await finish_test_generation(message, user_id, parse_answers(test_session.answers), questions, state)
@@ -18336,12 +18333,14 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
 
         existing_session = await session.get(TestSession, user_id)
         user = await session.get(User, user_id)
+        questions = (await session.scalars(select(TestQuestion).order_by(TestQuestion.sort_order, TestQuestion.id))).all()
 
         if existing_session:
             existing_session.created_at = datetime.utcnow()
             existing_session.answers = ""
             existing_session.is_finished = False
             existing_session.current_question_index = 0
+            existing_session.question_snapshot = question_snapshot(questions)
             existing_session.invocation_topic_id = user.current_topic_id if user else None
             existing_session.invocation_dialogue_id = user.current_dialogue_id if user else 1
             existing_session.invocation_platform = "telegram"
@@ -18353,6 +18352,7 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
                 answers="",
                 is_finished=False,
                 current_question_index=0,
+                question_snapshot=question_snapshot(questions),
                 invocation_topic_id=user.current_topic_id if user else None,
                 invocation_dialogue_id=user.current_dialogue_id if user else 1,
                 invocation_platform="telegram",
@@ -18790,6 +18790,9 @@ async def start_secret_test_handler(callback: CallbackQuery, state: FSMContext):
             getattr(general_config, "telegram_enabled_languages", '["ru"]'),
         )
 
+    if not questions or any(not translate(f"secret_test_question.{question.id}.text", locale, fallback=question.text, source=question.text or "") for question in questions):
+        await callback.answer(translate("ui.secret.not_added", locale, fallback="Вопросы еще не добавлены администратором."), show_alert=True)
+        return
     if not questions:
         questions_text = translate(
             "ui.secret.not_added",
@@ -19032,29 +19035,19 @@ async def admin_process_questions_file(message: Message, state: FSMContext, bot:
             return
 
         async with async_session_maker() as session:
-            await session.execute(delete(TestQuestion))
-
-            for idx, q_data in enumerate(questions_data):
-                new_q = TestQuestion(
-                    text=q_data['text'],
-                    category=q_data['category'],
-                    is_reverse=q_data['is_reverse'],
-                    sort_order=idx,
-                    comment=q_data.get('comment'),
-                    variable_name=q_data.get('variable_name'),
-                    allow_custom_answer=q_data.get('allow_custom_answer', False),
-                    buttons_layout=q_data.get('buttons_layout', 'vertical'),
-                    answer_options_json=q_data.get('answer_options_json'),
-                )
-                session.add(new_q)
-
-            config = await session.get(TestConfig, 1)
-            if not config:
-                config = TestConfig(id=1)
-                session.add(config)
-            config.formulas_json = json_dumps(formulas_data) if formulas_data else None
-            config.formulas_enabled = bool(formulas_data)
-            await commit_readiness_critical_mutation(session)
+            from question_authoring_import import apply_question_import
+            from admin_authoring_context import content_editing_locale
+            async with translation_coordination_lock(session):
+                existing = await session.scalar(select(TestQuestion.id).limit(1))
+                await apply_question_import(session, questions_data, content_editing_locale.get() or "ru")
+                if existing is None:
+                    config = await session.get(TestConfig, 1)
+                    if not config:
+                        config = TestConfig(id=1)
+                        session.add(config)
+                    config.formulas_json = json_dumps(formulas_data) if formulas_data else None
+                    config.formulas_enabled = bool(formulas_data)
+                await commit_readiness_critical_mutation(session)
 
         formula_text = f"\nФормул: {len(formulas_data)}" if formulas_data else ""
         await message.answer(f"✅ Успешно загружено {len(questions_data)} вопросов!{formula_text}")
@@ -19406,8 +19399,9 @@ async def admin_general_settings(callback: CallbackQuery, state: FSMContext | No
             await session.commit()
 
     processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
-    processing_text = getattr(config, "ai_processing_message_text", None) or DEFAULT_AI_PROCESSING_MESSAGE_TEXT
-    processing_text_display = _ai_processing_message_html(processing_text)
+    from content_authoring import admin_value
+    async with async_session_maker() as session:
+        processing_text_display = html.escape(await admin_value(session, "bot_general_config", config, "ai_processing_message_text", label=True))
 
     await callback.message.edit_text(
         "⚙️ <b>Общие настройки</b>\n\n"
@@ -19432,7 +19426,7 @@ async def _admin_language_config_and_readiness():
             readiness = await audit_translation_readiness(
                 session,
                 registry,
-                locales=("en", "pt"),
+                locales=tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru"),
             )
             return config, readiness, _translation_database_label(session)
 
@@ -19499,7 +19493,7 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
     enabled = set(normalize_enabled_languages(config.telegram_enabled_languages))
     default_locale = normalize_locale(config.telegram_default_language) or "ru"
     selector_enabled = bool(config.telegram_language_selection_enabled)
-    lines = ["🌐 <b>Языки Telegram</b>"]
+    lines = ["🌐 <b>Языки Telegram</b>", "Темы, контент, тесты и другие материалы редактируются в соответствующих разделах админки. Здесь управляются языками бота и системными переводами."]
     if bot_label:
         lines.extend(("", bot_label))
     lines.extend(
@@ -19513,15 +19507,20 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
             "Доступные языки:",
         )
     )
-    for locale in ("ru", "en", "pt"):
+    for locale in SUPPORTED_TELEGRAM_LOCALES:
         enabled_mark = "✅" if locale in enabled else "❌"
         default_mark = " · по умолчанию" if locale == default_locale else ""
         lines.append(f"{enabled_mark} {LOCALE_LABELS[locale]}{default_mark}")
-    lines.extend(("", "Готовность переводов:"))
-    for locale in ("en", "pt"):
+    lines.extend(("", "Готовность системных переводов:"))
+    for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru"):
         lines.append(
             f"{LOCALE_LABELS[locale]} — {_language_readiness_status(readiness, locale)}"
         )
+        from content_authoring import RESOURCES
+        for kind, counts in readiness.get("content", {}).get(locale, {}).items():
+            if counts["total"]:
+                title = RESOURCES[kind].title if kind in RESOURCES else kind
+                lines.append(f"{title}: {counts['complete']}/{counts['total']} · требуют проверки {counts['review']}")
     return "\n".join(lines)
 
 
@@ -19530,7 +19529,7 @@ def _language_readiness_text(readiness, bot_label: str = "") -> str:
     if bot_label:
         lines.extend(("", bot_label))
     lines.extend(("", "🇷🇺 Русский — канонический источник"))
-    for locale in ("en", "pt"):
+    for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru"):
         report = get_locale_readiness(readiness, locale)
         status = _language_readiness_status(readiness, locale)
         translated = report.get("translated", 0)
@@ -19709,11 +19708,11 @@ async def admin_language_toggle_selector(callback: CallbackQuery):
                 readiness = await audit_translation_readiness(
                     session,
                     registry,
-                    locales=tuple(locale for locale in ("en", "pt") if locale in enabled),
+                    locales=tuple(locale for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru") if locale in enabled),
                 )
                 not_ready = [
                     locale
-                    for locale in ("en", "pt")
+                    for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru")
                     if locale in enabled and not get_locale_readiness(readiness, locale)["ready"]
                 ]
                 if not_ready:
@@ -19882,7 +19881,7 @@ async def admin_translation_export(callback: CallbackQuery):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
     locale = normalize_locale(callback.data.removeprefix("admin_translation_export_"))
-    if locale not in {"en", "pt"}:
+    if locale not in (set(SUPPORTED_TELEGRAM_LOCALES) - {"ru"}):
         await callback.answer("Сначала выберите EN или PT.", show_alert=True)
         return
     bot_info = await callback.bot.get_me()
@@ -19916,13 +19915,13 @@ async def admin_translation_import_legacy(callback: CallbackQuery):
     await callback.answer("Выберите EN или PT, чтобы импортировать один язык.", show_alert=True)
 
 
-@router.callback_query(F.data.in_({"admin_translation_import_en", "admin_translation_import_pt"}))
+@router.callback_query(F.data.in_({f"admin_translation_import_{locale}" for locale in SUPPORTED_TELEGRAM_LOCALES if locale != "ru"}))
 async def admin_translation_import_start(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
     locale = normalize_locale(callback.data.removeprefix("admin_translation_import_"))
-    if locale not in {"en", "pt"}:
+    if locale not in (set(SUPPORTED_TELEGRAM_LOCALES) - {"ru"}):
         await callback.answer("Сначала выберите EN или PT.", show_alert=True)
         return
     bot_info = await callback.bot.get_me()
@@ -19950,7 +19949,7 @@ async def admin_translation_import_file(message: Message, state: FSMContext, bot
         return
     state_data = await state.get_data()
     expected_locale = normalize_locale(state_data.get("translation_locale"))
-    if expected_locale not in {"en", "pt"}:
+    if expected_locale not in (set(SUPPORTED_TELEGRAM_LOCALES) - {"ru"}):
         await state.clear()
         await message.answer("❌ Не выбран язык импорта. Откройте управление EN или PT заново.")
         return
@@ -19991,8 +19990,9 @@ async def admin_translation_import_file(message: Message, state: FSMContext, bot
                 )
         report = {
             "locale": expected_locale,
-            "count": len(pack["translations"]),
-            "required": len(registry.required_keys()),
+            "count": sum(not is_admin_content_key(entry.get("translation_key")) for entry in pack["translations"]),
+            "skipped": sum(is_admin_content_key(entry.get("translation_key")) for entry in pack["translations"]),
+            "required": len(registry.system().required_keys()),
             "missing": 0,
             "stale": 0,
             "invalid": 0,
@@ -20010,6 +20010,7 @@ async def admin_translation_import_file(message: Message, state: FSMContext, bot
             f"База: <code>{html.escape(target['database'])}</code>\n"
             f"Язык: {LOCALE_LABELS[expected_locale]}\n"
             f"Записей в файле: {report['count']}\n"
+            f"Пропущено материалов из старого пакета: {report['skipped']}\n"
             f"Обязательных переводов: {report['required']}\n"
             "Отсутствует: 0\nУстарело: 0\nОшибок: 0\n"
             "Проверка пакета: ✅ готов к импорту\n"
@@ -20056,7 +20057,7 @@ async def admin_translation_import_confirm(callback: CallbackQuery, state: FSMCo
     pack = data.get("translation_pack")
     if (
         await state.get_state() != AdminStates.confirm_translation_pack.state
-        or locale not in {"en", "pt"}
+        or locale not in (set(SUPPORTED_TELEGRAM_LOCALES) - {"ru"})
         or not isinstance(pack, dict)
     ):
         await state.clear()
@@ -20099,7 +20100,8 @@ async def admin_translation_import_confirm(callback: CallbackQuery, state: FSMCo
     config, readiness, database_label = await _admin_language_config_and_readiness()
     report = get_locale_readiness(readiness, locale)
     await callback.message.edit_text(
-        f"✅ Импортировано записей: {count}.\n\n"
+        f"✅ Импортировано системных записей: {count}.\n"
+        f"Пропущено материалов: {sum(is_admin_content_key(entry.get('translation_key')) for entry in pack['translations'])}.\n\n"
         + _language_locale_text(
             config,
             locale,
@@ -20122,7 +20124,7 @@ async def admin_translation_import_cancel(callback: CallbackQuery, state: FSMCon
         return
     locale = normalize_locale((await state.get_data()).get("translation_locale"))
     await state.clear()
-    await _show_admin_language_locale(callback, locale if locale in {"en", "pt"} else "ru")
+    await _show_admin_language_locale(callback, locale if locale in (set(SUPPORTED_TELEGRAM_LOCALES) - {"ru"}) else "ru")
 
 
 @router.callback_query(F.data == "admin_general_toggle_ai_processing_message")
@@ -20580,7 +20582,8 @@ async def process_case_study_upload(message: Message, state: FSMContext, bot: Bo
         await session.refresh(new_case)
         case_id = new_case.id
 
-    await update_case_study_index(case_id, text_content)
+    if new_case.text:
+        await update_case_study_index(case_id, new_case.text)
 
     await state.clear()
     await message.delete()
@@ -20919,31 +20922,11 @@ async def handle_topics_button_click(message: Message):
 
 class TopicDirectButtonFilter(Filter):
     async def __call__(self, message: Message) -> bool | dict:
-        if not message.text: return False
-        async with async_session_maker() as session:
-            user = await session.get(User, message.from_user.id)
-            config = await session.get(BotGeneralConfig, 1)
-            locale = resolve_effective_locale(
-                getattr(user, "telegram_language_code", None),
-                getattr(config, "telegram_default_language", "ru"),
-                bool(getattr(config, "telegram_language_selection_enabled", False)),
-                getattr(config, "telegram_enabled_languages", '["ru"]'),
-            )
-            is_admin_user = message.from_user.id in OWNER_IDS or bool(user and user.is_admin)
-            conditions = [Topic.is_active == True, Topic.show_in_main_menu == True]
-            if not is_admin_user:
-                conditions.append(Topic.admin_only == False)
-            topics = (await session.execute(select(Topic).where(*conditions))).scalars().all()
-            for topic in topics:
-                topic_name = translate(
-                    f"topic.{topic.id}.name",
-                    locale,
-                    fallback=topic.name,
-                    source=topic.name,
-                )
-                if topic_name == message.text:
-                    return {'topic_id': topic.id, 'topic_name': topic_name}
+        from content_menu import resolve_menu
+        if not message.text:
             return False
+        identity = await resolve_menu(message.from_user.id, message.text, "topic", session_maker=async_session_maker)
+        return {"topic_id": int(identity), "topic_name": message.text} if identity is not None else False
 
 
 @router.message(TopicDirectButtonFilter())
@@ -20963,6 +20946,7 @@ async def handle_direct_topic_button(message: Message, topic_id: int, topic_name
 async def handle_action_button_click(callback: CallbackQuery, state: FSMContext, bot: Bot):
     user_id = callback.from_user.id
     payload_text = None
+    display_text = None
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -20977,11 +20961,15 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
             topic = await session.get(Topic, user.current_topic_id)
             if topic and topic.start_button_payload:
                 payload_text = topic.start_button_payload
+                locale = await resolve_user_effective_locale(session, user)
+                display_text = translate(f"topic.{topic.id}.start_button_text", locale, source=topic.start_button_text or "", fallback=topic.start_button_text)
 
         if not payload_text:
             content = await session.get(Content, "start_message")
             if content and content.action_btn_payload:
                 payload_text = content.action_btn_payload
+                locale = await resolve_user_effective_locale(session, user)
+                display_text = translate(f"content.{content.key}.action_btn_text", locale, source=content.action_btn_text or "", fallback=content.action_btn_text)
 
     if payload_text:
         lease = single_flight.try_claim("telegram", user_id)
@@ -21014,7 +21002,8 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
                 'delete': callback.message.delete
             })()
 
-            await callback.message.answer(html.escape(payload_text))
+            if display_text:
+                await callback.message.answer(html.escape(display_text))
 
             await process_user_prompt(mock_message, user_id, payload_text, bot, state)
         finally:
@@ -21362,7 +21351,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
                     source=topic.name,
                 )
                 text_to_send = f"✅ Диалог в теме «{localized_topic_name}» перезапущен. Память очищена."
-                if topic.start_message:
+                if translate(f"topic.{topic.id}.start_message", topic_locale, fallback=topic.start_message, source=topic.start_message or ""):
                     text_to_send = translate(
                         f"topic.{topic.id}.start_message",
                         topic_locale,
@@ -21371,7 +21360,7 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
                     )
                     topic_mode_html = "HTML"
 
-                if topic.start_button_text and topic.start_button_payload:
+                if topic.start_button_payload and translate(f"topic.{topic.id}.start_button_text", topic_locale, fallback=topic.start_button_text, source=topic.start_button_text or ""):
                     reply_markup = kb.action_button_keyboard(
                         translate(
                             f"topic.{topic.id}.start_button_text",
@@ -23260,6 +23249,8 @@ async def _send_referral_templates(chat_id: int, ref_link: str, bot: Bot):
             fallback=tpl.text,
             source=tpl.text,
         ) or tpl.text
+        if not translated_template:
+            continue
         tpl_text = translated_template.replace("{ref_link}", ref_link)
         share_url = f"https://t.me/share/url?url={parse.quote(ref_link)}&text={parse.quote(tpl_text)}"
         await bot.send_message(

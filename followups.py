@@ -416,7 +416,9 @@ def validate_followup_step(step) -> None:
             raise FollowupStepConfigurationError("Некорректная задержка догоняющего шага")
     if message_type == "static":
         message_text = getattr(step, "message_text", None)
-        if not isinstance(message_text, str) or not message_text.strip():
+        from translation_service import translation_cache
+        translated = any(key == f"followup_step.{getattr(step, 'id', None)}.message_text" and value for (_, key), value in translation_cache.snapshot.translations.items())
+        if (not isinstance(message_text, str) or not message_text.strip()) and not translated:
             raise FollowupStepConfigurationError("Пустой текст догоняющего сообщения")
     else:
         ai_instruction = getattr(step, "ai_instruction", None)
@@ -471,9 +473,11 @@ async def prepare_followup_step(
     text = translate(
         f"followup_step.{step.id}.message_text",
         locale,
-        fallback=step.message_text.strip(),
+        fallback=(step.message_text or "").strip(),
         source=step.message_text,
-    ) or step.message_text.strip()
+    ) or ""
+    if not text:
+        raise FollowupStepConfigurationError("Текст шага отсутствует для языка получателя и русского языка")
     visible_text, response_button_rows = extract_response_buttons(text)
     if not response_button_rows:
         return FollowupStepSendResult(text, text, None)

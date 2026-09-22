@@ -19,10 +19,12 @@ from provider_models import build_telegram_model_callback_data
 from max_messenger_bot.identity import is_max_user_id, max_client_list_label
 from translation_service import (
     LOCALE_LABELS,
+    SUPPORTED_TELEGRAM_LOCALES,
     normalize_enabled_languages,
     resolve_effective_locale,
     translate,
 )
+from content_locales import admin_label
 
 
 def should_show_test_button(test_config) -> bool:
@@ -63,7 +65,6 @@ async def main_client_keyboard(user_id: int | None = None):
         )
         stmt = select(Content).where(
             Content.is_visible == True,
-            Content.button_title != None,
             Content.key.not_in(['disclaimer', 'test_results', 'test_intro', 'secret_test_outro', 'test_button'])
         ).order_by(Content.sort_order.asc())
         result = await session.execute(stmt)
@@ -99,6 +100,17 @@ async def main_client_keyboard(user_id: int | None = None):
         menu_topics = topic_res.scalars().all()
 
     keyboard_rows = []
+
+    buttons = [item for item in buttons if translate(f"content.{item.key}.button_title", locale, fallback=item.button_title, source=item.button_title or "")]
+    menu_topics = [item for item in menu_topics if translate(f"topic.{item.id}.name", locale, fallback=item.name, source=item.name or "")]
+    from content_menu import remember_menu
+    await remember_menu(user_id, [
+        (translate(f"content.{item.key}.button_title", locale, fallback=item.button_title, source=item.button_title or ""), "content", item.key)
+        for item in buttons
+    ] + [
+        (translate(f"topic.{item.id}.name", locale, fallback=item.name, source=item.name or ""), "topic", item.id)
+        for item in menu_topics
+    ], session_maker=async_session_maker)
 
     if topics_active and topics_on_top:
         keyboard_rows.append([KeyboardButton(text=topics_btn_name)])
@@ -222,6 +234,7 @@ def admin_test_menu_keyboard(config_or_enabled):
     builder.button(text="✏️ Финал секретного теста", callback_data="edit_content_secret_test_outro")
     builder.button(text="📝 Промпт теста", callback_data="admin_edit_test_prompt")
     builder.button(text="📥 Загрузить вопросы", callback_data="admin_upload_questions")
+    builder.button(text="❓ Вопросы теста", callback_data="admin_test_questions")
     builder.button(text="📐 Загрузить формулы", callback_data="admin_upload_formulas")
     builder.button(text="🔐 Секретные вопросы", callback_data="admin_secret_questions")
     builder.button(text="📖 Истории/Кейсы", callback_data="admin_case_studies_page_0")
@@ -276,7 +289,7 @@ def admin_language_settings_keyboard(config, readiness=None):
         ),
         callback_data="admin_language_toggle_selector",
     )
-    for locale in ("ru", "en", "pt"):
+    for locale in SUPPORTED_TELEGRAM_LOCALES:
         builder.button(
             text=f"⚙️ {LOCALE_LABELS[locale]}",
             callback_data=f"admin_language_locale_{locale}",
@@ -303,7 +316,7 @@ def admin_language_locale_keyboard(config, locale, readiness):
     )
     locale_code = locale.upper()
 
-    if locale in {"en", "pt"}:
+    if locale in (set(SUPPORTED_TELEGRAM_LOCALES) - {"ru"}):
         builder.button(
             text=f"📤 Экспорт {locale_code}",
             callback_data=f"admin_translation_export_{locale}",
@@ -333,7 +346,7 @@ def admin_language_locale_keyboard(config, locale, readiness):
 
 def admin_translation_readiness_keyboard():
     builder = InlineKeyboardBuilder()
-    for locale in ("en", "pt"):
+    for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru"):
         locale_code = locale.upper()
         builder.button(
             text=f"📤 Экспорт {locale_code}",
@@ -397,7 +410,7 @@ def admin_test_links_keyboard():
 def admin_secret_questions_keyboard(questions: list):
     builder = InlineKeyboardBuilder()
     for q in questions:
-        builder.button(text=f"🗑️ {q.text[:30]}...", callback_data=f"delete_secret_q_{q.id}")
+        builder.button(text=f"🗑️ {admin_label('secret_test_question', q, 'text')[:45]}...", callback_data=f"delete_secret_q_{q.id}")
 
     builder.button(text="➕ Добавить вопрос", callback_data="add_secret_question")
     builder.button(text="⬅️ Назад", callback_data="admin_test_menu")
@@ -682,7 +695,7 @@ async def content_management_keyboard():
         content_items = result.scalars().all()
 
     for item in content_items:
-        builder.button(text=f"✏️ {item.button_title}", callback_data=f"edit_content_{item.key}")
+        builder.button(text=f"✏️ {admin_label('content', item, 'button_title')}"[:64], callback_data=f"edit_content_{item.key}")
 
     builder.button(text="⬅️ Назад", callback_data="admin_panel")
     builder.adjust(1)
@@ -868,6 +881,8 @@ def select_topic_keyboard(topics: list, current_topic_id: int | None, locale: st
             fallback=topic.name,
             source=topic.name,
         )
+        if not topic_name:
+            continue
         text = f"✅ {topic_name}" if topic.id == current_topic_id else topic_name
         builder.button(text=text, callback_data=f"select_topic_{topic.id}")
     builder.adjust(1)
@@ -891,7 +906,7 @@ def topics_admin_list_keyboard(topics: list, page: int, total_pages: int, config
     for topic in topics:
         status = "🔒" if getattr(topic, 'admin_only', False) else ("🟢" if topic.is_active else "⚪️")
         builder.row(
-            InlineKeyboardButton(text=f"{status} {topic.name}", callback_data=f"edit_topic_{topic.id}"),
+            InlineKeyboardButton(text=f"{status} {admin_label('topic', topic, 'name')}"[:64], callback_data=f"edit_topic_{topic.id}"),
             InlineKeyboardButton(text="⬆️", callback_data=f"move_topic_up_{topic.id}_{page}"),
             InlineKeyboardButton(text="⬇️", callback_data=f"move_topic_down_{topic.id}_{page}")
         )
@@ -912,7 +927,7 @@ def topics_admin_list_keyboard(topics: list, page: int, total_pages: int, config
     builder.row(InlineKeyboardButton(text=f"Темы диалогов: {status_text}", callback_data="admin_toggle_topics"))
     topics_pos = "⬆️ Сверху" if config.topics_btn_on_top else "⬇️ В списке"
     builder.row(InlineKeyboardButton(text=f"Кнопка тем: {topics_pos}", callback_data="admin_toggle_topics_on_top"))
-    builder.row(InlineKeyboardButton(text=f"Название кнопки тем: {config.topics_btn_name}",
+    builder.row(InlineKeyboardButton(text=f"Название кнопки тем: {admin_label('subscription_config', config, 'topics_btn_name')}"[:64],
                                      callback_data="admin_rename_topics_btn"))
     builder.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel"))
     return builder.as_markup()
@@ -1084,6 +1099,8 @@ def plan_selection_keyboard(
     for plan in plans:
         price = plan.price
         text = _localized_plan_name(plan, locale)
+        if not text:
+            continue
 
         duration_unit_text = _localized_duration_unit(plan, locale)
         text += f" ({plan.duration_value} {duration_unit_text})"
@@ -1172,6 +1189,8 @@ def promo_plan_selection_keyboard(
     for plan in plans:
         price = plan.price
         text = _localized_plan_name(plan, locale)
+        if not text:
+            continue
 
         duration_unit_text = _localized_duration_unit(plan, locale)
         text += f" ({plan.duration_value} {duration_unit_text})"
@@ -1285,10 +1304,10 @@ def admin_plans_keyboard(plans: list):
         status = "🔒" if getattr(plan, 'admin_only', False) else ("🟢" if plan.is_active else "⚪️")
 
         duration_unit_text = "дн." if plan.duration_unit == 'days' else "мес."
-        plan_text = f"{plan.name} ({plan.duration_value} {duration_unit_text}) ({plan.price} руб)"
+        plan_text = f"{admin_label('plan', plan, 'name')} ({plan.duration_value} {duration_unit_text}) ({plan.price} руб)"
 
         if plan.is_trial and plan.upgrades_to_plan:
-            plan_text += f" ➡️ «{plan.upgrades_to_plan.name}»"
+            plan_text += f" ➡️ «{admin_label('plan', plan.upgrades_to_plan, 'name')}»"
 
         builder.button(text=f"{status} {plan_text}", callback_data=f"admin_edit_plan_{plan.id}")
     builder.button(text="➕ Создать новый тариф", callback_data="admin_create_plan")
@@ -1330,7 +1349,7 @@ def admin_edit_plan_keyboard(plan_id: int, is_active: bool, is_trial: bool, allo
 def admin_select_upgrade_plan_keyboard(plans: list, current_plan_id: int):
     builder = InlineKeyboardBuilder()
     for plan in plans:
-        builder.button(text=f"{plan.name} ({plan.price} руб)", callback_data=f"set_upgrade_plan_{plan.id}")
+        builder.button(text=f"{admin_label('plan', plan, 'name')} ({plan.price} руб)"[:64], callback_data=f"set_upgrade_plan_{plan.id}")
     builder.adjust(1)
     builder.row(InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"cancel_state_admin_edit_plan_{current_plan_id}"))
     return builder.as_markup()
@@ -1582,7 +1601,7 @@ def assign_promo_to_plan_keyboard(promo_id: int, all_plans: list, assigned_plan_
     if not applies_to_all:
         for plan in all_plans:
             is_assigned = plan.id in assigned_plan_ids
-            text = f"✅ {plan.name}" if is_assigned else f"⭕️ {plan.name}"
+            text = f"{'✅' if is_assigned else '⭕️'} {admin_label('plan', plan, 'name')}"[:64]
             action = "remove" if is_assigned else "add"
             callback_data = f"promo_plan_toggle_{action}_{promo_id}_{plan.id}_{page}"
             builder.button(text=text, callback_data=callback_data)
@@ -1625,7 +1644,8 @@ def universal_test_answer_keyboard(
     builder = InlineKeyboardBuilder()
     for index, option in enumerate(options):
         label = getattr(option, "button_text", None) or getattr(option, "text", str(option))
-        builder.button(text=label, callback_data=answer_callback_data(question_index, index))
+        callback_id = getattr(option, "callback_id", None)
+        builder.button(text=label, callback_data=answer_callback_data(question_index, callback_id if callback_id is not None else index))
     if horizontal and options:
         row_width = min(len(options), 8)
         builder.adjust(row_width)
@@ -2046,11 +2066,11 @@ def admin_referral_settings_keyboard(config):
     builder.button(text=first_only_label, callback_data="admin_referral_toggle_pay_first_only")
 
     builder.button(
-        text=f"🔤 Кнопка меню: «{config.referral_btn_name}»",
+        text=f"🔤 Кнопка меню: «{admin_label('subscription_config', config, 'referral_btn_name')}»"[:64],
         callback_data="admin_referral_set_btn_name"
     )
     builder.button(
-        text=f"🔤 Кнопка подписки: «{config.referral_sub_btn_name}»",
+        text=f"🔤 Кнопка подписки: «{admin_label('subscription_config', config, 'referral_sub_btn_name')}»"[:64],
         callback_data="admin_referral_set_sub_btn_name"
     )
 
@@ -2123,7 +2143,7 @@ def admin_referral_templates_keyboard(templates: list):
     """Список шаблонов приглашений для администратора."""
     builder = InlineKeyboardBuilder()
     for tpl in templates:
-        short_text = tpl.text[:40].replace('\n', ' ')
+        short_text = admin_label('referral_template', tpl, 'text')[:40].replace('\n', ' ')
         status = "✅" if tpl.is_enabled else "❌"
         builder.button(
             text=f"{status} {tpl.order_num + 1}. {short_text}…",

@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 import asyncio
 from typing import Any
+from content_locales import is_admin_content_key
 
 
 SUPPORTED_TELEGRAM_LOCALES = ("ru", "en", "pt")
@@ -35,10 +36,12 @@ class TranslationSnapshot:
         requested_locale = normalize_locale(locale) or "ru"
         default = normalize_default_language(default_locale)
         if requested_locale == "ru":
-            return source
+            return source or None
         exact = self.translations.get((requested_locale, translation_key))
         if exact:
             return exact
+        if is_admin_content_key(translation_key):
+            return source or None
         if default not in {"ru", requested_locale}:
             default_text = self.translations.get((default, translation_key))
             if default_text:
@@ -139,12 +142,26 @@ async def _install_translation_snapshot(
             and key in sources
             and isinstance(text, str)
             and text != ""
-            and stored_hash == source_hash(sources[key])
+            and (is_admin_content_key(key) or stored_hash == source_hash(sources[key]))
+            and (not is_admin_content_key(key) or dynamic_translation_safe(sources[key], text))
         )
     }
     translation_cache.install(revision, sources, translations)
     _cache_last_refresh_monotonic = now
     return translation_cache.snapshot
+
+
+def dynamic_translation_safe(source: str, translated: str) -> bool:
+    from translation_registry import _validate_telegram_html_value, embedded_target_signature
+    try:
+        _validate_telegram_html_value(translated)
+        if source:
+            validate_translation_format(source, translated)
+            if embedded_target_signature(source) != embedded_target_signature(translated):
+                return False
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def translate(
@@ -161,14 +178,14 @@ def translate(
     return value if value is not None else fallback
 
 
-async def refresh_translation_cache(session_maker) -> TranslationSnapshot:
+async def refresh_translation_cache(session_maker, *, force: bool = False) -> TranslationSnapshot:
     from translation_registry import build_translation_registry
     from translation_pack_manager import translation_coordination_lock
 
     global _cache_last_refresh_monotonic
     now = time.monotonic()
     if (
-        translation_cache.snapshot.sources
+        not force and translation_cache.snapshot.sources
         and now - _cache_last_refresh_monotonic < _CACHE_REFRESH_INTERVAL_SECONDS
     ):
         return translation_cache.snapshot
@@ -176,7 +193,7 @@ async def refresh_translation_cache(session_maker) -> TranslationSnapshot:
     async with _cache_refresh_lock:
         now = time.monotonic()
         if (
-            translation_cache.snapshot.sources
+            not force and translation_cache.snapshot.sources
             and now - _cache_last_refresh_monotonic < _CACHE_REFRESH_INTERVAL_SECONDS
         ):
             return translation_cache.snapshot

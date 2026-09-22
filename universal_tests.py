@@ -18,6 +18,9 @@ class AnswerOption:
     text: str
     value: float | None = None
     button_text: str | None = None
+    identity: str | None = None
+    translation_slot: str | None = None
+    callback_id: int | None = None
 
 
 def is_truthy(value: Any) -> bool:
@@ -60,7 +63,7 @@ def get_answer_options(question: Any) -> list[AnswerOption]:
     raw_options = json_loads(getattr(question, "answer_options_json", None), [])
     options: list[AnswerOption] = []
     if isinstance(raw_options, list):
-        for item in raw_options:
+        for index, item in enumerate(raw_options):
             if isinstance(item, dict):
                 text = str(item.get("text") or item.get("label") or "").strip()
                 value = _to_float_or_none(item.get("value"))
@@ -69,12 +72,17 @@ def get_answer_options(question: Any) -> list[AnswerOption]:
                 text = str(item).strip()
                 value = _to_float_or_none(item)
                 button_text = None
-            if text:
-                options.append(AnswerOption(text=text, value=value, button_text=button_text))
+            if text or (isinstance(item, dict) and item.get("identity")):
+                options.append(AnswerOption(
+                    text=text, value=value, button_text=button_text,
+                    identity=item.get("identity") if isinstance(item, dict) else None,
+                    translation_slot=str(item.get("translation_slot", len(options))) if isinstance(item, dict) else str(len(options)),
+                    callback_id=int(item.get("callback_id", len(options))) if isinstance(item, dict) else len(options),
+                ))
     if options:
         return options
     if is_legacy_scale_question(question):
-        return [AnswerOption(str(i), float(i)) for i in range(1, 6)]
+        return [AnswerOption(str(i), float(i), translation_slot=str(i - 1), callback_id=i - 1) for i in range(1, 6)]
     return []
 
 
@@ -183,9 +191,9 @@ def make_answer_record(question: Any, question_index: int, answer_text: str, num
 def make_option_answer_record(question: Any, question_index: int, callback_payload: str) -> dict[str, Any]:
     option_index = parse_answer_callback(callback_payload, question_index)
     options = get_answer_options(question)
-    if option_index < 0 or option_index >= len(options):
+    option = next((option for index, option in enumerate(options) if (option.callback_id if option.callback_id is not None else index) == option_index), None)
+    if option is None:
         raise ValueError("Такого варианта ответа нет.")
-    option = options[option_index]
     return make_answer_record(question, question_index, option.text, option.value)
 
 

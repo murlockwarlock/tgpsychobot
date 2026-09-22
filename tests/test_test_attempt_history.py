@@ -404,6 +404,7 @@ class TestAttemptHistoryTests(unittest.IsolatedAsyncioTestCase):
                     assert message_count == 1
                     assert attempt.report_text == "legacy report"
                     assert attempt.formula_results_json == '{"total":5}'
+                await engine.dispose()
 
             asyncio.run(main())
         """)

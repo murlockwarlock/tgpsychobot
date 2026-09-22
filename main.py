@@ -13,6 +13,9 @@ from aiogram.client.default import DefaultBotProperties
 from config import BOT_TOKEN, OWNER_IDS
 from handlers import router
 from automation_admin import router as automation_admin_router
+from admin_content_authoring import router as content_authoring_router
+from admin_authoring_context import AdminAuthoringMiddleware, admin_language_request
+from content_runtime import ContentRuntimeMiddleware
 from database import async_session_maker, init_db
 from background_worker import process_queue, process_mailings
 from scheduler import check_subscriptions, check_kie_credit_balance
@@ -361,14 +364,21 @@ def main():
         default=DefaultBotProperties(parse_mode="HTML"),
     )
     storage = MemoryStorage()
+    bot.session.middleware(admin_language_request)
     dp = Dispatcher(storage=storage)
 
     activity_middleware = FollowupActivityMiddleware()
+    dp.message.outer_middleware(ContentRuntimeMiddleware())
+    dp.callback_query.outer_middleware(ContentRuntimeMiddleware())
     dp.message.outer_middleware(activity_middleware)
     dp.callback_query.outer_middleware(activity_middleware)
 
     # FSM messages from automation settings must be routed before the general
     # dialogue handler.
+    dp.include_router(content_authoring_router)
+    for admin_router in (automation_admin_router, router):
+        admin_router.message.middleware(AdminAuthoringMiddleware())
+        admin_router.callback_query.middleware(AdminAuthoringMiddleware())
     dp.include_router(automation_admin_router)
     dp.include_router(router)
 

@@ -10,6 +10,7 @@ from ..api import MaxApiClient
 from ..formatting import markdown_to_html
 from ..keyboards import case_study_keyboard, final_test_keyboard, response_buttons_keyboard, secret_test_keyboard, universal_test_answers_keyboard
 from ..legacy import CaseStudy, Content, Message as DBMessage, SecretTestQuestion, TestConfig, TestQuestion, TestSession, User, async_session_maker
+from test_content_identity import question_snapshot, questions_for_session
 from ..logging_utils import get_ai_logger, get_bot_logger
 from ..storage import StateStore
 from ai_request_builder import get_user_ai_activity_gaps
@@ -92,6 +93,7 @@ def _build_test_diagram(questions: list[TestQuestion], answers: list[int]) -> tu
 
 
 def _pick_relevant_case(case_studies: list[CaseStudy], ranking: list[tuple[str, float]]) -> CaseStudy | None:
+    case_studies = [case for case in case_studies if case.text and case.text.strip()]
     if not case_studies:
         return None
     weakest_categories = [item[0] for item in ranking[:3]]
@@ -178,7 +180,7 @@ async def start_test(client: MaxApiClient, chat_id: int, user_id: int, states: S
             await client.send_message(chat_id=chat_id, text="Тестирование сейчас отключено.")
             return
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
-        if not questions:
+        if not questions or any(not question.text or any(not option.text for option in get_answer_options(question)) for question in questions):
             log.warning("Test start requested without questions user_id=%s chat_id=%s", user_id, chat_id)
             await client.send_message(chat_id=chat_id, text="Вопросы теста не загружены.")
             return
@@ -187,6 +189,7 @@ async def start_test(client: MaxApiClient, chat_id: int, user_id: int, states: S
             user_id=user_id,
             current_question_index=0,
             answers="[]",
+            question_snapshot=question_snapshot(questions),
             invocation_topic_id=user.current_topic_id if user else None,
             invocation_dialogue_id=user.current_dialogue_id if user else 1,
             invocation_platform="max",
@@ -200,6 +203,8 @@ async def start_test(client: MaxApiClient, chat_id: int, user_id: int, states: S
 async def _send_question(client: MaxApiClient, chat_id: int, user_id: int, index: int) -> None:
     async with async_session_maker() as session:
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        test_session = await session.get(TestSession, user_id)
+        questions = questions_for_session(test_session, questions)
         config = await session.get(TestConfig, 1)
     question = questions[index]
     options = get_answer_options(question)
@@ -215,6 +220,7 @@ async def process_answer(client: MaxApiClient, chat_id: int, user_id: int, answe
             await client.send_message(chat_id=chat_id, text="Сессия теста не найдена.")
             return
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        questions = questions_for_session(test_session, questions)
         question_index = test_session.current_question_index
         if question_index >= len(questions):
             await client.send_message(chat_id=chat_id, text="Вопросы теста уже закончились.")
@@ -256,6 +262,7 @@ async def process_text_answer(client: MaxApiClient, states: StateStore, chat_id:
             await client.send_message(chat_id=chat_id, text="Сессия теста не найдена.")
             return
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
+        questions = questions_for_session(test_session, questions)
         question_index = test_session.current_question_index
         if question_index >= len(questions):
             await _finish_universal_test(client, chat_id, user_id, states)
@@ -286,6 +293,7 @@ async def _finish_universal_test(client: MaxApiClient, chat_id: int, user_id: in
         test_config = await session.get(TestConfig, 1)
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
         answers = parse_answers(test_session.answers if test_session else "[]")
+        questions = questions_for_session(test_session, questions)
         formulas = json_loads(test_config.formulas_json, []) if test_config and test_config.formulas_enabled else []
         try:
             formula_results = calculate_formulas(answers, formulas) if formulas else {}
@@ -403,6 +411,7 @@ async def show_results(client: MaxApiClient, chat_id: int, user_id: int) -> None
         content = await session.get(Content, "test_results")
         questions = (await session.execute(select(TestQuestion).order_by(TestQuestion.sort_order.asc()))).scalars().all()
         case_studies = (await session.execute(select(CaseStudy).order_by(CaseStudy.id.desc()))).scalars().all()
+        questions = questions_for_session(test_session, questions)
         user = await session.get(User, user_id)
     if content and content.text_content:
         await client.send_message(chat_id=chat_id, text=content.text_content)

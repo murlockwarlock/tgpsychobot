@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from content_authoring import admin_value
 from datetime import datetime
 
 from aiogram import BaseMiddleware, Bot, F, Router
@@ -1064,6 +1065,8 @@ async def automation_action_view(callback: CallbackQuery):
         rec_id = action.recipient_user_id
         tpl = action.message_template
         meta = action.metadata_json
+        if act_type == "send_message" and "admin" not in (rec_type or ""):
+            tpl = await admin_value(session, "automation_action", action, "message_template", label=True)
 
     if act_type == "save_metadata":
         type_str = "Сохранение метаданных"
@@ -1081,6 +1084,8 @@ async def automation_action_view(callback: CallbackQuery):
 
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить значение/шаблон", callback_data=f"automation_action_edit_{handler_id}_{action_id}")
+    if act_type == "send_message" and "admin" not in (rec_type or ""):
+        builder.button(text="Текст сообщения", callback_data=f"ca:view:automation_action:{action_id}")
     builder.button(text="🗑 Удалить действие", callback_data=f"automation_action_delete_{handler_id}_{action_id}")
     builder.row(_back(f"automation_actions_{handler_id}"))
     builder.adjust(1)
@@ -1104,6 +1109,8 @@ async def automation_action_edit(callback: CallbackQuery, state: FSMContext):
         rec_id = action.recipient_user_id
         tpl = action.message_template
         meta = action.metadata_json
+        if act_type == "send_message" and "admin" not in (rec_type or ""):
+            tpl = await admin_value(session, "automation_action", action, "message_template", label=True)
 
     await state.set_state(AutomationAdminStates.action_edit_value)
     await state.update_data(
@@ -2025,8 +2032,11 @@ async def _followup_self_test_snapshot(
         reason = "manual_test_completed"
     elif step.message_type not in {"static", "ai"}:
         reason = "step_invalid"
-    elif step.message_type == "static" and not (step.message_text or "").strip():
-        reason = "step_invalid"
+    elif step.message_type == "static":
+        from translation_service import resolve_user_effective_locale, translate
+        locale = await resolve_user_effective_locale(session, user or test_user_id)
+        text = translate(f"followup_step.{step.id}.message_text", locale, source=step.message_text or "", fallback=step.message_text or "")
+        reason = "eligible" if text and text.strip() else "step_invalid"
     else:
         reason = "eligible"
     snapshot.update({
@@ -2353,9 +2363,14 @@ async def _show_followup_step_detail(
     kind = "AI" if step.message_type == "ai" else "static"
     content_label = "Инструкция" if step.message_type == "ai" else "Текст"
     content = (step.ai_instruction if step.message_type == "ai" else step.message_text) or "не задано"
+    if step.message_type == "static":
+        async with async_session_maker() as session:
+            content = await admin_value(session, "followup_step", step, "message_text", label=True)
     content = content[:3000] + ("…" if len(content) > 3000 else "")
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Редактировать", callback_data=f"followup_step_edit_{campaign_id}_{step_id}")
+    if step.message_type == "static":
+        builder.button(text="Текст сообщения", callback_data=f"ca:view:followup_step:{step_id}")
     builder.button(text="🗑 Удалить", callback_data=f"followup_step_delete_{campaign_id}_{step_id}")
     builder.row(_back(f"followup_steps_{campaign_id}"))
     builder.adjust(1)

@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from response_buttons import extract_response_buttons
 from translation_service import format_signature, source_hash, validate_translation_format
+from content_locales import is_admin_content_key
 
 
 TELEGRAM_MESSAGE_TEXT_LIMIT = 4096
@@ -23,6 +24,10 @@ class TranslationSource:
     source: str
     required: bool = True
     kind: str = "text"
+
+    @property
+    def domain(self) -> str:
+        return "admin_content" if is_admin_content_key(self.translation_key) else "system"
 
     @property
     def source_hash(self) -> str:
@@ -412,6 +417,9 @@ class TranslationRegistry:
             key for key in self.keys() if self._sources[key].required
         )
 
+    def system(self) -> TranslationRegistry:
+        return TranslationRegistry([source for source in self._sources.values() if source.domain == "system"])
+
 
 def validate_translation_value(source: TranslationSource, translated: str) -> None:
     validate_translation_format(source.source, translated)
@@ -494,8 +502,7 @@ def validate_telegram_html(source: str, translated: str) -> None:
 
 
 def _add_source(sources: list[TranslationSource], key: str, value, *, kind="text", required=True):
-    if isinstance(value, str) and value:
-        sources.append(TranslationSource(key, value, required=required, kind=kind))
+    sources.append(TranslationSource(key, value if isinstance(value, str) else "", required=required, kind=kind))
 
 
 def _decode_ai_processing_text(value: str | None) -> str:
@@ -531,9 +538,11 @@ async def build_translation_registry(session) -> TranslationRegistry:
         AutomationHandler,
         BotGeneralConfig,
         Content,
+        CaseStudy,
         FollowupCampaign,
         FollowupStep,
         Mailing,
+        MediaLibrary,
         ReferralTemplate,
         SecretTestQuestion,
         SubscriptionConfig,
@@ -640,6 +649,8 @@ async def build_translation_registry(session) -> TranslationRegistry:
     ).all()
     for item, handler in action_rows:
         recipient_type = str(item.recipient_type or "").lower()
+        if item.action_type != "send_message" or "admin" in recipient_type:
+            continue
         required = bool(
             handler.is_active
             and item.action_type == "send_message"
@@ -652,11 +663,17 @@ async def build_translation_registry(session) -> TranslationRegistry:
         _add_source(sources, f"test_question.{item.id}.text", item.text, kind="html", required=test_enabled)
         _add_source(sources, f"test_question.{item.id}.comment", item.comment, kind="html", required=test_enabled)
         for index, option in enumerate(get_answer_options(item)):
-            _add_source(sources, f"test_question.{item.id}.option.{index}.text", option.text, required=test_enabled)
-            _add_source(sources, f"test_question.{item.id}.option.{index}.button_text", option.button_text, kind="inline_button", required=test_enabled)
+            slot = option.translation_slot if option.translation_slot is not None else str(index)
+            _add_source(sources, f"test_question.{item.id}.option.{slot}.text", option.text, required=test_enabled)
+            _add_source(sources, f"test_question.{item.id}.option.{slot}.button_text", option.button_text, kind="inline_button", required=False)
 
     secret_rows = (await session.execute(select(SecretTestQuestion))).scalars().all()
     for item in secret_rows:
         _add_source(sources, f"secret_test_question.{item.id}.text", item.text, kind="html", required=secret_test_enabled)
+
+    for item in (await session.execute(select(MediaLibrary))).scalars():
+        _add_source(sources, f"media_library.{item.id}.description", item.description, kind="caption", required=False)
+    for item in (await session.execute(select(CaseStudy))).scalars():
+        _add_source(sources, f"case_study.{item.id}.text", item.text, required=False)
 
     return TranslationRegistry(sources)

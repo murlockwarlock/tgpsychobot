@@ -97,6 +97,7 @@ async def build_main_menu(user_id: int | None = None) -> list[dict]:
     for index in range(0, len(content_items), 2):
         rows.append([message_button(item.button_title) for item in content_items[index:index + 2] if item.button_title])
 
+    topics = [topic for topic in topics if topic.name]
     for index in range(0, len(topics), 2):
         rows.append([message_button(item.name) for item in topics[index:index + 2]])
 
@@ -179,6 +180,8 @@ def disclaimer_keyboard() -> list[dict]:
 def topics_keyboard(topics: Iterable, current_topic_id: int | None) -> list[dict]:
     rows: list[list[dict]] = []
     for topic in topics:
+        if not topic.name:
+            continue
         text = f"✅ {topic.name}" if topic.id == current_topic_id else topic.name
         rows.append([callback_button(text, f"select_topic_{topic.id}")])
     rows.append([callback_button("🏠 Перейти в основной диалог", "reset_topic")])
@@ -221,6 +224,8 @@ def retry_subscription_keyboard() -> list[dict]:
 def plans_keyboard(plans: Iterable[SubscriptionPlan], discount_percent: int, user_promos: list) -> list[dict]:
     rows: list[list[dict]] = []
     for plan in plans:
+        if not plan.name:
+            continue
         price = plan.price
         plan_discount = discount_percent
         specific = next(
@@ -269,7 +274,7 @@ def universal_test_answers_keyboard(options, horizontal: bool = False, question_
     buttons = [
         callback_button(
             getattr(option, "button_text", None) or getattr(option, "text", str(option)),
-            answer_callback_data(question_index, index),
+            answer_callback_data(question_index, option.callback_id if getattr(option, "callback_id", None) is not None else index),
         )
         for index, option in enumerate(options)
     ]

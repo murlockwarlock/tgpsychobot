@@ -4,7 +4,7 @@ import textwrap
 from sqlalchemy import (create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, BigInteger, Table,
                         Float, Interval, Index, UniqueConstraint, func, text)
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession as SQLAlchemyAsyncSession
 from datetime import datetime, timedelta
 from config import DATABASE_URL
 from memory_mode import MEMORY_MODE_RESET, MEMORY_MODE_TOPIC, get_memory_mode
@@ -12,6 +12,46 @@ from prompt_blocks import DEFAULT_SERVICE_PROMPT_TEMPLATE, DEFAULT_SHARED_PROMPT
 from provider_models import DEEPSEEK_DEFAULT_MODEL
 
 _engine_options = {"echo": False, "pool_pre_ping": True}
+
+
+class AsyncSession(SQLAlchemyAsyncSession):
+    def __init__(self, *args, **kwargs):
+        from admin_authoring_context import content_editing_locale
+        if content_editing_locale.get() not in {None, "ru"}:
+            kwargs["autoflush"] = False
+        super().__init__(*args, **kwargs)
+
+    async def flush(self, objects=None):
+        from admin_authoring_context import content_editing_locale
+        if content_editing_locale.get() not in {None, "ru"} and not self.info.get("authoring_flush"):
+            from content_authoring import localize_legacy_mutations
+            self.info["authoring_flush"] = True
+            try:
+                await localize_legacy_mutations(self)
+            finally:
+                self.info.pop("authoring_flush", None)
+        await super().flush(objects)
+
+    async def commit(self):
+        from admin_authoring_context import content_editing_locale
+        from content_authoring import RESOURCES, bump_revision
+        from sqlalchemy import inspect
+        if not self.info.get("authoring_revision_bumped"):
+            for resource in tuple(self.new) + tuple(self.dirty) + tuple(self.deleted):
+                spec = next((spec for spec in RESOURCES.values() if isinstance(resource, spec.model)), None)
+                if spec and (resource in self.new or resource in self.deleted or any(inspect(resource).attrs[field].history.has_changes() for field, _, _ in spec.fields)):
+                    await bump_revision(self)
+                    break
+        if content_editing_locale.get() not in {None, "ru"}:
+            from translation_pack_manager import translation_coordination_lock
+            async with translation_coordination_lock(self):
+                await self.flush()
+                await super().commit()
+            self.info.pop("authoring_revision_bumped", None)
+            return
+        await super().commit()
+        self.info.pop("authoring_revision_bumped", None)
+
 if not DATABASE_URL.startswith("sqlite"):
     _engine_options.update(pool_recycle=1800, pool_use_lifo=True)
 engine = create_async_engine(DATABASE_URL, **_engine_options)
@@ -498,6 +538,7 @@ class TestSession(Base):
     user_id = Column(BigInteger, ForeignKey('users.id'), primary_key=True)
     current_question_index = Column(Integer, default=0)
     answers = Column(Text, default="[]")
+    question_snapshot = Column(Text, nullable=True)
     formula_results = Column(Text, nullable=True)
     invocation_topic_id = Column(Integer, nullable=True)
     invocation_dialogue_id = Column(Integer, nullable=True)
@@ -623,6 +664,28 @@ class BotTranslation(Base):
     source_hash = Column(String(64), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class AdminContentPreference(Base):
+    __tablename__ = 'admin_content_preferences'
+    bot_id = Column(BigInteger, primary_key=True)
+    admin_id = Column(BigInteger, primary_key=True)
+    content_locale = Column(String(8), nullable=False, default='ru')
+
+
+class ContentIdentityCounter(Base):
+    __tablename__ = 'content_identity_counters'
+    namespace = Column(String(255), primary_key=True)
+    next_id = Column(Integer, nullable=False, default=0)
+
+
+class UserMenuBinding(Base):
+    __tablename__ = 'user_menu_bindings'
+    user_id = Column(BigInteger, primary_key=True)
+    label = Column(String(255), primary_key=True)
+    resource_kind = Column(String(32), nullable=False)
+    resource_id = Column(String(255), nullable=False)
+    ambiguous = Column(Boolean, nullable=False, default=False)
 
 
 DEFAULT_AI_PROCESSING_MESSAGE_TEXT = "Думаю..."
@@ -960,12 +1023,9 @@ def verify_yookassa_recurring_safety_schema(sync_conn) -> None:
             raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is missing in SQLite")
         sql_def = row[0]
     elif dialect_name == "postgresql":
-        row = sync_conn.execute(text(
-            "SELECT indexdef FROM pg_indexes WHERE tablename = 'yookassa_recurring_attempts' AND indexname = 'idx_unresolved_yookassa_attempt'"
-        )).first()
-        if not row or not row[0]:
-            raise RuntimeError("Critical index idx_unresolved_yookassa_attempt is missing in PostgreSQL")
-        sql_def = row[0]
+        from payment_index_validation import read_postgres_unresolved_index, validate_postgres_unresolved_index
+        validate_postgres_unresolved_index(read_postgres_unresolved_index(sync_conn))
+        return
     else:
         indexes = insp.get_indexes('yookassa_recurring_attempts')
         idx_info = next((i for i in indexes if i['name'] == 'idx_unresolved_yookassa_attempt'), None)
@@ -1382,6 +1442,8 @@ async def init_db():
             ))
 
             test_question_columns = [c['name'] for c in insp.get_columns('test_questions')]
+            if 'question_snapshot' not in [c['name'] for c in insp.get_columns('test_sessions')]:
+                sync_conn.execute(text("ALTER TABLE test_sessions ADD COLUMN question_snapshot TEXT"))
             if 'comment' not in test_question_columns:
                 sync_conn.execute(text("ALTER TABLE test_questions ADD COLUMN comment TEXT"))
             if 'variable_name' not in test_question_columns:
