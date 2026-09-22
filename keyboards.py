@@ -467,6 +467,16 @@ def ai_settings_keyboard(current_provider: str):
     return builder.as_markup()
 
 
+def deepseek_thinking_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="По умолчанию", callback_data="set_deepseek_thinking_default")
+    builder.button(text="Включён", callback_data="set_deepseek_thinking_on")
+    builder.button(text="Выключен", callback_data="set_deepseek_thinking_off")
+    builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def mask_api_key(value: str | None) -> str:
     if not value:
         return "Не задан"
@@ -531,8 +541,12 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
         )
         builder.button(text=f"📏 Макс. ответа: {token_value}", callback_data="set_max_output_tokens")
         if canonical_provider_name(current_provider) == PROVIDER_DEEPSEEK:
-            thinking_label = "Включён" if bool(deepseek_thinking_enabled) else "Выключен"
-            builder.button(text=f"🧠 Thinking: {thinking_label}", callback_data="toggle_deepseek_thinking")
+            thinking_label = (
+                "По умолчанию"
+                if deepseek_thinking_enabled is None
+                else "Включён" if deepseek_thinking_enabled else "Выключен"
+            )
+            builder.button(text=f"🧠 Thinking DeepSeek: {thinking_label}", callback_data="toggle_deepseek_thinking")
     builder.button(
         text=f"🧠 Память: {memory_mode_label(memory_mode)}",
         callback_data="toggle_preserve_topic_context"

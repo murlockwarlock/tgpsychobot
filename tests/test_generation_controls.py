@@ -102,11 +102,28 @@ def test_admin_exposes_deepseek_thinking_only_for_deepseek():
     )
     deepseek_markup = keyboards.ai_keys_models_keyboard(current_provider="Deepseek", **common)
     deepseek_labels = [button.text for row in deepseek_markup.inline_keyboard for button in row]
-    assert any("Thinking: Включён" in label for label in deepseek_labels)
+    assert any("Thinking DeepSeek: Включён" in label for label in deepseek_labels)
     assert any("По умолчанию" in label for label in deepseek_labels)
+    common["deepseek_thinking_enabled"] = None
+    default_markup = keyboards.ai_keys_models_keyboard(current_provider="Deepseek", **common)
+    default_labels = [button.text for row in default_markup.inline_keyboard for button in row]
+    assert any("Thinking DeepSeek: По умолчанию" in label for label in default_labels)
+    common["deepseek_thinking_enabled"] = False
+    disabled_markup = keyboards.ai_keys_models_keyboard(current_provider="Deepseek", **common)
+    disabled_labels = [button.text for row in disabled_markup.inline_keyboard for button in row]
+    assert any("Thinking DeepSeek: Выключен" in label for label in disabled_labels)
     openai_markup = keyboards.ai_keys_models_keyboard(current_provider="OpenAI", **common)
     openai_labels = [button.text for row in openai_markup.inline_keyboard for button in row]
     assert not any("Thinking" in label for label in openai_labels)
+    choice_markup = keyboards.deepseek_thinking_keyboard()
+    choices = {
+        button.text: button.callback_data
+        for row in choice_markup.inline_keyboard
+        for button in row
+    }
+    assert choices["По умолчанию"] == "set_deepseek_thinking_default"
+    assert choices["Включён"] == "set_deepseek_thinking_on"
+    assert choices["Выключен"] == "set_deepseek_thinking_off"
 
 
 @pytest.mark.asyncio
@@ -140,6 +157,32 @@ async def test_deepseek_thinking_and_custom_budget_are_per_config(generation_db)
     with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=create):
         assert await ai_integration.generate_response(101, "Проверка 2") == "ok"
     assert captured[0]["max_tokens"] == DEEPSEEK_CHAT_MAX_TOKENS
+    assert captured[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.asyncio
+async def test_deepseek_default_is_distinct_from_explicit_disabled(generation_db):
+    sessions = generation_db
+    captured = []
+
+    async def create(**kwargs):
+        captured.append(kwargs)
+        return _Completion()
+
+    with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=create):
+        assert await ai_integration.generate_response(101, "Проверка default") == "ok"
+
+    assert "extra_body" not in captured[0]
+
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        config.deepseek_thinking_enabled = False
+        await session.commit()
+
+    captured.clear()
+    with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=create):
+        assert await ai_integration.generate_response(101, "Проверка disabled") == "ok"
+
     assert captured[0]["extra_body"] == {"thinking": {"type": "disabled"}}
 
 

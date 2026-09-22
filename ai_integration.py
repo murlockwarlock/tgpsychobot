@@ -1479,7 +1479,7 @@ async def _call_deepseek_api(
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
     max_output_tokens: int | None = None,
-    thinking_enabled: bool = False,
+    thinking_enabled: bool | None = None,
 ):
     client = None
     try:
@@ -1513,8 +1513,11 @@ async def _call_deepseek_api(
             "messages": build_openai_chat_messages(layout),
             "max_tokens": max_output_tokens or DEEPSEEK_CHAT_MAX_TOKENS,
             "temperature": temperature,
-            "extra_body": {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}},
         }
+        if thinking_enabled is True:
+            payload["extra_body"] = {"thinking": {"type": "enabled"}}
+        elif thinking_enabled is False:
+            payload["extra_body"] = {"thinking": {"type": "disabled"}}
         _capture_ai_request(
             request_capture,
             provider="Deepseek",
@@ -1956,9 +1959,9 @@ async def get_ai_response(
                 getattr(ai_config, "max_output_tokens", None),
             )
             thinking_enabled = (
-                bool(getattr(ai_config, "deepseek_thinking_enabled", False))
+                getattr(ai_config, "deepseek_thinking_enabled", None)
                 if str(p_key).lower() == "deepseek"
-                else False
+                else None
             )
 
             if not str(p_model).startswith(("primary-", "fallback-", "mock-", "test-", "dummy-", "gpt-5.6-turbo")) and not str(p_model).endswith(("-telegram", "-max")):

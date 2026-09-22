@@ -296,7 +296,7 @@ async def _call_deepseek(
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
     max_output_tokens: int | None = None,
-    thinking_enabled: bool = False,
+    thinking_enabled: bool | None = None,
 ) -> str:
     normalized_model = normalize_deepseek_model(model)
     ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
@@ -307,8 +307,11 @@ async def _call_deepseek(
         "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
         "max_tokens": max_output_tokens or DEEPSEEK_CHAT_MAX_TOKENS,
         "temperature": temperature,
-        "extra_body": {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}},
     }
+    if thinking_enabled is True:
+        payload["extra_body"] = {"thinking": {"type": "enabled"}}
+    elif thinking_enabled is False:
+        payload["extra_body"] = {"thinking": {"type": "disabled"}}
     _capture_ai_request(
         request_capture,
         provider="Deepseek",
@@ -1168,7 +1171,7 @@ async def _dispatch_provider(
         }.get(provider, None),
         getattr(ai_config, "max_output_tokens", None),
     )
-    thinking_enabled = bool(getattr(ai_config, "deepseek_thinking_enabled", False)) if provider == "deepseek" else False
+    thinking_enabled = getattr(ai_config, "deepseek_thinking_enabled", None) if provider == "deepseek" else None
 
     async def _invoke():
         if provider == "openai":
@@ -1557,7 +1560,7 @@ async def get_ai_response(
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                                 max_output_tokens=fb_tokens,
-                                thinking_enabled=bool(getattr(ai_config, "deepseek_thinking_enabled", False)),
+                                thinking_enabled=getattr(ai_config, "deepseek_thinking_enabled", None),
                             )
                         elif fb_key == "kie":
                             fb_tokens = effective_chat_output_tokens(

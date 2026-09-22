@@ -4888,7 +4888,7 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             if configured_output_tokens is None
             else f"{effective_output_tokens}"
         )
-        deepseek_thinking_enabled = bool(getattr(config, "deepseek_thinking_enabled", False))
+        deepseek_thinking_enabled = getattr(config, "deepseek_thinking_enabled", None)
 
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
         vis_provider = config.vision_provider
@@ -4933,7 +4933,7 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             f"▫️ {model_label}: <code>{model_name}</code>\n"
             f"▫️ Максимум ответа: <b>{output_tokens_label} токенов</b>\n"
             + (
-                f"▫️ Thinking DeepSeek: <b>{'включён' if deepseek_thinking_enabled else 'выключен'}</b>\n"
+                f"▫️ Thinking DeepSeek: <b>{'по умолчанию' if deepseek_thinking_enabled is None else 'включён' if deepseek_thinking_enabled else 'выключен'}</b>\n"
                 if canonical_provider_name(provider) == PROVIDER_DEEPSEEK
                 else ""
             )
@@ -5015,7 +5015,7 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     else:
         current_model = getattr(config, f"{str(current_provider).lower()}_model", None) if config else None
     max_output_tokens = getattr(config, 'max_output_tokens', None) if config else None
-    deepseek_thinking_enabled = bool(getattr(config, 'deepseek_thinking_enabled', False)) if config else False
+    deepseek_thinking_enabled = getattr(config, 'deepseek_thinking_enabled', None) if config else None
     memory_mode = get_memory_mode(config) if config else MEMORY_MODE_RESET
     fb_provider = getattr(config, 'fallback_provider', None) if config else None
     fb_model = getattr(config, 'fallback_model', None) if config else None
@@ -5071,16 +5071,44 @@ async def admin_ai_keys_models(callback: CallbackQuery):
 
 
 @router.callback_query(F.data == "toggle_deepseek_thinking")
-async def toggle_deepseek_thinking(callback: CallbackQuery):
+async def choose_deepseek_thinking(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    if not config or canonical_provider_name(config.provider) != PROVIDER_DEEPSEEK:
+        await callback.answer("Режим Thinking доступен только для DeepSeek.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🧠 <b>Thinking DeepSeek</b>\n\nВыберите режим:",
+        reply_markup=kb.deepseek_thinking_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({
+    "set_deepseek_thinking_default",
+    "set_deepseek_thinking_on",
+    "set_deepseek_thinking_off",
+}))
+async def set_deepseek_thinking(callback: CallbackQuery):
+    values = {
+        "set_deepseek_thinking_default": None,
+        "set_deepseek_thinking_on": True,
+        "set_deepseek_thinking_off": False,
+    }
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config or canonical_provider_name(config.provider) != PROVIDER_DEEPSEEK:
             await callback.answer("Режим Thinking доступен только для DeepSeek.", show_alert=True)
             return
-        config.deepseek_thinking_enabled = not bool(getattr(config, "deepseek_thinking_enabled", False))
-        enabled = bool(config.deepseek_thinking_enabled)
+        config.deepseek_thinking_enabled = values[callback.data]
         await session.commit()
-    await callback.answer(f"Thinking: {'включён' if enabled else 'выключен'}")
+    labels = {
+        None: "по умолчанию",
+        True: "включён",
+        False: "выключен",
+    }
+    await callback.answer(f"Thinking DeepSeek: {labels[values[callback.data]]}")
     await admin_ai_keys_models(callback)
 
 
@@ -17297,7 +17325,7 @@ async def process_audio_limit(message: Message, state: FSMContext, bot: Bot):
                         else getattr(config, f"{str(config.provider).lower()}_model", None) if config else None
                     ),
                     max_output_tokens=getattr(config, 'max_output_tokens', None) if config else None,
-                    deepseek_thinking_enabled=bool(getattr(config, 'deepseek_thinking_enabled', False)) if config else False,
+                    deepseek_thinking_enabled=getattr(config, 'deepseek_thinking_enabled', None) if config else None,
                 )
             )
         except TelegramBadRequest:
@@ -24029,7 +24057,7 @@ async def save_ai_timeout(message: Message, state: FSMContext):
                     else getattr(conf2, f"{str(conf2.provider).lower()}_model", None) if conf2 else None
                 ),
                 max_output_tokens=getattr(conf2, 'max_output_tokens', None) if conf2 else None,
-                deepseek_thinking_enabled=bool(getattr(conf2, 'deepseek_thinking_enabled', False)) if conf2 else False,
+                deepseek_thinking_enabled=getattr(conf2, 'deepseek_thinking_enabled', None) if conf2 else None,
             )
             await message.answer(text, reply_markup=kb)
             
