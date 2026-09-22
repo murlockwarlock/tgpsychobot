@@ -44,7 +44,7 @@ def test_openrouter_catalog_is_curated_and_capability_driven():
     assert len(OPENROUTER_MODELS) == 15
     assert set(get_selectable_models(PROVIDER_OPENROUTER)) == set(OPENROUTER_MODEL_SPECS)
     assert set(get_selectable_models(PROVIDER_OPENROUTER, "vision")) == set(OPENROUTER_VISION_MODELS)
-    assert "deepseek/deepseek-v3.2" not in OPENROUTER_VISION_MODELS
+    assert "deepseek/deepseek-v4.1-flash" in OPENROUTER_VISION_MODELS
     assert all(spec.text for spec in OPENROUTER_MODEL_SPECS.values())
     assert OPENROUTER_MODEL_SPECS["google/gemini-3.7-flash"].audio_input is True
     assert validate_model_selection(PROVIDER_OPENROUTER, "openai/gpt-5.6-terra") == "openai/gpt-5.6-terra"
@@ -67,13 +67,13 @@ def test_openrouter_text_payload_preserves_history_and_output_budget():
     assert payload["messages"][-1] == {"role": "user", "content": "Текущий вопрос"}
 
 
-def test_openrouter_vision_uses_data_uri_and_rejects_text_only_model():
+def test_openrouter_vision_uses_data_uri_and_rejects_unknown_model():
     vision = build_openrouter_vision_layout(layout(), b"image", mime_type="image/png", user_instruction="Что на фото?")
     content = vision.current_user_content
     assert content[0] == {"type": "text", "text": "Что на фото?"}
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
     with pytest.raises(ModelUnavailableError):
-        validate_model_selection(PROVIDER_OPENROUTER, "deepseek/deepseek-v3.2", channel="vision")
+        validate_model_selection(PROVIDER_OPENROUTER, "unknown/model", channel="vision")
 
 
 class FakeResponse:
@@ -119,6 +119,7 @@ def test_openrouter_response_and_perplexity_citations_are_safe():
     assert text == "Готово"
     assert capture["provider"] == "OpenRouter"
     assert capture["payload"]["max_tokens"] == 512
+    assert "secret" not in repr(capture)
 
     payload = {
         "output_text": "Ответ [1]",

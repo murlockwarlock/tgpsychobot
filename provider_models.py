@@ -57,6 +57,20 @@ PERPLEXITY_MODE_OUTPUT_LIMITS = {
     "low": 32768,
     "medium": 128000,
 }
+PERPLEXITY_MODE_INFO = {
+    "fast": {
+        "name": "Быстрый поиск",
+        "desc": "Один короткий web-поиск с цитатами.",
+    },
+    "low": {
+        "name": "Обычный поиск",
+        "desc": "Повседневное исследование с актуальными источниками.",
+    },
+    "medium": {
+        "name": "Расширенное исследование",
+        "desc": "Многошаговый поиск по нескольким источникам.",
+    },
+}
 
 KIE_DEFAULT_CHAT_MODEL = "gemini-3-flash"
 
@@ -96,7 +110,7 @@ OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
     "anthropic/claude-haiku-4.5": OpenRouterModelSpec("anthropic/claude-haiku-4.5", "Anthropic Claude Haiku 4.5", True, True, False, 200000, 64000),
     "x-ai/grok-4.7": OpenRouterModelSpec("x-ai/grok-4.7", "xAI Grok 4.7", True, True, False, 500000, 450000),
     "x-ai/grok-4.6": OpenRouterModelSpec("x-ai/grok-4.6", "xAI Grok 4.6", True, True, False, 500000, 450000),
-    "deepseek/deepseek-v3.2": OpenRouterModelSpec("deepseek/deepseek-v3.2", "DeepSeek V3.2", True, False, False, 163840, 65536),
+    "deepseek/deepseek-v4.1-flash": OpenRouterModelSpec("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", True, True, False, 1048576, 384000),
     "qwen/qwen3-vl-235b-a22b-instruct": OpenRouterModelSpec("qwen/qwen3-vl-235b-a22b-instruct", "Qwen3 VL 235B Instruct", True, True, False, 262144, 32768),
     "moonshotai/kimi-k2.6": OpenRouterModelSpec("moonshotai/kimi-k2.6", "Kimi K2.6", True, True, False, 262144, 235929),
     "mistralai/mistral-medium-3-5": OpenRouterModelSpec("mistralai/mistral-medium-3-5", "Mistral Medium 3.5", True, True, False, 262144, 209715),

@@ -48,6 +48,7 @@ from error_reporting import (
 from vector_store import search_relevant_chunks
 from provider_models import (
     CLAUDE_CHAT_MAX_TOKENS,
+    DEEPGRAM_DEFAULT_MODEL,
     DEEPSEEK_CHAT_MAX_TOKENS,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     GEMINI_CHAT_MAX_TOKENS,
@@ -1192,18 +1193,22 @@ async def _dispatch_provider(
     )
 
     timeout = float(getattr(ai_config, "fallback_timeout", 60) or 60.0)
+    configured_model = {
+        "openai": getattr(ai_config, "openai_model", None),
+        "claude": getattr(ai_config, "claude_model", None),
+        "anthropic": getattr(ai_config, "claude_model", None),
+        "gemini": getattr(ai_config, "gemini_model", None),
+        "deepseek": getattr(ai_config, "deepseek_model", None),
+        "kie": getattr(ai_config, "kie_model", None),
+        "openrouter": getattr(ai_config, "openrouter_model", None),
+        "perplexity": getattr(ai_config, "perplexity_model", None),
+    }.get(provider)
+    selected_model = configured_model
+    if not selected_model and provider in {PROVIDER_OPENROUTER.lower(), PROVIDER_PERPLEXITY.lower()}:
+        selected_model = get_default_model(provider, channel="chat")
     output_tokens = effective_chat_output_tokens(
         ai_config.provider,
-        {
-            "openai": getattr(ai_config, "openai_model", None),
-            "claude": getattr(ai_config, "claude_model", None),
-            "anthropic": getattr(ai_config, "claude_model", None),
-            "gemini": getattr(ai_config, "gemini_model", None),
-            "deepseek": getattr(ai_config, "deepseek_model", None),
-            "kie": getattr(ai_config, "kie_model", None),
-            "openrouter": getattr(ai_config, "openrouter_model", None),
-            "perplexity": getattr(ai_config, "perplexity_model", None),
-        }.get(provider, None),
+        selected_model,
         getattr(ai_config, "max_output_tokens", None),
     )
     thinking_enabled = getattr(ai_config, "deepseek_thinking_enabled", None) if provider == "deepseek" else None
@@ -1288,7 +1293,7 @@ async def _dispatch_provider(
                 return await call_openrouter(
                     ai_config.openrouter_api_key,
                     layout,
-                    ai_config.openrouter_model,
+                    selected_model,
                     temperature=temperature,
                     max_output_tokens=output_tokens,
                     timeout=timeout,
@@ -1305,10 +1310,10 @@ async def _dispatch_provider(
                 return await call_perplexity(
                     ai_config.perplexity_api_key,
                     layout,
-                    ai_config.perplexity_model,
+                    selected_model,
                     max_output_tokens=effective_chat_output_tokens(
                         PROVIDER_PERPLEXITY,
-                        ai_config.perplexity_model,
+                        selected_model,
                         configured_perplexity_tokens,
                     ),
                     timeout=timeout,
@@ -1653,31 +1658,37 @@ async def get_ai_response(
                                 fb_model,
                                 getattr(ai_config, "max_output_tokens", None),
                             )
-                            return await call_openrouter(
-                                fb_api_key,
-                                request_layout,
-                                fb_model,
-                                temperature=temperature,
-                                max_output_tokens=fb_tokens,
-                                timeout=fb_timeout,
-                                request_capture=fallback_capture,
-                                activity_tracker=activity_tracker,
-                            )
+                            try:
+                                return await call_openrouter(
+                                    fb_api_key,
+                                    request_layout,
+                                    fb_model,
+                                    temperature=temperature,
+                                    max_output_tokens=fb_tokens,
+                                    timeout=fb_timeout,
+                                    request_capture=fallback_capture,
+                                    activity_tracker=activity_tracker,
+                                )
+                            except ProviderAdapterError as exc:
+                                raise _wrap_provider_adapter_error(exc) from exc
                         elif fb_key == "perplexity":
                             fb_tokens = effective_chat_output_tokens(
                                 fb_provider,
                                 fb_model,
                                 getattr(ai_config, "max_output_tokens", None),
                             )
-                            return await call_perplexity(
-                                fb_api_key,
-                                request_layout,
-                                fb_model,
-                                max_output_tokens=fb_tokens,
-                                timeout=fb_timeout,
-                                request_capture=fallback_capture,
-                                activity_tracker=activity_tracker,
-                            )
+                            try:
+                                return await call_perplexity(
+                                    fb_api_key,
+                                    request_layout,
+                                    fb_model,
+                                    max_output_tokens=fb_tokens,
+                                    timeout=fb_timeout,
+                                    request_capture=fallback_capture,
+                                    activity_tracker=activity_tracker,
+                                )
+                            except ProviderAdapterError as exc:
+                                raise _wrap_provider_adapter_error(exc) from exc
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
 
@@ -1989,9 +2000,8 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
             )
     if provider == PROVIDER_DEEPGRAM:
         api_key = getattr(config, "deepgram_api_key", None)
-        model = getattr(config, "deepgram_model", None) or "nova-3"
         try:
-            return await call_deepgram(api_key, file_bytes, filename, model=model)
+            return await call_deepgram(api_key, file_bytes, filename, model=DEEPGRAM_DEFAULT_MODEL)
         except ProviderAdapterError as exc:
             raise _wrap_provider_adapter_error(exc) from exc
     # Default: OpenAI

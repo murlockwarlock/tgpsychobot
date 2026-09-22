@@ -1,6 +1,3 @@
-import ast
-from pathlib import Path
-
 from sqlalchemy import create_engine, text
 
 from provider_models import (
@@ -17,14 +14,9 @@ def test_current_deepseek_models_are_used_in_telegram_and_max_admins():
     from provider_models import get_selectable_models
 
     expected = list(DEEPSEEK_MODELS)
-    # Telegram MODELS_INFO still lists the models for primary picker
-    module = ast.parse(Path("handlers.py").read_text(encoding="utf-8"))
-    models_assignment = next(
-        node for node in module.body
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "MODELS_INFO" for target in node.targets)
-    )
-    models_info = ast.literal_eval(models_assignment.value)
+    from handlers import MODELS_INFO
+
+    models_info = MODELS_INFO
     telegram_models = [name for name in models_info["Deepseek"] if name != "pricing"]
 
     assert telegram_models == expected

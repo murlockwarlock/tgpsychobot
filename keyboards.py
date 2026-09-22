@@ -483,7 +483,7 @@ def mask_api_key(value: str | None) -> str:
     if not value:
         return "Не задан"
     if len(value) <= 8:
-        return value
+        return "••••"
     return f"{value[:4]}...{value[-4:]}"
 
 

@@ -18,8 +18,10 @@ from provider_models import (
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
     PROVIDER_OPENAI,
+    PROVIDER_OPENROUTER,
     PROVIDER_PERPLEXITY,
     effective_chat_output_tokens,
+    get_default_model,
     get_chat_output_token_limit,
     validate_chat_output_tokens,
 )
@@ -272,6 +274,25 @@ async def test_perplexity_uses_shared_budget_and_default_when_reset(generation_d
         assert await ai_integration.generate_response(101, "Проверка Perplexity default") == "Ответ"
 
     assert call.await_args.kwargs["max_output_tokens"] == 128000
+
+
+@pytest.mark.asyncio
+async def test_new_provider_model_defaults_are_effective_without_backfill(generation_db):
+    sessions = generation_db
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = PROVIDER_OPENROUTER
+        config.openrouter_api_key = "openrouter-key"
+        config.openrouter_model = None
+        await session.commit()
+
+    with patch("ai_integration.call_openrouter", AsyncMock(return_value="ok")) as call:
+        assert await ai_integration.generate_response(101, "Проверка default модели") == "ok"
+
+    assert call.await_args.args[2] == get_default_model(PROVIDER_OPENROUTER)
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        assert config.openrouter_model is None
 
 
 @pytest.mark.asyncio

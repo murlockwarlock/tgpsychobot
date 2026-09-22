@@ -248,9 +248,8 @@ class AIConfig(Base):
     claude_model = Column(String, default='claude-sonnet-5')
     deepseek_model = Column(String, default=DEEPSEEK_DEFAULT_MODEL)
     openai_model = Column(String, default='gpt-5.6-terra')
-    openrouter_model = Column(String, default='openai/gpt-5.6-terra')
-    perplexity_model = Column(String, default='low')
-    deepgram_model = Column(String, default='nova-3')
+    openrouter_model = Column(String, nullable=True)
+    perplexity_model = Column(String, nullable=True)
     max_output_tokens = Column(Integer, nullable=True)
     deepseek_thinking_enabled = Column(Boolean, nullable=True)
     max_voice_duration_sec = Column(Integer, default=180, nullable=False)
@@ -1357,11 +1356,9 @@ async def init_db():
             if 'kie_model' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_model VARCHAR DEFAULT 'gemini-3-flash'"))
             if 'openrouter_model' not in ai_columns:
-                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN openrouter_model VARCHAR DEFAULT 'openai/gpt-5.6-terra'"))
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN openrouter_model VARCHAR"))
             if 'perplexity_model' not in ai_columns:
-                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN perplexity_model VARCHAR DEFAULT 'low'"))
-            if 'deepgram_model' not in ai_columns:
-                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN deepgram_model VARCHAR DEFAULT 'nova-3'"))
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN perplexity_model VARCHAR"))
             if 'kie_base_url' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_base_url VARCHAR DEFAULT 'https://api.kie.ai'"))
             if 'kie_upload_base_url' not in ai_columns:
@@ -1548,12 +1545,6 @@ async def init_db():
                 ai_conf.vision_model = 'gemini-3.7-flash'
             if getattr(ai_conf, 'kie_model', None) is None:
                 ai_conf.kie_model = 'gemini-3-flash'
-            if getattr(ai_conf, 'openrouter_model', None) is None:
-                ai_conf.openrouter_model = 'openai/gpt-5.6-terra'
-            if getattr(ai_conf, 'perplexity_model', None) is None:
-                ai_conf.perplexity_model = 'low'
-            if getattr(ai_conf, 'deepgram_model', None) is None:
-                ai_conf.deepgram_model = 'nova-3'
             if getattr(ai_conf, 'kie_base_url', None) is None:
                 ai_conf.kie_base_url = 'https://api.kie.ai'
             if getattr(ai_conf, 'kie_upload_base_url', None) is None:

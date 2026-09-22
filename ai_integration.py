@@ -60,6 +60,7 @@ from vector_store import search_relevant_chunks
 from user_metadata import extract_service_data
 from provider_models import (
     CLAUDE_CHAT_MAX_TOKENS,
+    DEEPGRAM_DEFAULT_MODEL,
     DEEPSEEK_CHAT_MAX_TOKENS,
     DEFAULT_KIE_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
@@ -1715,9 +1716,8 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
 
         elif provider == PROVIDER_DEEPGRAM:
             api_key = getattr(ai_config, "deepgram_api_key", None)
-            model = getattr(ai_config, "deepgram_model", None) or "nova-3"
             try:
-                response_text = await call_deepgram(api_key, file_bytes, filename, model=model)
+                response_text = await call_deepgram(api_key, file_bytes, filename, model=DEEPGRAM_DEFAULT_MODEL)
             except ProviderAdapterError as exc:
                 raise _wrap_provider_adapter_error(exc) from exc
 
@@ -1871,6 +1871,11 @@ async def get_ai_response(
         model = _normalize_config_value(getattr(ai_config, f"{provider_key}_model", None))
         if provider_key in ['anthropic', 'claude'] and not model:
             model = _normalize_config_value(ai_config.claude_model)
+        if not model and provider_key in {PROVIDER_OPENROUTER.lower(), PROVIDER_PERPLEXITY.lower()}:
+            try:
+                model = get_default_model(provider_key, channel="chat")
+            except ModelUnavailableError:
+                model = None
 
         system_prompt_text = _load_configured_system_prompt(
             ai_config,

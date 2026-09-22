@@ -92,6 +92,9 @@ from provider_models import (
     PROVIDER_OPENROUTER,
     PROVIDER_PERPLEXITY,
     PROVIDER_DEEPGRAM,
+    DEEPGRAM_DEFAULT_MODEL,
+    OPENROUTER_MODEL_SPECS,
+    PERPLEXITY_MODE_INFO,
     ModelUnavailableError,
     SELECTABLE_CHAT_MODELS,
     TELEGRAM_MODEL_CALLBACK_PREFIX,
@@ -1022,29 +1025,31 @@ MODELS_INFO = {
         'pricing': '<b>GPT 5.6:</b> Новое поколение OpenAI.'
     },
     "OpenRouter": {
-        'openai/gpt-5.6-terra': {'name': 'OpenRouter · OpenAI GPT-5.6 Terra', 'desc': 'OpenAI через OpenRouter, текст и фото.'},
-        'openai/gpt-5.6-sol': {'name': 'OpenRouter · OpenAI GPT-5.6 Sol', 'desc': 'Быстрый OpenAI через OpenRouter, текст и фото.'},
-        'openai/gpt-5.6-luna-pro': {'name': 'OpenRouter · OpenAI GPT-5.6 Luna Pro', 'desc': 'Флагманский OpenAI через OpenRouter, текст и фото.'},
-        'google/gemini-3.7-flash': {'name': 'OpenRouter · Gemini 3.7 Flash', 'desc': 'Gemini через OpenRouter, текст, фото и аудио.'},
-        'google/gemini-3.8-flash': {'name': 'OpenRouter · Gemini 3.8 Flash', 'desc': 'Новая быстрая Gemini через OpenRouter, текст, фото и аудио.'},
-        'google/gemini-3.1-pro-preview': {'name': 'OpenRouter · Gemini 3.1 Pro', 'desc': 'Gemini Pro через OpenRouter, текст, фото и аудио.'},
-        'anthropic/claude-sonnet-4.6': {'name': 'OpenRouter · Claude Sonnet 4.6', 'desc': 'Claude Sonnet через OpenRouter, текст и фото.'},
-        'anthropic/claude-opus-4.6': {'name': 'OpenRouter · Claude Opus 4.6', 'desc': 'Claude Opus через OpenRouter, текст и фото.'},
-        'anthropic/claude-haiku-4.5': {'name': 'OpenRouter · Claude Haiku 4.5', 'desc': 'Быстрый Claude через OpenRouter, текст и фото.'},
-        'x-ai/grok-4.7': {'name': 'OpenRouter · Grok 4.7', 'desc': 'Основной Grok через OpenRouter, текст и фото.'},
-        'x-ai/grok-4.6': {'name': 'OpenRouter · Grok 4.6', 'desc': 'Быстрый Grok через OpenRouter, текст и фото.'},
-        'deepseek/deepseek-v3.2': {'name': 'OpenRouter · DeepSeek V3.2', 'desc': 'DeepSeek через OpenRouter для текста.'},
-        'qwen/qwen3-vl-235b-a22b-instruct': {'name': 'OpenRouter · Qwen3 VL 235B', 'desc': 'Мультимодальная Qwen для текста и фото.'},
-        'moonshotai/kimi-k2.6': {'name': 'OpenRouter · Kimi K2.6', 'desc': 'Kimi через OpenRouter, текст и фото.'},
-        'mistralai/mistral-medium-3-5': {'name': 'OpenRouter · Mistral Medium 3.5', 'desc': 'Мультимодальная Mistral для текста и фото.'},
-        'pricing': '<b>OpenRouter:</b> стоимость зависит от выбранной модели и маршрута.'
+        **{
+            spec.model_id: {
+                "name": f"OpenRouter · {spec.friendly_name}",
+                "desc": (
+                    f"{spec.friendly_name}: "
+                    + ", ".join(
+                        capability
+                        for capability, enabled in (
+                            ("текст", spec.text),
+                            ("фото", spec.vision),
+                            ("аудио", spec.audio_input),
+                        )
+                        if enabled
+                    )
+                    + "."
+                ),
+            }
+            for spec in OPENROUTER_MODEL_SPECS.values()
+        },
+        "pricing": "<b>OpenRouter:</b> стоимость зависит от выбранной модели и маршрута.",
     },
     "Perplexity": {
-        'fast': {'name': 'Быстрый поиск', 'desc': 'Один короткий web-поиск с цитатами.'},
-        'low': {'name': 'Обычный поиск', 'desc': 'Повседневное исследование с актуальными источниками.'},
-        'medium': {'name': 'Расширенное исследование', 'desc': 'Многошаговый поиск по нескольким источникам.'},
-        'pricing': '<b>Perplexity:</b> режимы управляются официальными preset-настройками API.'
-    }
+        **PERPLEXITY_MODE_INFO,
+        "pricing": "<b>Perplexity:</b> режимы управляются официальными preset-настройками API.",
+    },
 }
 
 # Keep the Telegram primary selector driven by the shared KIE chat catalog.
@@ -1423,6 +1428,8 @@ def _resolve_ai_provider_model(config: AIConfig | None, channel: str) -> tuple[s
     if channel == "chat":
         provider = config.provider
         model = getattr(config, f"{provider.lower()}_model", None) if provider else None
+        if not model and provider in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
+            model = get_default_model(provider, channel="chat")
         return provider, model
     if channel == "transcription":
         provider = config.transcription_provider
@@ -1431,7 +1438,7 @@ def _resolve_ai_provider_model(config: AIConfig | None, channel: str) -> tuple[s
         elif provider == "KIE":
             model = getattr(config, "kie_transcription_model", None)
         elif provider == PROVIDER_DEEPGRAM:
-            model = getattr(config, "deepgram_model", None)
+            model = DEEPGRAM_DEFAULT_MODEL
         else:
             model = "whisper-1" if provider == "OpenAI" else None
         return provider, model
@@ -4923,7 +4930,7 @@ async def admin_ai_settings(message: Message | CallbackQuery):
 
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
         if config.transcription_provider == PROVIDER_DEEPGRAM:
-            trans_provider = f"{PROVIDER_DEEPGRAM} / {getattr(config, 'deepgram_model', None) or 'nova-3'}"
+            trans_provider = f"{PROVIDER_DEEPGRAM} / {DEEPGRAM_DEFAULT_MODEL}"
         vis_provider = config.vision_provider
         vis_model = _display_capability_model(vis_provider, config.vision_model, "vision")
         image_gen_provider = getattr(config, 'image_generation_provider', PROVIDER_OPENAI)
@@ -5029,7 +5036,7 @@ async def admin_ai_keys_models(callback: CallbackQuery):
 
     trans_provider = config.transcription_provider if config else 'OpenAI'
     if config and config.transcription_provider == PROVIDER_DEEPGRAM:
-        trans_provider = f"{PROVIDER_DEEPGRAM} / {getattr(config, 'deepgram_model', None) or 'nova-3'}"
+        trans_provider = f"{PROVIDER_DEEPGRAM} / {DEEPGRAM_DEFAULT_MODEL}"
     vis_provider = config.vision_provider if config else PROVIDER_GEMINI
     vis_model = _display_capability_model(
         vis_provider,
@@ -5051,6 +5058,8 @@ async def admin_ai_keys_models(callback: CallbackQuery):
         current_model = getattr(config, 'kie_model', None)
     else:
         current_model = getattr(config, f"{str(current_provider).lower()}_model", None) if config else None
+    if current_provider in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
+        current_model = _display_capability_model(current_provider, current_model, "chat")
     max_output_tokens = getattr(config, 'max_output_tokens', None) if config else None
     deepseek_thinking_enabled = getattr(config, 'deepseek_thinking_enabled', None) if config else None
     memory_mode = get_memory_mode(config) if config else MEMORY_MODE_RESET
@@ -5165,6 +5174,8 @@ async def start_set_max_output_tokens(callback: CallbackQuery, state: FSMContext
         if canonical_provider_name(provider) == PROVIDER_KIE
         else getattr(config, f"{str(provider).lower()}_model", None)
     )
+    if canonical_provider_name(provider) in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
+        model = _display_capability_model(provider, model, "chat")
     configured = getattr(config, "max_output_tokens", None)
     effective = effective_chat_output_tokens(provider, model, configured)
     limit = get_chat_output_token_limit(provider, model)
@@ -5462,11 +5473,6 @@ async def admin_toggle_transcription(callback: CallbackQuery):
             )
         elif config.transcription_provider == "KIE":
             config.transcription_provider = PROVIDER_DEEPGRAM
-            config.deepgram_model = validate_model_selection(
-                PROVIDER_DEEPGRAM,
-                getattr(config, "deepgram_model", None) or "nova-3",
-                channel="transcription",
-            )
         elif config.transcription_provider == PROVIDER_DEEPGRAM:
             config.transcription_provider = "None"
         else:
@@ -5739,7 +5745,29 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
             await message.answer("Недопустимая модель. Настройки не изменены.")
             return
 
-    column_name = f"{provider.lower()}_api_key" if is_key else f"{provider.lower()}_model"
+    key_fields = {
+        PROVIDER_DEEPSEEK: "deepseek_api_key",
+        PROVIDER_CLAUDE: "claude_api_key",
+        PROVIDER_GEMINI: "gemini_api_key",
+        PROVIDER_KIE: "kie_api_key",
+        PROVIDER_OPENAI: "openai_api_key",
+        PROVIDER_OPENROUTER: "openrouter_api_key",
+        PROVIDER_PERPLEXITY: "perplexity_api_key",
+        PROVIDER_DEEPGRAM: "deepgram_api_key",
+    }
+    model_fields = {
+        PROVIDER_DEEPSEEK: "deepseek_model",
+        PROVIDER_CLAUDE: "claude_model",
+        PROVIDER_GEMINI: "gemini_model",
+        PROVIDER_KIE: "kie_model",
+        PROVIDER_OPENAI: "openai_model",
+        PROVIDER_OPENROUTER: "openrouter_model",
+        PROVIDER_PERPLEXITY: "perplexity_model",
+    }
+    column_name = (key_fields if is_key else model_fields).get(provider)
+    if column_name is None:
+        await message.answer("Недопустимый провайдер. Настройки не изменены.")
+        return
 
     async with async_session_maker() as session:
         stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
@@ -19333,6 +19361,8 @@ async def get_ai_response_direct(
         model = getattr(ai_config, f"{provider_key}_model", None)
         if provider_key in ['anthropic', 'claude'] and not model:
             model = ai_config.claude_model
+        if not model and provider_key in {PROVIDER_OPENROUTER.lower(), PROVIDER_PERPLEXITY.lower()}:
+            model = get_default_model(provider_key, channel="chat")
 
         if not api_key:
             raise AIServiceError(f"API key for AI provider '{provider}' is not configured.")

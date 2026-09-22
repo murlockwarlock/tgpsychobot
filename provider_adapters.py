@@ -4,9 +4,13 @@ import asyncio
 import base64
 import copy
 import json
+import logging
 import mimetypes
+import time
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -16,6 +20,9 @@ from provider_models import (
     OPENROUTER_MODEL_SPECS,
     PERPLEXITY_MODES,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 class ProviderAdapterError(RuntimeError):
@@ -42,6 +49,15 @@ _ADAPTER_CLASSIFICATION_MAP = {
 
 def normalize_provider_error_classification(category: str | None) -> str:
     return _ADAPTER_CLASSIFICATION_MAP.get(str(category or "provider"), "unknown")
+
+
+async def _mark_activity(activity_tracker: Any | None) -> None:
+    if activity_tracker is None:
+        return
+    try:
+        await activity_tracker.mark_outbound_attempt_once()
+    except Exception as exc:
+        log.warning("Failed to mark activity before provider request: %s", exc)
 
 
 @dataclass(frozen=True)
@@ -252,17 +268,17 @@ async def _post_json(
     activity_tracker: Any | None = None,
     retries: int = 1,
 ) -> dict[str, Any]:
-    if activity_tracker is not None:
-        try:
-            await activity_tracker.mark_outbound_attempt_once()
-        except Exception:
-            pass
+    await _mark_activity(activity_tracker)
     if request_capture is not None:
         _capture_ai_request(request_capture, provider=provider, endpoint=url, payload=_capture_payload(payload))
     last_error: Exception | None = None
+    deadline = time.monotonic() + max(float(timeout), 0.1)
     for attempt in range(retries + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderAdapterError(f"Таймаут обращения к {provider}", category="timeout") from last_error
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
                 response = await client.post(url, headers=headers, json=payload)
             try:
                 data = response.json()
@@ -291,7 +307,7 @@ async def _post_json(
                 await asyncio.sleep(0)
                 continue
             raise ProviderAdapterError(f"Ошибка сети {provider}", category="network") from exc
-        except Exception as exc:
+        except (OSError, TypeError, ValueError) as exc:
             raise ProviderAdapterError(f"Ошибка ответа {provider}", category="provider") from exc
     raise ProviderAdapterError(f"Ошибка обращения к {provider}", category="provider") from last_error
 
@@ -376,7 +392,9 @@ async def call_deepgram(
     if model != DEEPGRAM_DEFAULT_MODEL:
         raise ProviderAdapterError("Недопустимая модель Deepgram", category="invalid_model")
     mime_type = mimetypes.guess_type(filename)[0] or "audio/ogg"
-    endpoint = "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&language=multi"
+    endpoint = "https://api.deepgram.com/v1/listen?" + urlencode(
+        {"model": model, "smart_format": "true", "language": "multi"}
+    )
     if request_capture is not None:
         _capture_ai_request(
             request_capture,
@@ -385,14 +403,14 @@ async def call_deepgram(
             payload={"model": model, "language": "multi", "smart_format": True},
         )
     last_error: Exception | None = None
-    if activity_tracker is not None:
-        try:
-            await activity_tracker.mark_outbound_attempt_once()
-        except Exception:
-            pass
+    await _mark_activity(activity_tracker)
+    deadline = time.monotonic() + max(float(timeout), 0.1)
     for attempt in range(2):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderAdapterError("Таймаут обращения к Deepgram", category="timeout") from last_error
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
                 response = await client.post(
                     endpoint,
                     headers={"Authorization": f"Token {api_key}", "Content-Type": mime_type},
@@ -451,7 +469,10 @@ async def verify_openrouter_catalog(timeout: float = 20.0) -> dict[str, Any]:
         live_context = item.get("context_length")
         live_output = (item.get("top_provider") or {}).get("max_completion_tokens")
         live_status = str(item.get("status") or "active")
+        expiration_date = item.get("expiration_date")
         mismatches = []
+        if spec.text != ("text" in modalities):
+            mismatches.append("text")
         if ("image" in modalities) != spec.vision:
             mismatches.append("vision")
         if ("audio" in modalities) != spec.audio_input:
@@ -462,13 +483,22 @@ async def verify_openrouter_catalog(timeout: float = 20.0) -> dict[str, Any]:
             mismatches.append("output_limit")
         if live_status.lower() in {"deprecated", "decommissioned", "disabled"}:
             mismatches.append("status")
+        if expiration_date:
+            try:
+                if date.fromisoformat(str(expiration_date)) <= date.today():
+                    mismatches.append("expiration_date")
+            except ValueError:
+                mismatches.append("expiration_date")
         result[model_id] = {
             "exists": True,
+            "canonical_slug": item.get("canonical_slug"),
+            "text": "text" in modalities,
             "vision": "image" in modalities,
             "audio_input": "audio" in modalities,
             "context_limit": live_context,
             "output_limit": live_output,
             "status": live_status,
+            "expiration_date": expiration_date,
             "matches_static": not mismatches,
             "mismatches": mismatches,
         }
