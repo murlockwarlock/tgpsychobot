@@ -433,6 +433,7 @@ def test_card_ai_callback_is_acknowledged_before_provider_io_and_reports_safe_fa
         })
         media_session = _Session({
             handlers.MediaLibrary: SimpleNamespace(
+                id=7,
                 file_name="card.jpg",
                 description="Описание",
                 file_id="file-7",

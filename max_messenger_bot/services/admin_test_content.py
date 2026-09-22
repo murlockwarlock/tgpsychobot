@@ -222,6 +222,8 @@ async def save_question_sort(client: MaxApiClient, states: StateStore, chat_id: 
         if not target:
             await client.send_message(chat_id=chat_id, text="Вопрос не найден.")
             return
+        from test_content_identity import preserve_active_test_definitions
+        await preserve_active_test_definitions(session)
         questions = [item for item in questions if item.id != question_id]
         insert_index = min(max(target_position - 1, 0), len(questions))
         questions.insert(insert_index, target)
@@ -239,6 +241,8 @@ async def delete_question(client: MaxApiClient, chat_id: int, question_id: int) 
             await client.send_message(chat_id=chat_id, text="Вопрос не найден.")
             return
         async with translation_coordination_lock(session):
+            from test_content_identity import preserve_active_test_definitions
+            await preserve_active_test_definitions(session)
             await session.execute(delete(TestQuestion).where(TestQuestion.id == question_id))
             await session.flush()
             await _normalize_question_sort_order(session)

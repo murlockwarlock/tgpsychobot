@@ -792,7 +792,11 @@ class MaxAdminContentEditorTests(unittest.IsolatedAsyncioTestCase):
         session = MagicMock()
         session.commit = AsyncMock()
         content_item = Content(key="about_me", text_content="old text", content_order="media_top", is_visible=True)
-        session.get = AsyncMock(return_value=content_item)
+        session.flush = AsyncMock()
+        session.info = {}
+        from database import BotGeneralConfig
+        config = BotGeneralConfig(id=1, translations_revision=0)
+        session.get = AsyncMock(side_effect=lambda model, key: config if model is BotGeneralConfig else content_item)
 
         media_rows = [
             MaxContentMedia(content_key="about_me", media_type="photo", token="tok123"),

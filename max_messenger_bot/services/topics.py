@@ -45,6 +45,7 @@ async def select_topic(client: MaxApiClient, chat_id: int, user_id: int, topic_i
     if (
         not user
         or not topic
+        or not topic.name
         or not topic.is_active
         or (topic.admin_only and not user.is_admin)
     ):

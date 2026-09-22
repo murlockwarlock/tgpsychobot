@@ -198,13 +198,16 @@ async def receive_test_file(client: MaxApiClient, states: StateStore, message: I
                 await client.send_message(chat_id=message.chat_id, text="Тест не изменён:\n- " + "\n- ".join(errors[:15]))
                 return
             async with async_session_maker() as session:
-                await session.execute(delete(TestQuestion))
-                for index, item in enumerate(questions_data):
-                    session.add(TestQuestion(sort_order=index, **item))
-                config = await session.get(TestConfig, 1)
-                config.formulas_json = json_dumps(formulas) if formulas else None
-                config.formulas_enabled = bool(formulas)
-                await commit_readiness_critical_mutation(session)
+                from question_authoring_import import apply_question_import
+                from translation_pack_manager import translation_coordination_lock
+                async with translation_coordination_lock(session):
+                    existing = await session.scalar(select(TestQuestion.id).limit(1))
+                    await apply_question_import(session, questions_data, "ru")
+                    if existing is None:
+                        config = await session.get(TestConfig, 1)
+                        config.formulas_json = json_dumps(formulas) if formulas else None
+                        config.formulas_enabled = bool(formulas)
+                    await commit_readiness_critical_mutation(session)
             result_text = f"✅ Загружено вопросов: {len(questions_data)}. Формул: {len(formulas)}."
         await states.clear(message.sender.user_id)
         await client.send_message(chat_id=message.chat_id, text=result_text)

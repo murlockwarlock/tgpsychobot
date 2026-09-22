@@ -118,7 +118,7 @@ async def update_case_study_index(case_id: int, text_content: str):
     embedding = await asyncio.to_thread(active_model.encode, text_content)
 
     await asyncio.to_thread(
-        active_case_collection.add,
+        active_case_collection.upsert,
         embeddings=[embedding.tolist()],
         documents=[text_content],
         metadatas=[{"case_id": case_id}],

@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from collections import Counter
 import json
+from content_locales import is_admin_content_key
 from typing import Any
 
 from sqlalchemy import select, text, inspect as sqlalchemy_inspect
@@ -15,6 +16,7 @@ from translation_service import (
     normalize_enabled_languages,
     translation_cache,
     source_hash,
+    dynamic_translation_safe,
 )
 
 
@@ -30,7 +32,7 @@ class TranslationResourceNotReady(ValueError):
 
 _translation_coordination_lock = asyncio.Lock()
 TRANSLATION_PACK_SCHEMA_VERSION = 2
-TRANSLATION_PACK_LOCALES = ("en", "pt")
+TRANSLATION_PACK_LOCALES = tuple(locale for locale in SUPPORTED_TELEGRAM_LOCALES if locale != "ru")
 
 
 def get_locale_readiness(readiness: dict[str, Any], locale: str) -> dict[str, Any]:
@@ -114,6 +116,7 @@ def validate_translation_pack(
     expected_locale: str | None = None,
     expected_target: dict[str, Any] | None = None,
 ) -> None:
+    registry = registry.system()
     errors: list[str] = []
     if not isinstance(pack, dict):
         raise TranslationPackValidationError(["pack must be an object"])
@@ -170,6 +173,8 @@ def validate_translation_pack(
         if locale == "ru":
             errors.append("Russian is the canonical source and cannot be imported")
             continue
+        if is_admin_content_key(key):
+            continue
         source = registry.get(key)
         if source is None:
             errors.append(f"unknown translation key: {key}")
@@ -214,6 +219,7 @@ async def export_translation_pack(
     locale: str,
     target: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    registry = registry.system()
     if locale not in TRANSLATION_PACK_LOCALES:
         raise ValueError(f"unsupported translation pack locale: {locale}")
     rows = (
@@ -239,6 +245,7 @@ async def export_translation_pack(
         )
     pack = {
         "schema_version": TRANSLATION_PACK_SCHEMA_VERSION,
+        "scope": "system",
         "locale": locale,
         "translations": entries,
     }
@@ -265,13 +272,22 @@ def _release_translation_lock(session) -> None:
 
 @asynccontextmanager
 async def translation_coordination_lock(session):
+    if session.info.get("translation_lock_depth", 0):
+        session.info["translation_lock_depth"] += 1
+        try:
+            yield
+        finally:
+            session.info["translation_lock_depth"] -= 1
+        return
     dialect_name = getattr(getattr(session.get_bind(), "dialect", None), "name", "")
     acquired = False
     try:
         await _acquire_translation_lock(session)
         acquired = True
+        session.info["translation_lock_depth"] = 1
         yield
     finally:
+        session.info.pop("translation_lock_depth", None)
         if acquired and dialect_name != "postgresql":
             _release_translation_lock(session)
 
@@ -413,78 +429,11 @@ async def _deactivate_untranslated_new_resource(session, resource) -> None:
 
 
 async def commit_readiness_critical_mutation(session) -> None:
-    from translation_registry import build_translation_registry
+    from content_authoring import bump_revision
 
     async with translation_coordination_lock(session):
-        config = await session.get(BotGeneralConfig, 1)
-        required_locales = tuple(
-            locale
-            for locale in normalize_enabled_languages(
-                getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]'
-            )
-            if locale != "ru"
-        )
-        changed_resources = [
-            resource
-            for resource in tuple(session.new) + tuple(session.dirty)
-            if _resource_has_translation_change(resource)
-        ]
-        if required_locales and changed_resources:
-            resource_flags = {
-                id(resource): (
-                    _resource_is_new(session, resource),
-                    type(resource).__name__ in _RESOURCE_TRANSLATION_FIELDS
-                    and (
-                        _resource_is_new(session, resource)
-                        or any(
-                            sqlalchemy_inspect(resource).attrs[field].history.has_changes()
-                            for field in _RESOURCE_TRANSLATION_FIELDS[type(resource).__name__]
-                            if field in sqlalchemy_inspect(resource).attrs
-                        )
-                    ),
-                    any(
-                        field in sqlalchemy_inspect(resource).attrs
-                        and sqlalchemy_inspect(resource).attrs[field].history.has_changes()
-                        and bool(getattr(resource, field, False))
-                        for field in _RESOURCE_ACTIVE_FIELDS.get(type(resource).__name__, ())
-                    ),
-                )
-                for resource in changed_resources
-            }
-            for resource in tuple(changed_resources):
-                if _resource_is_new(session, resource):
-                    await _deactivate_untranslated_new_resource(session, resource)
-            await session.flush()
-            registry = await build_translation_registry(session)
-            readiness = await audit_translation_readiness(
-                session,
-                registry,
-                locales=required_locales,
-            )
-            if not readiness["ready"]:
-                persistent_source_change = any(
-                    not resource_flags[id(resource)][0]
-                    and resource_flags[id(resource)][1]
-                    and _resource_has_required_sources(registry, resource)
-                    for resource in changed_resources
-                )
-                active_resource_change = any(
-                    not resource_flags[id(resource)][0]
-                    and resource_flags[id(resource)][2]
-                    and _resource_has_required_sources(registry, resource)
-                    for resource in changed_resources
-                )
-                if persistent_source_change or active_resource_change:
-                    await session.rollback()
-                    details = []
-                    for locale in required_locales:
-                        report = get_locale_readiness(readiness, locale)
-                        details.extend(report.get("missing", [])[:3])
-                        details.extend(report.get("stale", [])[:3])
-                        details.extend(report.get("invalid", [])[:3])
-                    raise TranslationResourceNotReady(
-                        "Translations are required before activation: " + ", ".join(details)
-                    )
+        await session.flush()
+        await bump_revision(session)
         await session.commit()
 
 
@@ -520,7 +469,7 @@ async def import_translation_pack(
                 expected_locale=expected_locale,
                 expected_target=expected_target,
             )
-            entries = pack["translations"]
+            entries = [entry for entry in pack["translations"] if not is_admin_content_key(entry.get("translation_key"))]
             bind = session.get_bind()
             dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
             if dialect_name == "postgresql":
@@ -578,7 +527,8 @@ async def import_translation_pack(
                     and key in source_snapshot
                     and isinstance(value, str)
                     and value != ""
-                    and stored_hash == source_hash(source_snapshot[key])
+                    and (is_admin_content_key(key) or stored_hash == source_hash(source_snapshot[key]))
+                    and (not is_admin_content_key(key) or dynamic_translation_safe(source_snapshot[key], value))
                 )
             }
             translation_cache.install(
@@ -595,6 +545,8 @@ async def audit_translation_readiness(
     *,
     locales: tuple[str, ...],
 ) -> dict[str, Any]:
+    full_registry = registry
+    registry = registry.system()
     rows = (
         await session.execute(
             select(BotTranslation.locale, BotTranslation.translation_key, BotTranslation.text, BotTranslation.source_hash)
@@ -640,10 +592,36 @@ async def audit_translation_readiness(
     orphaned = sorted(
         f"{locale}/{key}"
         for locale, key in by_key
-        if locale not in SUPPORTED_TELEGRAM_LOCALES or registry.get(key) is None
+        if locale not in SUPPORTED_TELEGRAM_LOCALES or full_registry.get(key) is None
     )
     return {
         "ready": all(report["ready"] for report in locale_reports.values()),
         "locales": locale_reports,
         "orphaned": orphaned,
+        "content": content_completeness(full_registry, by_key, locales),
     }
+
+
+def content_completeness(registry, by_key, locales):
+    primary = {"topic": "name", "plan": "name", "content": "text_content", "test_question": "text", "secret_test_question": "text", "mailing": "text", "automation_action": "message_template", "followup_step": "message_text", "referral_template": "text", "media_library": "description", "bot_general_config": "ai_processing_message_text", "case_study": "text"}
+    groups = {}
+    for key, source in registry.snapshot().items():
+        if source.domain != "admin_content":
+            continue
+        parts = key.split(".")
+        groups.setdefault(parts[0], {}).setdefault(parts[1], []).append(source)
+    result = {}
+    for locale in locales:
+        report = {}
+        for kind, resources in groups.items():
+            complete = review = 0
+            for sources in resources.values():
+                required = [source for source in sources if source.source or source.translation_key.rsplit(".", 1)[-1] == primary.get(kind)]
+                values = [(source, by_key.get((locale, source.translation_key))) for source in required]
+                if values and all(row and row[0] for _, row in values):
+                    complete += 1
+                if any(row and row[0] and row[1] != source.source_hash for source, row in values):
+                    review += 1
+            report[kind] = {"complete": complete, "total": len(resources), "review": review}
+        result[locale] = report
+    return result

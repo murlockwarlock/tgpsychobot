@@ -190,6 +190,7 @@ def _parse_new_question_row(row, index: int, schema: dict | None = None) -> dict
         return None
     options = _parse_answer_options_from_row(row, schema) if schema else _parse_answer_options(row[6:])
     return {
+        'id': int(row[0]) if schema and schema.get('explicit_ids') and _cell_text(row[0]).isdigit() else None,
         'text': question_text,
         'category': 'general',
         'is_reverse': False,
@@ -298,6 +299,7 @@ def _build_question_schema(header) -> dict:
         "option_columns": option_columns,
         "value_columns": value_columns,
         "button_columns": button_columns,
+        "explicit_ids": _cell_text(header[0]).lower() in {"id", "question_id", "id вопроса"},
     }
 
 

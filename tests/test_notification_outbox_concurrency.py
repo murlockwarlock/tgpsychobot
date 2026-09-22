@@ -228,7 +228,7 @@ class NotificationOutboxConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         key = "test:race:lease_safety"
         now = datetime(2026, 9, 11, 12, 0, 0)
         async with async_session_maker() as session:
-            await enqueue_outbox_event(
+            row = await enqueue_outbox_event(
                 session,
                 key,
                 "Yookassa",
@@ -236,6 +236,7 @@ class NotificationOutboxConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 "purchase_success",
                 {"plan_name": "Lease Guard Plan"},
             )
+            row.next_retry_at = now
             await session.commit()
 
         worker_a_started = asyncio.Event()
@@ -254,7 +255,7 @@ class NotificationOutboxConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             task_a = asyncio.create_task(
                 dispatch_outbox_by_key(self.bot, key, deliver_func=hanging_deliver_a)
             )
-            await worker_a_started.wait()
+            await asyncio.wait_for(worker_a_started.wait(), 5)
 
             # Advance clock 75 seconds (past the old 60s boundary, but within 300s lease)
             mock_dt.utcnow.return_value = now + timedelta(seconds=75)
@@ -317,7 +318,7 @@ class NotificationOutboxConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         key = "test:stale:cas_race"
         now = datetime(2026, 9, 11, 12, 0, 0)
         async with async_session_maker() as session:
-            await enqueue_outbox_event(
+            row = await enqueue_outbox_event(
                 session,
                 key,
                 "Yookassa",
@@ -325,6 +326,7 @@ class NotificationOutboxConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 "purchase_success",
                 {"plan_name": "Stale Candidate Plan"},
             )
+            row.next_retry_at = now
             await session.commit()
 
         deliver_mock_a = AsyncMock(return_value=False)
