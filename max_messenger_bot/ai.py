@@ -79,6 +79,7 @@ from provider_adapters import (
     call_deepgram,
     call_openrouter,
     call_perplexity,
+    normalize_provider_error_classification,
 )
 from vision_reliability import (
     VisionDeadlineTracker,
@@ -132,8 +133,10 @@ class InsufficientBalanceError(AIServiceError):
 
 def _wrap_provider_adapter_error(exc: ProviderAdapterError) -> AIServiceError:
     error = AIServiceError(str(exc))
-    error.classification = getattr(exc, "classification", "provider")
+    error.classification = normalize_provider_error_classification(getattr(exc, "classification", "provider"))
     error.http_status = getattr(exc, "http_status", None)
+    if getattr(exc, "provider_response_payload", None) is not None:
+        error.provider_response_payload = exc.provider_response_payload
     return error
 
 
@@ -1290,6 +1293,7 @@ async def _dispatch_provider(
                     max_output_tokens=output_tokens,
                     timeout=timeout,
                     request_capture=request_capture,
+                    activity_tracker=activity_tracker,
                 )
             except ProviderAdapterError as exc:
                 raise _wrap_provider_adapter_error(exc) from exc
@@ -1302,17 +1306,14 @@ async def _dispatch_provider(
                     ai_config.perplexity_api_key,
                     layout,
                     ai_config.perplexity_model,
-                    max_output_tokens=(
-                        effective_chat_output_tokens(
-                            PROVIDER_PERPLEXITY,
-                            ai_config.perplexity_model,
-                            configured_perplexity_tokens,
-                        )
-                        if configured_perplexity_tokens is not None
-                        else None
+                    max_output_tokens=effective_chat_output_tokens(
+                        PROVIDER_PERPLEXITY,
+                        ai_config.perplexity_model,
+                        configured_perplexity_tokens,
                     ),
                     timeout=timeout,
                     request_capture=request_capture,
+                    activity_tracker=activity_tracker,
                 )
             except ProviderAdapterError as exc:
                 raise _wrap_provider_adapter_error(exc) from exc
@@ -1645,6 +1646,37 @@ async def get_ai_response(
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                                 max_output_tokens=fb_tokens,
+                            )
+                        elif fb_key == "openrouter":
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
+                            return await call_openrouter(
+                                fb_api_key,
+                                request_layout,
+                                fb_model,
+                                temperature=temperature,
+                                max_output_tokens=fb_tokens,
+                                timeout=fb_timeout,
+                                request_capture=fallback_capture,
+                                activity_tracker=activity_tracker,
+                            )
+                        elif fb_key == "perplexity":
+                            fb_tokens = effective_chat_output_tokens(
+                                fb_provider,
+                                fb_model,
+                                getattr(ai_config, "max_output_tokens", None),
+                            )
+                            return await call_perplexity(
+                                fb_api_key,
+                                request_layout,
+                                fb_model,
+                                max_output_tokens=fb_tokens,
+                                timeout=fb_timeout,
+                                request_capture=fallback_capture,
+                                activity_tracker=activity_tracker,
                             )
                         else:
                             raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
@@ -2748,6 +2780,7 @@ async def analyze_image(
                     max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, call_model),
                     timeout=stage_budget,
                     request_capture=request_capture,
+                    activity_tracker=activity_tracker,
                 )
             except ProviderAdapterError as exc:
                 raise _wrap_provider_adapter_error(exc) from exc

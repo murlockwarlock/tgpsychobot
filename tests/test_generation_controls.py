@@ -271,7 +271,7 @@ async def test_perplexity_uses_shared_budget_and_default_when_reset(generation_d
     with patch("ai_integration.call_perplexity", AsyncMock(return_value="Ответ")) as call:
         assert await ai_integration.generate_response(101, "Проверка Perplexity default") == "Ответ"
 
-    assert call.await_args.kwargs["max_output_tokens"] is None
+    assert call.await_args.kwargs["max_output_tokens"] == 128000
 
 
 @pytest.mark.asyncio

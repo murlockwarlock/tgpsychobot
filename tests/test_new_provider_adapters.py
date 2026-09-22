@@ -14,6 +14,7 @@ from provider_adapters import (
     call_openrouter,
     call_perplexity,
     format_perplexity_response,
+    normalize_provider_error_classification,
 )
 from provider_models import (
     OPENROUTER_MODEL_SPECS,
@@ -181,6 +182,25 @@ def test_provider_errors_are_normalized_and_retries_are_bounded():
             asyncio.run(call_openrouter("secret", layout(), "openai/gpt-5.6-terra"))
     assert error.value.classification == "quota"
     assert error.value.http_status == 402
+    assert normalize_provider_error_classification("quota") == "insufficient_balance_quota"
+    assert normalize_provider_error_classification("server_error") == "provider_5xx"
+    assert normalize_provider_error_classification("network") == "network_connection"
+    assert normalize_provider_error_classification("invalid_model") == "configuration"
+
+
+def test_new_provider_activity_tracker_marks_only_once():
+    class Tracker:
+        def __init__(self):
+            self.calls = 0
+
+        async def mark_outbound_attempt_once(self):
+            self.calls += 1
+
+    FakeClient.response = FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})
+    tracker = Tracker()
+    with patch("provider_adapters.httpx.AsyncClient", FakeClient):
+        assert asyncio.run(call_openrouter("secret", layout(), "openai/gpt-5.6-terra", activity_tracker=tracker)) == "ok"
+    assert tracker.calls == 1
 
 
 def test_provider_rejects_invalid_models_and_malformed_responses():

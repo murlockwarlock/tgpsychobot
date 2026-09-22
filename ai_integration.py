@@ -92,6 +92,7 @@ from provider_adapters import (
     call_deepgram,
     call_openrouter,
     call_perplexity,
+    normalize_provider_error_classification,
 )
 from vision_reliability import (
     VisionExecutionContext,
@@ -146,8 +147,10 @@ class AIResponseError(AIServiceError):
 
 def _wrap_provider_adapter_error(exc: ProviderAdapterError) -> AIServiceError:
     error = AIServiceError(str(exc))
-    error.classification = getattr(exc, "classification", "provider")
+    error.classification = normalize_provider_error_classification(getattr(exc, "classification", "provider"))
     error.http_status = getattr(exc, "http_status", None)
+    if getattr(exc, "provider_response_payload", None) is not None:
+        error.provider_response_payload = exc.provider_response_payload
     return error
 
 
@@ -2050,6 +2053,7 @@ async def get_ai_response(
                             max_output_tokens=output_tokens,
                             timeout=timeout,
                             request_capture=capture_dict,
+                            activity_tracker=activity_tracker,
                         )
                     except ProviderAdapterError as exc:
                         raise _wrap_provider_adapter_error(exc) from exc
@@ -2060,17 +2064,14 @@ async def get_ai_response(
                             p_api_key,
                             request_layout,
                             p_model,
-                            max_output_tokens=(
-                                effective_chat_output_tokens(
-                                    PROVIDER_PERPLEXITY,
-                                    p_model,
-                                    configured_perplexity_tokens,
-                                )
-                                if configured_perplexity_tokens is not None
-                                else None
+                            max_output_tokens=effective_chat_output_tokens(
+                                PROVIDER_PERPLEXITY,
+                                p_model,
+                                configured_perplexity_tokens,
                             ),
                             timeout=timeout,
                             request_capture=capture_dict,
+                            activity_tracker=activity_tracker,
                         )
                     except ProviderAdapterError as exc:
                         raise _wrap_provider_adapter_error(exc) from exc
@@ -3791,6 +3792,7 @@ async def analyze_image_content(
                             max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, primary_target_model),
                             timeout=prim_budget,
                             request_capture=prim_capture,
+                            activity_tracker=activity_tracker,
                         ),
                         prim_budget,
                     )
@@ -4033,6 +4035,7 @@ async def analyze_image_content(
                             max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, eff_fallback_model),
                             timeout=fb_stage_budget,
                             request_capture=fb_capture,
+                            activity_tracker=activity_tracker,
                         ),
                         fb_stage_budget,
                     )

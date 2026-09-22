@@ -19427,6 +19427,36 @@ async def get_ai_response_direct(
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
             )
+        elif provider_key == 'openrouter':
+            try:
+                response_text = await ai_integration.call_openrouter(
+                    api_key,
+                    request_layout,
+                    model,
+                    max_output_tokens=effective_chat_output_tokens(
+                        PROVIDER_OPENROUTER,
+                        model,
+                        getattr(ai_config, "max_output_tokens", None),
+                    ),
+                    activity_tracker=activity_tracker,
+                )
+            except ai_integration.ProviderAdapterError as exc:
+                raise ai_integration._wrap_provider_adapter_error(exc) from exc
+        elif provider_key == 'perplexity':
+            try:
+                response_text = await ai_integration.call_perplexity(
+                    api_key,
+                    request_layout,
+                    model,
+                    max_output_tokens=effective_chat_output_tokens(
+                        PROVIDER_PERPLEXITY,
+                        model,
+                        getattr(ai_config, "max_output_tokens", None),
+                    ),
+                    activity_tracker=activity_tracker,
+                )
+            except ai_integration.ProviderAdapterError as exc:
+                raise ai_integration._wrap_provider_adapter_error(exc) from exc
         else:
             return f"Ошибка: Неизвестный провайдер ИИ ({provider})."
 

@@ -25,6 +25,25 @@ class ProviderAdapterError(RuntimeError):
         self.classification = category
 
 
+_ADAPTER_CLASSIFICATION_MAP = {
+    "auth": "auth",
+    "quota": "insufficient_balance_quota",
+    "rate_limit": "rate_limit",
+    "timeout": "timeout",
+    "server_error": "provider_5xx",
+    "network": "network_connection",
+    "invalid_request": "provider_rejection",
+    "invalid_model": "configuration",
+    "malformed_response": "invalid_response",
+    "empty_response": "empty_response",
+    "provider": "unknown",
+}
+
+
+def normalize_provider_error_classification(category: str | None) -> str:
+    return _ADAPTER_CLASSIFICATION_MAP.get(str(category or "provider"), "unknown")
+
+
 @dataclass(frozen=True)
 class ProviderCitation:
     title: str
@@ -230,8 +249,14 @@ async def _post_json(
     timeout: float,
     provider: str,
     request_capture: dict | None,
+    activity_tracker: Any | None = None,
     retries: int = 1,
 ) -> dict[str, Any]:
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception:
+            pass
     if request_capture is not None:
         _capture_ai_request(request_capture, provider=provider, endpoint=url, payload=_capture_payload(payload))
     last_error: Exception | None = None
@@ -280,6 +305,7 @@ async def call_openrouter(
     max_output_tokens: int | None = None,
     timeout: float = 60.0,
     request_capture: dict | None = None,
+    activity_tracker: Any | None = None,
 ) -> str:
     if not api_key:
         raise ProviderAdapterError("API ключ OpenRouter не задан", category="auth")
@@ -291,6 +317,7 @@ async def call_openrouter(
         timeout=timeout,
         provider="OpenRouter",
         request_capture=request_capture,
+        activity_tracker=activity_tracker,
     )
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -313,6 +340,7 @@ async def call_perplexity(
     max_output_tokens: int | None = None,
     timeout: float = 90.0,
     request_capture: dict | None = None,
+    activity_tracker: Any | None = None,
 ) -> str:
     if not api_key:
         raise ProviderAdapterError("API ключ Perplexity не задан", category="auth")
@@ -324,6 +352,7 @@ async def call_perplexity(
         timeout=timeout,
         provider="Perplexity",
         request_capture=request_capture,
+        activity_tracker=activity_tracker,
     )
     if request_capture is not None and isinstance(data.get("usage"), dict):
         request_capture["usage"] = data["usage"]
@@ -338,6 +367,7 @@ async def call_deepgram(
     model: str = DEEPGRAM_DEFAULT_MODEL,
     timeout: float = 60.0,
     request_capture: dict | None = None,
+    activity_tracker: Any | None = None,
 ) -> str:
     if not api_key:
         raise ProviderAdapterError("API ключ Deepgram не задан", category="auth")
@@ -355,6 +385,11 @@ async def call_deepgram(
             payload={"model": model, "language": "multi", "smart_format": True},
         )
     last_error: Exception | None = None
+    if activity_tracker is not None:
+        try:
+            await activity_tracker.mark_outbound_attempt_once()
+        except Exception:
+            pass
     for attempt in range(2):
         try:
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
