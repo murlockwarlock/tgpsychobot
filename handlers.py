@@ -12,6 +12,7 @@ import textwrap
 import json
 import zipfile
 import time
+from typing import Any
 from collections import OrderedDict, deque
 import secrets
 from dataclasses import dataclass, replace
@@ -293,8 +294,10 @@ from translation_pack_manager import (
     commit_readiness_critical_mutation,
     export_translation_pack,
     get_locale_readiness,
+    humanize_translation_pack_errors,
     import_translation_pack,
     translation_coordination_lock,
+    validate_translation_pack,
 )
 from translation_registry import build_translation_registry
 from card_spreads import extract_numbered_spread_definition
@@ -1123,6 +1126,7 @@ class AdminStates(StatesGroup):
     add_referral_template = State()
     edit_referral_template = State()
     upload_translation_pack = State()
+    confirm_translation_pack = State()
 
 
 class UserStates(StatesGroup):
@@ -19430,51 +19434,235 @@ async def _admin_language_config_and_readiness():
                 registry,
                 locales=("en", "pt"),
             )
-            return config, readiness
+            return config, readiness, _translation_database_label(session)
+
+
+def _translation_database_label(session) -> str:
+    database = getattr(getattr(session.get_bind(), "url", None), "database", None)
+    value = str(database or "database").replace("\\", "/").rsplit("/", 1)[-1]
+    if value == ":memory:":
+        return "memory"
+    for suffix in (".sqlite3", ".sqlite", ".db"):
+        if value.lower().endswith(suffix):
+            value = value[:-len(suffix)]
+            break
+    return value or "database"
+
+
+def _translation_pack_target(bot_info, database_label: str) -> dict[str, Any]:
+    return {
+        "telegram_bot_id": int(bot_info.id),
+        "telegram_username": getattr(bot_info, "username", None) or "",
+        "database": database_label,
+    }
+
+
+def _translation_pack_filename(target: dict[str, Any], locale: str) -> str:
+    def safe_part(value: Any) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "").lower()).strip("_-")
+        return normalized[:48] or "bot"
+
+    database = safe_part(target.get("database"))
+    username = safe_part(target.get("telegram_username") or target.get("telegram_bot_id"))
+    return f"telegram_translations_{database}_{username}_{locale}.json"
+
+
+def _language_bot_label(bot_info) -> str:
+    name = html.escape(getattr(bot_info, "first_name", None) or "Telegram-бот")
+    username = getattr(bot_info, "username", None)
+    if username:
+        return f"🤖 Бот: <b>{name}</b> (@{html.escape(username)})"
+    return f"🤖 Бот: <b>{name}</b> (ID <code>{int(bot_info.id)}</code>)"
+
+
+def _language_readiness_status(readiness, locale: str) -> str:
+    report = get_locale_readiness(readiness, locale)
+    if report.get("canonical"):
+        return "✅ канонический источник"
+    return "✅ готов" if report.get("ready") else "❌ не готов"
 
 
 def _language_readiness_summary(readiness, locale: str) -> str:
     report = get_locale_readiness(readiness, locale)
+    status = _language_readiness_status(readiness, locale)
     if report.get("canonical"):
-        return "✅ источник"
+        return status
     missing = len(report.get("missing", []))
     stale = len(report.get("stale", []))
     invalid = len(report.get("invalid", []))
     if report.get("ready"):
-        return f"✅ готов · {report.get('translated', 0)}/{report.get('required', 0)}"
-    return f"❌ не готов: пропущено {missing}, устарело {stale}, ошибок {invalid}"
+        return f"{status} · {report.get('translated', 0)}/{report.get('required', 0)}"
+    return f"{status} · отсутствует {missing}, устарело {stale}, ошибок {invalid}"
 
 
-def _language_locale_text(config, locale: str, readiness) -> str:
+def _language_overview_text(config, readiness, bot_label: str = "") -> str:
+    enabled = set(normalize_enabled_languages(config.telegram_enabled_languages))
+    default_locale = normalize_locale(config.telegram_default_language) or "ru"
+    selector_enabled = bool(config.telegram_language_selection_enabled)
+    lines = ["🌐 <b>Языки Telegram</b>"]
+    if bot_label:
+        lines.extend(("", bot_label))
+    lines.extend(
+        (
+            "",
+            f"Язык по умолчанию: <b>{LOCALE_LABELS[default_locale]}</b>",
+            f"Выбор языка пользователем: <b>{'Включён' if selector_enabled else 'Выключен'}</b>",
+            "Если выбор выключен, все пользователи получают ответы на русском. "
+            "Сохранённые предпочтения при этом не удаляются.",
+            "",
+            "Доступные языки:",
+        )
+    )
+    for locale in ("ru", "en", "pt"):
+        enabled_mark = "✅" if locale in enabled else "❌"
+        default_mark = " · по умолчанию" if locale == default_locale else ""
+        lines.append(f"{enabled_mark} {LOCALE_LABELS[locale]}{default_mark}")
+    lines.extend(("", "Готовность переводов:"))
+    for locale in ("en", "pt"):
+        lines.append(
+            f"{LOCALE_LABELS[locale]} — {_language_readiness_status(readiness, locale)}"
+        )
+    return "\n".join(lines)
+
+
+def _language_readiness_text(readiness, bot_label: str = "") -> str:
+    lines = ["🔎 <b>Проверка готовности переводов</b>"]
+    if bot_label:
+        lines.extend(("", bot_label))
+    lines.extend(("", "🇷🇺 Русский — канонический источник"))
+    for locale in ("en", "pt"):
+        report = get_locale_readiness(readiness, locale)
+        status = _language_readiness_status(readiness, locale)
+        translated = report.get("translated", 0)
+        required = report.get("required", 0)
+        missing = len(report.get("missing", []))
+        stale = len(report.get("stale", []))
+        invalid = len(report.get("invalid", []))
+        lines.extend(
+            (
+                "",
+                f"<b>{LOCALE_LABELS[locale]} — {status}</b>",
+                f"Обязательных: {translated} / {required}",
+                f"Отсутствует: {missing} · Устарело: {stale} · Ошибок: {invalid}",
+            )
+        )
+        if stale:
+            lines.append("Перевод устарел после изменения русского текста.")
+        if not report.get("ready"):
+            lines.append(
+                f"Дальше: экспортируйте актуальный шаблон {locale.upper()}, "
+                f"исправьте перевод и загрузите его через «Импорт {locale.upper()}»."
+            )
+    return "\n".join(lines)
+
+
+def _language_locale_text(
+    config,
+    locale: str,
+    readiness,
+    bot_label: str = "",
+    database_label: str = "",
+    bot_id: int | None = None,
+) -> str:
     enabled = locale in normalize_enabled_languages(config.telegram_enabled_languages)
     default_locale = normalize_locale(config.telegram_default_language) or "ru"
     report = get_locale_readiness(readiness, locale)
+    lines = []
+    if bot_label:
+        lines.extend((bot_label, ""))
+    if database_label or bot_id is not None:
+        technical = []
+        if database_label:
+            technical.append(f"база <code>{html.escape(database_label)}</code>")
+        if bot_id is not None:
+            technical.append(f"ID бота <code>{int(bot_id)}</code>")
+        lines.append("Технические данные: " + " · ".join(technical))
+    if lines:
+        lines.append("")
     if report.get("canonical"):
-        return (
-            f"{LOCALE_LABELS[locale]}\n\n"
-            "Статус перевода: ✅ канонический источник\n"
-            f"Включён: {'✅' if enabled else '❌'}\n"
-            f"По умолчанию: {'✅' if locale == default_locale else '❌'}"
+        lines.extend(
+            (
+                f"<b>{LOCALE_LABELS[locale]}</b>",
+                "Статус перевода: ✅ канонический источник",
+                f"Включён: {'✅' if enabled else '❌'}",
+                f"Язык по умолчанию: {'✅' if locale == default_locale else '❌'}",
+            )
         )
-    return (
-        f"{LOCALE_LABELS[locale]}\n\n"
-        f"Статус перевода: {_language_readiness_summary(readiness, locale)}\n"
-        f"Включён: {'✅' if enabled else '❌'}\n"
-        f"По умолчанию: {'✅' if locale == default_locale else '❌'}\n\n"
-        f"Переведено: {report.get('translated', 0)} / {report.get('required', 0)}\n"
-        f"Отсутствует: {len(report.get('missing', []))}\n"
-        f"Устарело: {len(report.get('stale', []))}\n"
-        f"Ошибок: {len(report.get('invalid', []))}"
+        return "\n".join(lines)
+    lines.extend(
+        (
+            f"<b>{LOCALE_LABELS[locale]}</b>",
+            f"Статус перевода: {_language_readiness_summary(readiness, locale)}",
+            f"Включён: {'✅' if enabled else '❌'}",
+            f"Язык по умолчанию: {'✅' if locale == default_locale else '❌'}",
+            "",
+            f"Обязательных: {report.get('translated', 0)} / {report.get('required', 0)}",
+            f"Отсутствует: {len(report.get('missing', []))}",
+            f"Устарело: {len(report.get('stale', []))}",
+            f"Ошибок: {len(report.get('invalid', []))}",
+        )
     )
+    if report.get("stale"):
+        lines.extend(
+            (
+                "",
+                "Перевод устарел после изменения русского текста.",
+                f"Экспортируйте обновлённый шаблон {locale.upper()}, внесите исправления "
+                f"и загрузите его через «Импорт {locale.upper()}».",
+            )
+        )
+    elif not report.get("ready"):
+        lines.extend(
+            (
+                "",
+                f"Чтобы исправить перевод, экспортируйте шаблон {locale.upper()}, "
+                f"заполните его и загрузите через «Импорт {locale.upper()}».",
+            )
+        )
+    else:
+        lines.extend(("", "Перевод соответствует текущему русскому тексту."))
+    return "\n".join(lines)
+
+
+def _set_ru_only_language_config(config) -> None:
+    config.telegram_default_language = "ru"
+    config.telegram_enabled_languages = '["ru"]'
+    config.telegram_language_selection_enabled = False
 
 
 async def _show_admin_language_locale(callback: CallbackQuery, locale: str):
-    config, readiness = await _admin_language_config_and_readiness()
+    bot_info = await callback.bot.get_me()
+    config, readiness, database_label = await _admin_language_config_and_readiness()
     report = get_locale_readiness(readiness, locale)
     await callback.message.edit_text(
-        _language_locale_text(config, locale, readiness),
+        _language_locale_text(
+            config,
+            locale,
+            readiness,
+            _language_bot_label(bot_info),
+            database_label,
+            bot_info.id,
+        ),
         parse_mode="HTML",
         reply_markup=kb.admin_language_locale_keyboard(config, locale, report),
+    )
+    await callback.answer()
+
+
+async def _show_admin_language_settings(callback: CallbackQuery, notice: str = ""):
+    bot_info = await callback.bot.get_me()
+    config, readiness, _ = await _admin_language_config_and_readiness()
+    text = _language_overview_text(
+        config,
+        readiness,
+        _language_bot_label(bot_info),
+    )
+    if notice:
+        text = notice + "\n\n" + text
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=kb.admin_language_settings_keyboard(config, readiness),
     )
     await callback.answer()
 
@@ -19484,33 +19672,7 @@ async def admin_language_settings(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    config, readiness = await _admin_language_config_and_readiness()
-    enabled = normalize_enabled_languages(config.telegram_enabled_languages)
-    default_locale = normalize_locale(config.telegram_default_language) or "ru"
-    lines = [
-        "🌐 <b>Языки Telegram</b>",
-        "",
-        f"По умолчанию: <b>{LOCALE_LABELS[default_locale]}</b>",
-        f"Выбор языка: <b>{'🟢 включён' if config.telegram_language_selection_enabled else '❌ выключен'}</b>",
-        "",
-    ]
-    for locale in ("ru", "en", "pt"):
-        status = "✅ включён" if locale in enabled else "❌ выключен"
-        default_mark = " · ⭐ по умолчанию" if locale == default_locale else ""
-        lines.append(
-            f"{LOCALE_LABELS[locale]}\n"
-            f"{status}{default_mark} · {_language_readiness_summary(readiness, locale)}"
-        )
-    text = "\n".join(lines)
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=kb.admin_language_settings_keyboard(
-            config,
-            readiness,
-        ),
-    )
-    await callback.answer()
+    await _show_admin_language_settings(callback)
 
 
 @router.callback_query(F.data.startswith("admin_language_locale_"))
@@ -19540,8 +19702,27 @@ async def admin_language_toggle_selector(callback: CallbackQuery):
             enabled = normalize_enabled_languages(config.telegram_enabled_languages)
             new_value = not bool(config.telegram_language_selection_enabled)
             if new_value and len(enabled) < 2:
-                await callback.answer("Сначала включите EN или PT.", show_alert=True)
+                await callback.answer("Сначала включите готовый перевод EN или PT.", show_alert=True)
                 return
+            if new_value:
+                registry = await build_translation_registry(session)
+                readiness = await audit_translation_readiness(
+                    session,
+                    registry,
+                    locales=tuple(locale for locale in ("en", "pt") if locale in enabled),
+                )
+                not_ready = [
+                    locale
+                    for locale in ("en", "pt")
+                    if locale in enabled and not get_locale_readiness(readiness, locale)["ready"]
+                ]
+                if not_ready:
+                    labels = " и ".join(LOCALE_LABELS[locale] for locale in not_ready)
+                    await callback.answer(
+                        f"Нельзя включить выбор языка: {labels} не готов. Сначала обновите перевод.",
+                        show_alert=True,
+                    )
+                    return
             config.telegram_language_selection_enabled = new_value
             await session.commit()
     await admin_language_settings(callback)
@@ -19556,6 +19737,41 @@ async def admin_language_set_default(callback: CallbackQuery):
     if locale is None:
         await callback.answer("Неизвестный язык.", show_alert=True)
         return
+    if locale != "ru":
+        await callback.answer("Язык по умолчанию — русский.", show_alert=True)
+        return
+    await callback.answer("Язык по умолчанию — русский.")
+
+
+@router.callback_query(F.data == "admin_language_ru_only")
+async def admin_language_ru_only(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    bot_info = await callback.bot.get_me()
+    config, _, database_label = await _admin_language_config_and_readiness()
+    technical = (
+        f"Технические данные: база <code>{html.escape(database_label)}</code> · "
+        f"ID бота <code>{int(bot_info.id)}</code>"
+    )
+    await callback.message.edit_text(
+        f"↩️ <b>Вернуть только русский?</b>\n\n"
+        f"{_language_bot_label(bot_info)}\n"
+        f"Текущий выбор языка: {'включён' if config.telegram_language_selection_enabled else 'выключен'}.\n\n"
+        "После подтверждения язык по умолчанию станет русским, EN и PT будут выключены, "
+        "а выбор языка пользователей отключится. Переводы сохранятся и их можно будет включить снова.\n\n"
+        f"{technical}",
+        parse_mode="HTML",
+        reply_markup=kb.admin_language_ru_only_confirmation_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_language_ru_only_confirm")
+async def admin_language_ru_only_confirm(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
     async with async_session_maker() as session:
         async with translation_coordination_lock(session):
             config = await session.get(BotGeneralConfig, 1)
@@ -19563,21 +19779,22 @@ async def admin_language_set_default(callback: CallbackQuery):
                 config = BotGeneralConfig(id=1)
                 session.add(config)
                 await session.flush()
-            enabled = normalize_enabled_languages(config.telegram_enabled_languages)
-            if locale not in enabled:
-                await callback.answer("Сначала включите этот язык.", show_alert=True)
-                return
-            if locale != "ru":
-                registry = await build_translation_registry(session)
-                readiness = await audit_translation_readiness(session, registry, locales=(locale,))
-                if not get_locale_readiness(readiness, locale)["ready"]:
-                    await callback.answer("Язык нельзя сделать основным: пакет не готов.", show_alert=True)
-                    return
-            config.telegram_default_language = locale
+            _set_ru_only_language_config(config)
             await session.commit()
     user_commands, _, _ = await build_command_sets()
     await refresh_default_commands(callback.bot, user_commands)
-    await admin_language_settings(callback)
+    await _show_admin_language_settings(
+        callback,
+        "✅ Включён режим «только русский». Переводы EN/PT сохранены.",
+    )
+
+
+@router.callback_query(F.data == "admin_language_ru_only_cancel")
+async def admin_language_ru_only_cancel(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await _show_admin_language_settings(callback, "Изменения не внесены.")
 
 
 @router.callback_query(F.data.startswith("admin_language_toggle_"))
@@ -19629,26 +19846,12 @@ async def admin_translation_audit(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    config, readiness = await _admin_language_config_and_readiness()
-    lines = ["🔎 <b>Аудит готовности переводов</b>"]
-    for locale in ("ru", "en", "pt"):
-        if locale == "ru":
-            lines.append("🇷🇺 Русский: канонический источник")
-            continue
-        report = get_locale_readiness(readiness, locale)
-        lines.append(
-            f"{LOCALE_LABELS[locale]}: {_language_readiness_summary(readiness, locale)}"
-        )
-        if report.get("missing"):
-            lines.append("Примеры отсутствующих: " + ", ".join(report["missing"][:5]))
-        if report.get("stale"):
-            lines.append("Примеры устаревших: " + ", ".join(report["stale"][:5]))
-    if readiness.get("orphaned"):
-        lines.append("Сиротские записи: " + ", ".join(readiness["orphaned"][:5]))
+    bot_info = await callback.bot.get_me()
+    _, readiness, _ = await _admin_language_config_and_readiness()
     await callback.message.edit_text(
-        "\n".join(lines),
+        _language_readiness_text(readiness, _language_bot_label(bot_info)),
         parse_mode="HTML",
-        reply_markup=kb.back_to_previous_menu("admin_language_settings"),
+        reply_markup=kb.admin_translation_readiness_keyboard(),
     )
     await callback.answer()
 
@@ -19682,15 +19885,23 @@ async def admin_translation_export(callback: CallbackQuery):
     if locale not in {"en", "pt"}:
         await callback.answer("Сначала выберите EN или PT.", show_alert=True)
         return
+    bot_info = await callback.bot.get_me()
     async with async_session_maker() as session:
         async with translation_coordination_lock(session):
             registry = await build_translation_registry(session)
-            pack = await export_translation_pack(session, registry, locale=locale)
+            target = _translation_pack_target(bot_info, _translation_database_label(session))
+            pack = await export_translation_pack(
+                session,
+                registry,
+                locale=locale,
+                target=target,
+            )
     payload = json.dumps(pack, ensure_ascii=False, indent=2).encode("utf-8")
     await callback.message.answer_document(
-        BufferedInputFile(payload, filename=f"telegram_translations_{locale}.json"),
+        BufferedInputFile(payload, filename=_translation_pack_filename(target, locale)),
         caption=(
-            f"📤 Пакет переводов {LOCALE_LABELS[locale]} ({locale.upper()}).\n\n"
+            f"📤 Пакет {LOCALE_LABELS[locale]} для "
+            f"{_language_bot_label(bot_info)}.\n\n"
             f"После редактирования отправьте его через «Импорт {locale.upper()}»."
         ),
     )
@@ -19705,7 +19916,7 @@ async def admin_translation_import_legacy(callback: CallbackQuery):
     await callback.answer("Выберите EN или PT, чтобы импортировать один язык.", show_alert=True)
 
 
-@router.callback_query(F.data.startswith("admin_translation_import_"))
+@router.callback_query(F.data.in_({"admin_translation_import_en", "admin_translation_import_pt"}))
 async def admin_translation_import_start(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
@@ -19714,13 +19925,20 @@ async def admin_translation_import_start(callback: CallbackQuery, state: FSMCont
     if locale not in {"en", "pt"}:
         await callback.answer("Сначала выберите EN или PT.", show_alert=True)
         return
+    bot_info = await callback.bot.get_me()
+    async with async_session_maker() as session:
+        target = _translation_pack_target(bot_info, _translation_database_label(session))
+    await state.clear()
     await state.set_state(AdminStates.upload_translation_pack)
-    await state.update_data(translation_locale=locale)
+    await state.update_data(translation_locale=locale, translation_target=target)
     await callback.message.edit_text(
-        f"📥 Отправьте JSON-файл пакета {LOCALE_LABELS[locale]} ({locale.upper()}).\n"
-        "Запись будет выполнена только после полной проверки.\n\n"
-        "Для отмены нажмите кнопку ниже.",
-        reply_markup=kb.back_to_previous_menu(f"admin_language_locale_{locale}"),
+        f"📥 <b>Импортировать перевод {locale.upper()}</b>\n\n"
+        f"{_language_bot_label(bot_info)}\n"
+        f"База: <code>{html.escape(target['database'])}</code>\n\n"
+        f"Отправьте один JSON-файл пакета {LOCALE_LABELS[locale]}. "
+        "Перед записью бот проверит язык, соответствие этому боту и качество перевода.",
+        parse_mode="HTML",
+        reply_markup=kb.admin_translation_import_upload_keyboard(locale),
     )
     await callback.answer()
 
@@ -19736,16 +19954,69 @@ async def admin_translation_import_file(message: Message, state: FSMContext, bot
         await state.clear()
         await message.answer("❌ Не выбран язык импорта. Откройте управление EN или PT заново.")
         return
+    filename = getattr(message.document, "file_name", None) or ""
+    if not filename.lower().endswith(".json"):
+        await message.answer("❌ Нужен один JSON-файл. Переводы не изменены.")
+        return
+    file_size = getattr(message.document, "file_size", None)
+    if file_size is not None and file_size > 4 * 1024 * 1024:
+        await message.answer("❌ Файл больше 4 МБ. Экспортируйте актуальный шаблон и проверьте его размер.")
+        return
     pack = None
     try:
         file_obj = await bot.get_file(message.document.file_id)
         file_bytes = await bot.download_file(file_obj.file_path)
         raw = file_bytes.read() if hasattr(file_bytes, "read") else bytes(file_bytes)
+        if len(raw) > 4 * 1024 * 1024:
+            await message.answer("❌ Файл больше 4 МБ. Экспортируйте актуальный шаблон и проверьте его размер.")
+            return
         pack = json.loads(raw.decode("utf-8"))
-        count = await import_translation_pack(
-            async_session_maker,
-            pack,
-            expected_locale=expected_locale,
+        if not isinstance(pack, dict):
+            raise TranslationPackValidationError(["pack must be an object"])
+        if pack.get("locale") != expected_locale:
+            raise TranslationPackValidationError(
+                [f"pack locale {pack.get('locale')} does not match expected locale {expected_locale}"]
+            )
+        bot_info = await bot.get_me()
+        async with async_session_maker() as session:
+            async with translation_coordination_lock(session):
+                registry = await build_translation_registry(session)
+                target = _translation_pack_target(bot_info, _translation_database_label(session))
+                validate_translation_pack(
+                    pack,
+                    registry,
+                    required_locales=(expected_locale,),
+                    expected_locale=expected_locale,
+                    expected_target=target,
+                )
+        report = {
+            "locale": expected_locale,
+            "count": len(pack["translations"]),
+            "required": len(registry.required_keys()),
+            "missing": 0,
+            "stale": 0,
+            "invalid": 0,
+        }
+        await state.set_state(AdminStates.confirm_translation_pack)
+        await state.update_data(
+            translation_locale=expected_locale,
+            translation_pack=pack,
+            translation_target=target,
+            translation_preview=report,
+        )
+        await message.answer(
+            "🔎 <b>Проверьте пакет перед записью</b>\n\n"
+            f"{_language_bot_label(bot_info)}\n"
+            f"База: <code>{html.escape(target['database'])}</code>\n"
+            f"Язык: {LOCALE_LABELS[expected_locale]}\n"
+            f"Записей в файле: {report['count']}\n"
+            f"Обязательных переводов: {report['required']}\n"
+            "Отсутствует: 0\nУстарело: 0\nОшибок: 0\n"
+            "Проверка пакета: ✅ готов к импорту\n"
+            "Совпадает с этим ботом и базой: ✅\n\n"
+            "Записи появятся только после подтверждения.",
+            parse_mode="HTML",
+            reply_markup=kb.admin_translation_import_confirmation_keyboard(expected_locale),
         )
     except (UnicodeDecodeError, json.JSONDecodeError, TranslationPackValidationError, ValueError) as exc:
         if isinstance(pack, dict) and pack.get("locale") != expected_locale:
@@ -19754,22 +20025,104 @@ async def admin_translation_import_file(message: Message, state: FSMContext, bot
                 f"а сейчас ожидается пакет {expected_locale.upper()}."
             )
             return
-        errors = getattr(exc, "errors", (str(exc),))
-        await message.answer("❌ Пакет отклонён:\n" + "\n".join(f"• {item}" for item in tuple(errors)[:20]))
+        if isinstance(exc, UnicodeDecodeError):
+            messages = ("Файл не читается как UTF-8. Экспортируйте новый шаблон и сохраните его в формате JSON.",)
+        elif isinstance(exc, json.JSONDecodeError):
+            messages = ("Файл не является корректным JSON. Исправьте его или экспортируйте новый шаблон.",)
+        else:
+            messages = humanize_translation_pack_errors(
+                getattr(exc, "errors", (str(exc),)),
+                expected_locale=expected_locale,
+            )
+        await message.answer(
+            "❌ Пакет не принят. Переводы не изменены.\n"
+            + "\n".join(f"• {item}" for item in messages)
+        )
         return
     except Exception:
         logging.exception("Translation pack import failed")
-        await message.answer("❌ Не удалось импортировать пакет. Переводы не изменены.")
+        await message.answer("❌ Не удалось проверить файл. Переводы не изменены. Попробуйте ещё раз или экспортируйте новый шаблон.")
         return
+
+
+@router.callback_query(F.data == "admin_translation_import_confirm")
+async def admin_translation_import_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await is_admin(callback.from_user.id):
+        await state.clear()
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    data = await state.get_data()
+    locale = normalize_locale(data.get("translation_locale"))
+    pack = data.get("translation_pack")
+    if (
+        await state.get_state() != AdminStates.confirm_translation_pack.state
+        or locale not in {"en", "pt"}
+        or not isinstance(pack, dict)
+    ):
+        await state.clear()
+        await callback.answer("Предварительная проверка истекла. Загрузите пакет заново.", show_alert=True)
+        return
+    try:
+        bot_info = await bot.get_me()
+        async with async_session_maker() as session:
+            target = _translation_pack_target(bot_info, _translation_database_label(session))
+        count = await import_translation_pack(
+            async_session_maker,
+            pack,
+            expected_locale=locale,
+            expected_target=target,
+        )
+    except (TranslationPackValidationError, ValueError) as exc:
+        messages = humanize_translation_pack_errors(
+            getattr(exc, "errors", (str(exc),)),
+            expected_locale=locale,
+        )
+        await callback.message.edit_text(
+            "❌ Пакет не принят. Переводы не изменены.\n"
+            + "\n".join(f"• {item}" for item in messages),
+            reply_markup=kb.admin_translation_import_upload_keyboard(locale),
+        )
+        await state.set_state(AdminStates.upload_translation_pack)
+        await state.update_data(translation_pack=None)
+        await callback.answer()
+        return
+    except Exception:
+        logging.exception("Translation pack import failed")
+        await callback.answer(
+            "Не удалось завершить импорт. Проверьте готовность и повторите попытку.",
+            show_alert=True,
+        )
+        return
+
     await state.clear()
-    await message.answer(f"✅ Импортировано записей: {count}.")
-    callback_mock = SimpleNamespace(
-        data=f"admin_language_locale_{expected_locale}",
-        message=message,
-        from_user=message.from_user,
-        answer=lambda *args, **kwargs: asyncio.sleep(0),
+    bot_info = await bot.get_me()
+    config, readiness, database_label = await _admin_language_config_and_readiness()
+    report = get_locale_readiness(readiness, locale)
+    await callback.message.edit_text(
+        f"✅ Импортировано записей: {count}.\n\n"
+        + _language_locale_text(
+            config,
+            locale,
+            readiness,
+            _language_bot_label(bot_info),
+            database_label,
+            bot_info.id,
+        ),
+        parse_mode="HTML",
+        reply_markup=kb.admin_language_locale_keyboard(config, locale, report),
     )
-    await _show_admin_language_locale(callback_mock, expected_locale)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_translation_import_cancel")
+async def admin_translation_import_cancel(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await state.clear()
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    locale = normalize_locale((await state.get_data()).get("translation_locale"))
+    await state.clear()
+    await _show_admin_language_locale(callback, locale if locale in {"en", "pt"} else "ru")
 
 
 @router.callback_query(F.data == "admin_general_toggle_ai_processing_message")

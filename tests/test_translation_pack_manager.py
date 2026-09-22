@@ -70,6 +70,80 @@ async def test_export_translation_pack_contains_exactly_one_locale(tmp_path, loc
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_export_translation_pack_can_bind_file_to_bot_and_database(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bound-export.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        async with sessions() as session:
+            pack = await export_translation_pack(
+                session,
+                _registry(),
+                locale="en",
+                target={"telegram_bot_id": 123, "database": "someone01"},
+            )
+
+        assert pack["target"] == {"telegram_bot_id": 123, "database": "someone01"}
+    finally:
+        await engine.dispose()
+
+
+def test_pack_target_must_match_the_selected_bot_and_database():
+    registry = _registry()
+    pack = _single_locale_pack(registry)
+    pack["target"] = {"telegram_bot_id": 123, "database": "someone01"}
+    expected_target = {"telegram_bot_id": 123, "database": "someone01"}
+
+    validate_translation_pack(
+        pack,
+        registry,
+        required_locales=("en",),
+        expected_locale="en",
+        expected_target=expected_target,
+    )
+
+    for target in (
+        {"telegram_bot_id": 456, "database": "someone01"},
+        {"telegram_bot_id": 123, "database": "another_bot"},
+        None,
+    ):
+        invalid = {**pack}
+        if target is None:
+            invalid.pop("target")
+        else:
+            invalid["target"] = target
+        with pytest.raises(TranslationPackValidationError):
+            validate_translation_pack(
+                invalid,
+                registry,
+                required_locales=("en",),
+                expected_locale="en",
+                expected_target=expected_target,
+            )
+
+
+def test_translation_pack_errors_are_explained_in_russian():
+    from translation_pack_manager import humanize_translation_pack_errors
+
+    messages = humanize_translation_pack_errors(
+        [
+            "pack target database does not match",
+            "stale source hash: ui.one",
+            "invalid translation en/ui.format: placeholders differ",
+            "missing required translation: en/ui.one",
+        ],
+        expected_locale="en",
+    )
+
+    assert any("другого бота" in message for message in messages)
+    assert any("изменения русского текста" in message.lower() for message in messages)
+    assert any("плейсхолдеры" in message.lower() for message in messages)
+    assert any("обязательных переводов" in message.lower() for message in messages)
+
+
 def test_translation_pack_rejects_mixed_ru_or_unexpected_locales():
     registry = _registry()
     valid_en = _valid_entry(registry, "ui.one", "One")
@@ -161,6 +235,34 @@ async def test_import_rejects_unexpected_locale_without_writes(tmp_path):
                 ),
                 registry=registry,
                 expected_locale="en",
+            )
+
+        async with sessions() as session:
+            assert await session.scalar(select(func.count()).select_from(BotTranslation)) == 0
+            assert await session.get(BotGeneralConfig, 1) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_import_rejects_wrong_bot_target_without_writes_or_revision_change(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'wrong-target.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    registry = _registry()
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        pack = _single_locale_pack(registry)
+        pack["target"] = {"telegram_bot_id": 123, "database": "someone01"}
+
+        with pytest.raises(TranslationPackValidationError):
+            await import_translation_pack(
+                sessions,
+                pack,
+                registry=registry,
+                expected_locale="en",
+                expected_target={"telegram_bot_id": 456, "database": "someone01"},
             )
 
         async with sessions() as session:

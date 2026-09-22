@@ -58,18 +58,75 @@ def get_locale_readiness(readiness: dict[str, Any], locale: str) -> dict[str, An
     )
 
 
+def humanize_translation_pack_errors(
+    errors: list[str] | tuple[str, ...],
+    *,
+    expected_locale: str | None = None,
+) -> tuple[str, ...]:
+    combined = "\n".join(str(error) for error in errors).lower()
+    messages: list[str] = []
+    if "pack target" in combined:
+        messages.append(
+            "Этот файл перевода создан для другой версии или другого бота. "
+            "Экспортируйте пакет на экране этого бота."
+        )
+    if "pack locale" in combined or "entry locale" in combined or "unsupported locale" in combined:
+        if expected_locale in TRANSLATION_PACK_LOCALES:
+            messages.append(
+                f"В файле указан другой язык. Здесь ожидается пакет {expected_locale.upper()}."
+            )
+        else:
+            messages.append("В файле указан неподдерживаемый язык.")
+    if "schema_version" in combined:
+        messages.append("Формат файла устарел. Экспортируйте новый шаблон из этого меню.")
+    if "stale source hash" in combined:
+        messages.append(
+            "Перевод устарел после изменения русского текста. "
+            "Экспортируйте актуальный шаблон и перенесите переводы."
+        )
+    missing_count = sum("missing required translation" in str(error).lower() for error in errors)
+    if missing_count:
+        messages.append(f"Не хватает обязательных переводов: {missing_count}.")
+    if "invalid translation" in combined or "replykeyboard collision" in combined:
+        messages.append(
+            "Проверьте плейсхолдеры, HTML-разметку, кнопки, ссылки и ограничения Telegram."
+        )
+    if "duplicate translation entry" in combined:
+        messages.append("В файле есть повторяющиеся записи. Удалите дубликаты и загрузите файл снова.")
+    if "unknown translation key" in combined:
+        messages.append("В файле есть записи, которых нет в текущем наборе переводов этого бота.")
+    if "empty required translation" in combined:
+        messages.append("Заполните все обязательные переводы.")
+    if "translations must be a list" in combined or "pack must be an object" in combined:
+        messages.append("Структура файла не распознана. Экспортируйте актуальный шаблон.")
+    if "russian is the canonical source" in combined:
+        messages.append("Русский — исходный язык; импортировать можно только EN или PT.")
+    if not messages:
+        messages.append("Файл не прошёл проверку. Переводы не изменены.")
+    return tuple(dict.fromkeys(messages))
+
+
 def validate_translation_pack(
     pack: dict[str, Any],
     registry: TranslationRegistry,
     *,
     required_locales: tuple[str, ...] = (),
     expected_locale: str | None = None,
+    expected_target: dict[str, Any] | None = None,
 ) -> None:
     errors: list[str] = []
     if not isinstance(pack, dict):
         raise TranslationPackValidationError(["pack must be an object"])
     if pack.get("schema_version") != TRANSLATION_PACK_SCHEMA_VERSION:
         errors.append(f"schema_version must be {TRANSLATION_PACK_SCHEMA_VERSION}")
+    if expected_target is not None:
+        target = pack.get("target")
+        if not isinstance(target, dict):
+            errors.append("pack target is missing")
+        else:
+            for field in ("telegram_bot_id", "database"):
+                if target.get(field) != expected_target.get(field):
+                    errors.append(f"pack target {field} does not match")
     pack_locale = pack.get("locale")
     if pack_locale not in TRANSLATION_PACK_LOCALES:
         errors.append(f"unsupported pack locale: {pack_locale}")
@@ -155,6 +212,7 @@ async def export_translation_pack(
     registry: TranslationRegistry,
     *,
     locale: str,
+    target: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if locale not in TRANSLATION_PACK_LOCALES:
         raise ValueError(f"unsupported translation pack locale: {locale}")
@@ -179,11 +237,14 @@ async def export_translation_pack(
                 "text": stored.get((locale, key), ""),
             }
         )
-    return {
+    pack = {
         "schema_version": TRANSLATION_PACK_SCHEMA_VERSION,
         "locale": locale,
         "translations": entries,
     }
+    if target is not None:
+        pack["target"] = target
+    return pack
 
 
 async def _acquire_translation_lock(session) -> None:
@@ -434,6 +495,7 @@ async def import_translation_pack(
     registry: TranslationRegistry | None = None,
     required_locales: tuple[str, ...] | None = None,
     expected_locale: str | None = None,
+    expected_target: dict[str, Any] | None = None,
 ) -> int:
     from translation_registry import build_translation_registry
 
@@ -456,6 +518,7 @@ async def import_translation_pack(
                 active_registry,
                 required_locales=required_locales,
                 expected_locale=expected_locale,
+                expected_target=expected_target,
             )
             entries = pack["translations"]
             bind = session.get_bind()
