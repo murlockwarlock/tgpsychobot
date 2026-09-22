@@ -72,6 +72,9 @@ from provider_models import (
     PROVIDER_GEMINI,
     PROVIDER_KIE,
     PROVIDER_OPENAI,
+    PROVIDER_OPENROUTER,
+    PROVIDER_PERPLEXITY,
+    PROVIDER_DEEPGRAM,
     ModelUnavailableError,
     ensure_model_available,
     get_default_model,
@@ -82,6 +85,13 @@ from provider_models import (
     normalize_deepseek_model,
     should_omit_claude_sampling,
     validate_model_selection,
+)
+from provider_adapters import (
+    ProviderAdapterError,
+    build_openrouter_vision_layout,
+    call_deepgram,
+    call_openrouter,
+    call_perplexity,
 )
 from vision_reliability import (
     VisionExecutionContext,
@@ -132,6 +142,13 @@ class AIServiceError(Exception):
 class AIResponseError(AIServiceError):
     """Provider returned an invalid or empty payload."""
     pass
+
+
+def _wrap_provider_adapter_error(exc: ProviderAdapterError) -> AIServiceError:
+    error = AIServiceError(str(exc))
+    error.classification = getattr(exc, "classification", "provider")
+    error.http_status = getattr(exc, "http_status", None)
+    return error
 
 
 def _validate_text_response(response_text: object, *, provider: str) -> str:
@@ -1693,6 +1710,14 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                     )
                     raise fallback_exc from kie_exc
 
+        elif provider == PROVIDER_DEEPGRAM:
+            api_key = getattr(ai_config, "deepgram_api_key", None)
+            model = getattr(ai_config, "deepgram_model", None) or "nova-3"
+            try:
+                response_text = await call_deepgram(api_key, file_bytes, filename, model=model)
+            except ProviderAdapterError as exc:
+                raise _wrap_provider_adapter_error(exc) from exc
+
         else:
             raise AIServiceError(f"Неизвестный провайдер транскрибации: {provider}")
 
@@ -1951,6 +1976,8 @@ async def get_ai_response(
                 "gemini": PROVIDER_GEMINI,
                 "kie": PROVIDER_KIE,
                 "deepseek": PROVIDER_DEEPSEEK,
+                "openrouter": PROVIDER_OPENROUTER,
+                "perplexity": PROVIDER_PERPLEXITY,
                 "xai": "xAI",
             }.get(str(p_key).lower(), p_key)
             output_tokens = effective_chat_output_tokens(
@@ -1976,13 +2003,17 @@ async def get_ai_response(
                         ensure_model_available(PROVIDER_KIE, p_model, channel="chat")
                     elif p_key == 'deepseek':
                         ensure_model_available(PROVIDER_DEEPSEEK, p_model)
+                    elif p_key == 'openrouter':
+                        ensure_model_available(PROVIDER_OPENROUTER, p_model)
+                    elif p_key == 'perplexity':
+                        ensure_model_available(PROVIDER_PERPLEXITY, p_model)
                     elif p_key == 'xai':
                         ensure_model_available(PROVIDER_OPENAI, p_model)
                     else:
                         raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
                 except (AIServiceError, Exception) as e:
                     raise AIServiceError(f"Ошибка проверки модели ИИ: {e}") from e
-            elif p_key not in {'openai', 'anthropic', 'claude', 'gemini', 'kie', 'deepseek', 'xai'}:
+            elif p_key not in {'openai', 'anthropic', 'claude', 'gemini', 'kie', 'deepseek', 'openrouter', 'perplexity', 'xai'}:
                 raise AIServiceError(f"Неизвестный провайдер ИИ: '{p_key}'")
 
 
@@ -2009,6 +2040,31 @@ async def get_ai_response(
                     return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
                 elif p_key == 'deepseek':
                     return await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens, thinking_enabled=thinking_enabled)
+                elif p_key == 'openrouter':
+                    try:
+                        return await call_openrouter(
+                            p_api_key,
+                            request_layout,
+                            p_model,
+                            temperature=temperature,
+                            max_output_tokens=output_tokens,
+                            timeout=timeout,
+                            request_capture=capture_dict,
+                        )
+                    except ProviderAdapterError as exc:
+                        raise _wrap_provider_adapter_error(exc) from exc
+                elif p_key == 'perplexity':
+                    try:
+                        return await call_perplexity(
+                            p_api_key,
+                            request_layout,
+                            p_model,
+                            max_output_tokens=(getattr(ai_config, "max_output_tokens", None) if getattr(ai_config, "max_output_tokens", None) is not None else None),
+                            timeout=timeout,
+                            request_capture=capture_dict,
+                        )
+                    except ProviderAdapterError as exc:
+                        raise _wrap_provider_adapter_error(exc) from exc
                 elif p_key == 'xai':
                     return await _call_openai_api(
                         p_api_key,
@@ -3367,7 +3423,7 @@ async def analyze_image_content(
     )
 
     # Pre-flight API key check for primary before any outbound HTTP
-    if primary_provider not in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE):
+    if primary_provider not in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER):
         err = AIServiceError(f"Неподдерживаемый провайдер для vision: {primary_provider}")
         err.classification = "configuration"
         raise err
@@ -3389,6 +3445,8 @@ async def analyze_image_content(
         primary_api_key = config.gemini_api_key
     elif primary_provider == PROVIDER_KIE:
         primary_api_key = getattr(config, "kie_api_key", None)
+    elif primary_provider == PROVIDER_OPENROUTER:
+        primary_api_key = getattr(config, "openrouter_api_key", None)
 
     if not primary_api_key:
         err = AIServiceError(f"API ключ для {primary_provider} (Vision) не установлен.")
@@ -3405,6 +3463,8 @@ async def analyze_image_content(
         elif eff_fallback_provider == "Gemini" and not config.gemini_api_key:
             fb_key_valid = False
         elif eff_fallback_provider == "KIE" and not getattr(config, "kie_api_key", None):
+            fb_key_valid = False
+        elif eff_fallback_provider == PROVIDER_OPENROUTER and not getattr(config, "openrouter_api_key", None):
             fb_key_valid = False
         if not fb_key_valid:
             eff_allow_fallback = False
@@ -3512,7 +3572,7 @@ async def analyze_image_content(
     last_classification: str | None = None
     last_failed_provider: str = primary_provider
     last_failed_model: str = primary_target_model
-    last_failed_budget: int = 4096 if primary_provider == "KIE" else get_provider_vision_max_tokens(primary_provider)
+    last_failed_budget: int = 4096 if primary_provider == "KIE" else get_provider_vision_max_tokens(primary_provider, primary_target_model)
     success_result: str | None = None
 
     if primary_provider == "KIE":
@@ -3699,6 +3759,34 @@ async def analyze_image_content(
                     ),
                     prim_budget,
                 )
+            elif primary_provider == PROVIDER_OPENROUTER:
+                base_layout = _coerce_request_layout(
+                    request_layout,
+                    history=history,
+                    system_prompt=prompt,
+                    runtime_context=request_context,
+                )
+                vision_layout = build_openrouter_vision_layout(
+                    base_layout,
+                    image_bytes,
+                    mime_type=_guess_image_media_type(image_bytes),
+                    user_instruction=effective_user_prompt,
+                )
+                try:
+                    res = await run_coro_with_timeout(
+                        call_openrouter(
+                            primary_api_key,
+                            vision_layout,
+                            primary_target_model,
+                            temperature=temperature,
+                            max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, primary_target_model),
+                            timeout=prim_budget,
+                            request_capture=prim_capture,
+                        ),
+                        prim_budget,
+                    )
+                except ProviderAdapterError as exc:
+                    raise _wrap_provider_adapter_error(exc) from exc
             else:
                 res = await run_coro_with_timeout(
                     _call_openai_vision(
@@ -3764,7 +3852,7 @@ async def analyze_image_content(
     fb_stage_budget = 0.0
     if eff_allow_fallback and bool(eff_fallback_provider):
         is_diff_provider = str(eff_fallback_provider).strip().lower() != str(primary_provider).strip().lower()
-        is_supported_provider = str(eff_fallback_provider).strip() in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE)
+        is_supported_provider = str(eff_fallback_provider).strip() in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER)
         is_valid_model = bool(eff_fallback_model)
         try:
             if is_valid_model and is_supported_provider:
@@ -3783,8 +3871,10 @@ async def analyze_image_content(
             has_api_key = bool(getattr(config, "claude_api_key", None))
         elif eff_fallback_provider == PROVIDER_OPENAI:
             has_api_key = bool(getattr(config, "openai_api_key", None) or os.getenv("OPENAI_API_KEY"))
+        elif eff_fallback_provider == PROVIDER_OPENROUTER:
+            has_api_key = bool(getattr(config, "openrouter_api_key", None))
 
-        fb_budget_val = get_provider_vision_max_tokens(eff_fallback_provider) if is_supported_provider else 0
+        fb_budget_val = get_provider_vision_max_tokens(eff_fallback_provider, eff_fallback_model) if is_supported_provider else 0
         should_fb = should_use_vision_provider_fallback(
             last_classification or "unknown",
             failed_budget=last_failed_budget,
@@ -3911,6 +4001,34 @@ async def analyze_image_content(
                     ),
                     fb_stage_budget,
                 )
+            elif eff_fallback_provider == PROVIDER_OPENROUTER:
+                base_layout = _coerce_request_layout(
+                    request_layout,
+                    history=history,
+                    system_prompt=prompt,
+                    runtime_context=request_context,
+                )
+                vision_layout = build_openrouter_vision_layout(
+                    base_layout,
+                    image_bytes,
+                    mime_type=_guess_image_media_type(image_bytes),
+                    user_instruction=effective_user_prompt,
+                )
+                try:
+                    fb_res = await run_coro_with_timeout(
+                        call_openrouter(
+                            getattr(config, "openrouter_api_key", None),
+                            vision_layout,
+                            eff_fallback_model,
+                            temperature=temperature,
+                            max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, eff_fallback_model),
+                            timeout=fb_stage_budget,
+                            request_capture=fb_capture,
+                        ),
+                        fb_stage_budget,
+                    )
+                except ProviderAdapterError as exc:
+                    raise _wrap_provider_adapter_error(exc) from exc
             else:
                 fb_res = await run_coro_with_timeout(
                     _call_openai_vision(
