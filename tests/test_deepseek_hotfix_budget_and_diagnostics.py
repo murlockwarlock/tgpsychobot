@@ -253,7 +253,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-flash")
         self.assertEqual(wire_payload["max_tokens"], 65536)
-        self.assertEqual(wire_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
+        self.assertNotIn("extra_body", wire_payload)
         self.assertNotIn("max_completion_tokens", wire_payload)
 
     async def test_telegram_deepseek_v4_pro_outbound_max_tokens_is_65536(self):
@@ -278,7 +278,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-pro")
         self.assertEqual(wire_payload["max_tokens"], 65536)
-        self.assertEqual(wire_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
+        self.assertNotIn("extra_body", wire_payload)
 
     async def test_max_deepseek_v4_flash_outbound_max_tokens_is_65536(self):
         captured_payloads = []
@@ -297,7 +297,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-flash")
         self.assertEqual(wire_payload["max_tokens"], 65536)
-        self.assertEqual(wire_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
+        self.assertNotIn("extra_body", wire_payload)
         self.assertNotIn("max_completion_tokens", wire_payload)
 
     async def test_max_deepseek_v4_pro_outbound_max_tokens_is_65536(self):
@@ -322,7 +322,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-pro")
         self.assertEqual(wire_payload["max_tokens"], 65536)
-        self.assertEqual(wire_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
+        self.assertNotIn("extra_body", wire_payload)
 
     async def test_deepseek_legacy_aliases_normalized_and_receive_65536(self):
         self.assertEqual(normalize_deepseek_model("deepseek-chat"), "deepseek-v4-flash")
@@ -348,7 +348,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured[0]["model"], "deepseek-v4-flash")
         self.assertEqual(captured[0]["max_tokens"], 65536)
-        self.assertEqual(captured[0].get("extra_body"), {"thinking": {"type": "disabled"}})
+        self.assertNotIn("extra_body", captured[0])
 
     # -------------------------------------------------------------------------
     # 3. Partial Content Semantics (finish_reason == "length" with non-empty content)
@@ -817,10 +817,10 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("extra_body", gemini_vision_captured[0]["json"])
 
     # -------------------------------------------------------------------------
-    # 8. Hotfix B1: Thinking Disabled & Request Capture Regression Tests
+    # 8. DeepSeek default thinking mode & request capture regression tests
     # -------------------------------------------------------------------------
 
-    async def test_deepseek_thinking_disabled_in_wire_payload_and_request_capture_both_platforms(self):
+    async def test_deepseek_thinking_default_omits_wire_override_and_request_capture_both_platforms(self):
         # 1. Telegram DeepSeek
         tg_captured = []
         async def mock_tg_deepseek(**kwargs):
@@ -830,14 +830,14 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_tg_deepseek):
-            resp = await ai_integration.generate_response(user_id=7001, user_prompt="Тест TG Thinking Disabled")
+            resp = await ai_integration.generate_response(user_id=7001, user_prompt="Тест TG Thinking Default")
             self.assertEqual(resp, "Ответ TG DeepSeek")
 
         self.assertEqual(len(tg_captured), 1)
         tg_payload = tg_captured[0]
         self.assertEqual(tg_payload["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
         self.assertEqual(tg_payload["max_tokens"], 65536)
-        self.assertEqual(tg_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
+        self.assertNotIn("extra_body", tg_payload)
 
         # Verify Telegram request_payload in AILog
         async with self.sessions() as session:
@@ -849,7 +849,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             tg_parsed = json.loads(tg_ai_log.request_payload)
             self.assertEqual(tg_parsed["provider"], "Deepseek")
             self.assertEqual(tg_parsed["payload"]["max_tokens"], 65536)
-            self.assertEqual(tg_parsed["payload"]["extra_body"], {"thinking": {"type": "disabled"}})
+            self.assertNotIn("extra_body", tg_parsed["payload"])
 
         # 2. MAX DeepSeek
         max_captured = []
@@ -860,14 +860,14 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_max_deepseek):
-            resp = await max_ai.get_ai_response(7001, "Тест MAX Thinking Disabled")
+            resp = await max_ai.get_ai_response(7001, "Тест MAX Thinking Default")
             self.assertEqual(resp, "Ответ MAX DeepSeek")
 
         self.assertEqual(len(max_captured), 1)
         max_payload = max_captured[0]
         self.assertEqual(max_payload["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
         self.assertEqual(max_payload["max_tokens"], 65536)
-        self.assertEqual(max_payload.get("extra_body"), {"thinking": {"type": "disabled"}})
+        self.assertNotIn("extra_body", max_payload)
 
         # Verify MAX request_payload in AILog
         async with self.sessions() as session:
@@ -879,7 +879,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             max_parsed = json.loads(max_ai_log.request_payload)
             self.assertEqual(max_parsed["provider"], "Deepseek")
             self.assertEqual(max_parsed["payload"]["max_tokens"], 65536)
-            self.assertEqual(max_parsed["payload"]["extra_body"], {"thinking": {"type": "disabled"}})
+            self.assertNotIn("extra_body", max_parsed["payload"])
 
     async def test_other_providers_isolated_from_deepseek_thinking_parameter(self):
         # Verify OpenAI, Claude, Gemini, KIE do not have extra_body/thinking passed
@@ -919,4 +919,3 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(max_openai_captured), 1)
         self.assertNotIn("extra_body", max_openai_captured[0])
         self.assertNotIn("thinking", max_openai_captured[0])
-
