@@ -289,6 +289,7 @@ from telegram_start_service import (
     claim_language_resume_lease,
     complete_language_selection,
     grant_subscription_days,
+    LANGUAGE_INTENT_STATUS,
     language_selection_enabled_for_user,
     mark_start_intent_completed,
     parse_referral_payload,
@@ -340,6 +341,14 @@ from universal_tests import (
 from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
 
 router = Router()
+
+
+def _assert_admin_render_text(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("Admin render text must be str")
+    return value
+
+
 log = logging.getLogger(__name__)
 plog = logging.getLogger("payment_events")
 user_locks = {}
@@ -4486,7 +4495,10 @@ async def cmd_promo(message: Message, state: FSMContext):
 async def back_to_admin_panel(callback: CallbackQuery, state: FSMContext | None = None):
     if state is not None:
         await state.clear()
-    await callback.message.edit_text("Добро пожаловать в админ-панель!", reply_markup=kb.admin_panel_keyboard())
+    await callback.message.edit_text(
+        _assert_admin_render_text("Добро пожаловать в админ-панель!"),
+        reply_markup=kb.admin_panel_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "admin_restart_bot")
@@ -4595,7 +4607,7 @@ async def admin_stats(callback: CallbackQuery):
     builder.button(text="📈 Подробно по этапам", callback_data="admin_automation_stage_stats")
     builder.button(text="⬅️ Назад", callback_data="admin_panel")
     builder.adjust(1)
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.message.edit_text(_assert_admin_render_text(text), reply_markup=builder.as_markup())
     await callback.answer()
 
 
@@ -4657,6 +4669,8 @@ async def admin_clients_list(callback: CallbackQuery, state: FSMContext):
 
             result = await session.execute(stmt)
             clients = result.scalars().all()
+
+    await state.update_data(client_list_page=page)
 
     header = f"👥 Список клиентов (Страница {page + 1}/{total_pages})"
     if export_mode:
@@ -4731,14 +4745,24 @@ async def stop_client_search(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("view_client_"))
 async def view_client_profile(callback: CallbackQuery, state: FSMContext):
-    if callback.data.startswith("view_client_"):
-        user_id = int(callback.data.split("_")[-1])
+    view_parts = callback.data.split("_")
+    if len(view_parts) >= 3 and view_parts[0:2] == ["view", "client"]:
+        user_id = int(view_parts[2])
+        encoded_page = (
+            int(view_parts[4])
+            if len(view_parts) >= 5 and view_parts[3] == "page" and view_parts[4].isdigit()
+            else None
+        )
     else:
         data = await state.get_data()
         user_id = data.get("viewing_client_id")
+        encoded_page = None
         if not user_id:
             await callback.answer("Ошибка: ID клиента потерян. Вернитесь к списку.", show_alert=True)
             return
+
+    state_data = await state.get_data()
+    list_page = encoded_page if encoded_page is not None else int(state_data.get("client_list_page", 0) or 0)
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -4746,7 +4770,7 @@ async def view_client_profile(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Клиент не найден", show_alert=True)
         return
 
-    await state.update_data(viewing_client_id=user_id)
+    await state.update_data(viewing_client_id=user_id, client_list_page=list_page)
 
     safe_chosen_name = html.escape(user.name) if user.name else "<i>Не указано</i>"
 
@@ -4786,7 +4810,8 @@ async def view_client_profile(callback: CallbackQuery, state: FSMContext):
         user_id,
         user.is_admin and user.id not in OWNER_IDS,
         user.can_view_history,
-        caller_is_owner
+        caller_is_owner,
+        list_page=list_page,
     )
 
     if not caller_can_view_history:
@@ -5016,11 +5041,17 @@ async def admin_ai_settings(message: Message | CallbackQuery):
     if is_callback:
         try:
             if target_message.text != text or target_message.reply_markup != kb.ai_settings_keyboard(provider):
-                await target_message.edit_text(text, reply_markup=kb.ai_settings_keyboard(provider))
+                await target_message.edit_text(
+                    _assert_admin_render_text(text),
+                    reply_markup=kb.ai_settings_keyboard(provider),
+                )
         except TelegramBadRequest:
             pass
     else:
-        await target_message.answer(text, reply_markup=kb.ai_settings_keyboard(provider))
+        await target_message.answer(
+            _assert_admin_render_text(text),
+            reply_markup=kb.ai_settings_keyboard(provider),
+        )
 
 
 @router.callback_query(F.data.startswith("ai_provider_"))
@@ -6090,8 +6121,17 @@ async def finish_kb_upload(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "admin_content")
 async def admin_content(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        multilingual_enabled = bool(
+            getattr(config, "multilingual_authoring_enabled", False)
+        )
+    if multilingual_enabled:
+        from admin_content_authoring import resource_list
+        await resource_list(callback, "content", 0)
+        return
     await callback.message.edit_text(
-        "✏️ Управление контентом\n\nВыберите раздел для редактирования.",
+        _assert_admin_render_text("✏️ Управление контентом\n\nВыберите раздел для редактирования."),
         reply_markup=await kb.content_management_keyboard()
     )
 
@@ -17949,6 +17989,28 @@ async def reset_client_subscription_confirm(callback: CallbackQuery, state: FSMC
         result = await session.execute(
             delete(UserSubscription).where(UserSubscription.user_id == user_id)
         )
+        await session.execute(
+            delete(TrialUsageHistory).where(TrialUsageHistory.user_id == user_id)
+        )
+        await session.execute(
+            delete(SubscriptionBenefitGrant).where(
+                SubscriptionBenefitGrant.grant_key == f"welcome:{user_id}"
+            )
+        )
+        intent = await session.get(TelegramStartIntent, user_id)
+        if intent is None:
+            session.add(
+                TelegramStartIntent(
+                    user_id=user_id,
+                    new_user_eligible=True,
+                    status=LANGUAGE_INTENT_STATUS,
+                )
+            )
+        else:
+            intent.new_user_eligible = True
+            intent.status = LANGUAGE_INTENT_STATUS
+            intent.lease_token = None
+            intent.lease_until = None
         await session.commit()
 
     client_label = (
@@ -19833,10 +19895,10 @@ async def admin_general_settings(
         "Если поле уже заполнено в профиле, бот повторно его не спрашивает. "
         "Отключённое поле можно заполнить позже через настройки пользователя.\n\n"
         f"Сообщение ожидания ИИ: {'включено' if processing_enabled else 'выключено'}\n"
-        f"Текущий текст: {processing_text_display}",
+        f"Текущий текст: {processing_text_display}"
     )
     await callback.message.edit_text(
-        text,
+        _assert_admin_render_text(text),
         parse_mode="HTML",
         reply_markup=kb.admin_general_settings_keyboard(config),
     )
@@ -20092,7 +20154,7 @@ async def _show_admin_language_settings(callback: CallbackQuery, notice: str = "
     if notice:
         text = notice + "\n\n" + text
     await callback.message.edit_text(
-        text,
+        _assert_admin_render_text(text),
         parse_mode="HTML",
         reply_markup=kb.admin_language_settings_keyboard(config, readiness),
     )

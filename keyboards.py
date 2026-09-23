@@ -645,7 +645,11 @@ def clients_paginator_keyboard(page: int, total_pages: int, clients: list, is_se
     builder = InlineKeyboardBuilder()
     for client in clients:
         status = "✅ " if client.id in selected_ids else ""
-        cb_data = f"toggle_export_{client.id}_{page}" if export_mode else f"view_client_{client.id}"
+        cb_data = (
+            f"toggle_export_{client.id}_{page}"
+            if export_mode
+            else f"view_client_{client.id}_page_{page}"
+        )
         if is_max_user_id(client.id):
             builder.button(text=f"{status}{max_client_list_label(client)}", callback_data=cb_data)
         else:
@@ -684,7 +688,13 @@ def clients_paginator_keyboard(page: int, total_pages: int, clients: list, is_se
     return builder.as_markup()
 
 
-def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view: bool, is_owner: bool):
+def client_profile_keyboard(
+    user_id: int,
+    is_target_admin: bool,
+    target_can_view: bool,
+    is_owner: bool,
+    list_page: int = 0,
+):
     builder = InlineKeyboardBuilder()
     builder.button(text="💳 Платежная инфо", callback_data=f"client_payment_info_{user_id}")
     builder.button(text="📜 История диалога", callback_data=f"client_history_{user_id}")
@@ -704,7 +714,7 @@ def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view
         btn_text = "❌ Забрать доступ к истории" if target_can_view else "✅ Дать доступ к истории"
         builder.button(text=btn_text, callback_data=f"toggle_history_access_{user_id}")
 
-    builder.button(text="⬅️ К списку клиентов", callback_data="admin_clients_page_0")
+    builder.button(text="⬅️ К списку клиентов", callback_data=f"admin_clients_page_{max(0, int(list_page))}")
     builder.adjust(1)
     return builder.as_markup()
 

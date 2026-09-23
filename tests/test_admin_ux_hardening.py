@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,13 +9,30 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import pytest
 import pytest_asyncio
-from aiogram.types import Chat, Message, User
+from aiogram import Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods import EditMessageText, GetMe, SendMessage
+from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User
 from aiogram.client.session.base import BaseSession
 from aiogram import Bot
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from database import Base, BotGeneralConfig, BotTranslation, Content, User as DBUser, UserMenuBinding
+from database import (
+    AIConfig,
+    Base,
+    BotGeneralConfig,
+    BotTranslation,
+    Content,
+    ContentMedia,
+    SubscriptionBenefitGrant,
+    SubscriptionConfig,
+    TelegramStartIntent,
+    TrialUsageHistory,
+    User as DBUser,
+    UserMenuBinding,
+    UserSubscription,
+)
 from translation_service import source_hash
 
 
@@ -37,6 +55,19 @@ async def factory():
     await engine.dispose()
 
 
+@pytest.fixture(scope="module")
+def admin_dispatcher():
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(handlers.router)
+    dispatcher.include_router(automation_admin.router)
+    dispatcher.include_router(admin_content_authoring.router)
+    return dispatcher
+
+
 class RecordingSession(BaseSession):
     def __init__(self):
         super().__init__()
@@ -54,6 +85,35 @@ class RecordingSession(BaseSession):
             yield b""
 
 
+class ValidatingTelegramSession(BaseSession):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    async def close(self):
+        return None
+
+    async def make_request(self, bot, method, timeout=None):
+        self.calls.append(method)
+        type(method).model_validate(method.model_dump())
+
+        if isinstance(method, (EditMessageText, SendMessage)):
+            return Message(
+                message_id=getattr(method, "message_id", 1),
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=int(method.chat_id), type="private"),
+                from_user=User(id=999, is_bot=True, first_name="TestBot", username="testbot"),
+                text=getattr(method, "text", ""),
+            ).as_(bot)
+        if isinstance(method, GetMe):
+            return User(id=999, is_bot=True, first_name="TestBot", username="testbot").as_(bot)
+        return True
+
+    async def stream_content(self, *args, **kwargs):
+        if False:
+            yield b""
+
+
 def _callback(bot, message, data):
     return SimpleNamespace(
         bot=bot,
@@ -61,6 +121,32 @@ def _callback(bot, message, data):
         from_user=message.from_user,
         data=data,
         answer=AsyncMock(),
+    )
+
+
+def _admin_message(bot, user_id=11, message_id=1, text="Админ-панель"):
+    user = User(id=user_id, is_bot=False, first_name="Admin")
+    return Message(
+        message_id=message_id,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=user_id, type="private"),
+        from_user=user,
+        text=text,
+    ).as_(bot)
+
+
+async def _feed_callback(dispatcher, bot, message, data, update_id):
+    user = message.from_user
+    callback = CallbackQuery(
+        id=f"callback-{update_id}",
+        from_user=user,
+        chat_instance="admin",
+        message=message,
+        data=data,
+    ).as_(bot)
+    return await dispatcher.feed_update(
+        bot,
+        Update(update_id=update_id, callback_query=callback),
     )
 
 
@@ -83,7 +169,7 @@ async def test_content_resource_fields_and_card_have_one_primary_editor(factory,
     user = User(id=11, is_bot=False, first_name="Admin")
     message = Message(
         message_id=1,
-        date=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        date=datetime.now(timezone.utc),
         chat=Chat(id=11, type="private"),
         from_user=user,
         text="x",
@@ -121,7 +207,7 @@ async def test_content_list_has_fifteen_items_and_excludes_technical_rows(factor
     user = User(id=11, is_bot=False, first_name="Admin")
     message = Message(
         message_id=1,
-        date=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        date=datetime.now(timezone.utc),
         chat=Chat(id=11, type="private"),
         from_user=user,
         text="x",
@@ -152,7 +238,7 @@ async def test_content_list_hides_pagination_at_fifteen(factory, monkeypatch):
     user = User(id=11, is_bot=False, first_name="Admin")
     message = Message(
         message_id=1,
-        date=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        date=datetime.now(timezone.utc),
         chat=Chat(id=11, type="private"),
         from_user=user,
         text="x",
@@ -217,7 +303,7 @@ async def test_menu_label_card_stays_ru_only_when_multilingual_off(factory, monk
     user = User(id=11, is_bot=False, first_name="Admin")
     message = Message(
         message_id=1,
-        date=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        date=datetime.now(timezone.utc),
         chat=Chat(id=11, type="private"),
         from_user=user,
         text="x",
@@ -253,6 +339,623 @@ def test_general_settings_exposes_existing_language_request_setting():
     language = next(button for button in buttons if button.text.startswith("Язык:"))
     assert language.text == "Язык: ✅ запрашивать"
     assert language.callback_data == "admin_general_toggle_language_selection"
+
+
+@pytest.mark.asyncio
+async def test_general_settings_handler_builds_validated_telegram_method(factory, monkeypatch):
+    import handlers
+    from aiogram import Bot
+    from aiogram.types import CallbackQuery, Update
+    from aiogram.methods import EditMessageText
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    user = User(id=11, is_bot=False, first_name="Admin")
+    message = Message(
+        message_id=1,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=11, type="private"),
+        from_user=user,
+        text="Админ-панель",
+    ).as_(bot)
+    callback = CallbackQuery(
+        id="general-settings",
+        from_user=user,
+        chat_instance="admin",
+        message=message,
+        data="admin_general_settings",
+    ).as_(bot)
+
+    await handlers.admin_general_settings(callback)
+
+    edit = next(method for method in session.calls if isinstance(method, EditMessageText))
+    assert isinstance(edit.text, str)
+    assert "Общие настройки" in edit.text
+    assert any(method.__class__.__name__ == "AnswerCallbackQuery" for method in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_admin_dispatcher_general_settings_journey_uses_validated_methods(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", factory)
+    monkeypatch.setattr(automation_admin, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    async with factory() as session:
+        session.add(DBUser(id=11, is_admin=True, first_name="Admin"))
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+
+    root_message = _admin_message(bot, text="/admin")
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=100, message=root_message),
+    )
+    root = next(method for method in reversed(session.calls) if isinstance(method, SendMessage))
+    assert root.text == "Добро пожаловать в админ-панель!"
+    assert any(
+        button.callback_data == "admin_general_settings"
+        for row in root.reply_markup.inline_keyboard
+        for button in row
+    )
+
+    await _feed_callback(dispatcher, bot, root_message, "admin_general_settings", 101)
+    general = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert isinstance(general.text, str)
+    assert "Общие настройки" in general.text
+    general_button_text = " ".join(
+        button.text
+        for row in general.reply_markup.inline_keyboard
+        for button in row
+    )
+    assert all(label in general_button_text for label in ("Имя", "Пол", "Возраст", "Язык"))
+    general_buttons = {
+        button.callback_data
+        for row in general.reply_markup.inline_keyboard
+        for button in row
+    }
+    assert "admin_panel" in general_buttons
+
+    await _feed_callback(dispatcher, bot, root_message, "admin_panel", 102)
+    back = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert back.text == "Добро пожаловать в админ-панель!"
+
+
+@pytest.mark.asyncio
+async def test_admin_dispatcher_crawls_every_visible_top_level_button(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", factory)
+    monkeypatch.setattr(automation_admin, "async_session_maker", factory)
+    monkeypatch.setattr(keyboards, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+    monkeypatch.setattr(
+        handlers,
+        "get_current_pm2_identity",
+        AsyncMock(return_value={"pm2_id": 1, "name": "test", "app_port": 8080}),
+    )
+
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            AIConfig(id=1),
+            SubscriptionConfig(id=1),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+
+    root_message = _admin_message(bot, text="/admin")
+    await dispatcher.feed_update(bot, Update(update_id=200, message=root_message))
+    root = next(method for method in reversed(session.calls) if isinstance(method, SendMessage))
+    visible = [
+        button
+        for row in root.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    expected = {
+        "admin_stats": ("navigation", "Статистика"),
+        "admin_clients_page_0": ("navigation", "Список клиентов"),
+        "admin_general_settings": ("navigation", "Общие настройки"),
+        "admin_test_menu": ("navigation", "Управление разделом"),
+        "automation_menu": ("navigation", "Автоматизации"),
+        "admin_ai_settings": ("navigation", "Настройки ИИ"),
+        "admin_subscriptions": ("navigation", "Управление подписками"),
+        "admin_kb_page_0": ("navigation", "База знаний"),
+        "admin_collections_page_0": ("navigation", "Медиа-коллекции"),
+        "admin_content": ("navigation", "Контент"),
+        "admin_topics_page_0": ("navigation", "Управление темами"),
+        "admin_manage_buttons": ("navigation", "Управление кнопками"),
+        "admin_manage_admins": ("navigation", "Управление администраторами"),
+        "admin_mailing_menu": ("navigation", "Управление рассылками"),
+        "admin_restart_bot": ("destructive", "Перезагрузить текущего бота"),
+    }
+    discovered = {button.callback_data for button in visible}
+    assert discovered == set(expected), "new visible admin button requires navigation contract entry"
+    assert len(visible) == len(expected) == 15
+
+    for index, button in enumerate(visible, start=1):
+        session.calls.clear()
+        context = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+        await context.clear()
+        await _feed_callback(dispatcher, bot, root_message, button.callback_data, 200 + index)
+        text_methods = [
+            method
+            for method in session.calls
+            if isinstance(method, (EditMessageText, SendMessage))
+        ]
+        assert text_methods, button.callback_data
+        destination = text_methods[-1]
+        assert expected[button.callback_data][1] in destination.text, button.callback_data
+        if expected[button.callback_data][0] == "destructive":
+            callbacks = {
+                item.callback_data
+                for row in destination.reply_markup.inline_keyboard
+                for item in row
+                if item.callback_data
+            }
+            assert "admin_panel" in callbacks
+        else:
+            await _feed_callback(dispatcher, bot, root_message, "admin_panel", 300 + index)
+            returned = next(
+                method
+                for method in reversed(session.calls)
+                if isinstance(method, EditMessageText)
+            )
+            assert returned.text == "Добро пожаловать в админ-панель!"
+
+
+@pytest.mark.asyncio
+async def test_admin_dispatcher_crawls_general_languages_and_ai_sections(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", factory)
+    monkeypatch.setattr(automation_admin, "async_session_maker", factory)
+    monkeypatch.setattr(keyboards, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            AIConfig(id=1, provider="Deepseek"),
+            SubscriptionConfig(id=1),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    root_message = _admin_message(bot, text="/admin")
+    await dispatcher.feed_update(bot, Update(update_id=400, message=root_message))
+
+    async def screen(callback_data, heading, update_id):
+        session.calls.clear()
+        context = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+        await context.clear()
+        await _feed_callback(dispatcher, bot, root_message, callback_data, update_id)
+        methods = [
+            method
+            for method in session.calls
+            if isinstance(method, (EditMessageText, SendMessage))
+        ]
+        assert methods, callback_data
+        rendered = methods[-1]
+        assert isinstance(rendered.text, str)
+        assert heading in rendered.text, callback_data
+        return rendered
+
+    general = await screen("admin_general_settings", "Общие настройки", 401)
+    general_callbacks = {
+        button.callback_data
+        for row in general.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert {
+        "admin_general_toggle_profile_name",
+        "admin_general_toggle_profile_gender",
+        "admin_general_toggle_profile_age",
+        "admin_general_toggle_language_selection",
+        "admin_general_toggle_ai_processing_message",
+        "admin_general_edit_ai_processing_message_text",
+        "admin_main_collections_page_0",
+        "admin_language_settings",
+        "admin_panel",
+    } <= general_callbacks
+
+    toggled = await screen("admin_general_toggle_profile_name", "Общие настройки", 402)
+    assert "Имя:" in " ".join(
+        button.text
+        for row in toggled.reply_markup.inline_keyboard
+        for button in row
+    )
+    await screen("admin_general_toggle_profile_gender", "Общие настройки", 403)
+    await screen("admin_general_toggle_profile_age", "Общие настройки", 404)
+    session.calls.clear()
+    await _feed_callback(dispatcher, bot, root_message, "admin_general_toggle_language_selection", 405)
+    assert any(method.__class__.__name__ == "AnswerCallbackQuery" for method in session.calls)
+    await screen("admin_main_collections_page_0", "Медиаколлекции основного диалога", 406)
+    await screen("admin_language_settings", "Языки", 407)
+    language = await screen("admin_toggle_multilingual_authoring", "Языки", 408)
+    language_callbacks = {
+        button.callback_data
+        for row in language.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert "admin_language_locale_en" in language_callbacks
+    await screen("admin_language_locale_en", "English", 409)
+    await screen("admin_language_settings", "Языки", 410)
+    await screen("admin_general_settings", "Общие настройки", 411)
+    await screen("admin_panel", "Добро пожаловать в админ-панель", 412)
+
+    ai = await screen("admin_ai_settings", "Настройки ИИ", 413)
+    ai_callbacks = {
+        button.callback_data
+        for row in ai.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert "toggle_deepseek_thinking" in ai_callbacks
+    assert "set_max_output_tokens" in ai_callbacks
+    await screen("toggle_deepseek_thinking", "Thinking", 414)
+    await screen("admin_ai_settings", "Настройки ИИ", 415)
+    await screen("admin_ai_keys", "Ключи, модели", 416)
+    await screen("admin_ai_settings", "Настройки ИИ", 417)
+    await screen("admin_panel", "Добро пожаловать в админ-панель", 418)
+
+
+@pytest.mark.asyncio
+async def test_admin_dispatcher_content_journey_validates_rendering_and_runtime(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import content_menu
+    import handlers
+    import keyboards
+    from content_authoring import read_content_value, save_content_value
+    from translation_service import refresh_translation_cache
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", factory)
+    monkeypatch.setattr(automation_admin, "async_session_maker", factory)
+    monkeypatch.setattr(keyboards, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+    monkeypatch.setattr(handlers, "send_temp_notification", AsyncMock())
+
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.telegram_language_selection_enabled = True
+        content = Content(key="about_me", button_title="Об авторе", text_content="<b>Русский</b>")
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            DBUser(id=42, telegram_language_code="pt", first_name="User"),
+            content,
+        ])
+        await session.flush()
+        await save_content_value(session, "content", content, "button_title", "en", "About")
+        await save_content_value(session, "content", content, "button_title", "pt", "Sobre")
+        await save_content_value(session, "content", content, "text_content", "en", "<b>English</b>")
+        await save_content_value(session, "content", content, "text_content", "pt", "<b>Português</b>")
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    root_message = _admin_message(bot, text="/admin")
+    await dispatcher.feed_update(bot, Update(update_id=500, message=root_message))
+
+    await _feed_callback(dispatcher, bot, root_message, "admin_content", 501)
+    content_list = next(
+        method for method in reversed(session.calls) if isinstance(method, EditMessageText)
+    )
+    assert "Контент" in content_list.text
+    content_view = next(
+        button.callback_data
+        for row in content_list.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("ca:view:content:about_me")
+    )
+    await _feed_callback(dispatcher, bot, root_message, content_view, 502)
+    card = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "Контент #about_me" in card.text
+    assert "Изменить: контент" in " ".join(
+        button.text
+        for row in card.reply_markup.inline_keyboard
+        for button in row
+    )
+    await _feed_callback(dispatcher, bot, root_message, "ca:locale:content:about_me:pt:0", 503)
+    pt_card = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "Português" in pt_card.text
+    await _feed_callback(dispatcher, bot, root_message, "ca:edit_content:content:about_me:pt:0", 504)
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=505,
+            message=_admin_message(bot, text="Новый PT").model_copy(
+                update={"entities": [MessageEntity(type="bold", offset=0, length=8)]}
+            ),
+        ),
+    )
+    await _feed_callback(dispatcher, bot, root_message, "save_content_about_me", 506)
+    saved_card = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "Новый PT" in saved_card.text
+    async with factory() as verify:
+        content = await verify.get(Content, "about_me")
+        assert content.text_content == "<b>Русский</b>"
+        assert (await read_content_value(verify, "content", content, "text_content", "pt")).text == "<b>Новый PT</b>"
+
+    await refresh_translation_cache(factory, force=True)
+    user_keyboard = await keyboards.main_client_keyboard(42)
+    labels = [button.text for row in user_keyboard.keyboard for button in row]
+    assert "Sobre" in labels
+    assert await content_menu.resolve_menu(42, "Sobre", "content", session_maker=factory) == "about_me"
+
+    await _feed_callback(dispatcher, bot, root_message, "ca:list:content:0", 507)
+    listed_again = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "Контент" in listed_again.text
+    await _feed_callback(dispatcher, bot, root_message, "admin_panel", 508)
+    returned = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert returned.text == "Добро пожаловать в админ-панель!"
+
+
+@pytest.mark.asyncio
+async def test_subscription_reset_then_real_start_regrants_welcome_bonus(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "OWNER_IDS", [11])
+    monkeypatch.setattr(handlers, "refresh_commands_for_user", AsyncMock())
+    monkeypatch.setattr(handlers, "_sync_user_birthdate_from_telegram", AsyncMock(return_value=False))
+    monkeypatch.setattr(handlers, "render_static_content_telegram", AsyncMock(return_value=True))
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.profile_collect_name = False
+        config.profile_collect_gender = False
+        config.profile_collect_age = False
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            DBUser(id=42, first_name="User", accepted_disclaimer=True),
+            SubscriptionConfig(id=1, welcome_bonus_days=3),
+            UserSubscription(
+                user_id=42,
+                start_date=now - timedelta(days=1),
+                end_date=now + timedelta(days=1),
+                payment_provider="Trial Welcome",
+            ),
+            TrialUsageHistory(user_id=42, plan_id=None, used_at=now - timedelta(days=1)),
+            SubscriptionBenefitGrant(
+                grant_key="welcome:42",
+                grant_type="welcome",
+                beneficiary_user_id=42,
+                days=3,
+                created_at=now - timedelta(days=1),
+            ),
+            TelegramStartIntent(user_id=42, new_user_eligible=False, status="completed"),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    admin_message = _admin_message(bot, user_id=11)
+    await _feed_callback(dispatcher, bot, admin_message, "admin_reset_sub_42", 599)
+    confirmation = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "Сбросить подписку клиента" in confirmation.text
+    await _feed_callback(dispatcher, bot, admin_message, "admin_reset_sub_confirm_42", 600)
+    async with factory() as verify:
+        assert await verify.scalar(select(UserSubscription.id).where(UserSubscription.user_id == 42)) is None
+        assert await verify.scalar(select(TrialUsageHistory.id).where(TrialUsageHistory.user_id == 42)) is None
+        assert await verify.scalar(
+            select(SubscriptionBenefitGrant.id).where(SubscriptionBenefitGrant.grant_key == "welcome:42")
+        ) is None
+        intent = await verify.get(TelegramStartIntent, 42)
+        assert intent.new_user_eligible is True
+        assert intent.status == "awaiting_language"
+
+    user_message = _admin_message(bot, user_id=42, text="/start")
+    await dispatcher.feed_update(bot, Update(update_id=601, message=user_message))
+    bonus = [
+        method.text
+        for method in session.calls
+        if isinstance(method, SendMessage) and method.text and "бонус" in method.text.lower()
+    ]
+    assert bonus and "3" in bonus[-1]
+    async with factory() as verify:
+        subscription = await verify.scalar(
+            select(UserSubscription).where(UserSubscription.user_id == 42)
+        )
+        assert subscription is not None
+        assert subscription.end_date > datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=2)
+
+
+@pytest.mark.asyncio
+async def test_clients_nested_navigation_returns_to_same_page_and_search(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", factory)
+    monkeypatch.setattr(automation_admin, "async_session_maker", factory)
+    monkeypatch.setattr(keyboards, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "OWNER_IDS", [11])
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    async with factory() as session:
+        session.add(DBUser(id=11, is_admin=True, first_name="Admin"))
+        session.add_all(
+            [DBUser(id=100 + index, first_name=f"target-{index}") for index in range(12)]
+        )
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    root_message = _admin_message(bot, user_id=11, text="/admin")
+    await dispatcher.feed_update(bot, Update(update_id=700, message=root_message))
+    state = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+    await state.update_data(client_search_query="target")
+
+    await _feed_callback(dispatcher, bot, root_message, "admin_clients_page_1", 701)
+    clients_page = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "2/2" in clients_page.text
+    client_callback = next(
+        button.callback_data
+        for row in clients_page.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("view_client_")
+    )
+    assert client_callback.endswith("_page_1")
+    await _feed_callback(dispatcher, bot, root_message, client_callback, 702)
+    profile = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    profile_callbacks = {
+        button.callback_data
+        for row in profile.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert "admin_clients_page_1" in profile_callbacks
+    user_id = int(client_callback.split("_")[2])
+    await _feed_callback(dispatcher, bot, root_message, f"client_payment_info_{user_id}", 703)
+    payment = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    nested_back = next(
+        button.callback_data
+        for row in payment.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("view_client_")
+    )
+    await _feed_callback(dispatcher, bot, root_message, nested_back, 704)
+    profile_again = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "Профиль клиента" in profile_again.text
+    await _feed_callback(dispatcher, bot, root_message, "admin_clients_page_1", 705)
+    returned = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "2/2" in returned.text
+    assert any(
+        "target-" in button.text
+        for row in returned.reply_markup.inline_keyboard
+        for button in row
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_client_profile_action_preserves_page_context(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", factory)
+    monkeypatch.setattr(automation_admin, "async_session_maker", factory)
+    monkeypatch.setattr(keyboards, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "OWNER_IDS", [11])
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Owner"),
+            DBUser(id=321, first_name="Nested target", can_view_history=True),
+            *[
+                DBUser(id=322 + index, first_name=f"nested-{index}")
+                for index in range(15)
+            ],
+            AIConfig(id=1),
+            SubscriptionConfig(id=1),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    root_message = _admin_message(bot, user_id=11, text="/admin")
+    await dispatcher.feed_update(bot, Update(update_id=750, message=root_message))
+    state = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+    await state.update_data(client_search_query="nested", client_list_page=1)
+
+    await _feed_callback(dispatcher, bot, root_message, "view_client_321_page_1", 751)
+    profile = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    profile_callbacks = [
+        button.callback_data
+        for row in profile.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data != "admin_clients_page_1"
+    ]
+    assert profile_callbacks
+
+    for offset, callback_data in enumerate(profile_callbacks, start=1):
+        session.calls.clear()
+        context = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+        await context.update_data(client_search_query="nested", client_list_page=1, viewing_client_id=321)
+        await _feed_callback(dispatcher, bot, root_message, callback_data, 751 + offset)
+        methods = [
+            method
+            for method in session.calls
+            if isinstance(method, (EditMessageText, SendMessage))
+        ]
+        assert methods, callback_data
+        rendered = methods[-1]
+        assert isinstance(rendered.text, str), callback_data
+        back_callbacks = [
+            button.callback_data
+            for row in (rendered.reply_markup.inline_keyboard if rendered.reply_markup else [])
+            for button in row
+            if button.callback_data and button.callback_data.startswith("view_client_")
+        ]
+        if back_callbacks:
+            await _feed_callback(dispatcher, bot, root_message, back_callbacks[-1], 800 + offset)
+            profile_again = next(
+                method for method in reversed(session.calls) if isinstance(method, EditMessageText)
+            )
+            assert "Профиль клиента" in profile_again.text
+            list_callback = next(
+                button.callback_data
+                for row in profile_again.reply_markup.inline_keyboard
+                for button in row
+                if button.callback_data == "admin_clients_page_1"
+            )
+        else:
+            list_callback = next(
+                button.callback_data
+                for row in (rendered.reply_markup.inline_keyboard if rendered.reply_markup else [])
+                for button in row
+                if button.callback_data == "admin_clients_page_1"
+            )
+        await _feed_callback(dispatcher, bot, root_message, list_callback, 900 + offset)
+        returned = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+        assert "2/2" in returned.text, callback_data
+        assert any(
+            "nested" in button.text
+            for row in returned.reply_markup.inline_keyboard
+            for button in row
+        )
 
 
 def test_language_overview_explains_default_fallback_and_single_language_warning():
