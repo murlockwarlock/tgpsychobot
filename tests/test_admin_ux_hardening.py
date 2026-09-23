@@ -580,6 +580,59 @@ async def test_content_admin_journey_round_trips_locale_storage_and_runtime(fact
     assert "Контент" in admin_message.edit_text.await_args.args[0]
 
 
+@pytest.mark.asyncio
+async def test_content_deep_link_routes_to_same_localized_resource(factory, monkeypatch):
+    import handlers
+    import keyboards
+    from content_authoring import save_content_value
+    from translation_service import refresh_translation_cache
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "refresh_commands_for_user", AsyncMock())
+    monkeypatch.setattr(handlers, "_sync_user_birthdate_from_telegram", AsyncMock())
+    monkeypatch.setattr(keyboards, "main_client_keyboard", AsyncMock(return_value=None))
+
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.multilingual_authoring_enabled = True
+        config.telegram_language_selection_enabled = True
+        config.profile_collect_name = False
+        config.profile_collect_gender = False
+        config.profile_collect_age = False
+        content = Content(key="about_me", button_title="Об авторе", text_content="RU")
+        user = DBUser(id=44, telegram_language_code="pt", first_name="User")
+        session.add_all([content, user])
+        await session.flush()
+        await save_content_value(session, "content", content, "button_title", "pt", "Sobre")
+        await save_content_value(session, "content", content, "text_content", "pt", "Texto português")
+        await session.commit()
+    await refresh_translation_cache(factory, force=True)
+
+    bot = SimpleNamespace(
+        send_message=AsyncMock(),
+        send_photo=AsyncMock(),
+        send_video=AsyncMock(),
+        send_media_group=AsyncMock(),
+    )
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=44, username="user", full_name="User"),
+        chat=SimpleNamespace(id=44),
+        answer=AsyncMock(),
+    )
+    await handlers._run_start_business(
+        message,
+        _JourneyState(),
+        bot,
+        args="about_me",
+    )
+
+    assert any(
+        "Texto português" in call.args[1]
+        for call in bot.send_message.await_args_list
+        if len(call.args) > 1
+    )
+
+
 class _JourneyState:
     def __init__(self, data=None):
         self.data = dict(data or {})
