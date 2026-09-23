@@ -11,13 +11,15 @@ Telegram Admin всегда остаётся русским. У каждого b
 | Объект | Локализуемые поля | Общие поля | Карточка при ВКЛ |
 |---|---|---|---|
 | Topic | `name`, `description`, `start_message`, `start_button_text` | ID, порядок, видимость, payload, routing, prompts, связи | Да |
-| Content | `button_title`, `text_content`, `action_btn_text`, локальный список media | key, visibility, order, action payload | Да |
+| Content | `button_title`, `text_content`, локальный список media | key, visibility, order, action payload | Да |
 | SubscriptionPlan | `name`, `description` | цена, срок, provider, permissions, flags | Да |
 | SubscriptionConfig | пользовательские labels меню | платежи, бонусы, flags, URLs | Да |
 | ReferralTemplate | пользовательский `text` | ID, порядок, enabled, начисления | Да |
 | MediaLibrary | пользовательский `description`/caption | file ID, имя для AI, категория, media type, collections | Да |
 
 TestQuestion, answer options, automations, followups, prompts, knowledge base, campaigns, admin messages и внутренние настройки не получают новые locale tabs. Их существующие русские формы не меняются.
+
+Тестовая кнопка не является Content-ресурсом для пользовательской подписи. Её единственный runtime-источник — `ui.button.test`; старый `Content.test_button` сохранён для совместимости состояния и скрыт из общего списка и registry.
 
 ## Хранение
 

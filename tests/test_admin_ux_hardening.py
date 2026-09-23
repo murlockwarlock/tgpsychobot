@@ -29,6 +29,7 @@ from database import (
     SubscriptionBenefitGrant,
     SubscriptionConfig,
     TelegramStartIntent,
+    TestConfig as DBTestConfig,
     TrialUsageHistory,
     User as DBUser,
     UserMenuBinding,
@@ -231,6 +232,179 @@ async def test_content_list_has_fifteen_items_and_excludes_technical_rows(factor
     assert len(content_buttons) == 15
     assert any(button.callback_data == "ca:list:content:1" for row in rows for button in row)
     assert not any("test_" in button.text or "secret_test_outro" in button.text for row in rows for button in row)
+
+
+@pytest.mark.asyncio
+async def test_content_list_uses_human_first_labels_and_card_keeps_machine_id(factory, monkeypatch):
+    import admin_content_authoring as module
+
+    monkeypatch.setattr(module, "async_session_maker", factory)
+    async with factory() as session:
+        session.add_all([
+            Content(key="menu", button_title="Старое меню", text_content="menu"),
+            Content(key="start_message", button_title="Старт", text_content="start"),
+            Content(key="disclaimer", button_title="Правила", text_content="rules"),
+            Content(key="about_me", button_title="Об авторе", text_content="about"),
+            Content(key="btn_4d49f0df8b", button_title="Записаться на сессию", text_content="book"),
+        ])
+        await session.commit()
+
+    recording = RecordingSession()
+    bot = Bot("123456:TEST", session=recording)
+    message = _admin_message(bot)
+    await module.resource_list(_callback(bot, message, "ca:list:content:0"), "content", 0)
+    rows = recording.calls[-1].reply_markup.inline_keyboard
+    labels = [button.text for row in rows for button in row]
+    assert "Меню" in labels
+    assert "Приветствие (/start)" in labels
+    assert "Дисклеймер" in labels
+    assert "Об авторе · about_me" in labels
+    assert "Записаться на сессию · btn_4d49f0df8b" in labels
+    assert "menu: Меню" not in labels
+
+    await module.resource_card(
+        _callback(bot, message, "ca:view:content:menu:ru:0"),
+        "content",
+        "menu",
+        "ru",
+        0,
+    )
+    assert "ID: <code>menu</code>" in recording.calls[-1].text
+
+
+@pytest.mark.asyncio
+async def test_perplexity_model_screen_omits_unrepresented_rub_pricing(factory, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    message = _admin_message(bot)
+    await handlers.view_models_by_provider(_callback(bot, message, "view_models_Perplexity"))
+    rendered = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "Выберите режим Perplexity:" in rendered.text
+    assert "Прайсинг" not in rendered.text
+    assert "руб" not in rendered.text.lower()
+    assert "Быстрый поиск" in rendered.text
+    assert isinstance(rendered.text, str)
+
+
+@pytest.mark.asyncio
+async def test_test_content_is_reachable_from_test_management_and_saves(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+
+    for module in (admin_content_authoring, automation_admin, handlers, keyboards):
+        monkeypatch.setattr(module, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+    monkeypatch.setattr(handlers, "send_temp_notification", AsyncMock())
+
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            DBTestConfig(id=1, is_enabled=True, secret_test_enabled=True),
+            Content(key="test_intro", text_content="Intro", is_visible=True),
+            Content(key="test_results", text_content="Results", is_visible=True),
+            Content(key="secret_test_outro", text_content="Final", is_visible=True),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    message = _admin_message(bot)
+    dispatcher = admin_dispatcher
+    await _feed_callback(dispatcher, bot, message, "admin_test_menu", 1100)
+    test_menu = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    callbacks = [
+        button.callback_data
+        for row in test_menu.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    for index, callback_data in enumerate((
+        "edit_content_test_intro",
+        "edit_content_test_results",
+        "edit_content_secret_test_outro",
+    ), start=1):
+        assert callback_data in callbacks
+        await _feed_callback(dispatcher, bot, message, callback_data, 1100 + index)
+        editor = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+        assert "Редактирование:" in editor.text
+        content_key = callback_data.removeprefix("edit_content_")
+        if index < 3:
+            await dispatcher.feed_update(
+                bot,
+                Update(
+                    update_id=1110 + index,
+                    message=_admin_message(bot, text=f"Обновлено {content_key}"),
+                ),
+            )
+            await _feed_callback(dispatcher, bot, message, f"save_content_{content_key}", 1120 + index)
+        else:
+            await _feed_callback(dispatcher, bot, message, f"cancel_content_edit_{content_key}", 1120 + index)
+        returned = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+        assert "Управление разделом 'Тест'" in returned.text
+
+
+@pytest.mark.asyncio
+async def test_test_button_uses_ui_translation_source_for_keyboard_and_filter(factory, monkeypatch):
+    import handlers
+    import keyboards
+
+    monkeypatch.setattr(keyboards, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=42, telegram_language_code="ru"),
+            DBTestConfig(id=1, is_enabled=True),
+            Content(key="test_button", button_title="LEGACY TEST LABEL", is_visible=True),
+            SubscriptionConfig(id=1, subscriptions_enabled=False),
+        ])
+        await session.commit()
+
+    markup = await keyboards.main_client_keyboard(42)
+    labels = [button.text for row in markup.keyboard for button in row]
+    assert "📝 Пройти тест" in labels
+    assert "LEGACY TEST LABEL" not in labels
+
+    message = _admin_message(Bot("123456:TEST", session=RecordingSession()), user_id=42, text="📝 Пройти тест")
+    assert await handlers.TestButtonFilter()(message)
+
+    from translation_registry import build_translation_registry
+    async with factory() as session:
+        registry = await build_translation_registry(session)
+        assert registry.get("ui.button.test") is not None
+        assert registry.get("content.test_button.button_title") is None
+
+
+@pytest.mark.asyncio
+async def test_action_button_editor_is_scoped_to_start_message(factory, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    async with factory() as session:
+        session.add_all([
+            Content(key="about_me", button_title="Об авторе", text_content="Текст"),
+            Content(
+                key="start_message",
+                button_title="Приветствие",
+                text_content="Старт",
+                action_btn_text="Начать",
+                action_btn_payload="начать",
+            ),
+        ])
+        await session.commit()
+
+    ordinary_state = SimpleNamespace(get_data=AsyncMock(return_value={"content_key": "about_me", "text_content": "Текст"}))
+    ordinary_text, _ = await handlers.get_content_display(ordinary_state)
+    assert "Кнопка действия" not in ordinary_text
+
+    start_state = SimpleNamespace(get_data=AsyncMock(return_value={"content_key": "start_message", "text_content": "Старт"}))
+    start_text, _ = await handlers.get_content_display(start_state)
+    assert "Кнопка действия" in start_text
 
 
 @pytest.mark.asyncio
@@ -980,7 +1154,10 @@ def test_language_overview_explains_default_fallback_and_single_language_warning
     )
     readiness = {"locales": {"en": {"canonical": False}, "pt": {"canonical": False}}}
     text = _language_overview_text(config, readiness)
-    assert "сохранённый доступный язык" in text
+    assert "Язык по умолчанию: <b>🇷🇺 Русский</b>" in text
+    assert "Выбор языка: <b>Включён</b>" in text
+    assert "Мультиязычность: <b>Включена</b>" in text
+    assert "сохранённый доступный язык" not in text
     assert "доступен только один язык" in text
 
 

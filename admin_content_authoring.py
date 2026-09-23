@@ -89,6 +89,15 @@ def _content_display_value(resource, value, locale):
     return value.admin_label()
 
 
+def _content_list_label(resource, value):
+    identity = str(resource.key)
+    special_title = CONTENT_SPECIAL_TITLES.get(identity)
+    if special_title:
+        return special_title
+    title = (value.text or "Не задано").replace("\n", " ").strip()
+    return f"{title} · {identity}" if title else identity
+
+
 def _content_status_label(resource):
     return "✅ Виден пользователям" if resource.is_visible else "❌ Скрыт от пользователей"
 
@@ -261,9 +270,9 @@ async def resource_list(event, kind, page=0):
         for resource in resources:
             identity = getattr(resource, spec.identity_field)
             value = await read_content_value(session, kind, resource, spec.fields[0][0], "ru")
-            label = _content_display_value(resource, value, "ru") if kind == "content" else value.admin_label()
+            label = _content_list_label(resource, value) if kind == "content" else value.admin_label()
             label = label.replace("\n", " ")
-            row = [(f"{identity}: {label}"[:64], f"ca:view:{kind}:{identity}:{page}")]
+            row = [(label[:64], f"ca:view:{kind}:{identity}:{page}")]
             if kind == "topic":
                 row.extend([("Выше", f"move_topic_up_{identity}_{page}"), ("Ниже", f"move_topic_down_{identity}_{page}")])
             rows.append(row)
@@ -308,6 +317,8 @@ async def resource_card(event, kind, identity, locale="ru", page=0):
             return
         fields = list(spec.fields)
         text = [f"<b>{spec.title} #{html.escape(str(identity))}</b>"]
+        if kind == "content":
+            text.append(f"ID: <code>{html.escape(str(identity))}</code>")
         if localized:
             text.append(locale_heading(locale))
         if kind == "content":

@@ -1018,7 +1018,8 @@ MODELS_INFO = {
             'name': 'DeepSeek V4 Pro',
             'desc': 'Более мощная модель для сложных рассуждений и требовательных задач.'
         },
-        'pricing': '<b>V4 Flash:</b> $0.14 / $0.28\n<b>V4 Pro:</b> $0.435 / $0.87\n(Вход / выход за 1M токенов, без учёта кеша)'
+        'pricing': '<b>V4 Flash:</b> $0.14 / $0.28\n<b>V4 Pro:</b> $0.435 / $0.87\n(Вход / выход за 1M токенов, без учёта кеша)',
+        'pricing_currency': 'USD',
     },
     "OpenAI": {
         'gpt-5.6-terra': {
@@ -1206,12 +1207,10 @@ class TestButtonFilter(Filter):
                 runtime_language_selection_enabled(config),
                 runtime_enabled_languages(config),
             )
-            title = await session.scalar(select(Content.button_title).where(Content.key == "test_button").limit(1))
             return message.text == translate(
-                "content.test_button.button_title",
+                "ui.button.test",
                 locale,
-                fallback=title or "📝 Пройти тест",
-                source=title or "",
+                fallback="📝 Пройти тест",
             )
 
 
@@ -6269,6 +6268,14 @@ async def handle_info_buttons(message: Message):
         await render_static_content_telegram(message.bot, message.chat.id, message.from_user.id, content_key)
 
 
+def _provider_pricing_footer(provider_models: dict) -> str:
+    pricing = provider_models.get("pricing")
+    currency = provider_models.get("pricing_currency")
+    if not pricing or not currency:
+        return ""
+    return f"\n<b>Прайсинг ({html.escape(str(currency))}):</b>\n{pricing}"
+
+
 @router.callback_query(F.data.startswith("view_models_"))
 async def view_models_by_provider(callback: CallbackQuery):
     provider = canonical_provider_name(callback.data.replace("view_models_", "", 1))
@@ -6279,14 +6286,19 @@ async def view_models_by_provider(callback: CallbackQuery):
         await callback.answer("Модели для этого провайдера не найдены.", show_alert=True)
         return
 
-    text = f"Выберите модель для <b>{provider}</b>:\n\n"
+    heading = (
+        "Выберите режим Perplexity:\n\n"
+        if provider == PROVIDER_PERPLEXITY
+        else f"Выберите модель для <b>{provider}</b>:\n\n"
+    )
+    text = heading
     for model_id in selectable_models:
         model = provider_models.get(model_id, {
             "name": model_id,
             "desc": "Доступная модель из активного каталога.",
         })
         text += f"▪️ <b>{model['name']}</b>: {model['desc']}\n"
-    text += f"\n<b>Прайсинг (официальный):</b>\n{provider_models['pricing']}\n\n<i>Цены в рублях являются примерными.</i>"
+    text += _provider_pricing_footer(provider_models)
 
     await callback.message.edit_text(
         text,
@@ -19998,14 +20010,8 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
         (
             "",
             f"Язык по умолчанию: <b>{LOCALE_LABELS[default_locale]}</b>",
-            f"Выбор языка пользователем: <b>{'Включён' if selector_enabled else 'Выключен'}</b>",
-            f"Мультиязычность: <b>{'ВКЛ' if authoring_enabled else 'ВЫКЛ'}</b>",
-            "Если выбор языка выключен, используется язык по умолчанию. Если выбор включён, "
-            "сохранённый доступный язык используется для пользователя; иначе используется язык по умолчанию. "
-            "Недоступное сохранённое предпочтение не удаляется. При выключенной мультиязычности "
-            "эффективный пользовательский режим — русский. Если мультиязычность выключена или выбор языка выключен, "
-            "все пользователи получают ответы на русском при текущем русском языке по умолчанию. "
-            "Сохранённые предпочтения при этом не удаляются.",
+            f"Выбор языка: <b>{'Включён' if selector_enabled else 'Выключен'}</b>",
+            f"Мультиязычность: <b>{'Включена' if authoring_enabled else 'Выключена'}</b>",
             "",
             "Доступные языки:",
         )

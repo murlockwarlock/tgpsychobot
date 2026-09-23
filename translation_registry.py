@@ -573,7 +573,9 @@ async def build_translation_registry(session) -> TranslationRegistry:
     secret_test_enabled = bool(test_enabled and getattr(test_config, "secret_test_enabled", False))
     content_rows = (await session.execute(select(Content).options(selectinload(Content.media)))).scalars().all()
     for item in content_rows:
-        if item.key in {"test_intro", "test_results", "test_button"}:
+        if item.key == "test_button":
+            continue
+        if item.key in {"test_intro", "test_results"}:
             required = test_enabled
         elif item.key == "secret_test_outro":
             required = secret_test_enabled
