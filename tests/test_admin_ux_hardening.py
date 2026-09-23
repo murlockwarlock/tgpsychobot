@@ -245,6 +245,7 @@ async def test_content_list_uses_human_first_labels_and_card_keeps_machine_id(fa
             Content(key="start_message", button_title="Старт", text_content="start"),
             Content(key="disclaimer", button_title="Правила", text_content="rules"),
             Content(key="about_me", button_title="Об авторе", text_content="about"),
+            Content(key="instruction_bot", button_title="Инструкция", text_content="instruction"),
             Content(key="btn_4d49f0df8b", button_title="Записаться на сессию", text_content="book"),
         ])
         await session.commit()
@@ -258,9 +259,25 @@ async def test_content_list_uses_human_first_labels_and_card_keeps_machine_id(fa
     assert "Меню" in labels
     assert "Приветствие (/start)" in labels
     assert "Дисклеймер" in labels
-    assert "Об авторе · about_me" in labels
-    assert "Записаться на сессию · btn_4d49f0df8b" in labels
+    assert "Об авторе" in labels
+    assert "Инструкция" in labels
+    assert "Записаться на сессию" in labels
+    assert "about_me" not in labels
+    assert "instruction_bot" not in labels
+    assert "btn_4d49f0df8b" not in labels
     assert "menu: Меню" not in labels
+    assert next(
+        button.callback_data
+        for row in rows
+        for button in row
+        if button.text == "Об авторе"
+    ) == "ca:view:content:about_me:0"
+    assert next(
+        button.callback_data
+        for row in rows
+        for button in row
+        if button.text == "Записаться на сессию"
+    ) == "ca:view:content:btn_4d49f0df8b:0"
 
     await module.resource_card(
         _callback(bot, message, "ca:view:content:menu:ru:0"),
@@ -270,6 +287,35 @@ async def test_content_list_uses_human_first_labels_and_card_keeps_machine_id(fa
         0,
     )
     assert "ID: <code>menu</code>" in recording.calls[-1].text
+
+    await module.resource_card(
+        _callback(bot, message, "ca:view:content:about_me:0"),
+        "content",
+        "about_me",
+        "ru",
+        0,
+    )
+    assert "ID: <code>about_me</code>" in recording.calls[-1].text
+    await module.resource_card(
+        _callback(bot, message, "ca:view:content:btn_4d49f0df8b:0"),
+        "content",
+        "btn_4d49f0df8b",
+        "ru",
+        0,
+    )
+    assert "ID: <code>btn_4d49f0df8b</code>" in recording.calls[-1].text
+    await module.resource_list(
+        _callback(bot, message, "ca:list:content:0"),
+        "content",
+        0,
+    )
+    listed_again = recording.calls[-1]
+    assert any(
+        button.text == "Об авторе"
+        and button.callback_data == "ca:view:content:about_me:0"
+        for row in listed_again.reply_markup.inline_keyboard
+        for button in row
+    )
 
 
 @pytest.mark.asyncio
@@ -857,6 +903,14 @@ async def test_admin_dispatcher_content_journey_validates_rendering_and_runtime(
         method for method in reversed(session.calls) if isinstance(method, EditMessageText)
     )
     assert "Контент" in content_list.text
+    content_buttons = [
+        button
+        for row in content_list.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("ca:view:content:")
+    ]
+    assert any(button.text == "Об авторе" for button in content_buttons)
+    assert not any("about_me" in button.text for button in content_buttons)
     content_view = next(
         button.callback_data
         for row in content_list.reply_markup.inline_keyboard
@@ -866,6 +920,7 @@ async def test_admin_dispatcher_content_journey_validates_rendering_and_runtime(
     await _feed_callback(dispatcher, bot, root_message, content_view, 502)
     card = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
     assert "Контент #about_me" in card.text
+    assert "ID: <code>about_me</code>" in card.text
     assert "Изменить: контент" in " ".join(
         button.text
         for row in card.reply_markup.inline_keyboard

@@ -95,7 +95,7 @@ def _content_list_label(resource, value):
     if special_title:
         return special_title
     title = (value.text or "Не задано").replace("\n", " ").strip()
-    return f"{title} · {identity}" if title else identity
+    return title or "Не задано"
 
 
 def _content_status_label(resource):
