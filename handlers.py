@@ -1019,7 +1019,6 @@ MODELS_INFO = {
             'desc': 'Более мощная модель для сложных рассуждений и требовательных задач.'
         },
         'pricing': '<b>V4 Flash:</b> $0.14 / $0.28\n<b>V4 Pro:</b> $0.435 / $0.87\n(Вход / выход за 1M токенов, без учёта кеша)',
-        'pricing_currency': 'USD',
     },
     "OpenAI": {
         'gpt-5.6-terra': {
@@ -1063,6 +1062,8 @@ MODELS_INFO = {
         "pricing": "<b>Perplexity:</b> режимы управляются официальными preset-настройками API.",
     },
 }
+
+PROVIDER_PRICING_CURRENCIES = {"Deepseek": "USD"}
 
 # Keep the Telegram primary selector driven by the shared KIE chat catalog.
 MODELS_INFO["KIE"] = {
@@ -6268,9 +6269,9 @@ async def handle_info_buttons(message: Message):
         await render_static_content_telegram(message.bot, message.chat.id, message.from_user.id, content_key)
 
 
-def _provider_pricing_footer(provider_models: dict) -> str:
+def _provider_pricing_footer(provider: str, provider_models: dict) -> str:
     pricing = provider_models.get("pricing")
-    currency = provider_models.get("pricing_currency")
+    currency = PROVIDER_PRICING_CURRENCIES.get(provider)
     if not pricing or not currency:
         return ""
     return f"\n<b>Прайсинг ({html.escape(str(currency))}):</b>\n{pricing}"
@@ -6298,7 +6299,7 @@ async def view_models_by_provider(callback: CallbackQuery):
             "desc": "Доступная модель из активного каталога.",
         })
         text += f"▪️ <b>{model['name']}</b>: {model['desc']}\n"
-    text += _provider_pricing_footer(provider_models)
+    text += _provider_pricing_footer(provider, provider_models)
 
     await callback.message.edit_text(
         text,

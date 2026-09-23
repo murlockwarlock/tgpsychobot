@@ -146,7 +146,7 @@ async def test_admin_can_open_language_screen_and_readiness_audit(tmp_path, monk
         await handlers.admin_language_settings(_callback(bot, message, "admin_language_settings"))
         screen = message.edit_text.await_args.args[0]
         assert "Язык по умолчанию" in screen
-        assert "Выбор языка пользователем: <b>Включён</b>" in screen
+        assert "Выбор языка: <b>Включён</b>" in screen
         assert "@example_bot" in screen
         assert "🇬🇧 English — ❌ не готов" in screen
         assert "🇵🇹 Português — ❌ не готов" in screen
