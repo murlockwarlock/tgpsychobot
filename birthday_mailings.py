@@ -16,7 +16,12 @@ from mailing_utils import (
 )
 from time_helpers import to_msk, utc_now
 from error_reporting import notify_admins_about_error
-from translation_service import resolve_effective_locale, translate
+from translation_service import (
+    resolve_effective_locale,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
+    translate,
+)
 
 
 log = logging.getLogger(__name__)
@@ -76,8 +81,8 @@ async def process_birthday_mailings(bot: Bot, *, now: datetime | None = None):
                     locale = resolve_effective_locale(
                         getattr(user, "telegram_language_code", None),
                         getattr(general_config, "telegram_default_language", "ru"),
-                        bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-                        getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+                        runtime_language_selection_enabled(general_config),
+                        runtime_enabled_languages(general_config),
                         platform="max" if user.id >= 100_000_000_000 else "telegram",
                     )
                     localized_text = translate(

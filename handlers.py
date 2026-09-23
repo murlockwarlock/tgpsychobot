@@ -301,6 +301,8 @@ from translation_service import (
     normalize_locale,
     resolve_effective_locale,
     resolve_user_effective_locale,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
     translate,
 )
 from translation_pack_manager import (
@@ -383,8 +385,8 @@ async def _maybe_defer_start_for_language(
             config
             and intent
             and language_selection_enabled_for_user(
-                selector_enabled=bool(getattr(config, "telegram_language_selection_enabled", False)),
-                enabled_languages=getattr(config, "telegram_enabled_languages", '["ru"]'),
+                selector_enabled=runtime_language_selection_enabled(config),
+                enabled_languages=runtime_enabled_languages(config),
                 user_language=getattr(user, "telegram_language_code", None),
                 intent_new_user_eligible=bool(intent.new_user_eligible),
             )
@@ -397,7 +399,7 @@ async def _maybe_defer_start_for_language(
                 None,
                 getattr(config, "telegram_default_language", "ru"),
                 True,
-                getattr(config, "telegram_enabled_languages", '["ru"]'),
+                runtime_enabled_languages(config),
             )
             await message.answer(
                 translate(
@@ -857,8 +859,8 @@ async def _resolve_card_spread_rounds(
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         topic = await session.get(Topic, topic_id)
         if not user or not topic or not topic.system_prompt:
@@ -1192,8 +1194,8 @@ class TestButtonFilter(Filter):
             locale = resolve_effective_locale(
                 getattr(user, "telegram_language_code", None),
                 getattr(config, "telegram_default_language", "ru"),
-                bool(getattr(config, "telegram_language_selection_enabled", False)),
-                getattr(config, "telegram_enabled_languages", '["ru"]'),
+                runtime_language_selection_enabled(config),
+                runtime_enabled_languages(config),
             )
             title = await session.scalar(select(Content.button_title).where(Content.key == "test_button").limit(1))
             return message.text == translate(
@@ -1214,8 +1216,8 @@ class TopicsButtonFilter(Filter):
             locale = resolve_effective_locale(
                 getattr(user, "telegram_language_code", None),
                 getattr(general_config, "telegram_default_language", "ru"),
-                bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-                getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+                runtime_language_selection_enabled(general_config),
+                runtime_enabled_languages(general_config),
             )
             btn_name = translate(
                 f"subscription_config.{config.id}.topics_btn_name" if config else "ui.button.topics",
@@ -1238,8 +1240,8 @@ class ReferralButtonFilter(Filter):
             locale = resolve_effective_locale(
                 getattr(user, "telegram_language_code", None),
                 getattr(general_config, "telegram_default_language", "ru"),
-                bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-                getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+                runtime_language_selection_enabled(general_config),
+                runtime_enabled_languages(general_config),
             )
             return message.text == translate(
                 f"subscription_config.{config.id}.referral_btn_name",
@@ -1259,8 +1261,8 @@ class SubscriptionButtonFilter(Filter):
             locale = resolve_effective_locale(
                 getattr(user, "telegram_language_code", None),
                 getattr(config, "telegram_default_language", "ru"),
-                bool(getattr(config, "telegram_language_selection_enabled", False)),
-                getattr(config, "telegram_enabled_languages", '["ru"]'),
+                runtime_language_selection_enabled(config),
+                runtime_enabled_languages(config),
             )
         return message.text == translate("ui.button.subscription", locale, fallback="⭐️ Подписка")
 
@@ -1275,8 +1277,8 @@ class SettingsButtonFilter(Filter):
             locale = resolve_effective_locale(
                 getattr(user, "telegram_language_code", None),
                 getattr(config, "telegram_default_language", "ru"),
-                bool(getattr(config, "telegram_language_selection_enabled", False)),
-                getattr(config, "telegram_enabled_languages", '["ru"]'),
+                runtime_language_selection_enabled(config),
+                runtime_enabled_languages(config),
             )
         return message.text == translate("ui.button.settings", locale, fallback="⚙️ Настройки")
 
@@ -1291,8 +1293,8 @@ class NewDialogueButtonFilter(Filter):
             locale = resolve_effective_locale(
                 getattr(user, "telegram_language_code", None),
                 getattr(config, "telegram_default_language", "ru"),
-                bool(getattr(config, "telegram_language_selection_enabled", False)),
-                getattr(config, "telegram_enabled_languages", '["ru"]'),
+                runtime_language_selection_enabled(config),
+                runtime_enabled_languages(config),
             )
         return message.text == translate("ui.button.new_dialogue", locale, fallback="🗑️ Новый диалог")
 
@@ -1323,8 +1325,8 @@ async def _is_reserved_user_menu_text(text: str, user_id: int | None = None) -> 
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         reserved_texts.update({
             translate("ui.button.settings", locale, fallback="⚙️ Настройки"),
@@ -2083,8 +2085,8 @@ async def _start_test_from_ai_directive(bot: Bot, user_id: int, state: FSMContex
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         if config and not config.is_enabled and not await is_admin(user_id):
             await bot.send_message(
@@ -2914,8 +2916,8 @@ async def render_static_content_telegram(
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         canonical_media = [
             {"type": media.file_type, "file_id": media.file_id}
@@ -4115,9 +4117,7 @@ async def select_telegram_language(callback: CallbackQuery, state: FSMContext, b
 
     async with async_session_maker() as session:
         config = await session.get(BotGeneralConfig, 1)
-        enabled_languages = normalize_enabled_languages(
-            getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]'
-        )
+        enabled_languages = runtime_enabled_languages(config)
         if locale not in enabled_languages:
             await callback.answer(
                 translate("ui.language.unavailable", current_locale, fallback="Этот язык сейчас недоступен."),
@@ -4400,8 +4400,8 @@ async def cmd_promo(message: Message, state: FSMContext):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         is_admin_user = user_id in OWNER_IDS or (user and user.is_admin)
         trial_conditions = [SubscriptionPlan.is_active == True, SubscriptionPlan.is_trial == True]
@@ -6117,8 +6117,8 @@ async def get_content_from_db(key: str, user_id: int | None = None) -> dict:
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(config, "telegram_default_language", "ru"),
-            bool(getattr(config, "telegram_language_selection_enabled", False)),
-            getattr(config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(config),
+            runtime_enabled_languages(config),
         )
         if content_obj:
             canonical_media = [
@@ -9715,8 +9715,8 @@ async def _continue_profile_onboarding(
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(config, "telegram_default_language", "ru"),
-            bool(getattr(config, "telegram_language_selection_enabled", False)),
-            getattr(config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(config),
+            runtime_enabled_languages(config),
         )
 
     missing = missing_profile_fields(config, user) if user else []
@@ -9765,8 +9765,8 @@ async def _request_profile_onboarding_if_needed(
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(config, "telegram_default_language", "ru"),
-            bool(getattr(config, "telegram_language_selection_enabled", False)),
-            getattr(config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(config),
+            runtime_enabled_languages(config),
         )
         if (
             not resume_start
@@ -9852,8 +9852,8 @@ async def select_topic_menu(message: Message):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
         current_status = translate("ui.topics.current_main", locale, fallback="в <b>Основном диалоге</b>")
@@ -11618,8 +11618,8 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         referral_info = None
         if sub_config_kb and sub_config_kb.referral_enabled:
@@ -13376,8 +13376,8 @@ async def show_plans_for_subscription(message_or_callback, state: FSMContext):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         is_admin_user = user_id in OWNER_IDS or (user and user.is_admin)
         plan_conditions = [SubscriptionPlan.is_active == True]
@@ -13496,8 +13496,8 @@ async def choose_payment_provider(callback: CallbackQuery, state: FSMContext):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         user_sub = user.subscription if user else None
         user_promos = user.promo_codes if user else []
@@ -13662,8 +13662,8 @@ async def _create_yookassa_invoice_impl(callback: CallbackQuery, state: FSMConte
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
     if not plan:
@@ -14038,8 +14038,8 @@ async def create_telegram_pay_invoice(callback: CallbackQuery, state: FSMContext
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
     if not plan:
@@ -15082,8 +15082,8 @@ async def successful_payment_handler(message: Message, bot: Bot, state: FSMConte
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
         if plan.is_trial:
@@ -15238,13 +15238,15 @@ async def user_settings_menu(message: Message, state: FSMContext):
     user_id = message.from_user.id
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        config = await session.get(BotGeneralConfig, 1)
         locale = await resolve_user_effective_locale(session, user or user_id)
+        language_available = runtime_language_selection_enabled(config)
     if not user:
         return
 
     await message.answer(
         _build_user_settings_text(user, locale),
-        reply_markup=kb.user_settings_keyboard(user, locale),
+        reply_markup=await _user_settings_keyboard(user, locale, language_available=language_available),
     )
 
 
@@ -15282,11 +15284,22 @@ async def _get_user_locale(user_id: int) -> str:
         return await resolve_user_effective_locale(session, user_id)
 
 
+async def _user_settings_keyboard(user, locale: str, *, language_available: bool | None = None):
+    if language_available is None:
+        async with async_session_maker() as session:
+            config = await session.get(BotGeneralConfig, 1)
+        language_available = runtime_language_selection_enabled(config)
+    return kb.user_settings_keyboard(user, locale, language_available=language_available)
+
+
 @router.callback_query(F.data == "settings_change_language")
 async def settings_change_language(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(BotGeneralConfig, 1)
-        enabled_languages = getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]'
+        if not runtime_language_selection_enabled(config):
+            await callback.answer("Выбор языка сейчас недоступен.", show_alert=True)
+            return
+        enabled_languages = runtime_enabled_languages(config)
         locale = await resolve_user_effective_locale(session, callback.from_user.id)
     await callback.message.edit_text(
         translate("ui.settings.language_prompt", locale, fallback="Выберите язык:"),
@@ -15307,9 +15320,14 @@ async def settings_select_language(callback: CallbackQuery):
         return
     async with async_session_maker() as session:
         config = await session.get(BotGeneralConfig, 1)
-        enabled_languages = normalize_enabled_languages(
-            getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]'
-        )
+        enabled_languages = runtime_enabled_languages(config)
+        if not runtime_language_selection_enabled(config):
+            current_locale = await resolve_user_effective_locale(session, callback.from_user.id)
+            await callback.answer(
+                translate("ui.settings.language_unavailable", current_locale, fallback="Этот язык сейчас недоступен."),
+                show_alert=True,
+            )
+            return
         if locale not in enabled_languages:
             current_locale = await resolve_user_effective_locale(session, callback.from_user.id)
             await callback.answer(
@@ -15331,7 +15349,7 @@ async def settings_select_language(callback: CallbackQuery):
         await refresh_commands_for_user(callback.bot, user.id, is_admin_user)
     await callback.message.edit_text(
         translate("ui.settings.language_changed", locale, fallback="✅ Язык изменён."),
-        reply_markup=kb.user_settings_keyboard(user, locale),
+        reply_markup=await _user_settings_keyboard(user, locale),
     )
     await callback.answer()
 
@@ -15395,12 +15413,12 @@ async def process_new_name(message: Message, state: FSMContext, bot: Bot):
                     text,
                     chat_id=message.chat.id,
                     message_id=settings_msg_id,
-                    reply_markup=kb.user_settings_keyboard(user, locale),
+                    reply_markup=await _user_settings_keyboard(user, locale),
                 )
             except Exception:
-                await message.answer(text, reply_markup=kb.user_settings_keyboard(user, locale))
+                await message.answer(text, reply_markup=await _user_settings_keyboard(user, locale))
         else:
-            await message.answer(text, reply_markup=kb.user_settings_keyboard(user, locale))
+            await message.answer(text, reply_markup=await _user_settings_keyboard(user, locale))
     else:
         await message.answer(
             translate(
@@ -15474,7 +15492,7 @@ async def settings_toggle_length(callback: CallbackQuery):
         ).format(length=length_text),
     )
     try:
-        await callback.message.edit_text(text, reply_markup=kb.user_settings_keyboard(user, locale))
+        await callback.message.edit_text(text, reply_markup=await _user_settings_keyboard(user, locale))
     except Exception:
         pass
     await callback.answer()
@@ -17001,8 +17019,8 @@ async def _create_robokassa_invoice_impl(callback: CallbackQuery, state: FSMCont
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
     if not plan:
@@ -18074,8 +18092,8 @@ async def _test_locale(session, user_id: int) -> str:
     return resolve_effective_locale(
         getattr(user, "telegram_language_code", None),
         getattr(config, "telegram_default_language", "ru"),
-        bool(getattr(config, "telegram_language_selection_enabled", False)),
-        getattr(config, "telegram_enabled_languages", '["ru"]'),
+        runtime_language_selection_enabled(config),
+        runtime_enabled_languages(config),
     )
 
 
@@ -18324,7 +18342,7 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
             ).format(gender=gender_label),
         )
         try:
-            await callback.message.edit_text(text, reply_markup=kb.user_settings_keyboard(user, locale))
+            await callback.message.edit_text(text, reply_markup=await _user_settings_keyboard(user, locale))
         except Exception:
             pass
         return
@@ -18413,8 +18431,8 @@ async def send_next_question(message: Message, user_id: int, state: FSMContext, 
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
     total_count = len(questions)
@@ -18627,12 +18645,12 @@ async def process_test_age(message: Message, state: FSMContext, bot: Bot):
                     text,
                     chat_id=message.chat.id,
                     message_id=settings_msg_id,
-                    reply_markup=kb.user_settings_keyboard(user, locale),
+                    reply_markup=await _user_settings_keyboard(user, locale),
                 )
             except Exception:
-                await message.answer(text, reply_markup=kb.user_settings_keyboard(user, locale))
+                await message.answer(text, reply_markup=await _user_settings_keyboard(user, locale))
         else:
-            await message.answer(text, reply_markup=kb.user_settings_keyboard(user, locale))
+            await message.answer(text, reply_markup=await _user_settings_keyboard(user, locale))
         return
 
     async with async_session_maker() as session:
@@ -18692,8 +18710,8 @@ async def finish_test_generation(
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
         test_session = await session.get(TestSession, user_id)
@@ -18887,8 +18905,8 @@ async def show_test_results(callback: CallbackQuery, state: FSMContext):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
         content_obj = await session.get(Content, "test_results", options=[selectinload(Content.media)])
@@ -19094,8 +19112,8 @@ async def start_secret_test_handler(callback: CallbackQuery, state: FSMContext):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
     if not questions or any(not translate(f"secret_test_question.{question.id}.text", locale, fallback=question.text, source=question.text or "") for question in questions):
@@ -19149,8 +19167,8 @@ async def process_secret_answers(message: Message, state: FSMContext):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
         content_obj = await session.get(Content, "secret_test_outro", options=[selectinload(Content.media)])
@@ -19832,7 +19850,7 @@ def _language_readiness_summary(readiness, locale: str) -> str:
 def _language_overview_text(config, readiness, bot_label: str = "") -> str:
     enabled = set(normalize_enabled_languages(config.telegram_enabled_languages))
     default_locale = normalize_locale(config.telegram_default_language) or "ru"
-    selector_enabled = bool(config.telegram_language_selection_enabled)
+    selector_enabled = runtime_language_selection_enabled(config)
     authoring_enabled = bool(getattr(config, "multilingual_authoring_enabled", False))
     lines = [
         "🌐 <b>Языки Telegram</b>",
@@ -19846,8 +19864,8 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
             "",
             f"Язык по умолчанию: <b>{LOCALE_LABELS[default_locale]}</b>",
             f"Выбор языка пользователем: <b>{'Включён' if selector_enabled else 'Выключен'}</b>",
-            f"Мультиязычность авторинга: <b>{'ВКЛ' if authoring_enabled else 'ВЫКЛ'}</b>",
-            "Если выбор выключен, все пользователи получают ответы на русском. "
+            f"Мультиязычность: <b>{'ВКЛ' if authoring_enabled else 'ВЫКЛ'}</b>",
+            "Если мультиязычность выключена или выбор языка выключен, все пользователи получают ответы на русском. "
             "Сохранённые предпочтения при этом не удаляются.",
             "",
             "Доступные языки:",
@@ -20039,6 +20057,9 @@ async def admin_language_toggle_selector(callback: CallbackQuery):
                 config = BotGeneralConfig(id=1)
                 session.add(config)
                 await session.flush()
+            if not bool(getattr(config, "multilingual_authoring_enabled", False)):
+                await callback.answer("Сначала включите мультиязычность.", show_alert=True)
+                return
             enabled = normalize_enabled_languages(config.telegram_enabled_languages)
             new_value = not bool(config.telegram_language_selection_enabled)
             if new_value and len(enabled) < 2:
@@ -23483,8 +23504,8 @@ async def _get_referral_screen_text(user_id: int, bot: Bot) -> tuple[str | None,
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru") if general_config else "ru",
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)) if general_config else False,
-            getattr(general_config, "telegram_enabled_languages", '["ru"]') if general_config else '["ru"]',
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
 
         count_result = await session.execute(

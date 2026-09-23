@@ -1,9 +1,10 @@
 # Упрощённый multilingual authoring
 
-Telegram Admin всегда остаётся русским. У каждого bot/database есть независимый флаг `BotGeneralConfig.multilingual_authoring_enabled`.
+Telegram Admin всегда остаётся русским. У каждого bot/database есть независимый режим `BotGeneralConfig.multilingual_authoring_enabled`, который в админке показывается как `🌐 Мультиязычность`.
 
-- `ВЫКЛ` — обычные формы работают как в русскоязычном админ-панеле до multilingual authoring. Locale tabs, статусы переводов и глобальный выбор языка не показываются.
-- `ВКЛ` — языки выбираются только внутри карточки поддерживаемого объекта. Выбор не сохраняется как глобальная настройка администратора и не влияет на язык пользователя, язык по умолчанию или список доступных языков.
+- `ВЫКЛ` — обычные формы работают как в русскоязычном админ-панеле до multilingual authoring. Locale tabs и глобальный выбор языка не показываются; runtime принудительно использует русский, а кнопка пользовательского выбора языка недоступна.
+- `ВКЛ` — языки выбираются только внутри карточки поддерживаемого объекта. Runtime использует существующие `telegram_enabled_languages`, `telegram_default_language` и `telegram_language_selection_enabled`; при включённом selector пользователи снова получают свои сохранённые EN/PT preferences. Выбор языка администратора не сохраняется глобально.
+- Переключение режима не меняет `telegram_enabled_languages`, `telegram_language_selection_enabled` и `User.telegram_language_code`. Переводы и preferences сохраняются и становятся активными снова после `ВКЛ`.
 
 ## Матрица поддерживаемых объектов
 
@@ -34,11 +35,11 @@ Canonical RU остаётся в существующих полях бизне�
 
 ## Совместимость
 
-`admin_content_preferences` и старые per-admin locale helpers оставлены для безопасного rollback, но больше не используются обычным runtime flow. Existing EN/PT `BotTranslation` rows читаются без копирования и удаления. Existing user preferences, default locale, enabled locales, system pack data и provider settings не мигрируются.
+`admin_content_preferences` и старые per-admin locale helpers оставлены для безопасного rollback, но больше не используются обычным runtime flow. Existing EN/PT `BotTranslation` rows читаются без копирования и удаления. При добавлении режима в уже существующую базу `init_db()` один раз выводит его начальное значение из прежней конфигурации: если были включены EN/PT или user selector, режим становится `ВКЛ`; русские-only базы остаются `ВЫКЛ`. После этого значение меняется только явным переключателем админа.
 
 Нормальный путь админа:
 
-1. `🌐 Языки` → `🌐 Мультиязычность: ВКЛ`.
+1. `🌐 Языки` → `🌐 Мультиязычность: ВКЛ` (это одновременно включает продуктовый multilingual mode; системные packs и список языков остаются отдельными настройками).
 2. `Темы` → открыть Topic ID.
 3. В карточке выбрать `🇬🇧 English` или `🇵🇹 Português`.
 4. Изменить только нужные display fields и сохранить.

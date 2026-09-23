@@ -136,6 +136,7 @@ async def test_admin_can_open_language_screen_and_readiness_audit(tmp_path, monk
                 BotGeneralConfig(
                     id=1,
                     telegram_default_language="ru",
+                    multilingual_authoring_enabled=True,
                     telegram_language_selection_enabled=True,
                     telegram_enabled_languages='["ru", "en", "pt"]',
                 )
@@ -329,6 +330,7 @@ async def test_ready_locale_can_be_enabled_and_selector_can_be_toggled(tmp_path,
                 BotGeneralConfig(
                     id=1,
                     telegram_default_language="ru",
+                    multilingual_authoring_enabled=True,
                     telegram_language_selection_enabled=False,
                     telegram_enabled_languages='["ru"]',
                 )
@@ -382,6 +384,7 @@ async def test_not_ready_locale_and_selector_activation_are_blocked(tmp_path, mo
                 BotGeneralConfig(
                     id=1,
                     telegram_default_language="ru",
+                    multilingual_authoring_enabled=True,
                     telegram_language_selection_enabled=False,
                     telegram_enabled_languages='["ru"]',
                 )

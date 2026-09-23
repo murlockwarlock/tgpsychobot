@@ -26,6 +26,12 @@ from database import Base, BotGeneralConfig, BotTranslation, Content, ContentMed
 from translation_pack_manager import audit_translation_readiness
 from translation_registry import TranslationRegistry, TranslationSource
 from translation_service import source_hash
+from telegram_start_service import language_selection_enabled_for_user
+from translation_service import (
+    resolve_user_effective_locale,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
+)
 
 
 @pytest_asyncio.fixture
@@ -70,6 +76,92 @@ async def test_multilingual_authoring_is_per_bot_and_locales_follow_enabled_lang
         await session.commit()
     async with factory() as session:
         assert await authoring_locales(session) == ("ru",)
+
+
+@pytest.mark.asyncio
+async def test_multilingual_off_is_effectively_ru_only_without_mutating_configuration(factory):
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.telegram_language_selection_enabled = True
+        session.add(DBUser(id=101, telegram_language_code="en"))
+        await session.commit()
+
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        user = await session.get(DBUser, 101)
+        assert runtime_enabled_languages(config) == ("ru",)
+        assert runtime_language_selection_enabled(config) is False
+        assert await resolve_user_effective_locale(session, user) == "ru"
+        assert language_selection_enabled_for_user(
+            selector_enabled=runtime_language_selection_enabled(config),
+            enabled_languages=runtime_enabled_languages(config),
+            user_language=user.telegram_language_code,
+            intent_new_user_eligible=True,
+        ) is False
+        assert config.telegram_enabled_languages == '["ru", "en", "pt"]'
+        assert config.telegram_language_selection_enabled is True
+        assert user.telegram_language_code == "en"
+
+
+def test_multilingual_off_hides_user_language_selector_button():
+    from keyboards import user_settings_keyboard
+
+    user = SimpleNamespace(gender=None, age=None, response_length="normal")
+    markup = user_settings_keyboard(user, "ru", language_available=False)
+    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert "settings_change_language" not in callbacks
+
+
+@pytest.mark.asyncio
+async def test_multilingual_on_reuses_existing_language_configuration(factory):
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.multilingual_authoring_enabled = True
+        config.telegram_language_selection_enabled = True
+        session.add(DBUser(id=102, telegram_language_code="pt"))
+        await session.commit()
+
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        user = await session.get(DBUser, 102)
+        assert runtime_enabled_languages(config) == ("ru", "en", "pt")
+        assert runtime_language_selection_enabled(config) is True
+        assert await resolve_user_effective_locale(session, user) == "pt"
+        assert language_selection_enabled_for_user(
+            selector_enabled=runtime_language_selection_enabled(config),
+            enabled_languages=runtime_enabled_languages(config),
+            user_language=None,
+            intent_new_user_eligible=True,
+        ) is True
+
+
+@pytest.mark.asyncio
+async def test_toggle_preserves_translations_objects_and_preferences(factory):
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.multilingual_authoring_enabled = True
+        config.telegram_language_selection_enabled = True
+        topic = Topic(id=27, name="Самооценка")
+        user = DBUser(id=103, telegram_language_code="en")
+        session.add_all([topic, user])
+        await session.flush()
+        await save_content_value(session, "topic", topic, "name", "en", "Self-esteem")
+        await session.commit()
+
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.multilingual_authoring_enabled = False
+        await session.commit()
+
+    async with factory() as session:
+        topic = await session.get(Topic, 27)
+        user = await session.get(DBUser, 103)
+        config = await session.get(BotGeneralConfig, 1)
+        config.multilingual_authoring_enabled = True
+        await session.commit()
+        assert topic.name == "Самооценка"
+        assert (await read_content_value(session, "topic", topic, "name", "en")).text == "Self-esteem"
+        assert user.telegram_language_code == "en"
 
 
 @pytest.mark.asyncio
@@ -150,6 +242,7 @@ async def test_content_runtime_uses_locale_media_and_russian_fallback(factory, m
     monkeypatch.setattr(handlers.kb, "content_management_keyboard", AsyncMock(return_value=None))
     async with factory() as session:
         config = await session.get(BotGeneralConfig, 1)
+        config.multilingual_authoring_enabled = True
         config.telegram_language_selection_enabled = True
         content = Content(key="fallback", text_content="Русский")
         content.media.append(ContentMedia(file_type="photo", file_id="ru-photo"))
@@ -184,6 +277,7 @@ async def test_content_renderer_uses_locale_media_and_preserves_explicit_empty_o
     monkeypatch.setattr(handlers.kb, "main_client_keyboard", AsyncMock(return_value=None))
     async with factory() as session:
         config = await session.get(BotGeneralConfig, 1)
+        config.multilingual_authoring_enabled = True
         config.telegram_language_selection_enabled = True
         content = Content(key="render_media", text_content="Русский текст")
         content.media.append(ContentMedia(file_type="photo", file_id="ru-photo"))

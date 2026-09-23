@@ -63,7 +63,12 @@ def test_main_readiness_summary_uses_locale_report():
 
 
 def test_main_language_screen_has_compact_locale_management_buttons():
-    buttons = _buttons(keyboards.admin_language_settings_keyboard(_config(), _readiness()))
+    buttons = _buttons(
+        keyboards.admin_language_settings_keyboard(
+            _config(multilingual_authoring_enabled=True),
+            _readiness(),
+        )
+    )
     texts = [button.text for button in buttons]
     callbacks = [button.callback_data for button in buttons]
 
@@ -79,11 +84,27 @@ def test_main_language_screen_has_compact_locale_management_buttons():
 
     selector_buttons = _buttons(
         keyboards.admin_language_settings_keyboard(
-            _config(telegram_language_selection_enabled=True),
+            _config(multilingual_authoring_enabled=True, telegram_language_selection_enabled=True),
             _readiness(),
         )
     )
     assert "⛔ Запретить пользователям выбирать язык" in [button.text for button in selector_buttons]
+
+
+def test_multilingual_off_keeps_configured_locales_but_locks_user_selector():
+    buttons = _buttons(
+        keyboards.admin_language_settings_keyboard(
+            _config(telegram_enabled_languages='["ru", "en", "pt"]'),
+            _readiness(),
+        )
+    )
+    texts = [button.text for button in buttons]
+    callbacks = [button.callback_data for button in buttons]
+    assert "🌐 Мультиязычность: ВЫКЛ" in texts
+    assert "🔒 Выбор языка неактивен до включения мультиязычности" in texts
+    assert "admin_language_toggle_selector" not in callbacks
+    assert "⚙️ 🇬🇧 English" in texts
+    assert "⚙️ 🇵🇹 Português" in texts
 
 
 def test_locale_detail_owns_locale_actions_and_hides_current_default_action():
@@ -166,6 +187,7 @@ def test_import_preview_and_ru_only_confirmation_buttons_are_explicit():
 
 def test_overview_shows_bot_default_enabled_and_selector_semantics_in_russian():
     config = _config(
+        multilingual_authoring_enabled=True,
         telegram_language_selection_enabled=True,
         telegram_enabled_languages='["ru", "en", "pt"]',
     )
@@ -177,7 +199,7 @@ def test_overview_shows_bot_default_enabled_and_selector_semantics_in_russian():
 
     assert "Язык по умолчанию: <b>🇷🇺 Русский</b>" in text
     assert "Выбор языка пользователем: <b>Включён</b>" in text
-    assert "Если выбор выключен, все пользователи получают ответы на русском" in text
+    assert "Если мультиязычность выключена или выбор языка выключен, все пользователи получают ответы на русском" in text
     assert "Сохранённые предпочтения при этом не удаляются." in text
     assert "✅ 🇬🇧 English" in text
     assert "✅ 🇵🇹 Português" in text

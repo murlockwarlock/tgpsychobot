@@ -243,8 +243,8 @@ async def resolve_user_effective_locale(
     return resolve_effective_locale(
         getattr(user, "telegram_language_code", None) if user else None,
         getattr(config, "telegram_default_language", "ru") if config else "ru",
-        bool(getattr(config, "telegram_language_selection_enabled", False)) if config else False,
-        getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]',
+        runtime_language_selection_enabled(config),
+        runtime_enabled_languages(config),
         platform=platform,
     )
 
@@ -268,6 +268,22 @@ def normalize_enabled_languages(raw: Any) -> tuple[str, ...]:
     enabled.discard(None)
     enabled.add("ru")
     return tuple(locale for locale in SUPPORTED_TELEGRAM_LOCALES if locale in enabled)
+
+
+def multilingual_mode_enabled(config: Any) -> bool:
+    return bool(getattr(config, "multilingual_authoring_enabled", False)) if config is not None else False
+
+
+def runtime_enabled_languages(config: Any) -> tuple[str, ...]:
+    if not multilingual_mode_enabled(config):
+        return ("ru",)
+    return normalize_enabled_languages(getattr(config, "telegram_enabled_languages", '["ru"]'))
+
+
+def runtime_language_selection_enabled(config: Any) -> bool:
+    return multilingual_mode_enabled(config) and bool(
+        getattr(config, "telegram_language_selection_enabled", False)
+    )
 
 
 def normalize_default_language(value: Any) -> str:

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import textwrap
 from sqlalchemy import (create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, BigInteger, Table,
                         Float, Interval, Index, UniqueConstraint, func, text)
@@ -1164,6 +1165,7 @@ def verify_payment_notification_outbox_schema(sync_conn) -> None:
 
 
 async def init_db():
+    multilingual_column_added = False
     async with engine.begin() as conn:
         await _acquire_database_init_lock(conn)
         await conn.run_sync(Base.metadata.create_all)
@@ -1171,6 +1173,7 @@ async def init_db():
         from sqlalchemy import text, inspect as sa_inspect
 
         def _check_and_migrate(sync_conn):
+            nonlocal multilingual_column_added
             insp = sa_inspect(sync_conn)
             sync_conn.execute(text(
                 "UPDATE media_library SET media_type = 'photo' "
@@ -1294,6 +1297,7 @@ async def init_db():
                     "ALTER TABLE bot_general_config "
                     "ADD COLUMN multilingual_authoring_enabled BOOLEAN DEFAULT FALSE NOT NULL"
                 ))
+                multilingual_column_added = True
             if 'translations_revision' not in general_columns:
                 sync_conn.execute(text(
                     "ALTER TABLE bot_general_config "
@@ -1642,6 +1646,15 @@ async def init_db():
                 general_conf.telegram_enabled_languages = '["ru"]'
             if getattr(general_conf, 'translations_revision', None) is None:
                 general_conf.translations_revision = 0
+            if multilingual_column_added and not general_conf.multilingual_authoring_enabled:
+                try:
+                    configured_languages = json.loads(general_conf.telegram_enabled_languages or '["ru"]')
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    configured_languages = []
+                general_conf.multilingual_authoring_enabled = bool(
+                    general_conf.telegram_language_selection_enabled
+                    or any(language in {"en", "pt"} for language in configured_languages)
+                )
 
         # Seed default content sections for new bots (won't overwrite existing)
         default_content = [

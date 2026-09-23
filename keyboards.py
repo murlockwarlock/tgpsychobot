@@ -27,6 +27,8 @@ from translation_service import (
     SUPPORTED_TELEGRAM_LOCALES,
     normalize_enabled_languages,
     resolve_effective_locale,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
     translate,
 )
 from content_locales import admin_label
@@ -65,8 +67,8 @@ async def main_client_keyboard(user_id: int | None = None):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         stmt = select(Content).where(
             Content.is_visible == True,
@@ -284,7 +286,7 @@ def admin_general_settings_keyboard(config):
 
 def admin_language_settings_keyboard(config, readiness=None):
     builder = InlineKeyboardBuilder()
-    selector_enabled = bool(getattr(config, "telegram_language_selection_enabled", False))
+    selector_enabled = runtime_language_selection_enabled(config)
     authoring_enabled = bool(getattr(config, "multilingual_authoring_enabled", False))
 
     builder.button(
@@ -292,14 +294,20 @@ def admin_language_settings_keyboard(config, readiness=None):
         callback_data="admin_toggle_multilingual_authoring",
     )
 
-    builder.button(
-        text=(
-            "⛔ Запретить пользователям выбирать язык"
-            if selector_enabled
-            else "✅ Разрешить пользователям выбирать язык"
-        ),
-        callback_data="admin_language_toggle_selector",
-    )
+    if authoring_enabled:
+        builder.button(
+            text=(
+                "⛔ Запретить пользователям выбирать язык"
+                if selector_enabled
+                else "✅ Разрешить пользователям выбирать язык"
+            ),
+            callback_data="admin_language_toggle_selector",
+        )
+    else:
+        builder.button(
+            text="🔒 Выбор языка неактивен до включения мультиязычности",
+            callback_data="admin_language_settings",
+        )
     for locale in SUPPORTED_TELEGRAM_LOCALES:
         builder.button(
             text=f"⚙️ {LOCALE_LABELS[locale]}",
@@ -1746,7 +1754,7 @@ def gender_selection_keyboard(is_test: bool = False, locale: str = "ru"):
     return builder.as_markup()
 
 
-def user_settings_keyboard(user, locale: str = "ru"):
+def user_settings_keyboard(user, locale: str = "ru", *, language_available: bool = True):
     builder = InlineKeyboardBuilder()
 
     builder.button(
@@ -1796,7 +1804,8 @@ def user_settings_keyboard(user, locale: str = "ru"):
         callback_data="settings_toggle_length",
     )
 
-    builder.button(text=translate("ui.settings.language", locale, fallback="🌐 Язык"), callback_data="settings_change_language")
+    if language_available:
+        builder.button(text=translate("ui.settings.language", locale, fallback="🌐 Язык"), callback_data="settings_change_language")
     builder.button(text=translate("ui.settings.close", locale, fallback="❌ Закрыть"), callback_data="settings_close")
     builder.adjust(1)
     return builder.as_markup()
