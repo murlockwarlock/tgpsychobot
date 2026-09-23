@@ -4761,8 +4761,13 @@ async def view_client_profile(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Ошибка: ID клиента потерян. Вернитесь к списку.", show_alert=True)
             return
 
-    state_data = await state.get_data()
-    list_page = encoded_page if encoded_page is not None else int(state_data.get("client_list_page", 0) or 0)
+    if encoded_page is not None:
+        list_page = encoded_page
+    elif not hasattr(state, "get_data"):
+        list_page = 0
+    else:
+        state_data = await state.get_data()
+        list_page = int(state_data.get("client_list_page", 0) or 0)
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)

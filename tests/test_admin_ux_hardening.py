@@ -1,5 +1,6 @@
 import json
 import os
+import importlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -61,11 +62,21 @@ def admin_dispatcher():
     import automation_admin
     import handlers
 
+    if handlers.router.parent_router is not None:
+        handlers = importlib.reload(handlers)
+    if automation_admin.router.parent_router is not None:
+        automation_admin = importlib.reload(automation_admin)
+    if admin_content_authoring.router.parent_router is not None:
+        admin_content_authoring = importlib.reload(admin_content_authoring)
+
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(handlers.router)
     dispatcher.include_router(automation_admin.router)
     dispatcher.include_router(admin_content_authoring.router)
-    return dispatcher
+    yield dispatcher
+    for module in (admin_content_authoring, automation_admin, handlers):
+        if module.router.parent_router is not None:
+            importlib.reload(module)
 
 
 class RecordingSession(BaseSession):
