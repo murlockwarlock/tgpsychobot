@@ -1,93 +1,46 @@
-# Единый язык редактирования контента
+# Упрощённый multilingual authoring
 
-Telegram Admin остаётся русским. Язык контента — отдельная настройка рабочего пространства `(bot_id, admin_id)`, по умолчанию `ru`. Она не изменяет язык пользователя, default/enabled языки бота или предпочтения другого администратора. Список языков берётся из общего каталога `SUPPORTED_TELEGRAM_LOCALES`; редакторы не содержат отдельных EN/PT-форм. Новые языки этим изменением не включаются.
+Telegram Admin всегда остаётся русским. У каждого bot/database есть независимый флаг `BotGeneralConfig.multilingual_authoring_enabled`.
 
-## Матрица ресурсов
+- `ВЫКЛ` — обычные формы работают как в русскоязычном админ-панеле до multilingual authoring. Locale tabs, статусы переводов и глобальный выбор языка не показываются.
+- `ВКЛ` — языки выбираются только внутри карточки поддерживаемого объекта. Выбор не сохраняется как глобальная настройка администратора и не влияет на язык пользователя, язык по умолчанию или список доступных языков.
 
-Все перечисленные поля уже доступны администраторам в бизнес-разделах. Колонка «Контент» означает единый selector и BotTranslation для не-RU; обычный system pack их исключает. Общие поля не локализуются.
+## Матрица поддерживаемых объектов
 
-| Ресурс | Поля | Видимость пользователю | Управление | Общие поля / исключения | Проверки |
-|---|---|---|---|---|---|
-| Topic | name, description, start_message, start_button_text | Да | Контент | ID, порядок, доступность, prompts, payload, привязки | Field matrix, PT-first, IDs, runtime, dispatcher |
-| Content | button_title, text_content, action_btn_text | Да | Контент | key, media, порядок, visibility, action payload | Field matrix, PT-first, HTML/targets, static rendering |
-| Приветствие, меню, дисклеймер | Те же поля Content | Да | Контент | Ключи start_message/menu/disclaimer | Content editor, system/dynamic split |
-| Вступление/результат теста, финал секретного теста | Content.text_content и кнопки | Да | Контент | Ключи test_intro/test_results/secret_test_outro | Content matrix, test regression |
-| SubscriptionPlan | name, description | Да | Контент | Цена, длительность, trial, provider, upgrade, ID | Field matrix, PT-first, plan lists, MAX |
-| TestQuestion | text, comment | Да | Контент | ID, category, variable, scoring, sort, branching | Field matrix, insertion/deletion/reorder, active snapshots |
-| Вариант ответа | text, button_text | Да | Контент | identity, translation_slot, callback_id, value | Insert/delete/reorder, old EN/PT aliases, scores/callbacks |
-| SecretTestQuestion | text | Да | Контент | ID, sort | Field matrix, PT-first, missing availability |
-| Mailing | text | Да | Контент | Аудитория, расписание, media, delivery state | Field matrix, legacy save, mailing runtime |
-| AutomationAction | message_template для selected_user | Да | Контент | Получатель/ID, условия, metadata, порядок | Field matrix, legacy save, automation regression |
-| Сообщения всем администраторам | message_template | Только админам | RU, не pack | Остаются русскими | Registry boundary |
-| FollowupStep | message_text для static | Да | Контент | Delay, campaign, scope, AI instruction | Field matrix, legacy save, followup regression |
-| ReferralTemplate | text | Да | Контент | ID, порядок, enabled, правила начисления | Field matrix, PT-first, referral regression |
-| SubscriptionConfig | topics_btn_name, referral_btn_name, referral_sub_btn_name | Да | Контент | Provider config, бонусы, flags, URLs | Field matrix, legacy save, workspace isolation |
-| BotGeneralConfig | ai_processing_message_text | Да | Контент | Enabled flag, customer locale settings | Field matrix, entities, legacy save |
-| MediaLibrary | description | Да, caption | Контент | File IDs/names, category, media type, collections | Field matrix, media regression |
-| CaseStudy | text | Да, в MAX; также материал для AI | Контент | ID, RU search index | Field matrix, MAX empty-RU filtering |
-| TestConfig | System/result prompts, formulas, selected variables | Инструкции, не готовый пользовательский текст | Общие | Не переводятся | Test/scoring regression |
-| RandomMessage | content | AI-контекст/метафора, не прямое сообщение | Общие | Не переводится | Audit: get_random_message_by_topic |
-| KnowledgeBase, prompts, metadata, provider config | Документы/инструкции/технические значения | Не прямой display copy | Общие | Не переводятся | Existing regression |
-| Фиксированные меню, ошибки, уведомления, validation copy | STATIC_TRANSLATION_SOURCES | Да | System pack | Нет обычной content-формы | Pack/registry/readiness tests |
+| Объект | Локализуемые поля | Общие поля | Карточка при ВКЛ |
+|---|---|---|---|
+| Topic | `name`, `description`, `start_message`, `start_button_text` | ID, порядок, видимость, payload, routing, prompts, связи | Да |
+| Content | `button_title`, `text_content`, `action_btn_text`, локальный список media | key, visibility, order, action payload | Да |
+| SubscriptionPlan | `name`, `description` | цена, срок, provider, permissions, flags | Да |
+| SubscriptionConfig | пользовательские labels меню | платежи, бонусы, flags, URLs | Да |
+| ReferralTemplate | пользовательский `text` | ID, порядок, enabled, начисления | Да |
+| MediaLibrary | пользовательский `description`/caption | file ID, имя для AI, категория, media type, collections | Да |
 
-У тарифов нет отдельного редактируемого поля benefits: пользовательские преимущества находятся в description или Content. Единственного отдельного объекта определения теста с переводимым названием нет: TestConfig хранит общие настройки, а пользовательские тексты — Content и TestQuestion.
+TestQuestion, answer options, automations, followups, prompts, knowledge base, campaigns, admin messages и внутренние настройки не получают новые locale tabs. Их существующие русские формы не меняются.
 
-## Хранение и создание
+## Хранение
 
-RU хранится в существующих canonical-полях. Не-RU upsert использует существующий `BotTranslation(locale, translation_key)` и текущий source_hash; импортированные строки читаются напрямую. Изменения увеличивают translations_revision; runtime обновляет cache без перезапуска.
+Canonical RU остаётся в существующих полях бизнес-объектов. EN/PT variants используют уже существующий `BotTranslation` с ключом `resource_type.stable_id.field`; новые колонки `name_en`/`name_pt` не создаются. Системные packs по-прежнему работают только с system registry, а dynamic keys не экспортируются и не перезаписываются импортом.
 
-Для non-RU-first создаётся один объект с обычным стабильным PK. Обязательное canonical-поле содержит пустую строку (отсутствие RU), не чужой язык и не видимый placeholder. Content получает непрозрачный машинный key. Тариф создаётся неактивным до настройки цены/длительности. PostgreSQL использует существующие sequences; SQLite harness дополнительно исключает повторное использование ID сохранённых переводов.
+Для Content локальный media override хранится тем же ключом в JSON-варианте `content.<key>.media`. Если варианта нет, runtime использует общий/RU media. В текущей модели MediaLibrary file identity остаётся общей, а caption/description локализуется; отдельный файл для языка не создаётся без соответствующей продуктовой семантики.
 
-Additive schema: `admin_content_preferences`, `content_identity_counters`, `user_menu_bindings`; nullable `test_sessions.question_snapshot`. Языковых колонок на бизнес-таблицах нет. Bulk backfill и перезапись BotTranslation отсутствуют.
+Новый объект создаётся обычным RU-first способом. Затем в той же карточке можно сохранить EN/PT. Переводы не создают копии и не меняют stable ID.
 
-## Идентичность и совместимость
+## Runtime fallback
 
-Legacy question keys уже содержат TestQuestion.id. Legacy answer slot был индексом, поэтому при первом структурном редактировании варианты получают UUID identity, неизменный translation_slot и callback_id. Старые numeric slots/значения callback сохраняются. Новый вариант получает новый slot и монотонный callback ID; удалённые IDs не перераспределяются. Сами строки переводов не копируются и не переименовываются.
+Для user locale используется вариант этого locale, затем реальный RU variant. Если обязательного display value нет ни там, ни там, материал не показывается в списке. Отсутствующий вариант в карточке явно обозначается как `⚠️ Перевод не задан` с русским reference; reference никогда автоматически не сохраняется как перевод.
 
-Активное прохождение получает snapshot вопросов, scoring, вариантов и отображаемых переводов. Вставка/удаление/перестановка live-definition не меняет уже выданные callbacks и баллы. Старый импорт файла больше не удаляет всю таблицу. Обновление существующих вопросов требует явного ID; варианты без stable IDs изменяются через карточку, а не неоднозначным позиционным импортом. Переводной импорт не сбрасывает формулы.
+Недостаток dynamic content не меняет system readiness EN/PT и не отключает язык целиком. `🌐 Языки` управляет user-language availability, selector, system readiness и system pack import/export. В пояснении экрана указано, что темы, контент, тарифы, реферальные сообщения и media переводятся в своих карточках.
 
-ReplyKeyboard labels сохраняют привязку к stable resource ID в user_menu_bindings. Старое меню без такой привязки обновляется при нажатии; название не используется для выбора бизнес-объекта. Повторное назначение выданной подписи другому объекту запрещено.
+## Совместимость
 
-## Отсутствие перевода и review
+`admin_content_preferences` и старые per-admin locale helpers оставлены для безопасного rollback, но больше не используются обычным runtime flow. Existing EN/PT `BotTranslation` rows читаются без копирования и удаления. Existing user preferences, default locale, enabled locales, system pack data и provider settings не мигрируются.
 
-Перед структурной правкой legacy-вопросам без variable_name фиксируются их прежние вычисленные answer_01/answer_02/etc. Это происходит только при редактировании определения, не миграцией всех данных; перестановка больше не переназначает формульные переменные другому вопросу.
+Нормальный путь админа:
 
-Админ видит именно выбранный язык. При отсутствии: «Перевод не задан», с RU-справкой при наличии. Runtime использует выбранный язык, затем только настоящий RU; без обязательного display value ресурс скрывается/недоступен. MAX не использует EN/PT и пропускает RU-пустые ресурсы.
-
-После RU-изменения существующий перевод остаётся сохранённым и доступным, помечается «Требует проверки после изменения русского текста». Сохранение/подтверждение фиксирует актуальный hash. Если RU изменился во время открытой формы, требуется открыть её заново. Некорректная machine syntax не выдаётся пользователю. При non-RU-first остальные языки проверяются против уже существующего перевода на сохранность placeholders и embedded targets.
-
-System readiness проверяет только system keys. Content completeness и review показываются отдельно по ресурсам; недостающая тема не выключает EN/PT.
-
-## Packs
-
-Обычный export содержит system scope. Legacy full pack распознаётся: admin-managed prefixes пропускаются, preview/result сообщают количество пропущенных ключей. Даже устаревшая dynamic-строка не перезаписывает свежую правку из Admin. System keys сохраняют строгую проверку locale, target, source hash, формата и completeness.
-
-## PostgreSQL restore gate
-
-До исправления production predicate содержал cast всего массива:
-
-```sql
-((status)::text = ANY ((ARRAY['claimed'::character varying, 'pending'::character varying, 'unknown'::character varying])::text[]))
-```
-
-После pg_dump/restore PostgreSQL вывел эквивалентные casts элементов:
-
-```sql
-((status)::text = ANY (ARRAY[('claimed'::character varying)::text, ('pending'::character varying)::text, ('unknown'::character varying)::text]))
-```
-
-В обоих случаях сравниваются те же три строковых значения без усечения или изменения регистра. Проверка PostgreSQL теперь читает pg_index/pg_class/pg_attribute/pg_opclass и pg_get_expr: unique/valid/ready/immediate, ровно subscription_id, btree, обычная колонка и default operator class. Predicate разбирается ограниченной грамматикой; разрешены только text/varchar casts без typmod, pg_catalog qualification и скобки. Иное поле, набор значений, оператор, выражение/функция или дополнительное условие отвергаются. SQLite-проверка не ослаблялась. Production index не изменяется и не пересоздаётся.
-
-Изолированный gate использует восстановленный свежий backup: два init_db, проверка неизменного catalog, подключение application routers, сборка commands/cache, read-only payment sanity. Внешние workers/webhooks и отправки пользователям не запускаются. Восстановление production-backup допускается только как отдельная recovery-операция с остановкой writers: оно не является автоматическим откатом живых новых пользовательских транзакций. Старый binary без stable-answer/snapshot поддержки нельзя возвращать поверх уже изменённых определений; требуется совместимый runtime либо согласованное восстановление данных.
-
-## Walkthrough
-
-1. `/admin` → «Сменить язык контента» → «Português».
-2. «Темы» → карточка нужного ID → «Изменить: Название» → португальское значение → сообщение «Сохранено».
-3. «Добавить» в «Темы» → `Autoestima`. Создан один ID, RU отсутствует.
-4. `/admin` → «Сменить язык контента» → «Русский» → тот же ID → «Изменить: Название» → `Самооценка`.
-5. Аналогично «Контент», «Подписки → Тарифные планы», «Тест → Вопросы теста», рассылки, автоматизации и догонялки. Общие настройки действуют для всех языков.
-6. Для проверки устаревшего перевода открыть EN/PT-поле и сохранить либо нажать «Подтвердить перевод».
-7. «Языки» использовать для доступности языков пользователям и системного pack, не для названий тем/контента/вопросов.
-
-Telegram native UI проверяется dispatcher/API-тестами; browser viewport screenshots не являются выполненной проверкой этой интерфейсной поверхности.
+1. `🌐 Языки` → `🌐 Мультиязычность: ВКЛ`.
+2. `Темы` → открыть Topic ID.
+3. В карточке выбрать `🇬🇧 English` или `🇵🇹 Português`.
+4. Изменить только нужные display fields и сохранить.
+5. Переключение на другую карточку снова начинается с RU, без глобального locale state.
+6. `🌐 Языки` использовать только для пользовательских языков и системных packs.

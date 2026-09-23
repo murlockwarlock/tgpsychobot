@@ -14,7 +14,7 @@ from config import BOT_TOKEN, OWNER_IDS
 from handlers import router
 from automation_admin import router as automation_admin_router
 from admin_content_authoring import router as content_authoring_router
-from admin_authoring_context import AdminAuthoringMiddleware, admin_language_request
+from admin_authoring_context import AdminAuthoringMiddleware
 from content_runtime import ContentRuntimeMiddleware
 from database import async_session_maker, init_db
 from background_worker import process_queue, process_mailings
@@ -364,7 +364,6 @@ def main():
         default=DefaultBotProperties(parse_mode="HTML"),
     )
     storage = MemoryStorage()
-    bot.session.middleware(admin_language_request)
     dp = Dispatcher(storage=storage)
 
     activity_middleware = FollowupActivityMiddleware()

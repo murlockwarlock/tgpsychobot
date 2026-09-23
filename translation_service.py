@@ -143,7 +143,10 @@ async def _install_translation_snapshot(
             and isinstance(text, str)
             and text != ""
             and (is_admin_content_key(key) or stored_hash == source_hash(sources[key]))
-            and (not is_admin_content_key(key) or dynamic_translation_safe(sources[key], text))
+            and (
+                not is_admin_content_key(key)
+                or dynamic_translation_safe(sources[key], text, translation_key=key)
+            )
         )
     }
     translation_cache.install(revision, sources, translations)
@@ -151,8 +154,19 @@ async def _install_translation_snapshot(
     return translation_cache.snapshot
 
 
-def dynamic_translation_safe(source: str, translated: str) -> bool:
+def dynamic_translation_safe(source: str, translated: str, *, translation_key: str | None = None) -> bool:
     from translation_registry import _validate_telegram_html_value, embedded_target_signature
+    if translation_key and translation_key.startswith("content.") and translation_key.endswith(".media"):
+        try:
+            payload = json.loads(translated)
+        except (TypeError, ValueError):
+            return False
+        return isinstance(payload, list) and all(
+            isinstance(item, dict)
+            and item.get("type") in {"photo", "video"}
+            and bool(item.get("file_id"))
+            for item in payload
+        )
     try:
         _validate_telegram_html_value(translated)
         if source:

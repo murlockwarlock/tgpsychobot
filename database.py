@@ -654,6 +654,7 @@ class BotGeneralConfig(Base):
     telegram_default_language = Column(String(8), default="ru", nullable=False)
     telegram_language_selection_enabled = Column(Boolean, default=False, nullable=False)
     telegram_enabled_languages = Column(Text, default='["ru"]', nullable=False)
+    multilingual_authoring_enabled = Column(Boolean, default=False, nullable=False)
     translations_revision = Column(Integer, default=0, nullable=False)
 
 
@@ -1287,6 +1288,11 @@ async def init_db():
                 sync_conn.execute(text(
                     "ALTER TABLE bot_general_config "
                     "ADD COLUMN telegram_enabled_languages TEXT DEFAULT '[\"ru\"]' NOT NULL"
+                ))
+            if 'multilingual_authoring_enabled' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN multilingual_authoring_enabled BOOLEAN DEFAULT FALSE NOT NULL"
                 ))
             if 'translations_revision' not in general_columns:
                 sync_conn.execute(text(

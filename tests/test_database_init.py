@@ -176,6 +176,7 @@ async def test_init_db_adds_multilingual_foundation_with_safe_defaults(tmp_path,
             "telegram_default_language",
             "telegram_language_selection_enabled",
             "telegram_enabled_languages",
+            "multilingual_authoring_enabled",
             "translations_revision",
         } <= general_columns
 
@@ -188,8 +189,32 @@ async def test_init_db_adds_multilingual_foundation_with_safe_defaults(tmp_path,
         assert config.telegram_default_language == "ru"
         assert config.telegram_language_selection_enabled is False
         assert config.telegram_enabled_languages == '["ru"]'
+        assert config.multilingual_authoring_enabled is False
         assert config.translations_revision == 0
         assert user.telegram_language_code is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_adds_multilingual_authoring_flag_to_legacy_config(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-authoring-flag.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.execute(text(
+                "ALTER TABLE bot_general_config DROP COLUMN multilingual_authoring_enabled"
+            ))
+        await database.init_db()
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is False
     finally:
         await engine.dispose()
 

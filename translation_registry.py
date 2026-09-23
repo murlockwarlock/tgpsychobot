@@ -7,6 +7,7 @@ from html.parser import HTMLParser
 from dataclasses import dataclass
 
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from response_buttons import extract_response_buttons
 from translation_service import format_signature, source_hash, validate_translation_format
@@ -570,7 +571,7 @@ async def build_translation_registry(session) -> TranslationRegistry:
     test_config = await session.get(TestConfig, 1)
     test_enabled = bool(getattr(test_config, "is_enabled", False))
     secret_test_enabled = bool(test_enabled and getattr(test_config, "secret_test_enabled", False))
-    content_rows = (await session.execute(select(Content))).scalars().all()
+    content_rows = (await session.execute(select(Content).options(selectinload(Content.media)))).scalars().all()
     for item in content_rows:
         if item.key in {"test_intro", "test_results", "test_button"}:
             required = test_enabled
@@ -581,6 +582,15 @@ async def build_translation_registry(session) -> TranslationRegistry:
         _add_source(sources, f"content.{item.key}.button_title", item.button_title, kind="reply_button", required=required)
         _add_source(sources, f"content.{item.key}.text_content", item.text_content, kind="html", required=required)
         _add_source(sources, f"content.{item.key}.action_btn_text", item.action_btn_text, kind="inline_button", required=required)
+        media_source = json.dumps(
+            [
+                {"type": media.file_type, "file_id": media.file_id}
+                for media in (item.media or ())
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        _add_source(sources, f"content.{item.key}.media", media_source, required=False)
 
     topic_rows = (await session.execute(select(Topic))).scalars().all()
     for item in topic_rows:

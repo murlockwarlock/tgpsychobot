@@ -163,6 +163,31 @@ async def test_admin_can_open_language_screen_and_readiness_audit(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_multilingual_authoring_toggle_is_stored_per_bot_config(tmp_path, monkeypatch):
+    registry = _registry()
+    _patch_registry(monkeypatch, registry)
+    engine, sessions = await _test_db(tmp_path, monkeypatch, database="authoring-toggle")
+    try:
+        async with sessions() as session:
+            session.add(BotGeneralConfig(id=1, telegram_enabled_languages='["ru", "en", "pt"]'))
+            await session.commit()
+        bot = _Bot(_pack(registry, "bot"))
+        message = _Message(bot, document=False)
+        callback = _callback(bot, message, "admin_toggle_multilingual_authoring")
+        await handlers.admin_toggle_multilingual_authoring(callback)
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is True
+            assert config.telegram_enabled_languages == '["ru", "en", "pt"]'
+        await handlers.admin_toggle_multilingual_authoring(callback)
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("locale", ("en", "pt"))
 async def test_admin_export_is_locale_and_bot_database_specific(tmp_path, monkeypatch, locale):
     registry = _registry()

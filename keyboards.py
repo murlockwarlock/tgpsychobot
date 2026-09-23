@@ -285,6 +285,12 @@ def admin_general_settings_keyboard(config):
 def admin_language_settings_keyboard(config, readiness=None):
     builder = InlineKeyboardBuilder()
     selector_enabled = bool(getattr(config, "telegram_language_selection_enabled", False))
+    authoring_enabled = bool(getattr(config, "multilingual_authoring_enabled", False))
+
+    builder.button(
+        text=f"🌐 Мультиязычность: {'ВКЛ' if authoring_enabled else 'ВЫКЛ'}",
+        callback_data="admin_toggle_multilingual_authoring",
+    )
 
     builder.button(
         text=(

@@ -4,19 +4,21 @@ import html
 import re
 import math
 
-from aiogram import BaseMiddleware, F, Router
+from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
 from content_authoring import (
-    RESOURCES, create_resource, editing_locale, read_content_value, field_source,
-    save_content_value, set_editing_locale,
+    AUTHORING_RESOURCES, RESOURCES, authoring_locales, create_resource,
+    multilingual_authoring_enabled, read_content_value,
+    save_content_value,
 )
 from database import async_session_maker
 from translation_pack_manager import translation_coordination_lock
-from translation_service import LOCALE_LABELS, SUPPORTED_TELEGRAM_LOCALES, refresh_translation_cache
+from translation_service import LOCALE_LABELS, refresh_translation_cache
 from universal_tests import get_answer_options
 
 
@@ -36,12 +38,16 @@ def keyboard(rows):
 
 
 def locale_heading(locale):
-    return f"✍️ Язык контента: {LOCALE_LABELS.get(locale, locale)}"
+    return f"Язык: {LOCALE_LABELS.get(locale, locale)}"
 
 
 async def locale_for(event):
+    return "ru"
+
+
+async def authoring_enabled_for(event):
     async with async_session_maker() as session:
-        return await editing_locale(session, event.bot.id, event.from_user.id)
+        return await multilingual_authoring_enabled(session)
 
 
 async def allowed(event):
@@ -56,12 +62,13 @@ async def allowed(event):
 async def show_root(event, state=None):
     if not await allowed(event):
         return
+    if not await authoring_enabled_for(event):
+        raise SkipHandler()
     if state is not None:
         await state.clear()
     import keyboards as kb
     markup = kb.admin_panel_keyboard()
-    markup.inline_keyboard.insert(0, [InlineKeyboardButton(text="🌐 Сменить язык контента", callback_data="ca:language")])
-    text = "Добро пожаловать в админ-панель!\n\n" + locale_heading(await locale_for(event))
+    text = "Добро пожаловать в админ-панель!"
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(text, reply_markup=markup)
         await event.answer()
@@ -79,9 +86,17 @@ async def root_callback(callback: CallbackQuery, state):
     await show_root(callback, state)
 
 
+@router.callback_query(F.data == "admin_manage_buttons")
+async def menu_labels_card(callback: CallbackQuery, state):
+    if not await authoring_enabled_for(callback):
+        raise SkipHandler()
+    await state.clear()
+    await resource_card(callback, "subscription_config", "1")
+    await callback.answer()
+
+
 async def resource_list(event, kind, page=0):
-    spec = RESOURCES[kind]
-    locale = await locale_for(event)
+    spec = AUTHORING_RESOURCES.get(kind, RESOURCES[kind])
     async with async_session_maker() as session:
         query = select(spec.model).order_by(getattr(spec.model, spec.identity_field))
         if hasattr(spec.model, "sort_order"):
@@ -94,7 +109,7 @@ async def resource_list(event, kind, page=0):
         rows = []
         for resource in resources[:8]:
             identity = getattr(resource, spec.identity_field)
-            value = await read_content_value(session, kind, resource, spec.fields[0][0], locale)
+            value = await read_content_value(session, kind, resource, spec.fields[0][0], "ru")
             label = value.admin_label().replace("\n", " ")
             row = [(f"{identity}: {label}"[:64], f"ca:view:{kind}:{identity}")]
             if kind == "topic":
@@ -104,7 +119,7 @@ async def resource_list(event, kind, page=0):
             from database import SubscriptionConfig
             config = await session.get(SubscriptionConfig, 1)
             if config:
-                value = await read_content_value(session, "subscription_config", config, "topics_btn_name", locale)
+                value = await read_content_value(session, "subscription_config", config, "topics_btn_name", "ru")
                 rows.extend([
                     [("Темы: " + ("включены" if config.topics_enabled else "выключены"), "admin_toggle_topics")],
                     [("Кнопка тем: " + ("сверху" if config.topics_btn_on_top else "в списке"), "admin_toggle_topics_on_top")],
@@ -119,45 +134,50 @@ async def resource_list(event, kind, page=0):
         rows.append(nav)
     if kind in {"topic", "content", "plan", "test_question", "secret_test_question", "referral_template", "case_study"}:
         rows.append([("Добавить", f"ca:new:{kind}")])
-    rows.extend([[('🌐 Сменить язык контента', 'ca:language')], [('В админ-панель', 'admin_panel')]])
-    await event.message.edit_text(f"{locale_heading(locale)}\n\n<b>{spec.title}</b>", reply_markup=keyboard(rows))
+    rows.append([('В админ-панель', 'admin_panel')])
+    await event.message.edit_text(f"<b>{spec.title}</b>", reply_markup=keyboard(rows))
 
 
-async def resource_card(event, kind, identity):
-    spec = RESOURCES[kind]
+async def resource_card(event, kind, identity, locale="ru"):
+    spec = AUTHORING_RESOURCES.get(kind, RESOURCES[kind])
     identity = identity if spec.identity_field == "key" else int(identity)
-    locale = await locale_for(event)
     async with async_session_maker() as session:
+        enabled = await multilingual_authoring_enabled(session)
+        if not enabled:
+            locale = "ru"
+        locales = await authoring_locales(session) if enabled and kind in AUTHORING_RESOURCES else ("ru",)
+        if locale not in locales:
+            locale = "ru"
         resource = await session.get(spec.model, identity)
         if resource is None:
             await event.answer("Материал не найден.", show_alert=True)
             return
         fields = list(spec.fields)
-        text = [locale_heading(locale), f"<b>{spec.title} #{html.escape(str(identity))}</b>"]
+        text = [f"<b>{spec.title} #{html.escape(str(identity))}</b>", locale_heading(locale)]
         rows = []
+        if enabled and kind in AUTHORING_RESOURCES and len(locales) > 1:
+            rows.append([(LOCALE_LABELS[item], f"ca:locale:{kind}:{identity}:{item}") for item in locales])
         for field, title, _ in fields:
             value = await read_content_value(session, kind, resource, field, locale)
             preview = value.admin_label()
             if len(preview) > 250:
                 preview = preview[:247] + "…"
             text.append(f"\n<b>{title}:</b>\n{html.escape(preview)}")
-            if value.needs_review:
-                text.append("⚠️ Требует проверки после изменения русского текста")
             if field.startswith("option."):
                 _, slot, part = field.split(".")
                 option = next(option for option in get_answer_options(resource) if option.translation_slot == slot)
                 route = f"ca:opt:{identity}:{option.callback_id}:{part}"
             else:
-                route = f"ca:edit:{kind}:{identity}:{fields.index((field, title, _))}"
+                route = f"ca:edit:{kind}:{identity}:{locale}:{fields.index((field, title, _))}"
             rows.append([(f"Изменить: {title}", route)])
         globals_markup = None
         import keyboards as kb
         if kind == "topic":
             globals_markup = kb.edit_topic_keyboard(identity, resource.is_active, in_menu=resource.show_in_main_menu, in_list=resource.show_in_list, admin_only=resource.admin_only, auto_start=resource.auto_start_dialogue)
         elif kind == "plan":
-            rows.append([("Общие настройки тарифа", f"ca:settings:plan:{identity}")])
+            rows.append([("Общие настройки тарифа", f"ca:settings:plan:{identity}:{locale}")])
         elif kind == "content":
-            rows.append([("Медиа и общие настройки", f"ca:settings:content:{identity}")])
+            rows.append([("Медиа и общие настройки", f"ca:settings:content:{identity}:{locale}")])
         elif kind == "test_question":
             rows.append([("Варианты и порядок", f"ca:answers:{identity}")])
         elif kind == "referral_template":
@@ -171,7 +191,7 @@ async def resource_card(event, kind, identity):
                 filtered = [(button.text, button.callback_data) for button in row if not button.callback_data.startswith(("edit_topic_name_", "edit_topic_intro_", "edit_topic_btn_text_", "admin_ref_tpl_edit_"))]
                 if filtered:
                     rows.append(filtered)
-        rows.extend([[('🌐 Сменить язык контента', 'ca:language')], [('К списку', f'ca:list:{kind}:0')]])
+        rows.append([('К списку', f'ca:list:{kind}:0')])
     await event.message.edit_text("\n".join(text), reply_markup=keyboard(rows))
 
 
@@ -186,10 +206,13 @@ def resource_fields(kind, resource):
     return fields
 
 
-async def begin_edit(event, state, kind, identity, field_index):
-    locale = await locale_for(event)
-    spec = RESOURCES[kind]
+async def begin_edit(event, state, kind, identity, field_index, locale="ru"):
+    spec = AUTHORING_RESOURCES.get(kind, RESOURCES[kind])
     async with async_session_maker() as session:
+        if not await multilingual_authoring_enabled(session):
+            locale = "ru"
+        elif locale not in await authoring_locales(session):
+            locale = "ru"
         resource = await session.get(spec.model, identity if spec.identity_field == "key" else int(identity))
         if resource is None:
             await event.answer("Материал не найден.", show_alert=True)
@@ -205,7 +228,7 @@ async def begin_edit(event, state, kind, identity, field_index):
         field, title, _ = selected
         value = await read_content_value(session, kind, resource, field, locale)
     await state.set_state(ContentAuthoringStates.value)
-    await state.set_data({"kind": kind, "identity": identity, "field": field, "locale": locale, "source_hash": field_source(kind, resource, field).source_hash})
+    await state.set_data({"kind": kind, "identity": identity, "field": field, "locale": locale, "authoring_locale": locale})
     rows = []
     if value.needs_review:
         rows.append([("Подтвердить перевод", "ca:confirm")])
@@ -220,26 +243,30 @@ async def content_callback(callback: CallbackQuery, state):
         return
     parts = callback.data.split(":")
     action = parts[1]
+    if action in {"language", "list", "locale", "view", "edit", "new", "settings", "confirm"}:
+        if not await authoring_enabled_for(callback):
+            raise SkipHandler()
     if action == "language":
         await state.clear()
-        await callback.message.edit_text(locale_heading(await locale_for(callback)), reply_markup=keyboard(
-            [[(LOCALE_LABELS.get(locale, locale), f"ca:locale:{locale}")] for locale in SUPPORTED_TELEGRAM_LOCALES]
-            + [[("Назад", "admin_panel")]],
-        ))
+        await callback.message.edit_text("Выбор языка теперь доступен внутри карточки материала.", reply_markup=keyboard([[('В админ-панель', 'admin_panel')]]))
     elif action == "locale":
-        async with async_session_maker() as session:
-            await set_editing_locale(session, callback.bot.id, callback.from_user.id, parts[2])
-            await session.commit()
-        await show_root(callback, state)
+        if len(parts) != 5:
+            await callback.answer("Откройте карточку материала заново.", show_alert=True)
+            return
+        await resource_card(callback, parts[2], parts[3], parts[4])
+        await callback.answer()
         return
     elif action == "list":
         await state.clear()
         await resource_list(callback, parts[2], int(parts[3]))
     elif action == "view":
         await state.clear()
-        await resource_card(callback, parts[2], parts[3])
+        await resource_card(callback, parts[2], parts[3], parts[4] if len(parts) > 4 else "ru")
     elif action == "edit":
-        await begin_edit(callback, state, parts[2], parts[3], int(parts[4]))
+        if len(parts) == 6:
+            await begin_edit(callback, state, parts[2], parts[3], int(parts[5]), parts[4])
+        else:
+            await begin_edit(callback, state, parts[2], parts[3], int(parts[4]), "ru")
     elif action == "opt":
         async with async_session_maker() as session:
             question = await session.get(RESOURCES["test_question"].model, int(parts[2]))
@@ -257,16 +284,19 @@ async def content_callback(callback: CallbackQuery, state):
         return
     elif action == "new":
         kind = parts[2]
-        locale = await locale_for(callback)
         await state.set_state(ContentAuthoringStates.value)
-        await state.set_data({"kind": kind, "identity": None, "field": RESOURCES[kind].fields[0][0], "locale": locale})
-        await callback.message.edit_text(f"{locale_heading(locale)}\n\n{RESOURCES[kind].fields[0][1]}:", reply_markup=keyboard([[('Отмена', f'ca:list:{kind}:0')]]))
+        spec = AUTHORING_RESOURCES.get(kind, RESOURCES[kind])
+        await state.set_data({"kind": kind, "identity": None, "field": spec.fields[0][0], "locale": "ru", "authoring_locale": "ru"})
+        await callback.message.edit_text(f"{spec.fields[0][1]}:", reply_markup=keyboard([[('Отмена', f'ca:list:{kind}:0')]]))
     elif action == "settings":
         from handlers import _show_admin_edit_plan_menu, start_content_edit
         from admin_authoring_context import content_editing_locale
-        locale = await locale_for(callback)
+        locale = "ru"
+        if len(parts) > 4:
+            locale = parts[4]
         token = content_editing_locale.set(locale)
         try:
+            await state.update_data(authoring_locale=locale)
             if parts[2] == "plan":
                 await _show_admin_edit_plan_menu(callback.bot, callback.message.chat.id, callback.message.message_id, int(parts[3]))
             elif parts[2] == "content":
@@ -284,15 +314,15 @@ async def content_callback(callback: CallbackQuery, state):
         async with async_session_maker() as session:
             async with translation_coordination_lock(session):
                 resource = await session.get(spec.model, data["identity"] if spec.identity_field == "key" else int(data["identity"]))
-                if resource is None or field_source(data["kind"], resource, data["field"]).source_hash != data.get("source_hash"):
-                    await callback.answer("Русский текст изменился. Откройте материал заново для проверки.", show_alert=True)
+                if resource is None:
+                    await callback.answer("Материал удалён. Откройте список заново.", show_alert=True)
                     return
                 value = await read_content_value(session, data["kind"], resource, data["field"], data["locale"])
                 if value.text:
                     await save_content_value(session, data["kind"], resource, data["field"], data["locale"], value.text)
                     await session.commit()
         await state.clear()
-        await resource_card(callback, data["kind"], data["identity"])
+        await resource_card(callback, data["kind"], data["identity"], data.get("locale", "ru"))
     await callback.answer()
 
 
@@ -328,8 +358,6 @@ async def content_value_received(message: Message, state):
                     resource = await session.get(spec.model, identity if spec.identity_field == "key" else int(identity))
                     if resource is None:
                         raise ValueError("Материал удалён. Вернитесь к списку.")
-                    if data["locale"] != "ru" and data.get("source_hash") != field_source(data["kind"], resource, data["field"]).source_hash:
-                        raise ValueError("Русский текст изменился. Откройте материал заново для проверки.")
                     await save_content_value(session, data["kind"], resource, data["field"], data["locale"], value)
                 await session.commit()
     except ValueError as exc:
@@ -340,16 +368,22 @@ async def content_value_received(message: Message, state):
         await update_case_study_index(int(identity), value)
     await state.clear()
     await refresh_translation_cache(async_session_maker, force=True)
-    await message.answer(f"{locale_heading(data['locale'])}\n\nСохранено.", reply_markup=keyboard([[('Открыть материал', f"ca:view:{data['kind']}:{identity}")]]))
+    await message.answer(f"{locale_heading(data.get('locale', 'ru'))}\n\nСохранено.", reply_markup=keyboard([[('Открыть материал', f"ca:view:{data['kind']}:{identity}:{data.get('locale', 'ru')}")]]))
 
 
-ENTRY_LISTS = {"admin_content": "content", "admin_plans": "plan", "admin_secret_questions": "secret_test_question", "admin_test_questions": "test_question", "admin_referral_templates": "referral_template"}
+ENTRY_LISTS = {
+    "admin_content": "content",
+    "admin_plans": "plan",
+    "admin_referral_templates": "referral_template",
+}
 
 
 @router.callback_query(lambda event: event.data in ENTRY_LISTS or bool(re.fullmatch(r"admin_(?:topics|case_studies)_page_\d+", event.data or "")))
 async def list_entry(callback: CallbackQuery, state):
     if not await allowed(callback):
         return
+    if not await authoring_enabled_for(callback):
+        raise SkipHandler()
     await state.clear()
     paginated = callback.data.startswith(("admin_topics_page_", "admin_case_studies_page_"))
     kind = "case_study" if callback.data.startswith("admin_case_studies_page_") else ENTRY_LISTS.get(callback.data, "topic")
@@ -364,6 +398,8 @@ DETAIL_ROUTES = ((r"edit_topic_(\d+)", "topic"), (r"admin_edit_plan_(\d+)", "pla
 async def detail_entry(callback: CallbackQuery, state):
     if not await allowed(callback):
         return
+    if not await authoring_enabled_for(callback):
+        raise SkipHandler()
     await state.clear()
     for pattern, kind in DETAIL_ROUTES:
         match = re.fullmatch(pattern, callback.data)
@@ -395,14 +431,20 @@ SINGLE_FIELDS = {
 async def field_entry(callback: CallbackQuery, state):
     if not await allowed(callback):
         return
+    if not await authoring_enabled_for(callback):
+        raise SkipHandler()
     if callback.data in SINGLE_FIELDS:
         kind, index = SINGLE_FIELDS[callback.data]
-        await begin_edit(callback, state, kind, "1", index)
+        if kind not in AUTHORING_RESOURCES:
+            raise SkipHandler()
+        await resource_card(callback, kind, "1")
     else:
         for pattern, kind, index in FIELD_ROUTES:
             match = re.fullmatch(pattern, callback.data)
             if match:
-                await begin_edit(callback, state, kind, match[1], index)
+                if kind not in AUTHORING_RESOURCES:
+                    raise SkipHandler()
+                await resource_card(callback, kind, match[1])
                 break
     await callback.answer()
 

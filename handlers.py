@@ -1,7 +1,7 @@
 import asyncio
 from content_locales import is_admin_content_key
 from test_content_identity import question_snapshot, questions_for_session
-from content_authoring import admin_value, admin_projection
+from content_authoring import admin_value, admin_projection, parse_content_media_value, save_content_value
 import base64
 import math
 import html
@@ -46,7 +46,7 @@ from aiogram.utils.formatting import Text
 
 from config import OWNER_IDS
 from database import (async_session_maker, User, Message as DBMessage, AIConfig, KnowledgeBase, Content, IndexingQueue,
-                     ContentMedia, Topic, SubscriptionPlan, UserSubscription, PromoCode, SubscriptionConfig, Mailing,
+                     ContentMedia, BotTranslation, Topic, SubscriptionPlan, UserSubscription, PromoCode, SubscriptionConfig, Mailing,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
                      ReferralPaymentLog, MailingDeliveryLog,
                      MediaCollection, media_collection_items, topic_collection_association,
@@ -6083,6 +6083,10 @@ async def admin_content(callback: CallbackQuery, state: FSMContext):
     )
 
 
+def _content_media_list(value: str | None, fallback: list[dict[str, str]]) -> list[dict[str, str]]:
+    return parse_content_media_value(value) or fallback
+
+
 async def get_content_from_db(key: str, user_id: int | None = None) -> dict:
     async with async_session_maker() as session:
         content_obj = await session.get(Content, key, options=[selectinload(Content.media)])
@@ -6101,17 +6105,37 @@ async def get_content_from_db(key: str, user_id: int | None = None) -> dict:
             getattr(config, "telegram_enabled_languages", '["ru"]'),
         )
         if content_obj:
-            media_list = [
+            canonical_media = [
                 {'type': media.file_type, 'file_id': media.file_id}
                 for media in content_obj.media
             ]
             from admin_authoring_context import content_editing_locale
             if user_id is None and content_editing_locale.get():
+                admin_locale = content_editing_locale.get()
+                localized_media = await admin_value(
+                    session, "content", content_obj, "media", locale=admin_locale
+                )
                 return {
-                    "text": await admin_value(session, "content", content_obj, "text_content"),
-                    "media": media_list, "is_visible": content_obj.is_visible,
+                    "text": await admin_value(
+                        session, "content", content_obj, "text_content", locale=admin_locale
+                    ),
+                    "media": _content_media_list(localized_media, canonical_media),
+                    "is_visible": content_obj.is_visible,
                     "content_order": content_obj.content_order, "missing": False,
                 }
+            localized_media = translate(
+                f"content.{content_obj.key}.media",
+                locale,
+                fallback=None,
+                source=json.dumps(
+                    [
+                        {"type": media["type"], "file_id": media["file_id"]}
+                        for media in canonical_media
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
             return {
                 "text": translate(
                     f"content.{content_obj.key}.text_content",
@@ -6119,7 +6143,7 @@ async def get_content_from_db(key: str, user_id: int | None = None) -> dict:
                     fallback=content_obj.text_content,
                     source=content_obj.text_content or "",
                 ),
-                "media": media_list,
+                "media": _content_media_list(localized_media, canonical_media),
                 "is_visible": content_obj.is_visible,
                 "content_order": content_obj.content_order,
                 "missing": False,
@@ -6257,14 +6281,32 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
     text = data.get('text_content', '')
     media_files = data.get('media_files', [])
     content_order = data.get('content_order', 'media_top')
+    authoring_locale = data.get('authoring_locale') or data.get('locale') or "ru"
 
     async with async_session_maker() as session:
-        content_obj = await session.get(Content, content_key)
-        button_title = content_obj.button_title if content_obj else content_key
+        content_obj = await session.get(Content, content_key, options=[selectinload(Content.media)])
+        button_title = (
+            await admin_value(session, "content", content_obj, "button_title", locale=authoring_locale)
+            if content_obj else content_key
+        )
         is_visible = content_obj.is_visible if content_obj else True
 
-        btn_text = content_obj.action_btn_text if content_obj else None
+        btn_text = (
+            await admin_value(session, "content", content_obj, "action_btn_text", locale=authoring_locale)
+            if content_obj else None
+        )
         btn_payload = content_obj.action_btn_payload if content_obj else None
+        if content_obj and "media_files" not in data:
+            localized_media = await admin_value(
+                session, "content", content_obj, "media", locale=authoring_locale
+            )
+            media_files = _content_media_list(
+                localized_media,
+                [
+                    {"type": media.file_type, "file_id": media.file_id}
+                    for media in content_obj.media
+                ],
+            )
 
     display_name = button_title if button_title else content_key
 
@@ -6487,6 +6529,7 @@ async def save_content(callback: CallbackQuery, state: FSMContext):
     new_text = data.get('text_content')
     new_media = data.get('media_files', [])
     new_order = data.get('content_order', 'media_top')
+    authoring_locale = data.get('authoring_locale') or "ru"
 
     async with async_session_maker() as session:
         content_obj = await session.get(Content, content_key, options=[selectinload(Content.media)])
@@ -6494,16 +6537,29 @@ async def save_content(callback: CallbackQuery, state: FSMContext):
             content_obj = Content(key=content_key)
             session.add(content_obj)
 
-        content_obj.text_content = new_text
         content_obj.content_order = new_order
-
-        content_obj.media.clear()
-        await session.flush()
-        for media_item in new_media:
-            content_obj.media.append(ContentMedia(
-                file_type=media_item['type'],
-                file_id=media_item['file_id']
-            ))
+        if authoring_locale == "ru":
+            content_obj.text_content = new_text
+            content_obj.media.clear()
+            await session.flush()
+            for media_item in new_media:
+                content_obj.media.append(ContentMedia(
+                    file_type=media_item['type'],
+                    file_id=media_item['file_id']
+                ))
+        else:
+            await session.flush()
+            await save_content_value(
+                session, "content", content_obj, "text_content", authoring_locale, new_text or ""
+            )
+            await save_content_value(
+                session,
+                "content",
+                content_obj,
+                "media",
+                authoring_locale,
+                json.dumps(new_media, ensure_ascii=False, separators=(",", ":")),
+            )
         await commit_readiness_critical_mutation(session)
 
     await state.clear()
@@ -19750,7 +19806,12 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
     enabled = set(normalize_enabled_languages(config.telegram_enabled_languages))
     default_locale = normalize_locale(config.telegram_default_language) or "ru"
     selector_enabled = bool(config.telegram_language_selection_enabled)
-    lines = ["🌐 <b>Языки Telegram</b>", "Темы, контент, тесты и другие материалы редактируются в соответствующих разделах админки. Здесь управляются языками бота и системными переводами."]
+    authoring_enabled = bool(getattr(config, "multilingual_authoring_enabled", False))
+    lines = [
+        "🌐 <b>Языки Telegram</b>",
+        "Темы, контент, тарифы, реферальные сообщения и медиаматериалы переводятся прямо в их карточках.",
+        "Здесь управляются языками пользователей и системными переводами.",
+    ]
     if bot_label:
         lines.extend(("", bot_label))
     lines.extend(
@@ -19758,6 +19819,7 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
             "",
             f"Язык по умолчанию: <b>{LOCALE_LABELS[default_locale]}</b>",
             f"Выбор языка пользователем: <b>{'Включён' if selector_enabled else 'Выключен'}</b>",
+            f"Мультиязычность авторинга: <b>{'ВКЛ' if authoring_enabled else 'ВЫКЛ'}</b>",
             "Если выбор выключен, все пользователи получают ответы на русском. "
             "Сохранённые предпочтения при этом не удаляются.",
             "",
@@ -19773,11 +19835,6 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
         lines.append(
             f"{LOCALE_LABELS[locale]} — {_language_readiness_status(readiness, locale)}"
         )
-        from content_authoring import RESOURCES
-        for kind, counts in readiness.get("content", {}).get(locale, {}).items():
-            if counts["total"]:
-                title = RESOURCES[kind].title if kind in RESOURCES else kind
-                lines.append(f"{title}: {counts['complete']}/{counts['total']} · требуют проверки {counts['review']}")
     return "\n".join(lines)
 
 
@@ -19980,6 +20037,25 @@ async def admin_language_toggle_selector(callback: CallbackQuery):
                     )
                     return
             config.telegram_language_selection_enabled = new_value
+            await session.commit()
+    await admin_language_settings(callback)
+
+
+@router.callback_query(F.data == "admin_toggle_multilingual_authoring")
+async def admin_toggle_multilingual_authoring(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        async with translation_coordination_lock(session):
+            config = await session.get(BotGeneralConfig, 1)
+            if config is None:
+                config = BotGeneralConfig(id=1)
+                session.add(config)
+                await session.flush()
+            config.multilingual_authoring_enabled = not bool(
+                getattr(config, "multilingual_authoring_enabled", False)
+            )
             await session.commit()
     await admin_language_settings(callback)
 
