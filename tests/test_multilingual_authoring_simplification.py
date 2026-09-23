@@ -147,6 +147,7 @@ async def test_content_runtime_uses_locale_media_and_russian_fallback(factory, m
     from handlers import get_content_from_db
     import handlers
     monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers.kb, "content_management_keyboard", AsyncMock(return_value=None))
     async with factory() as session:
         config = await session.get(BotGeneralConfig, 1)
         config.telegram_language_selection_enabled = True
@@ -219,6 +220,51 @@ async def test_content_renderer_uses_locale_media_and_preserves_explicit_empty_o
     assert await render_static_content_telegram(bot, 42, 42, "render_media")
     bot.send_photo.assert_not_called()
     assert any("Texto português" in call.args[1] for call in bot.send_message.call_args_list if len(call.args) > 1)
+
+
+@pytest.mark.asyncio
+async def test_content_settings_save_does_not_materialize_russian_media_as_missing_locale_variant(factory, monkeypatch):
+    import handlers
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers.kb, "content_management_keyboard", AsyncMock(return_value=None))
+    async with factory() as session:
+        content = Content(key="settings_media", text_content="Русский текст")
+        content.media.append(ContentMedia(file_type="photo", file_id="ru-photo"))
+        session.add(content)
+        await session.commit()
+
+    class State:
+        async def get_data(self):
+            return {
+                "content_key": "settings_media",
+                "text_content": "Texto português",
+                "media_files": [{"type": "photo", "file_id": "ru-photo"}],
+                "content_order": "media_top",
+                "authoring_locale": "pt",
+                "media_variant_present": False,
+                "media_variant_touched": False,
+            }
+
+        async def clear(self):
+            return None
+
+    callback = SimpleNamespace(
+        message=SimpleNamespace(edit_text=AsyncMock()),
+        answer=AsyncMock(),
+    )
+    await handlers.save_content(callback, State())
+
+    async with factory() as session:
+        assert await session.scalar(
+            select(BotTranslation.text).where(
+                BotTranslation.locale == "pt",
+                BotTranslation.translation_key == "content.settings_media.media",
+            )
+        ) is None
+        media_rows = (await session.scalars(
+            select(ContentMedia).where(ContentMedia.content_key == "settings_media")
+        )).all()
+        assert [(item.file_type, item.file_id) for item in media_rows] == [("photo", "ru-photo")]
 
 
 class _RecordingSession(BaseSession):

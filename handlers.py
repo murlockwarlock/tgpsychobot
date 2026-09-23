@@ -1,7 +1,7 @@
 import asyncio
 from content_locales import is_admin_content_key
 from test_content_identity import question_snapshot, questions_for_session
-from content_authoring import admin_value, admin_projection, parse_content_media_value, save_content_value
+from content_authoring import admin_value, admin_projection, parse_content_media_value, read_content_value, save_content_value
 import base64
 import math
 import html
@@ -6128,14 +6128,16 @@ async def get_content_from_db(key: str, user_id: int | None = None) -> dict:
             from admin_authoring_context import content_editing_locale
             if user_id is None and content_editing_locale.get():
                 admin_locale = content_editing_locale.get()
-                localized_media = await admin_value(
-                    session, "content", content_obj, "media", locale=admin_locale
+                localized_text = await read_content_value(
+                    session, "content", content_obj, "text_content", admin_locale
+                )
+                localized_media = await read_content_value(
+                    session, "content", content_obj, "media", admin_locale
                 )
                 return {
-                    "text": await admin_value(
-                        session, "content", content_obj, "text_content", locale=admin_locale
-                    ),
-                    "media": _content_media_list(localized_media, canonical_media),
+                    "text": localized_text.text or "",
+                    "media": _content_media_list(localized_media.text, canonical_media),
+                    "media_variant_present": admin_locale == "ru" or localized_media.text is not None,
                     "is_visible": content_obj.is_visible,
                     "content_order": content_obj.content_order, "missing": False,
                 }
@@ -6429,15 +6431,23 @@ async def start_content_edit(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.edit_content)
 
     current_content = await get_content_from_db(content_key)
+    state_data = await state.get_data()
+    authoring_locale = state_data.get("authoring_locale") or "ru"
 
     async with async_session_maker() as session:
-        obj = await session.get(Content, content_key)
+        obj = await session.get(Content, content_key, options=[selectinload(Content.media)])
         order = getattr(obj, 'content_order', 'media_top')
+        media_variant_present = authoring_locale == "ru"
+        if obj and authoring_locale != "ru":
+            media_value = await read_content_value(session, "content", obj, "media", authoring_locale)
+            media_variant_present = media_value.text is not None
 
     await state.update_data(
         content_key=content_key,
         text_content=current_content.get('text'),
         media_files=current_content.get('media', []),
+        media_variant_present=media_variant_present,
+        media_variant_touched=False,
         content_order=order,
         message_id_to_edit=callback.message.message_id
     )
@@ -6488,7 +6498,7 @@ async def process_content_update(message: Message, state: FSMContext, bot: Bot):
 
         media_files = data.get('media_files', [])
         media_files.append({'type': file_type, 'file_id': file_id})
-        await state.update_data(media_files=media_files)
+        await state.update_data(media_files=media_files, media_variant_touched=True)
         await send_temp_notification(message.from_user.id, bot, f"✅ Медиафайл добавлен (всего: {len(media_files)}).",
                                      delay=3)
 
@@ -6528,7 +6538,7 @@ async def handle_media_delete(callback: CallbackQuery, state: FSMContext):
 
     if 0 <= index_to_delete < len(media_files):
         media_files.pop(index_to_delete)
-        await state.update_data(media_files=media_files)
+        await state.update_data(media_files=media_files, media_variant_touched=True)
         await callback.answer(f"Медиафайл #{index_to_delete + 1} удален.")
     else:
         await callback.answer("Ошибка: неверный индекс файла.", show_alert=True)
@@ -6568,14 +6578,15 @@ async def save_content(callback: CallbackQuery, state: FSMContext):
             await save_content_value(
                 session, "content", content_obj, "text_content", authoring_locale, new_text or ""
             )
-            await save_content_value(
-                session,
-                "content",
-                content_obj,
-                "media",
-                authoring_locale,
-                json.dumps(new_media, ensure_ascii=False, separators=(",", ":")),
-            )
+            if data.get("media_variant_present") or data.get("media_variant_touched"):
+                await save_content_value(
+                    session,
+                    "content",
+                    content_obj,
+                    "media",
+                    authoring_locale,
+                    json.dumps(new_media, ensure_ascii=False, separators=(",", ":")),
+                )
         await commit_readiness_critical_mutation(session)
 
     await state.clear()
