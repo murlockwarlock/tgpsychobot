@@ -737,7 +737,7 @@ async def _prepare_ai_button_submission(
     return True, button_text
 
 user_spread_state = {}  # Runtime cache; the source of truth is card_spread_states in the database.
-PAGE_SIZE = 5
+PAGE_SIZE = 15
 USER_HISTORY_PAGE_SIZE = 10
 KB_PAGE_SIZE = 6
 ROBOKASSA_INVOICE_LIFETIME = timedelta(hours=2)
@@ -6289,6 +6289,18 @@ async def process_selection(callback: CallbackQuery, state: FSMContext, bot: Bot
         await admin_ai_keys_models(callback)
 
 
+def render_admin_content_preview(value: str | None) -> str:
+    source = value or ""
+    if not source:
+        return "<i>Текст не задан.</i>"
+    try:
+        from translation_registry import TranslationSource, validate_translation_value
+        validate_translation_value(TranslationSource("admin.preview", source, kind="html"), source)
+    except (TypeError, ValueError):
+        return html.escape(source)
+    return source
+
+
 async def get_content_display(state: FSMContext, bot: Bot = None):
     data = await state.get_data()
     content_key = data.get('content_key')
@@ -6300,6 +6312,7 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
     media_files = data.get('media_files', [])
     content_order = data.get('content_order', 'media_top')
     authoring_locale = data.get('authoring_locale') or data.get('locale') or "ru"
+    russian_text = None
 
     async with async_session_maker() as session:
         content_obj = await session.get(Content, content_key, options=[selectinload(Content.media)])
@@ -6314,6 +6327,9 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
             if content_obj else None
         )
         btn_payload = content_obj.action_btn_payload if content_obj else None
+        if content_obj and authoring_locale != "ru":
+            russian_value = await read_content_value(session, "content", content_obj, "text_content", "ru")
+            russian_text = russian_value.text
         if content_obj and "media_files" not in data:
             localized_media = await admin_value(
                 session, "content", content_obj, "media", locale=authoring_locale
@@ -6344,7 +6360,13 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
         truncated_text = text
         if len(text) > 3500:
             truncated_text = text[:3500] + "\n\n[...] (Текст слишком длинный для полного отображения)"
-        text_display = f"<pre><code>{html.escape(truncated_text)}</code></pre>"
+        text_display = render_admin_content_preview(truncated_text)
+    elif authoring_locale != "ru" and russian_text:
+        text_display = (
+            "⚠️ Перевод не задан\n"
+            "Русский исходник:\n"
+            f"{render_admin_content_preview(russian_text)}"
+        )
 
     media_display = "<i>Медиафайлы не добавлены.</i>"
     if media_files:
@@ -6396,7 +6418,7 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
         f"<b><u>Порядок вывода:</u></b> {order_desc}\n"
         f"{link_line}"
         f"{btn_info}\n"
-        f"<b><u>Текущий текст:</u></b>\n{text_display}\n\n"
+        f"<b><u>Предпросмотр:</u></b>\n{text_display}\n\n"
         f"<b><u>Текущие медиафайлы:</u></b>\n{media_display}\n\n"
         f"{button_help}\n\n"
         f"Отправьте новый текст (сохранится форматирование), чтобы изменить его, или медиа, чтобы добавить. "
@@ -6453,7 +6475,7 @@ async def start_content_edit(callback: CallbackQuery, state: FSMContext):
     )
 
     text, keyboard = await get_content_display(state, callback.bot)
-    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 @router.message(AdminStates.edit_content, (F.text | F.photo | F.video | F.document))
@@ -6505,18 +6527,21 @@ async def process_content_update(message: Message, state: FSMContext, bot: Bot):
     await message.delete()
 
     try:
+        current_data = await state.get_data()
+        if not current_data.get('content_key'):
+            return
         text, keyboard = await get_content_display(state, bot)
         if not text:
-            await message.answer("Ошибка: данные сессии утеряны. Вернитесь в админ-панель.")
             return
 
-        msg_id_to_edit = data.get('message_id_to_edit')
+        msg_id_to_edit = current_data.get('message_id_to_edit')
         if msg_id_to_edit:
             await bot.edit_message_text(
                 text=text,
                 chat_id=message.from_user.id,
                 message_id=msg_id_to_edit,
-                reply_markup=keyboard
+                reply_markup=keyboard,
+                parse_mode="HTML",
             )
     except TelegramBadRequest:
         pass
@@ -6545,13 +6570,16 @@ async def handle_media_delete(callback: CallbackQuery, state: FSMContext):
 
     text, keyboard = await get_content_display(state, callback.bot)
     if text:
-        await callback.message.edit_text(text, reply_markup=keyboard)
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 @router.callback_query(AdminStates.edit_content, F.data.startswith("save_content_"))
 async def save_content(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    content_key = data['content_key']
+    content_key = data.get('content_key')
+    if not content_key:
+        await callback.answer("Редактор уже закрыт.", show_alert=True)
+        return
     new_text = data.get('text_content')
     new_media = data.get('media_files', [])
     new_order = data.get('content_order', 'media_top')
@@ -6591,20 +6619,41 @@ async def save_content(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
-    if content_key in ['test_intro', 'test_results', 'secret_test_outro']:
+    if data.get("parent_kind") == "content":
+        from admin_content_authoring import resource_card
+        await resource_card(
+            callback,
+            "content",
+            content_key,
+            data.get("authoring_locale") or "ru",
+            int(data.get("parent_page", 0) or 0),
+        )
+    elif content_key in ['test_intro', 'test_results', 'secret_test_outro']:
         await admin_test_menu(callback)
     else:
-        await callback.message.edit_text("✅ Раздел успешно обновлен!",
-                                         reply_markup=await kb.content_management_keyboard())
+        await callback.message.edit_text(
+            "✅ Раздел успешно обновлен!",
+            reply_markup=await kb.content_management_keyboard(),
+        )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("cancel_content_edit_"), StateFilter(AdminStates.edit_content))
 async def cancel_content_edit_handler(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
     await state.clear()
     content_key = callback.data.replace("cancel_content_edit_", "")
 
-    if content_key in ['test_intro', 'test_results', 'secret_test_outro']:
+    if data.get("parent_kind") == "content":
+        from admin_content_authoring import resource_card
+        await resource_card(
+            callback,
+            "content",
+            content_key,
+            data.get("authoring_locale") or "ru",
+            int(data.get("parent_page", 0) or 0),
+        )
+    elif content_key in ['test_intro', 'test_results', 'secret_test_outro']:
         await admin_test_menu(callback)
     else:
         await admin_content(callback, state)
@@ -16468,8 +16517,19 @@ async def admin_delete_button_start(callback: CallbackQuery):
 async def admin_delete_button_confirm(callback: CallbackQuery):
     button_key = callback.data.replace("confirm_delete_button_", "")
     async with async_session_maker() as session:
+        from admin_content_authoring import content_dependency_report
+        dependencies = await content_dependency_report(session, button_key)
+        if dependencies:
+            await callback.message.edit_text(
+                "Нельзя удалить раздел без риска оставить нерабочие ссылки.\n\n"
+                "Зависимости:\n" + "\n".join(f"• {item}" for item in dependencies),
+                reply_markup=kb.back_to_admin_panel(),
+            )
+            await callback.answer("Удаление отменено: найдены зависимости.", show_alert=True)
+            return
         async with translation_coordination_lock(session):
             await session.execute(delete(ContentMedia).where(ContentMedia.content_key == button_key))
+            await session.execute(delete(BotTranslation).where(BotTranslation.translation_key.like(f"content.{button_key}.%")))
             await session.execute(delete(Content).where(Content.key == button_key))
             await session.commit()
 
@@ -19740,7 +19800,11 @@ async def admin_test_toggle_profile_field(callback: CallbackQuery):
 
 
 @router.callback_query(F.data == "admin_general_settings")
-async def admin_general_settings(callback: CallbackQuery, state: FSMContext | None = None):
+async def admin_general_settings(
+    callback: CallbackQuery,
+    state: FSMContext | None = None,
+    notice: str = "",
+):
     if state is not None:
         await state.clear()
     if getattr(callback, "data", None) == "admin_general_settings":
@@ -19761,14 +19825,18 @@ async def admin_general_settings(callback: CallbackQuery, state: FSMContext | No
     async with async_session_maker() as session:
         processing_text_display = html.escape(await admin_value(session, "bot_general_config", config, "ai_processing_message_text", label=True))
 
-    await callback.message.edit_text(
-        "⚙️ <b>Общие настройки</b>\n\n"
+    text = (
+        (notice + "\n\n" if notice else "")
+        + "⚙️ <b>Общие настройки</b>\n\n"
         "Выберите, какие данные бот должен запросить у нового пользователя при входе. "
         "Настройки действуют на весь бот, а не только на тест.\n\n"
         "Если поле уже заполнено в профиле, бот повторно его не спрашивает. "
         "Отключённое поле можно заполнить позже через настройки пользователя.\n\n"
         f"Сообщение ожидания ИИ: {'включено' if processing_enabled else 'выключено'}\n"
         f"Текущий текст: {processing_text_display}",
+    )
+    await callback.message.edit_text(
+        text,
         parse_mode="HTML",
         reply_markup=kb.admin_general_settings_keyboard(config),
     )
@@ -19865,7 +19933,11 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
             f"Язык по умолчанию: <b>{LOCALE_LABELS[default_locale]}</b>",
             f"Выбор языка пользователем: <b>{'Включён' if selector_enabled else 'Выключен'}</b>",
             f"Мультиязычность: <b>{'ВКЛ' if authoring_enabled else 'ВЫКЛ'}</b>",
-            "Если мультиязычность выключена или выбор языка выключен, все пользователи получают ответы на русском. "
+            "Если выбор языка выключен, используется язык по умолчанию. Если выбор включён, "
+            "сохранённый доступный язык используется для пользователя; иначе используется язык по умолчанию. "
+            "Недоступное сохранённое предпочтение не удаляется. При выключенной мультиязычности "
+            "эффективный пользовательский режим — русский. Если мультиязычность выключена или выбор языка выключен, "
+            "все пользователи получают ответы на русском при текущем русском языке по умолчанию. "
             "Сохранённые предпочтения при этом не удаляются.",
             "",
             "Доступные языки:",
@@ -19875,6 +19947,8 @@ def _language_overview_text(config, readiness, bot_label: str = "") -> str:
         enabled_mark = "✅" if locale in enabled else "❌"
         default_mark = " · по умолчанию" if locale == default_locale else ""
         lines.append(f"{enabled_mark} {LOCALE_LABELS[locale]}{default_mark}")
+    if selector_enabled and len(enabled) == 1:
+        lines.extend(("", "⚠️ Для выбора доступен только один язык. Пользователю фактически нечего выбирать."))
     lines.extend(("", "Готовность системных переводов:"))
     for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru"):
         lines.append(
@@ -20050,6 +20124,13 @@ async def admin_language_toggle_selector(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
+    notice = await _toggle_language_selection_setting(callback)
+    if notice is None:
+        return
+    await _show_admin_language_settings(callback, notice=notice)
+
+
+async def _toggle_language_selection_setting(callback: CallbackQuery) -> str | None:
     async with async_session_maker() as session:
         async with translation_coordination_lock(session):
             config = await session.get(BotGeneralConfig, 1)
@@ -20059,34 +20140,46 @@ async def admin_language_toggle_selector(callback: CallbackQuery):
                 await session.flush()
             if not bool(getattr(config, "multilingual_authoring_enabled", False)):
                 await callback.answer("Сначала включите мультиязычность.", show_alert=True)
-                return
+                return None
             enabled = normalize_enabled_languages(config.telegram_enabled_languages)
             new_value = not bool(config.telegram_language_selection_enabled)
-            if new_value and len(enabled) < 2:
-                await callback.answer("Сначала включите готовый перевод EN или PT.", show_alert=True)
-                return
             if new_value:
-                registry = await build_translation_registry(session)
-                readiness = await audit_translation_readiness(
-                    session,
-                    registry,
-                    locales=tuple(locale for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru") if locale in enabled),
-                )
-                not_ready = [
-                    locale
-                    for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru")
-                    if locale in enabled and not get_locale_readiness(readiness, locale)["ready"]
-                ]
-                if not_ready:
-                    labels = " и ".join(LOCALE_LABELS[locale] for locale in not_ready)
-                    await callback.answer(
-                        f"Нельзя включить выбор языка: {labels} не готов. Сначала обновите перевод.",
-                        show_alert=True,
+                if len(enabled) >= 2:
+                    registry = await build_translation_registry(session)
+                    readiness = await audit_translation_readiness(
+                        session,
+                        registry,
+                        locales=tuple(locale for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru") if locale in enabled),
                     )
-                    return
+                    not_ready = [
+                        locale
+                        for locale in tuple(item for item in SUPPORTED_TELEGRAM_LOCALES if item != "ru")
+                        if locale in enabled and not get_locale_readiness(readiness, locale)["ready"]
+                    ]
+                    if not_ready:
+                        labels = " и ".join(LOCALE_LABELS[locale] for locale in not_ready)
+                        await callback.answer(
+                            f"Нельзя включить выбор языка: {labels} не готов. Сначала обновите перевод.",
+                            show_alert=True,
+                        )
+                        return None
             config.telegram_language_selection_enabled = new_value
             await session.commit()
-    await admin_language_settings(callback)
+    if new_value and len(enabled) == 1:
+        return "⚠️ Для выбора доступен только один язык. Пользователю фактически нечего выбирать."
+    return ""
+
+
+@router.callback_query(F.data == "admin_general_toggle_language_selection")
+async def admin_general_toggle_language_selection(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    notice = await _toggle_language_selection_setting(callback)
+    if notice is None:
+        return
+    await admin_general_settings(callback, notice=notice)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_toggle_multilingual_authoring")
@@ -21472,7 +21565,11 @@ async def admin_save_content_btn_fields(message: Message, state: FSMContext, bot
         if content is None:
             await message.answer("Раздел не найден.")
             return
-        setattr(content, target_column, value)
+        authoring_locale = data.get("authoring_locale") or "ru"
+        if authoring_locale != "ru" and target_column == "action_btn_text":
+            await save_content_value(session, "content", content, "action_btn_text", authoring_locale, value or "")
+        else:
+            setattr(content, target_column, value)
         await commit_readiness_critical_mutation(session)
 
     await message.delete()
@@ -21511,8 +21608,17 @@ async def clear_content_btn_handler(callback: CallbackQuery, state: FSMContext, 
     async with async_session_maker() as session:
         content = await session.get(Content, content_key)
         if content:
-            content.action_btn_text = None
-            content.action_btn_payload = None
+            authoring_locale = (await state.get_data()).get("authoring_locale") or "ru"
+            if authoring_locale != "ru":
+                await session.execute(
+                    delete(BotTranslation).where(
+                        BotTranslation.locale == authoring_locale,
+                        BotTranslation.translation_key == f"content.{content_key}.action_btn_text",
+                    )
+                )
+            else:
+                content.action_btn_text = None
+                content.action_btn_payload = None
             await commit_readiness_critical_mutation(session)
 
     await state.set_state(AdminStates.edit_content)

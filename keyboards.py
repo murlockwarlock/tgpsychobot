@@ -257,12 +257,18 @@ def admin_general_settings_keyboard(config):
         ("name", "Имя", bool(getattr(config, "profile_collect_name", True))),
         ("gender", "Пол", bool(getattr(config, "profile_collect_gender", True))),
         ("age", "Возраст", bool(getattr(config, "profile_collect_age", False))),
+        ("language", "Язык", runtime_language_selection_enabled(config)),
     )
     for field, title, enabled in fields:
         status = "✅ запрашивать" if enabled else "❌ не запрашивать"
+        callback_data = (
+            "admin_general_toggle_language_selection"
+            if field == "language"
+            else f"admin_general_toggle_profile_{field}"
+        )
         builder.button(
             text=f"{title}: {status}",
-            callback_data=f"admin_general_toggle_profile_{field}",
+            callback_data=callback_data,
         )
     processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
     processing_status = "✅ включено" if processing_enabled else "❌ выключено"
@@ -978,9 +984,9 @@ def topics_admin_list_keyboard(topics: list, page: int, total_pages: int, config
     if topics and total_pages > 1:
         nav_buttons = []
         if page > 0:
-            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_topics_page_{page - 1}"))
+            nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_topics_page_{page - 1}"))
         if page < total_pages - 1:
-            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_topics_page_{page + 1}"))
+            nav_buttons.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"admin_topics_page_{page + 1}"))
         if nav_buttons:
             builder.row(*nav_buttons)
 
@@ -1552,18 +1558,16 @@ def manage_buttons_keyboard(buttons: list, change_name_status: bool):
 
     for button in sorted_buttons:
         status = "✅" if button.is_visible else "❌"
-        builder.row(InlineKeyboardButton(
-            text=f"{status} {button.button_title}",
-            callback_data=f"edit_button_visibility_{button.key}"
-        ))
         builder.row(
-            InlineKeyboardButton(text="✏️ Переим.", callback_data=f"edit_button_title_{button.key}"),
+            InlineKeyboardButton(
+                text=f"{status} {button.button_title}",
+                callback_data=f"edit_button_visibility_{button.key}",
+            ),
             InlineKeyboardButton(text="⬆️", callback_data=f"move_btn_up_{button.key}"),
             InlineKeyboardButton(text="⬇️", callback_data=f"move_btn_down_{button.key}"),
-            InlineKeyboardButton(text="🗑️", callback_data=f"delete_button_{button.key}")
         )
 
-    builder.row(InlineKeyboardButton(text="➕ Добавить новую кнопку", callback_data="admin_add_button"))
+    builder.row(InlineKeyboardButton(text="✏️ Названия пунктов меню", callback_data="admin_menu_labels"))
     builder.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel"))
     return builder.as_markup()
 

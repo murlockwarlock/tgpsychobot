@@ -54,8 +54,7 @@ AUTHORING_RESOURCES = {
         Content,
         "Контент",
         (("button_title", "Название кнопки", "reply_button"),
-         ("text_content", "Текст", "html"),
-         ("action_btn_text", "Кнопка действия", "inline_button")),
+         ("text_content", "Текст", "html")),
         "key",
     ),
     "plan": AuthoringResource(
