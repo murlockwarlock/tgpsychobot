@@ -45,6 +45,10 @@ async def locale_for(event):
     return "ru"
 
 
+def is_localized_resource(kind):
+    return kind in AUTHORING_RESOURCES
+
+
 async def authoring_enabled_for(event):
     async with async_session_maker() as session:
         return await multilingual_authoring_enabled(session)
@@ -145,7 +149,8 @@ async def resource_card(event, kind, identity, locale="ru"):
         enabled = await multilingual_authoring_enabled(session)
         if not enabled:
             locale = "ru"
-        locales = await authoring_locales(session) if enabled and kind in AUTHORING_RESOURCES else ("ru",)
+        localized = enabled and is_localized_resource(kind)
+        locales = await authoring_locales(session) if localized else ("ru",)
         if locale not in locales:
             locale = "ru"
         resource = await session.get(spec.model, identity)
@@ -153,9 +158,11 @@ async def resource_card(event, kind, identity, locale="ru"):
             await event.answer("Материал не найден.", show_alert=True)
             return
         fields = list(spec.fields)
-        text = [f"<b>{spec.title} #{html.escape(str(identity))}</b>", locale_heading(locale)]
+        text = [f"<b>{spec.title} #{html.escape(str(identity))}</b>"]
+        if localized:
+            text.append(locale_heading(locale))
         rows = []
-        if enabled and kind in AUTHORING_RESOURCES and len(locales) > 1:
+        if localized and len(locales) > 1:
             rows.append([(LOCALE_LABELS[item], f"ca:locale:{kind}:{identity}:{item}") for item in locales])
         for field, title, _ in fields:
             value = await read_content_value(session, kind, resource, field, locale)
@@ -234,7 +241,8 @@ async def begin_edit(event, state, kind, identity, field_index, locale="ru"):
         rows.append([("Подтвердить перевод", "ca:confirm")])
     rows.append([("Отмена", f"ca:view:{kind}:{identity}")])
     reference = f"\n\nРусский исходник:\n{html.escape((value.russian or 'Не задан')[:1000])}" if locale != "ru" else ""
-    await event.message.edit_text(f"{locale_heading(locale)}\n\n{title}:\n{html.escape(value.admin_label()[:1500])}{reference}\n\nВведите новое значение.", reply_markup=keyboard(rows))
+    heading = f"{locale_heading(locale)}\n\n" if is_localized_resource(kind) else ""
+    await event.message.edit_text(f"{heading}{title}:\n{html.escape(value.admin_label()[:1500])}{reference}\n\nВведите новое значение.", reply_markup=keyboard(rows))
 
 
 @router.callback_query(F.data.startswith("ca:"))
@@ -244,7 +252,10 @@ async def content_callback(callback: CallbackQuery, state):
     parts = callback.data.split(":")
     action = parts[1]
     if action in {"language", "list", "locale", "view", "edit", "new", "settings", "confirm"}:
-        if not await authoring_enabled_for(callback):
+        kind = parts[2] if len(parts) > 2 and action in {"list", "locale", "view", "edit", "new", "settings"} else None
+        if (action == "language" and not await authoring_enabled_for(callback)) or (
+            is_localized_resource(kind) and not await authoring_enabled_for(callback)
+        ):
             raise SkipHandler()
     if action == "language":
         await state.clear()
@@ -368,12 +379,16 @@ async def content_value_received(message: Message, state):
         await update_case_study_index(int(identity), value)
     await state.clear()
     await refresh_translation_cache(async_session_maker, force=True)
-    await message.answer(f"{locale_heading(data.get('locale', 'ru'))}\n\nСохранено.", reply_markup=keyboard([[('Открыть материал', f"ca:view:{data['kind']}:{identity}:{data.get('locale', 'ru')}")]]))
+    locale = data.get("locale", "ru")
+    heading = f"{locale_heading(locale)}\n\n" if is_localized_resource(data["kind"]) else ""
+    route = f"ca:view:{data['kind']}:{identity}:{locale}" if is_localized_resource(data["kind"]) else f"ca:view:{data['kind']}:{identity}"
+    await message.answer(f"{heading}Сохранено.", reply_markup=keyboard([[('Открыть материал', route)]]))
 
 
 ENTRY_LISTS = {
     "admin_content": "content",
     "admin_plans": "plan",
+    "admin_test_questions": "test_question",
     "admin_referral_templates": "referral_template",
 }
 
@@ -382,11 +397,11 @@ ENTRY_LISTS = {
 async def list_entry(callback: CallbackQuery, state):
     if not await allowed(callback):
         return
-    if not await authoring_enabled_for(callback):
-        raise SkipHandler()
-    await state.clear()
     paginated = callback.data.startswith(("admin_topics_page_", "admin_case_studies_page_"))
     kind = "case_study" if callback.data.startswith("admin_case_studies_page_") else ENTRY_LISTS.get(callback.data, "topic")
+    if is_localized_resource(kind) and not await authoring_enabled_for(callback):
+        raise SkipHandler()
+    await state.clear()
     await resource_list(callback, kind, int(callback.data.rsplit("_", 1)[1]) if paginated else 0)
     await callback.answer()
 
@@ -476,7 +491,7 @@ async def show_answers(callback, question_id, page=0):
             [("Удалить вопрос", f"ca:question_delete:{question_id}")],
             [("Назад", f"ca:view:test_question:{question_id}")],
         ])
-    await callback.message.edit_text(f"{locale_heading(locale)}\n\nВопрос #{question_id}\nПорядок, значения и удаление общие для всех языков.", reply_markup=keyboard(rows))
+    await callback.message.edit_text(f"Вопрос #{question_id}\nПорядок, значения и удаление общие для всех языков.", reply_markup=keyboard(rows))
 
 
 async def change_structure(callback, state, parts):

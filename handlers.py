@@ -2917,6 +2917,16 @@ async def render_static_content_telegram(
             bool(getattr(general_config, "telegram_language_selection_enabled", False)),
             getattr(general_config, "telegram_enabled_languages", '["ru"]'),
         )
+        canonical_media = [
+            {"type": media.file_type, "file_id": media.file_id}
+            for media in (content_obj.media if content_obj else ())
+        ]
+        localized_media = translate(
+            f"content.{content_key}.media",
+            locale,
+            fallback=None,
+            source=json.dumps(canonical_media, ensure_ascii=False, separators=(",", ":")),
+        ) if content_obj else None
 
     main_kb = await kb.main_client_keyboard(user_id)
     if not content_obj:
@@ -2955,7 +2965,10 @@ async def render_static_content_telegram(
             "start_action" if is_start else "content_action",
         )
 
-    media = list(content_obj.media or [])
+    media = [
+        SimpleNamespace(file_type=item["type"], file_id=item["file_id"])
+        for item in _content_media_list(localized_media, canonical_media)
+    ]
     if not clean_text and not media and not inline_kb:
         return False
     order = content_obj.content_order or "media_top"
@@ -6084,7 +6097,10 @@ async def admin_content(callback: CallbackQuery, state: FSMContext):
 
 
 def _content_media_list(value: str | None, fallback: list[dict[str, str]]) -> list[dict[str, str]]:
-    return parse_content_media_value(value) or fallback
+    if value is None:
+        return fallback
+    parsed = parse_content_media_value(value)
+    return fallback if parsed is None else parsed
 
 
 async def get_content_from_db(key: str, user_id: int | None = None) -> dict:

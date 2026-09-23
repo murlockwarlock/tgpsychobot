@@ -1,5 +1,7 @@
 import json
 import os
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 os.environ.setdefault("BOT_TOKEN", "123456:test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -20,7 +22,7 @@ from content_authoring import (
     read_content_value,
     save_content_value,
 )
-from database import Base, BotGeneralConfig, BotTranslation, Content, ContentMedia, SubscriptionPlan, Topic
+from database import Base, BotGeneralConfig, BotTranslation, Content, ContentMedia, SubscriptionPlan, TestQuestion as Question, Topic, User
 from translation_pack_manager import audit_translation_readiness
 from translation_registry import TranslationRegistry, TranslationSource
 from translation_service import source_hash
@@ -173,6 +175,52 @@ async def test_content_runtime_uses_locale_media_and_russian_fallback(factory, m
         await session.commit()
 
 
+@pytest.mark.asyncio
+async def test_content_renderer_uses_locale_media_and_preserves_explicit_empty_override(factory, monkeypatch):
+    import handlers
+    from handlers import render_static_content_telegram
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers.kb, "main_client_keyboard", AsyncMock(return_value=None))
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.telegram_language_selection_enabled = True
+        content = Content(key="render_media", text_content="Русский текст")
+        content.media.append(ContentMedia(file_type="photo", file_id="ru-photo"))
+        session.add_all([content, User(id=42, telegram_language_code="pt")])
+        await session.flush()
+        await save_content_value(session, "content", content, "text_content", "pt", "Texto português")
+        await save_content_value(
+            session,
+            "content",
+            content,
+            "media",
+            "pt",
+            json.dumps([{"type": "photo", "file_id": "pt-photo"}], ensure_ascii=False),
+        )
+        await session.commit()
+    from translation_service import refresh_translation_cache
+    await refresh_translation_cache(factory, force=True)
+    bot = SimpleNamespace(
+        send_photo=AsyncMock(),
+        send_video=AsyncMock(),
+        send_media_group=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    assert await render_static_content_telegram(bot, 42, 42, "render_media")
+    assert bot.send_photo.call_args.args[1] == "pt-photo"
+
+    async with factory() as session:
+        content = await session.get(Content, "render_media")
+        await save_content_value(session, "content", content, "media", "pt", "[]")
+        await session.commit()
+    await refresh_translation_cache(factory, force=True)
+    bot.send_photo.reset_mock()
+    bot.send_message.reset_mock()
+    assert await render_static_content_telegram(bot, 42, 42, "render_media")
+    bot.send_photo.assert_not_called()
+    assert any("Texto português" in call.args[1] for call in bot.send_message.call_args_list if len(call.args) > 1)
+
+
 class _RecordingSession(BaseSession):
     def __init__(self):
         super().__init__()
@@ -215,3 +263,15 @@ async def test_object_card_exposes_locale_tabs_only_when_enabled(factory, monkey
     callback_data = [button.callback_data for row in second.reply_markup.inline_keyboard for button in row]
     assert "ca:locale:topic:17:en" in callback_data
     assert "ca:locale:topic:17:pt" in callback_data
+    async with factory() as session:
+        session.add(Question(id=31, text="Вопрос", category="custom"))
+        await session.commit()
+    assert module.ENTRY_LISTS["admin_test_questions"] == "test_question"
+    await module.resource_card(callback, "test_question", 31)
+    question_card = recording.calls[-1]
+    assert "Язык:" not in question_card.text
+    assert not any(
+        button.callback_data and button.callback_data.startswith("ca:locale:")
+        for row in question_card.reply_markup.inline_keyboard
+        for button in row
+    )
