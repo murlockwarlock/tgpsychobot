@@ -22,7 +22,7 @@ from content_authoring import (
     read_content_value,
     save_content_value,
 )
-from database import Base, BotGeneralConfig, BotTranslation, Content, ContentMedia, SubscriptionPlan, TestQuestion as Question, Topic, User
+from database import Base, BotGeneralConfig, BotTranslation, Content, ContentMedia, SubscriptionPlan, TestQuestion as Question, Topic, User as DBUser
 from translation_pack_manager import audit_translation_readiness
 from translation_registry import TranslationRegistry, TranslationSource
 from translation_service import source_hash
@@ -186,7 +186,7 @@ async def test_content_renderer_uses_locale_media_and_preserves_explicit_empty_o
         config.telegram_language_selection_enabled = True
         content = Content(key="render_media", text_content="Русский текст")
         content.media.append(ContentMedia(file_type="photo", file_id="ru-photo"))
-        session.add_all([content, User(id=42, telegram_language_code="pt")])
+        session.add_all([content, DBUser(id=42, telegram_language_code="pt")])
         await session.flush()
         await save_content_value(session, "content", content, "text_content", "pt", "Texto português")
         await save_content_value(
