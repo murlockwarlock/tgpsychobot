@@ -125,10 +125,7 @@ async def content_dependency_report(session, content_key: str) -> list[str]:
         )
     )
     translated_refs = await session.scalar(
-        select(func.count()).select_from(BotTranslation).where(
-            BotTranslation.translation_key.like("content.%"),
-            BotTranslation.text.ilike(pattern),
-        )
+        select(func.count()).select_from(BotTranslation).where(BotTranslation.text.ilike(pattern))
     )
     template_refs = 0
     for model, field in (
@@ -148,10 +145,22 @@ async def content_dependency_report(session, content_key: str) -> list[str]:
 
     deep_link_pattern = f"%?start={content_key}%"
     deep_link_refs = await session.scalar(
-        select(func.count()).select_from(Content).where(
-            Content.text_content.ilike(deep_link_pattern),
-        )
+        select(func.count()).select_from(Content).where(Content.text_content.ilike(deep_link_pattern))
     )
+    deep_link_refs += await session.scalar(
+        select(func.count()).select_from(BotTranslation).where(BotTranslation.text.ilike(deep_link_pattern))
+    ) or 0
+    for model, field in (
+        (Topic, Topic.description),
+        (Topic, Topic.start_message),
+        (AutomationAction, AutomationAction.message_template),
+        (FollowupStep, FollowupStep.message_text),
+        (Mailing, Mailing.text),
+        (ReferralTemplate, ReferralTemplate.text),
+    ):
+        deep_link_refs += await session.scalar(
+            select(func.count()).select_from(model).where(field.ilike(deep_link_pattern))
+        ) or 0
     if deep_link_refs:
         report.append(f"прямые ссылки на {content_key} в контенте ({deep_link_refs})")
 
