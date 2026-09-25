@@ -4,14 +4,15 @@ import os
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import database
-from database import Base, BotGeneralConfig, BotTranslation, TelegramPendingAIReply, User
+from database import AIConfig, AIModelSettings, Base, BotGeneralConfig, BotTranslation, TelegramPendingAIReply, User
+from provider_models import PROVIDER_DEEPSEEK
 
 
 class _FakeConnection:
@@ -215,6 +216,57 @@ async def test_init_db_adds_multilingual_authoring_flag_to_legacy_config(tmp_pat
         async with sessions() as session:
             config = await session.get(BotGeneralConfig, 1)
             assert config.multilingual_authoring_enabled is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_maps_legacy_generation_settings_to_active_model_scope(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'model-settings-migration.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        await database.init_db()
+        async with sessions() as session:
+            config = await session.get(AIConfig, 1)
+            config.provider = PROVIDER_DEEPSEEK
+            config.deepseek_model = "deepseek-flash"
+            config.max_output_tokens = 12000
+            config.temperature = 0.4
+            config.deepseek_thinking_enabled = True
+            existing = await session.scalar(
+                select(AIModelSettings).where(
+                    AIModelSettings.provider == PROVIDER_DEEPSEEK,
+                    AIModelSettings.model == "deepseek-flash",
+                    AIModelSettings.channel == "chat",
+                )
+            )
+            if existing is not None:
+                await session.delete(existing)
+            await session.commit()
+
+        await database.init_db()
+
+        async with sessions() as session:
+            settings = await session.scalar(
+                select(AIModelSettings).where(
+                    AIModelSettings.provider == PROVIDER_DEEPSEEK,
+                    AIModelSettings.model == "deepseek-flash",
+                    AIModelSettings.channel == "chat",
+                )
+            )
+            config = await session.get(AIConfig, 1)
+
+        assert settings is not None
+        assert settings.max_output_tokens == 12000
+        assert settings.temperature == 0.4
+        assert settings.reasoning_effort == "high"
+        assert config.max_output_tokens == 12000
+        assert config.deepseek_thinking_enabled is True
     finally:
         await engine.dispose()
 

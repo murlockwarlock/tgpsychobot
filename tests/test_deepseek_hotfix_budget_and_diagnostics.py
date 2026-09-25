@@ -252,7 +252,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured_payloads), 1)
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-flash")
-        self.assertEqual(wire_payload["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", wire_payload)
         self.assertNotIn("extra_body", wire_payload)
         self.assertNotIn("max_completion_tokens", wire_payload)
 
@@ -277,7 +277,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured_payloads), 1)
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-pro")
-        self.assertEqual(wire_payload["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", wire_payload)
         self.assertNotIn("extra_body", wire_payload)
 
     async def test_max_deepseek_v4_flash_outbound_max_tokens_is_65536(self):
@@ -296,7 +296,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured_payloads), 1)
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-flash")
-        self.assertEqual(wire_payload["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", wire_payload)
         self.assertNotIn("extra_body", wire_payload)
         self.assertNotIn("max_completion_tokens", wire_payload)
 
@@ -321,13 +321,13 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured_payloads), 1)
         wire_payload = captured_payloads[0]
         self.assertEqual(wire_payload["model"], "deepseek-v4-pro")
-        self.assertEqual(wire_payload["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", wire_payload)
         self.assertNotIn("extra_body", wire_payload)
 
     async def test_deepseek_legacy_aliases_normalized_and_receive_65536(self):
-        self.assertEqual(normalize_deepseek_model("deepseek-chat"), "deepseek-v4-flash")
-        self.assertEqual(normalize_deepseek_model("deepseek-reasoner"), "deepseek-v4-flash")
-        self.assertEqual(normalize_deepseek_model("deepseek-coder"), "deepseek-v4-flash")
+        self.assertEqual(normalize_deepseek_model("deepseek-chat"), "deepseek-flash")
+        self.assertEqual(normalize_deepseek_model("deepseek-reasoner"), "deepseek-flash")
+        self.assertEqual(normalize_deepseek_model("deepseek-coder"), "deepseek-flash")
 
         async with self.sessions() as session:
             cfg = await session.get(AIConfig, 1)
@@ -346,8 +346,8 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             resp = await ai_integration.generate_response(user_id=7001, user_prompt="Тест Alias")
             self.assertEqual(resp, "Ответ Legacy Alias")
 
-        self.assertEqual(captured[0]["model"], "deepseek-v4-flash")
-        self.assertEqual(captured[0]["max_tokens"], 65536)
+        self.assertEqual(captured[0]["model"], "deepseek-flash")
+        self.assertNotIn("max_tokens", captured[0])
         self.assertNotIn("extra_body", captured[0])
 
     # -------------------------------------------------------------------------
@@ -620,7 +620,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(captured_deepseek), 1)
         self.assertEqual(captured_deepseek[0]["model"], "deepseek-v4-flash")
-        self.assertEqual(captured_deepseek[0]["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", captured_deepseek[0])
 
     # -------------------------------------------------------------------------
     # 6. Negative / Invariant Confirmation: Direct Chat 16384/65536 & KIE / Vision 4096
@@ -644,7 +644,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_openai):
             await ai_integration.generate_response(user_id=7001, user_prompt="Тест OpenAI")
 
-        self.assertEqual(openai_captured[0]["max_completion_tokens"], 16384)
+        self.assertNotIn("max_completion_tokens", openai_captured[0])
         self.assertNotIn("max_tokens", openai_captured[0])
 
         # 2. Claude: max_tokens == 16384
@@ -697,7 +697,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(ai_integration.httpx, "AsyncClient", return_value=FakeGeminiClient()):
             await ai_integration.generate_response(user_id=7001, user_prompt="Тест Gemini")
 
-        self.assertEqual(gemini_captured[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
+        self.assertNotIn("maxOutputTokens", gemini_captured[0]["json"]["generationConfig"])
 
         # 4. DeepSeek: max_tokens == 65536
         async with self.sessions() as session:
@@ -716,7 +716,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         with patch("openai.resources.chat.completions.AsyncCompletions.create", side_effect=mock_deepseek):
             await ai_integration.generate_response(user_id=7001, user_prompt="Тест DeepSeek")
 
-        self.assertEqual(deepseek_captured[0]["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", deepseek_captured[0])
         self.assertNotIn("max_completion_tokens", deepseek_captured[0])
 
         # 5. KIE: max_tokens == 4096 (NON-TARGET remains 4096)
@@ -835,8 +835,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(tg_captured), 1)
         tg_payload = tg_captured[0]
-        self.assertEqual(tg_payload["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
-        self.assertEqual(tg_payload["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", tg_payload)
         self.assertNotIn("extra_body", tg_payload)
 
         # Verify Telegram request_payload in AILog
@@ -848,7 +847,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(tg_ai_log.request_payload)
             tg_parsed = json.loads(tg_ai_log.request_payload)
             self.assertEqual(tg_parsed["provider"], "Deepseek")
-            self.assertEqual(tg_parsed["payload"]["max_tokens"], 65536)
+            self.assertNotIn("max_tokens", tg_parsed["payload"])
             self.assertNotIn("extra_body", tg_parsed["payload"])
 
         # 2. MAX DeepSeek
@@ -865,8 +864,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(max_captured), 1)
         max_payload = max_captured[0]
-        self.assertEqual(max_payload["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
-        self.assertEqual(max_payload["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", max_payload)
         self.assertNotIn("extra_body", max_payload)
 
         # Verify MAX request_payload in AILog
@@ -878,7 +876,7 @@ class DeepSeekHotfixBudgetAndDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(max_ai_log.request_payload)
             max_parsed = json.loads(max_ai_log.request_payload)
             self.assertEqual(max_parsed["provider"], "Deepseek")
-            self.assertEqual(max_parsed["payload"]["max_tokens"], 65536)
+            self.assertNotIn("max_tokens", max_parsed["payload"])
             self.assertNotIn("extra_body", max_parsed["payload"])
 
     async def test_other_providers_isolated_from_deepseek_thinking_parameter(self):

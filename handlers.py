@@ -45,7 +45,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.formatting import Text
 
 from config import OWNER_IDS
-from database import (async_session_maker, User, Message as DBMessage, AIConfig, KnowledgeBase, Content, IndexingQueue,
+from database import (async_session_maker, User, Message as DBMessage, AIConfig, AIModelSettings, KnowledgeBase, Content, IndexingQueue,
                      ContentMedia, BotTranslation, Topic, SubscriptionPlan, UserSubscription, PromoCode, SubscriptionConfig, Mailing,
                      RobokassaPayment, YookassaPayment, TrialUsageHistory, RandomMessage, MediaLibrary, UserTopicState, get_all_admin_ids,
                      ReferralPaymentLog, MailingDeliveryLog,
@@ -100,13 +100,12 @@ from provider_models import (
     TELEGRAM_MODEL_CALLBACK_PREFIX,
     build_telegram_model_callback_data,
     canonical_provider_name,
-    effective_chat_output_tokens,
     get_chat_output_token_limit,
     get_default_model,
+    get_capability_providers,
     get_selectable_models,
     resolve_telegram_model_callback,
     validate_model_selection,
-    validate_chat_output_tokens,
 )
 from knowledge_base_admin import (
     delete_knowledge_base_record,
@@ -124,6 +123,22 @@ from max_messenger_bot.identity import (
     raw_max_user_id,
 )
 from vision_reliability import VisionExecutionContext
+from ai_model_settings import (
+    get_generation_capabilities,
+    get_or_create_model_settings,
+    normalize_reasoning_effort,
+    reasoning_from_legacy,
+    resolve_model_settings,
+    validate_model_setting,
+    wire_max_output_tokens,
+    wire_reasoning_effort,
+    wire_temperature,
+    REASONING_AUTO,
+    REASONING_NONE,
+    REASONING_LOW,
+    REASONING_HIGH,
+    REASONING_MAX,
+)
 
 
 
@@ -533,13 +548,21 @@ async def handle_compact_model_callback(callback: CallbackQuery):
         elif channel == "image_edit":
             config.image_edit_provider = provider
             config.image_edit_model = normalized_model
+        elif channel == "transcription":
+            config.transcription_provider = provider
+            if provider == PROVIDER_KIE:
+                config.kie_transcription_model = normalized_model
+            elif provider == PROVIDER_DEEPGRAM:
+                config.deepgram_model = normalized_model
         else:
             await _reject_model_callback(callback)
             return
         await session.commit()
 
     await callback.answer(f"✅ Модель изменена на {normalized_model}")
-    if channel in {"chat", "fallback", "vision_fallback"}:
+    if channel == "chat":
+        await _render_active_model_settings(callback)
+    elif channel in {"fallback", "vision_fallback", "vision", "image_gen", "image_edit", "transcription"} and getattr(callback, "message", None):
         await admin_ai_keys_models(callback)
 
 
@@ -1010,6 +1033,10 @@ MODELS_INFO = {
         'pricing': '<b>Sonnet 5:</b> Рекомендуемая модель Anthropic.'
     },
     "Deepseek": {
+        'deepseek-flash': {
+            'name': 'DeepSeek Flash',
+            'desc': 'Актуальная multimodal-модель DeepSeek для текста и анализа изображений.'
+        },
         'deepseek-v4-flash': {
             'name': 'DeepSeek V4 Flash',
             'desc': 'Быстрая и экономичная модель для повседневных диалогов и большинства задач.'
@@ -1060,6 +1087,12 @@ MODELS_INFO = {
     "Perplexity": {
         **PERPLEXITY_MODE_INFO,
         "pricing": "<b>Perplexity:</b> режимы управляются официальными preset-настройками API.",
+    },
+    "Deepgram": {
+        "nova-3": {
+            "name": "Deepgram Nova-3",
+            "desc": "Распознавание голосовых сообщений.",
+        },
     },
 }
 
@@ -1122,6 +1155,8 @@ PROMPT_BLOCKS = {
 class AdminStates(StatesGroup):
     set_ai_timeout = State()
     set_max_output_tokens = State()
+    set_model_max_tokens = State()
+    set_model_temperature = State()
     set_api_key = State()
     set_model = State()
     set_system_prompt = State()
@@ -1449,7 +1484,7 @@ def _resolve_ai_provider_model(config: AIConfig | None, channel: str) -> tuple[s
         elif provider == "KIE":
             model = getattr(config, "kie_transcription_model", None)
         elif provider == PROVIDER_DEEPGRAM:
-            model = DEEPGRAM_DEFAULT_MODEL
+            model = getattr(config, "deepgram_model", None) or DEEPGRAM_DEFAULT_MODEL
         else:
             model = "whisper-1" if provider == "OpenAI" else None
         return provider, model
@@ -4965,18 +5000,9 @@ async def admin_ai_settings(message: Message | CallbackQuery):
                 model_name = _display_capability_model(provider, model_name, "chat")
             model_name = model_name or "не выбрана"
             model_label = "Активная модель"
-        configured_output_tokens = getattr(config, "max_output_tokens", None)
-        effective_output_tokens = effective_chat_output_tokens(provider, model_name, configured_output_tokens)
-        output_tokens_label = (
-            f"По умолчанию (эффективно: {effective_output_tokens})"
-            if configured_output_tokens is None
-            else f"{effective_output_tokens}"
-        )
-        deepseek_thinking_enabled = getattr(config, "deepseek_thinking_enabled", None)
-
         trans_provider = config.transcription_provider if config.transcription_provider != 'None' else "Выключена"
         if config.transcription_provider == PROVIDER_DEEPGRAM:
-            trans_provider = f"{PROVIDER_DEEPGRAM} / {DEEPGRAM_DEFAULT_MODEL}"
+            trans_provider = f"{PROVIDER_DEEPGRAM} / {getattr(config, 'deepgram_model', None) or DEEPGRAM_DEFAULT_MODEL}"
         vis_provider = config.vision_provider
         vis_model = _display_capability_model(vis_provider, config.vision_model, "vision")
         image_gen_provider = getattr(config, 'image_generation_provider', PROVIDER_OPENAI)
@@ -5017,13 +5043,7 @@ async def admin_ai_settings(message: Message | CallbackQuery):
     text = (f"🤖 <b>Настройки ИИ</b>\n\n"
             f"▫️ Текущий провайдер: <b>{provider}</b>\n"
             f"▫️ {model_label}: <code>{model_name}</code>\n"
-            f"▫️ Максимум ответа: <b>{output_tokens_label} токенов</b>\n"
-            + (
-                f"▫️ Thinking DeepSeek: <b>{'по умолчанию' if deepseek_thinking_enabled is None else 'включён' if deepseek_thinking_enabled else 'выключен'}</b>\n"
-                if canonical_provider_name(provider) == PROVIDER_DEEPSEEK
-                else ""
-            )
-            + f"{fb_text}\n"
+            f"{fb_text}\n"
             f"📝 <b>Промпты:</b>\n"
             f"▫️ Основной промпт: <b>{prompt_source}</b>\n"
             f"▫️ Общий блок: <b>{shared_block_status}</b>\n"
@@ -5086,13 +5106,13 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
 
-    trans_provider = config.transcription_provider if config else 'OpenAI'
-    if config and config.transcription_provider == PROVIDER_DEEPGRAM:
-        trans_provider = f"{PROVIDER_DEEPGRAM} / {DEEPGRAM_DEFAULT_MODEL}"
-    vis_provider = config.vision_provider if config else PROVIDER_GEMINI
+    trans_provider = getattr(config, 'transcription_provider', 'OpenAI') if config else 'OpenAI'
+    if config and getattr(config, 'transcription_provider', None) == PROVIDER_DEEPGRAM:
+        trans_provider = f"{PROVIDER_DEEPGRAM} / {getattr(config, 'deepgram_model', None) or DEEPGRAM_DEFAULT_MODEL}"
+    vis_provider = getattr(config, 'vision_provider', PROVIDER_GEMINI) if config else PROVIDER_GEMINI
     vis_model = _display_capability_model(
         vis_provider,
-        config.vision_model if config else None,
+        getattr(config, 'vision_model', None) if config else None,
         "vision",
     )
     image_gen_provider = getattr(config, 'image_generation_provider', PROVIDER_OPENAI) if config else PROVIDER_OPENAI
@@ -5102,10 +5122,10 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     image_edit_model = getattr(config, 'image_edit_model', None) if config else None
     image_edit_model = _display_capability_model(image_edit_provider, image_edit_model, "image_edit")
     kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0) if config else 0
-    c_first = config.context_limit_first if config else 2
-    c_recent = config.context_limit_recent if config else 10
+    c_first = getattr(config, 'context_limit_first', 2) if config else 2
+    c_recent = getattr(config, 'context_limit_recent', 10) if config else 10
     temp = getattr(config, 'temperature', 0.7) if config else 0.7
-    current_provider = config.provider if config else PROVIDER_GEMINI
+    current_provider = getattr(config, 'provider', PROVIDER_GEMINI) if config else PROVIDER_GEMINI
     if config and canonical_provider_name(current_provider) == PROVIDER_KIE:
         current_model = getattr(config, 'kie_model', None)
     else:
@@ -5139,8 +5159,18 @@ async def admin_ai_keys_models(callback: CallbackQuery):
         for provider, value in api_keys.items()
     )
 
+    current_model_label = current_model or "не задана"
+    vision_fallback_summary = (
+        f"{vision_fallback_provider} · {vision_fallback_model}"
+        if allow_vision_fallback and vision_fallback_provider
+        else "выключен"
+    )
     await callback.message.edit_text(
-        "🔑 <b>Ключи, модели и глубина контекста</b>\n\n" + keys_text,
+        "🔑 <b>Провайдеры и модели</b>\n\n"
+        f"Активная модель: <b>{current_provider} · {current_model_label}</b>\n"
+        f"🗣 Распознавание: <b>{trans_provider}</b>\n"
+        f"🖼 Фото (Vision) резерв: <b>{vision_fallback_summary}</b>\n\n"
+        + keys_text,
         reply_markup=kb.ai_keys_models_keyboard(
             trans_provider,
             c_first,
@@ -5171,19 +5201,390 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     )
 
 
-@router.callback_query(F.data == "toggle_deepseek_thinking")
-async def choose_deepseek_thinking(callback: CallbackQuery):
+def _active_chat_model_scope(config: AIConfig) -> tuple[str, str]:
+    provider = canonical_provider_name(config.provider)
+    field = "kie_model" if provider == PROVIDER_KIE else f"{provider.lower()}_model"
+    model = getattr(config, field, None)
+    if not model:
+        model = get_default_model(provider, channel="chat")
+    return provider, model
+
+
+def _reasoning_label(value: str) -> str:
+    return {
+        REASONING_AUTO: "Авто",
+        REASONING_NONE: "Выкл",
+        REASONING_LOW: "Low",
+        REASONING_HIGH: "High",
+        REASONING_MAX: "Max",
+    }.get(value, "Авто")
+
+
+async def _active_model_settings_render_data() -> tuple[str, InlineKeyboardMarkup]:
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-    if not config or canonical_provider_name(config.provider) != PROVIDER_DEEPSEEK:
-        await callback.answer("Режим Thinking доступен только для DeepSeek.", show_alert=True)
+        if not config:
+            return "Ошибка: конфигурация ИИ не найдена.", kb.back_to_admin_panel()
+        provider, model = _active_chat_model_scope(config)
+        settings = await resolve_model_settings(session, provider, model, "chat", config=config)
+    capabilities = get_generation_capabilities(provider, model, "chat")
+    max_label = "Авто" if settings.max_output_tokens is None else str(settings.max_output_tokens)
+    if provider == PROVIDER_DEEPSEEK:
+        temp_label = "не применяется" if settings.reasoning_effort != REASONING_NONE else (
+            "Авто" if settings.temperature is None else str(settings.temperature)
+        )
+    else:
+        temp_label = "не поддерживается" if not capabilities.temperature else (
+            "Авто" if settings.temperature is None else str(settings.temperature)
+        )
+    text = (
+        f"⚙️ <b>Параметры модели</b>\n\n"
+        f"Провайдер: <b>{provider}</b>\n"
+        f"Модель: <code>{model}</code>\n\n"
+        f"📏 Max tokens: <b>{max_label}</b>\n"
+    )
+    if capabilities.reasoning_effort:
+        text += f"🧠 Reasoning: <b>{_reasoning_label(settings.reasoning_effort)}</b>\n"
+    if capabilities.temperature or provider == PROVIDER_DEEPSEEK:
+        text += f"🌡 Temperature: <b>{temp_label}</b>\n"
+    return text, kb.model_settings_keyboard(
+        show_reasoning=bool(capabilities.reasoning_effort),
+        show_temperature=capabilities.temperature and (
+            provider != PROVIDER_DEEPSEEK or settings.reasoning_effort == REASONING_NONE
+        ),
+    )
+
+
+async def _render_active_model_settings(target: CallbackQuery | Message):
+    target_message = target.message if isinstance(target, CallbackQuery) else target
+    text, markup = await _active_model_settings_render_data()
+    await target_message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def _edit_active_model_settings(bot: Bot, chat_id: int, message_id: int):
+    text, markup = await _active_model_settings_render_data()
+    await bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "view_active_model_settings")
+async def view_active_model_settings(callback: CallbackQuery):
+    await _render_active_model_settings(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "view_active_model_choices")
+async def view_active_model_choices(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    if not config:
+        await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
         return
+    provider, _ = _active_chat_model_scope(config)
+    selectable_models = get_selectable_models(provider, channel="chat")
+    provider_models = MODELS_INFO.get(provider, {})
+    models = {
+        model_id: provider_models.get(model_id, {"name": model_id, "desc": "Доступная модель."})
+        for model_id in selectable_models
+    }
     await callback.message.edit_text(
-        "🧠 <b>Thinking DeepSeek</b>\n\nВыберите режим:",
-        reply_markup=kb.deepseek_thinking_keyboard(),
+        f"Выберите модель для <b>{provider}</b>:",
+        reply_markup=kb.model_selection_keyboard(provider, models, channel="chat"),
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "model_setting_reasoning")
+async def model_setting_reasoning(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    if not config or canonical_provider_name(config.provider) != PROVIDER_DEEPSEEK:
+        await callback.answer("Reasoning доступен только для DeepSeek.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🧠 <b>Reasoning DeepSeek</b>\n\nВыберите режим:",
+        reply_markup=kb.model_reasoning_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("model_reasoning_"))
+async def save_model_reasoning(callback: CallbackQuery):
+    value = callback.data.replace("model_reasoning_", "", 1)
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config or canonical_provider_name(config.provider) != PROVIDER_DEEPSEEK:
+            await callback.answer("Reasoning доступен только для DeepSeek.", show_alert=True)
+            return
+        provider, model = _active_chat_model_scope(config)
+        try:
+            normalized = validate_model_setting(provider, model, "reasoning_effort", value)
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+        row = await get_or_create_model_settings(session, provider, model, "chat", config=config)
+        row.reasoning_effort = normalized
+        await session.commit()
+    await callback.answer(f"Reasoning: {_reasoning_label(normalized)}")
+    await _render_active_model_settings(callback)
+
+
+@router.callback_query(F.data == "model_setting_max_tokens")
+async def start_model_max_tokens(callback: CallbackQuery, state: FSMContext):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
+            return
+        provider, model = _active_chat_model_scope(config)
+        settings = await resolve_model_settings(session, provider, model, "chat", config=config)
+    limit = get_chat_output_token_limit(provider, model, settings.reasoning_effort)
+    current = "Авто" if settings.max_output_tokens is None else str(settings.max_output_tokens)
+    await callback.message.edit_text(
+        f"📏 <b>Max tokens</b>\n\nТекущее значение: <b>{current}</b>\n"
+        f"Введите число от 1 до {limit} или «Авто».",
+        reply_markup=kb.back_to_previous_menu("view_active_model_settings"),
+        parse_mode="HTML",
+    )
+    await state.update_data(
+        settings_message_id=callback.message.message_id,
+        settings_chat_id=callback.message.chat.id,
+        settings_provider=provider,
+        settings_model=model,
+    )
+    await state.set_state(AdminStates.set_model_max_tokens)
+
+
+@router.message(AdminStates.set_model_max_tokens, F.text)
+async def save_model_max_tokens(message: Message, state: FSMContext, bot: Bot):
+    raw_value = message.text.strip()
+    state_data = await state.get_data()
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await message.answer("Ошибка: конфигурация ИИ не найдена.")
+            return
+        provider = state_data.get("settings_provider") or _active_chat_model_scope(config)[0]
+        model = state_data.get("settings_model") or _active_chat_model_scope(config)[1]
+        current = await resolve_model_settings(session, provider, model, "chat", config=config)
+        try:
+            value = validate_model_setting(
+                provider,
+                model,
+                "max_output_tokens",
+                raw_value,
+                reasoning_effort=current.reasoning_effort,
+            )
+        except ValueError as exc:
+            await message.answer(f"❌ {exc}")
+            return
+        row = await get_or_create_model_settings(session, provider, model, "chat", config=config)
+        row.max_output_tokens = value
+        await session.commit()
+    await state.clear()
+    await message.answer(f"✅ Max tokens: {'Авто' if value is None else value}")
+    if state_data.get("settings_message_id") and state_data.get("settings_chat_id"):
+        await _edit_active_model_settings(bot, state_data["settings_chat_id"], state_data["settings_message_id"])
+    else:
+        await _render_active_model_settings(message)
+
+
+@router.callback_query(F.data == "model_setting_temperature")
+async def start_model_temperature(callback: CallbackQuery, state: FSMContext):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
+            return
+        provider, model = _active_chat_model_scope(config)
+        settings = await resolve_model_settings(session, provider, model, "chat", config=config)
+    if provider == PROVIDER_DEEPSEEK and settings.reasoning_effort != REASONING_NONE:
+        await callback.answer("Температура не применяется в режиме Reasoning.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🌡 <b>Temperature</b>\n\nВведите число от 0.0 до 2.0 или «Авто».",
+        reply_markup=kb.back_to_previous_menu("view_active_model_settings"),
+        parse_mode="HTML",
+    )
+    await state.update_data(
+        settings_message_id=callback.message.message_id,
+        settings_chat_id=callback.message.chat.id,
+        settings_provider=provider,
+        settings_model=model,
+    )
+    await state.set_state(AdminStates.set_model_temperature)
+
+
+@router.message(AdminStates.set_model_temperature, F.text)
+async def save_model_temperature(message: Message, state: FSMContext, bot: Bot):
+    raw_value = message.text.strip().replace(",", ".")
+    state_data = await state.get_data()
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await message.answer("Ошибка: конфигурация ИИ не найдена.")
+            return
+        provider = state_data.get("settings_provider") or _active_chat_model_scope(config)[0]
+        model = state_data.get("settings_model") or _active_chat_model_scope(config)[1]
+        try:
+            value = validate_model_setting(provider, model, "temperature", raw_value)
+        except ValueError as exc:
+            await message.answer(f"❌ {exc}")
+            return
+        row = await get_or_create_model_settings(session, provider, model, "chat", config=config)
+        row.temperature = value
+        await session.commit()
+    await state.clear()
+    await message.answer(f"✅ Temperature: {'Авто' if value is None else value}")
+    if state_data.get("settings_message_id") and state_data.get("settings_chat_id"):
+        await _edit_active_model_settings(bot, state_data["settings_chat_id"], state_data["settings_message_id"])
+    else:
+        await _render_active_model_settings(message)
+
+
+@router.callback_query(F.data == "model_setting_api_key")
+async def start_model_api_key(callback: CallbackQuery, state: FSMContext):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    if not config:
+        await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
+        return
+    provider, model = _active_chat_model_scope(config)
+    await state.set_state(AdminStates.set_api_key)
+    await state.update_data(
+        provider=provider,
+        settings_provider=provider,
+        settings_model=model,
+        settings_message_id=callback.message.message_id,
+        settings_chat_id=callback.message.chat.id,
+    )
+    await callback.message.edit_text(
+        f"Отправьте новый API-ключ для {provider}.",
+        reply_markup=kb.back_to_previous_menu("view_active_model_settings"),
+    )
+    await callback.answer()
+
+
+def _capability_picker_keyboard(channel: str, *, include_off: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for provider in get_capability_providers(channel):
+        builder.button(text=provider, callback_data=f"admin_choose_capability_{channel}_{provider}")
+    if include_off:
+        builder.button(text="Выкл", callback_data=f"admin_choose_capability_{channel}_None")
+    builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+async def _show_capability_provider_picker(callback: CallbackQuery, channel: str, title: str, *, include_off: bool = False):
+    await callback.message.edit_text(
+        title,
+        reply_markup=_capability_picker_keyboard(channel, include_off=include_off),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_select_transcription_provider")
+async def select_transcription_provider(callback: CallbackQuery):
+    await _show_capability_provider_picker(callback, "transcription", "Выберите провайдера распознавания голосовых:", include_off=True)
+
+
+@router.callback_query(F.data == "admin_select_vision_provider")
+async def select_vision_provider(callback: CallbackQuery):
+    await _show_capability_provider_picker(callback, "vision", "Выберите провайдера анализа фото:")
+
+
+@router.callback_query(F.data == "admin_select_image_generation_provider")
+async def select_image_generation_provider(callback: CallbackQuery):
+    await _show_capability_provider_picker(callback, "image_gen", "Выберите провайдера генерации изображений:", include_off=True)
+
+
+@router.callback_query(F.data == "admin_select_image_edit_provider")
+async def select_image_edit_provider(callback: CallbackQuery):
+    await _show_capability_provider_picker(callback, "image_edit", "Выберите провайдера редактирования изображений:", include_off=True)
+
+
+@router.callback_query(F.data.startswith("admin_choose_capability_"))
+async def choose_capability_provider(callback: CallbackQuery):
+    payload = callback.data.replace("admin_choose_capability_", "", 1)
+    channel, _, provider_value = payload.rpartition("_")
+    if channel not in {"transcription", "vision", "image", "image_gen", "image_edit"}:
+        await callback.answer("Недопустимый канал.", show_alert=True)
+        return
+    if channel == "image":
+        channel = "image_gen"
+    if provider_value == "None":
+        if channel == "transcription":
+            async with async_session_maker() as session:
+                config = await session.get(AIConfig, 1)
+                if config:
+                    config.transcription_provider = "None"
+                    await session.commit()
+            await callback.answer("Распознавание выключено")
+            await admin_ai_keys_models(callback)
+            return
+        async with async_session_maker() as session:
+            config = await session.get(AIConfig, 1)
+            if config:
+                if channel == "image_gen":
+                    config.image_generation_provider = "None"
+                    config.image_generation_model = ""
+                elif channel == "image_edit":
+                    config.image_edit_provider = "None"
+                    config.image_edit_model = ""
+                await session.commit()
+        await callback.answer("Функция выключена")
+        await admin_ai_keys_models(callback)
+        return
+    provider = canonical_provider_name(provider_value)
+    if provider not in get_capability_providers(channel):
+        await callback.answer("Провайдер не поддерживает этот канал.", show_alert=True)
+        return
+    model = get_default_model(provider, channel=channel)
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
+            return
+        if channel == "transcription":
+            config.transcription_provider = provider
+            if provider == PROVIDER_DEEPGRAM:
+                config.deepgram_model = model
+            elif provider == PROVIDER_KIE:
+                config.kie_transcription_model = model
+        elif channel == "vision":
+            config.vision_provider = provider
+            config.vision_model = model
+        elif channel == "image_gen":
+            config.image_generation_provider = provider
+            config.image_generation_model = model
+        elif channel == "image_edit":
+            config.image_edit_provider = provider
+            config.image_edit_model = model
+        await session.commit()
+    await callback.answer(f"✅ Провайдер: {provider}")
+    models = get_selectable_models(provider, channel=channel)
+    info = MODELS_INFO.get(provider, {})
+    await callback.message.edit_text(
+        f"Выберите модель для {provider}:",
+        reply_markup=kb.model_selection_keyboard(
+            provider,
+            {model_id: info.get(model_id, {"name": model_id, "desc": "Доступная модель."}) for model_id in models},
+            channel=channel,
+        ),
+    )
+
+
+@router.callback_query(F.data == "toggle_deepseek_thinking")
+async def choose_deepseek_thinking(callback: CallbackQuery):
+    await model_setting_reasoning(callback)
 
 
 @router.callback_query(F.data.in_({
@@ -5202,7 +5603,9 @@ async def set_deepseek_thinking(callback: CallbackQuery):
         if not config or canonical_provider_name(config.provider) != PROVIDER_DEEPSEEK:
             await callback.answer("Режим Thinking доступен только для DeepSeek.", show_alert=True)
             return
-        config.deepseek_thinking_enabled = values[callback.data]
+        provider, model = _active_chat_model_scope(config)
+        row = await get_or_create_model_settings(session, provider, model, "chat", config=config)
+        row.reasoning_effort = reasoning_from_legacy(values[callback.data])
         await session.commit()
     labels = {
         None: "по умолчанию",
@@ -5210,105 +5613,53 @@ async def set_deepseek_thinking(callback: CallbackQuery):
         False: "выключен",
     }
     await callback.answer(f"Thinking DeepSeek: {labels[values[callback.data]]}")
-    await admin_ai_keys_models(callback)
+    await _render_active_model_settings(callback)
 
 
 @router.callback_query(F.data == "set_max_output_tokens")
 async def start_set_max_output_tokens(callback: CallbackQuery, state: FSMContext):
-    async with async_session_maker() as session:
-        config = await session.get(AIConfig, 1)
-    if not config:
-        await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
-        return
-    provider = config.provider
-    model = (
-        getattr(config, "kie_model", None)
-        if canonical_provider_name(provider) == PROVIDER_KIE
-        else getattr(config, f"{str(provider).lower()}_model", None)
-    )
-    if canonical_provider_name(provider) in (PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY):
-        model = _display_capability_model(provider, model, "chat")
-    configured = getattr(config, "max_output_tokens", None)
-    effective = effective_chat_output_tokens(provider, model, configured)
-    limit = get_chat_output_token_limit(provider, model)
-    current = (
-        f"{configured} токенов (эффективно: {effective})"
-        if configured is not None
-        else f"По умолчанию (эффективно: {effective})"
-    )
-    await callback.message.edit_text(
-        f"📏 Максимум ответа: {current}.\n\n"
-        f"Введите целое число от 1 до {limit} или отправьте «По умолчанию»:",
-        reply_markup=kb.back_to_previous_menu("admin_ai_keys"),
-    )
-    await state.set_state(AdminStates.set_max_output_tokens)
+    await start_model_max_tokens(callback, state)
 
 
 @router.message(AdminStates.set_max_output_tokens, F.text)
-async def save_max_output_tokens(message: Message, state: FSMContext):
+async def save_max_output_tokens(message: Message, state: FSMContext, bot: Bot):
     raw_value = message.text.strip()
+    state_data = await state.get_data()
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
             await message.answer("Ошибка: конфигурация ИИ не найдена.")
             return
-        provider = config.provider
-        model = (
-            getattr(config, "kie_model", None)
-            if canonical_provider_name(provider) == PROVIDER_KIE
-            else getattr(config, f"{str(provider).lower()}_model", None)
-        )
-        if raw_value.casefold() in {"по умолчанию", "по умолчанию.", "default"}:
-            config.max_output_tokens = None
-            await session.commit()
-            saved_value = None
-        else:
-            try:
-                saved_value = validate_chat_output_tokens(provider, model, raw_value)
-            except ValueError as exc:
-                await message.answer(f"❌ {exc}")
-                return
-            config.max_output_tokens = saved_value
-            await session.commit()
+        provider, model = _active_chat_model_scope(config)
+        provider = state_data.get("settings_provider") or provider
+        model = state_data.get("settings_model") or model
+        current = await resolve_model_settings(session, provider, model, "chat", config=config)
+        try:
+            saved_value = validate_model_setting(
+                provider,
+                model,
+                "max_output_tokens",
+                raw_value,
+                reasoning_effort=current.reasoning_effort,
+            )
+        except ValueError as exc:
+            await message.answer(f"❌ {exc}")
+            return
+        row = await get_or_create_model_settings(session, provider, model, "chat", config=config)
+        row.max_output_tokens = saved_value
+        await session.commit()
     await state.clear()
-    effective = effective_chat_output_tokens(provider, model, saved_value)
-    configured_label = "По умолчанию" if saved_value is None else f"{saved_value}"
-    await message.answer(
-        f"✅ Максимум ответа сохранён: {configured_label} токенов (эффективно: {effective})."
-    )
-    await admin_ai_settings(message)
+    await message.answer(f"✅ Max tokens: {'Авто' if saved_value is None else saved_value}")
+    if state_data.get("settings_message_id") and state_data.get("settings_chat_id"):
+        await _edit_active_model_settings(bot, state_data["settings_chat_id"], state_data["settings_message_id"])
+    else:
+        await _render_active_model_settings(message)
 
 
 
 @router.callback_query(F.data == "admin_toggle_vision")
 async def admin_toggle_vision(callback: CallbackQuery):
-    _VISION_CYCLE = [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_CLAUDE, PROVIDER_OPENROUTER]
-    async with async_session_maker() as session:
-        config = await session.get(AIConfig, 1)
-        if not config:
-            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
-            return
-
-        current_vp = config.vision_provider or PROVIDER_GEMINI
-        try:
-            idx = _VISION_CYCLE.index(current_vp)
-        except ValueError:
-            idx = 0
-        next_vp = _VISION_CYCLE[(idx + 1) % len(_VISION_CYCLE)]
-        next_model = validate_model_selection(
-            next_vp,
-            get_default_model(next_vp, channel="vision"),
-            channel="vision",
-        )
-        config.vision_provider = next_vp
-        config.vision_model = next_model
-
-        new_provider = config.vision_provider
-        new_model = config.vision_model
-        await session.commit()
-
-    await callback.answer(f"✅ Провайдер: {new_provider}, Модель: {new_model}")
-    await admin_ai_keys_models(callback)
+    await select_vision_provider(callback)
 
 
 @router.callback_query(F.data == "set_context_first")
@@ -5386,15 +5737,7 @@ async def finish_set_context_recent(message: Message, state: FSMContext, bot: Bo
 
 @router.callback_query(F.data == "set_temperature")
 async def start_set_temperature(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.set_temperature)
-    await state.update_data(message_id_to_edit=callback.message.message_id)
-    await callback.message.edit_text(
-        "Введите температуру генерации ИИ (от <b>0.0</b> до <b>2.0</b>).\n\n"
-        "0.0 — строго и предсказуемо\n"
-        "0.7 — сбалансированно (по умолчанию)\n"
-        "2.0 — максимально творчески",
-        reply_markup=kb.back_to_previous_menu("admin_ai_keys")
-    )
+    await start_model_temperature(callback, state)
 
 
 @router.callback_query(F.data == "set_kie_credit_threshold")
@@ -5415,31 +5758,29 @@ async def start_set_kie_credit_threshold(callback: CallbackQuery, state: FSMCont
 
 @router.message(AdminStates.set_temperature, F.text)
 async def finish_set_temperature(message: Message, state: FSMContext, bot: Bot):
-    try:
-        temp = float(message.text.strip().replace(',', '.'))
-        if not (0.0 <= temp <= 2.0):
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите число от 0.0 до 2.0 (например: 0.7)")
-        return
-
+    state_data = await state.get_data()
     async with async_session_maker() as session:
-        await session.execute(update(AIConfig).where(AIConfig.id == 1).values(temperature=temp))
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await message.answer("Ошибка: конфигурация ИИ не найдена.")
+            return
+        provider, model = _active_chat_model_scope(config)
+        provider = state_data.get("settings_provider") or provider
+        model = state_data.get("settings_model") or model
+        try:
+            temp = validate_model_setting(provider, model, "temperature", message.text.strip().replace(',', '.'))
+        except ValueError as exc:
+            await message.answer(f"❌ {exc}")
+            return
+        row = await get_or_create_model_settings(session, provider, model, "chat", config=config)
+        row.temperature = temp
         await session.commit()
-
-    data = await state.get_data()
-    msg_id = data.get('message_id_to_edit')
     await state.clear()
-    await message.delete()
-
-    callback_mock = type('obj', (object,), {
-        'message': type('obj', (object,), {
-            'chat': message.chat,
-            'message_id': msg_id,
-            'edit_text': lambda *args, **kwargs: bot.edit_message_text(chat_id=message.chat.id, message_id=msg_id, *args, **kwargs)
-        })
-    })()
-    await admin_ai_keys_models(callback_mock)
+    await message.answer(f"✅ Temperature: {temp}")
+    if state_data.get("settings_message_id") and state_data.get("settings_chat_id"):
+        await _edit_active_model_settings(bot, state_data["settings_chat_id"], state_data["settings_message_id"])
+    else:
+        await _render_active_model_settings(message)
 
 
 @router.message(AdminStates.set_kie_credit_threshold, F.text)
@@ -5508,90 +5849,17 @@ async def admin_toggle_test_btn(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_toggle_transcription")
 async def admin_toggle_transcription(callback: CallbackQuery):
-    async with async_session_maker() as session:
-        config = await session.get(AIConfig, 1)
-        if not config:
-            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
-            return
-
-        if config.transcription_provider == "OpenAI":
-            config.transcription_provider = "Gemini"
-        elif config.transcription_provider == "Gemini":
-            config.transcription_provider = "KIE"
-            config.kie_transcription_model = validate_model_selection(
-                PROVIDER_KIE,
-                get_default_model(PROVIDER_KIE, channel="transcription"),
-                channel="transcription",
-            )
-        elif config.transcription_provider == "KIE":
-            config.transcription_provider = PROVIDER_DEEPGRAM
-        elif config.transcription_provider == PROVIDER_DEEPGRAM:
-            config.transcription_provider = "None"
-        else:
-            config.transcription_provider = "OpenAI"
-
-        new_provider = config.transcription_provider
-        await session.commit()
-
-    display_provider = "Выкл" if new_provider == "None" else new_provider
-    await callback.answer(f"✅ Провайдер транскрибации изменен на {display_provider}")
-
-    await admin_ai_keys_models(callback)
+    await select_transcription_provider(callback)
 
 
 @router.callback_query(F.data == "admin_toggle_image_generation")
 async def admin_toggle_image_generation(callback: CallbackQuery):
-    _IMG_GEN_CYCLE = [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_KIE]
-    async with async_session_maker() as session:
-        config = await session.get(AIConfig, 1)
-        if not config:
-            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
-            return
-
-        current_igp = config.image_generation_provider or PROVIDER_OPENAI
-        try:
-            idx = _IMG_GEN_CYCLE.index(current_igp)
-        except ValueError:
-            idx = 0
-        next_igp = _IMG_GEN_CYCLE[(idx + 1) % len(_IMG_GEN_CYCLE)]
-        next_model = validate_model_selection(
-            next_igp,
-            get_default_model(next_igp, channel="image_gen"),
-            channel="image_gen",
-        )
-        config.image_generation_provider = next_igp
-        config.image_generation_model = next_model
-        await session.commit()
-
-    await callback.answer(f"✅ Генерация изображений: {config.image_generation_provider}")
-    await admin_ai_keys_models(callback)
+    await select_image_generation_provider(callback)
 
 
 @router.callback_query(F.data == "admin_toggle_image_edit")
 async def admin_toggle_image_edit(callback: CallbackQuery):
-    _IMG_EDIT_CYCLE = [PROVIDER_KIE, PROVIDER_GEMINI]
-    async with async_session_maker() as session:
-        config = await session.get(AIConfig, 1)
-        if not config:
-            await callback.answer("Ошибка: Конфигурация ИИ не найдена.", show_alert=True)
-            return
-
-        current_iep = config.image_edit_provider or PROVIDER_KIE
-        try:
-            idx = _IMG_EDIT_CYCLE.index(current_iep)
-        except ValueError:
-            idx = 0
-        next_iep = _IMG_EDIT_CYCLE[(idx + 1) % len(_IMG_EDIT_CYCLE)]
-        config.image_edit_provider = next_iep
-        config.image_edit_model = validate_model_selection(
-            next_iep,
-            get_default_model(next_iep, channel="image_edit"),
-            channel="image_edit",
-        )
-        await session.commit()
-
-    await callback.answer(f"✅ Редактирование изображений: {config.image_edit_provider}")
-    await admin_ai_keys_models(callback)
+    await select_image_edit_provider(callback)
 
 
 _FALLBACK_CYCLE = [None, PROVIDER_DEEPSEEK, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENAI, PROVIDER_OPENROUTER, PROVIDER_PERPLEXITY]
@@ -5731,7 +5999,7 @@ async def admin_toggle_vision_fallback(callback: CallbackQuery):
 @router.callback_query(F.data == "admin_change_vision_fallback_provider")
 async def admin_change_vision_fallback_provider(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
-    for p in [PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER]:
+    for p in get_capability_providers("vision"):
         builder.button(text=p, callback_data=f"admin_set_vision_fallback_provider_{p}")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(2)
@@ -5743,6 +6011,9 @@ async def admin_change_vision_fallback_provider(callback: CallbackQuery):
 async def admin_set_vision_fallback_provider(callback: CallbackQuery):
     provider = callback.data.replace("admin_set_vision_fallback_provider_", "", 1)
     canonical = canonical_provider_name(provider)
+    if canonical not in get_capability_providers("vision"):
+        await callback.answer("Провайдер не поддерживает Vision.", show_alert=True)
+        return
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
@@ -5828,7 +6099,10 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
 
     await state.clear()
 
-    await admin_ai_settings(message)
+    if data.get("settings_message_id") and data.get("settings_chat_id"):
+        await _edit_active_model_settings(bot, data["settings_chat_id"], data["settings_message_id"])
+    else:
+        await admin_ai_settings(message)
 
     notification = "ключ API" if is_key else "модель"
     await send_temp_notification(message.from_user.id, bot, f"✅ Новый {notification} для {provider} сохранен.")
@@ -6280,7 +6554,8 @@ def _provider_pricing_footer(provider: str, provider_models: dict) -> str:
 @router.callback_query(F.data.startswith("view_models_"))
 async def view_models_by_provider(callback: CallbackQuery):
     provider = canonical_provider_name(callback.data.replace("view_models_", "", 1))
-    selectable_models = get_selectable_models(provider, channel="chat")
+    channel = "transcription" if provider == PROVIDER_DEEPGRAM else "chat"
+    selectable_models = get_selectable_models(provider, channel=channel)
     provider_models = MODELS_INFO.get(provider)
 
     if not provider_models or not selectable_models:
@@ -6312,6 +6587,7 @@ async def view_models_by_provider(callback: CallbackQuery):
                 })
                 for model_id in selectable_models
             },
+            channel=channel,
         )
     )
 
@@ -19608,6 +19884,27 @@ async def get_ai_response_direct(
         if not model and provider_key in {PROVIDER_OPENROUTER.lower(), PROVIDER_PERPLEXITY.lower()}:
             model = get_default_model(provider_key, channel="chat")
 
+        settings_provider = {
+            "openai": PROVIDER_OPENAI,
+            "anthropic": PROVIDER_CLAUDE,
+            "claude": PROVIDER_CLAUDE,
+            "gemini": PROVIDER_GEMINI,
+            "deepseek": PROVIDER_DEEPSEEK,
+            "kie": PROVIDER_KIE,
+            "openrouter": PROVIDER_OPENROUTER,
+            "perplexity": PROVIDER_PERPLEXITY,
+        }.get(provider_key, provider)
+        model_settings = await resolve_model_settings(
+            session,
+            settings_provider,
+            model,
+            "chat",
+            config=ai_config,
+        )
+        output_tokens = wire_max_output_tokens(model_settings)
+        request_temperature = wire_temperature(model_settings)
+        reasoning_effort = wire_reasoning_effort(model_settings)
+
         if not api_key:
             raise AIServiceError(f"API key for AI provider '{provider}' is not configured.")
 
@@ -19669,26 +19966,35 @@ async def get_ai_response_direct(
         if provider_key == 'gemini':
             response_text = await _call_gemini_api(
                 api_key, model, fake_history, "", system_prompt,
+                temperature=request_temperature,
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
+                max_output_tokens=output_tokens,
             )
         elif provider_key == 'openai':
             response_text = await _call_openai_api(
                 api_key, model, fake_history, "", system_prompt,
+                temperature=request_temperature,
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
+                max_completion_tokens=output_tokens,
             )
         elif provider_key in ['anthropic', 'claude']:
             response_text = await _call_claude_api(
                 api_key, model, fake_history, "", system_prompt,
+                temperature=request_temperature,
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
+                max_output_tokens=output_tokens,
             )
         elif provider_key == 'deepseek':
             response_text = await _call_deepseek_api(
                 api_key, model, fake_history, "", system_prompt,
+                temperature=request_temperature,
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
+                max_output_tokens=output_tokens,
+                reasoning_effort=reasoning_effort,
             )
         elif provider_key == 'kie':
             response_text = await _call_kie_chat(
@@ -19698,8 +20004,10 @@ async def get_ai_response_direct(
                 fake_history,
                 "",
                 system_prompt,
+                temperature=request_temperature,
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
+                max_output_tokens=output_tokens,
             )
         elif provider_key == 'openrouter':
             try:
@@ -19707,11 +20015,8 @@ async def get_ai_response_direct(
                     api_key,
                     request_layout,
                     model,
-                    max_output_tokens=effective_chat_output_tokens(
-                        PROVIDER_OPENROUTER,
-                        model,
-                        getattr(ai_config, "max_output_tokens", None),
-                    ),
+                    temperature=request_temperature,
+                    max_output_tokens=output_tokens,
                     activity_tracker=activity_tracker,
                 )
             except ai_integration.ProviderAdapterError as exc:
@@ -19722,11 +20027,7 @@ async def get_ai_response_direct(
                     api_key,
                     request_layout,
                     model,
-                    max_output_tokens=effective_chat_output_tokens(
-                        PROVIDER_PERPLEXITY,
-                        model,
-                        getattr(ai_config, "max_output_tokens", None),
-                    ),
+                    max_output_tokens=output_tokens,
                     activity_tracker=activity_tracker,
                 )
             except ai_integration.ProviderAdapterError as exc:

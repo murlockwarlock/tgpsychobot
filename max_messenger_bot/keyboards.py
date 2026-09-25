@@ -898,7 +898,7 @@ def admin_subscriptions_keyboard() -> list[dict]:
 
 
 def admin_ai_settings_keyboard(current_provider: str) -> list[dict]:
-    providers = ["Deepseek", "Claude", "Gemini", "OpenAI", "KIE"]
+    providers = ["Deepseek", "Claude", "Gemini", "OpenAI", "KIE", "OpenRouter", "Perplexity"]
     rows: list[list[dict]] = []
     for index in range(0, len(providers), 2):
         chunk = []
@@ -906,7 +906,7 @@ def admin_ai_settings_keyboard(current_provider: str) -> list[dict]:
             label = f"✅ {provider}" if provider.lower() == current_provider.lower() else provider
             chunk.append(callback_button(label, f"admin_ai_provider_{provider}"))
         rows.append(chunk)
-    rows.append([callback_button("🔑 Ключи и модели", "admin_ai_keys")])
+    rows.append([callback_button("⚙️ Провайдеры и модели", "admin_ai_keys")])
     rows.append([callback_button("📝 Системный промпт", "admin_ai_system_prompt")])
     rows.append([callback_button("📥 Скачать системный промпт", "admin_ai_download_system_prompt")])
     rows.append([callback_button("📎 Общий блок для всех промптов", "admin_ai_global_prompt_appendix")])
@@ -929,19 +929,21 @@ def admin_ai_keys_keyboard(
     trans_label = f"🗣️ Аудио: {transcription_provider}" if transcription_provider != "None" else "🗣️ Аудио: ❌ Выкл"
     return inline_keyboard(
         [
-            # Keys column | Models column — grouped same as TG bot
-            [callback_button("🔑 Deepseek", "admin_ai_key_Deepseek"), callback_button("🧠 Deepseek", "admin_ai_models_Deepseek")],
-            [callback_button("🔑 Claude",   "admin_ai_key_Claude"),   callback_button("🧠 Claude",   "admin_ai_models_Claude")],
-            [callback_button("🔑 Gemini",   "admin_ai_key_Gemini"),   callback_button("🧠 Gemini",   "admin_ai_models_Gemini")],
-            [callback_button("🔑 OpenAI",   "admin_ai_key_OpenAI"),   callback_button("🧠 OpenAI",   "admin_ai_models_OpenAI")],
+            [callback_button("🔑 Deepseek", "admin_ai_key_Deepseek"), callback_button("🔑 Claude", "admin_ai_key_Claude")],
+            [callback_button("🔑 Gemini", "admin_ai_key_Gemini"), callback_button("🔑 OpenAI", "admin_ai_key_OpenAI")],
+            [callback_button("🔑 KIE", "admin_ai_key_KIE"), callback_button("🔑 OpenRouter", "admin_ai_key_OpenRouter")],
+            [callback_button("🔑 Perplexity", "admin_ai_key_Perplexity"), callback_button("🔑 Deepgram", "admin_ai_key_Deepgram")],
+            [callback_button("🧠 Deepseek", "admin_ai_models_Deepseek"), callback_button("🧠 Claude", "admin_ai_models_Claude")],
+            [callback_button("🧠 Gemini", "admin_ai_models_Gemini"), callback_button("🧠 OpenAI", "admin_ai_models_OpenAI")],
+            [callback_button("🧠 KIE", "admin_ai_models_KIE"), callback_button("🧠 OpenRouter", "admin_ai_models_OpenRouter")],
+            [callback_button("🧠 Perplexity", "admin_ai_models_Perplexity"), callback_button("🧠 Deepgram", "admin_ai_models_Deepgram")],
             # Context
             [callback_button(f"📌 Первые: {context_first}", "admin_ai_set_context_first"), callback_button(f"🔄 Последние: {context_recent}", "admin_ai_set_context_recent")],
             # Audio
-            [callback_button(trans_label, "admin_ai_toggle_transcription"), callback_button(f"⏱️ Лимит аудио: {audio_limit}", "admin_ai_set_audio_limit")],
-            # Temp + Memory
-            [callback_button(f"🌡️ Температура: {round(temperature, 2)}", "admin_ai_set_temperature"), callback_button(f"🧠 Память: {memory_mode_label}", "admin_ai_cycle_memory_scope")],
+            [callback_button(trans_label, "admin_ai_select_transcription_provider"), callback_button(f"⏱️ Лимит аудио: {audio_limit}", "admin_ai_set_audio_limit")],
+            [callback_button("⚙️ Параметры активной модели", "admin_ai_model_settings"), callback_button(f"🧠 Память: {memory_mode_label}", "admin_ai_cycle_memory_scope")],
             # Vision
-            [callback_button(f"👁️ Фото: {vision_provider}", "admin_ai_toggle_vision"), callback_button(f"Модель: {vision_model[:16]}", "admin_ai_vision_models")],
+            [callback_button(f"👁️ Фото: {vision_provider}", "admin_ai_select_vision_provider"), callback_button(f"Модель: {vision_model[:16]}", "admin_ai_vision_models")],
             [callback_button("⬅️ Назад", "admin_ai_settings")],
         ]
     )

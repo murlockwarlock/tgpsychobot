@@ -126,7 +126,7 @@ def test_runtime_catalog_rejects_retired_disabled_unknown_and_cross_provider_mod
 
 
 def test_deepseek_legacy_alias_is_normalized_before_validation():
-    assert validate_model_selection(PROVIDER_DEEPSEEK, "deepseek-reasoner") == "deepseek-v4-flash"
+    assert validate_model_selection(PROVIDER_DEEPSEEK, "deepseek-reasoner") == "deepseek-flash"
     ensure_model_available(PROVIDER_DEEPSEEK, "deepseek-chat", channel="chat")
 
 
@@ -329,8 +329,8 @@ async def test_max_temperature_zero_reaches_primary_and_fallback(monkeypatch):
     result = await ai.get_ai_response(1, "question")
 
     assert result == "fallback answer"
-    assert primary.await_args.args[4] == 0.0
-    assert fallback.await_args.args[3] == 0.0
+    assert primary.await_args.args[4] is None
+    assert fallback.await_args.args[3] is None
 
 
 @pytest.mark.asyncio
