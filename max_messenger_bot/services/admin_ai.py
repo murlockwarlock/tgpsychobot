@@ -258,7 +258,7 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
         f"🎨 <b>Генерация изображений:</b> {'✅' if img_gen_enabled else '❌'} / {html.escape(img_gen)}\n"
         f"✏️ <b>Редактирование изображений:</b> {'✅' if img_edit_enabled else '❌'} / {html.escape(img_edit)}\n"
         f"🔄 <b>Фолбэк:</b> {'✅' if fallback_enabled else '❌'} / {html.escape(fallback_info)}\n"
-        f"🖼 <b>Фото (Vision) резерв:</b> {html.escape(vision_fallback_info) if vision_fallback_enabled else 'выключен'}\n\n"
+        f"🖼 <b>Фото (Vision) резерв:</b> {'включён' if vision_fallback_enabled else 'выключен'} · {html.escape(vision_fallback_info)}\n\n"
         "Ниже доступны смена моделей, лимитов контекста и vision/audio-параметров."
     )
     await client.send_message(

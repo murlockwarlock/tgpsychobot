@@ -5174,11 +5174,11 @@ async def admin_ai_keys_models(callback: CallbackQuery):
     )
 
     current_model_label = current_model or "не задана"
-    vision_fallback_summary = (
-        f"{vision_fallback_provider} · {vision_fallback_model}"
-        if allow_vision_fallback and vision_fallback_provider
-        else "выключен"
-    )
+    if vision_fallback_provider:
+        vision_fallback_status = "включён" if allow_vision_fallback else "выключен"
+        vision_fallback_summary = f"{vision_fallback_status} · {vision_fallback_provider} · {vision_fallback_model or 'не выбрана'}"
+    else:
+        vision_fallback_summary = "выключен · провайдер не выбран"
     await callback.message.edit_text(
         "🔑 <b>Провайдеры и модели</b>\n\n"
         f"Активная модель: <b>{current_provider} · {current_model_label}</b>\n"
