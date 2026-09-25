@@ -154,8 +154,13 @@ class MaxBotApplication:
         lock = self._user_locks.setdefault(user_id, asyncio.Lock())
 
         async def runner() -> None:
-            async with lock:
-                await coro
+            try:
+                async with lock:
+                    await coro
+            except asyncio.CancelledError:
+                if asyncio.iscoroutine(coro):
+                    coro.close()
+                raise
 
         task = asyncio.create_task(runner())
         self.user_tasks[user_id] = task
