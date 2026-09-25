@@ -7485,6 +7485,24 @@ async def save_content(callback: CallbackQuery, state: FSMContext):
                 )
         await commit_readiness_critical_mutation(session)
 
+    max_media_error = None
+    if authoring_locale == "ru" and data.get("media_variant_touched"):
+        try:
+            from max_messenger_bot.content_media import materialize_content_media_from_telegram
+
+            await materialize_content_media_from_telegram(
+                content_key,
+                callback.bot,
+                session_factory=async_session_maker,
+            )
+        except Exception as exc:
+            max_media_error = exc
+            logging.warning(
+                "MAX content media materialization failed content_key=%s error_type=%s",
+                content_key,
+                type(exc).__name__,
+            )
+
     await state.clear()
 
     if data.get("parent_kind") == "content":
@@ -7503,7 +7521,13 @@ async def save_content(callback: CallbackQuery, state: FSMContext):
             "✅ Раздел успешно обновлен!",
             reply_markup=await kb.content_management_keyboard(),
         )
-    await callback.answer()
+    if max_media_error is not None:
+        await callback.answer(
+            "Сохранено в Telegram. Медиа MAX не обновлено; повторите сохранение после восстановления MAX.",
+            show_alert=True,
+        )
+    else:
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("cancel_content_edit_"), StateFilter(AdminStates.edit_content))
@@ -17420,7 +17444,10 @@ async def admin_delete_button_confirm(callback: CallbackQuery):
             await callback.answer("Удаление отменено: найдены зависимости.", show_alert=True)
             return
         async with translation_coordination_lock(session):
+            from max_messenger_bot.storage import MaxContentMedia
+
             await session.execute(delete(ContentMedia).where(ContentMedia.content_key == button_key))
+            await session.execute(delete(MaxContentMedia).where(MaxContentMedia.content_key == button_key))
             await session.execute(delete(BotTranslation).where(BotTranslation.translation_key.like(f"content.{button_key}.%")))
             await session.execute(delete(Content).where(Content.key == button_key))
             await session.commit()

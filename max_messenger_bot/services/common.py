@@ -19,6 +19,7 @@ from ..logging_utils import get_bot_logger
 from ..legacy import (
     AIConfig,
     Content,
+    ContentMedia,
     Message as DBMessage,
     RandomMessage,
     SubscriptionConfig,
@@ -241,11 +242,55 @@ async def get_content(content_key: str) -> Content | None:
 
 async def get_content_attachments(content_key: str) -> list[dict]:
     async with async_session_maker() as session:
+        canonical_rows = (
+            await session.execute(
+                select(ContentMedia)
+                .where(ContentMedia.content_key == content_key)
+                .order_by(ContentMedia.id.asc())
+            )
+        ).scalars().all()
         media_rows = (
             await session.execute(
                 select(MaxContentMedia).where(MaxContentMedia.content_key == content_key).order_by(MaxContentMedia.id.asc())
             )
         ).scalars().all()
+    expected_types = ["image" if row.file_type in {"photo", "image"} else row.file_type for row in canonical_rows]
+    actual_types = ["image" if row.media_type == "photo" else row.media_type for row in media_rows]
+    source_mismatch = any(
+        (row.source_media_id is not None and row.source_media_id != source.id)
+        or (row.source_file_id is not None and row.source_file_id != source.file_id)
+        for source, row in zip(canonical_rows, media_rows)
+    ) or len(canonical_rows) != len(media_rows)
+    if canonical_rows and (source_mismatch or expected_types != actual_types):
+        try:
+            from ..content_media import materialize_missing_content_media
+
+            await materialize_missing_content_media(content_key, session_factory=async_session_maker)
+        except Exception as exc:
+            log.warning(
+                "MAX content media recovery failed content_key=%s error_type=%s",
+                content_key,
+                type(exc).__name__,
+            )
+        async with async_session_maker() as session:
+            media_rows = (
+                await session.execute(
+                    select(MaxContentMedia).where(MaxContentMedia.content_key == content_key).order_by(MaxContentMedia.id.asc())
+                )
+            ).scalars().all()
+    elif canonical_rows and media_rows and all(
+        row.source_media_id is None and row.source_file_id is None for row in media_rows
+    ):
+        try:
+            from ..content_media import bind_legacy_content_media
+
+            await bind_legacy_content_media(content_key, session_factory=async_session_maker)
+        except Exception as exc:
+            log.warning(
+                "MAX legacy content media binding failed content_key=%s error_type=%s",
+                content_key,
+                type(exc).__name__,
+            )
     attachments = []
     for row in media_rows:
         mtype = "image" if row.media_type == "photo" else row.media_type

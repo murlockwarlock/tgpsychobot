@@ -177,12 +177,15 @@ async def content_dependency_report(session, content_key: str) -> list[str]:
 
 
 async def _delete_content_resource(session, content_key: str) -> None:
+    from max_messenger_bot.storage import MaxContentMedia
+
     await session.execute(
         delete(BotTranslation).where(
             BotTranslation.translation_key.like(f"content.{content_key}.%")
         )
     )
     await session.execute(delete(ContentMedia).where(ContentMedia.content_key == content_key))
+    await session.execute(delete(MaxContentMedia).where(MaxContentMedia.content_key == content_key))
     await session.execute(delete(Content).where(Content.key == content_key))
 
 
