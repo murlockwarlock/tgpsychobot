@@ -542,72 +542,18 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     deepgram_model = DEEPGRAM_DEFAULT_MODEL
     if str(current_transcription_provider).startswith("Deepgram / "):
         deepgram_model = str(current_transcription_provider).split(" / ", 1)[1] or deepgram_model
-    builder.button(text=f"🗣️ Deepgram · {short_model(deepgram_model)}", callback_data="view_models_Deepgram")
-    if current_provider:
-        builder.button(
-            text=f"⚙️ Параметры: {current_provider} · {short_model(current_model or 'не задана')}",
-            callback_data="view_active_model_settings",
-        )
+    builder.button(text="🗣️ Deepgram", callback_data="view_models_Deepgram")
 
-    builder.button(text=f"📌 Первые: {context_first}", callback_data="set_context_first")
-    builder.button(text=f"🔄 Последние: {context_recent}", callback_data="set_context_recent")
-
-    trans_label = (
-        f"🗣️ Аудио: {current_transcription_provider}"
-        if current_transcription_provider != 'None'
-        else "🗣️ Аудио: выкл"
-    )
-    builder.button(text=trans_label, callback_data="admin_select_transcription_provider")
-    builder.button(text="⏱️ Лимит аудио", callback_data="set_audio_limit")
-
-    threshold_label = int(kie_credit_alert_threshold) if float(kie_credit_alert_threshold).is_integer() else round(kie_credit_alert_threshold, 2)
-    builder.button(text=f"💳 KIE порог: {threshold_label}", callback_data="set_kie_credit_threshold")
-    builder.button(
-        text=f"🧠 Память: {memory_mode_label(memory_mode)}",
-        callback_data="toggle_preserve_topic_context"
-    )
-    proxy_status = "✅ ВКЛ" if use_proxy else "❌ ВЫКЛ"
-    builder.button(text=f"🌍 Прокси Deepseek: {proxy_status}", callback_data="admin_toggle_proxy")
-    if fallback_provider:
-        fallback_status = "✅ ВКЛ" if allow_fallback else "❌ ВЫКЛ"
-        fb_label = f"🔄 Резерв: {fallback_provider} — {fallback_status}"
-    else:
-        fb_label = "🔄 Резерв: ❌ ВЫКЛ"
-    builder.button(text=fb_label, callback_data="admin_toggle_fallback")
-    if fallback_provider:
-        fb_model_short = short_model(fallback_model) if fallback_model else "не задана"
-        builder.button(text=f"Модель: {fb_model_short}", callback_data="admin_change_fallback_model")
-
-    builder.button(text=f"👁️ Фото: {current_vision_provider}",
-                   callback_data="admin_select_vision_provider")
-    builder.button(text=f"Модель: {short_model(current_vision_model)}", callback_data="admin_change_vision_model")
-
-    v_fb_status = (
-        f"{vision_fallback_provider} · {short_model(vision_fallback_model)}"
-        if allow_vision_fallback and vision_fallback_provider
-        else "выключен"
-    )
-    builder.button(text=f"🛡 Резерв фото: {v_fb_status}", callback_data="admin_toggle_vision_fallback")
-    v_fb_prov_label = f"Пров: {vision_fallback_provider}" if vision_fallback_provider else "Пров: не задан"
-    builder.button(text=v_fb_prov_label, callback_data="admin_change_vision_fallback_provider")
-    v_fb_model_label = f"Модель: {short_model(vision_fallback_model)}" if vision_fallback_model else "Модель: не задана"
-    builder.button(text=v_fb_model_label, callback_data="admin_change_vision_fallback_model")
-
-    builder.button(text=f"🖼 Ген: {image_generation_provider}",
-                   callback_data="admin_select_image_generation_provider")
-    builder.button(text=f"Модель: {short_model(image_generation_model)}", callback_data="admin_change_image_generation_model")
-
-    builder.button(text=f"🎨 Редакт: {image_edit_provider}",
-                   callback_data="admin_select_image_edit_provider")
-    builder.button(text=f"Модель: {short_model(image_edit_model)}", callback_data="admin_change_image_edit_model")
-
-    builder.button(text="⏱️ Таймаут ИИ", callback_data="set_ai_timeout")
+    builder.button(text="💬 Основной чат", callback_data="admin_ai_main_chat")
+    builder.button(text="🔄 Резерв текста", callback_data="admin_ai_text_fallback")
+    builder.button(text="🎙 Аудио", callback_data="admin_ai_audio")
+    builder.button(text="🖼 Vision", callback_data="admin_ai_vision")
+    builder.button(text="🛡 Vision резерв", callback_data="admin_ai_vision_fallback")
+    builder.button(text="🎨 Генерация изображений", callback_data="admin_ai_image_generation")
+    builder.button(text="✏️ Редактирование изображений", callback_data="admin_ai_image_edit")
+    builder.button(text="⚙️ Общие настройки", callback_data="admin_ai_common")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
-
-    if fallback_provider:
-        builder.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 2, 1, 2, 2, 2, 1, 1)
-    else:
-        builder.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 1, 2, 2, 2, 1, 1)
+    builder.adjust(2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -620,31 +566,49 @@ def model_selection_keyboard(provider: str, models: dict, channel: str = "chat",
         )
     builder.button(
         text="⬅️ Назад",
-        callback_data=back_callback or ("view_active_model_settings" if channel == "chat" else "admin_ai_keys"),
+        callback_data=back_callback or ("admin_ai_keys" if channel == "chat" else "admin_ai_keys"),
     )
     builder.adjust(1)
     return builder.as_markup()
 
 
-def model_settings_keyboard(*, show_reasoning: bool, show_temperature: bool) -> InlineKeyboardMarkup:
+def provider_model_settings_keyboard(
+    provider: str,
+    *,
+    show_reasoning: bool,
+    show_temperature: bool,
+    transcription_only: bool = False,
+    show_proxy: bool = False,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🤖 Выбрать модель", callback_data="view_active_model_choices")
-    builder.button(text="📏 Max tokens", callback_data="model_setting_max_tokens")
-    if show_reasoning:
-        builder.button(text="🧠 Reasoning", callback_data="model_setting_reasoning")
-    if show_temperature:
-        builder.button(text="🌡 Temperature", callback_data="model_setting_temperature")
-    builder.button(text="🔑 API-ключ", callback_data="model_setting_api_key")
+    builder.button(text="🤖 Выбрать модель", callback_data=f"view_provider_models_{provider}")
+    if not transcription_only:
+        builder.button(text="📏 Max tokens", callback_data=f"model_setting_max_tokens_{provider}")
+        if show_reasoning:
+            builder.button(text="🧠 Reasoning", callback_data=f"model_setting_reasoning_{provider}")
+        if show_temperature:
+            builder.button(text="🌡 Temperature", callback_data=f"model_setting_temperature_{provider}")
+        if show_proxy:
+            builder.button(text="🌍 Proxy", callback_data="admin_ai_deepseek_proxy")
+    builder.button(text="🔑 API-ключ", callback_data=f"model_setting_api_key_{provider}")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def model_reasoning_keyboard() -> InlineKeyboardMarkup:
+def model_settings_keyboard(*, show_reasoning: bool, show_temperature: bool) -> InlineKeyboardMarkup:
+    return provider_model_settings_keyboard(
+        "Deepseek",
+        show_reasoning=show_reasoning,
+        show_temperature=show_temperature,
+    )
+
+
+def model_reasoning_keyboard(provider: str = "Deepseek") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for value, label in (("auto", "Авто"), ("none", "Выкл"), ("low", "Low"), ("high", "High"), ("max", "Max")):
-        builder.button(text=label, callback_data=f"model_reasoning_{value}")
-    builder.button(text="⬅️ Назад", callback_data="view_active_model_settings")
+        builder.button(text=label, callback_data=f"model_reasoning_{provider}_{value}")
+    builder.button(text="⬅️ Назад", callback_data=f"view_models_{provider}")
     builder.adjust(1)
     return builder.as_markup()
 

@@ -228,7 +228,7 @@ class ApiKeyDisplayTests(unittest.TestCase):
         self.assertIn("🔑 Deepseek: abcd...wxyz", labels)
         self.assertNotIn(secret, "\n".join(labels))
 
-    def test_fallback_status_is_visible_in_telegram_admin_keyboard(self):
+    def test_fallback_has_a_dedicated_entry_in_telegram_admin_keyboard(self):
         common = {
             "current_transcription_provider": "OpenAI",
             "context_first": 2,
@@ -244,13 +244,11 @@ class ApiKeyDisplayTests(unittest.TestCase):
             "fallback_model": "deepseek-v4-flash",
         }
 
-        disabled = ai_keys_models_keyboard(**common, allow_fallback=False)
-        enabled = ai_keys_models_keyboard(**common, allow_fallback=True)
-
-        disabled_labels = [button.text for row in disabled.inline_keyboard for button in row]
-        enabled_labels = [button.text for row in enabled.inline_keyboard for button in row]
-        self.assertIn("🔄 Резерв: Deepseek — ❌ ВЫКЛ", disabled_labels)
-        self.assertIn("🔄 Резерв: Deepseek — ✅ ВКЛ", enabled_labels)
+        markup = ai_keys_models_keyboard(**common, allow_fallback=False)
+        labels = [button.text for row in markup.inline_keyboard for button in row]
+        self.assertIn("🔄 Резерв текста", labels)
+        self.assertNotIn("🔄 Резерв: Deepseek — ❌ ВЫКЛ", labels)
+        self.assertNotIn("🔄 Резерв: Deepseek — ✅ ВКЛ", labels)
 
 
 class RemoveMarkdownTests(unittest.TestCase):

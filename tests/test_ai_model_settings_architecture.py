@@ -262,7 +262,7 @@ def test_provider_key_and_model_layouts_are_four_by_two():
     assert all(len(rows[index]) == 2 for index in range(8))
     assert rows[3][1].text.startswith("🔑 Deepgram")
     assert rows[7][1].text.startswith("🗣️ Deepgram")
-    assert "nova-3" in rows[7][1].text or "nova-3" in rows[3][1].text
+    assert rows[7][1].text == "🗣️ Deepgram"
 
 
 def test_deepgram_transcription_model_callback_resolves_without_chat_selection():
@@ -285,9 +285,9 @@ def test_max_admin_key_and_model_cards_are_four_by_two():
     attachments = _build_keys_keyboard(config)
     rows = attachments[0]["payload"]["buttons"]
     assert all(len(row) == 2 for row in rows[:4])
-    assert all(len(row) == 2 for row in rows[5:9])
+    assert all(len(row) == 2 for row in rows[4:8])
     assert "Deepgram" in rows[3][1]["text"]
-    assert rows[8][1]["text"].startswith("🗣️ Deepgram · nova-3")
+    assert rows[7][1]["text"] == "🗣️ Deepgram"
 
 
 def test_capability_controls_open_explicit_pickers_not_cycles():
@@ -301,14 +301,54 @@ def test_capability_controls_open_explicit_pickers_not_cycles():
         for button in row
         if button.callback_data
     }
-    assert "admin_select_transcription_provider" in callbacks
-    assert "admin_select_vision_provider" in callbacks
-    assert "admin_select_image_generation_provider" in callbacks
-    assert "admin_select_image_edit_provider" in callbacks
+    assert {
+        "admin_ai_audio",
+        "admin_ai_vision",
+        "admin_ai_image_generation",
+        "admin_ai_image_edit",
+    } <= callbacks
     assert "admin_toggle_transcription" not in callbacks
     assert "admin_toggle_vision" not in callbacks
     assert "admin_toggle_image_generation" not in callbacks
     assert "admin_toggle_image_edit" not in callbacks
+
+
+def test_fallback_toggle_does_not_change_main_routing_layout():
+    args = (
+        "OpenAI",
+        2,
+        10,
+        "Gemini",
+        "gemini-3.7-flash",
+        "OpenAI",
+        "gpt-image-2",
+        "KIE",
+        "seedream/4.5-edit",
+        0,
+    )
+    enabled = keyboards.ai_keys_models_keyboard(*args, allow_fallback=True, api_keys={})
+    disabled = keyboards.ai_keys_models_keyboard(*args, allow_fallback=False, api_keys={})
+
+    def rows(markup):
+        return [
+            [(button.text, button.callback_data) for button in row]
+            for row in markup.inline_keyboard
+        ]
+
+    enabled_rows = rows(enabled)
+    disabled_rows = rows(disabled)
+    assert enabled_rows == disabled_rows
+    assert [row[0][1] for row in enabled_rows[8:]] == [
+        "admin_ai_main_chat",
+        "admin_ai_text_fallback",
+        "admin_ai_audio",
+        "admin_ai_vision",
+        "admin_ai_vision_fallback",
+        "admin_ai_image_generation",
+        "admin_ai_image_edit",
+        "admin_ai_common",
+        "admin_ai_settings",
+    ]
 
 
 PICKER_CASES = tuple(
@@ -436,12 +476,9 @@ async def test_non_active_chat_model_selection_returns_to_provider_list(settings
         answer=AsyncMock(),
     )
     monkeypatch.setattr(handlers, "async_session_maker", settings_db)
-    model_card = AsyncMock()
-    provider_list = AsyncMock()
-    monkeypatch.setattr(handlers, "_render_active_model_settings", model_card)
-    monkeypatch.setattr(handlers, "admin_ai_keys_models", provider_list)
+    provider_card = AsyncMock()
+    monkeypatch.setattr(handlers, "_render_provider_model_settings", provider_card)
 
     await handlers.handle_compact_model_callback(callback)
 
-    model_card.assert_not_awaited()
-    provider_list.assert_awaited_once_with(callback)
+    provider_card.assert_awaited_once_with(callback, PROVIDER_OPENAI)

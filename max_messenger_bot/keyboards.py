@@ -926,7 +926,6 @@ def admin_ai_keys_keyboard(
     memory_mode_label: str,
     audio_limit: int,
 ) -> list[dict]:
-    trans_label = f"🗣️ Аудио: {transcription_provider}" if transcription_provider != "None" else "🗣️ Аудио: ❌ Выкл"
     return inline_keyboard(
         [
             [callback_button("🔑 Deepseek", "admin_ai_key_Deepseek"), callback_button("🔑 Claude", "admin_ai_key_Claude")],
@@ -937,24 +936,25 @@ def admin_ai_keys_keyboard(
             [callback_button("🧠 Gemini", "admin_ai_models_Gemini"), callback_button("🧠 OpenAI", "admin_ai_models_OpenAI")],
             [callback_button("🧠 KIE", "admin_ai_models_KIE"), callback_button("🧠 OpenRouter", "admin_ai_models_OpenRouter")],
             [callback_button("🧠 Perplexity", "admin_ai_models_Perplexity"), callback_button("🧠 Deepgram", "admin_ai_models_Deepgram")],
-            # Context
-            [callback_button(f"📌 Первые: {context_first}", "admin_ai_set_context_first"), callback_button(f"🔄 Последние: {context_recent}", "admin_ai_set_context_recent")],
-            # Audio
-            [callback_button(trans_label, "admin_ai_select_transcription_provider"), callback_button(f"⏱️ Лимит аудио: {audio_limit}", "admin_ai_set_audio_limit")],
-            [callback_button("⚙️ Параметры активной модели", "admin_ai_model_settings"), callback_button(f"🧠 Память: {memory_mode_label}", "admin_ai_cycle_memory_scope")],
-            # Vision
-            [callback_button(f"👁️ Фото: {vision_provider}", "admin_ai_select_vision_provider"), callback_button(f"Модель: {vision_model[:16]}", "admin_ai_vision_models")],
+            [callback_button("💬 Основной чат", "admin_ai_main_chat")],
+            [callback_button("🔄 Резерв текста", "admin_ai_text_fallback")],
+            [callback_button("🎙 Аудио", "admin_ai_audio")],
+            [callback_button("🖼 Vision", "admin_ai_vision")],
+            [callback_button("🛡 Vision резерв", "admin_ai_vision_fallback")],
+            [callback_button("🎨 Генерация изображений", "admin_ai_image_generation")],
+            [callback_button("✏️ Редактирование изображений", "admin_ai_image_edit")],
+            [callback_button("⚙️ Общие настройки", "admin_ai_common")],
             [callback_button("⬅️ Назад", "admin_ai_settings")],
         ]
     )
 
 
-def admin_ai_model_selection_keyboard(provider: str, current_model: str, models: list[str]) -> list[dict]:
+def admin_ai_model_selection_keyboard(provider: str, current_model: str, models: list[str], *, back_callback: str = "admin_ai_keys") -> list[dict]:
     rows: list[list[dict]] = []
     for model in models:
         label = f"✅ {model}" if model == current_model else model
         rows.append([callback_button(label, f"admin_ai_set_model_{provider}_{model}")])
-    rows.append([callback_button("⬅️ Назад", "admin_ai_keys")])
+    rows.append([callback_button("⬅️ Назад", back_callback)])
     return inline_keyboard(rows)
 
 

@@ -169,10 +169,8 @@ def test_telegram_and_max_image_admin_buttons_still_render():
     )
     telegram_callbacks = _telegram_callbacks(telegram_markup)
     assert {
-        "admin_select_image_generation_provider",
-        "admin_change_image_generation_model",
-        "admin_select_image_edit_provider",
-        "admin_change_image_edit_model",
+        "admin_ai_image_generation",
+        "admin_ai_image_edit",
     } <= telegram_callbacks
 
     max_config = SimpleNamespace(
@@ -203,8 +201,6 @@ def test_telegram_and_max_image_admin_buttons_still_render():
     )
     max_callbacks = _max_callbacks(admin_ai._build_keys_keyboard(max_config))
     assert {
-        "admin_ai_select_image_generation_provider",
-        "admin_ai_image_generation_models",
-        "admin_ai_select_image_edit_provider",
-        "admin_ai_image_edit_models",
+        "admin_ai_image_generation",
+        "admin_ai_image_edit",
     } <= max_callbacks

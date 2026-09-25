@@ -36,7 +36,7 @@ from ai_model_settings import (
     REASONING_MAX,
 )
 
-FALLBACK_PROVIDERS = ["OpenAI", "Gemini", "Claude", "Deepseek", "KIE"]
+FALLBACK_PROVIDERS = list(get_capability_providers("fallback"))
 
 KEY_FIELDS = {
     "Deepseek": "deepseek_api_key",
@@ -79,6 +79,18 @@ def _provider_model(provider: str | None, model: str | None) -> str:
     provider_label = provider or "нет"
     model_label = model or "нет"
     return f"{provider_label}/{model_label}"
+
+
+def _transcription_model(config: AIConfig, provider: str | None) -> str:
+    provider = canonical_provider_name(provider)
+    if provider == PROVIDER_DEEPGRAM:
+        return getattr(config, "deepgram_model", None) or get_default_model(provider, channel="transcription")
+    if provider == PROVIDER_KIE:
+        return getattr(config, "kie_transcription_model", None) or get_default_model(provider, channel="transcription")
+    try:
+        return get_default_model(provider, channel="transcription")
+    except ModelUnavailableError:
+        return "не выбрана"
 
 
 def _split_provider_model_payload(payload: str) -> tuple[str | None, str]:
@@ -190,31 +202,18 @@ def _build_keys_keyboard(config) -> list:
          callback_button(f"OpenRouter: {_mask(getattr(config, 'openrouter_api_key', None))}", "admin_ai_key_OpenRouter")],
         [callback_button(f"Perplexity: {_mask(getattr(config, 'perplexity_api_key', None))}", "admin_ai_key_Perplexity"),
          callback_button(f"Deepgram: {_mask(getattr(config, 'deepgram_api_key', None))}", "admin_ai_key_Deepgram")],
-        [callback_button(f"📊 Порог KIE: {config.kie_credit_alert_threshold}", "admin_ai_set_kie_threshold")],
-        [callback_button("🔤 Deepseek модель", "admin_ai_models_Deepseek"),
-         callback_button("🔤 Claude модель", "admin_ai_models_Claude")],
-        [callback_button("🔤 Gemini модель", "admin_ai_models_Gemini"),
-         callback_button("🔤 OpenAI модель", "admin_ai_models_OpenAI")],
-        [callback_button("🔤 KIE модель", "admin_ai_models_KIE"),
-         callback_button("🔤 OpenRouter модель", "admin_ai_models_OpenRouter")],
-        [callback_button("🔤 Perplexity режим", "admin_ai_models_Perplexity"),
-         callback_button(f"🗣️ Deepgram · {getattr(config, 'deepgram_model', None) or get_default_model(PROVIDER_DEEPGRAM, channel='transcription')}", "admin_ai_models_Deepgram")],
-        [callback_button(f"🎙 Транскрипция: {transcription_label}", "admin_ai_select_transcription_provider"),
-         callback_button(f"⏱ Лимит аудио: {config.max_voice_duration_sec}с", "admin_ai_set_audio_limit")],
-        [callback_button(f"👁 Vision: {config.vision_provider}/{config.vision_model}", "admin_ai_select_vision_provider"),
-         callback_button("🔤 Vision модель", "admin_ai_vision_models")],
-        [callback_button(f"🔄👁 {'✅' if vision_fallback_enabled else '❌'} {_provider_model(vision_fb_provider, vision_fb_model)}", "admin_ai_toggle_vision_fallback")],
-        [callback_button("🔤 Фолбэк Vision провайдер/модель", "admin_ai_vision_fallback_models")],
-        [callback_button(_status_model_button("🎨 Генерация", img_gen_enabled, config.image_generation_provider, config.image_generation_model), "admin_ai_select_image_generation_provider")],
-        [callback_button("🔤 Модель генерации", "admin_ai_image_generation_models")],
-        [callback_button(_status_model_button("✏️ Редактирование", img_edit_enabled, config.image_edit_provider, config.image_edit_model), "admin_ai_select_image_edit_provider")],
-        [callback_button("🔤 Модель редактирования", "admin_ai_image_edit_models")],
-        [callback_button(f"🔄 {'✅' if fallback_enabled else '❌'} {_provider_model(config.fallback_provider, config.fallback_model or _fallback_model_for_provider(config, config.fallback_provider))}", "admin_ai_toggle_fallback")],
-        [callback_button("🔤 Фолбэк провайдер/модель", "admin_ai_fallback_models")],
-        [callback_button(f"📐 Контекст: первые {config.context_limit_first}", "admin_ai_set_context_first"),
-         callback_button(f"📐 Последние {config.context_limit_recent}", "admin_ai_set_context_recent")],
-        [callback_button("⚙️ Параметры активной модели", "admin_ai_model_settings")],
-        [callback_button(f"🧠 Режим памяти: {memory_mode_label(memory)}", "admin_ai_cycle_memory_scope")],
+        [callback_button("🧠 Deepseek", "admin_ai_models_Deepseek"), callback_button("🧠 Claude", "admin_ai_models_Claude")],
+        [callback_button("🧠 Gemini", "admin_ai_models_Gemini"), callback_button("🧠 OpenAI", "admin_ai_models_OpenAI")],
+        [callback_button("🧠 KIE", "admin_ai_models_KIE"), callback_button("🧠 OpenRouter", "admin_ai_models_OpenRouter")],
+        [callback_button("🧠 Perplexity", "admin_ai_models_Perplexity"), callback_button("🗣️ Deepgram", "admin_ai_models_Deepgram")],
+        [callback_button("💬 Основной чат", "admin_ai_main_chat")],
+        [callback_button("🔄 Резерв текста", "admin_ai_text_fallback")],
+        [callback_button("🎙 Аудио", "admin_ai_audio")],
+        [callback_button("🖼 Vision", "admin_ai_vision")],
+        [callback_button("🛡 Vision резерв", "admin_ai_vision_fallback")],
+        [callback_button("🎨 Генерация изображений", "admin_ai_image_generation")],
+        [callback_button("✏️ Редактирование изображений", "admin_ai_image_edit")],
+        [callback_button("⚙️ Общие настройки", "admin_ai_common")],
         [callback_button("◀️ Назад", "admin_ai_settings")],
     ]
     return inline_keyboard(rows)
@@ -222,6 +221,7 @@ def _build_keys_keyboard(config) -> list:
 
 async def show_keys(client: MaxApiClient, chat_id: int) -> None:
     config = await _get_config()
+    active_provider, active_model = _active_chat_scope(config)
     current_memory_mode = normalize_memory_mode(config)
     img_gen_enabled = getattr(config, 'allow_image_generation', False)
     img_edit_enabled = getattr(config, 'allow_image_edit', False)
@@ -244,6 +244,7 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
     kie_threshold = config.kie_credit_alert_threshold
     text = (
         "<b>Провайдеры и модели</b>\n\n"
+        f"💬 <b>Основной чат:</b> {html.escape(active_provider)} · <code>{html.escape(active_model)}</code>\n"
         f"<b>Deepseek:</b> <code>{_mask(config.deepseek_api_key)}</code>\n"
         f"<b>Claude:</b> <code>{_mask(config.claude_api_key)}</code>\n"
         f"<b>Gemini:</b> <code>{_mask(config.gemini_api_key)}</code>\n"
@@ -267,7 +268,161 @@ async def show_keys(client: MaxApiClient, chat_id: int) -> None:
     )
 
 
-async def show_capability_providers(client: MaxApiClient, chat_id: int, channel: str) -> None:
+async def show_main_chat(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    provider, model = _active_chat_scope(config)
+    rows = [
+        [callback_button("🏢 Выбрать провайдера", "admin_ai_main_chat_provider")],
+        [callback_button("🤖 Выбрать модель", "admin_ai_main_chat_model")],
+        [callback_button("⚙️ Параметры модели", f"admin_ai_models_{provider}")],
+        [callback_button("◀️ Назад", "admin_ai_keys")],
+    ]
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"<b>💬 Основной чат</b>\n\nПровайдер: <b>{html.escape(provider)}</b>\nМодель: <code>{html.escape(model)}</code>",
+        attachments=inline_keyboard(rows),
+    )
+
+
+async def show_audio(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    provider = config.transcription_provider or "выключено"
+    model = _transcription_model(config, provider) if provider != "выключено" else "не выбрана"
+    rows = [
+        [callback_button("🏢 Выбрать провайдера", "admin_ai_select_transcription_provider")],
+        [callback_button("🤖 Выбрать модель", "admin_ai_audio_model")],
+        [callback_button("⏱️ Лимит аудио", "admin_ai_set_audio_limit")],
+        [callback_button("◀️ Назад", "admin_ai_keys")],
+    ]
+    await client.send_message(chat_id=chat_id, text=f"<b>🎙 Аудио</b>\n\nПровайдер: <b>{html.escape(provider)}</b>\nМодель: <code>{html.escape(model or 'не выбрана')}</code>\nЛимит: <b>{config.max_voice_duration_sec} сек.</b>", attachments=inline_keyboard(rows))
+
+
+async def show_vision(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    rows = [
+        [callback_button("🏢 Выбрать провайдера", "admin_ai_select_vision_provider")],
+        [callback_button("🤖 Выбрать модель", "admin_ai_vision_models")],
+        [callback_button("🛡 Vision резерв", "admin_ai_vision_fallback")],
+        [callback_button("◀️ Назад", "admin_ai_keys")],
+    ]
+    await client.send_message(chat_id=chat_id, text=f"<b>🖼 Vision</b>\n\nПровайдер: <b>{html.escape(config.vision_provider or 'не выбран')}</b>\nМодель: <code>{html.escape(config.vision_model or 'не выбрана')}</code>", attachments=inline_keyboard(rows))
+
+
+async def show_image_generation(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    rows = [
+        [callback_button("❌ Выключить" if config.allow_image_generation else "✅ Включить", "admin_ai_image_generation_toggle")],
+        [callback_button("🏢 Выбрать провайдера", "admin_ai_select_image_generation_provider")],
+        [callback_button("🤖 Выбрать модель", "admin_ai_image_generation_models")],
+        [callback_button("◀️ Назад", "admin_ai_keys")],
+    ]
+    await client.send_message(chat_id=chat_id, text=f"<b>🎨 Генерация изображений</b>\n\nСтатус: <b>{'Включена' if config.allow_image_generation else 'Выключена'}</b>\nПровайдер: <b>{html.escape(config.image_generation_provider or 'не выбран')}</b>\nМодель: <code>{html.escape(config.image_generation_model or 'не выбрана')}</code>", attachments=inline_keyboard(rows))
+
+
+async def show_image_edit(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    rows = [
+        [callback_button("❌ Выключить" if config.allow_image_edit else "✅ Включить", "admin_ai_image_edit_toggle")],
+        [callback_button("🏢 Выбрать провайдера", "admin_ai_select_image_edit_provider")],
+        [callback_button("🤖 Выбрать модель", "admin_ai_image_edit_models")],
+        [callback_button("◀️ Назад", "admin_ai_keys")],
+    ]
+    await client.send_message(chat_id=chat_id, text=f"<b>✏️ Редактирование изображений</b>\n\nСтатус: <b>{'Включено' if config.allow_image_edit else 'Выключено'}</b>\nПровайдер: <b>{html.escape(config.image_edit_provider or 'не выбран')}</b>\nМодель: <code>{html.escape(config.image_edit_model or 'не выбрана')}</code>", attachments=inline_keyboard(rows))
+
+
+async def show_common(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    rows = [
+        [callback_button("📌 Первые", "admin_ai_set_context_first"), callback_button("🔄 Последние", "admin_ai_set_context_recent")],
+        [callback_button("🧠 Память", "admin_ai_cycle_memory_scope"), callback_button("⏱️ Таймаут ИИ", "admin_ai_set_timeout")],
+        [callback_button("💳 Порог KIE", "admin_ai_set_kie_threshold")],
+        [callback_button("◀️ Назад", "admin_ai_keys")],
+    ]
+    await client.send_message(chat_id=chat_id, text=f"<b>⚙️ Общие настройки</b>\n\nПервые сообщения: <b>{config.context_limit_first}</b>\nПоследние сообщения: <b>{config.context_limit_recent}</b>\nПамять: <b>{memory_mode_label(normalize_memory_mode(config))}</b>\nТаймаут ИИ: <b>{getattr(config, 'fallback_timeout', 60)} сек.</b>", attachments=inline_keyboard(rows))
+
+
+async def show_main_chat_provider_picker(client: MaxApiClient, chat_id: int) -> None:
+    rows = [[callback_button(provider, f"admin_ai_main_chat_set_provider_{provider}")] for provider in get_capability_providers("chat")]
+    rows.append([callback_button("◀️ Назад", "admin_ai_main_chat")])
+    await client.send_message(chat_id=chat_id, text="Выберите провайдера основного чата.", attachments=inline_keyboard(rows))
+
+
+async def show_main_chat_model(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    provider, current_model = _active_chat_scope(config)
+    models = list(get_selectable_models(provider, channel="chat"))
+    rows = [
+        [callback_button(f"✅ {model}" if model == current_model else model, f"admin_ai_main_chat_set_model_{provider}_{model}")]
+        for model in models
+    ]
+    rows.append([callback_button("◀️ Назад", "admin_ai_main_chat")])
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"Выберите модель основного чата ({html.escape(provider)}):",
+        attachments=inline_keyboard(rows),
+    )
+
+
+async def set_main_chat_model(client: MaxApiClient, chat_id: int, provider: str, model: str) -> None:
+    provider = canonical_provider_name(provider)
+    try:
+        normalized = validate_model_selection(provider, model, channel="chat")
+    except ModelUnavailableError:
+        await _reject_model_selection(client, chat_id)
+        return
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        active_provider, _ = _active_chat_scope(config)
+        if active_provider != provider:
+            await client.send_message(chat_id=chat_id, text="Провайдер основного чата изменился. Откройте выбор модели заново.")
+            return
+        field = MODEL_FIELDS.get(provider) or f"{provider.lower()}_model"
+        setattr(config, field, normalized)
+        await session.commit()
+    await show_main_chat(client, chat_id)
+
+
+async def set_main_chat_provider(client: MaxApiClient, chat_id: int, provider: str) -> None:
+    provider = canonical_provider_name(provider)
+    if provider not in get_capability_providers("chat"):
+        await client.send_message(chat_id=chat_id, text="Провайдер недоступен.")
+        return
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        config.provider = provider
+        field = MODEL_FIELDS.get(provider) or f"{provider.lower()}_model"
+        if not getattr(config, field, None):
+            setattr(config, field, get_default_model(provider, channel="chat"))
+        await session.commit()
+    await show_main_chat(client, chat_id)
+
+
+async def show_audio_model(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    provider = config.transcription_provider
+    if not provider or provider == "None":
+        await show_capability_providers(client, chat_id, "transcription", back_callback="admin_ai_audio")
+        return
+    await show_channel_models(client, chat_id, provider, "transcription", back_callback="admin_ai_audio")
+
+
+async def toggle_image_generation_screen(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        config.allow_image_generation = not bool(config.allow_image_generation)
+        await session.commit()
+    await show_image_generation(client, chat_id)
+
+
+async def toggle_image_edit_screen(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        config.allow_image_edit = not bool(config.allow_image_edit)
+        await session.commit()
+    await show_image_edit(client, chat_id)
+
+
+async def show_capability_providers(client: MaxApiClient, chat_id: int, channel: str, *, back_callback: str = "admin_ai_keys") -> None:
     labels = {
         "transcription": "Выберите провайдера распознавания голосовых:",
         "vision": "Выберите провайдера анализа фото:",
@@ -277,7 +432,7 @@ async def show_capability_providers(client: MaxApiClient, chat_id: int, channel:
     rows = [[callback_button(provider, f"admin_ai_choose_capability_{channel}_{provider}")] for provider in get_capability_providers(channel)]
     if channel in {"transcription", "image_gen", "image_edit"}:
         rows.append([callback_button("Выкл", f"admin_ai_choose_capability_{channel}_None")])
-    rows.append([callback_button("⬅️ Назад", "admin_ai_keys")])
+    rows.append([callback_button("⬅️ Назад", back_callback)])
     await client.send_message(chat_id=chat_id, text=labels.get(channel, "Выберите провайдера:"), attachments=inline_keyboard(rows))
 
 
@@ -319,16 +474,27 @@ async def choose_capability_provider(client: MaxApiClient, chat_id: int, channel
             config.image_edit_provider = provider
             config.image_edit_model = model
         await session.commit()
-    await show_models(client, chat_id, provider) if channel == "chat" else await show_channel_models(client, chat_id, provider, channel)
+    await show_models(client, chat_id, provider) if channel == "chat" else await show_channel_models(
+        client,
+        chat_id,
+        provider,
+        channel,
+        back_callback={
+            "transcription": "admin_ai_audio",
+            "vision": "admin_ai_vision",
+            "image_gen": "admin_ai_image_generation",
+            "image_edit": "admin_ai_image_edit",
+        }.get(channel, "admin_ai_keys"),
+    )
 
 
-async def show_channel_models(client: MaxApiClient, chat_id: int, provider: str, channel: str) -> None:
+async def show_channel_models(client: MaxApiClient, chat_id: int, provider: str, channel: str, *, back_callback: str = "admin_ai_keys") -> None:
     models = list(get_selectable_models(provider, channel=channel))
     current = ""
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
         if channel == "transcription":
-            current = getattr(config, "deepgram_model", None) if provider == PROVIDER_DEEPGRAM else getattr(config, "kie_transcription_model", None)
+            current = _transcription_model(config, provider)
         elif channel == "vision":
             current = config.vision_model
         elif channel == "image_gen":
@@ -336,7 +502,7 @@ async def show_channel_models(client: MaxApiClient, chat_id: int, provider: str,
         elif channel == "image_edit":
             current = config.image_edit_model
     rows = [[callback_button(f"✅ {m}" if m == current else m, f"admin_ai_set_channel_model_{channel}_{provider}_{m}")] for m in models]
-    rows.append([callback_button("⬅️ Назад", "admin_ai_keys")])
+    rows.append([callback_button("⬅️ Назад", back_callback)])
     await client.send_message(chat_id=chat_id, text=f"Выберите модель для {provider}:", attachments=inline_keyboard(rows))
 
 
@@ -364,16 +530,29 @@ async def set_channel_model(client: MaxApiClient, chat_id: int, channel: str, pr
             config.image_edit_provider = provider
             config.image_edit_model = normalized
         await session.commit()
-    await show_keys(client, chat_id)
+    if channel == "transcription":
+        await show_audio(client, chat_id)
+    elif channel == "vision":
+        await show_vision(client, chat_id)
+    elif channel == "image_gen":
+        await show_image_generation(client, chat_id)
+    elif channel == "image_edit":
+        await show_image_edit(client, chat_id)
+    else:
+        await show_keys(client, chat_id)
 
 
 def _active_chat_scope(config: AIConfig) -> tuple[str, str]:
-    provider = canonical_provider_name(config.provider)
-    field = MODEL_FIELDS.get(provider) or f"{provider.lower()}_model"
+    return _provider_scope(config, config.provider, channel="chat")
+
+
+def _provider_scope(config: AIConfig, provider: str | None, *, channel: str = "chat") -> tuple[str, str]:
+    normalized_provider = canonical_provider_name(provider)
+    field = MODEL_FIELDS.get(normalized_provider) or f"{normalized_provider.lower()}_model"
     model = getattr(config, field, None)
     if not model:
-        model = get_default_model(provider, channel="chat")
-    return provider, model
+        model = get_default_model(normalized_provider, channel=channel)
+    return normalized_provider, model
 
 
 def _reasoning_label(value: str) -> str:
@@ -386,11 +565,24 @@ def _reasoning_label(value: str) -> str:
     }.get(value, "Авто")
 
 
-async def show_model_settings(client: MaxApiClient, chat_id: int) -> None:
+async def show_provider_settings(client: MaxApiClient, chat_id: int, provider: str) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        provider, model = _active_chat_scope(config)
-        settings = await resolve_model_settings(session, provider, model, "chat", config=config)
+        provider, model = _provider_scope(config, provider, channel="transcription" if provider == PROVIDER_DEEPGRAM else "chat")
+        settings = await resolve_model_settings(session, provider, model, "chat", config=config) if provider != PROVIDER_DEEPGRAM else None
+    if provider == PROVIDER_DEEPGRAM:
+        text = (
+            "<b>Deepgram</b>\n\n"
+            f"Модель: <code>{html.escape(model)}</code>\n"
+            "Распознавание голосовых"
+        )
+        rows = [
+            [callback_button("🤖 Выбрать модель", f"admin_ai_provider_models_{provider}")],
+            [callback_button("🔑 API-ключ", f"admin_ai_model_key_{provider}")],
+            [callback_button("⬅️ Назад", "admin_ai_keys")],
+        ]
+        await client.send_message(chat_id=chat_id, text=text, attachments=inline_keyboard(rows))
+        return
     caps = get_generation_capabilities(provider, model, "chat")
     max_label = "Авто" if settings.max_output_tokens is None else str(settings.max_output_tokens)
     text = (
@@ -404,31 +596,47 @@ async def show_model_settings(client: MaxApiClient, chat_id: int) -> None:
     if caps.temperature or provider == PROVIDER_DEEPSEEK:
         temp = "не применяется" if provider == PROVIDER_DEEPSEEK and settings.reasoning_effort != REASONING_NONE else ("Авто" if settings.temperature is None else str(settings.temperature))
         text += f"🌡 Temperature: <b>{temp}</b>\n"
-    rows = [
-        [callback_button("📏 Max tokens", "admin_ai_model_max_tokens")],
-    ]
+    if provider == PROVIDER_DEEPSEEK:
+        text += f"🌍 Proxy: <b>{'Включён' if getattr(config, 'use_proxy', True) else 'Выключен'}</b>\n"
+    rows = [[callback_button("📏 Max tokens", f"admin_ai_model_max_tokens_{provider}")]]
     if caps.reasoning_effort:
-        rows.append([callback_button("🧠 Reasoning", "admin_ai_model_reasoning")])
+        rows.append([callback_button("🧠 Reasoning", f"admin_ai_model_reasoning_{provider}")])
     if caps.temperature and (provider != PROVIDER_DEEPSEEK or settings.reasoning_effort == REASONING_NONE):
-        rows.append([callback_button("🌡 Temperature", "admin_ai_model_temperature")])
+        rows.append([callback_button("🌡 Temperature", f"admin_ai_model_temperature_{provider}")])
+    if provider == PROVIDER_DEEPSEEK:
+        rows.append([callback_button("🌍 Proxy", "admin_ai_deepseek_proxy")])
     rows.extend([
-        [callback_button("🤖 Выбрать модель", "admin_ai_model_choices")],
-        [callback_button("🔑 API-ключ", "admin_ai_model_key")],
+        [callback_button("🤖 Выбрать модель", f"admin_ai_provider_models_{provider}")],
+        [callback_button("🔑 API-ключ", f"admin_ai_model_key_{provider}")],
         [callback_button("⬅️ Назад", "admin_ai_keys")],
     ])
     await client.send_message(chat_id=chat_id, text=text, attachments=inline_keyboard(rows))
 
 
-async def show_model_reasoning(client: MaxApiClient, chat_id: int) -> None:
-    rows = [[callback_button(label, f"admin_ai_reasoning_{value}")] for value, label in (("auto", "Авто"), ("none", "Выкл"), ("low", "Low"), ("high", "High"), ("max", "Max"))]
-    rows.append([callback_button("⬅️ Назад", "admin_ai_model_settings")])
+async def toggle_deepseek_proxy(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        config.use_proxy = not bool(getattr(config, "use_proxy", True))
+        await session.commit()
+    await show_provider_settings(client, chat_id, PROVIDER_DEEPSEEK)
+
+
+async def show_model_settings(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    await show_provider_settings(client, chat_id, _active_chat_scope(config)[0])
+
+
+async def show_model_reasoning(client: MaxApiClient, chat_id: int, provider: str | None = None) -> None:
+    provider = canonical_provider_name(provider or (await _get_config()).provider)
+    rows = [[callback_button(label, f"admin_ai_reasoning_{provider}_{value}")] for value, label in (("auto", "Авто"), ("none", "Выкл"), ("low", "Low"), ("high", "High"), ("max", "Max"))]
+    rows.append([callback_button("⬅️ Назад", f"admin_ai_models_{provider}")])
     await client.send_message(chat_id=chat_id, text="<b>Reasoning DeepSeek</b>", attachments=inline_keyboard(rows))
 
 
-async def save_model_reasoning(client: MaxApiClient, chat_id: int, value: str) -> None:
+async def save_model_reasoning(client: MaxApiClient, chat_id: int, value: str, provider: str | None = None) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        provider, model = _active_chat_scope(config)
+        provider, model = _provider_scope(config, provider or config.provider)
         try:
             value = validate_model_setting(provider, model, "reasoning_effort", value)
         except ValueError as exc:
@@ -437,12 +645,12 @@ async def save_model_reasoning(client: MaxApiClient, chat_id: int, value: str) -
         row = await get_or_create_model_settings(session, provider, model, "chat", config=config)
         row.reasoning_effort = value
         await session.commit()
-    await show_model_settings(client, chat_id)
+    await show_provider_settings(client, chat_id, provider)
 
 
-async def start_model_max_tokens(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+async def start_model_max_tokens(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, provider: str | None = None) -> None:
     config = await _get_config()
-    provider, model = _active_chat_scope(config)
+    provider, model = _provider_scope(config, provider or config.provider)
     await states.set(user_id, chat_id, "admin_ai_model_max_tokens", {"provider": provider, "model": model})
     await client.send_message(chat_id=chat_id, text="Введите число от 1 до лимита модели или «Авто».")
 
@@ -465,12 +673,12 @@ async def save_model_max_tokens(client: MaxApiClient, states: StateStore, chat_i
         row.max_output_tokens = value
         await session.commit()
     await states.clear(user_id)
-    await show_model_settings(client, chat_id)
+    await show_provider_settings(client, chat_id, provider)
 
 
-async def start_model_temperature(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+async def start_model_temperature(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, provider: str | None = None) -> None:
     config = await _get_config()
-    provider, model = _active_chat_scope(config)
+    provider, model = _provider_scope(config, provider or config.provider)
     async with async_session_maker() as session:
         settings = await resolve_model_settings(session, provider, model, "chat", config=config)
     if provider == PROVIDER_DEEPSEEK and settings.reasoning_effort != REASONING_NONE:
@@ -497,7 +705,7 @@ async def save_model_temperature(client: MaxApiClient, states: StateStore, chat_
         row.temperature = value
         await session.commit()
     await states.clear(user_id)
-    await show_model_settings(client, chat_id)
+    await show_provider_settings(client, chat_id, provider)
 
 
 async def start_set_key(
@@ -516,8 +724,12 @@ async def start_set_key(
     data = {"field": field, "provider": provider}
     if return_to_model_settings:
         config = await _get_config()
-        active_provider, active_model = _active_chat_scope(config)
-        data.update({"model_settings": True, "provider": active_provider, "model": active_model})
+        scoped_provider, scoped_model = _provider_scope(
+            config,
+            provider,
+            channel="transcription" if provider == PROVIDER_DEEPGRAM else "chat",
+        )
+        data.update({"model_settings": True, "provider": scoped_provider, "model": scoped_model})
     await states.set(user_id, chat_id, "admin_ai_set_key", data)
     await client.send_message(chat_id=chat_id, text=f"Введите новый API key для {provider}.")
 
@@ -535,13 +747,14 @@ async def save_key(client: MaxApiClient, states: StateStore, chat_id: int, user_
     model_settings = bool(snapshot.data.get("model_settings")) if snapshot else False
     await states.clear(user_id)
     if model_settings:
-        await show_model_settings(client, chat_id)
+        await show_provider_settings(client, chat_id, snapshot.data.get("provider") or "Deepseek")
     else:
         await show_keys(client, chat_id)
 
 
 async def show_models(client: MaxApiClient, chat_id: int, provider: str) -> None:
     config = await _get_config()
+    provider = canonical_provider_name(provider)
     field = MODEL_FIELDS.get(provider)
     channel = "transcription" if canonical_provider_name(provider) == PROVIDER_DEEPGRAM else "chat"
     models = list(get_selectable_models(provider, channel=channel))
@@ -549,7 +762,7 @@ async def show_models(client: MaxApiClient, chat_id: int, provider: str) -> None
     await client.send_message(
         chat_id=chat_id,
         text=f"Выберите модель для {provider}.",
-        attachments=admin_ai_model_selection_keyboard(provider, current_model or "", models),
+        attachments=admin_ai_model_selection_keyboard(provider, current_model or "", models, back_callback=f"admin_ai_models_{provider}"),
     )
 
 
@@ -571,7 +784,7 @@ async def set_model(client: MaxApiClient, chat_id: int, provider: str, model_nam
         if provider == PROVIDER_DEEPGRAM:
             config.transcription_provider = PROVIDER_DEEPGRAM
         await session.commit()
-    await show_model_settings(client, chat_id) if channel == "chat" else await show_keys(client, chat_id)
+    await show_provider_settings(client, chat_id, provider) if channel == "chat" else await show_provider_settings(client, chat_id, provider)
 
 
 async def toggle_transcription(client: MaxApiClient, chat_id: int) -> None:
@@ -614,7 +827,7 @@ async def set_vision_model(
         config.vision_provider = intended_provider
         config.vision_model = normalized_model
         await session.commit()
-    await show_keys(client, chat_id)
+    await show_vision(client, chat_id)
 
 
 async def start_set_int(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, state_name: str, field: str, prompt: str) -> None:
@@ -640,7 +853,7 @@ async def save_int(client: MaxApiClient, states: StateStore, chat_id: int, user_
         setattr(config, field, value)
         await session.commit()
     await states.clear(user_id)
-    await show_keys(client, chat_id)
+    await show_common(client, chat_id) if field in {"context_limit_first", "context_limit_recent", "fallback_timeout"} else await show_keys(client, chat_id)
 
 
 async def start_set_temperature(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
@@ -779,7 +992,7 @@ async def set_image_generation_model(
         config.image_generation_provider = intended_provider
         config.image_generation_model = normalized_model
         await session.commit()
-    await show_keys(client, chat_id)
+    await show_image_generation(client, chat_id)
 
 
 async def show_image_edit_models(client: MaxApiClient, chat_id: int) -> None:
@@ -819,15 +1032,36 @@ async def set_image_edit_model(
         config.image_edit_provider = intended_provider
         config.image_edit_model = normalized_model
         await session.commit()
-    await show_keys(client, chat_id)
+    await show_image_edit(client, chat_id)
+
+
+async def show_fallback_screen(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    provider = config.fallback_provider or "не выбран"
+    model = config.fallback_model or "не выбрана"
+    status = "Включён" if config.allow_fallback else "Выключен"
+    rows = [
+        [callback_button("❌ Выключить" if config.allow_fallback else "✅ Включить", "admin_ai_fallback_toggle")],
+        [callback_button("🏢 Выбрать провайдера", "admin_ai_fallback_provider")],
+        [callback_button("🤖 Выбрать модель", "admin_ai_fallback_model")],
+        [callback_button("⬅️ Назад", "admin_ai_keys")],
+    ]
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"<b>🔄 Резерв текста</b>\n\nСтатус: <b>{status}</b>\nПровайдер: <b>{html.escape(provider)}</b>\nМодель: <code>{html.escape(model)}</code>",
+        attachments=inline_keyboard(rows),
+    )
 
 
 async def toggle_fallback(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
+        if not config.allow_fallback and not config.fallback_provider:
+            await show_fallback_models(client, chat_id)
+            return
         config.allow_fallback = not bool(config.allow_fallback)
         await session.commit()
-    await show_keys(client, chat_id)
+    await show_fallback_screen(client, chat_id)
 
 
 async def show_fallback_models(client: MaxApiClient, chat_id: int) -> None:
@@ -837,7 +1071,7 @@ async def show_fallback_models(client: MaxApiClient, chat_id: int) -> None:
         [callback_button(f"{'✅ ' if p == current_provider else ''}{p}", f"admin_ai_set_fallback_provider_{p}")]
         for p in FALLBACK_PROVIDERS
     ]
-    rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
+    rows.append([callback_button("◀️ Назад", "admin_ai_text_fallback")])
     await client.send_message(
         chat_id=chat_id,
         text="Выберите провайдер фолбэка.",
@@ -861,7 +1095,7 @@ async def set_fallback_provider(client: MaxApiClient, chat_id: int, provider: st
         current_model = config.fallback_model
     models = list(get_selectable_models(provider, channel="fallback"))
     rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
-    rows.append([callback_button("◀️ Назад", "admin_ai_fallback_models")])
+    rows.append([callback_button("◀️ Назад", "admin_ai_text_fallback")])
     await client.send_message(
         chat_id=chat_id,
         text=f"Выберите модель фолбэка для {provider}.",
@@ -881,15 +1115,48 @@ async def save_fallback_model(client: MaxApiClient, chat_id: int, provider: str,
         config.fallback_provider = provider
         config.fallback_model = normalized_model
         await session.commit()
-    await show_keys(client, chat_id)
+    await show_fallback_screen(client, chat_id)
+
+
+async def show_fallback_model(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    provider = config.fallback_provider
+    if not provider:
+        await show_fallback_models(client, chat_id)
+        return
+    models = list(get_selectable_models(provider, channel="fallback"))
+    rows = [[callback_button(f"{'✅ ' if m == config.fallback_model else ''}{m}", f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
+    rows.append([callback_button("◀️ Назад", "admin_ai_text_fallback")])
+    await client.send_message(chat_id=chat_id, text=f"Выберите модель резерва текста для {provider}.", attachments=inline_keyboard(rows))
 
 
 async def toggle_vision_fallback(client: MaxApiClient, chat_id: int) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
+        if not config.allow_vision_fallback and not config.vision_fallback_provider:
+            await show_vision_fallback_models(client, chat_id)
+            return
         config.allow_vision_fallback = not bool(config.allow_vision_fallback)
         await session.commit()
-    await show_keys(client, chat_id)
+    await show_vision_fallback_screen(client, chat_id)
+
+
+async def show_vision_fallback_screen(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    provider = config.vision_fallback_provider or "не выбран"
+    model = config.vision_fallback_model or "не выбрана"
+    status = "Включён" if config.allow_vision_fallback else "Выключен"
+    rows = [
+        [callback_button("❌ Выключить" if config.allow_vision_fallback else "✅ Включить", "admin_ai_vision_fallback_toggle")],
+        [callback_button("🏢 Выбрать провайдера", "admin_ai_vision_fallback_provider")],
+        [callback_button("🤖 Выбрать модель", "admin_ai_vision_fallback_model")],
+        [callback_button("⬅️ Назад", "admin_ai_keys")],
+    ]
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"<b>🛡 Vision резерв</b>\n\nСтатус: <b>{status}</b>\nПровайдер: <b>{html.escape(provider)}</b>\nМодель: <code>{html.escape(model)}</code>",
+        attachments=inline_keyboard(rows),
+    )
 
 
 async def show_vision_fallback_models(client: MaxApiClient, chat_id: int) -> None:
@@ -899,7 +1166,7 @@ async def show_vision_fallback_models(client: MaxApiClient, chat_id: int) -> Non
         [callback_button(f"{'✅ ' if p == current_provider else ''}{p}", f"admin_ai_set_vision_fallback_provider_{p}")]
         for p in VISION_FALLBACK_PROVIDERS
     ]
-    rows.append([callback_button("◀️ Назад", "admin_ai_keys")])
+    rows.append([callback_button("◀️ Назад", "admin_ai_vision_fallback")])
     await client.send_message(
         chat_id=chat_id,
         text="Выберите провайдер фолбэка для Vision.",
@@ -923,7 +1190,7 @@ async def set_vision_fallback_provider(client: MaxApiClient, chat_id: int, provi
         current_model = config.vision_fallback_model
     models = list(get_selectable_models(provider, channel="vision_fallback"))
     rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_save_vision_fallback_{provider}_{m}")] for m in models]
-    rows.append([callback_button("◀️ Назад", "admin_ai_vision_fallback_models")])
+    rows.append([callback_button("◀️ Назад", "admin_ai_vision_fallback")])
     await client.send_message(
         chat_id=chat_id,
         text=f"Выберите модель фолбэка Vision для {provider}.",
@@ -943,7 +1210,19 @@ async def save_vision_fallback_model(client: MaxApiClient, chat_id: int, provide
         config.vision_fallback_provider = provider
         config.vision_fallback_model = normalized_model
         await session.commit()
-    await show_keys(client, chat_id)
+    await show_vision_fallback_screen(client, chat_id)
+
+
+async def show_vision_fallback_model(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    provider = config.vision_fallback_provider
+    if not provider:
+        await show_vision_fallback_models(client, chat_id)
+        return
+    models = list(get_selectable_models(provider, channel="vision_fallback"))
+    rows = [[callback_button(f"{'✅ ' if m == config.vision_fallback_model else ''}{m}", f"admin_ai_save_vision_fallback_{provider}_{m}")] for m in models]
+    rows.append([callback_button("◀️ Назад", "admin_ai_vision_fallback")])
+    await client.send_message(chat_id=chat_id, text=f"Выберите модель Vision резерва для {provider}.", attachments=inline_keyboard(rows))
 
 
 async def cancel_prompt_input(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:

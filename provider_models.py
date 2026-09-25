@@ -291,6 +291,7 @@ SELECTABLE_TRANSCRIPTION_MODELS: dict[str, tuple[str, ...]] = {
 
 CAPABILITY_PROVIDERS: dict[str, tuple[str, ...]] = {
     "chat": tuple(SELECTABLE_CHAT_MODELS),
+    "fallback": tuple(SELECTABLE_FALLBACK_MODELS),
     "transcription": tuple(SELECTABLE_TRANSCRIPTION_MODELS),
     "vision": tuple(SELECTABLE_VISION_MODELS),
     "vision_fallback": tuple(SELECTABLE_VISION_MODELS),

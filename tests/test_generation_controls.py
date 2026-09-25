@@ -129,11 +129,11 @@ def test_admin_exposes_deepseek_thinking_only_for_deepseek():
     deepgram_markup = keyboards.ai_keys_models_keyboard(current_provider="OpenRouter", **deepgram_common)
     deepgram_labels = [button.text for row in deepgram_markup.inline_keyboard for button in row]
     assert any("Deepgram" in label for label in deepgram_labels)
-    choice_markup = keyboards.model_reasoning_keyboard()
+    choice_markup = keyboards.model_reasoning_keyboard("Deepseek")
     choices = {button.text: button.callback_data for row in choice_markup.inline_keyboard for button in row}
-    assert choices["Авто"] == "model_reasoning_auto"
-    assert choices["Выкл"] == "model_reasoning_none"
-    assert choices["Max"] == "model_reasoning_max"
+    assert choices["Авто"] == "model_reasoning_Deepseek_auto"
+    assert choices["Выкл"] == "model_reasoning_Deepseek_none"
+    assert choices["Max"] == "model_reasoning_Deepseek_max"
 
 
 @pytest.mark.asyncio
