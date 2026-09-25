@@ -426,3 +426,22 @@ async def test_telegram_capability_model_choice_uses_same_stable_callback(
             assert (config.image_edit_provider, config.image_edit_model) == (provider, model)
 
     callback.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_non_active_chat_model_selection_returns_to_provider_list(settings_db, monkeypatch):
+    callback = SimpleNamespace(
+        data=build_telegram_model_callback_data(PROVIDER_OPENAI, "chat", "gpt-5.6-terra"),
+        message=SimpleNamespace(edit_text=AsyncMock()),
+        answer=AsyncMock(),
+    )
+    monkeypatch.setattr(handlers, "async_session_maker", settings_db)
+    model_card = AsyncMock()
+    provider_list = AsyncMock()
+    monkeypatch.setattr(handlers, "_render_active_model_settings", model_card)
+    monkeypatch.setattr(handlers, "admin_ai_keys_models", provider_list)
+
+    await handlers.handle_compact_model_callback(callback)
+
+    model_card.assert_not_awaited()
+    provider_list.assert_awaited_once_with(callback)
