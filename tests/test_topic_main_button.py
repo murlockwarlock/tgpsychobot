@@ -76,6 +76,11 @@ async def db_session(tmp_path, monkeypatch):
     try:
         yield sessions
     finally:
+        pending_tasks = list(handlers.user_processing_tasks.values())
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         handlers.user_message_buffers.clear()
         handlers.user_processing_tasks.clear()
         handlers._ai_button_claims.clear()

@@ -57,6 +57,51 @@ def _max_buttons(attachments):
     ]
 
 
+def _classify_max_callback(payload):
+    navigation = (
+        "admin_panel",
+        "admin_ai_settings",
+        "admin_ai_keys",
+        "admin_ai_model_settings",
+        "admin_ai_model_reasoning",
+        "admin_ai_model_max_tokens",
+        "admin_ai_model_temperature",
+        "admin_ai_model_key",
+        "admin_ai_model_choices",
+        "admin_ai_select_",
+        "admin_ai_models_",
+        "admin_ai_vision_fallback_models",
+        "admin_ai_choose_capability_",
+        "admin_ai_set_channel_model_",
+        "admin_ai_set_model_",
+        "admin_ai_reasoning_",
+        "admin_ai_cancel_",
+    )
+    mutation = (
+        "admin_ai_key_",
+        "admin_ai_set_kie_",
+        "admin_ai_toggle_",
+        "admin_ai_set_context_",
+        "admin_ai_set_audio_limit",
+        "admin_ai_cycle_memory_scope",
+        "admin_ai_image_generation_models",
+        "admin_ai_image_edit_models",
+        "admin_ai_vision_models",
+        "admin_ai_fallback_models",
+        "admin_ai_set_fallback_provider_",
+        "admin_ai_save_fallback_",
+        "admin_ai_set_vision_model_",
+        "admin_ai_set_image_gen_model_",
+        "admin_ai_set_image_edit_model_",
+        "admin_ai_set_vision_fallback_provider_",
+        "admin_ai_save_vision_fallback_",
+        "admin_ai_vision_fallback_models",
+    )
+    if payload.startswith(navigation) or payload.startswith(mutation):
+        return "mutation" if payload.startswith(mutation) else "navigation"
+    raise AssertionError(f"unclassified changed MAX AI callback: {payload}")
+
+
 def _validate_max_payload(path, json_data):
     if path in {"/messages", "/answers"} and json_data is not None:
         assert isinstance(json_data, dict)
@@ -148,6 +193,8 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
     rows = keys["attachments"][0]["payload"]["buttons"]
     assert all(len(row) == 2 for row in rows[:4])
     assert all(len(row) == 2 for row in rows[5:9])
+    for button in key_buttons:
+        _classify_max_callback(button["payload"])
 
     for button in key_buttons_only:
         prompt = await press(button["payload"], keys.get("attachments", []))
@@ -159,6 +206,8 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
         model_screen = await press(button["payload"], keys.get("attachments", []))
         choices = _max_buttons(model_screen.get("attachments"))
         assert choices, button["payload"]
+        for choice in choices:
+            _classify_max_callback(choice["payload"])
         selected = await press(choices[0]["payload"], model_screen.get("attachments", []))
         assert isinstance(selected["text"], str)
         keys = await press("admin_ai_keys", selected.get("attachments", []))
@@ -176,6 +225,8 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
             for button in _max_buttons(picker.get("attachments"))
             if button["payload"].startswith("admin_ai_choose_capability_")
         ]
+        for provider_button in providers:
+            _classify_max_callback(provider_button["payload"])
         expected = set(get_capability_providers(channel))
         assert expected <= {button["payload"].rsplit("_", 1)[-1] for button in providers}
         for provider_button in providers:
@@ -185,6 +236,8 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
                 assert "Провайдеры и модели" in keys["text"]
                 continue
             model_choice = _max_buttons(chosen.get("attachments"))[0]
+            for choice in _max_buttons(chosen.get("attachments")):
+                _classify_max_callback(choice["payload"])
             keys = await press(model_choice["payload"], chosen.get("attachments", []))
             assert "Провайдеры и модели" in keys["text"], (channel, provider_button["payload"], model_choice["payload"])
             picker = await press(picker_payload, keys.get("attachments", []))
@@ -192,14 +245,22 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
     await press("admin_ai_toggle_vision_fallback", keys.get("attachments", []))
     fallback_picker = await press("admin_ai_vision_fallback_models", keys.get("attachments", []))
     fallback_provider = _max_buttons(fallback_picker.get("attachments"))[0]
+    for button in _max_buttons(fallback_picker.get("attachments")):
+        _classify_max_callback(button["payload"])
     fallback_models = await press(fallback_provider["payload"], fallback_picker.get("attachments", []))
     fallback_model = _max_buttons(fallback_models.get("attachments"))[0]
+    for button in _max_buttons(fallback_models.get("attachments")):
+        _classify_max_callback(button["payload"])
     keys = await press(fallback_model["payload"], fallback_models.get("attachments", []))
     assert "Vision" in keys["text"]
 
     model_settings = await press("admin_ai_model_settings", keys.get("attachments", []))
     assert "Max tokens" in model_settings["text"]
+    for button in _max_buttons(model_settings.get("attachments")):
+        _classify_max_callback(button["payload"])
     reasoning = await press("admin_ai_model_reasoning", model_settings.get("attachments", []))
+    for button in _max_buttons(reasoning.get("attachments")):
+        _classify_max_callback(button["payload"])
     max_button = next(button for button in _max_buttons(reasoning.get("attachments")) if button["payload"].endswith("max"))
     model_settings = await press(max_button["payload"], reasoning.get("attachments", []))
     assert "Reasoning: <b>Max" in model_settings["text"]

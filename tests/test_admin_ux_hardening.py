@@ -1018,6 +1018,7 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
             "model_setting_",
             "model_reasoning_",
             "cancel_state_",
+            "admin_panel",
         )
         mutation_prefixes = (
             "set_key_",
@@ -1063,6 +1064,8 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
 
     model_card_buttons = [button for button in key_buttons if button.callback_data.startswith("view_models_")]
     for card_button in model_card_buttons:
+        classify(card_button.callback_data)
+        journey_counts["classified"] += 1
         picker = await press(card_button.callback_data)
         assert buttons(picker.reply_markup)
         model_callbacks = [item.callback_data for item in buttons(picker.reply_markup) if item.callback_data.startswith("ai_m_")]
@@ -1093,6 +1096,8 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
             item.callback_data.rsplit("_", 1)[-1] for item in buttons(picker.reply_markup)
         }
         for provider_callback in provider_callbacks:
+            classify(provider_callback)
+            journey_counts["classified"] += 1
             chosen = await press(provider_callback)
             if provider_callback.endswith("_None"):
                 assert "Провайдеры и модели" in chosen.text
@@ -1100,6 +1105,7 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
             assert "Выберите модель" in chosen.text
             model_callback = next(item.callback_data for item in buttons(chosen.reply_markup) if item.callback_data.startswith("ai_m_"))
             classify(model_callback)
+            journey_counts["classified"] += 1
             returned = await press(model_callback)
             assert "Провайдеры и модели" in returned.text
             picker = await press({
@@ -1109,6 +1115,13 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
                 "image_edit": "admin_select_image_edit_provider",
             }[channel])
 
+    for callback_data in (
+        "admin_change_vision_fallback_provider",
+        "admin_change_vision_fallback_model",
+        "admin_toggle_vision_fallback",
+    ):
+        classify(callback_data)
+        journey_counts["classified"] += 1
     await press("admin_change_vision_fallback_provider")
     fallback_provider_callbacks = [
         item.callback_data
@@ -1117,9 +1130,13 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
     ]
     assert fallback_provider_callbacks
     chosen_fallback = fallback_provider_callbacks[0]
+    classify(chosen_fallback)
+    journey_counts["classified"] += 1
     await press(chosen_fallback)
     await press("admin_change_vision_fallback_model")
     fallback_model_callback = next(item.callback_data for item in buttons(current_markup) if item.callback_data.startswith("ai_m_"))
+    classify(fallback_model_callback)
+    journey_counts["classified"] += 1
     await press(fallback_model_callback)
     await press("admin_toggle_vision_fallback", expected="Провайдеры и модели")
 
@@ -1130,9 +1147,13 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
         if resolve_telegram_model_callback(item.callback_data)
         and resolve_telegram_model_callback(item.callback_data)[2] == "deepseek-flash"
     )
+    classify(flash_callback)
+    journey_counts["classified"] += 1
     await press(flash_callback, expected="Параметры модели")
     reasoning_picker = await press("model_setting_reasoning", expected="Reasoning DeepSeek")
     for value in ("auto", "none", "low", "high", "max"):
+        classify(f"model_reasoning_{value}")
+        journey_counts["classified"] += 1
         await press(f"model_reasoning_{value}", expected="Параметры модели")
         if value != "max":
             reasoning_picker = await press("model_setting_reasoning", expected="Reasoning DeepSeek")
@@ -1146,6 +1167,9 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
         )
     assert settings.reasoning_effort == "max"
 
+    for callback_data in ("model_setting_max_tokens", "model_setting_reasoning", "model_setting_temperature", "model_setting_api_key"):
+        classify(callback_data)
+        journey_counts["classified"] += 1
     await press("model_setting_max_tokens", expected="Max tokens")
     await send_text("32000")
     await press("model_setting_max_tokens", expected="Max tokens")
@@ -1157,6 +1181,9 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
     await press("model_setting_api_key", expected="API-ключ")
     api_cancel = next(item.callback_data for item in buttons(current_markup) if item.callback_data.startswith("cancel_state_"))
     await press(api_cancel, clear=False, expected="Параметры модели")
+    for callback_data in ("admin_ai_keys", "admin_ai_settings", "admin_panel"):
+        classify(callback_data)
+        journey_counts["classified"] += 1
     await press("admin_ai_keys", expected="Провайдеры и модели")
     await press("admin_ai_settings", expected="Настройки ИИ")
     await press("admin_panel", expected="Добро пожаловать в админ-панель")
