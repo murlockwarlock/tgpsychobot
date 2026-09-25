@@ -9360,6 +9360,8 @@ async def cancel_handler(callback: CallbackQuery, state: FSMContext):
         await admin_ai_settings(callback)
     elif target_menu_callback_data == "admin_ai_keys":
         await admin_ai_keys_models(callback_mock)
+    elif target_menu_callback_data == "view_active_model_settings":
+        await _render_active_model_settings(callback)
     elif target_menu_callback_data == "admin_plans":
         await admin_plans_list(callback_mock)
     elif target_menu_callback_data.startswith("admin_edit_plan_"):

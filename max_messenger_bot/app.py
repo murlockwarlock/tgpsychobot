@@ -1079,7 +1079,16 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ai_set_channel_model_"):
                 payload = data.replace("admin_ai_set_channel_model_", "", 1)
-                channel, _, remainder = payload.partition("_")
+                channel = ""
+                remainder = ""
+                for candidate in ("image_generation", "image_gen", "image_edit", "transcription", "vision"):
+                    prefix = f"{candidate}_"
+                    if payload.startswith(prefix):
+                        channel = candidate
+                        remainder = payload[len(prefix):]
+                        break
+                if not channel:
+                    channel, _, remainder = payload.partition("_")
                 provider, _, model_name = remainder.partition("_")
                 await admin_ai_service.set_channel_model(self.client, chat_id, channel, provider, model_name)
                 return
