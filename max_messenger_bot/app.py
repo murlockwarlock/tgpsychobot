@@ -438,7 +438,13 @@ class MaxBotApplication:
                 await admin_ai_service.save_int(self.client, self.states, message.chat_id, message.sender.user_id, text, minimum=0)
                 return
             if state.state == "admin_ai_set_temperature":
-                await admin_ai_service.save_temperature(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                await admin_ai_service.save_model_temperature(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "admin_ai_model_max_tokens":
+                await admin_ai_service.save_model_max_tokens(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "admin_ai_model_temperature":
+                await admin_ai_service.save_model_temperature(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
             if state.state == "admin_ai_set_system_prompt":
                 await admin_ai_service.save_system_prompt(self.client, self.states, message.chat_id, message.sender.user_id, text)
@@ -1022,6 +1028,61 @@ class MaxBotApplication:
             if data == "admin_ai_keys":
                 await admin_ai_service.show_keys(self.client, chat_id)
                 return
+            if data == "admin_ai_model_settings":
+                await admin_ai_service.show_model_settings(self.client, chat_id)
+                return
+            if data == "admin_ai_model_reasoning":
+                await admin_ai_service.show_model_reasoning(self.client, chat_id)
+                return
+            if data == "admin_ai_model_choices":
+                config = await admin_ai_service._get_config()
+                provider, _ = admin_ai_service._active_chat_scope(config)
+                await admin_ai_service.show_models(self.client, chat_id, provider)
+                return
+            if data == "admin_ai_model_key":
+                config = await admin_ai_service._get_config()
+                provider, _ = admin_ai_service._active_chat_scope(config)
+                await admin_ai_service.start_set_key(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    provider,
+                    return_to_model_settings=True,
+                )
+                return
+            if data.startswith("admin_ai_reasoning_"):
+                await admin_ai_service.save_model_reasoning(self.client, chat_id, data.replace("admin_ai_reasoning_", "", 1))
+                return
+            if data == "admin_ai_model_max_tokens":
+                await admin_ai_service.start_model_max_tokens(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_ai_model_temperature":
+                await admin_ai_service.start_model_temperature(self.client, self.states, chat_id, user_id)
+                return
+            if data == "admin_ai_select_transcription_provider":
+                await admin_ai_service.show_capability_providers(self.client, chat_id, "transcription")
+                return
+            if data == "admin_ai_select_vision_provider":
+                await admin_ai_service.show_capability_providers(self.client, chat_id, "vision")
+                return
+            if data == "admin_ai_select_image_generation_provider":
+                await admin_ai_service.show_capability_providers(self.client, chat_id, "image_gen")
+                return
+            if data == "admin_ai_select_image_edit_provider":
+                await admin_ai_service.show_capability_providers(self.client, chat_id, "image_edit")
+                return
+            if data.startswith("admin_ai_choose_capability_"):
+                payload = data.replace("admin_ai_choose_capability_", "", 1)
+                channel, _, provider = payload.rpartition("_")
+                await admin_ai_service.choose_capability_provider(self.client, chat_id, channel, provider)
+                return
+            if data.startswith("admin_ai_set_channel_model_"):
+                payload = data.replace("admin_ai_set_channel_model_", "", 1)
+                channel, _, remainder = payload.partition("_")
+                provider, _, model_name = remainder.partition("_")
+                await admin_ai_service.set_channel_model(self.client, chat_id, channel, provider, model_name)
+                return
             if data.startswith("admin_ai_key_"):
                 await admin_ai_service.start_set_key(self.client, self.states, chat_id, user_id, data.replace("admin_ai_key_", "", 1))
                 return
@@ -1037,10 +1098,10 @@ class MaxBotApplication:
                 await admin_ai_service.set_model(self.client, chat_id, provider, model_name)
                 return
             if data == "admin_ai_toggle_transcription":
-                await admin_ai_service.toggle_transcription(self.client, chat_id)
+                await admin_ai_service.show_capability_providers(self.client, chat_id, "transcription")
                 return
             if data == "admin_ai_toggle_vision":
-                await admin_ai_service.toggle_vision(self.client, chat_id)
+                await admin_ai_service.show_capability_providers(self.client, chat_id, "vision")
                 return
             if data == "admin_ai_vision_models":
                 await admin_ai_service.show_vision_models(self.client, chat_id)
@@ -1937,10 +1998,10 @@ class MaxBotApplication:
                 return
             # ── AI extras ─────────────────────────────────────────────────
             if data == "admin_ai_toggle_image_generation":
-                await admin_ai_service.toggle_image_generation(self.client, chat_id)
+                await admin_ai_service.show_capability_providers(self.client, chat_id, "image_gen")
                 return
             if data == "admin_ai_toggle_image_edit":
-                await admin_ai_service.toggle_image_edit(self.client, chat_id)
+                await admin_ai_service.show_capability_providers(self.client, chat_id, "image_edit")
                 return
             if data == "admin_ai_image_generation_models":
                 await admin_ai_service.show_image_generation_models(self.client, chat_id)

@@ -893,7 +893,7 @@ async def test_max_openai_request_payload_captured_and_sanitized(monkeypatch):
     assert parsed["provider"] == "OpenAI"
     assert parsed["endpoint"] == "https://api.openai.com/v1/chat/completions"
     assert parsed["payload"]["model"] == "gpt-5.6-terra"
-    assert parsed["payload"]["max_completion_tokens"] == 16384
+    assert "max_completion_tokens" not in parsed["payload"]
     messages = parsed["payload"]["messages"]
     assert any(m["role"] == "user" and m["content"] == "Как дела?" for m in messages)
 
@@ -947,7 +947,7 @@ async def test_max_deepseek_topic_request_payload_complete_and_sanitized(monkeyp
     assert len(session.added) == 1
     log_entry = session.added[0]
     assert log_entry.provider == "Deepseek"
-    assert log_entry.model == "deepseek-v4-flash"
+    assert log_entry.model == "deepseek-flash"
     assert log_entry.context_kind == "topic"
     assert log_entry.topic_id == 15
 
@@ -956,7 +956,7 @@ async def test_max_deepseek_topic_request_payload_complete_and_sanitized(monkeyp
     parsed = json.loads(log_entry.request_payload)
     assert parsed["provider"] == "Deepseek"
     assert parsed["endpoint"] == "https://api.deepseek.com/chat/completions"
-    assert parsed["payload"]["model"] == "deepseek-v4-flash"
+    assert parsed["payload"]["model"] == "deepseek-flash"
 
     messages = parsed["payload"]["messages"]
     # 1. Effective system/topic prompt
@@ -1216,7 +1216,7 @@ async def test_max_deepseek_fallback_legacy_alias_persists_normalized_model_and_
 
     # 1. Final provider and model correspond to DeepSeek fallback
     assert log_entry.provider == "Deepseek"
-    assert log_entry.model == "deepseek-v4-flash"
+    assert log_entry.model == "deepseek-flash"
 
     # 2. Assert payload exists first
     assert log_entry.request_payload
@@ -1226,7 +1226,7 @@ async def test_max_deepseek_fallback_legacy_alias_persists_normalized_model_and_
     assert parsed["provider"] == "Deepseek"
     assert parsed["endpoint"] == "https://api.deepseek.com/chat/completions"
     assert parsed["payload"]["model"] == log_entry.model
-    assert parsed["payload"]["model"] == "deepseek-v4-flash"
+    assert parsed["payload"]["model"] == "deepseek-flash"
     assert "gemini" not in parsed["endpoint"].lower()
     assert "gemini" not in parsed["provider"].lower()
 
@@ -1297,4 +1297,3 @@ def test_ai_log_unpopulated_request_payload_displays_unrecorded():
     file_content = handlers._build_ai_log_file_content(log_entry)
     assert "[1] FULL REQUEST PAYLOAD:\n----------------------------------------\nне зафиксирован\n" in file_content
     assert "только саммари без payload" not in file_content.split("[2] RAW RESPONSE")[0]
-

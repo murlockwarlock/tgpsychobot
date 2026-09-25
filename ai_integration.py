@@ -79,6 +79,7 @@ from provider_models import (
     ModelUnavailableError,
     ensure_model_available,
     get_default_model,
+    get_capability_providers,
     get_provider_vision_max_tokens,
     get_selectable_models,
     inspect_deepseek_response,
@@ -94,6 +95,12 @@ from provider_adapters import (
     call_openrouter,
     call_perplexity,
     normalize_provider_error_classification,
+)
+from ai_model_settings import (
+    resolve_model_settings,
+    wire_max_output_tokens,
+    wire_reasoning_effort,
+    wire_temperature,
 )
 from vision_reliability import (
     VisionExecutionContext,
@@ -839,7 +846,7 @@ async def _call_gemini_api(
     history: list,
     context: str,
     system_prompt: str,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     timeout: float = 60.0,
     request_capture: dict | None = None,
     runtime_context: str = "",
@@ -867,10 +874,10 @@ async def _call_gemini_api(
         if not contents or contents[-1]['role'] != 'user':
             raise AIResponseError("Gemini request history must end with a user message")
 
-        generation_config: dict[str, Any] = {
-            "maxOutputTokens": max_output_tokens or GEMINI_CHAT_MAX_TOKENS,
-        }
-        if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
+        generation_config: dict[str, Any] = {}
+        if max_output_tokens is not None:
+            generation_config["maxOutputTokens"] = max_output_tokens
+        if temperature is not None and not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
             generation_config["temperature"] = temperature
 
         payload = {
@@ -924,7 +931,7 @@ async def _call_kie_chat(
     history: list,
     context: str,
     system_prompt: str,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     request_capture: dict | None = None,
     runtime_context: str = "",
     *,
@@ -1274,7 +1281,7 @@ async def _call_claude_api(
     history: list,
     context: str,
     system_prompt: str,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     timeout: float = 60.0,
     request_capture: dict | None = None,
     runtime_context: str = "",
@@ -1310,7 +1317,7 @@ async def _call_claude_api(
             "system": build_anthropic_system(layout),
             "messages": claude_history,
         }
-        if not should_omit_claude_sampling(target_model):
+        if temperature is not None and not should_omit_claude_sampling(target_model):
             payload["temperature"] = temperature
 
         _capture_ai_request(
@@ -1491,7 +1498,7 @@ async def _call_deepseek_api(
     history: list,
     context: str,
     system_prompt: str,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     use_proxy: bool = True,
     timeout: float = 60.0,
     request_capture: dict | None = None,
@@ -1501,6 +1508,7 @@ async def _call_deepseek_api(
     activity_tracker: ActivityTracker | None = None,
     max_output_tokens: int | None = None,
     thinking_enabled: bool | None = None,
+    reasoning_effort: str | None = None,
 ):
     client = None
     try:
@@ -1532,10 +1540,17 @@ async def _call_deepseek_api(
         payload = {
             "model": normalized_model,
             "messages": build_openai_chat_messages(layout),
-            "max_tokens": max_output_tokens or DEEPSEEK_CHAT_MAX_TOKENS,
-            "temperature": temperature,
         }
-        if thinking_enabled is True:
+        if max_output_tokens is not None:
+            payload["max_tokens"] = max_output_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if reasoning_effort == "none":
+            payload["extra_body"] = {"thinking": {"type": "disabled"}}
+        elif reasoning_effort is not None:
+            payload["reasoning_effort"] = reasoning_effort
+            payload["extra_body"] = {"thinking": {"type": "enabled"}}
+        elif thinking_enabled is True:
             payload["extra_body"] = {"thinking": {"type": "enabled"}}
         elif thinking_enabled is False:
             payload["extra_body"] = {"thinking": {"type": "disabled"}}
@@ -1716,8 +1731,9 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
 
         elif provider == PROVIDER_DEEPGRAM:
             api_key = getattr(ai_config, "deepgram_api_key", None)
+            model = getattr(ai_config, "deepgram_model", None) or DEEPGRAM_DEFAULT_MODEL
             try:
-                response_text = await call_deepgram(api_key, file_bytes, filename, model=DEEPGRAM_DEFAULT_MODEL)
+                response_text = await call_deepgram(api_key, file_bytes, filename, model=model)
             except ProviderAdapterError as exc:
                 raise _wrap_provider_adapter_error(exc) from exc
 
@@ -1733,14 +1749,14 @@ async def _call_openai_api(
     history: list,
     context: str,
     system_prompt: str,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     timeout: float = 60.0,
     request_capture: dict | None = None,
     runtime_context: str = "",
     *,
     request_layout: AIRequestLayout | None = None,
     activity_tracker: ActivityTracker | None = None,
-    max_completion_tokens: int = 4096,
+    max_completion_tokens: int | None = 4096,
 ):
     try:
         if not api_key:
@@ -1760,9 +1776,10 @@ async def _call_openai_api(
         payload: dict[str, Any] = {
             "model": target_model,
             "messages": build_openai_chat_messages(layout),
-            "max_completion_tokens": max_completion_tokens,
         }
-        if not target_model.startswith("gpt-5.6"):
+        if max_completion_tokens is not None:
+            payload["max_completion_tokens"] = max_completion_tokens
+        if temperature is not None and not target_model.startswith("gpt-5.6"):
             payload["temperature"] = temperature
 
         _capture_ai_request(
@@ -1849,8 +1866,6 @@ async def get_ai_response(
         ai_config = await session.get(AIConfig, 1)
         if not ai_config:
             return "❌ Ошибка: Конфигурация ИИ не найдена."
-
-        temperature = _resolve_temperature(ai_config)
 
         _, media_files = await load_available_media(session, active_topic_id)
         available_media_text, media_instruction_block = format_available_media_text(media_files, active_topic_id)
@@ -1988,16 +2003,17 @@ async def get_ai_response(
                 "perplexity": PROVIDER_PERPLEXITY,
                 "xai": "xAI",
             }.get(str(p_key).lower(), p_key)
-            output_tokens = effective_chat_output_tokens(
-                normalized_provider,
+            settings_provider = PROVIDER_OPENAI if str(p_key).lower() == "xai" else normalized_provider
+            model_settings = await resolve_model_settings(
+                session,
+                settings_provider,
                 p_model,
-                getattr(ai_config, "max_output_tokens", None),
+                "chat",
+                config=ai_config,
             )
-            thinking_enabled = (
-                getattr(ai_config, "deepseek_thinking_enabled", None)
-                if str(p_key).lower() == "deepseek"
-                else None
-            )
+            output_tokens = wire_max_output_tokens(model_settings)
+            request_temperature = wire_temperature(model_settings)
+            reasoning_effort = wire_reasoning_effort(model_settings)
 
             if not str(p_model).startswith(("primary-", "fallback-", "mock-", "test-", "dummy-", "gpt-5.6-turbo")) and not str(p_model).endswith(("-telegram", "-max")):
                 try:
@@ -2033,7 +2049,7 @@ async def get_ai_response(
                         list(request_layout.history),
                         "",
                         formatted_body,
-                        temperature,
+                        request_temperature,
                         timeout=timeout,
                         request_capture=capture_dict,
                         request_layout=request_layout,
@@ -2041,20 +2057,20 @@ async def get_ai_response(
                         max_completion_tokens=output_tokens,
                     )
                 elif p_key in ['anthropic', 'claude']:
-                    return await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
+                    return await _call_claude_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, request_temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
                 elif p_key == 'gemini':
-                    return await _call_gemini_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
+                    return await _call_gemini_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, request_temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
                 elif p_key == 'kie':
-                    return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
+                    return await _call_kie_chat(p_api_key, _get_kie_base_url(ai_config), p_model, list(request_layout.history), "", formatted_body, request_temperature, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens)
                 elif p_key == 'deepseek':
-                    return await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, temperature, use_proxy=use_proxy, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens, thinking_enabled=thinking_enabled)
+                    return await _call_deepseek_api(p_api_key, p_model, list(request_layout.history), "", formatted_body, request_temperature, use_proxy=use_proxy, timeout=timeout, request_capture=capture_dict, request_layout=request_layout, activity_tracker=activity_tracker, max_output_tokens=output_tokens, reasoning_effort=reasoning_effort)
                 elif p_key == 'openrouter':
                     try:
                         return await call_openrouter(
                             p_api_key,
                             request_layout,
                             p_model,
-                            temperature=temperature,
+                            temperature=request_temperature,
                             max_output_tokens=output_tokens,
                             timeout=timeout,
                             request_capture=capture_dict,
@@ -2064,16 +2080,11 @@ async def get_ai_response(
                         raise _wrap_provider_adapter_error(exc) from exc
                 elif p_key == 'perplexity':
                     try:
-                        configured_perplexity_tokens = getattr(ai_config, "max_output_tokens", None)
                         return await call_perplexity(
                             p_api_key,
                             request_layout,
                             p_model,
-                            max_output_tokens=effective_chat_output_tokens(
-                                PROVIDER_PERPLEXITY,
-                                p_model,
-                                configured_perplexity_tokens,
-                            ),
+                            max_output_tokens=output_tokens,
                             timeout=timeout,
                             request_capture=capture_dict,
                             activity_tracker=activity_tracker,
@@ -2087,7 +2098,7 @@ async def get_ai_response(
                         list(request_layout.history),
                         "",
                         formatted_body,
-                        temperature,
+                        request_temperature,
                         timeout=timeout,
                         request_capture=capture_dict,
                         request_layout=request_layout,
@@ -3048,6 +3059,68 @@ async def _call_openai_vision(
         raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {exception_summary(e)}") from e
 
 
+async def _call_deepseek_vision(
+    api_key: str,
+    model: str,
+    image_bytes: bytes,
+    prompt: str,
+    history: list = None,
+    request_capture: dict | None = None,
+    *,
+    request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
+    stage_budget: float = 25.0,
+) -> str:
+    target_model = model or "deepseek-flash"
+    ensure_model_available(PROVIDER_DEEPSEEK, target_model, channel="vision")
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
+    media_type = _guess_image_media_type(image_bytes)
+    user_text = _extract_vision_user_prompt(request_layout=request_layout, prompt=prompt)
+    layout = _coerce_request_layout(
+        request_layout,
+        history=history,
+        system_prompt=prompt,
+        current_user_content=None,
+    ).with_current_user_content([
+        {"type": "text", "text": user_text},
+        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64_image}", "detail": "high"}},
+    ])
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=stage_budget, max_retries=0)
+    payload = {
+        "model": target_model,
+        "messages": build_openai_chat_messages(layout),
+        "max_tokens": get_provider_vision_max_tokens(PROVIDER_DEEPSEEK),
+    }
+    _capture_ai_request(
+        request_capture,
+        provider=PROVIDER_DEEPSEEK,
+        endpoint=f"{base_url.rstrip('/')}/chat/completions",
+        payload=payload,
+    )
+    if activity_tracker is not None:
+        await activity_tracker.mark_outbound_attempt_once()
+    try:
+        response = await client.chat.completions.create(**payload)
+        choices = getattr(response, "choices", None) or []
+        choice = choices[0] if choices else None
+        message = getattr(choice, "message", None) if choice else None
+        content = getattr(message, "content", None) if message else None
+        finish_reason = getattr(choice, "finish_reason", None) if choice else None
+        if request_capture is not None:
+            request_capture["http_status"] = 200
+            request_capture["finish_reason"] = finish_reason
+        if finish_reason == "length":
+            raise AIResponseError("DeepSeek Vision output budget exhausted")
+        if not isinstance(content, str) or not content.strip():
+            raise AIResponseError("DeepSeek Vision returned empty content")
+        return content.strip()
+    except (AIServiceError, AIResponseError):
+        raise
+    except Exception as exc:
+        raise AIServiceError(f"Ошибка анализа изображения (DeepSeek): {exception_summary(exc)}") from exc
+
+
 async def _call_gemini_vision(
     api_key: str,
     model: str,
@@ -3438,11 +3511,15 @@ async def analyze_image_content(
     )
 
     # Pre-flight API key check for primary before any outbound HTTP
-    if primary_provider not in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER):
+    if primary_provider not in get_capability_providers("vision"):
         err = AIServiceError(f"Неподдерживаемый провайдер для vision: {primary_provider}")
         err.classification = "configuration"
         raise err
 
+    if primary_provider == PROVIDER_DEEPSEEK and primary_model not in get_selectable_models(PROVIDER_DEEPSEEK, channel="vision"):
+        err = AIServiceError(f"Недопустимая модель vision {primary_model} для {primary_provider}")
+        err.classification = "configuration"
+        raise err
     primary_target_model = primary_model or get_default_model(primary_provider, channel="vision")
     try:
         ensure_model_available(primary_provider, primary_target_model, channel="vision")
@@ -3458,6 +3535,8 @@ async def analyze_image_content(
         primary_api_key = config.claude_api_key
     elif primary_provider == PROVIDER_GEMINI:
         primary_api_key = config.gemini_api_key
+    elif primary_provider == PROVIDER_DEEPSEEK:
+        primary_api_key = config.deepseek_api_key
     elif primary_provider == PROVIDER_KIE:
         primary_api_key = getattr(config, "kie_api_key", None)
     elif primary_provider == PROVIDER_OPENROUTER:
@@ -3477,12 +3556,17 @@ async def analyze_image_content(
             fb_key_valid = False
         elif eff_fallback_provider == "Gemini" and not config.gemini_api_key:
             fb_key_valid = False
+        elif eff_fallback_provider == PROVIDER_DEEPSEEK and not config.deepseek_api_key:
+            fb_key_valid = False
         elif eff_fallback_provider == "KIE" and not getattr(config, "kie_api_key", None):
             fb_key_valid = False
         elif eff_fallback_provider == PROVIDER_OPENROUTER and not getattr(config, "openrouter_api_key", None):
             fb_key_valid = False
         if not fb_key_valid:
             eff_allow_fallback = False
+
+    if eff_fallback_provider == PROVIDER_DEEPSEEK and eff_fallback_model not in get_selectable_models(PROVIDER_DEEPSEEK, channel="vision"):
+        eff_allow_fallback = False
 
     request_group_id = f"vision-{uuid.uuid4().hex[:12]}"
     attempt_no = 0
@@ -3774,6 +3858,21 @@ async def analyze_image_content(
                     ),
                     prim_budget,
                 )
+            elif primary_provider == PROVIDER_DEEPSEEK:
+                res = await run_coro_with_timeout(
+                    _call_deepseek_vision(
+                        primary_api_key,
+                        primary_target_model,
+                        image_bytes,
+                        prompt,
+                        history=history,
+                        request_capture=prim_capture,
+                        request_layout=request_layout,
+                        activity_tracker=activity_tracker,
+                        stage_budget=prim_budget,
+                    ),
+                    prim_budget,
+                )
             elif primary_provider == PROVIDER_OPENROUTER:
                 base_layout = _coerce_request_layout(
                     request_layout,
@@ -3868,7 +3967,7 @@ async def analyze_image_content(
     fb_stage_budget = 0.0
     if eff_allow_fallback and bool(eff_fallback_provider):
         is_diff_provider = str(eff_fallback_provider).strip().lower() != str(primary_provider).strip().lower()
-        is_supported_provider = str(eff_fallback_provider).strip() in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER)
+        is_supported_provider = str(eff_fallback_provider).strip() in get_capability_providers("vision_fallback")
         is_valid_model = bool(eff_fallback_model)
         try:
             if is_valid_model and is_supported_provider:
@@ -3885,6 +3984,8 @@ async def analyze_image_content(
             has_api_key = bool(getattr(config, "gemini_api_key", None))
         elif eff_fallback_provider == PROVIDER_CLAUDE:
             has_api_key = bool(getattr(config, "claude_api_key", None))
+        elif eff_fallback_provider == PROVIDER_DEEPSEEK:
+            has_api_key = bool(getattr(config, "deepseek_api_key", None))
         elif eff_fallback_provider == PROVIDER_OPENAI:
             has_api_key = bool(getattr(config, "openai_api_key", None) or os.getenv("OPENAI_API_KEY"))
         elif eff_fallback_provider == PROVIDER_OPENROUTER:
@@ -4013,6 +4114,21 @@ async def analyze_image_content(
                         request_layout=request_layout,
                         activity_tracker=activity_tracker,
                         effective_user_prompt=effective_user_prompt,
+                        stage_budget=fb_stage_budget,
+                    ),
+                    fb_stage_budget,
+                )
+            elif eff_fallback_provider == PROVIDER_DEEPSEEK:
+                fb_res = await run_coro_with_timeout(
+                    _call_deepseek_vision(
+                        getattr(config, "deepseek_api_key", None),
+                        eff_fallback_model or "deepseek-flash",
+                        image_bytes,
+                        prompt,
+                        history=history,
+                        request_capture=fb_capture,
+                        request_layout=request_layout,
+                        activity_tracker=activity_tracker,
                         stage_budget=fb_stage_budget,
                     ),
                     fb_stage_budget,

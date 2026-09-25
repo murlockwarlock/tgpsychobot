@@ -114,7 +114,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.dispose()
 
     # -------------------------------------------------------------------------
-    # 1. Telegram OpenAI Direct: max_completion_tokens == 16384, no max_tokens
+    # 1. Telegram OpenAI Direct: Auto leaves the output override unset
     # -------------------------------------------------------------------------
     async def test_telegram_openai_direct_chat_budget(self):
         async with self.sessions() as session:
@@ -133,8 +133,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(captured), 1)
         wire_payload = captured[0]
-        self.assertEqual(wire_payload["max_completion_tokens"], 16384)
-        self.assertEqual(wire_payload["max_completion_tokens"], OPENAI_CHAT_MAX_TOKENS)
+        self.assertNotIn("max_completion_tokens", wire_payload)
         self.assertNotIn("max_tokens", wire_payload)
 
         # AILog verification
@@ -142,11 +141,11 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             log_entry = await session.scalar(select(AILog).where(AILog.platform == "telegram").order_by(AILog.id.desc()))
             self.assertIsNotNone(log_entry)
             parsed = json.loads(log_entry.request_payload)
-            self.assertEqual(parsed["payload"]["max_completion_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", parsed["payload"])
             self.assertNotIn("max_tokens", parsed["payload"])
 
     # -------------------------------------------------------------------------
-    # 2. MAX OpenAI Direct: max_completion_tokens == 16384, no max_tokens
+    # 2. MAX OpenAI Direct: Auto leaves the output override unset
     # -------------------------------------------------------------------------
     async def test_max_openai_direct_chat_budget(self):
         async with self.sessions() as session:
@@ -165,8 +164,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(captured), 1)
         wire_payload = captured[0]
-        self.assertEqual(wire_payload["max_completion_tokens"], 16384)
-        self.assertEqual(wire_payload["max_completion_tokens"], OPENAI_CHAT_MAX_TOKENS)
+        self.assertNotIn("max_completion_tokens", wire_payload)
         self.assertNotIn("max_tokens", wire_payload)
 
         # AILog verification
@@ -174,7 +172,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             log_entry = await session.scalar(select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc()))
             self.assertIsNotNone(log_entry)
             parsed = json.loads(log_entry.request_payload)
-            self.assertEqual(parsed["payload"]["max_completion_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", parsed["payload"])
             self.assertNotIn("max_tokens", parsed["payload"])
 
     # -------------------------------------------------------------------------
@@ -254,7 +252,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("max_completion_tokens", parsed["payload"])
 
     # -------------------------------------------------------------------------
-    # 5. Telegram Gemini Direct: generationConfig.maxOutputTokens == 16384
+    # 5. Telegram Gemini Direct: Auto leaves maxOutputTokens unset
     # -------------------------------------------------------------------------
     async def test_telegram_gemini_direct_chat_budget(self):
         async with self.sessions() as session:
@@ -284,9 +282,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), 1)
         payload = captured[0]["json"]
         self.assertIn("generationConfig", payload)
-        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 16384)
-        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], GEMINI_CHAT_MAX_TOKENS)
-        self.assertNotIn("maxOutputTokens", payload)
+        self.assertNotIn("maxOutputTokens", payload["generationConfig"])
         self.assertNotIn("max_tokens", payload)
         self.assertNotIn("max_completion_tokens", payload)
 
@@ -295,10 +291,10 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             log_entry = await session.scalar(select(AILog).where(AILog.platform == "telegram").order_by(AILog.id.desc()))
             self.assertIsNotNone(log_entry)
             parsed = json.loads(log_entry.request_payload)
-            self.assertEqual(parsed["payload"]["generationConfig"]["maxOutputTokens"], 16384)
+            self.assertNotIn("maxOutputTokens", parsed["payload"]["generationConfig"])
 
     # -------------------------------------------------------------------------
-    # 6. MAX Gemini Direct: generationConfig.maxOutputTokens == 16384
+    # 6. MAX Gemini Direct: Auto leaves maxOutputTokens unset
     # -------------------------------------------------------------------------
     async def test_max_gemini_direct_chat_budget(self):
         async with self.sessions() as session:
@@ -324,9 +320,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), 1)
         payload = captured[0]["json"]
         self.assertIn("generationConfig", payload)
-        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 16384)
-        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], GEMINI_CHAT_MAX_TOKENS)
-        self.assertNotIn("maxOutputTokens", payload)
+        self.assertNotIn("maxOutputTokens", payload["generationConfig"])
         self.assertNotIn("max_tokens", payload)
         self.assertNotIn("max_completion_tokens", payload)
 
@@ -335,7 +329,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             log_entry = await session.scalar(select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc()))
             self.assertIsNotNone(log_entry)
             parsed = json.loads(log_entry.request_payload)
-            self.assertEqual(parsed["payload"]["generationConfig"]["maxOutputTokens"], 16384)
+            self.assertNotIn("maxOutputTokens", parsed["payload"]["generationConfig"])
 
     # -------------------------------------------------------------------------
     # 7, 8, 9: Provider-Specific Field Discipline Confirmed Above (and explicit tests)
@@ -347,7 +341,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(DEEPSEEK_CHAT_MAX_TOKENS, 65536)
 
     # -------------------------------------------------------------------------
-    # 10. Telegram Fallback -> OpenAI (actual outbound payload uses 16384)
+    # 10. Telegram Fallback -> OpenAI (Auto leaves the output override unset)
     # -------------------------------------------------------------------------
     async def test_telegram_fallback_to_openai(self):
         async with self.sessions() as session:
@@ -374,7 +368,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp, "Fallback OpenAI OK")
 
         self.assertEqual(len(captured_fallback), 1)
-        self.assertEqual(captured_fallback[0]["max_completion_tokens"], 16384)
+        self.assertNotIn("max_completion_tokens", captured_fallback[0])
         self.assertNotIn("max_tokens", captured_fallback[0])
 
     # -------------------------------------------------------------------------
@@ -454,7 +448,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp, "Fallback Gemini OK")
 
         self.assertEqual(len(captured_fallback), 1)
-        self.assertEqual(captured_fallback[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
+        self.assertNotIn("maxOutputTokens", captured_fallback[0]["json"]["generationConfig"])
 
     # -------------------------------------------------------------------------
     # 13. MAX Fallback -> OpenAI (actual outbound payload uses 16384)
@@ -484,7 +478,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp, "MAX Fallback OpenAI OK")
 
         self.assertEqual(len(captured_fallback), 1)
-        self.assertEqual(captured_fallback[0]["max_completion_tokens"], 16384)
+        self.assertNotIn("max_completion_tokens", captured_fallback[0])
         self.assertNotIn("max_tokens", captured_fallback[0])
 
     # -------------------------------------------------------------------------
@@ -556,7 +550,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp, "MAX Fallback Gemini OK")
 
         self.assertEqual(len(captured_fallback), 1)
-        self.assertEqual(captured_fallback[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
+        self.assertNotIn("maxOutputTokens", captured_fallback[0]["json"]["generationConfig"])
 
     # -------------------------------------------------------------------------
     # 16, 17, 18. DeepSeek Direct Telegram & MAX remain 16384
@@ -576,8 +570,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             resp = await ai_integration.generate_response(user_id=7001, user_prompt="Вопрос к DeepSeek TG")
             self.assertEqual(resp, "TG DeepSeek OK")
 
-        self.assertEqual(captured_tg[0]["max_tokens"], 65536)
-        self.assertEqual(captured_tg[0]["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
+        self.assertNotIn("max_tokens", captured_tg[0])
 
         captured_max = []
         async def fake_deepseek_max(**kwargs):
@@ -588,8 +581,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             resp = await max_ai.get_ai_response(7001, "Вопрос к DeepSeek MAX", track_user_activity=True)
             self.assertEqual(resp, "MAX DeepSeek OK")
 
-        self.assertEqual(captured_max[0]["max_tokens"], 65536)
-        self.assertEqual(captured_max[0]["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS)
+        self.assertNotIn("max_tokens", captured_max[0])
 
     # -------------------------------------------------------------------------
     # 19. KIE Normal Chat Remains 4096
@@ -798,7 +790,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             # Schema unchanged: keys are 'provider', 'endpoint', 'payload'
             self.assertEqual(set(parsed.keys()), {"provider", "endpoint", "payload"})
             self.assertEqual(parsed["provider"], "OpenAI")
-            self.assertEqual(parsed["payload"]["max_completion_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", parsed["payload"])
             self.assertNotIn("sk-", parsed["endpoint"])
             self.assertNotIn("sk-", log_entry.request_payload)
 
@@ -826,7 +818,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(captured), 1)
         wire_payload = captured[0]
-        self.assertEqual(wire_payload["max_completion_tokens"], 4096)
+        self.assertNotIn("max_completion_tokens", wire_payload)
         self.assertNotIn("max_tokens", wire_payload)
 
         # AILog verification
@@ -834,7 +826,7 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             log_entry = await session.scalar(select(AILog).where(AILog.platform == "telegram").order_by(AILog.id.desc()))
             self.assertIsNotNone(log_entry)
             parsed = json.loads(log_entry.request_payload)
-            self.assertEqual(parsed["payload"]["max_completion_tokens"], 4096)
+            self.assertNotIn("max_completion_tokens", parsed["payload"])
             self.assertNotIn("max_tokens", parsed["payload"])
 
     # -------------------------------------------------------------------------
@@ -866,9 +858,8 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(captured_calls), 2)
         # Primary OpenAI got 16384
-        self.assertEqual(captured_calls[0]["max_completion_tokens"], 16384)
-        # Fallback xAI got 4096
-        self.assertEqual(captured_calls[1]["max_completion_tokens"], 4096)
+        self.assertNotIn("max_completion_tokens", captured_calls[0])
+        self.assertNotIn("max_completion_tokens", captured_calls[1])
 
     # -------------------------------------------------------------------------
     # 31. Telegram Fallback from xAI -> OpenAI (OpenAI gets 16384)
@@ -899,10 +890,8 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp, "OpenAI fallback OK")
 
         self.assertEqual(len(captured_calls), 2)
-        # Primary xAI was 4096
-        self.assertEqual(captured_calls[0]["max_completion_tokens"], 4096)
-        # Fallback OpenAI received 16384
-        self.assertEqual(captured_calls[1]["max_completion_tokens"], 16384)
+        self.assertNotIn("max_completion_tokens", captured_calls[0])
+        self.assertNotIn("max_completion_tokens", captured_calls[1])
 
     # -------------------------------------------------------------------------
     # 32. _call_openai_api Defaults Safely to 4096
@@ -972,4 +961,3 @@ class PhaseA2DirectChatBudgetsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(parsed["endpoint"], "https://api.anthropic.com/v1/messages")
             self.assertEqual(parsed["payload"]["max_tokens"], 16384)
             self.assertNotIn("max_completion_tokens", parsed["payload"])
-

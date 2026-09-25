@@ -66,6 +66,7 @@ from provider_models import (
     ModelUnavailableError,
     ensure_model_available,
     get_default_model,
+    get_capability_providers,
     get_provider_vision_max_tokens,
     get_selectable_models,
     inspect_deepseek_response,
@@ -106,6 +107,12 @@ from ai_request_context import (
     extract_effective_provider_and_model,
     neutralize_stable_prompt,
     normalize_request_messages,
+)
+from ai_model_settings import (
+    resolve_model_settings,
+    wire_max_output_tokens,
+    wire_reasoning_effort,
+    wire_temperature,
 )
 from kie_chat import (
     build_kie_chat_request,
@@ -274,12 +281,12 @@ async def _call_openai(
     api_key: str,
     model: str,
     messages: list[dict] | None,
-    temperature: float,
+    temperature: float | None,
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
-    max_completion_tokens: int | None = None,
+    max_completion_tokens: int | None = OPENAI_CHAT_MAX_TOKENS,
 ) -> str:
     target_model = model or "gpt-5.6-terra"
     ensure_model_available(PROVIDER_OPENAI, target_model)
@@ -288,9 +295,10 @@ async def _call_openai(
     payload: dict = {
         "model": target_model,
         "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
-        "max_completion_tokens": max_completion_tokens or OPENAI_CHAT_MAX_TOKENS,
     }
-    if not target_model.startswith("gpt-5.6"):
+    if max_completion_tokens is not None:
+        payload["max_completion_tokens"] = max_completion_tokens
+    if temperature is not None and not target_model.startswith("gpt-5.6"):
         payload["temperature"] = temperature
     _capture_ai_request(
         request_capture,
@@ -311,13 +319,14 @@ async def _call_deepseek(
     api_key: str,
     model: str,
     messages: list[dict] | None,
-    temperature: float,
+    temperature: float | None,
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
     max_output_tokens: int | None = None,
     thinking_enabled: bool | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     normalized_model = normalize_deepseek_model(model)
     ensure_model_available(PROVIDER_DEEPSEEK, normalized_model)
@@ -326,10 +335,17 @@ async def _call_deepseek(
     payload = {
         "model": normalized_model,
         "messages": build_openai_chat_messages(request_layout or _legacy_layout(messages)),
-        "max_tokens": max_output_tokens or DEEPSEEK_CHAT_MAX_TOKENS,
-        "temperature": temperature,
     }
-    if thinking_enabled is True:
+    if max_output_tokens is not None:
+        payload["max_tokens"] = max_output_tokens
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if reasoning_effort == "none":
+        payload["extra_body"] = {"thinking": {"type": "disabled"}}
+    elif reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+        payload["extra_body"] = {"thinking": {"type": "enabled"}}
+    elif thinking_enabled is True:
         payload["extra_body"] = {"thinking": {"type": "enabled"}}
     elif thinking_enabled is False:
         payload["extra_body"] = {"thinking": {"type": "disabled"}}
@@ -410,7 +426,7 @@ async def _call_claude(
     model: str,
     messages: list[dict] | None,
     system_prompt: str,
-    temperature: float,
+    temperature: float | None,
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
@@ -433,7 +449,7 @@ async def _call_claude(
         "system": build_anthropic_system(layout),
         "messages": anthropic_messages,
     }
-    if not should_omit_claude_sampling(target_model):
+    if temperature is not None and not should_omit_claude_sampling(target_model):
         payload["temperature"] = temperature
     _capture_ai_request(
         request_capture,
@@ -466,7 +482,7 @@ async def _call_gemini(
     model: str,
     messages: list[dict] | None,
     system_prompt: str,
-    temperature: float,
+    temperature: float | None,
     *,
     request_layout: AIRequestLayout | None = None,
     request_capture: dict | None = None,
@@ -478,8 +494,10 @@ async def _call_gemini(
     target_model = model or "gemini-3.7-flash"
     ensure_model_available(PROVIDER_GEMINI, target_model)
     layout = request_layout or _legacy_layout(messages, system_prompt)
-    generation_config: dict = {"maxOutputTokens": max_output_tokens or GEMINI_CHAT_MAX_TOKENS}
-    if not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
+    generation_config: dict = {}
+    if max_output_tokens is not None:
+        generation_config["maxOutputTokens"] = max_output_tokens
+    if temperature is not None and not (target_model.startswith("gemini-3.7") or target_model.startswith("gemini-3.6")):
         generation_config["temperature"] = temperature
 
     payload = {
@@ -1185,7 +1203,7 @@ async def _dispatch_provider(
     request_capture: dict | None = None,
     activity_tracker: ActivityTracker | None = None,
 ) -> str:
-    provider, temperature = _resolve_provider(ai_config)
+    provider, _ = _resolve_provider(ai_config)
     layout = (
         request_layout
         if isinstance(request_layout, AIRequestLayout)
@@ -1206,12 +1224,28 @@ async def _dispatch_provider(
     selected_model = configured_model
     if not selected_model and provider in {PROVIDER_OPENROUTER.lower(), PROVIDER_PERPLEXITY.lower()}:
         selected_model = get_default_model(provider, channel="chat")
-    output_tokens = effective_chat_output_tokens(
-        ai_config.provider,
-        selected_model,
-        getattr(ai_config, "max_output_tokens", None),
-    )
-    thinking_enabled = getattr(ai_config, "deepseek_thinking_enabled", None) if provider == "deepseek" else None
+    settings_provider = {
+        "anthropic": PROVIDER_CLAUDE,
+        "claude": PROVIDER_CLAUDE,
+        "openai": PROVIDER_OPENAI,
+        "xai": PROVIDER_OPENAI,
+        "gemini": PROVIDER_GEMINI,
+        "deepseek": PROVIDER_DEEPSEEK,
+        "kie": PROVIDER_KIE,
+        "openrouter": PROVIDER_OPENROUTER,
+        "perplexity": PROVIDER_PERPLEXITY,
+    }.get(provider, ai_config.provider)
+    async with async_session_maker() as settings_session:
+        model_settings = await resolve_model_settings(
+            settings_session,
+            settings_provider,
+            selected_model,
+            "chat",
+            config=ai_config,
+        )
+    output_tokens = wire_max_output_tokens(model_settings)
+    temperature = wire_temperature(model_settings)
+    reasoning_effort = wire_reasoning_effort(model_settings)
 
     async def _invoke():
         if provider == "openai":
@@ -1219,7 +1253,7 @@ async def _dispatch_provider(
                 raise AIServiceError("OpenAI API key не задан")
             return await _call_openai(
                 ai_config.openai_api_key,
-                ai_config.openai_model,
+                selected_model or ai_config.openai_model,
                 [],
                 temperature,
                 request_layout=layout,
@@ -1233,7 +1267,7 @@ async def _dispatch_provider(
                 raise AIServiceError("Claude API key не задан")
             return await _call_claude(
                 claude_key,
-                ai_config.claude_model,
+                selected_model or ai_config.claude_model,
                 [],
                 layout.stable_system_prompt,
                 temperature,
@@ -1247,7 +1281,7 @@ async def _dispatch_provider(
                 raise AIServiceError("Gemini API key не задан")
             return await _call_gemini(
                 ai_config.gemini_api_key,
-                ai_config.gemini_model,
+                selected_model or ai_config.gemini_model,
                 [],
                 layout.stable_system_prompt,
                 temperature,
@@ -1261,14 +1295,14 @@ async def _dispatch_provider(
                 raise AIServiceError("DeepSeek API key не задан")
             return await _call_deepseek(
                 ai_config.deepseek_api_key,
-                ai_config.deepseek_model,
+                selected_model or ai_config.deepseek_model,
                 [],
                 temperature,
                 request_layout=layout,
                 request_capture=request_capture,
                 activity_tracker=activity_tracker,
                 max_output_tokens=output_tokens,
-                thinking_enabled=thinking_enabled,
+                reasoning_effort=reasoning_effort,
             )
         elif provider == "kie":
             if not ai_config.kie_api_key:
@@ -1277,7 +1311,7 @@ async def _dispatch_provider(
             return await _call_kie_text_chat(
                 ai_config.kie_api_key,
                 base_url,
-                ai_config.kie_model or "gemini-3-flash",
+                selected_model or ai_config.kie_model or "gemini-3-flash",
                 [],
                 layout.stable_system_prompt,
                 temperature,
@@ -1306,16 +1340,11 @@ async def _dispatch_provider(
             if not getattr(ai_config, "perplexity_api_key", None):
                 raise AIServiceError("Perplexity API key не задан")
             try:
-                configured_perplexity_tokens = getattr(ai_config, "max_output_tokens", None)
                 return await call_perplexity(
                     ai_config.perplexity_api_key,
                     layout,
                     selected_model,
-                    max_output_tokens=effective_chat_output_tokens(
-                        PROVIDER_PERPLEXITY,
-                        selected_model,
-                        configured_perplexity_tokens,
-                    ),
+                    max_output_tokens=output_tokens,
                     timeout=timeout,
                     request_capture=request_capture,
                     activity_tracker=activity_tracker,
@@ -1585,85 +1614,76 @@ async def get_ai_response(
                     fb_timeout = float(getattr(ai_config, "fallback_timeout", 60) or 60.0)
 
                     async def _invoke_fb():
-                        if fb_key == "openai":
-                            fb_tokens = effective_chat_output_tokens(
-                                fb_provider,
+                        fb_settings_provider = {
+                            "openai": PROVIDER_OPENAI,
+                            "claude": PROVIDER_CLAUDE,
+                            "anthropic": PROVIDER_CLAUDE,
+                            "gemini": PROVIDER_GEMINI,
+                            "deepseek": PROVIDER_DEEPSEEK,
+                            "kie": PROVIDER_KIE,
+                            "openrouter": PROVIDER_OPENROUTER,
+                            "perplexity": PROVIDER_PERPLEXITY,
+                        }.get(fb_key, fb_provider)
+                        async with async_session_maker() as settings_session:
+                            fb_model_settings = await resolve_model_settings(
+                                settings_session,
+                                fb_settings_provider,
                                 fb_model,
-                                getattr(ai_config, "max_output_tokens", None),
+                                "chat",
+                                config=ai_config,
                             )
+                        fb_tokens = wire_max_output_tokens(fb_model_settings)
+                        fb_temperature = wire_temperature(fb_model_settings)
+                        fb_reasoning_effort = wire_reasoning_effort(fb_model_settings)
+                        if fb_key == "openai":
                             return await _call_openai(
-                                fb_api_key, fb_model, [], temperature,
+                                fb_api_key, fb_model, [], fb_temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                                 max_completion_tokens=fb_tokens,
                             )
                         elif fb_key in {"claude", "anthropic"}:
-                            fb_tokens = effective_chat_output_tokens(
-                                fb_provider,
-                                fb_model,
-                                getattr(ai_config, "max_output_tokens", None),
-                            )
                             return await _call_claude(
-                                fb_api_key, fb_model, [], stable_system_prompt, temperature,
+                                fb_api_key, fb_model, [], stable_system_prompt, fb_temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                                 max_output_tokens=fb_tokens,
                             )
                         elif fb_key == "gemini":
-                            fb_tokens = effective_chat_output_tokens(
-                                fb_provider,
-                                fb_model,
-                                getattr(ai_config, "max_output_tokens", None),
-                            )
                             return await _call_gemini(
-                                fb_api_key, fb_model, [], stable_system_prompt, temperature,
+                                fb_api_key, fb_model, [], stable_system_prompt, fb_temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                                 max_output_tokens=fb_tokens,
                             )
                         elif fb_key == "deepseek":
-                            fb_tokens = effective_chat_output_tokens(
-                                fb_provider,
-                                fb_model,
-                                getattr(ai_config, "max_output_tokens", None),
-                            )
                             return await _call_deepseek(
-                                fb_api_key, fb_model, [], temperature,
+                                fb_api_key, fb_model, [], fb_temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                                 max_output_tokens=fb_tokens,
-                                thinking_enabled=getattr(ai_config, "deepseek_thinking_enabled", None),
+                                reasoning_effort=fb_reasoning_effort,
                             )
                         elif fb_key == "kie":
-                            fb_tokens = effective_chat_output_tokens(
-                                fb_provider,
-                                fb_model,
-                                getattr(ai_config, "max_output_tokens", None),
-                            )
                             return await _call_kie_text_chat(
                                 fb_api_key, _get_kie_base_url(ai_config), fb_model, [],
-                                stable_system_prompt, temperature,
+                                stable_system_prompt, fb_temperature,
                                 request_layout=request_layout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,
                                 max_output_tokens=fb_tokens,
                             )
                         elif fb_key == "openrouter":
-                            fb_tokens = effective_chat_output_tokens(
-                                fb_provider,
-                                fb_model,
-                                getattr(ai_config, "max_output_tokens", None),
-                            )
                             try:
                                 return await call_openrouter(
                                     fb_api_key,
                                     request_layout,
                                     fb_model,
-                                    temperature=temperature,
+                                    temperature=fb_temperature,
                                     max_output_tokens=fb_tokens,
                                     timeout=fb_timeout,
                                     request_capture=fallback_capture,
@@ -1672,11 +1692,6 @@ async def get_ai_response(
                             except ProviderAdapterError as exc:
                                 raise _wrap_provider_adapter_error(exc) from exc
                         elif fb_key == "perplexity":
-                            fb_tokens = effective_chat_output_tokens(
-                                fb_provider,
-                                fb_model,
-                                getattr(ai_config, "max_output_tokens", None),
-                            )
                             try:
                                 return await call_perplexity(
                                     fb_api_key,
@@ -2001,7 +2016,12 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
     if provider == PROVIDER_DEEPGRAM:
         api_key = getattr(config, "deepgram_api_key", None)
         try:
-            return await call_deepgram(api_key, file_bytes, filename, model=DEEPGRAM_DEFAULT_MODEL)
+            return await call_deepgram(
+                api_key,
+                file_bytes,
+                filename,
+                model=getattr(config, "deepgram_model", None) or DEEPGRAM_DEFAULT_MODEL,
+            )
         except ProviderAdapterError as exc:
             raise _wrap_provider_adapter_error(exc) from exc
     # Default: OpenAI
@@ -2014,6 +2034,55 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
 # ---------------------------------------------------------------------------
 # Image Analysis (Vision)
 # ---------------------------------------------------------------------------
+
+async def _analyze_deepseek(
+    api_key: str,
+    model: str,
+    image_bytes: bytes,
+    system_prompt: str,
+    prompt: str,
+    history: list = None,
+    request_layout: AIRequestLayout | None = None,
+    activity_tracker: ActivityTracker | None = None,
+    timeout: float = 25.0,
+    request_capture: dict | None = None,
+) -> str:
+    target_model = model or "deepseek-flash"
+    ensure_model_available(PROVIDER_DEEPSEEK, target_model, channel="vision")
+    image_data = base64.b64encode(image_bytes).decode("ascii")
+    media_type = _guess_image_media_type(image_bytes)
+    layout = (request_layout or AIRequestLayout(
+        stable_system_prompt=system_prompt,
+        history=normalize_request_messages(history),
+    )).with_current_user_content([
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}", "detail": "high"}},
+    ])
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0, timeout=timeout)
+    payload = {
+        "model": target_model,
+        "messages": build_openai_chat_messages(layout),
+        "max_tokens": get_provider_vision_max_tokens(PROVIDER_DEEPSEEK),
+    }
+    _capture_ai_request(request_capture, provider=PROVIDER_DEEPSEEK, endpoint=f"{base_url.rstrip('/')}/chat/completions", payload=payload)
+    if activity_tracker is not None:
+        await activity_tracker.mark_outbound_attempt_once()
+    response = await client.chat.completions.create(**payload)
+    choices = getattr(response, "choices", None) or []
+    choice = choices[0] if choices else None
+    message = getattr(choice, "message", None) if choice else None
+    content = getattr(message, "content", None) if message else None
+    finish_reason = getattr(choice, "finish_reason", None) if choice else None
+    if request_capture is not None:
+        request_capture["http_status"] = 200
+        request_capture["finish_reason"] = finish_reason
+    if finish_reason == "length":
+        raise AIResponseError("DeepSeek Vision output budget exhausted")
+    if not isinstance(content, str) or not content.strip():
+        raise AIResponseError("DeepSeek Vision returned empty content")
+    return content.strip()
+
 
 async def _analyze_gemini(
     api_key: str,
@@ -2446,13 +2515,17 @@ async def analyze_image(
             raise AIServiceError("Обработка изображений отключена администратором")
 
         primary_provider = (config.vision_provider or "Gemini").strip()
-        if primary_provider not in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER):
+        if primary_provider not in get_capability_providers("vision"):
             err = AIServiceError(f"Неподдерживаемый провайдер для vision: {primary_provider}")
             err.classification = "configuration"
             raise err
 
         configured_model = getattr(config, "vision_model", None)
-        if configured_model and is_retired_model(configured_model):
+        if primary_provider == PROVIDER_DEEPSEEK and configured_model not in get_selectable_models(PROVIDER_DEEPSEEK, channel="vision"):
+            err = AIServiceError(f"Недопустимая модель vision {configured_model} для {primary_provider}")
+            err.classification = "configuration"
+            raise err
+        elif configured_model and is_retired_model(configured_model):
             primary_model = get_default_model(primary_provider, channel="vision")
         else:
             primary_model = configured_model or get_default_model(primary_provider, channel="vision")
@@ -2471,6 +2544,8 @@ async def analyze_image(
             primary_api_key = config.claude_api_key
         elif primary_provider == PROVIDER_GEMINI:
             primary_api_key = config.gemini_api_key
+        elif primary_provider == PROVIDER_DEEPSEEK:
+            primary_api_key = config.deepseek_api_key
         elif primary_provider == PROVIDER_KIE:
             primary_api_key = getattr(config, "kie_api_key", None)
         elif primary_provider == PROVIDER_OPENROUTER:
@@ -2552,6 +2627,10 @@ async def analyze_image(
         fallback_provider,
         fallback_model,
     )
+    if fb_provider == PROVIDER_DEEPSEEK and fb_model not in get_selectable_models(PROVIDER_DEEPSEEK, channel="vision"):
+        eff_allow_fallback = False
+        fb_provider = None
+        fb_model = None
 
     attempts: list[dict] = []
     last_exception: Exception | None = None
@@ -2729,6 +2808,22 @@ async def analyze_image(
                 request_layout.stable_system_prompt,
                 prompt,
                 temperature,
+                history=list(request_layout.history),
+                request_layout=request_layout,
+                activity_tracker=activity_tracker,
+                timeout=stage_budget,
+                request_capture=request_capture,
+            )
+        elif prov == PROVIDER_DEEPSEEK:
+            api_key = config.deepseek_api_key
+            if not api_key:
+                raise AIServiceError("API ключ DeepSeek для vision не задан")
+            return await _analyze_deepseek(
+                api_key,
+                call_model,
+                image_bytes,
+                request_layout.stable_system_prompt,
+                prompt,
                 history=list(request_layout.history),
                 request_layout=request_layout,
                 activity_tracker=activity_tracker,
@@ -3085,7 +3180,7 @@ async def analyze_image(
     fb_budget = 0.0
     if raw_result is None and eff_allow_fallback and fb_provider and fb_model and last_exception is not None:
         is_diff = str(fb_provider).strip().lower() != str(primary_provider).strip().lower()
-        is_supported = str(fb_provider).strip() in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_KIE, PROVIDER_OPENROUTER)
+        is_supported = str(fb_provider).strip() in get_capability_providers("vision_fallback")
         is_valid_model = bool(fb_model)
         try:
             if is_valid_model and is_supported:
@@ -3106,6 +3201,8 @@ async def analyze_image(
             has_key = bool(getattr(config, "openai_api_key", None) or os.getenv("OPENAI_API_KEY"))
         elif fb_provider == PROVIDER_OPENROUTER:
             has_key = bool(getattr(config, "openrouter_api_key", None))
+        elif fb_provider == PROVIDER_DEEPSEEK:
+            has_key = bool(getattr(config, "deepseek_api_key", None))
 
         last_cls = _classify_vision_error(last_exception)
         primary_tokens = get_provider_vision_max_tokens(primary_provider, primary_model)

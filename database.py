@@ -236,6 +236,7 @@ class AIConfig(Base):
     openrouter_api_key = Column(String, nullable=True)
     perplexity_api_key = Column(String, nullable=True)
     deepgram_api_key = Column(String, nullable=True)
+    deepgram_model = Column(String, default='nova-3', nullable=True)
     yandex_api_key = Column(String, nullable=True)
     yandex_folder_id = Column(String, nullable=True)
     gemini_model = Column(String, default='gemini-3.7-flash')
@@ -278,6 +279,22 @@ class AIConfig(Base):
     allow_vision_fallback = Column(Boolean, default=False, nullable=False)
     vision_fallback_provider = Column(String, nullable=True)
     vision_fallback_model = Column(String, nullable=True)
+
+
+class AIModelSettings(Base):
+    __tablename__ = 'ai_model_settings'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    provider = Column(String, nullable=False)
+    model = Column(String, nullable=False)
+    channel = Column(String, nullable=False, default='chat')
+    max_output_tokens = Column(Integer, nullable=True)
+    temperature = Column(Float, nullable=True)
+    reasoning_effort = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    __table_args__ = (
+        UniqueConstraint('provider', 'model', 'channel', name='uq_ai_model_settings_scope'),
+    )
 
 
 
@@ -1353,6 +1370,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN perplexity_api_key VARCHAR"))
             if 'deepgram_api_key' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN deepgram_api_key VARCHAR"))
+            if 'deepgram_model' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN deepgram_model VARCHAR DEFAULT 'nova-3'"))
             if 'kie_model' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN kie_model VARCHAR DEFAULT 'gemini-3-flash'"))
             if 'openrouter_model' not in ai_columns:
@@ -1403,6 +1422,7 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN allow_image_edit BOOLEAN DEFAULT FALSE NOT NULL"))
 
             _migrate_ai_config_models(sync_conn)
+            AIModelSettings.__table__.create(sync_conn, checkfirst=True)
 
             topic_columns = [c['name'] for c in insp.get_columns('topics')]
             if 'auto_start_dialogue' not in topic_columns:
@@ -1551,6 +1571,8 @@ async def init_db():
                 ai_conf.kie_upload_base_url = 'https://kieai.redpandaai.co'
             if getattr(ai_conf, 'kie_transcription_model', None) is None:
                 ai_conf.kie_transcription_model = 'elevenlabs/speech-to-text'
+            if getattr(ai_conf, 'deepgram_model', None) is None:
+                ai_conf.deepgram_model = 'nova-3'
             if getattr(ai_conf, 'kie_credit_alert_threshold', None) is None:
                 ai_conf.kie_credit_alert_threshold = 0
             if getattr(ai_conf, 'kie_credit_alert_sent', None) is None:
@@ -1574,6 +1596,44 @@ async def init_db():
                 ai_conf.use_proxy = True
             if getattr(ai_conf, 'fallback_timeout', None) is None:
                 ai_conf.fallback_timeout = 60
+
+        if ai_conf:
+            from sqlalchemy import select
+            from provider_models import canonical_provider_name, get_default_model, normalize_deepseek_model
+
+            provider = canonical_provider_name(ai_conf.provider)
+            model_field = "kie_model" if provider == "KIE" else f"{provider.lower()}_model"
+            model = getattr(ai_conf, model_field, None)
+            if not model:
+                try:
+                    model = get_default_model(provider, channel="chat")
+                except Exception:
+                    model = None
+            if provider == "Deepseek" and model:
+                model = normalize_deepseek_model(model)
+            if model:
+                settings = await session.scalar(
+                    select(AIModelSettings).where(
+                        AIModelSettings.provider == provider,
+                        AIModelSettings.model == model,
+                        AIModelSettings.channel == "chat",
+                    )
+                )
+                if settings is None:
+                    legacy_reasoning = getattr(ai_conf, "deepseek_thinking_enabled", None)
+                    settings = AIModelSettings(
+                        provider=provider,
+                        model=model,
+                        channel="chat",
+                        max_output_tokens=getattr(ai_conf, "max_output_tokens", None),
+                        temperature=getattr(ai_conf, "temperature", None),
+                        reasoning_effort=(
+                            "high" if legacy_reasoning is True
+                            else "none" if legacy_reasoning is False
+                            else "auto"
+                        ) if provider == "Deepseek" else None,
+                    )
+                    session.add(settings)
 
         sub_conf = await session.get(SubscriptionConfig, 1)
         if not sub_conf:
