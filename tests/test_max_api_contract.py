@@ -84,6 +84,26 @@ async def test_upload_file_reuses_create_token_when_upload_response_is_empty():
     assert session.requests[1][1] == "https://upload.test/file"
 
 
+@pytest.mark.asyncio
+async def test_upload_file_extracts_image_token_from_photos_response():
+    client = MaxApiClient("test-token", "https://max.test")
+    session = _Session(
+        [
+            _Response(body='{"url":"https://upload.test/file"}', content_type="application/json"),
+            _Response(
+                body='{"photos":{"photo-id":{"token":"image-token"}}}',
+                content_type="application/json",
+            ),
+        ]
+    )
+    client._session = session
+
+    result = await client.upload_file("image", __file__)
+
+    assert result["token"] == "image-token"
+    assert result["photos"]["photo-id"]["token"] == "image-token"
+
+
 def test_max_api_default_uses_current_platform_endpoint(monkeypatch):
     monkeypatch.delenv("MAX_API_BASE", raising=False)
     clear_settings_cache()

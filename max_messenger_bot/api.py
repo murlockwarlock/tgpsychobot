@@ -36,6 +36,22 @@ class MaxApiError(RuntimeError):
         return "attachment.not.ready" in text
 
 
+def _upload_token(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("token")
+    if isinstance(token, str) and token:
+        return token
+    photos = payload.get("photos")
+    if isinstance(photos, dict):
+        for photo in photos.values():
+            if isinstance(photo, dict):
+                token = photo.get("token")
+                if isinstance(token, str) and token:
+                    return token
+    return None
+
+
 class MaxApiClient:
     def __init__(self, token: str, base_url: str) -> None:
         self.token = token
@@ -260,8 +276,9 @@ class MaxApiClient:
                             parsed = None
                         if isinstance(parsed, dict):
                             result = parsed
-                    if create_result.get("token") and not result.get("token"):
-                        result["token"] = create_result["token"]
+                    token = _upload_token(result) or _upload_token(create_result)
+                    if token:
+                        result["token"] = token
                     if not result:
                         result = dict(create_result)
         except aiohttp.ClientError as exc:
