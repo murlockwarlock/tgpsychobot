@@ -121,8 +121,9 @@ def _classify_max_callback(payload):
         "admin_ai_fallback_toggle",
         "admin_ai_vision_fallback_toggle",
         "admin_ai_image_generation_toggle",
-        "admin_ai_image_edit_toggle",
-    )
+            "admin_ai_image_edit_toggle",
+            "admin_ai_deepseek_proxy",
+        )
     if payload.startswith(navigation) or payload.startswith(mutation):
         return "mutation" if payload.startswith(mutation) else "navigation"
     raise AssertionError(f"unclassified changed MAX AI callback: {payload}")
@@ -168,6 +169,13 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
     client._request = fake_request
     app = MaxBotApplication(client=client)
     update_id = 1
+    classified_callbacks = set()
+    model_picker_back_passes = 0
+
+    def classify_visible(attachments):
+        for button in _max_buttons(attachments):
+            _classify_max_callback(button["payload"])
+            classified_callbacks.add(button["payload"])
 
     async def send_admin_command(command):
         nonlocal update_id
@@ -210,6 +218,7 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
     assert "Настройки ИИ" in ai["text"]
     keys = await press("admin_ai_keys", ai.get("attachments", []))
     assert "Провайдеры и модели" in keys["text"]
+    classify_visible(keys.get("attachments"))
 
     key_buttons = _max_buttons(keys.get("attachments"))
     key_buttons_only = [button for button in key_buttons if button["payload"].startswith("admin_ai_key_")]
@@ -227,6 +236,7 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
         assert "API key" in prompt["text"]
         keys = await send_admin_command("/admin")
         keys = await press("admin_ai_keys", keys.get("attachments", []))
+        classify_visible(keys.get("attachments"))
 
     chat_providers = {payload.replace("admin_ai_models_", "", 1) for payload in (button["payload"] for button in model_buttons)}
     assert "Deepgram" in chat_providers
@@ -237,21 +247,33 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
         detail = await press(button["payload"], keys.get("attachments", []))
         assert provider in detail["text"]
         detail_buttons = _max_buttons(detail.get("attachments"))
+        classify_visible(detail.get("attachments"))
         if provider != "Deepgram":
             assert any(item["payload"] == f"admin_ai_model_max_tokens_{provider}" for item in detail_buttons)
             prompt = await press(f"admin_ai_model_max_tokens_{provider}", detail.get("attachments", []))
             assert "Авто" in prompt["text"]
+            classify_visible(prompt.get("attachments"))
             saved = await send_admin_command("Авто")
             assert provider in saved["text"] and "Max tokens" in saved["text"]
+            classify_visible(saved.get("attachments"))
         else:
             saved = detail
         model_screen = await press(f"admin_ai_provider_models_{provider}", saved.get("attachments", []))
+        classify_visible(model_screen.get("attachments"))
         choices = _max_buttons(model_screen.get("attachments"))
         assert choices, provider
         for choice in choices:
             _classify_max_callback(choice["payload"])
+        model_back = next(item for item in choices if item["payload"] == f"admin_ai_models_{provider}")
+        detail = await press(model_back["payload"], model_screen.get("attachments", []))
+        assert provider in detail["text"]
+        model_picker_back_passes += 1
+        model_screen = await press(f"admin_ai_provider_models_{provider}", detail.get("attachments", []))
+        classify_visible(model_screen.get("attachments"))
+        choices = _max_buttons(model_screen.get("attachments"))
         selected = await press(choices[0]["payload"], model_screen.get("attachments", []))
         assert provider in selected["text"]
+        classify_visible(selected.get("attachments"))
         keys = await press("admin_ai_keys", selected.get("attachments", []))
 
     picker_callbacks = {
@@ -262,6 +284,7 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
     }
     for picker_payload, channel in picker_callbacks.items():
         picker = await press(picker_payload, keys.get("attachments", []))
+        classify_visible(picker.get("attachments"))
         providers = [
             button
             for button in _max_buttons(picker.get("attachments"))
@@ -273,6 +296,7 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
         assert expected <= {button["payload"].rsplit("_", 1)[-1] for button in providers}
         for provider_button in providers:
             chosen = await press(provider_button["payload"], picker.get("attachments", []))
+            classify_visible(chosen.get("attachments"))
             if provider_button["payload"].endswith("_None"):
                 keys = chosen
                 assert "Провайдеры и модели" in keys["text"]
@@ -281,6 +305,7 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
             for choice in _max_buttons(chosen.get("attachments")):
                 _classify_max_callback(choice["payload"])
             keys = await press(model_choice["payload"], chosen.get("attachments", []))
+            classify_visible(keys.get("attachments"))
             heading_title = {
                 "transcription": "Аудио",
                 "vision": "Vision",
@@ -291,20 +316,27 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
             picker = await press(picker_payload, keys.get("attachments", []))
 
     fallback = await press("admin_ai_text_fallback", keys.get("attachments", []))
+    classify_visible(fallback.get("attachments"))
     provider_picker = await press("admin_ai_fallback_provider", fallback.get("attachments", []))
+    classify_visible(provider_picker.get("attachments"))
     provider_button = next(item for item in _max_buttons(provider_picker.get("attachments")) if item["payload"].startswith("admin_ai_set_fallback_provider_"))
     selected_fallback_provider = provider_button["payload"].replace("admin_ai_set_fallback_provider_", "", 1)
     model_picker = await press(provider_button["payload"], provider_picker.get("attachments", []))
+    classify_visible(model_picker.get("attachments"))
     model_button = next(item for item in _max_buttons(model_picker.get("attachments")) if item["payload"].startswith("admin_ai_save_fallback_"))
     selected_fallback_model = model_button["payload"].replace(f"admin_ai_save_fallback_{selected_fallback_provider}_", "", 1)
     fallback = await press(model_button["payload"], model_picker.get("attachments", []))
+    classify_visible(fallback.get("attachments"))
     assert "Резерв текста" in fallback["text"]
     assert "Выключен" in fallback["text"]
     fallback = await press("admin_ai_fallback_toggle", fallback.get("attachments", []))
+    classify_visible(fallback.get("attachments"))
     assert "Включён" in fallback["text"]
     fallback = await press("admin_ai_fallback_toggle", fallback.get("attachments", []))
+    classify_visible(fallback.get("attachments"))
     assert "Выключен" in fallback["text"]
     fallback = await press("admin_ai_fallback_toggle", fallback.get("attachments", []))
+    classify_visible(fallback.get("attachments"))
     assert "Включён" in fallback["text"]
     assert selected_fallback_provider in fallback["text"] and selected_fallback_model in fallback["text"]
     keys = await press("admin_ai_keys", fallback.get("attachments", []))
@@ -316,6 +348,7 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
         ("admin_ai_image_edit", "Редактирование", "image_edit"),
     ):
         screen = await press(picker_payload, keys.get("attachments", []))
+        classify_visible(screen.get("attachments"))
         assert heading in screen["text"]
         provider_picker = await press(
             {
@@ -326,6 +359,7 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
             }[picker_payload],
             screen.get("attachments", []),
         )
+        classify_visible(provider_picker.get("attachments"))
         provider_buttons = [
             item for item in _max_buttons(provider_picker.get("attachments"))
             if item["payload"].startswith(f"admin_ai_choose_capability_{channel}_")
@@ -334,25 +368,34 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
         for provider_button in provider_buttons:
             _classify_max_callback(provider_button["payload"])
         chosen = await press(provider_buttons[0]["payload"], provider_picker.get("attachments", []))
+        classify_visible(chosen.get("attachments"))
         model_buttons_for_channel = _max_buttons(chosen.get("attachments"))
         if model_buttons_for_channel and not model_buttons_for_channel[0]["payload"].endswith("_None"):
             selected = next(item for item in model_buttons_for_channel if not item["payload"].endswith("_None"))
             chosen = await press(selected["payload"], chosen.get("attachments", []))
+            classify_visible(chosen.get("attachments"))
         assert heading in chosen["text"]
         keys = await press("admin_ai_keys", chosen.get("attachments", []))
 
     vision_fallback = await press("admin_ai_vision_fallback", keys.get("attachments", []))
+    classify_visible(vision_fallback.get("attachments"))
     provider_picker = await press("admin_ai_vision_fallback_provider", vision_fallback.get("attachments", []))
+    classify_visible(provider_picker.get("attachments"))
     provider_button = next(item for item in _max_buttons(provider_picker.get("attachments")) if item["payload"].startswith("admin_ai_set_vision_fallback_provider_"))
     model_picker = await press(provider_button["payload"], provider_picker.get("attachments", []))
+    classify_visible(model_picker.get("attachments"))
     model_button = next(item for item in _max_buttons(model_picker.get("attachments")) if item["payload"].startswith("admin_ai_save_vision_fallback_"))
     vision_fallback = await press(model_button["payload"], model_picker.get("attachments", []))
+    classify_visible(vision_fallback.get("attachments"))
     assert "Vision резерв" in vision_fallback["text"]
     await press("admin_ai_vision_fallback_toggle", vision_fallback.get("attachments", []))
     keys = await press("admin_ai_keys", vision_fallback.get("attachments", []))
+    classify_visible(keys.get("attachments"))
     ai = await press("admin_ai_settings", keys.get("attachments", []))
     root = await press("admin_panel", ai.get("attachments", []))
     assert "Добро пожаловать" in root["text"]
+    assert classified_callbacks
+    assert model_picker_back_passes == 8
 
 
 async def _true_async():

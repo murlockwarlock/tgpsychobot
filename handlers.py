@@ -512,7 +512,7 @@ async def _apply_registration_referral(
 
 
 @router.callback_query(F.data.startswith(TELEGRAM_MODEL_CALLBACK_PREFIX))
-async def handle_compact_model_callback(callback: CallbackQuery):
+async def handle_compact_model_callback(callback: CallbackQuery, state: FSMContext | None = None):
     resolved = resolve_telegram_model_callback(callback.data)
     if not resolved:
         await _reject_model_callback(callback)
@@ -559,6 +559,12 @@ async def handle_compact_model_callback(callback: CallbackQuery):
             return
         await session.commit()
 
+    picker_return = None
+    if state is not None:
+        picker_return = (await state.get_data()).get("model_picker_return")
+        if picker_return:
+            await state.update_data(model_picker_return=None)
+
     await callback.answer(f"✅ Модель изменена на {normalized_model}")
     if channel == "chat" and getattr(callback, "message", None):
         await _render_provider_model_settings(callback, provider)
@@ -566,7 +572,7 @@ async def handle_compact_model_callback(callback: CallbackQuery):
         await _render_text_fallback(callback)
     elif channel == "vision_fallback" and getattr(callback, "message", None):
         await _render_vision_fallback(callback)
-    elif channel == "transcription" and provider == PROVIDER_DEEPGRAM and getattr(callback, "message", None):
+    elif channel == "transcription" and provider == PROVIDER_DEEPGRAM and picker_return == f"view_models_{provider}" and getattr(callback, "message", None):
         await _render_provider_model_settings(callback, provider, channel="transcription")
     elif channel == "transcription" and getattr(callback, "message", None):
         await open_audio_settings(callback, answer=False)
@@ -5641,7 +5647,7 @@ async def select_image_edit_provider(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("admin_choose_capability_"))
-async def choose_capability_provider(callback: CallbackQuery):
+async def choose_capability_provider(callback: CallbackQuery, state: FSMContext | None = None):
     payload = callback.data.replace("admin_choose_capability_", "", 1)
     channel, _, provider_value = payload.rpartition("_")
     if channel not in {"transcription", "vision", "image", "image_gen", "image_edit"}:
@@ -5720,6 +5726,8 @@ async def choose_capability_provider(callback: CallbackQuery):
             back_callback=back_callback,
         ),
     )
+    if state is not None:
+        await state.update_data(model_picker_return=back_callback)
 
 
 @router.callback_query(F.data == "toggle_deepseek_thinking")
@@ -6364,7 +6372,7 @@ async def open_audio_settings(callback: CallbackQuery, *, answer: bool = True):
 
 
 @router.callback_query(F.data == "admin_audio_model")
-async def open_audio_model_picker(callback: CallbackQuery):
+async def open_audio_model_picker(callback: CallbackQuery, state: FSMContext | None = None):
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         provider = getattr(config, "transcription_provider", None) if config else None
@@ -6383,6 +6391,8 @@ async def open_audio_model_picker(callback: CallbackQuery):
             back_callback="admin_ai_audio",
         ),
     )
+    if state is not None:
+        await state.update_data(model_picker_return="admin_ai_audio")
     await callback.answer()
 
 
@@ -7076,7 +7086,7 @@ async def view_models_by_provider(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("view_provider_models_"))
-async def view_provider_model_choices(callback: CallbackQuery):
+async def view_provider_model_choices(callback: CallbackQuery, state: FSMContext | None = None):
     provider = canonical_provider_name(callback.data.replace("view_provider_models_", "", 1))
     channel = "transcription" if provider == PROVIDER_DEEPGRAM else "chat"
     selectable_models = get_selectable_models(provider, channel=channel)
@@ -7111,6 +7121,8 @@ async def view_provider_model_choices(callback: CallbackQuery):
             back_callback=f"view_models_{provider}",
         )
     )
+    if state is not None:
+        await state.update_data(model_picker_return=f"view_models_{provider}")
     await callback.answer()
 
 

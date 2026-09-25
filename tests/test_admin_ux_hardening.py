@@ -162,6 +162,91 @@ async def _feed_callback(dispatcher, bot, message, data, update_id):
     )
 
 
+def _ai_callback_buttons(markup):
+    return [
+        button
+        for row in (markup.inline_keyboard if markup else [])
+        for button in row
+        if button.callback_data
+    ]
+
+
+def _classify_telegram_ai_callback(callback_data):
+    navigation = {
+        "admin_ai_settings",
+        "admin_ai_keys",
+        "admin_ai_main_chat",
+        "admin_ai_main_chat_provider",
+        "admin_ai_main_chat_model",
+        "admin_ai_text_fallback",
+        "admin_ai_fallback_provider",
+        "admin_ai_fallback_model",
+        "admin_ai_audio",
+        "admin_audio_model",
+        "admin_ai_vision",
+        "admin_change_vision_model",
+        "admin_ai_vision_fallback",
+        "admin_ai_vision_fallback_provider",
+        "admin_ai_vision_fallback_model",
+        "admin_ai_image_generation",
+        "admin_change_image_generation_model",
+        "admin_ai_image_edit",
+        "admin_change_image_edit_model",
+        "admin_ai_common",
+        "admin_edit_system_prompt",
+        "admin_edit_shared_prompt_block",
+        "admin_edit_service_prompt_block",
+        "admin_ai_logs_0_all",
+        "admin_panel",
+        "admin_select_transcription_provider",
+        "admin_select_vision_provider",
+        "admin_select_image_generation_provider",
+        "admin_select_image_edit_provider",
+    }
+    if callback_data in navigation or callback_data.startswith((
+        "view_models_",
+        "view_provider_models_",
+        "cancel_state_",
+    )):
+        return "navigation"
+    if callback_data.startswith((
+        "ai_provider_",
+        "set_key_",
+        "model_setting_",
+        "model_reasoning_",
+        "ai_m_",
+        "admin_choose_capability_",
+        "admin_ai_fallback_set_provider_",
+        "admin_ai_vision_fallback_set_provider_",
+        "admin_ai_main_chat_set_",
+    )):
+        return "mutation"
+    if callback_data in {
+        "admin_ai_fallback_toggle",
+        "admin_ai_vision_fallback_toggle",
+        "admin_ai_image_generation_toggle",
+        "admin_ai_image_edit_toggle",
+        "admin_ai_deepseek_proxy",
+        "set_audio_limit",
+        "set_context_first",
+        "set_context_recent",
+        "toggle_preserve_topic_context",
+        "set_ai_timeout",
+        "set_kie_credit_threshold",
+    }:
+        return "mutation"
+    raise AssertionError(f"unclassified changed Telegram AI callback: {callback_data}")
+
+
+def _classify_telegram_ai_markup(markup, contracts):
+    buttons = _ai_callback_buttons(markup)
+    assert buttons
+    for button in buttons:
+        category = _classify_telegram_ai_callback(button.callback_data)
+        contracts[button.callback_data] = category
+    return buttons
+
+
 @pytest.mark.asyncio
 async def test_content_resource_fields_and_card_have_one_primary_editor(factory, monkeypatch):
     import admin_content_authoring as module
@@ -666,6 +751,63 @@ async def test_admin_dispatcher_general_settings_journey_uses_validated_methods(
 
 
 @pytest.mark.asyncio
+async def test_admin_audio_deepgram_model_selection_returns_to_audio_section(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+
+    for module in (handlers, admin_content_authoring, automation_admin):
+        monkeypatch.setattr(module, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            AIConfig(id=1, provider="Deepseek", transcription_provider="OpenAI"),
+            SubscriptionConfig(id=1),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    message = _admin_message(bot, user_id=11, text="/admin")
+
+    async def press(data, update_id):
+        session.calls.clear()
+        await _feed_callback(dispatcher, bot, message, data, update_id)
+        return next(
+            method
+            for method in reversed(session.calls)
+            if isinstance(method, (EditMessageText, SendMessage))
+        )
+
+    await dispatcher.feed_update(bot, Update(update_id=600, message=message))
+    await press("admin_ai_settings", 601)
+    await press("admin_ai_keys", 602)
+    await press("admin_ai_audio", 603)
+    picker = await press("admin_select_transcription_provider", 604)
+    deepgram_provider = next(
+        button
+        for row in picker.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data == "admin_choose_capability_transcription_Deepgram"
+    )
+    models = await press(deepgram_provider.callback_data, 605)
+    model_button = next(
+        button
+        for row in models.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("ai_m_")
+    )
+    audio = await press(model_button.callback_data, 606)
+
+    assert "🎙 <b>Аудио</b>" in audio.text
+    assert "Deepgram" in audio.text
+
+
+@pytest.mark.asyncio
 async def test_admin_dispatcher_crawls_every_visible_top_level_button(factory, admin_dispatcher, monkeypatch):
     import admin_content_authoring
     import automation_admin
@@ -935,7 +1077,7 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
     current_message = _admin_message(bot, user_id=11, text="/admin")
     await dispatcher.feed_update(bot, Update(update_id=1200, message=current_message))
     current_markup = next(method for method in reversed(session.calls) if isinstance(method, SendMessage)).reply_markup
-    journey_count = 0
+    update_id = 1200
 
     def buttons(markup):
         return [button for row in (markup.inline_keyboard if markup else []) for button in row if button.callback_data]
@@ -947,12 +1089,12 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
         return methods[-1]
 
     async def press(data, expected=None):
-        nonlocal current_message, current_markup, journey_count
+        nonlocal current_message, current_markup, update_id
         await dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11).clear()
         session.calls.clear()
         callback_message = current_message.model_copy(update={"reply_markup": current_markup, "text": getattr(current_message, "text", "Админ-панель")})
-        await _feed_callback(dispatcher, bot, callback_message, data, 1201 + journey_count)
-        journey_count += 1
+        update_id += 1
+        await _feed_callback(dispatcher, bot, callback_message, data, update_id)
         result = rendered()
         if expected:
             assert expected in result.text
@@ -975,7 +1117,8 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
             max_button = next(b for b in buttons(detail.reply_markup) if b.callback_data.startswith("model_setting_max_tokens_"))
             await press(max_button.callback_data, "Max tokens")
             prompt = rendered()
-            await dispatcher.feed_update(bot, Update(update_id=1300 + journey_count, message=_admin_message(bot, user_id=11, text="Авто").model_copy(update={"reply_markup": current_markup})))
+            update_id += 1
+            await dispatcher.feed_update(bot, Update(update_id=update_id, message=_admin_message(bot, user_id=11, text="Авто").model_copy(update={"reply_markup": current_markup})))
             result = rendered()
             assert "Max tokens" in result.text
             current_markup = result.reply_markup
@@ -995,10 +1138,435 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
 
     for callback_data, heading in (("admin_ai_audio", "Аудио"), ("admin_ai_vision", "Vision"), ("admin_ai_image_generation", "Генерация"), ("admin_ai_image_edit", "Редактирование"), ("admin_ai_common", "Общие настройки")):
         await press(callback_data, heading)
-        await press("admin_ai_keys", "Провайдеры и модели")
+    await press("admin_ai_keys", "Провайдеры и модели")
 
     await press("admin_panel", "Добро пожаловать в админ-панель")
-    assert journey_count >= 30
+
+
+@pytest.mark.asyncio
+async def test_telegram_ai_visible_button_contracts_use_complete_dispatcher_journeys(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    from database import AIModelSettings
+    from provider_models import (
+        ALL_PROVIDERS,
+        PROVIDER_DEEPGRAM,
+        resolve_telegram_model_callback,
+    )
+
+    for module in (handlers, admin_content_authoring, automation_admin):
+        monkeypatch.setattr(module, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+    monkeypatch.setattr(handlers, "send_temp_notification", AsyncMock())
+
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            AIConfig(
+                id=1,
+                provider="Deepseek",
+                deepseek_model="deepseek-flash",
+                transcription_provider="OpenAI",
+                vision_provider="Gemini",
+                vision_model="gemini-3.7-flash",
+                image_generation_provider="OpenAI",
+                image_generation_model="gpt-image-2",
+                image_edit_provider="KIE",
+                image_edit_model="seedream/4.5-edit",
+                fallback_provider=None,
+                fallback_model=None,
+                allow_fallback=False,
+                allow_vision_fallback=False,
+                vision_fallback_provider=None,
+                vision_fallback_model=None,
+                use_proxy=True,
+            ),
+            SubscriptionConfig(id=1),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    message = _admin_message(bot, user_id=11, text="/admin")
+    update_id = 2000
+    current_markup = None
+    current_text = "/admin"
+    contracts = {}
+    nested_back_contracts = {
+        "provider_model_picker": [0, 8],
+        "provider_api_key_cancel": [0, 8],
+        "deepseek_reasoning": [0, 1],
+        "text_fallback": [0, 8],
+        "vision_fallback": [0, 7],
+        "capability_pickers": [0, 19],
+    }
+    completed_flows = {
+        "text_fallback": False,
+        "vision_fallback": False,
+        "transcription": False,
+        "vision": False,
+        "image_gen": False,
+        "image_edit": False,
+    }
+
+    async def render_latest(expected=None, *, classify=True):
+        nonlocal current_markup, current_text
+        methods = [method for method in session.calls if isinstance(method, (EditMessageText, SendMessage))]
+        assert methods
+        rendered = methods[-1]
+        assert isinstance(rendered.text, str)
+        if expected:
+            assert expected in rendered.text, rendered.text
+        if classify:
+            _classify_telegram_ai_markup(rendered.reply_markup, contracts)
+        current_markup = rendered.reply_markup
+        current_text = rendered.text
+        return rendered
+
+    async def press(callback_data, expected=None, *, classify=True):
+        nonlocal update_id
+        visible = {button.callback_data for button in _ai_callback_buttons(current_markup)}
+        assert callback_data in visible, (callback_data, visible, current_text)
+        session.calls.clear()
+        update_id += 1
+        callback_message = message.model_copy(update={"text": current_text, "reply_markup": current_markup})
+        await _feed_callback(dispatcher, bot, callback_message, callback_data, update_id)
+        return await render_latest(expected, classify=classify)
+
+    async def send_text(value, expected=None):
+        nonlocal update_id
+        session.calls.clear()
+        update_id += 1
+        input_message = _admin_message(bot, user_id=11, message_id=message.message_id, text=value)
+        input_message = input_message.model_copy(update={"reply_markup": current_markup})
+        await dispatcher.feed_update(bot, Update(update_id=update_id, message=input_message))
+        return await render_latest(expected)
+
+    await dispatcher.feed_update(bot, Update(update_id=update_id, message=message))
+    await render_latest("Добро пожаловать", classify=False)
+    await press("admin_ai_settings", "Настройки ИИ", classify=False)
+    keys = await press("admin_ai_keys", "Провайдеры и модели")
+    key_buttons = _ai_callback_buttons(keys.reply_markup)
+    assert [len(row) for row in keys.reply_markup.inline_keyboard[:8]] == [2] * 8
+    assert len([button for button in key_buttons if button.callback_data.startswith("set_key_")]) == 8
+    assert not {
+        "admin_toggle_fallback",
+        "admin_toggle_transcription",
+        "admin_toggle_vision",
+        "admin_toggle_image_generation",
+        "admin_toggle_image_edit",
+    } & {button.callback_data for button in key_buttons}
+    provider_buttons = [button for button in key_buttons if button.callback_data.startswith("view_models_")]
+    assert len(provider_buttons) == 8
+    assert {button.callback_data.replace("view_models_", "", 1) for button in provider_buttons} == {*ALL_PROVIDERS, PROVIDER_DEEPGRAM}
+
+    model_picker_passes = 0
+    api_key_passes = 0
+    max_token_passes = 0
+    for provider_button in provider_buttons:
+        provider = provider_button.callback_data.replace("view_models_", "", 1)
+        detail = await press(provider_button.callback_data, "Провайдер:")
+        api_button = next(button for button in _ai_callback_buttons(detail.reply_markup) if button.callback_data == f"model_setting_api_key_{provider}")
+        prompt = await press(api_button.callback_data, "Отправьте новый API-ключ")
+        cancel = next(button.callback_data for button in _ai_callback_buttons(prompt.reply_markup) if button.callback_data.startswith("cancel_state_view_models_"))
+        detail = await press(cancel, "Параметры модели" if provider != PROVIDER_DEEPGRAM else provider)
+        nested_back_contracts["provider_api_key_cancel"][0] += 1
+        api_button = next(button for button in _ai_callback_buttons(detail.reply_markup) if button.callback_data == f"model_setting_api_key_{provider}")
+        await press(api_button.callback_data, "Отправьте новый API-ключ")
+        detail = await send_text(f"isolated-{provider.lower()}-key", provider)
+        async with factory() as verify:
+            config = await verify.get(AIConfig, 1)
+            key_field = "deepgram_api_key" if provider == PROVIDER_DEEPGRAM else f"{provider.lower()}_api_key"
+            assert getattr(config, key_field) == f"isolated-{provider.lower()}-key"
+            assert config.provider == "Deepseek"
+        api_key_passes += 1
+
+        model_picker = await press(f"view_provider_models_{provider}", "Выберите модель")
+        model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "⬅️ Назад")
+        detail = await press(model_back, "Параметры модели" if provider != PROVIDER_DEEPGRAM else provider)
+        nested_back_contracts["provider_model_picker"][0] += 1
+        model_picker = await press(f"view_provider_models_{provider}", "Выберите модель")
+        model_button = next(button for button in _ai_callback_buttons(model_picker.reply_markup) if button.callback_data.startswith("ai_m_"))
+        resolved = resolve_telegram_model_callback(model_button.callback_data)
+        assert resolved and resolved[0] == provider
+        detail = await press(model_button.callback_data, "Провайдер:")
+        assert resolved[2] in detail.text
+        model_picker_passes += 1
+
+        if provider != PROVIDER_DEEPGRAM:
+            max_button = next(button for button in _ai_callback_buttons(detail.reply_markup) if button.callback_data == f"model_setting_max_tokens_{provider}")
+            await press(max_button.callback_data, "Max tokens")
+            detail = await send_text("1", "Max tokens")
+            assert "Max tokens: <b>1</b>" in detail.text
+            async with factory() as verify:
+                settings = await verify.scalar(
+                    select(AIModelSettings).where(
+                        AIModelSettings.provider == provider,
+                        AIModelSettings.model == resolved[2],
+                        AIModelSettings.channel == "chat",
+                    )
+                )
+                assert settings.max_output_tokens == 1
+            max_token_passes += 1
+
+        if provider == "Deepseek":
+            proxy_button = next(button for button in _ai_callback_buttons(detail.reply_markup) if button.callback_data == "admin_ai_deepseek_proxy")
+            proxy_before = None
+            async with factory() as verify:
+                proxy_before = (await verify.get(AIConfig, 1)).use_proxy
+            detail = await press(proxy_button.callback_data, "Proxy:")
+            async with factory() as verify:
+                assert (await verify.get(AIConfig, 1)).use_proxy is not proxy_before
+            await press("admin_ai_keys", "Провайдеры и модели")
+            detail = await press("view_models_Deepseek", "Параметры модели")
+            proxy_button = next(button for button in _ai_callback_buttons(detail.reply_markup) if button.callback_data == "admin_ai_deepseek_proxy")
+            await press(proxy_button.callback_data, "Proxy:")
+            async with factory() as verify:
+                assert (await verify.get(AIConfig, 1)).use_proxy is proxy_before
+            detail = await press("model_setting_reasoning_Deepseek", "Reasoning DeepSeek")
+            reasoning_back = next(button.callback_data for button in _ai_callback_buttons(detail.reply_markup) if button.text == "⬅️ Назад")
+            detail = await press(reasoning_back, "Параметры модели")
+            nested_back_contracts["deepseek_reasoning"][0] += 1
+            detail = await press("model_setting_reasoning_Deepseek", "Reasoning DeepSeek")
+            reasoning_max = next(button.callback_data for button in _ai_callback_buttons(detail.reply_markup) if button.callback_data == "model_reasoning_Deepseek_max")
+            detail = await press(reasoning_max, "Параметры модели")
+            assert "Reasoning: <b>Max</b>" in detail.text
+            await press("admin_ai_keys", "Провайдеры и модели")
+            detail = await press("view_models_Deepseek", "Параметры модели")
+            assert "Reasoning: <b>Max</b>" in detail.text
+
+        await press("admin_ai_keys", "Провайдеры и модели")
+        keys = await render_latest("Провайдеры и модели")
+
+    assert model_picker_passes == 8
+    assert api_key_passes == 8
+    assert max_token_passes == len(ALL_PROVIDERS)
+
+    async def return_to_keys():
+        nonlocal keys
+        keys = await press("admin_ai_keys", "Провайдеры и модели")
+
+    fallback = await press("admin_ai_text_fallback", "Резерв текста")
+    fallback_picker = await press("admin_ai_fallback_provider", "провайдера")
+    await press("admin_ai_text_fallback", "Резерв текста")
+    nested_back_contracts["text_fallback"][0] += 1
+    fallback_picker = await press("admin_ai_fallback_provider", "провайдера")
+    fallback_provider_buttons = [button for button in _ai_callback_buttons(fallback_picker.reply_markup) if button.callback_data.startswith("admin_ai_fallback_set_provider_")]
+    assert fallback_provider_buttons
+    for provider_button in fallback_provider_buttons:
+        fallback = await press(provider_button.callback_data, "Резерв текста")
+        model_picker = await press("admin_ai_fallback_model", "Выберите модель")
+        model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "⬅️ Назад")
+        fallback = await press(model_back, "Резерв текста")
+        nested_back_contracts["text_fallback"][0] += 1
+        model_picker = await press("admin_ai_fallback_model", "Выберите модель")
+        model_button = next(button for button in _ai_callback_buttons(model_picker.reply_markup) if button.callback_data.startswith("ai_m_"))
+        fallback = await press(model_button.callback_data, "Резерв текста")
+        await return_to_keys()
+        fallback = await press("admin_ai_text_fallback", "Резерв текста")
+        fallback_picker = await press("admin_ai_fallback_provider", "провайдера")
+    fallback = await press(fallback_provider_buttons[-1].callback_data, "Резерв текста")
+    await press("admin_ai_fallback_model", "Выберите модель")
+    model_button = next(button for button in _ai_callback_buttons(current_markup) if button.callback_data.startswith("ai_m_"))
+    fallback = await press(model_button.callback_data, "Резерв текста")
+    fallback = await press("admin_ai_fallback_toggle", "Резерв текста")
+    fallback = await press("admin_ai_fallback_toggle", "Резерв текста")
+    await return_to_keys()
+    fallback = await press("admin_ai_text_fallback", "Резерв текста")
+    assert "Статус: <b>Выключен</b>" in fallback.text
+    assert "Провайдер:" in fallback.text and "Модель:" in fallback.text
+    fallback = await press("admin_ai_fallback_toggle", "Резерв текста")
+    assert "Статус: <b>Включён</b>" in fallback.text
+    completed_flows["text_fallback"] = True
+    await return_to_keys()
+
+    vision_fallback = await press("admin_ai_vision_fallback", "Vision резерв")
+    vision_picker = await press("admin_ai_vision_fallback_provider", "провайдера")
+    await press("admin_ai_vision_fallback", "Vision резерв")
+    nested_back_contracts["vision_fallback"][0] += 1
+    vision_picker = await press("admin_ai_vision_fallback_provider", "провайдера")
+    vision_provider_buttons = [button for button in _ai_callback_buttons(vision_picker.reply_markup) if button.callback_data.startswith("admin_ai_vision_fallback_set_provider_")]
+    assert vision_provider_buttons
+    for provider_button in vision_provider_buttons:
+        vision_fallback = await press(provider_button.callback_data, "Vision резерв")
+        model_picker = await press("admin_ai_vision_fallback_model", "модель Vision")
+        model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "⬅️ Назад")
+        vision_fallback = await press(model_back, "Vision резерв")
+        nested_back_contracts["vision_fallback"][0] += 1
+        model_picker = await press("admin_ai_vision_fallback_model", "модель Vision")
+        model_button = next(button for button in _ai_callback_buttons(model_picker.reply_markup) if button.callback_data.startswith("ai_m_"))
+        vision_fallback = await press(model_button.callback_data, "Vision резерв")
+        await return_to_keys()
+        vision_fallback = await press("admin_ai_vision_fallback", "Vision резерв")
+        vision_picker = await press("admin_ai_vision_fallback_provider", "провайдера")
+    vision_fallback = await press(vision_provider_buttons[-1].callback_data, "Vision резерв")
+    await press("admin_ai_vision_fallback_toggle", "Vision резерв")
+    await press("admin_ai_vision_fallback_toggle", "Vision резерв")
+    await return_to_keys()
+    vision_fallback = await press("admin_ai_vision_fallback", "Vision резерв")
+    assert "Статус: <b>Выключен</b>" in vision_fallback.text
+    assert "Провайдер:" in vision_fallback.text and "Модель:" in vision_fallback.text
+    vision_fallback = await press("admin_ai_vision_fallback_toggle", "Vision резерв")
+    assert "Статус: <b>Включён</b>" in vision_fallback.text
+    completed_flows["vision_fallback"] = True
+    await return_to_keys()
+
+    capability_journeys = {
+        "transcription": ("admin_ai_audio", "admin_select_transcription_provider", "🎙 <b>Аудио</b>", "admin_ai_audio"),
+        "vision": ("admin_ai_vision", "admin_select_vision_provider", "🖼 <b>Vision</b>", "admin_ai_vision"),
+        "image_gen": ("admin_ai_image_generation", "admin_select_image_generation_provider", "Генерация изображений", "admin_ai_image_generation"),
+        "image_edit": ("admin_ai_image_edit", "admin_select_image_edit_provider", "Редактирование изображений", "admin_ai_image_edit"),
+    }
+    for channel, (section_callback, provider_callback, heading, back_callback) in capability_journeys.items():
+        section = await press(section_callback, heading)
+        picker = await press(provider_callback, "провайдера")
+        provider_buttons = [button for button in _ai_callback_buttons(picker.reply_markup) if button.callback_data.startswith(f"admin_choose_capability_{channel}_")]
+        assert provider_buttons
+        for provider_button in provider_buttons:
+            if provider_button.callback_data.endswith("_None"):
+                selected = await press(provider_button.callback_data, heading)
+                assert not any(button.callback_data.startswith("ai_m_") for button in _ai_callback_buttons(selected.reply_markup))
+                await press("admin_ai_keys", "Провайдеры и модели")
+                section = await press(section_callback, heading)
+                picker = await press(provider_callback, "провайдера")
+                continue
+            selected = await press(provider_button.callback_data, "Выберите модель")
+            model_buttons = [button for button in _ai_callback_buttons(selected.reply_markup) if button.callback_data.startswith("ai_m_")]
+            if model_buttons:
+                model_picker_back = next(button.callback_data for button in _ai_callback_buttons(selected.reply_markup) if button.text == "⬅️ Назад")
+                await press(model_picker_back, heading)
+                nested_back_contracts["capability_pickers"][0] += 1
+                picker = await press(provider_callback, "провайдера")
+                selected = await press(provider_button.callback_data, "Выберите модель")
+                model_button = model_buttons[0]
+                selected = await press(model_button.callback_data, heading)
+                assert provider_button.callback_data.rsplit("_", 1)[-1] in selected.text
+            else:
+                assert "выключ" in selected.text.lower()
+            await press("admin_ai_keys", "Провайдеры и модели")
+            section = await press(section_callback, heading)
+            picker = await press(provider_callback, "провайдера")
+        await press(back_callback, heading)
+        nested_back_contracts["capability_pickers"][0] += 1
+        completed_flows[channel] = True
+        await return_to_keys()
+
+    await press("admin_ai_settings", "Настройки ИИ", classify=False)
+    session.calls.clear()
+    update_id += 1
+    callback_message = message.model_copy(update={"text": current_text, "reply_markup": current_markup})
+    await _feed_callback(dispatcher, bot, callback_message, "admin_panel", update_id)
+    await render_latest("Добро пожаловать", classify=False)
+
+    assert model_picker_passes == 8
+    assert api_key_passes == 8
+    assert max_token_passes == 7
+    assert nested_back_contracts == {
+        "provider_model_picker": [8, 8],
+        "provider_api_key_cancel": [8, 8],
+        "deepseek_reasoning": [1, 1],
+        "text_fallback": [8, 8],
+        "vision_fallback": [7, 7],
+        "capability_pickers": [19, 19],
+    }
+    assert all(completed_flows.values())
+    assert len(contracts) > 0
+    assert all(category in {"navigation", "mutation", "destructive", "external"} for category in contracts.values())
+
+
+@pytest.mark.asyncio
+async def test_telegram_legacy_ai_callbacks_redirect_without_cycling(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+
+    for module in (handlers, admin_content_authoring, automation_admin):
+        monkeypatch.setattr(module, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            AIConfig(
+                id=1,
+                provider="Deepseek",
+                transcription_provider="OpenAI",
+                vision_provider="Gemini",
+                image_generation_provider="OpenAI",
+                image_edit_provider="KIE",
+                allow_fallback=False,
+            ),
+            SubscriptionConfig(id=1),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    message = _admin_message(bot, user_id=11, text="/admin")
+    await dispatcher.feed_update(bot, Update(update_id=3000, message=message))
+    root = next(method for method in reversed(session.calls) if isinstance(method, SendMessage))
+    await _feed_callback(dispatcher, bot, message.model_copy(update={"reply_markup": root.reply_markup}), "admin_ai_settings", 3001)
+    ai = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    await _feed_callback(dispatcher, bot, message.model_copy(update={"reply_markup": ai.reply_markup, "text": ai.text}), "admin_ai_keys", 3002)
+    keys = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+
+    stale = {
+        "admin_toggle_fallback": ("Резерв текста", "admin_ai_keys", "fallback_provider", "fallback_model"),
+        "admin_toggle_transcription": ("Выберите провайдера", "admin_ai_audio", "transcription_provider", None),
+        "admin_toggle_vision": ("Выберите провайдера", "admin_ai_vision", "vision_provider", "vision_model"),
+        "admin_toggle_image_generation": ("Выберите провайдера", "admin_ai_image_generation", "image_generation_provider", "image_generation_model"),
+        "admin_toggle_image_edit": ("Выберите провайдера", "admin_ai_image_edit", "image_edit_provider", "image_edit_model"),
+    }
+    for index, (callback_data, (heading, parent, *fields)) in enumerate(stale.items(), start=1):
+        async with factory() as verify:
+            before = {field: getattr(await verify.get(AIConfig, 1), field) for field in fields if field}
+        session.calls.clear()
+        await _feed_callback(
+            dispatcher,
+            bot,
+            message.model_copy(update={"reply_markup": keys.reply_markup, "text": keys.text}),
+            callback_data,
+            3010 + index,
+        )
+        rendered = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+        assert heading in rendered.text
+        assert callback_data not in {button.callback_data for button in _ai_callback_buttons(rendered.reply_markup)}
+        async with factory() as verify:
+            after = {field: getattr(await verify.get(AIConfig, 1), field) for field in fields if field}
+        assert before == after
+        back = next(
+            button.callback_data
+            for button in _ai_callback_buttons(rendered.reply_markup)
+            if button.text in {"⬅️ Назад", "◀️ Назад"}
+        )
+        await _feed_callback(
+            dispatcher,
+            bot,
+            message.model_copy(update={"reply_markup": rendered.reply_markup, "text": rendered.text}),
+            back,
+            3020 + index,
+        )
+        parent_screen = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+        if parent == "admin_ai_keys":
+            assert "Провайдеры и модели" in parent_screen.text
+        else:
+            assert parent_screen.reply_markup
+        keys = parent_screen if parent == "admin_ai_keys" else keys
+        if parent != "admin_ai_keys":
+            session.calls.clear()
+            await _feed_callback(
+                dispatcher,
+                bot,
+                message.model_copy(update={"reply_markup": parent_screen.reply_markup, "text": parent_screen.text}),
+                "admin_ai_keys",
+                3030 + index,
+            )
+            keys = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
 
 
 @pytest.mark.asyncio
