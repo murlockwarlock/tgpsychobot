@@ -218,10 +218,13 @@ class MaxApiClient:
                 payload["message"]["attachments"] = attachments
         if notification:
             payload["notification"] = notification
-        if not payload and not notification:
-            payload["notification"] = "✓"
         try:
-            result = await self._request("POST", "/answers", params={"callback_id": callback_id}, json_data=payload)
+            result = await self._request(
+                "POST",
+                "/answers",
+                params={"callback_id": callback_id},
+                json_data=payload or None,
+            )
             log.info("MAX callback answered callback_id=%s has_message=%s has_notification=%s", callback_id, "message" in payload, bool(notification))
             return result
         except Exception as e:
@@ -249,7 +252,18 @@ class MaxApiClient:
                             text[:2000],
                         )
                         raise MaxApiError(f"Upload failed: HTTP {response.status}: {text}")
-                    result = await response.json()
+                    result: dict[str, Any] = {}
+                    if text.strip():
+                        try:
+                            parsed = json.loads(text)
+                        except json.JSONDecodeError:
+                            parsed = None
+                        if isinstance(parsed, dict):
+                            result = parsed
+                    if create_result.get("token") and not result.get("token"):
+                        result["token"] = create_result["token"]
+                    if not result:
+                        result = dict(create_result)
         except aiohttp.ClientError as exc:
             log.exception("MAX upload transport error media_type=%s file=%s", media_type, file_path)
             raise MaxApiError(f"Upload transport error: {exc}") from exc

@@ -495,7 +495,7 @@ def test_max_identity_verification_uses_read_only_me(monkeypatch):
     result = verifier.verify_identity(entry, "max-secret", {})
 
     assert result["status"] == "verified"
-    assert calls[0][0] == "https://platform-api.max.ru/me"
+    assert calls[0][0] == "https://platform-api2.max.ru/me"
     assert calls[0][2]["headers"] == {"Authorization": "max-secret"}
 
 

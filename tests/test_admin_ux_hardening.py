@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import EditMessageText, GetMe, SendMessage
+from aiogram.methods import EditMessageText, GetChat, GetMe, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User
 from aiogram.client.session.base import BaseSession
 from aiogram import Bot
@@ -119,6 +119,8 @@ class ValidatingTelegramSession(BaseSession):
             ).as_(bot)
         if isinstance(method, GetMe):
             return User(id=999, is_bot=True, first_name="TestBot", username="testbot").as_(bot)
+        if isinstance(method, GetChat):
+            return Chat(id=method.chat_id, type="private", first_name="Admin", username="admin").as_(bot)
         return True
 
     async def stream_content(self, *args, **kwargs):

@@ -52,7 +52,7 @@
 | Планировщик | APScheduler |
 | AI HTTP-клиенты | OpenAI SDK, Anthropic SDK, Google Generative AI, httpx |
 | Платежи | Telegram Payments, YooKassa, Robokassa |
-| MAX | собственный async-клиент к `platform-api.max.ru` |
+| MAX | собственный async-клиент к `platform-api2.max.ru` |
 | Тесты | pytest |
 
 ## Структура проекта

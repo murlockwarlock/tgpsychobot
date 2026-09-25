@@ -310,7 +310,7 @@ def patch_bot_send_message(bot: Bot):
             if not token:
                 logging.getLogger("scheduler").warning(f"Cannot send MAX message to {chat_id_int}: MAX_BOT_TOKEN not configured in env")
                 return None
-            base_url = os.environ.get("MAX_API_BASE", "https://platform-api.max.ru")
+            base_url = os.environ.get("MAX_API_BASE", "https://platform-api2.max.ru")
             
             # Map reply_markup to attachments if present
             attachments = None
