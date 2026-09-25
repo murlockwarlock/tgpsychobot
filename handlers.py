@@ -524,11 +524,14 @@ async def handle_compact_model_callback(callback: CallbackQuery):
         await _reject_model_callback(callback)
         return
 
+    active_scope = None
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
             await _reject_model_callback(callback)
             return
+        if channel == "chat":
+            active_scope = _active_chat_model_scope(config)
 
         if channel == "chat":
             setattr(config, f"{provider.lower()}_model", normalized_model)
@@ -560,8 +563,10 @@ async def handle_compact_model_callback(callback: CallbackQuery):
         await session.commit()
 
     await callback.answer(f"✅ Модель изменена на {normalized_model}")
-    if channel == "chat":
+    if channel == "chat" and active_scope and active_scope[0] == provider:
         await _render_active_model_settings(callback)
+    elif channel == "chat" and getattr(callback, "message", None):
+        await admin_ai_keys_models(callback)
     elif channel in {"fallback", "vision_fallback", "vision", "image_gen", "image_edit", "transcription"} and getattr(callback, "message", None):
         await admin_ai_keys_models(callback)
 
@@ -6588,6 +6593,7 @@ async def view_models_by_provider(callback: CallbackQuery):
                 for model_id in selectable_models
             },
             channel=channel,
+            back_callback="admin_ai_keys",
         )
     )
 
