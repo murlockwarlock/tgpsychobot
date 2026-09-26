@@ -45,3 +45,11 @@ MAX displays the raw MAX user id in the same `Пользователь … / ID 
 the internal database identity remains shared with Telegram scheduling. Follow-up
 static text is intentionally a Russian shared business field; it is not part of
 the multilingual authoring whitelist on either platform.
+
+MAX journey tests extract callback payloads from the rendered inline-keyboard
+attachments and dispatch those exact payloads through `MaxBotApplication`. Every
+visible `admin_fu_*` callback is classified by `classify_followup_callback`; an
+unknown rendered callback fails the test. The same journey client drives the real
+`MaxApiClient` request boundary through an isolated HTTP session and validates
+message, attachment, inline-keyboard, and callback payload shapes before any
+network call.

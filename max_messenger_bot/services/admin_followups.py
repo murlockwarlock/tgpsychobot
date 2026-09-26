@@ -283,7 +283,13 @@ async def clear_stops(client: MaxApiClient, chat_id: int, campaign_id: int) -> N
 
 
 async def show_stage_picker(client: MaxApiClient, chat_id: int, campaign_id: int) -> None:
-    rows = [[callback_button(FOLLOWUP_STAGE_LABELS[mode], f"admin_fu_stage_mode_{campaign_id}_{mode}")] for mode in FOLLOWUP_STAGE_MODES]
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, campaign_id)
+    current_mode = _canonical_followup_stage_condition(item).mode if item is not None else "all"
+    rows = [
+        [callback_button(("✅ " if mode == current_mode else "") + FOLLOWUP_STAGE_LABELS[mode], f"admin_fu_stage_mode_{campaign_id}_{mode}")]
+        for mode in FOLLOWUP_STAGE_MODES
+    ]
     rows.append(_back(f"admin_fu_conditions_{campaign_id}"))
     await client.send_message(chat_id=chat_id, text="🪜 <b>Этапы запуска</b>\n\nВыберите режим проверки текущего этапа.", attachments=inline_keyboard(rows))
 
@@ -302,7 +308,13 @@ async def select_stage_mode(client: MaxApiClient, states: StateStore, chat_id: i
     await states.set(user_id, chat_id, "max_followup_stage_values", {"campaign_id": campaign_id, "mode": mode})
     await client.send_message(
         chat_id=chat_id,
-        text=f"🪜 <b>{FOLLOWUP_STAGE_LABELS[mode]}</b>\n\nВведите точные названия этапов через запятую. Регистр сохраняется.\nДля незаданного этапа используйте <code>{UNSET_STAGE_TOKEN}</code>.",
+        text=(
+            f"🪜 <b>{FOLLOWUP_STAGE_LABELS[mode]}</b>\n\n"
+            "Введите точные названия этапов через запятую. Регистр сохраняется.\n"
+            f"Для незаданного этапа используйте <code>{UNSET_STAGE_TOKEN}</code>.\n"
+            "Примеры: <code>guide_choice, [не задан]</code>; "
+            "<code>guide_choice, thinking, child_words, completed, [не задан]</code>."
+        ),
         attachments=inline_keyboard([_back(f"admin_fu_stage_{campaign_id}")]),
     )
 
@@ -399,7 +411,17 @@ async def receive_metadata_value(client: MaxApiClient, states: StateStore, chat_
 
 async def start_stops(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, campaign_id: int) -> None:
     await states.set(user_id, chat_id, "max_followup_stop_events", {"campaign_id": campaign_id})
-    await client.send_message(chat_id=chat_id, text="🛑 <b>События остановки</b>\n\nВведите точные имена событий через запятую. Пустой список не останавливает цепочку.", attachments=inline_keyboard([_back(f"admin_fu_conditions_{campaign_id}")]))
+    rows = []
+    async with async_session_maker() as session:
+        item = await session.get(FollowupCampaign, campaign_id)
+    if item is not None and parse_followup_csv(item.stop_events):
+        rows.append([callback_button("🧹 Очистить список", f"admin_fu_stops_clear_{campaign_id}")])
+    rows.append(_back(f"admin_fu_conditions_{campaign_id}"))
+    await client.send_message(
+        chat_id=chat_id,
+        text="🛑 <b>События остановки</b>\n\nВведите точные имена событий через запятую. Пустой список не останавливает цепочку.",
+        attachments=inline_keyboard(rows),
+    )
 
 
 async def receive_stops(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, value: str) -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 FOLLOWUP_CAMPAIGN_EXPLANATION = (
     "Цепочка начинается после действия пользователя и запускается заново после его нового сообщения или нажатия кнопки. "
     "При смене темы или создании нового диалога старая цепочка отменяется. "
@@ -22,3 +24,53 @@ FOLLOWUP_METADATA_LABELS = {
     "not_equals": "!=",
     "contains": "содержит",
 }
+
+
+def classify_followup_callback(payload: str) -> str | None:
+    if payload in {"admin_followups", "admin_fu_list", "admin_fu_add"}:
+        return "navigation"
+    if re.fullmatch(r"admin_fu_campaign_\d+", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_(topics|conditions|stage|metadata|steps|quiet|jitter|self_test)_\d+", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_metadata_operator_edit_\d+", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_step_\d+_\d+", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_step_text_\d+(?:_ru)?", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_(rename|stage|metadata|stops|quiet|jitter)_\d+", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_step_add_\d+_(?:static|ai)", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_step_edit_\d+_\d+", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_step_text_edit_\d+_ru", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_step_delete_\d+_\d+", payload):
+        return "destructive"
+    if re.fullmatch(r"admin_fu_delete_ask_\d+", payload):
+        return "navigation"
+    if re.fullmatch(r"admin_fu_toggle_\d+", payload):
+        return "mutation"
+    if re.fullmatch(r"admin_fu_scope_all_\d+", payload):
+        return "mutation"
+    if re.fullmatch(r"admin_fu_scope_main_\d+", payload):
+        return "mutation"
+    if re.fullmatch(r"admin_fu_scope_topic_\d+_\d+", payload):
+        return "mutation"
+    if re.fullmatch(r"admin_fu_stage_mode_\d+_(?:all|selected|all_except)", payload):
+        return "mutation"
+    if re.fullmatch(r"admin_fu_metadata_op_\d+_(?:equals|not_equals|contains)", payload):
+        return "mutation"
+    if re.fullmatch(r"admin_fu_metadata_clear_\d+", payload):
+        return "mutation"
+    if re.fullmatch(r"admin_fu_stops_clear_\d+", payload):
+        return "mutation"
+    if re.fullmatch(r"admin_fu_delete_yes_\d+", payload):
+        return "destructive"
+    if re.fullmatch(r"admin_fu_step_delete_yes_\d+_\d+", payload):
+        return "destructive"
+    if re.fullmatch(r"admin_fu_self_test_send_\d+", payload):
+        return "external"
+    return None
