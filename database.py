@@ -1280,6 +1280,16 @@ async def init_db():
                 "WHERE attempt_count IS NULL OR attempt_count < 1"
             ))
 
+            delivery_columns = [c['name'] for c in insp.get_columns('followup_deliveries')]
+            if 'platform' not in delivery_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE followup_deliveries ADD COLUMN platform VARCHAR"
+                ))
+            if 'external_message_id' not in delivery_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE followup_deliveries ADD COLUMN external_message_id TEXT"
+                ))
+
             general_columns = [c['name'] for c in insp.get_columns('bot_general_config')]
             if 'ai_processing_message_enabled' not in general_columns:
                 sync_conn.execute(text(
@@ -1990,6 +2000,8 @@ class FollowupDelivery(Base):
     generation = Column(Integer, default=1, nullable=False)
     sent_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     telegram_message_id = Column(BigInteger, nullable=True)
+    platform = Column(String, nullable=True)
+    external_message_id = Column(Text, nullable=True)
 
 
 class FollowupDeliveryAttempt(Base):
