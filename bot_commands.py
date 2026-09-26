@@ -9,6 +9,8 @@ from database import BotGeneralConfig, SubscriptionConfig, User, async_session_m
 from translation_service import (
     normalize_enabled_languages,
     resolve_effective_locale,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
     translate,
 )
 
@@ -87,7 +89,7 @@ async def build_command_sets() -> tuple[list[BotCommand], list[BotCommand], tupl
         None,
         default_locale,
         False,
-        enabled,
+        runtime_enabled_languages(config),
     )
     user_commands = build_user_commands(*flags, locale=default_locale)
     admin_commands = build_admin_commands(*flags)
@@ -123,24 +125,15 @@ async def refresh_commands_for_user(bot: Bot, user_id: int, is_admin_user: bool)
     try:
         user_commands, admin_commands, _ = await build_command_sets()
         if is_admin_user:
-            async with async_session_maker() as session:
-                user = await session.get(User, user_id)
-                config = await session.get(BotGeneralConfig, 1)
-            admin_locale = resolve_effective_locale(
-                getattr(user, "telegram_language_code", None),
-                getattr(config, "telegram_default_language", "ru") if config else "ru",
-                bool(getattr(config, "telegram_language_selection_enabled", False)) if config else False,
-                getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]',
-            )
             flags = await load_command_flags()
-            await refresh_chat_commands(bot, user_id, build_admin_commands(*flags, locale=admin_locale))
+            await refresh_chat_commands(bot, user_id, build_admin_commands(*flags, locale="ru"))
             return
 
         async with async_session_maker() as session:
             user = await session.get(User, user_id)
             config = await session.get(BotGeneralConfig, 1)
-        selector_enabled = bool(getattr(config, "telegram_language_selection_enabled", False)) if config else False
-        enabled = getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]'
+        selector_enabled = runtime_language_selection_enabled(config)
+        enabled = runtime_enabled_languages(config)
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(config, "telegram_default_language", "ru") if config else "ru",

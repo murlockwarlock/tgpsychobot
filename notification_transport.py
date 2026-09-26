@@ -62,7 +62,7 @@ async def send_notification_transport(
         if not token:
             log.warning("Cannot send MAX message to %s: MAX_BOT_TOKEN not configured in env", recipient_id)
             return False
-        base_url = os.environ.get("MAX_API_BASE", "https://platform-api.max.ru")
+        base_url = os.environ.get("MAX_API_BASE", "https://platform-api2.max.ru")
 
         attachments = None
         if reply_markup and hasattr(reply_markup, "inline_keyboard"):

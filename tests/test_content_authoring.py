@@ -7,6 +7,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -103,7 +104,7 @@ async def test_existing_keyboard_needs_refresh_without_guessing_identity(factory
         translation_cache.install(prior.revision, prior.sources, prior.translations)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def factory():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
@@ -373,7 +374,7 @@ async def test_runtime_retains_dynamic_review_values_and_refreshes_revision(fact
 
 
 @pytest.mark.asyncio
-async def test_telegram_authoring_workflow_uses_russian_ui_and_selected_values(factory, monkeypatch):
+async def test_telegram_authoring_workflow_uses_object_local_values(factory, monkeypatch):
     import importlib
     import sys
     from datetime import datetime, timezone
@@ -419,38 +420,43 @@ async def test_telegram_authoring_workflow_uses_russian_ui_and_selected_values(f
         await dispatcher.feed_update(bot, Update(update_id=update_id, callback_query=CallbackQuery(id=str(update_id), from_user=user, chat_instance="test", message=incoming, data=data)))
 
     try:
-        await click("ca:locale:pt")
-        assert any("Язык контента: 🇵🇹 Português" in (getattr(call, "text", "") or "") for call in session.calls)
+        async with factory() as db:
+            config = await db.get(BotGeneralConfig, 1)
+            config.multilingual_authoring_enabled = True
+            await db.commit()
         await click("ca:new:topic")
         update_id += 1
         await dispatcher.feed_update(bot, Update(update_id=update_id, message=incoming.model_copy(update={"text": "Autoestima"})))
         async with factory() as db:
             topic = await db.scalar(select(Topic))
-            assert topic.name == ""
-            assert (await read_content_value(db, "topic", topic, "name", "pt")).text == "Autoestima"
+            assert topic.name == "Autoestima"
         await click(f"ca:view:topic:{topic.id}")
         card = next(call for call in reversed(session.calls) if getattr(call, "text", None))
         assert "Autoestima" in card.text and "Название" in card.text
+        callback_data = [button.callback_data for row in card.reply_markup.inline_keyboard for button in row]
+        assert f"ca:locale:topic:{topic.id}:pt" in callback_data
         for row in card.reply_markup.inline_keyboard:
             for button in row:
                 assert len(button.callback_data.encode()) <= 64
-        await click("ca:locale:ru")
-        await click(f"ca:view:topic:{topic.id}")
+        await click(f"ca:locale:topic:{topic.id}:pt")
         card = next(call for call in reversed(session.calls) if getattr(call, "text", None))
         assert "Перевод не задан" in card.text
-        await click(f"ca:edit:topic:{topic.id}:0")
+        await click(f"ca:edit:topic:{topic.id}:pt:0")
         update_id += 1
-        await dispatcher.feed_update(bot, Update(update_id=update_id, message=incoming.model_copy(update={"text": "Самооценка"})))
+        await dispatcher.feed_update(bot, Update(update_id=update_id, message=incoming.model_copy(update={"text": "Autoestima PT"})))
         async with factory() as db:
             same = await db.get(Topic, topic.id)
-            assert same.name == "Самооценка"
-            assert (await read_content_value(db, "topic", same, "name", "pt")).text == "Autoestima"
-        await click(f"ca:edit:topic:{topic.id}:0")
-        await click("ca:locale:pt")
+            assert same.name == "Autoestima"
+            assert (await read_content_value(db, "topic", same, "name", "pt")).text == "Autoestima PT"
+        await click(f"ca:locale:topic:{topic.id}:en")
+        await click(f"ca:edit:topic:{topic.id}:en:0")
+        update_id += 1
+        await dispatcher.feed_update(bot, Update(update_id=update_id, message=incoming.model_copy(update={"text": "Self-esteem"})))
+        async with factory() as db:
+            same = await db.get(Topic, topic.id)
+            assert same.name == "Autoestima"
+            assert (await read_content_value(db, "topic", same, "name", "en")).text == "Self-esteem"
         workspace = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
-        assert await workspace.get_state() is None
-        await click(f"ca:edit:topic:{topic.id}:0")
-        await click(f"ca:view:topic:{topic.id}")
         assert await workspace.get_state() is None
     finally:
         await dispatcher.storage.close()

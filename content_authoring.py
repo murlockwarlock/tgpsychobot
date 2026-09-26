@@ -42,6 +42,66 @@ RESOURCES = {
     "case_study": AuthoringResource(CaseStudy, "Истории и кейсы", (("text", "Текст истории", "text"),)),
 }
 
+AUTHORING_RESOURCES = {
+    "topic": AuthoringResource(
+        Topic,
+        "Темы",
+        (("name", "Название", "reply_button"), ("description", "Описание", "text"),
+         ("start_message", "Стартовое сообщение", "html"),
+         ("start_button_text", "Кнопка старта", "inline_button")),
+    ),
+    "content": AuthoringResource(
+        Content,
+        "Контент",
+        (("button_title", "Название кнопки", "reply_button"),
+         ("text_content", "Текст", "html")),
+        "key",
+    ),
+    "plan": AuthoringResource(
+        SubscriptionPlan,
+        "Тарифы",
+        (("name", "Название", "text"), ("description", "Описание", "text")),
+    ),
+    "referral_template": AuthoringResource(
+        ReferralTemplate,
+        "Реферальные сообщения",
+        (("text", "Текст", "text"),),
+    ),
+    "subscription_config": AuthoringResource(
+        SubscriptionConfig,
+        "Кнопки меню",
+        (("topics_btn_name", "Кнопка тем", "reply_button"),
+         ("referral_btn_name", "Кнопка рефералов", "reply_button"),
+         ("referral_sub_btn_name", "Кнопка бонуса", "reply_button")),
+    ),
+    "media_library": AuthoringResource(
+        MediaLibrary,
+        "Медиаматериалы",
+        (("description", "Подпись", "caption"),),
+    ),
+}
+
+
+async def multilingual_authoring_enabled(session) -> bool:
+    config = await session.get(BotGeneralConfig, 1)
+    return bool(getattr(config, "multilingual_authoring_enabled", False))
+
+
+async def authoring_locales(session) -> tuple[str, ...]:
+    if not await multilingual_authoring_enabled(session):
+        return ("ru",)
+    config = await session.get(BotGeneralConfig, 1)
+    try:
+        enabled = tuple(
+            item
+            for item in json.loads(getattr(config, "telegram_enabled_languages", None) or "[\"ru\"]")
+            if isinstance(item, str)
+        )
+    except (TypeError, ValueError):
+        enabled = ("ru",)
+    locales = tuple(locale for locale in SUPPORTED_TELEGRAM_LOCALES if locale in enabled)
+    return locales or ("ru",)
+
 
 async def editing_locale(session, bot_id: int, admin_id: int) -> str:
     preference = await session.get(AdminContentPreference, (bot_id, admin_id))
@@ -65,11 +125,46 @@ def resource_key(kind: str, resource, field: str) -> str:
     return f"{kind}.{getattr(resource, RESOURCES[kind].identity_field)}.{field}"
 
 
+def content_media_value(resource) -> str:
+    return json.dumps(
+        [
+            {"type": media.file_type, "file_id": media.file_id}
+            for media in (getattr(resource, "media", None) or ())
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def parse_content_media_value(value: str | None) -> list[dict[str, str]] | None:
+    if not value:
+        return None
+    try:
+        items = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(items, list):
+        return None
+    result = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") not in {"photo", "video"} or not item.get("file_id"):
+            return None
+        result.append({"type": str(item["type"]), "file_id": str(item["file_id"])})
+    return result
+
+
 def field_source(kind: str, resource, field: str) -> TranslationSource:
     if kind == "automation_action" and (resource.action_type != "send_message" or "admin" in (resource.recipient_type or "")):
         raise ValueError("Сообщение администраторам редактируется по-русски в настройках автоматизации.")
     if kind == "followup_step" and resource.message_type != "static":
         raise ValueError("AI-инструкция является общей настройкой.")
+    if kind == "content" and field == "media":
+        from sqlalchemy import inspect
+        if "media" in inspect(resource).unloaded:
+            media_source = ""
+        else:
+            media_source = content_media_value(resource)
+        return TranslationSource(resource_key(kind, resource, field), media_source, kind="text")
     for name, _, value_kind in RESOURCES[kind].fields:
         if field == name:
             value = getattr(resource, field) or ""
@@ -96,18 +191,18 @@ async def read_content_value(session, kind: str, resource, field: str, locale: s
     return ContentValue(row.text if row else None, source.source or None, bool(row and row.text and row.source_hash != source.source_hash))
 
 
-async def admin_value(session, kind: str, resource, field: str, *, label=False):
+async def admin_value(session, kind: str, resource, field: str, *, label=False, locale=None):
     from admin_authoring_context import content_editing_locale
-    locale = content_editing_locale.get() or "ru"
+    locale = locale or content_editing_locale.get() or "ru"
     value = await read_content_value(session, kind, resource, field, locale)
     return value.admin_label() if label else value.text or ""
 
 
-async def admin_projection(session, kind, resource):
+async def admin_projection(session, kind, resource, *, locale=None):
     from types import SimpleNamespace
     values = {key: value for key, value in vars(resource).items() if not key.startswith("_")}
     for field, _, _ in RESOURCES[kind].fields:
-        values[field] = await admin_value(session, kind, resource, field, label=True)
+        values[field] = await admin_value(session, kind, resource, field, label=True, locale=locale)
     return SimpleNamespace(**values)
 
 
@@ -139,13 +234,15 @@ async def save_content_value(session, kind: str, resource, field: str, locale: s
         existing = await session.scalar(select(BotTranslation.text).where(BotTranslation.translation_key == source.translation_key, BotTranslation.text != "").order_by(BotTranslation.created_at, BotTranslation.locale).limit(1))
         if existing:
             validation_source = TranslationSource(source.translation_key, existing, kind=source.kind)
-    if value:
+    if value and not (kind == "content" and field == "media"):
         try:
             validate_translation_value(validation_source, value)
         except (ValueError, TypeError) as exc:
             raise ValueError("Текст не сохранён: проверьте длину, форматирование, переменные и адреса кнопок.") from exc
     if kind == "bot_general_config" and len(value) > 200:
         raise ValueError("Максимум 200 символов.")
+    if kind == "content" and field == "media" and value and parse_content_media_value(value) is None:
+        raise ValueError("Медиафайлы имеют неверный формат.")
     if source.kind == "reply_button" and value:
         await validate_button_label(session, source.translation_key, locale, value)
     if locale == "ru":
@@ -157,6 +254,11 @@ async def save_content_value(session, kind: str, resource, field: str, locale: s
                 if item["translation_slot"] == slot:
                     item[name] = value
             resource.answer_options_json = json_dumps(items)
+        elif kind == "content" and field == "media":
+            from database import ContentMedia
+            resource.media.clear()
+            for media in parse_content_media_value(value) or []:
+                resource.media.append(ContentMedia(file_type=media["type"], file_id=media["file_id"]))
         else:
             setattr(resource, field, stored_value)
     else:

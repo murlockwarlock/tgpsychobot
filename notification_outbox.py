@@ -29,6 +29,8 @@ from translation_service import (
     normalize_locale,
     refresh_translation_cache,
     resolve_effective_locale,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
     translation_cache,
     translate,
 )
@@ -66,8 +68,8 @@ async def _prepare_outbox_payload(
     locale = resolve_effective_locale(
         None if recipient_id >= 100_000_000_000 else getattr(user, "telegram_language_code", None),
         getattr(config, "telegram_default_language", "ru") if config else "ru",
-        bool(getattr(config, "telegram_language_selection_enabled", False)) if config else False,
-        getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]',
+        runtime_language_selection_enabled(config),
+        runtime_enabled_languages(config),
         platform="max" if recipient_id >= 100_000_000_000 else "telegram",
         admin=admin_recipient,
     )

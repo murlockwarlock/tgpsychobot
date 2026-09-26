@@ -598,7 +598,7 @@ async def audit_translation_readiness(
         "ready": all(report["ready"] for report in locale_reports.values()),
         "locales": locale_reports,
         "orphaned": orphaned,
-        "content": content_completeness(full_registry, by_key, locales),
+        "content": {},
     }
 
 

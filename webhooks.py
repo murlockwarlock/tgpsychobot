@@ -69,7 +69,7 @@ async def send_msg_universal(bot: Bot, user_id: int, text: str, parse_mode: str 
         if not token:
             log.warning(f"Cannot send MAX message to {user_id}: MAX_BOT_TOKEN not configured in env")
             return False
-        base_url = os.environ.get("MAX_API_BASE", "https://platform-api.max.ru")
+        base_url = os.environ.get("MAX_API_BASE", "https://platform-api2.max.ru")
         
         attachments = None
         if reply_markup and hasattr(reply_markup, "inline_keyboard"):

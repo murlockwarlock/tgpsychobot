@@ -4,14 +4,15 @@ import os
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import database
-from database import Base, BotGeneralConfig, TelegramPendingAIReply, User
+from database import AIConfig, AIModelSettings, Base, BotGeneralConfig, BotTranslation, TelegramPendingAIReply, User
+from provider_models import PROVIDER_DEEPSEEK
 
 
 class _FakeConnection:
@@ -176,6 +177,7 @@ async def test_init_db_adds_multilingual_foundation_with_safe_defaults(tmp_path,
             "telegram_default_language",
             "telegram_language_selection_enabled",
             "telegram_enabled_languages",
+            "multilingual_authoring_enabled",
             "translations_revision",
         } <= general_columns
 
@@ -188,8 +190,193 @@ async def test_init_db_adds_multilingual_foundation_with_safe_defaults(tmp_path,
         assert config.telegram_default_language == "ru"
         assert config.telegram_language_selection_enabled is False
         assert config.telegram_enabled_languages == '["ru"]'
+        assert config.multilingual_authoring_enabled is False
         assert config.translations_revision == 0
         assert user.telegram_language_code is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_adds_multilingual_authoring_flag_to_legacy_config(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-authoring-flag.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.execute(text(
+                "ALTER TABLE bot_general_config DROP COLUMN multilingual_authoring_enabled"
+            ))
+        await database.init_db()
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_maps_legacy_generation_settings_to_active_model_scope(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'model-settings-migration.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        await database.init_db()
+        async with sessions() as session:
+            config = await session.get(AIConfig, 1)
+            config.provider = PROVIDER_DEEPSEEK
+            config.deepseek_model = "deepseek-flash"
+            config.max_output_tokens = 12000
+            config.temperature = 0.4
+            config.deepseek_thinking_enabled = True
+            existing = await session.scalar(
+                select(AIModelSettings).where(
+                    AIModelSettings.provider == PROVIDER_DEEPSEEK,
+                    AIModelSettings.model == "deepseek-flash",
+                    AIModelSettings.channel == "chat",
+                )
+            )
+            if existing is not None:
+                await session.delete(existing)
+            await session.commit()
+
+        await database.init_db()
+
+        async with sessions() as session:
+            settings = await session.scalar(
+                select(AIModelSettings).where(
+                    AIModelSettings.provider == PROVIDER_DEEPSEEK,
+                    AIModelSettings.model == "deepseek-flash",
+                    AIModelSettings.channel == "chat",
+                )
+            )
+            config = await session.get(AIConfig, 1)
+
+        assert settings is not None
+        assert settings.max_output_tokens == 12000
+        assert settings.temperature == 0.4
+        assert settings.reasoning_effort == "high"
+        assert config.max_output_tokens == 12000
+        assert config.deepseek_thinking_enabled is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_keeps_multilingual_mode_off_for_legacy_multilingual_config(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-multilingual-mode.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        async with sessions() as session:
+            session.add(BotGeneralConfig(
+                id=1,
+                telegram_default_language="ru",
+                telegram_language_selection_enabled=True,
+                telegram_enabled_languages='["ru", "en", "pt"]',
+                translations_revision=0,
+            ))
+            session.add_all([
+                BotTranslation(locale="en", translation_key="topic.17.name", text="Relationships", source_hash="legacy"),
+                BotTranslation(locale="pt", translation_key="topic.17.name", text="Relacionamentos", source_hash="legacy"),
+            ])
+            await session.commit()
+
+        async with engine.begin() as connection:
+            await connection.execute(text(
+                "ALTER TABLE bot_general_config DROP COLUMN multilingual_authoring_enabled"
+            ))
+
+        await database.init_db()
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is False
+            assert config.telegram_enabled_languages == '["ru", "en", "pt"]'
+            assert config.telegram_language_selection_enabled is True
+            translations = (await session.execute(
+                text("SELECT locale, text FROM bot_translations ORDER BY locale")
+            )).all()
+            assert translations == [("en", "Relationships"), ("pt", "Relacionamentos")]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_keeps_multilingual_mode_off_for_legacy_en_pt_without_selector(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-en-pt-no-selector.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(BotGeneralConfig(
+                id=1,
+                telegram_default_language="ru",
+                telegram_language_selection_enabled=False,
+                telegram_enabled_languages='["ru", "en", "pt"]',
+                translations_revision=7,
+            ))
+            await session.commit()
+        async with engine.begin() as connection:
+            await connection.execute(text(
+                "ALTER TABLE bot_general_config DROP COLUMN multilingual_authoring_enabled"
+            ))
+
+        await database.init_db()
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is False
+            assert config.telegram_enabled_languages == '["ru", "en", "pt"]'
+            assert config.telegram_language_selection_enabled is False
+            assert config.translations_revision == 7
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_keeps_multilingual_mode_off_for_legacy_ru_only_config(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-ru-only.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with engine.begin() as connection:
+            await connection.execute(text(
+                "ALTER TABLE bot_general_config DROP COLUMN multilingual_authoring_enabled"
+            ))
+
+        await database.init_db()
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is False
+            assert config.telegram_enabled_languages == '["ru"]'
+            assert config.telegram_language_selection_enabled is False
     finally:
         await engine.dispose()
 

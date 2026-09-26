@@ -143,7 +143,10 @@ async def _install_translation_snapshot(
             and isinstance(text, str)
             and text != ""
             and (is_admin_content_key(key) or stored_hash == source_hash(sources[key]))
-            and (not is_admin_content_key(key) or dynamic_translation_safe(sources[key], text))
+            and (
+                not is_admin_content_key(key)
+                or dynamic_translation_safe(sources[key], text, translation_key=key)
+            )
         )
     }
     translation_cache.install(revision, sources, translations)
@@ -151,8 +154,19 @@ async def _install_translation_snapshot(
     return translation_cache.snapshot
 
 
-def dynamic_translation_safe(source: str, translated: str) -> bool:
+def dynamic_translation_safe(source: str, translated: str, *, translation_key: str | None = None) -> bool:
     from translation_registry import _validate_telegram_html_value, embedded_target_signature
+    if translation_key and translation_key.startswith("content.") and translation_key.endswith(".media"):
+        try:
+            payload = json.loads(translated)
+        except (TypeError, ValueError):
+            return False
+        return isinstance(payload, list) and all(
+            isinstance(item, dict)
+            and item.get("type") in {"photo", "video"}
+            and bool(item.get("file_id"))
+            for item in payload
+        )
     try:
         _validate_telegram_html_value(translated)
         if source:
@@ -229,8 +243,8 @@ async def resolve_user_effective_locale(
     return resolve_effective_locale(
         getattr(user, "telegram_language_code", None) if user else None,
         getattr(config, "telegram_default_language", "ru") if config else "ru",
-        bool(getattr(config, "telegram_language_selection_enabled", False)) if config else False,
-        getattr(config, "telegram_enabled_languages", '["ru"]') if config else '["ru"]',
+        runtime_language_selection_enabled(config),
+        runtime_enabled_languages(config),
         platform=platform,
     )
 
@@ -254,6 +268,22 @@ def normalize_enabled_languages(raw: Any) -> tuple[str, ...]:
     enabled.discard(None)
     enabled.add("ru")
     return tuple(locale for locale in SUPPORTED_TELEGRAM_LOCALES if locale in enabled)
+
+
+def multilingual_mode_enabled(config: Any) -> bool:
+    return bool(getattr(config, "multilingual_authoring_enabled", False)) if config is not None else False
+
+
+def runtime_enabled_languages(config: Any) -> tuple[str, ...]:
+    if not multilingual_mode_enabled(config):
+        return ("ru",)
+    return normalize_enabled_languages(getattr(config, "telegram_enabled_languages", '["ru"]'))
+
+
+def runtime_language_selection_enabled(config: Any) -> bool:
+    return multilingual_mode_enabled(config) and bool(
+        getattr(config, "telegram_language_selection_enabled", False)
+    )
 
 
 def normalize_default_language(value: Any) -> str:

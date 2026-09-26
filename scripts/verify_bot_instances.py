@@ -397,7 +397,7 @@ def verify_identity(
             actual_id = result.get("id")
         else:
             payload = request_json(
-                "https://platform-api.max.ru/me",
+                "https://platform-api2.max.ru/me",
                 environment,
                 headers={"Authorization": token},
             )

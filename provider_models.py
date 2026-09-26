@@ -35,8 +35,9 @@ ALL_TRANSCRIPTION_PROVIDERS = (
     PROVIDER_DEEPGRAM,
 )
 
-DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-flash"
 DEEPSEEK_MODELS = (
+    "deepseek-flash",
     "deepseek-v4-flash",
     "deepseek-v4-pro",
 )
@@ -46,6 +47,7 @@ DEEPSEEK_LEGACY_MODELS = (
     "deepseek-coder",
 )
 DEEPSEEK_CHAT_MAX_TOKENS = 65536
+DEEPSEEK_REASONING_MAX_TOKENS = 393216
 OPENAI_CHAT_MAX_TOKENS = 16384
 CLAUDE_CHAT_MAX_TOKENS = 16384
 GEMINI_CHAT_MAX_TOKENS = 16384
@@ -110,7 +112,7 @@ OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
     "anthropic/claude-haiku-4.5": OpenRouterModelSpec("anthropic/claude-haiku-4.5", "Anthropic Claude Haiku 4.5", True, True, False, 200000, 64000),
     "x-ai/grok-4.7": OpenRouterModelSpec("x-ai/grok-4.7", "xAI Grok 4.7", True, True, False, 500000, 450000),
     "x-ai/grok-4.6": OpenRouterModelSpec("x-ai/grok-4.6", "xAI Grok 4.6", True, True, False, 500000, 450000),
-    "deepseek/deepseek-v4.1-flash": OpenRouterModelSpec("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", True, True, False, 1048576, 384000),
+    "deepseek/deepseek-v4.1-flash": OpenRouterModelSpec("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", True, True, False, 1048576, 393216),
     "qwen/qwen3-vl-235b-a22b-instruct": OpenRouterModelSpec("qwen/qwen3-vl-235b-a22b-instruct", "Qwen3 VL 235B Instruct", True, True, False, 262144, 32768),
     "moonshotai/kimi-k2.6": OpenRouterModelSpec("moonshotai/kimi-k2.6", "Kimi K2.6", True, True, False, 262144, 235929),
     "mistralai/mistral-medium-3-5": OpenRouterModelSpec("mistralai/mistral-medium-3-5", "Mistral Medium 3.5", True, True, False, 262144, 209715),
@@ -246,6 +248,7 @@ SELECTABLE_VISION_MODELS: dict[str, tuple[str, ...]] = {
         "gemini-3-flash",
     ),
     PROVIDER_OPENROUTER: OPENROUTER_VISION_MODELS,
+    PROVIDER_DEEPSEEK: ("deepseek-flash",),
 }
 
 # Active direct Gemini and KIE text-to-image models.
@@ -285,6 +288,21 @@ SELECTABLE_TRANSCRIPTION_MODELS: dict[str, tuple[str, ...]] = {
     ),
     PROVIDER_DEEPGRAM: (DEEPGRAM_DEFAULT_MODEL,),
 }
+
+CAPABILITY_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "chat": tuple(SELECTABLE_CHAT_MODELS),
+    "fallback": tuple(SELECTABLE_FALLBACK_MODELS),
+    "transcription": tuple(SELECTABLE_TRANSCRIPTION_MODELS),
+    "vision": tuple(SELECTABLE_VISION_MODELS),
+    "vision_fallback": tuple(SELECTABLE_VISION_MODELS),
+    "image_gen": tuple(SELECTABLE_IMAGE_GEN_MODELS),
+    "image_generation": tuple(SELECTABLE_IMAGE_GEN_MODELS),
+    "image_edit": tuple(SELECTABLE_IMAGE_EDIT_MODELS),
+}
+
+
+def get_capability_providers(channel: str) -> tuple[str, ...]:
+    return tuple(CAPABILITY_PROVIDERS.get((channel or "").strip().lower(), ()))
 
 
 # ==========================================
@@ -465,7 +483,7 @@ def resolve_telegram_model_callback(callback_data: str | None) -> tuple[str, str
         return None
     digest = match.group(1)
 
-    for provider in ALL_PROVIDERS:
+    for provider in (*ALL_PROVIDERS, PROVIDER_DEEPGRAM):
         for model in get_selectable_models(provider, channel=channel):
             expected = _telegram_model_callback_digest(channel, provider, model)
             if compare_digest(digest, expected):
@@ -580,9 +598,12 @@ def get_default_model(provider: str | None, channel: str = "chat") -> str:
     return PROVIDER_DEFAULT_MODELS.get(p_name, "gemini-3.7-flash")
 
 
-def get_chat_output_token_limit(provider: str | None, model: str | None) -> int:
+def get_chat_output_token_limit(provider: str | None, model: str | None, reasoning_effort: str | None = None) -> int:
     p_name = canonical_provider_name(provider)
     if p_name == PROVIDER_DEEPSEEK:
+        mode = str(reasoning_effort).strip().lower() if reasoning_effort is not None else ""
+        if mode in {"auto", "low", "high", "max"}:
+            return DEEPSEEK_REASONING_MAX_TOKENS
         return DEEPSEEK_CHAT_MAX_TOKENS
     if p_name == PROVIDER_OPENAI:
         return OPENAI_CHAT_MAX_TOKENS
@@ -766,7 +787,7 @@ def get_provider_vision_max_tokens(provider: str | None, model: str | None = Non
     p_name = canonical_provider_name(provider)
     if p_name == PROVIDER_KIE:
         return KIE_VISION_INITIAL_MAX_TOKENS
-    if p_name in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI):
+    if p_name in (PROVIDER_OPENAI, PROVIDER_CLAUDE, PROVIDER_GEMINI, PROVIDER_DEEPSEEK):
         return DIRECT_VISION_MAX_TOKENS
     if p_name == PROVIDER_OPENROUTER:
         spec = OPENROUTER_MODEL_SPECS.get((model or "").strip())

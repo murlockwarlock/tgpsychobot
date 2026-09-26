@@ -321,7 +321,7 @@ async def test_legacy_ai_button_callback_still_uses_inline_label_and_action():
 
 
 @pytest.mark.asyncio
-async def test_telegram_fallback_picker_enables_the_fallback_runtime(monkeypatch):
+async def test_telegram_legacy_fallback_callback_opens_canonical_screen(monkeypatch):
     config = SimpleNamespace(fallback_provider=None, fallback_model=None, allow_fallback=False)
 
     class Session:
@@ -337,32 +337,20 @@ async def test_telegram_fallback_picker_enables_the_fallback_runtime(monkeypatch
         async def commit(self):
             return None
 
-    callback = SimpleNamespace(answer=AsyncMock())
+    callback = SimpleNamespace(
+        answer=AsyncMock(),
+        message=SimpleNamespace(edit_text=AsyncMock()),
+    )
     monkeypatch.setattr(handlers, "async_session_maker", lambda: Session())
     monkeypatch.setattr(handlers, "admin_ai_keys_models", AsyncMock())
 
     await handlers.admin_toggle_fallback(callback)
 
-    assert config.fallback_provider is not None
-    assert config.fallback_model
-    assert config.allow_fallback is True
-    assert "включен" in callback.answer.await_args_list[0].args[0]
-
-    legacy_config = SimpleNamespace(
-        fallback_provider="KIE",
-        fallback_model="claude-haiku-4-5",
-        allow_fallback=False,
-    )
-
-    class LegacySession(Session):
-        async def get(self, _model, _key):
-            return legacy_config
-
-    monkeypatch.setattr(handlers, "async_session_maker", lambda: LegacySession())
-    await handlers.admin_toggle_fallback(callback)
-    assert legacy_config.fallback_provider == "KIE"
-    assert legacy_config.allow_fallback is True
-    assert "включен" in callback.answer.await_args_list[1].args[0]
+    assert config.fallback_provider is None
+    assert config.fallback_model is None
+    assert config.allow_fallback is False
+    callback.message.edit_text.assert_awaited_once()
+    assert "Резерв текста" in callback.message.edit_text.await_args.args[0]
 
 
 @pytest.mark.asyncio

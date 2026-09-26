@@ -322,7 +322,7 @@ def test_fresh_aiconfig_defaults_are_current_and_active():
     }
     assert config.openrouter_model is None
     assert config.perplexity_model is None
-    assert not hasattr(config, "deepgram_model")
+    assert (config.deepgram_model or "nova-3") == "nova-3"
     for field_name, model_val in runtime_models.items():
         assert model_val not in RETIRED_UPSTREAM_MODELS, (
             f"AIConfig.{field_name} defaults to retired model {model_val!r}"

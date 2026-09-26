@@ -97,7 +97,7 @@ def get_settings() -> Settings:
 
     return Settings(
         max_token=token,
-        max_api_base=os.getenv("MAX_API_BASE", "https://platform-api.max.ru").rstrip("/"),
+        max_api_base=os.getenv("MAX_API_BASE", "https://platform-api2.max.ru").rstrip("/"),
         host=os.getenv("MAX_APP_HOST", "0.0.0.0"),
         port=int(os.getenv("MAX_APP_PORT", "8090")),
         webhook_path=webhook_path,

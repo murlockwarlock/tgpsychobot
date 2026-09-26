@@ -244,8 +244,9 @@ class MaxAILogsUITests(unittest.IsolatedAsyncioTestCase):
     # 8. Period Filtering in SQL
     async def test_period_filtering_in_sql(self):
         now = datetime.utcnow()
+        today_start = admin_ai_logs._ai_log_period_start("today")
         async with async_session_maker() as session:
-            session.add(AILog(id=21, user_id=1, raw_response="today", created_at=now - timedelta(hours=1), provider="P", model="M"))
+            session.add(AILog(id=21, user_id=1, raw_response="today", created_at=today_start + timedelta(hours=1), provider="P", model="M"))
             session.add(AILog(id=22, user_id=1, raw_response="3d_ago", created_at=now - timedelta(days=3), provider="P", model="M"))
             session.add(AILog(id=23, user_id=1, raw_response="10d_ago", created_at=now - timedelta(days=10), provider="P", model="M"))
             session.add(AILog(id=24, user_id=1, raw_response="40d_ago", created_at=now - timedelta(days=40), provider="P", model="M"))

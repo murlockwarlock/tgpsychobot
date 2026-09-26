@@ -33,6 +33,8 @@ class MaxContentMedia(StorageBase):
     content_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     media_type: Mapped[str] = mapped_column(String(32), nullable=False)
     token: Mapped[str] = mapped_column(String(512), nullable=False)
+    source_media_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_file_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
@@ -52,9 +54,18 @@ class MaxTopicMedia(StorageBase):
 
 async def init_storage() -> None:
     from .legacy import engine
+    from sqlalchemy import inspect, text
+
+    def migrate(sync_connection) -> None:
+        columns = {column["name"] for column in inspect(sync_connection).get_columns("max_content_media")}
+        if "source_media_id" not in columns:
+            sync_connection.execute(text("ALTER TABLE max_content_media ADD COLUMN source_media_id INTEGER"))
+        if "source_file_id" not in columns:
+            sync_connection.execute(text("ALTER TABLE max_content_media ADD COLUMN source_file_id VARCHAR(512)"))
 
     async with engine.begin() as conn:
         await conn.run_sync(StorageBase.metadata.create_all)
+        await conn.run_sync(migrate)
 
 
 @dataclass

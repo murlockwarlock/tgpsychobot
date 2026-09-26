@@ -136,6 +136,7 @@ async def test_admin_can_open_language_screen_and_readiness_audit(tmp_path, monk
                 BotGeneralConfig(
                     id=1,
                     telegram_default_language="ru",
+                    multilingual_authoring_enabled=True,
                     telegram_language_selection_enabled=True,
                     telegram_enabled_languages='["ru", "en", "pt"]',
                 )
@@ -145,7 +146,7 @@ async def test_admin_can_open_language_screen_and_readiness_audit(tmp_path, monk
         await handlers.admin_language_settings(_callback(bot, message, "admin_language_settings"))
         screen = message.edit_text.await_args.args[0]
         assert "Язык по умолчанию" in screen
-        assert "Выбор языка пользователем: <b>Включён</b>" in screen
+        assert "Выбор языка: <b>Включён</b>" in screen
         assert "@example_bot" in screen
         assert "🇬🇧 English — ❌ не готов" in screen
         assert "🇵🇹 Português — ❌ не готов" in screen
@@ -158,6 +159,31 @@ async def test_admin_can_open_language_screen_and_readiness_audit(tmp_path, monk
         assert "🇬🇧 English — ❌ не готов" in audit
         assert "🇵🇹 Português — ❌ не готов" in audit
         assert "Отсутствует: 1" in audit
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_multilingual_authoring_toggle_is_stored_per_bot_config(tmp_path, monkeypatch):
+    registry = _registry()
+    _patch_registry(monkeypatch, registry)
+    engine, sessions = await _test_db(tmp_path, monkeypatch, database="authoring-toggle")
+    try:
+        async with sessions() as session:
+            session.add(BotGeneralConfig(id=1, telegram_enabled_languages='["ru", "en", "pt"]'))
+            await session.commit()
+        bot = _Bot(_pack(registry, "bot"))
+        message = _Message(bot, document=False)
+        callback = _callback(bot, message, "admin_toggle_multilingual_authoring")
+        await handlers.admin_toggle_multilingual_authoring(callback)
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is True
+            assert config.telegram_enabled_languages == '["ru", "en", "pt"]'
+        await handlers.admin_toggle_multilingual_authoring(callback)
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            assert config.multilingual_authoring_enabled is False
     finally:
         await engine.dispose()
 
@@ -304,6 +330,7 @@ async def test_ready_locale_can_be_enabled_and_selector_can_be_toggled(tmp_path,
                 BotGeneralConfig(
                     id=1,
                     telegram_default_language="ru",
+                    multilingual_authoring_enabled=True,
                     telegram_language_selection_enabled=False,
                     telegram_enabled_languages='["ru"]',
                 )
@@ -357,6 +384,7 @@ async def test_not_ready_locale_and_selector_activation_are_blocked(tmp_path, mo
                 BotGeneralConfig(
                     id=1,
                     telegram_default_language="ru",
+                    multilingual_authoring_enabled=True,
                     telegram_language_selection_enabled=False,
                     telegram_enabled_languages='["ru"]',
                 )

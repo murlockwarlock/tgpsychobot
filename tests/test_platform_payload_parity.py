@@ -179,9 +179,9 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             captured_body = logged_payload.get("payload", logged_payload)
             self.assertEqual(captured_body["model"], payload["model"])
             self.assertEqual(captured_body["messages"], payload["messages"])
-            self.assertEqual(payload["max_completion_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", payload)
             self.assertNotIn("max_tokens", payload)
-            self.assertEqual(captured_body["max_completion_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", captured_body)
 
     async def test_max_normal_openai_payload_and_ailog(self):
         captured_payloads = []
@@ -244,9 +244,9 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             captured_body = logged_payload.get("payload", logged_payload)
             self.assertEqual(captured_body["model"], payload["model"])
             self.assertEqual(captured_body["messages"], payload["messages"])
-            self.assertEqual(payload["max_completion_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", payload)
             self.assertNotIn("max_tokens", payload)
-            self.assertEqual(captured_body["max_completion_tokens"], 16384)
+            self.assertNotIn("max_completion_tokens", captured_body)
 
     async def test_max_vision_shared_builder_payload(self):
         captured_payloads = []
@@ -409,7 +409,7 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GEN_IMG", system_text)
         self.assertIn("<DATA>", system_text)
         self.assertIn("ВРЕМЕННОЙ КОНТЕКСТ:", system_text)
-        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 16384)
+        self.assertNotIn("maxOutputTokens", payload["generationConfig"])
 
     async def test_claude_platform_payload_parity_and_ailog(self):
         async with self.sessions() as session:
@@ -518,7 +518,7 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tg_ai_log.provider, "Gemini")
             tg_log_data = json.loads(tg_ai_log.request_payload)
             self.assertEqual(tg_log_data["provider"], "Gemini")
-            self.assertEqual(tg_log_data["payload"]["generationConfig"]["maxOutputTokens"], 16384)
+            self.assertNotIn("maxOutputTokens", tg_log_data["payload"]["generationConfig"])
 
         async def fake_gemini_max_post(url, *args, **kwargs):
             captured_max.append(kwargs)
@@ -545,11 +545,11 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(max_ai_log.provider, "Gemini")
             max_log_data = json.loads(max_ai_log.request_payload)
             self.assertEqual(max_log_data["provider"], "Gemini")
-            self.assertEqual(max_log_data["payload"]["generationConfig"]["maxOutputTokens"], 16384)
+            self.assertNotIn("maxOutputTokens", max_log_data["payload"]["generationConfig"])
 
         # Parity comparison
-        self.assertEqual(captured_tg[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
-        self.assertEqual(captured_max[0]["json"]["generationConfig"]["maxOutputTokens"], 16384)
+        self.assertNotIn("maxOutputTokens", captured_tg[0]["json"]["generationConfig"])
+        self.assertNotIn("maxOutputTokens", captured_max[0]["json"]["generationConfig"])
 
     async def test_deepseek_platform_payload_parity_and_ailog(self):
         async with self.sessions() as session:
@@ -597,7 +597,7 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tg_log_data["provider"], "Deepseek")
             self.assertNotIn("sk-", tg_log_data.get("endpoint", ""))
             self.assertEqual(tg_log_data["payload"]["model"], "deepseek-v4-flash")
-            self.assertEqual(tg_log_data["payload"]["max_tokens"], 65536)
+            self.assertNotIn("max_tokens", tg_log_data["payload"])
             self.assertEqual(tg_log_data["payload"]["messages"], captured_tg[0]["messages"])
 
         # MAX actual get_ai_response
@@ -619,7 +619,7 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(max_log_data["provider"], "Deepseek")
             self.assertNotIn("sk-", max_log_data.get("endpoint", ""))
             self.assertEqual(max_log_data["payload"]["model"], "deepseek-v4-flash")
-            self.assertEqual(max_log_data["payload"]["max_tokens"], 65536)
+            self.assertNotIn("max_tokens", max_log_data["payload"])
             self.assertEqual(max_log_data["payload"]["messages"], captured_max[0]["messages"])
 
         # Compare normalized common semantic request between TG and MAX
@@ -628,8 +628,8 @@ class PlatformPayloadParityIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload_tg["model"], "deepseek-v4-flash")
         self.assertEqual(payload_max["model"], "deepseek-v4-flash")
-        self.assertEqual(payload_tg["max_tokens"], 65536)
-        self.assertEqual(payload_max["max_tokens"], 65536)
+        self.assertNotIn("max_tokens", payload_tg)
+        self.assertNotIn("max_tokens", payload_max)
 
         msgs_tg = payload_tg["messages"]
         msgs_max = payload_max["messages"]

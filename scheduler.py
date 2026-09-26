@@ -74,6 +74,8 @@ from translation_service import (
     normalize_locale,
     translate,
     translation_cache,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -92,8 +94,8 @@ def _scheduler_locale_for_key(user, general_config, key: str) -> str:
     locale = resolve_effective_locale(
         getattr(user, "telegram_language_code", None),
         getattr(general_config, "telegram_default_language", "ru") if general_config else "ru",
-        bool(getattr(general_config, "telegram_language_selection_enabled", False)) if general_config else False,
-        getattr(general_config, "telegram_enabled_languages", '["ru"]') if general_config else '["ru"]',
+        runtime_language_selection_enabled(general_config),
+        runtime_enabled_languages(general_config),
     )
     if locale == "ru":
         return "ru"
@@ -308,7 +310,7 @@ def patch_bot_send_message(bot: Bot):
             if not token:
                 logging.getLogger("scheduler").warning(f"Cannot send MAX message to {chat_id_int}: MAX_BOT_TOKEN not configured in env")
                 return None
-            base_url = os.environ.get("MAX_API_BASE", "https://platform-api.max.ru")
+            base_url = os.environ.get("MAX_API_BASE", "https://platform-api2.max.ru")
             
             # Map reply_markup to attachments if present
             attachments = None
@@ -839,8 +841,8 @@ async def check_subscriptions(bot: Bot):
                 user_locale = resolve_effective_locale(
                     getattr(user, "telegram_language_code", None),
                     getattr(general_config, "telegram_default_language", "ru") if general_config else "ru",
-                    bool(getattr(general_config, "telegram_language_selection_enabled", False)) if general_config else False,
-                    getattr(general_config, "telegram_enabled_languages", '["ru"]') if general_config else '["ru"]',
+                    runtime_language_selection_enabled(general_config),
+                    runtime_enabled_languages(general_config),
                     platform="max" if user.id >= 100_000_000_000 else "telegram",
                 )
                 user_subscribe_kb = build_subscribe_keyboard(user_locale)

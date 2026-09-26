@@ -18,7 +18,7 @@ from time_helpers import format_msk, to_msk
 from provider_models import (
     build_telegram_model_callback_data,
     canonical_provider_name,
-    effective_chat_output_tokens,
+    DEEPGRAM_DEFAULT_MODEL,
     PROVIDER_DEEPSEEK,
 )
 from max_messenger_bot.identity import is_max_user_id, max_client_list_label
@@ -27,6 +27,8 @@ from translation_service import (
     SUPPORTED_TELEGRAM_LOCALES,
     normalize_enabled_languages,
     resolve_effective_locale,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
     translate,
 )
 from content_locales import admin_label
@@ -65,8 +67,8 @@ async def main_client_keyboard(user_id: int | None = None):
         locale = resolve_effective_locale(
             getattr(user, "telegram_language_code", None),
             getattr(general_config, "telegram_default_language", "ru"),
-            bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-            getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+            runtime_language_selection_enabled(general_config),
+            runtime_enabled_languages(general_config),
         )
         stmt = select(Content).where(
             Content.is_visible == True,
@@ -255,12 +257,18 @@ def admin_general_settings_keyboard(config):
         ("name", "Имя", bool(getattr(config, "profile_collect_name", True))),
         ("gender", "Пол", bool(getattr(config, "profile_collect_gender", True))),
         ("age", "Возраст", bool(getattr(config, "profile_collect_age", False))),
+        ("language", "Язык", runtime_language_selection_enabled(config)),
     )
     for field, title, enabled in fields:
         status = "✅ запрашивать" if enabled else "❌ не запрашивать"
+        callback_data = (
+            "admin_general_toggle_language_selection"
+            if field == "language"
+            else f"admin_general_toggle_profile_{field}"
+        )
         builder.button(
             text=f"{title}: {status}",
-            callback_data=f"admin_general_toggle_profile_{field}",
+            callback_data=callback_data,
         )
     processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
     processing_status = "✅ включено" if processing_enabled else "❌ выключено"
@@ -284,16 +292,28 @@ def admin_general_settings_keyboard(config):
 
 def admin_language_settings_keyboard(config, readiness=None):
     builder = InlineKeyboardBuilder()
-    selector_enabled = bool(getattr(config, "telegram_language_selection_enabled", False))
+    selector_enabled = runtime_language_selection_enabled(config)
+    authoring_enabled = bool(getattr(config, "multilingual_authoring_enabled", False))
 
     builder.button(
-        text=(
-            "⛔ Запретить пользователям выбирать язык"
-            if selector_enabled
-            else "✅ Разрешить пользователям выбирать язык"
-        ),
-        callback_data="admin_language_toggle_selector",
+        text=f"🌐 Мультиязычность: {'ВКЛ' if authoring_enabled else 'ВЫКЛ'}",
+        callback_data="admin_toggle_multilingual_authoring",
     )
+
+    if authoring_enabled:
+        builder.button(
+            text=(
+                "⛔ Запретить пользователям выбирать язык"
+                if selector_enabled
+                else "✅ Разрешить пользователям выбирать язык"
+            ),
+            callback_data="admin_language_toggle_selector",
+        )
+    else:
+        builder.button(
+            text="🔒 Выбор языка неактивен до включения мультиязычности",
+            callback_data="admin_language_settings",
+        )
     for locale in SUPPORTED_TELEGRAM_LOCALES:
         builder.button(
             text=f"⚙️ {LOCALE_LABELS[locale]}",
@@ -456,10 +476,7 @@ def ai_settings_keyboard(current_provider: str):
     for name, data in providers.items():
         text = f"✅ {name}" if name == current_provider else name
         builder.button(text=text, callback_data=data)
-    builder.button(text="📏 Изменить максимум ответа", callback_data="set_max_output_tokens")
-    if canonical_provider_name(current_provider) == PROVIDER_DEEPSEEK:
-        builder.button(text="🧠 Изменить Thinking", callback_data="toggle_deepseek_thinking")
-    builder.button(text="⚙️ Настроить ключи и модели", callback_data="admin_ai_keys")
+    builder.button(text="⚙️ Провайдеры и модели", callback_data="admin_ai_keys")
     builder.button(text="📝 Изменить системный промпт", callback_data="admin_edit_system_prompt")
     builder.button(text="🧩 Общий блок для тем", callback_data="admin_edit_shared_prompt_block")
     builder.button(text="📦 Служебный блок промпта", callback_data="admin_edit_service_prompt_block")
@@ -470,13 +487,7 @@ def ai_settings_keyboard(current_provider: str):
 
 
 def deepseek_thinking_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="По умолчанию", callback_data="set_deepseek_thinking_default")
-    builder.button(text="Включён", callback_data="set_deepseek_thinking_on")
-    builder.button(text="Выключен", callback_data="set_deepseek_thinking_off")
-    builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
-    builder.adjust(1)
-    return builder.as_markup()
+    return model_reasoning_keyboard()
 
 
 def mask_api_key(value: str | None) -> str:
@@ -528,91 +539,76 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     builder.button(text="🧠 OpenAI", callback_data="view_models_OpenAI")
     builder.button(text="🧠 OpenRouter", callback_data="view_models_OpenRouter")
     builder.button(text="🧠 Perplexity", callback_data="view_models_Perplexity")
+    deepgram_model = DEEPGRAM_DEFAULT_MODEL
+    if str(current_transcription_provider).startswith("Deepgram / "):
+        deepgram_model = str(current_transcription_provider).split(" / ", 1)[1] or deepgram_model
+    builder.button(text="🗣️ Deepgram", callback_data="view_models_Deepgram")
 
-    builder.button(text=f"📌 Первые: {context_first}", callback_data="set_context_first")
-    builder.button(text=f"🔄 Последние: {context_recent}", callback_data="set_context_recent")
-
-    trans_label = (
-        f"🗣️ Аудио: {current_transcription_provider}"
-        if current_transcription_provider != 'None'
-        else "🗣️ Аудио: выкл"
-    )
-    builder.button(text=trans_label, callback_data="admin_toggle_transcription")
-    builder.button(text="⏱️ Лимит аудио", callback_data="set_audio_limit")
-
-    threshold_label = int(kie_credit_alert_threshold) if float(kie_credit_alert_threshold).is_integer() else round(kie_credit_alert_threshold, 2)
-    builder.button(text=f"💳 KIE порог: {threshold_label}", callback_data="set_kie_credit_threshold")
-    builder.button(text=f"🌡️ Температура: {round(temperature, 2)}", callback_data="set_temperature")
-    if current_provider:
-        effective_tokens = effective_chat_output_tokens(current_provider, current_model, max_output_tokens)
-        token_value = (
-            f"По умолчанию (эфф.: {effective_tokens})"
-            if max_output_tokens is None
-            else f"{effective_tokens}"
-        )
-        builder.button(text=f"📏 Макс. ответа: {token_value}", callback_data="set_max_output_tokens")
-        if canonical_provider_name(current_provider) == PROVIDER_DEEPSEEK:
-            thinking_label = (
-                "По умолчанию"
-                if deepseek_thinking_enabled is None
-                else "Включён" if deepseek_thinking_enabled else "Выключен"
-            )
-            builder.button(text=f"🧠 Thinking DeepSeek: {thinking_label}", callback_data="toggle_deepseek_thinking")
-    builder.button(
-        text=f"🧠 Память: {memory_mode_label(memory_mode)}",
-        callback_data="toggle_preserve_topic_context"
-    )
-    proxy_status = "✅ ВКЛ" if use_proxy else "❌ ВЫКЛ"
-    builder.button(text=f"🌍 Прокси Deepseek: {proxy_status}", callback_data="admin_toggle_proxy")
-    if fallback_provider:
-        fallback_status = "✅ ВКЛ" if allow_fallback else "❌ ВЫКЛ"
-        fb_label = f"🔄 Резерв: {fallback_provider} — {fallback_status}"
-    else:
-        fb_label = "🔄 Резерв: ❌ ВЫКЛ"
-    builder.button(text=fb_label, callback_data="admin_toggle_fallback")
-    if fallback_provider:
-        fb_model_short = short_model(fallback_model) if fallback_model else "не задана"
-        builder.button(text=f"Модель: {fb_model_short}", callback_data="admin_change_fallback_model")
-
-    builder.button(text=f"👁️ Фото: {current_vision_provider}",
-                   callback_data="admin_toggle_vision")
-    builder.button(text=f"Модель: {short_model(current_vision_model)}", callback_data="admin_change_vision_model")
-
-    v_fb_status = "✅ ВКЛ" if allow_vision_fallback else "❌ ВЫКЛ"
-    builder.button(text=f"🛡 Резерв фото: {v_fb_status}", callback_data="admin_toggle_vision_fallback")
-    v_fb_prov_label = f"Пров: {vision_fallback_provider}" if vision_fallback_provider else "Пров: не задан"
-    builder.button(text=v_fb_prov_label, callback_data="admin_change_vision_fallback_provider")
-    v_fb_model_label = f"Модель: {short_model(vision_fallback_model)}" if vision_fallback_model else "Модель: не задана"
-    builder.button(text=v_fb_model_label, callback_data="admin_change_vision_fallback_model")
-
-    builder.button(text=f"🖼 Ген: {image_generation_provider}",
-                   callback_data="admin_toggle_image_generation")
-    builder.button(text=f"Модель: {short_model(image_generation_model)}", callback_data="admin_change_image_generation_model")
-
-    builder.button(text=f"🎨 Редакт: {image_edit_provider}",
-                   callback_data="admin_toggle_image_edit")
-    builder.button(text=f"Модель: {short_model(image_edit_model)}", callback_data="admin_change_image_edit_model")
-
-    builder.button(text="⏱️ Таймаут ИИ", callback_data="set_ai_timeout")
+    builder.button(text="💬 Основной чат", callback_data="admin_ai_main_chat")
+    builder.button(text="🔄 Резерв текста", callback_data="admin_ai_text_fallback")
+    builder.button(text="🎙 Аудио", callback_data="admin_ai_audio")
+    builder.button(text="🖼 Vision", callback_data="admin_ai_vision")
+    builder.button(text="🛡 Vision резерв", callback_data="admin_ai_vision_fallback")
+    builder.button(text="🎨 Генерация изображений", callback_data="admin_ai_image_generation")
+    builder.button(text="✏️ Редактирование изображений", callback_data="admin_ai_image_edit")
+    builder.button(text="⚙️ Общие настройки", callback_data="admin_ai_common")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_settings")
-
-    # Layout: keys 2+2+1, models 2+2+1, context 2, audio+limit 2,
-    # KIE+temp 2, mem 1, proxy 1, fallback 1 (or 1+1), vision 2, vision_fb 1+2, gen 2, edit 2, timeout 1, back 1
-    if fallback_provider:
-        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 1, 1, 1, 1, 2, 1, 2, 2, 2, 1, 1)
-    else:
-        builder.adjust(2, 2, 1, 2, 2, 1, 2, 2, 2, 1, 1, 1, 2, 1, 2, 2, 2, 1, 1)
+    builder.adjust(2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1)
     return builder.as_markup()
 
 
-def model_selection_keyboard(provider: str, models: dict):
+def model_selection_keyboard(provider: str, models: dict, channel: str = "chat", back_callback: str | None = None):
     builder = InlineKeyboardBuilder()
     for model_key, model_info in models.items():
         builder.button(
             text=model_info['name'],
-            callback_data=build_telegram_model_callback_data(provider, "chat", model_key),
+            callback_data=build_telegram_model_callback_data(provider, channel, model_key),
         )
+    builder.button(
+        text="⬅️ Назад",
+        callback_data=back_callback or ("admin_ai_keys" if channel == "chat" else "admin_ai_keys"),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def provider_model_settings_keyboard(
+    provider: str,
+    *,
+    show_reasoning: bool,
+    show_temperature: bool,
+    transcription_only: bool = False,
+    show_proxy: bool = False,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🤖 Выбрать модель", callback_data=f"view_provider_models_{provider}")
+    if not transcription_only:
+        builder.button(text="📏 Max tokens", callback_data=f"model_setting_max_tokens_{provider}")
+        if show_reasoning:
+            builder.button(text="🧠 Reasoning", callback_data=f"model_setting_reasoning_{provider}")
+        if show_temperature:
+            builder.button(text="🌡 Temperature", callback_data=f"model_setting_temperature_{provider}")
+        if show_proxy:
+            builder.button(text="🌍 Proxy", callback_data="admin_ai_deepseek_proxy")
+    builder.button(text="🔑 API-ключ", callback_data=f"model_setting_api_key_{provider}")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def model_settings_keyboard(*, show_reasoning: bool, show_temperature: bool) -> InlineKeyboardMarkup:
+    return provider_model_settings_keyboard(
+        "Deepseek",
+        show_reasoning=show_reasoning,
+        show_temperature=show_temperature,
+    )
+
+
+def model_reasoning_keyboard(provider: str = "Deepseek") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for value, label in (("auto", "Авто"), ("none", "Выкл"), ("low", "Low"), ("high", "High"), ("max", "Max")):
+        builder.button(text=label, callback_data=f"model_reasoning_{provider}_{value}")
+    builder.button(text="⬅️ Назад", callback_data=f"view_models_{provider}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -625,7 +621,11 @@ def clients_paginator_keyboard(page: int, total_pages: int, clients: list, is_se
     builder = InlineKeyboardBuilder()
     for client in clients:
         status = "✅ " if client.id in selected_ids else ""
-        cb_data = f"toggle_export_{client.id}_{page}" if export_mode else f"view_client_{client.id}"
+        cb_data = (
+            f"toggle_export_{client.id}_{page}"
+            if export_mode
+            else f"view_client_{client.id}_page_{page}"
+        )
         if is_max_user_id(client.id):
             builder.button(text=f"{status}{max_client_list_label(client)}", callback_data=cb_data)
         else:
@@ -664,7 +664,13 @@ def clients_paginator_keyboard(page: int, total_pages: int, clients: list, is_se
     return builder.as_markup()
 
 
-def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view: bool, is_owner: bool):
+def client_profile_keyboard(
+    user_id: int,
+    is_target_admin: bool,
+    target_can_view: bool,
+    is_owner: bool,
+    list_page: int = 0,
+):
     builder = InlineKeyboardBuilder()
     builder.button(text="💳 Платежная инфо", callback_data=f"client_payment_info_{user_id}")
     builder.button(text="📜 История диалога", callback_data=f"client_history_{user_id}")
@@ -684,7 +690,7 @@ def client_profile_keyboard(user_id: int, is_target_admin: bool, target_can_view
         btn_text = "❌ Забрать доступ к истории" if target_can_view else "✅ Дать доступ к истории"
         builder.button(text=btn_text, callback_data=f"toggle_history_access_{user_id}")
 
-    builder.button(text="⬅️ К списку клиентов", callback_data="admin_clients_page_0")
+    builder.button(text="⬅️ К списку клиентов", callback_data=f"admin_clients_page_{max(0, int(list_page))}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -964,9 +970,9 @@ def topics_admin_list_keyboard(topics: list, page: int, total_pages: int, config
     if topics and total_pages > 1:
         nav_buttons = []
         if page > 0:
-            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_topics_page_{page - 1}"))
+            nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_topics_page_{page - 1}"))
         if page < total_pages - 1:
-            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_topics_page_{page + 1}"))
+            nav_buttons.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"admin_topics_page_{page + 1}"))
         if nav_buttons:
             builder.row(*nav_buttons)
 
@@ -1538,18 +1544,16 @@ def manage_buttons_keyboard(buttons: list, change_name_status: bool):
 
     for button in sorted_buttons:
         status = "✅" if button.is_visible else "❌"
-        builder.row(InlineKeyboardButton(
-            text=f"{status} {button.button_title}",
-            callback_data=f"edit_button_visibility_{button.key}"
-        ))
         builder.row(
-            InlineKeyboardButton(text="✏️ Переим.", callback_data=f"edit_button_title_{button.key}"),
+            InlineKeyboardButton(
+                text=f"{status} {button.button_title}",
+                callback_data=f"edit_button_visibility_{button.key}",
+            ),
             InlineKeyboardButton(text="⬆️", callback_data=f"move_btn_up_{button.key}"),
             InlineKeyboardButton(text="⬇️", callback_data=f"move_btn_down_{button.key}"),
-            InlineKeyboardButton(text="🗑️", callback_data=f"delete_button_{button.key}")
         )
 
-    builder.row(InlineKeyboardButton(text="➕ Добавить новую кнопку", callback_data="admin_add_button"))
+    builder.row(InlineKeyboardButton(text="✏️ Названия пунктов меню", callback_data="admin_menu_labels"))
     builder.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel"))
     return builder.as_markup()
 
@@ -1740,7 +1744,7 @@ def gender_selection_keyboard(is_test: bool = False, locale: str = "ru"):
     return builder.as_markup()
 
 
-def user_settings_keyboard(user, locale: str = "ru"):
+def user_settings_keyboard(user, locale: str = "ru", *, language_available: bool = True):
     builder = InlineKeyboardBuilder()
 
     builder.button(
@@ -1790,7 +1794,8 @@ def user_settings_keyboard(user, locale: str = "ru"):
         callback_data="settings_toggle_length",
     )
 
-    builder.button(text=translate("ui.settings.language", locale, fallback="🌐 Язык"), callback_data="settings_change_language")
+    if language_available:
+        builder.button(text=translate("ui.settings.language", locale, fallback="🌐 Язык"), callback_data="settings_change_language")
     builder.button(text=translate("ui.settings.close", locale, fallback="❌ Закрыть"), callback_data="settings_close")
     builder.adjust(1)
     return builder.as_markup()

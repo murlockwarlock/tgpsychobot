@@ -18,7 +18,13 @@ from time_helpers import utc_now
 from vector_store import delete_document_vectors, update_vector_index
 import keyboards as kb
 from error_reporting import notify_admins_about_error
-from translation_service import refresh_translation_cache, resolve_effective_locale, translate
+from translation_service import (
+    refresh_translation_cache,
+    resolve_effective_locale,
+    runtime_enabled_languages,
+    runtime_language_selection_enabled,
+    translate,
+)
 class DailyLimitError(Exception):
     pass
 
@@ -384,8 +390,8 @@ async def process_mailings(bot: Bot):
                             locale = resolve_effective_locale(
                                 getattr(target_user, "telegram_language_code", None),
                                 getattr(general_config, "telegram_default_language", "ru"),
-                                bool(getattr(general_config, "telegram_language_selection_enabled", False)),
-                                getattr(general_config, "telegram_enabled_languages", '["ru"]'),
+                                runtime_language_selection_enabled(general_config),
+                                runtime_enabled_languages(general_config),
                                 platform="max" if user_id >= 100_000_000_000 else "telegram",
                             )
                             localized_text = translate(

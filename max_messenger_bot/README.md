@@ -6,7 +6,7 @@
 
 - отдельная точка входа: `python -m max_messenger_bot.app`
 - конфиг `MAX` через env или `config.ini [max]`
-- webhook/polling клиент для `platform-api.max.ru`
+- webhook/polling клиент для `platform-api2.max.ru`
 - собственное хранилище состояний: `max_bot_states`
 - отдельные таблицы под MAX-медиа:
   - `max_content_media`
