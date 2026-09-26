@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -13,9 +14,11 @@ from followup_admin_contract import (
     FOLLOWUP_METADATA_LABELS,
     FOLLOWUP_STAGE_LABELS,
     FOLLOWUP_STEPS_EXPLANATION,
+    parse_followup_step_input,
 )
 from followups import (
     FOLLOWUP_STAGE_MODES,
+    FOLLOWUP_STEP_DELETE_PROTECTED_ATTEMPT_STATUSES,
     FollowupTransportRegistry,
     UNSET_STAGE_TOKEN,
     _canonical_followup_stage_condition,
@@ -25,6 +28,7 @@ from followups import (
     prepare_followup_step,
 )
 from translation_service import resolve_user_effective_locale, translate
+from translation_pack_manager import translation_coordination_lock
 
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard
@@ -44,6 +48,9 @@ from ..storage import StateStore
 
 def _back(payload: str) -> list[dict]:
     return [callback_button("⬅️ Назад", payload)]
+
+
+_max_followup_tests_inflight: dict[tuple[int, int], asyncio.Event] = {}
 
 
 async def _campaign(session, campaign_id: int):
@@ -412,10 +419,7 @@ async def receive_metadata_value(client: MaxApiClient, states: StateStore, chat_
 async def start_stops(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, campaign_id: int) -> None:
     await states.set(user_id, chat_id, "max_followup_stop_events", {"campaign_id": campaign_id})
     rows = []
-    async with async_session_maker() as session:
-        item = await session.get(FollowupCampaign, campaign_id)
-    if item is not None and parse_followup_csv(item.stop_events):
-        rows.append([callback_button("🧹 Очистить список", f"admin_fu_stops_clear_{campaign_id}")])
+    rows.append([callback_button("🧹 Очистить список", f"admin_fu_stops_clear_{campaign_id}")])
     rows.append(_back(f"admin_fu_conditions_{campaign_id}"))
     await client.send_message(
         chat_id=chat_id,
@@ -467,8 +471,15 @@ async def show_step(client: MaxApiClient, chat_id: int, campaign_id: int, step_i
     index = next(index for index, candidate in enumerate(item.steps, 1) if candidate.id == step_id)
     kind = "AI" if step.message_type == "ai" else "static"
     content_label = "Инструкция" if kind == "AI" else "Текст"
-    content = (step.ai_instruction if kind == "AI" else step.message_text) or "не задано"
-    text = f"🪜 <b>Шаг {index}</b>\n\nИндекс: <b>{index}</b>\nЗадержка: <b>{step.delay_minutes} мин.</b>\nТип: <b>{kind}</b>\n{content_label}:\n<code>{html.escape(content[:3000])}</code>"
+    if kind == "AI":
+        content = step.ai_instruction or "не задано"
+    else:
+        from content_authoring import read_content_value
+
+        async with async_session_maker() as session:
+            content = (await read_content_value(session, "followup_step", step, "message_text", "ru")).admin_label()
+    content = content[:3000] + ("…" if len(content) > 3000 else "")
+    text = f"🪜 <b>Шаг {index}</b>\n\nИндекс: <b>{index}</b>\nЗадержка: <b>{step.delay_minutes} мин.</b>\nТип: <b>{kind}</b>\n{content_label}:\n<code>{html.escape(content)}</code>"
     rows = [[callback_button("✏️ Редактировать", f"admin_fu_step_edit_{campaign_id}_{step_id}")]]
     if kind == "static":
         rows.append([callback_button("Текст сообщения", f"admin_fu_step_text_{step_id}")])
@@ -490,7 +501,10 @@ async def show_step_text(client: MaxApiClient, chat_id: int, step_id: int, local
         [callback_button("Изменить: Сообщение", f"admin_fu_step_text_edit_{step_id}_ru")],
         _back(f"admin_fu_step_{campaign_id}_{step_id}"),
     ]
-    preview = html.escape(value.admin_label() if value.text else "Не задано")
+    preview = value.admin_label()
+    if len(preview) > 250:
+        preview = preview[:247] + "…"
+    preview = html.escape(preview)
     await client.send_message(
         chat_id=chat_id,
         text=f"<b>Сообщения follow-up #{step_id}</b>\n\n<b>Сообщение:</b>\n{preview}",
@@ -554,22 +568,27 @@ async def start_step_add(client: MaxApiClient, states: StateStore, chat_id: int,
 
 async def receive_step_add(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, value: str) -> None:
     snapshot = await states.get(user_id)
-    lines = value.splitlines()
-    if not snapshot or len(lines) < 2:
+    parsed = parse_followup_step_input(value)
+    if not snapshot:
         await client.send_message(chat_id=chat_id, text="Нужны минуты в первой строке и текст ниже.")
         return
-    try:
-        delay = int(lines[0].strip())
-    except ValueError:
-        delay = 0
-    content = "\n".join(lines[1:]).strip()
-    if not 1 <= delay <= 525600 or not content:
+    if parsed is None:
+        first, separator, body = (value or "").partition("\n")
+        if not separator or not first.strip().isdigit() or not body.strip():
+            await client.send_message(chat_id=chat_id, text="Нужны минуты в первой строке и текст ниже.")
+            return
         await client.send_message(chat_id=chat_id, text="Задержка должна быть от 1 минуты до 365 дней.")
+        return
+    delay, content = parsed
+    if not content:
+        await client.send_message(chat_id=chat_id, text="Нужны минуты в первой строке и текст ниже.")
         return
     data = snapshot.data
     async with async_session_maker() as session:
-        max_order = await session.scalar(select(FollowupStep.sort_order).where(FollowupStep.campaign_id == int(data["campaign_id"])).order_by(FollowupStep.sort_order.desc()).limit(1))
-        step = FollowupStep(campaign_id=int(data["campaign_id"]), sort_order=(max_order or 0) + 1, delay_minutes=delay, message_type=data["message_type"])
+        order = await session.scalar(
+            select(func.count(FollowupStep.id)).where(FollowupStep.campaign_id == int(data["campaign_id"]))
+        ) or 0
+        step = FollowupStep(campaign_id=int(data["campaign_id"]), sort_order=order, delay_minutes=delay, message_type=data["message_type"])
         if data["message_type"] == "ai":
             step.ai_instruction = content
         else:
@@ -584,7 +603,9 @@ async def receive_step_add(client: MaxApiClient, states: StateStore, chat_id: in
 async def start_step_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, campaign_id: int, step_id: int) -> None:
     async with async_session_maker() as session:
         step = await session.get(FollowupStep, step_id)
-    if step is None:
+    if step is None or step.campaign_id != campaign_id:
+        await states.clear(user_id)
+        await client.send_message(chat_id=chat_id, text="Шаг не найден.")
         return
     content = step.ai_instruction if step.message_type == "ai" else step.message_text
     await states.set(user_id, chat_id, "max_followup_step_edit", {"campaign_id": campaign_id, "step_id": step_id})
@@ -594,28 +615,34 @@ async def start_step_edit(client: MaxApiClient, states: StateStore, chat_id: int
 
 async def receive_step_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, value: str) -> None:
     snapshot = await states.get(user_id)
-    lines = value.splitlines()
-    if not snapshot or len(lines) < 2:
+    parsed = parse_followup_step_input(value)
+    if not snapshot:
         await client.send_message(chat_id=chat_id, text="Нужны минуты в первой строке и текст ниже.")
         return
-    try:
-        delay = int(lines[0].strip())
-    except ValueError:
-        delay = 0
-    content = "\n".join(lines[1:]).strip()
-    data = snapshot.data
-    if not 1 <= delay <= 525600 or not content:
+    if parsed is None:
+        first, separator, body = (value or "").partition("\n")
+        if not separator or not first.strip().isdigit() or not body.strip():
+            await client.send_message(chat_id=chat_id, text="Нужны минуты в первой строке и текст ниже.")
+            return
         await client.send_message(chat_id=chat_id, text="Задержка должна быть от 1 минуты до 365 дней.")
         return
+    delay, content = parsed
+    if not content:
+        await client.send_message(chat_id=chat_id, text="Нужны минуты в первой строке и текст ниже.")
+        return
+    data = snapshot.data
     async with async_session_maker() as session:
         step = await session.get(FollowupStep, int(data["step_id"]))
-        if step:
-            step.delay_minutes = delay
-            if step.message_type == "ai":
-                step.ai_instruction = content
-            else:
-                step.message_text = content
-            await session.commit()
+        if step is None or step.campaign_id != int(data["campaign_id"]):
+            await states.clear(user_id)
+            await client.send_message(chat_id=chat_id, text="Шаг не найден.")
+            return
+        step.delay_minutes = delay
+        if step.message_type == "ai":
+            step.ai_instruction = content
+        else:
+            step.message_text = content
+        await session.commit()
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="✅ Шаг изменён.")
     await show_step(client, chat_id, int(data["campaign_id"]), int(data["step_id"]))
@@ -627,17 +654,37 @@ async def ask_delete_step(client: MaxApiClient, chat_id: int, campaign_id: int, 
 
 async def delete_step(client: MaxApiClient, chat_id: int, campaign_id: int, step_id: int) -> None:
     async with async_session_maker() as session:
-        step = await session.get(FollowupStep, step_id)
-        if step is None or step.campaign_id != campaign_id:
-            return
-        sent_count = await session.scalar(select(func.count(FollowupDelivery.id)).where(FollowupDelivery.step_id == step_id)) or 0
-        protected_count = await session.scalar(select(func.count(FollowupDeliveryAttempt.id)).where(FollowupDeliveryAttempt.step_id == step_id, FollowupDeliveryAttempt.status.in_(("claimed", "retryable", "uncertain")))) or 0
-        if sent_count or protected_count:
-            await client.send_message(chat_id=chat_id, text="Шаг уже отправлялся или находится в процессе отправки, его нельзя удалить без потери истории.")
-            await show_steps(client, chat_id, campaign_id)
-            return
-        await session.delete(step)
-        await session.commit()
+        async with translation_coordination_lock(session):
+            step = await session.scalar(
+                select(FollowupStep)
+                .where(FollowupStep.id == step_id, FollowupStep.campaign_id == campaign_id)
+                .with_for_update()
+            )
+            if step is None:
+                return
+            sent_count = await session.scalar(select(func.count(FollowupDelivery.id)).where(FollowupDelivery.step_id == step_id)) or 0
+            protected_count = await session.scalar(
+                select(func.count(FollowupDeliveryAttempt.id)).where(
+                    FollowupDeliveryAttempt.step_id == step_id,
+                    FollowupDeliveryAttempt.status.in_(FOLLOWUP_STEP_DELETE_PROTECTED_ATTEMPT_STATUSES),
+                )
+            ) or 0
+            if sent_count or protected_count:
+                await client.send_message(chat_id=chat_id, text="Шаг уже отправлялся или находится в процессе отправки, его нельзя удалить без потери истории.")
+                await show_steps(client, chat_id, campaign_id)
+                return
+            await session.delete(step)
+            await session.flush()
+            remaining = (
+                await session.scalars(
+                    select(FollowupStep)
+                    .where(FollowupStep.campaign_id == campaign_id)
+                    .order_by(FollowupStep.sort_order, FollowupStep.id)
+                )
+            ).all()
+            for index, remaining_step in enumerate(remaining):
+                remaining_step.sort_order = index
+            await session.commit()
     await client.send_message(chat_id=chat_id, text="✅ Шаг удалён.")
     await show_steps(client, chat_id, campaign_id)
 
@@ -708,10 +755,11 @@ async def receive_jitter(client: MaxApiClient, states: StateStore, chat_id: int,
 
 async def delete_campaign(client: MaxApiClient, chat_id: int, campaign_id: int) -> None:
     async with async_session_maker() as session:
-        item = await session.get(FollowupCampaign, campaign_id)
-        if item:
-            await session.delete(item)
-            await session.commit()
+        async with translation_coordination_lock(session):
+            item = await session.get(FollowupCampaign, campaign_id)
+            if item:
+                await session.delete(item)
+                await session.commit()
     await client.send_message(chat_id=chat_id, text="✅ Цепочка удалена.")
     await show_campaigns(client, chat_id)
 
@@ -933,27 +981,36 @@ async def send_self_test(
     campaign_id: int,
     states: StateStore | None = None,
 ) -> None:
-    step_index = 0
-    if states is not None:
-        step_index = _self_test_index(await states.get(user_id), campaign_id)
-    async with async_session_maker() as session:
-        snapshot = await _self_test_snapshot(session, campaign_id, user_id, step_index)
-    item = snapshot["campaign"]
-    user = snapshot["user"]
-    step = snapshot["step"]
-    if item is None or user is None or step is None or not snapshot["can_send"]:
+    key = (user_id, campaign_id)
+    existing = _max_followup_tests_inflight.get(key)
+    if existing is not None:
+        await existing.wait()
         await show_self_test(client, chat_id, user_id, campaign_id, states)
         return
+    completed = asyncio.Event()
+    _max_followup_tests_inflight[key] = completed
     try:
-        prepared = await prepare_followup_step(
-            user=user,
-            step=step,
-            dialogue_id=snapshot["dialogue_id"],
-            topic_id=snapshot["topic_id"],
-        )
-        await emit_followup_step(FollowupTransportRegistry(max_client=client), user=user, step=step, send_result=prepared)
+        step_index = 0
         if states is not None:
-            await states.set(user_id, chat_id, "max_followup_self_test", {"campaign_id": campaign_id, "step_index": step_index + 1})
+            step_index = _self_test_index(await states.get(user_id), campaign_id)
+        async with async_session_maker() as session:
+            snapshot = await _self_test_snapshot(session, campaign_id, user_id, step_index)
+        item = snapshot["campaign"]
+        user = snapshot["user"]
+        step = snapshot["step"]
+        if item is not None and user is not None and step is not None and snapshot["can_send"]:
+            prepared = await prepare_followup_step(
+                user=user,
+                step=step,
+                dialogue_id=snapshot["dialogue_id"],
+                topic_id=snapshot["topic_id"],
+            )
+            await emit_followup_step(FollowupTransportRegistry(max_client=client), user=user, step=step, send_result=prepared)
+            if states is not None:
+                await states.set(user_id, chat_id, "max_followup_self_test", {"campaign_id": campaign_id, "step_index": step_index + 1})
     except Exception:
         await client.send_message(chat_id=chat_id, text="Не удалось отправить шаг. Проверьте условия и настройки транспорта.")
+    finally:
+        _max_followup_tests_inflight.pop(key, None)
+        completed.set()
     await show_self_test(client, chat_id, user_id, campaign_id, states)

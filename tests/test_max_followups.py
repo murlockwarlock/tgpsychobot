@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import json
 import os
@@ -17,7 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import followups
 import automation_admin
 import admin_content_authoring
-from database import Base, FollowupCampaign, FollowupDelivery, FollowupDeliveryAttempt, FollowupRun, FollowupStep, User
+from database import Base, FollowupCampaign, FollowupDelivery, FollowupDeliveryAttempt, FollowupRun, FollowupStep, Topic, User
 from max_messenger_bot.app import MaxBotApplication
 from max_messenger_bot import app as max_app_module
 from max_messenger_bot.api import MaxApiClient
@@ -73,8 +74,8 @@ class _BoundarySession:
         request = {"method": method, "path": f"/{path}", "params": params or {}, "body": json}
         if path == "messages" and self.validate_body is not None:
             self.validate_body(json)
-        if path == "answers" and self.validate_body is not None and json is not None:
-            self.validate_body(json.get("message", {}))
+        if path == "answers" and self.validate_body is not None and json is not None and json.get("message") is not None:
+            self.validate_body(json["message"])
         self.requests.append(request)
         if path == "messages":
             mid = f"max-boundary-{len(self.requests)}"
@@ -100,8 +101,7 @@ class ValidatingMaxClient(MaxApiClient):
         assert isinstance(attachments, list)
         for attachment in attachments:
             assert isinstance(attachment, dict)
-            if attachment.get("type") != "inline_keyboard":
-                continue
+            assert attachment.get("type") == "inline_keyboard"
             payload = attachment.get("payload")
             assert isinstance(payload, dict)
             buttons = payload.get("buttons")
@@ -148,6 +148,7 @@ def _latest_screen(client: ValidatingMaxClient):
 async def _press_visible_button(app, client, raw_user_id, update_number, label_or_match):
     request, buttons = _latest_screen(client)
     if callable(label_or_match):
+        assert any(label_or_match(button.get("text", "")) for button in buttons), [button.get("text") for button in buttons]
         button = next(button for button in buttons if label_or_match(button.get("text", "")))
     else:
         button = next(button for button in buttons if button.get("text") == label_or_match)
@@ -179,6 +180,20 @@ async def _send_admin_text(app, raw_user_id, update_number, text):
             "message": {
                 "recipient": {"chat_id": raw_user_id},
                 "sender": {"user_id": raw_user_id, "name": "Admin"},
+                "body": {"text": text},
+            },
+        }
+    )
+
+
+async def _send_user_text(app, raw_user_id, update_number, text):
+    await app.handle_update(
+        {
+            "update_type": "message_created",
+            "update_id": f"journey-{update_number}",
+            "message": {
+                "recipient": {"chat_id": raw_user_id},
+                "sender": {"user_id": raw_user_id, "name": "User"},
                 "body": {"text": text},
             },
         }
@@ -231,22 +246,22 @@ async def test_max_static_followup_uses_max_keyboard_and_delivery_metadata(follo
         )
         await session.commit()
 
-    client = FakeMaxClient()
+    client = ValidatingMaxClient()
     with patch.object(followups, "async_session_maker", followup_db):
         assert await followups.process_due_followups(
             followups.FollowupTransportRegistry(max_client=client)
         ) == 1
 
-    assert len(client.sent) == 1
-    payload = client.sent[0]
-    assert payload["user_id"] == 101
+    assert len(client.messages) == 1
+    payload = client.messages[0]["body"]
+    assert client.messages[0]["params"]["user_id"] == 101
     assert payload["text"] == "Напоминание"
     assert payload["attachments"][0]["type"] == "inline_keyboard"
     assert payload["attachments"][0]["payload"]["buttons"][0][0]["text"] == "Продолжить"
     async with followup_db() as session:
         delivery = await session.scalar(select(FollowupDelivery))
     assert delivery.platform == "max"
-    assert delivery.external_message_id == "max-1"
+    assert delivery.external_message_id == "max-boundary-1"
     assert delivery.telegram_message_id is None
 
 
@@ -285,13 +300,13 @@ async def test_max_static_followup_button_uses_real_callback_route(followup_db, 
         )
         await session.commit()
 
-    client = FakeMaxClient()
+    client = ValidatingMaxClient()
     with patch.object(followups, "async_session_maker", followup_db):
         assert await followups.process_due_followups(
             followups.FollowupTransportRegistry(max_client=client)
         ) == 1
 
-    button_payload = client.sent[0]["attachments"][0]["payload"]["buttons"][0][0]["payload"]
+    button_payload = client.messages[0]["body"]["attachments"][0]["payload"]["buttons"][0][0]["payload"]
     monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
     monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
     monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _false_async())
@@ -309,12 +324,12 @@ async def test_max_static_followup_button_uses_real_callback_route(followup_db, 
                 "payload": button_payload,
                 "sender": {"user_id": 111, "name": "MAX"},
             },
-            "message": {"recipient": {"chat_id": 111}, "body": {"attachments": client.sent[0]["attachments"]}},
+            "message": {"recipient": {"chat_id": 111}, "body": {"attachments": client.messages[0]["body"]["attachments"]}},
         }
     )
 
     show_menu.assert_awaited_once_with(client, 111, user_id=user_id)
-    assert client.answered == [("cb-static-button", {})]
+    assert client.transport.requests[-1]["path"] == "/answers"
 
 
 @pytest.mark.asyncio
@@ -347,13 +362,13 @@ async def test_max_and_telegram_due_runs_use_only_their_platform_transport(follo
             return SimpleNamespace(message_id=7)
 
     telegram = TelegramClient()
-    maximum = FakeMaxClient()
+    maximum = ValidatingMaxClient()
     with patch.object(followups, "async_session_maker", followup_db):
         assert await followups.process_due_followups(
             followups.FollowupTransportRegistry(telegram=telegram, max_client=maximum)
         ) == 2
     assert telegram.sent == [(303, "Hi")]
-    assert [item["user_id"] for item in maximum.sent] == [202]
+    assert [item["params"]["user_id"] for item in maximum.messages] == [202]
 
 
 @pytest.mark.asyncio
@@ -367,7 +382,7 @@ async def test_max_ai_followup_keeps_buttons_and_followup_request_context(follow
         await session.flush()
         session.add(FollowupRun(campaign_id=campaign.id, user_id=user_id, dialogue_id=7, topic_id=0, due_at=datetime.utcnow() - timedelta(minutes=1)))
         await session.commit()
-    client = FakeMaxClient()
+    client = ValidatingMaxClient()
     with patch.object(followups, "async_session_maker", followup_db), patch(
         "ai_integration.get_ai_response",
         new=AsyncMock(return_value="Ответ\n[Открыть](btn:continue)"),
@@ -376,8 +391,8 @@ async def test_max_ai_followup_keeps_buttons_and_followup_request_context(follow
     response.assert_awaited_once()
     assert response.await_args.kwargs["request_type"] == "followup"
     assert response.await_args.kwargs["track_user_activity"] is False
-    assert client.sent[0]["text"] == "Ответ"
-    assert client.sent[0]["attachments"][0]["payload"]["buttons"][0][0]["text"] == "Открыть"
+    assert client.messages[0]["body"]["text"] == "Ответ"
+    assert client.messages[0]["body"]["attachments"][0]["payload"]["buttons"][0][0]["text"] == "Открыть"
 
 
 @pytest.mark.asyncio
@@ -513,6 +528,665 @@ async def test_max_activity_ingress_runs_through_handle_update_boundary():
 
 
 @pytest.mark.asyncio
+async def test_max_topic_switch_finalizes_after_committed_scope(followup_db, monkeypatch):
+    raw_user_id = 701
+    user_id = MAX_ID_OFFSET + raw_user_id
+    topic = Topic(name="New scope", is_active=True, show_in_list=True)
+    campaign = FollowupCampaign(
+        name="Topic race",
+        is_active=True,
+        all_topics=True,
+        include_main_dialogue=True,
+        quiet_start_minute=0,
+        quiet_end_minute=0,
+        jitter_min_seconds=0,
+        jitter_max_seconds=0,
+    )
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="Later"))
+    async with followup_db() as session:
+        user = User(id=user_id, first_name="MAX", current_dialogue_id=1, current_topic_id=None)
+        session.add_all([user, topic, campaign])
+        await session.flush()
+        session.add(
+            FollowupRun(
+                campaign_id=campaign.id,
+                user_id=user_id,
+                dialogue_id=1,
+                topic_id=0,
+                due_at=datetime.utcnow(),
+                status="active",
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.topics_service, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _false_async())
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_select(client, chat_id, selected_user_id, selected_topic_id, states):
+        started.set()
+        await release.wait()
+        async with followup_db() as session:
+            selected_user = await session.get(User, selected_user_id)
+            selected_user.current_topic_id = selected_topic_id
+            await session.commit()
+        await client.send_message(chat_id=chat_id, text="✅ Тема сохранена.")
+
+    monkeypatch.setattr(max_app_module.topics_service, "select_topic", delayed_select)
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+
+    await _send_user_text(app, raw_user_id, 1, "/topics")
+    _latest_screen(client)
+    switch = asyncio.create_task(_press_visible_button(app, client, raw_user_id, 2, "New scope"))
+    await started.wait()
+    assert not switch.done()
+    release.set()
+    await switch
+
+    async with followup_db() as session:
+        saved_user = await session.get(User, user_id)
+        runs = (
+            await session.scalars(
+                select(FollowupRun)
+                .where(FollowupRun.user_id == user_id)
+                .order_by(FollowupRun.dialogue_id, FollowupRun.topic_id)
+            )
+        ).all()
+    assert saved_user.current_topic_id == topic.id
+    assert {(run.dialogue_id, run.topic_id, run.status) for run in runs} == {
+        (1, 0, "cancelled"),
+        (1, topic.id, "active"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_max_reset_topic_finalizes_after_committed_scope(followup_db, monkeypatch):
+    raw_user_id = 712
+    user_id = MAX_ID_OFFSET + raw_user_id
+    topic = Topic(name="Current scope", is_active=True, show_in_list=True)
+    campaign = FollowupCampaign(
+        name="Reset topic race",
+        is_active=True,
+        all_topics=True,
+        include_main_dialogue=True,
+        quiet_start_minute=0,
+        quiet_end_minute=0,
+        jitter_min_seconds=0,
+        jitter_max_seconds=0,
+    )
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="Later"))
+    async with followup_db() as session:
+        user = User(id=user_id, first_name="MAX", current_dialogue_id=1, current_topic_id=7)
+        session.add_all([user, topic, campaign])
+        await session.flush()
+        session.add(
+            FollowupRun(
+                campaign_id=campaign.id,
+                user_id=user_id,
+                dialogue_id=1,
+                topic_id=7,
+                due_at=datetime.utcnow(),
+                status="active",
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.topics_service, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _false_async())
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_reset(client, chat_id, selected_user_id, states):
+        started.set()
+        await release.wait()
+        async with followup_db() as session:
+            selected_user = await session.get(User, selected_user_id)
+            selected_user.current_topic_id = None
+            await session.commit()
+        await client.send_message(chat_id=chat_id, text="✅ Основной диалог сохранён.")
+
+    monkeypatch.setattr(max_app_module.topics_service, "reset_topic", delayed_reset)
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+
+    await _send_user_text(app, raw_user_id, 1, "/topics")
+    _latest_screen(client)
+    reset = asyncio.create_task(_press_visible_button(app, client, raw_user_id, 2, "🏠 Перейти в основной диалог"))
+    await started.wait()
+    assert not reset.done()
+    release.set()
+    await reset
+
+    async with followup_db() as session:
+        saved_user = await session.get(User, user_id)
+        runs = (
+            await session.scalars(
+                select(FollowupRun)
+                .where(FollowupRun.user_id == user_id)
+                .order_by(FollowupRun.dialogue_id, FollowupRun.topic_id)
+            )
+        ).all()
+    assert saved_user.current_topic_id is None
+    assert {(run.dialogue_id, run.topic_id, run.status) for run in runs} == {
+        (1, 0, "active"),
+        (1, 7, "cancelled"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_max_dialogue_reset_finalizes_after_committed_scope(followup_db, monkeypatch):
+    raw_user_id = 702
+    user_id = MAX_ID_OFFSET + raw_user_id
+    topic = Topic(name="Reset scope", is_active=True, show_in_list=True)
+    campaign = FollowupCampaign(
+        name="Reset race",
+        is_active=True,
+        all_topics=True,
+        include_main_dialogue=True,
+        quiet_start_minute=0,
+        quiet_end_minute=0,
+        jitter_min_seconds=0,
+        jitter_max_seconds=0,
+    )
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="Later"))
+    async with followup_db() as session:
+        user = User(id=user_id, first_name="MAX", current_dialogue_id=1, current_topic_id=7)
+        session.add_all([user, topic, campaign])
+        await session.flush()
+        session.add(
+            FollowupRun(
+                campaign_id=campaign.id,
+                user_id=user_id,
+                dialogue_id=1,
+                topic_id=7,
+                due_at=datetime.utcnow(),
+                status="active",
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _false_async())
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_reset(client, states, chat_id, selected_user_id, token, expected_dialogue_id, expected_topic_id):
+        await states.clear(selected_user_id)
+        started.set()
+        await release.wait()
+        async with followup_db() as session:
+            selected_user = await session.get(User, selected_user_id)
+            selected_user.current_dialogue_id += 1
+            await session.commit()
+        await client.send_message(chat_id=chat_id, text="✅ Диалог сброшен.")
+
+    monkeypatch.setattr(max_app_module.common, "execute_dialogue_reset", delayed_reset)
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+
+    await _send_user_text(app, raw_user_id, 1, "🗑️ Сбросить диалог")
+    _latest_screen(client)
+    reset = asyncio.create_task(_press_visible_button(app, client, raw_user_id, 2, "🗑️ Да, сбросить диалог"))
+    await started.wait()
+    assert not reset.done()
+    release.set()
+    await reset
+
+    async with followup_db() as session:
+        saved_user = await session.get(User, user_id)
+        runs = (
+            await session.scalars(
+                select(FollowupRun)
+                .where(FollowupRun.user_id == user_id)
+                .order_by(FollowupRun.dialogue_id)
+            )
+        ).all()
+    assert saved_user.current_dialogue_id == 2
+    assert {(run.dialogue_id, run.topic_id, run.status) for run in runs} == {
+        (1, 7, "cancelled"),
+        (2, 7, "active"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_max_static_editor_back_cancels_input_and_reopen_preserves_text(followup_db, monkeypatch):
+    raw_admin_id = 703
+    admin_id = MAX_ID_OFFSET + raw_admin_id
+    campaign = FollowupCampaign(name="Editor", include_main_dialogue=True)
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=5, message_type="static", message_text="Original"))
+    async with followup_db() as session:
+        session.add_all([User(id=admin_id, name="Admin", first_name="Admin", is_admin=True), campaign])
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_admin_followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "maybe_require_disclaimer", lambda *args, **kwargs: _false_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_access_before_chat", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "run_ai_dialogue", AsyncMock())
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+    update_number = 0
+
+    async def send(text):
+        nonlocal update_number
+        update_number += 1
+        await _send_admin_text(app, raw_admin_id, update_number, text)
+        return _latest_screen(client)
+
+    async def press(label):
+        nonlocal update_number
+        update_number += 1
+        return await _press_visible_button(app, client, raw_admin_id, update_number, label)
+
+    await send("/admin")
+    await press("💬 Догоняющие сообщения")
+    await press(lambda text: text.endswith("Editor"))
+    await press(lambda text: text.startswith("🪜 Шаги"))
+    await press(lambda text: text.startswith("1. через 5 мин."))
+    await press("Текст сообщения")
+    await press("Изменить: Сообщение")
+    state = await app.states.get(admin_id)
+    assert state is not None and state.state == "max_followup_step_text"
+    await press("⬅️ Назад")
+    assert await app.states.get(admin_id) is None
+
+    await send("unrelated ordinary text")
+    await asyncio.sleep(0)
+    async with followup_db() as session:
+        saved_step = await session.scalar(select(FollowupStep))
+    assert saved_step.message_text == "Original"
+
+    await press("⬅️ Назад")
+    await press("Текст сообщения")
+    assert "Original" in client.messages[-1]["body"]["text"]
+    await press("Изменить: Сообщение")
+    await send("Changed")
+    await press("⬅️ Назад")
+    await press("⬅️ Назад")
+    await press(lambda text: text.startswith("1. через 5 мин."))
+    await press("Текст сообщения")
+    assert "Changed" in client.messages[-1]["body"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_max_step_edit_rejects_cross_campaign_step(followup_db, monkeypatch):
+    raw_admin_id = 704
+    admin_id = MAX_ID_OFFSET + raw_admin_id
+    campaign_a = FollowupCampaign(name="Campaign A")
+    campaign_b = FollowupCampaign(name="Campaign B")
+    step_b = FollowupStep(sort_order=0, delay_minutes=5, message_type="static", message_text="Protected")
+    campaign_b.steps.append(step_b)
+    async with followup_db() as session:
+        session.add_all([User(id=admin_id, name="Admin", is_admin=True), campaign_a, campaign_b])
+        await session.commit()
+        campaign_a_id = campaign_a.id
+        step_b_id = step_b.id
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_admin_followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+
+    await app.handle_update(
+        {
+            "update_type": "message_callback",
+            "update_id": "cross-campaign-open",
+            "callback": {
+                "callback_id": "cross-campaign-open-callback",
+                "payload": f"admin_fu_step_edit_{campaign_a_id}_{step_b_id}",
+                "sender": {"user_id": raw_admin_id, "name": "Admin"},
+            },
+            "message": {"recipient": {"chat_id": raw_admin_id}, "body": {"attachments": []}},
+        }
+    )
+    assert "Шаг не найден" in client.messages[-1]["body"]["text"]
+    assert await app.states.get(admin_id) is None
+
+    await app.states.set(
+        admin_id,
+        raw_admin_id,
+        "max_followup_step_edit",
+        {"campaign_id": campaign_a_id, "step_id": step_b_id},
+    )
+    await _send_admin_text(app, raw_admin_id, 705, "99\nHacked")
+    async with followup_db() as session:
+        saved_step = await session.get(FollowupStep, step_b_id)
+    assert saved_step.delay_minutes == 5
+    assert saved_step.message_text == "Protected"
+    assert await app.states.get(admin_id) is None
+
+
+@pytest.mark.asyncio
+async def test_max_step_delete_reindexes_remaining_steps_through_visible_button(followup_db, monkeypatch):
+    raw_admin_id = 706
+    admin_id = MAX_ID_OFFSET + raw_admin_id
+    campaign = FollowupCampaign(name="Delete visible", include_main_dialogue=True)
+    campaign.steps.extend(
+        [
+            FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="First"),
+            FollowupStep(sort_order=1, delay_minutes=2, message_type="static", message_text="Middle"),
+            FollowupStep(sort_order=2, delay_minutes=3, message_type="static", message_text="Last"),
+        ]
+    )
+    async with followup_db() as session:
+        session.add_all([User(id=admin_id, name="Admin", is_admin=True), campaign])
+        await session.commit()
+        middle_id = campaign.steps[1].id
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_admin_followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+    update_number = 0
+
+    async def send(text):
+        nonlocal update_number
+        update_number += 1
+        await _send_admin_text(app, raw_admin_id, update_number, text)
+        return _latest_screen(client)
+
+    async def press(label):
+        nonlocal update_number
+        update_number += 1
+        return await _press_visible_button(app, client, raw_admin_id, update_number, label)
+
+    await send("/admin")
+    await press("💬 Догоняющие сообщения")
+    await press(lambda text: text.endswith("Delete visible"))
+    await press(lambda text: text.startswith("🪜 Шаги"))
+    await press(lambda text: text.startswith("2. через 2 мин."))
+    await press("🗑 Удалить")
+
+    async with followup_db() as session:
+        remaining = (
+            await session.scalars(
+                select(FollowupStep).where(FollowupStep.campaign_id == campaign.id).order_by(FollowupStep.sort_order, FollowupStep.id)
+            )
+        ).all()
+    assert [step.sort_order for step in remaining] == [0, 1]
+    assert middle_id not in {step.id for step in remaining}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["claimed", "retryable", "uncertain", "delivered", "retry_exhausted"])
+async def test_max_step_delete_blocks_all_protected_attempt_statuses(followup_db, status):
+    campaign = FollowupCampaign(name=f"Protected {status}")
+    step = FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="Protected")
+    campaign.steps.append(step)
+    user = User(id=MAX_ID_OFFSET + 707, first_name="Admin", is_admin=True)
+    async with followup_db() as session:
+        session.add_all([campaign, user])
+        await session.flush()
+        run = FollowupRun(campaign_id=campaign.id, user_id=user.id, dialogue_id=1, topic_id=0, due_at=datetime.utcnow())
+        session.add(run)
+        await session.flush()
+        attempt = FollowupDeliveryAttempt(
+            run_id=run.id,
+            step_id=step.id,
+            step_index=0,
+            generation=1,
+            claim_token=f"token-{status}",
+            status=status,
+        )
+        session.add(attempt)
+        await session.commit()
+
+    client = FakeMaxClient()
+    with patch.object(max_admin_followups, "async_session_maker", followup_db):
+        await max_admin_followups.delete_step(client, 1, campaign.id, step.id)
+    async with followup_db() as session:
+        assert await session.get(FollowupStep, step.id) is not None
+        saved_attempt = await session.scalar(select(FollowupDeliveryAttempt))
+    assert saved_attempt.status == status
+    assert any("нельзя удалить" in message["text"] for message in client.sent)
+
+
+@pytest.mark.asyncio
+async def test_max_step_delete_blocks_delivery_history_and_preserves_it(followup_db):
+    campaign = FollowupCampaign(name="Delivery history")
+    step = FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="Sent")
+    campaign.steps.append(step)
+    user = User(id=MAX_ID_OFFSET + 708, first_name="Admin", is_admin=True)
+    async with followup_db() as session:
+        session.add_all([campaign, user])
+        await session.flush()
+        run = FollowupRun(campaign_id=campaign.id, user_id=user.id, dialogue_id=1, topic_id=0, due_at=datetime.utcnow())
+        session.add(run)
+        await session.flush()
+        delivery = FollowupDelivery(run_id=run.id, step_id=step.id, platform="max", external_message_id="history")
+        session.add(delivery)
+        await session.commit()
+
+    client = FakeMaxClient()
+    with patch.object(max_admin_followups, "async_session_maker", followup_db):
+        await max_admin_followups.delete_step(client, 1, campaign.id, step.id)
+    async with followup_db() as session:
+        assert await session.get(FollowupStep, step.id) is not None
+        saved_delivery = await session.scalar(select(FollowupDelivery))
+    assert saved_delivery.external_message_id == "history"
+
+
+@pytest.mark.asyncio
+async def test_max_self_test_concurrent_visible_presses_send_once(followup_db, monkeypatch):
+    raw_admin_id = 709
+    admin_id = MAX_ID_OFFSET + raw_admin_id
+    campaign = FollowupCampaign(
+        name="Self test",
+        is_active=True,
+        include_main_dialogue=True,
+        quiet_start_minute=0,
+        quiet_end_minute=0,
+        jitter_min_seconds=0,
+        jitter_max_seconds=0,
+    )
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="SELF_TEST_ONCE"))
+    async with followup_db() as session:
+        session.add_all([User(id=admin_id, name="Admin", is_admin=True, current_dialogue_id=1), campaign])
+        await session.commit()
+
+    for module in (max_app_module, max_storage, max_admin_followups):
+        monkeypatch.setattr(module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+    update_number = 0
+
+    async def send(text):
+        nonlocal update_number
+        update_number += 1
+        await _send_admin_text(app, raw_admin_id, update_number, text)
+        return _latest_screen(client)
+
+    async def press(label):
+        nonlocal update_number
+        update_number += 1
+        return await _press_visible_button(app, client, raw_admin_id, update_number, label)
+
+    await send("/admin")
+    await press("💬 Догоняющие сообщения")
+    await press(lambda text: text.endswith("Self test"))
+    await press("🧪 Проверить на себе")
+    request, buttons = _latest_screen(client)
+    send_button = next(button for button in buttons if button.get("text", "").startswith("▶️"))
+    payload = send_button["payload"]
+    update_base = {
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "self-test-concurrent",
+            "payload": payload,
+            "sender": {"user_id": raw_admin_id, "name": "Admin"},
+        },
+        "message": {"recipient": {"chat_id": raw_admin_id}, "body": {"attachments": request["body"].get("attachments", [])}},
+    }
+    first = {**update_base, "update_id": "self-test-first"}
+    second = {**update_base, "update_id": "self-test-second", "callback": {**update_base["callback"], "callback_id": "self-test-second-callback"}}
+    await asyncio.gather(app.handle_update(first), app.handle_update(second))
+
+    external = [message for message in client.messages if message["body"].get("text") == "SELF_TEST_ONCE"]
+    assert len(external) == 1
+    state = await app.states.get(admin_id)
+    assert state is not None
+    assert state.data["step_index"] == 1
+    assert "Ручная проверка завершена" in client.messages[-1]["body"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_max_empty_and_nonempty_stop_event_screens_match_telegram(followup_db, monkeypatch):
+    raw_admin_id = 710
+    admin_id = MAX_ID_OFFSET + raw_admin_id
+    campaign = FollowupCampaign(name="Stop parity", include_main_dialogue=True)
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="Text"))
+    async with followup_db() as session:
+        session.add_all([User(id=admin_id, name="Admin", is_admin=True), campaign])
+        await session.commit()
+
+    for module in (max_app_module, max_storage, max_admin_followups, automation_admin):
+        monkeypatch.setattr(module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+    update_number = 0
+
+    async def send(text):
+        nonlocal update_number
+        update_number += 1
+        await _send_admin_text(app, raw_admin_id, update_number, text)
+        return _latest_screen(client)
+
+    async def press(label):
+        nonlocal update_number
+        update_number += 1
+        return await _press_visible_button(app, client, raw_admin_id, update_number, label)
+
+    async def expected_telegram_labels():
+        target = SimpleNamespace(
+            data=f"followup_stop_events_edit_{campaign.id}",
+            message=SimpleNamespace(edit_text=AsyncMock()),
+        )
+        state = SimpleNamespace(
+            get_data=AsyncMock(return_value={}),
+            set_state=AsyncMock(),
+            update_data=AsyncMock(),
+            clear=AsyncMock(),
+        )
+        await automation_admin.followup_stop_events_edit(target, state)
+        markup = target.message.edit_text.await_args.kwargs["reply_markup"]
+        return [button.text for row in markup.inline_keyboard for button in row]
+
+    await send("/admin")
+    await press("💬 Догоняющие сообщения")
+    await press(lambda text: text.endswith("Stop parity"))
+    await press("⚙️ Условия")
+    await press("✏️ Изменить события остановки")
+    _, buttons = _latest_screen(client)
+    assert [button["text"] for button in buttons] == await expected_telegram_labels()
+    await press("🧹 Очистить список")
+
+    await press("✏️ Изменить события остановки")
+    await send("PAYMENT_SUCCESS")
+    await press("✏️ Изменить события остановки")
+    _, buttons = _latest_screen(client)
+    assert [button["text"] for button in buttons] == await expected_telegram_labels()
+
+
+@pytest.mark.asyncio
+async def test_max_step_input_rejects_plus_prefix_through_real_message_route(followup_db, monkeypatch):
+    raw_admin_id = 711
+    admin_id = MAX_ID_OFFSET + raw_admin_id
+    campaign = FollowupCampaign(name="Numeric parity", include_main_dialogue=True)
+    async with followup_db() as session:
+        session.add_all([User(id=admin_id, name="Admin", is_admin=True), campaign])
+        await session.commit()
+
+    for module in (max_app_module, max_storage, max_admin_followups):
+        monkeypatch.setattr(module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+    update_number = 0
+
+    async def send(text):
+        nonlocal update_number
+        update_number += 1
+        await _send_admin_text(app, raw_admin_id, update_number, text)
+        return _latest_screen(client)
+
+    async def press(label):
+        nonlocal update_number
+        update_number += 1
+        return await _press_visible_button(app, client, raw_admin_id, update_number, label)
+
+    await send("/admin")
+    await press("💬 Догоняющие сообщения")
+    await press(lambda text: text.endswith("Numeric parity"))
+    await press(lambda text: text.startswith("🪜 Шаги"))
+    await press("➕ Обычный текст")
+    await send("+1\nShould not save")
+    async with followup_db() as session:
+        assert (await session.scalars(select(FollowupStep))).all() == []
+    await send("1\nSaved")
+    async with followup_db() as session:
+        saved = (await session.scalars(select(FollowupStep))).all()
+    assert len(saved) == 1
+    assert saved[0].delay_minutes == 1
+    assert saved[0].message_text == "Saved"
+
+
+@pytest.mark.asyncio
+async def test_max_long_static_step_detail_matches_telegram_presentation(followup_db, monkeypatch):
+    long_text = "x" * 3200
+    campaign = FollowupCampaign(name="Long parity", include_main_dialogue=True)
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text=long_text))
+    async with followup_db() as session:
+        session.add(campaign)
+        await session.commit()
+        campaign_id = campaign.id
+        step_id = campaign.steps[0].id
+
+    monkeypatch.setattr(automation_admin, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_admin_followups, "async_session_maker", followup_db)
+    telegram_target = SimpleNamespace(edit_text=AsyncMock(), message=SimpleNamespace(edit_text=AsyncMock()))
+    telegram_target.message.edit_text = telegram_target.edit_text
+    await automation_admin._show_followup_step_detail(telegram_target, campaign_id, step_id)
+    telegram_text = telegram_target.edit_text.await_args.args[0]
+
+    client = FakeMaxClient()
+    await max_admin_followups.show_step(client, 1, campaign_id, step_id)
+    assert client.sent[-1]["text"] == telegram_text
+
+
+@pytest.mark.asyncio
 async def test_max_admin_followup_campaign_journey_uses_real_application_routes(followup_db, monkeypatch):
     raw_admin_id = 505
     admin_id = MAX_ID_OFFSET + raw_admin_id
@@ -636,6 +1310,7 @@ async def test_max_followup_admin_uses_visible_buttons_for_complete_real_journey
         jitter_min_seconds=0,
         jitter_max_seconds=0,
     )
+    topic = Topic(name="Visible topic", is_active=True, show_in_list=True)
     campaign.steps.extend(
         [
             FollowupStep(sort_order=0, delay_minutes=5, message_type="static", message_text="Static"),
@@ -643,7 +1318,7 @@ async def test_max_followup_admin_uses_visible_buttons_for_complete_real_journey
         ]
     )
     async with followup_db() as session:
-        session.add_all([User(id=admin_id, first_name="Admin", is_admin=True, current_dialogue_id=1), campaign])
+        session.add_all([User(id=admin_id, first_name="Admin", is_admin=True, current_dialogue_id=1), topic, campaign])
         await session.commit()
 
     monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
@@ -669,11 +1344,17 @@ async def test_max_followup_admin_uses_visible_buttons_for_complete_real_journey
 
     await send("/admin")
     await press("💬 Догоняющие сообщения")
+    await press("➕ Новая цепочка")
+    await press("⬅️ Назад")
+    await press("➕ Новая цепочка")
+    await send("Temporary visible campaign")
+    await press("⬅️ Назад")
     await press(lambda text: text.endswith("Visible journey"))
 
     await press("💬 Темы")
     await press(lambda text: text.endswith("Основной диалог"))
     await press(lambda text: text.startswith("❌ Основной диалог"))
+    await press(lambda text: text.startswith("❌ Visible topic"))
     await press("⬅️ Назад")
 
     await press("⚙️ Условия")
@@ -753,14 +1434,6 @@ async def test_max_followup_admin_uses_visible_buttons_for_complete_real_journey
     assert [button["text"] for button in delete_buttons] == telegram_delete_labels
     await press("⬅️ Назад")
     assert client.messages[-1]["body"]["text"].startswith("💬 <b>Visible journey renamed")
-    await press("⬅️ Назад")
-    assert client.messages[-1]["body"]["text"].startswith("💬 <b>Догоняющие сообщения")
-    assert all(
-        classify_followup_callback(button["payload"]) is not None
-        for button in _keyboard_buttons(client.messages[-1])
-        if button.get("type") == "callback" and button.get("payload", "").startswith("admin_fu")
-    )
-
     async with followup_db() as session:
         saved_campaign = await session.scalar(select(FollowupCampaign).where(FollowupCampaign.name == "Visible journey renamed"))
         assert saved_campaign is not None
@@ -770,7 +1443,19 @@ async def test_max_followup_admin_uses_visible_buttons_for_complete_real_journey
         assert saved_campaign.jitter_min_seconds == 30
         assert saved_campaign.jitter_max_seconds == 180
         assert saved_campaign.quiet_start_minute == 22 * 60
+
+    await press("🗑 Удалить")
+    await press("Да, удалить")
+    async with followup_db() as session:
+        assert await session.get(FollowupCampaign, campaign.id) is None
+    assert client.messages[-1]["body"]["text"].startswith("💬 <b>Догоняющие сообщения")
     await press("⬅️ Назад")
+    assert all(
+        classify_followup_callback(button["payload"]) is not None
+        for button in _keyboard_buttons(client.messages[-1])
+        if button.get("type") == "callback" and button.get("payload", "").startswith("admin_fu")
+    )
+
     assert client.messages[-1]["body"]["text"] == "Добро пожаловать в админ-панель MAX."
     assert client.visible_followup_callbacks
     assert all(value in {"navigation", "mutation", "destructive", "external"} for value in client.visible_followup_callbacks.values())
@@ -881,7 +1566,7 @@ async def test_max_self_test_screen_matches_telegram_contract(followup_db, monke
 @pytest.mark.asyncio
 async def test_max_static_step_text_card_matches_telegram_contract(followup_db, monkeypatch):
     campaign = FollowupCampaign(name="Text card", include_main_dialogue=True)
-    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=5, message_type="static", message_text="Напоминание"))
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=5, message_type="static", message_text="x" * 3200))
     async with followup_db() as session:
         session.add(campaign)
         await session.commit()
@@ -1209,4 +1894,10 @@ async def test_max_followup_transport_uses_real_api_boundary_validation():
                     "payload": {"buttons": [[{"type": "callback", "text": "Плохо", "payload": None}]]},
                 }
             ],
+        )
+    with pytest.raises(AssertionError):
+        await client.send_message(
+            chat_id=1,
+            text="Проверка",
+            attachments=[{"type": "unknown_attachment", "payload": {}}],
         )

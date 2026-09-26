@@ -26,6 +26,16 @@ FOLLOWUP_METADATA_LABELS = {
 }
 
 
+def parse_followup_step_input(raw_text: str | None) -> tuple[int, str] | None:
+    first, separator, body = (raw_text or "").partition("\n")
+    if not separator or not first.strip().isdigit() or not body.strip():
+        return None
+    delay = int(first.strip())
+    if not 1 <= delay <= 525600:
+        return None
+    return delay, body.strip()
+
+
 def classify_followup_callback(payload: str) -> str | None:
     if payload in {"admin_followups", "admin_fu_list", "admin_fu_add"}:
         return "navigation"

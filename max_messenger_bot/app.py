@@ -151,7 +151,7 @@ class MaxBotApplication:
         self._processed_updates: set[str] = set()
         self._processed_updates_list: list[str] = []
 
-    def spawn_user_task(self, user_id: int, coro) -> None:
+    def spawn_user_task(self, user_id: int, coro) -> asyncio.Task[None]:
         lock = self._user_locks.setdefault(user_id, asyncio.Lock())
 
         async def runner() -> None:
@@ -167,6 +167,7 @@ class MaxBotApplication:
         self.user_tasks[user_id] = task
         task.add_done_callback(lambda t: self.user_tasks.pop(user_id, None) if self.user_tasks.get(user_id) is t else None)
         _track_task(self.background_tasks, task)
+        return task
 
     def spawn_ai_user_task(self, user_id: int, coro, lease: SingleFlightLease) -> None:
         lock = self._user_locks.setdefault(user_id, asyncio.Lock())
@@ -926,11 +927,11 @@ class MaxBotApplication:
                 await topics_service.show_topics(self.client, chat_id, user_id)
                 return
             if action in MAIN_TOPIC_ACTIONS:
-                self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
+                await self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
                 return
             if (action.startswith("topic_") and action[6:].isdigit() and int(action[6:]) > 0) or (action.startswith("svc:topic:") and action[10:].isdigit() and int(action[10:]) > 0):
                 topic_id = int(action[10:] if action.startswith("svc:topic:") else action[6:])
-                self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, topic_id, self.states))
+                await self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, topic_id, self.states))
                 return
             if action in ("subscription", "svc:subscription"):
                 await subscriptions_service.show_subscription_info(self.client, chat_id, user_id)
@@ -1033,11 +1034,11 @@ class MaxBotApplication:
             return
         if data.startswith("select_topic_"):
             await self.client.answer_callback(callback.callback_id)
-            self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states))
+            await self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states))
             return
         if data == "reset_topic":
             await self.client.answer_callback(callback.callback_id)
-            self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
+            await self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
             return
         if data.startswith("confirm_reset_dialogue:"):
             await self.client.answer_callback(callback.callback_id)
@@ -1046,11 +1047,11 @@ class MaxBotApplication:
                 token = parts[1]
                 expected_dialogue_id = int(parts[2])
                 expected_topic_id = int(parts[3])
-                self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, token, expected_dialogue_id, expected_topic_id))
+                await self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, token, expected_dialogue_id, expected_topic_id))
             elif len(parts) == 3:
                 expected_dialogue_id = int(parts[1])
                 expected_topic_id = int(parts[2])
-                self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, "", expected_dialogue_id, expected_topic_id))
+                await self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, "", expected_dialogue_id, expected_topic_id))
             return
         if data.startswith("cancel_reset_dialogue"):
             await self.client.answer_callback(callback.callback_id)
@@ -1198,6 +1199,9 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_fu_step_text_"):
                 parts = data.split("_")
+                state = await self.states.get(user_id)
+                if state and state.state == "max_followup_step_text":
+                    await self.states.clear(user_id)
                 if len(parts) == 7 and parts[4] == "edit":
                     await admin_followups_service.start_step_text_edit(self.client, self.states, chat_id, user_id, int(parts[5]), parts[6])
                     return

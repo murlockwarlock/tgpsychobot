@@ -37,11 +37,7 @@ from database import (
 )
 from followups import (
     FOLLOWUP_METADATA_OPERATOR_LABELS,
-    FOLLOWUP_ATTEMPT_CLAIMED,
-    FOLLOWUP_ATTEMPT_RETRYABLE,
-    FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED,
-    FOLLOWUP_ATTEMPT_DELIVERED,
-    FOLLOWUP_ATTEMPT_UNCERTAIN,
+    FOLLOWUP_STEP_DELETE_PROTECTED_ATTEMPT_STATUSES,
     FOLLOWUP_STAGE_MODE_LABELS,
     FOLLOWUP_STAGE_MODES,
     UNSET_STAGE_TOKEN,
@@ -54,7 +50,12 @@ from followups import (
 )
 from time_helpers import format_msk
 from translation_pack_manager import commit_readiness_critical_mutation, translation_coordination_lock
-from followup_admin_contract import FOLLOWUP_CAMPAIGN_DETAIL_INTRO, FOLLOWUP_CAMPAIGN_EXPLANATION, FOLLOWUP_STEPS_EXPLANATION
+from followup_admin_contract import (
+    FOLLOWUP_CAMPAIGN_DETAIL_INTRO,
+    FOLLOWUP_CAMPAIGN_EXPLANATION,
+    FOLLOWUP_STEPS_EXPLANATION,
+    parse_followup_step_input,
+)
 
 
 import logging
@@ -2440,13 +2441,7 @@ async def followup_step_edit(callback: CallbackQuery, state: FSMContext):
 
 
 def _parse_followup_step_input(raw_text: str | None) -> tuple[int, str] | None:
-    first, separator, body = (raw_text or "").partition("\n")
-    if not separator or not first.strip().isdigit() or not body.strip():
-        return None
-    delay = int(first.strip())
-    if not 1 <= delay <= 525600:
-        return None
-    return delay, body.strip()
+    return parse_followup_step_input(raw_text)
 
 
 @router.message(AutomationAdminStates.followup_step)
@@ -2545,11 +2540,7 @@ async def followup_step_delete(callback: CallbackQuery, state: FSMContext | None
                         FollowupDeliveryAttempt.step_id == step.id,
                         FollowupDeliveryAttempt.status.in_(
                             (
-                                FOLLOWUP_ATTEMPT_CLAIMED,
-                                FOLLOWUP_ATTEMPT_RETRYABLE,
-                                FOLLOWUP_ATTEMPT_UNCERTAIN,
-                                FOLLOWUP_ATTEMPT_DELIVERED,
-                                FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED,
+                                *FOLLOWUP_STEP_DELETE_PROTECTED_ATTEMPT_STATUSES,
                             )
                         ),
                     )
