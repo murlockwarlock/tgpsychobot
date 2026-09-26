@@ -402,7 +402,10 @@ async def resource_card(event, kind, identity, locale="ru", page=0):
                 filtered = [(button.text, button.callback_data) for button in row if not button.callback_data.startswith(("edit_topic_name_", "edit_topic_intro_", "edit_topic_btn_text_", "admin_ref_tpl_edit_"))]
                 if filtered:
                     rows.append(filtered)
-        rows.append([('К списку', f'ca:list:{kind}:{page}')])
+        if kind == "followup_step":
+            rows.append([("⬅️ Назад", f"followup_step_{resource.campaign_id}_{identity}")])
+        else:
+            rows.append([('К списку', f'ca:list:{kind}:{page}')])
     await event.message.edit_text("\n".join(text), reply_markup=keyboard(rows), parse_mode="HTML")
 
 

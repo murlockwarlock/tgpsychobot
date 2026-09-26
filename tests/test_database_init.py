@@ -400,6 +400,12 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
                 "ALTER TABLE followup_delivery_attempts DROP COLUMN attempt_count"
             ))
             await connection.execute(text(
+                "ALTER TABLE followup_deliveries DROP COLUMN platform"
+            ))
+            await connection.execute(text(
+                "ALTER TABLE followup_deliveries DROP COLUMN external_message_id"
+            ))
+            await connection.execute(text(
                 "INSERT INTO followup_campaigns ("
                 "name, is_active, all_topics, include_main_dialogue, stage_mode, stage_values, "
                 "metadata_field_path, metadata_operator, metadata_expected_value, stop_events, "
@@ -435,6 +441,9 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
             attempt_columns = await connection.run_sync(
                 lambda sync_connection: inspect(sync_connection).get_columns("followup_delivery_attempts")
             )
+            delivery_columns = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).get_columns("followup_deliveries")
+            )
             migrated_value = await connection.scalar(text(
                 "SELECT stage_include_unset FROM followup_campaigns WHERE name = 'legacy'"
             ))
@@ -445,8 +454,12 @@ async def test_init_db_migrates_existing_followup_columns(tmp_path, monkeypatch)
             ))).all())
         campaign_column = next(column for column in campaign_columns if column["name"] == "stage_include_unset")
         attempt_column = next(column for column in attempt_columns if column["name"] == "attempt_count")
+        delivery_platform = next(column for column in delivery_columns if column["name"] == "platform")
+        delivery_external_id = next(column for column in delivery_columns if column["name"] == "external_message_id")
         assert campaign_column["nullable"] is False
         assert attempt_column["nullable"] is False
+        assert delivery_platform["nullable"] is True
+        assert delivery_external_id["nullable"] is True
         assert migrated_value == 0
         assert migrated_modes == {
             "legacy all": "all_legacy",

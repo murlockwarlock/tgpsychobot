@@ -24,6 +24,7 @@ from .services import admin_kb as admin_kb_service
 from .services import admin_mailing as admin_mailing_service
 from .services import admin_payments as admin_payments_service
 from .services import admin_test_content as admin_test_content_service
+from .services import admin_followups as admin_followups_service
 from .services import admin_tests as admin_tests_service
 from .services import admin_topics as admin_topics_service
 from .services import admin_referral as admin_referral_service
@@ -31,7 +32,7 @@ from .services import admin_collections as admin_collections_service
 from .services import admin_topic_media as admin_topic_media_service
 from .services import common, settings as settings_service, subscriptions as subscriptions_service, tests as tests_service, topics as topics_service
 from .settings import get_settings, validate_webhook_runtime_settings
-from .keyboards import inline_keyboard, main_menu_row
+from .keyboards import callback_button, inline_keyboard, main_menu_row
 from .identity import is_max_user_id
 from response_buttons import MAIN_TOPIC_ACTIONS, build_ai_button_system_message, split_action_callback_data
 from .storage import StateStore, init_storage
@@ -257,19 +258,67 @@ class MaxBotApplication:
                 return
         await common.show_start_screen(self.client, chat_id, user_id, start_payload, self.states)
 
+    async def _followup_scope(self, user_id: int) -> tuple[int, int] | None:
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+        if user is None:
+            return None
+        return user.current_dialogue_id or 1, user.current_topic_id or 0
+
+    async def _begin_max_followup_activity(self, user_id: int):
+        if not is_max_user_id(user_id):
+            return None
+        if await common.is_admin(user_id):
+            return None
+        scope = await self._followup_scope(user_id)
+        if scope is None:
+            return None
+        from followups import begin_user_activity
+
+        return await begin_user_activity(user_id, dialogue_id=scope[0], topic_id=scope[1])
+
+    async def _finalize_max_followup_activity(self, user_id: int, ingress) -> None:
+        if ingress is None or not is_max_user_id(user_id):
+            return
+        scope = await self._followup_scope(user_id)
+        if scope is None:
+            return
+        from followups import finalize_user_activity
+
+        await finalize_user_activity(
+            user_id,
+            ingress,
+            dialogue_id=scope[0],
+            topic_id=scope[1],
+        )
+
     async def handle_message(self, message: IncomingMessage, force_start: bool = False) -> None:
+        await common.ensure_user(
+            message.sender.user_id,
+            message.sender.username,
+            message.sender.full_name,
+            public_name=message.sender.public_name,
+        )
+        ingress = None
+        try:
+            ingress = await self._begin_max_followup_activity(message.sender.user_id)
+        except Exception:
+            log.exception("Could not begin MAX follow-up activity user_id=%s", message.sender.user_id)
+        try:
+            await self._handle_message_impl(message, force_start=force_start)
+        finally:
+            try:
+                await self._finalize_max_followup_activity(message.sender.user_id, ingress)
+            except Exception:
+                log.exception("Could not finalize MAX follow-up activity user_id=%s", message.sender.user_id)
+
+    async def _handle_message_impl(self, message: IncomingMessage, force_start: bool = False) -> None:
         log.info(
             "Incoming message user_id=%s chat_id=%s force_start=%s text=%s",
             message.sender.user_id,
             message.chat_id,
             force_start,
             (message.text or "")[:300],
-        )
-        await common.ensure_user(
-            message.sender.user_id,
-            message.sender.username,
-            message.sender.full_name,
-            public_name=message.sender.public_name,
         )
         if force_start:
             await self._handle_start_command(message.chat_id, message.sender.user_id, message.start_payload)
@@ -286,6 +335,39 @@ class MaxBotApplication:
             await self.states.clear(message.sender.user_id)
             state = None
         if state:
+            if state.state == "max_followup_campaign_name":
+                await admin_followups_service.receive_campaign_name(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_campaign_rename":
+                await admin_followups_service.receive_rename(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_stage_values":
+                await admin_followups_service.receive_stage_values(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_metadata_field":
+                await admin_followups_service.receive_metadata_field(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_metadata_value":
+                await admin_followups_service.receive_metadata_value(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_stop_events":
+                await admin_followups_service.receive_stops(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_step_add":
+                await admin_followups_service.receive_step_add(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_step_edit":
+                await admin_followups_service.receive_step_edit(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_step_text":
+                await admin_followups_service.receive_step_text(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_quiet":
+                await admin_followups_service.receive_quiet(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_jitter":
+                await admin_followups_service.receive_jitter(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
             if state.state in common.MEDIA_COLLECTION_ADMIN_STATES and not await common.require_media_collection_admin(
                 self.client,
                 self.states,
@@ -795,7 +877,6 @@ class MaxBotApplication:
 
 
     async def handle_callback(self, callback: IncomingCallback) -> None:
-        log.info("Incoming callback user_id=%s chat_id=%s payload=%s", callback.sender.user_id, callback.chat_id, callback.payload)
         if is_max_user_id(callback.sender.user_id):
             await common.ensure_user(
                 callback.sender.user_id,
@@ -803,6 +884,21 @@ class MaxBotApplication:
                 callback.sender.full_name,
                 public_name=callback.sender.public_name,
             )
+        ingress = None
+        try:
+            ingress = await self._begin_max_followup_activity(callback.sender.user_id)
+        except Exception:
+            log.exception("Could not begin MAX follow-up activity user_id=%s", callback.sender.user_id)
+        try:
+            await self._handle_callback_impl(callback)
+        finally:
+            try:
+                await self._finalize_max_followup_activity(callback.sender.user_id, ingress)
+            except Exception:
+                log.exception("Could not finalize MAX follow-up activity user_id=%s", callback.sender.user_id)
+
+    async def _handle_callback_impl(self, callback: IncomingCallback) -> None:
+        log.info("Incoming callback user_id=%s chat_id=%s payload=%s", callback.sender.user_id, callback.chat_id, callback.payload)
         data = callback.payload
         user_id = callback.sender.user_id
         chat_id = callback.chat_id
@@ -1021,6 +1117,127 @@ class MaxBotApplication:
             await self.client.send_message(chat_id=chat_id, text="Я здесь. Можем обсудить результаты или любой другой вопрос.")
             return
         if await common.is_admin(user_id):
+            if data == "admin_followups":
+                await self.states.clear(user_id)
+                await admin_followups_service.show_campaigns(self.client, chat_id)
+                return
+            if data == "admin_fu_list":
+                await self.states.clear(user_id)
+                await admin_followups_service.show_campaigns(self.client, chat_id)
+                return
+            if data == "admin_fu_add":
+                await admin_followups_service.start_campaign_add(self.client, self.states, chat_id, user_id)
+                return
+            if data.startswith("admin_fu_campaign_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_campaign(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_toggle_"):
+                await admin_followups_service.toggle_campaign(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_rename_"):
+                await admin_followups_service.start_rename(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_topics_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_topics(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_scope_all_"):
+                await admin_followups_service.toggle_scope(self.client, chat_id, int(data.rsplit("_", 1)[1]), "all")
+                return
+            if data.startswith("admin_fu_scope_main_"):
+                await admin_followups_service.toggle_scope(self.client, chat_id, int(data.rsplit("_", 1)[1]), "main")
+                return
+            if data.startswith("admin_fu_scope_topic_"):
+                parts = data.split("_")
+                await admin_followups_service.toggle_scope(self.client, chat_id, int(parts[4]), "topic", int(parts[5]))
+                return
+            if data.startswith("admin_fu_conditions_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_conditions(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_stage_mode_"):
+                parts = data.split("_")
+                await admin_followups_service.select_stage_mode(self.client, self.states, chat_id, user_id, int(parts[4]), parts[5])
+                return
+            if data.startswith("admin_fu_stage_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_stage_picker(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_metadata_op_"):
+                parts = data.split("_")
+                await admin_followups_service.select_metadata_operator(self.client, self.states, chat_id, user_id, int(parts[4]), parts[5])
+                return
+            if data.startswith("admin_fu_metadata_operator_edit_"):
+                await admin_followups_service.show_metadata_operator(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_metadata_clear_"):
+                await admin_followups_service.clear_metadata(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_metadata_"):
+                await admin_followups_service.start_metadata(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_stops_clear_"):
+                await admin_followups_service.clear_stops(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_stops_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.start_stops(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_steps_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_steps(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_step_add_"):
+                parts = data.split("_")
+                await admin_followups_service.start_step_add(self.client, self.states, chat_id, user_id, int(parts[4]), parts[5])
+                return
+            if data.startswith("admin_fu_step_edit_"):
+                parts = data.split("_")
+                await admin_followups_service.start_step_edit(self.client, self.states, chat_id, user_id, int(parts[4]), int(parts[5]))
+                return
+            if data.startswith("admin_fu_step_text_"):
+                parts = data.split("_")
+                if len(parts) == 7 and parts[4] == "edit":
+                    await admin_followups_service.start_step_text_edit(self.client, self.states, chat_id, user_id, int(parts[5]), parts[6])
+                    return
+                if len(parts) == 7 and parts[4] == "locale":
+                    await admin_followups_service.show_step_text(self.client, chat_id, int(parts[5]), parts[6])
+                    return
+                await admin_followups_service.show_step_text(self.client, chat_id, int(parts[4]))
+                return
+            if data.startswith("admin_fu_step_delete_yes_"):
+                parts = data.split("_")
+                await admin_followups_service.delete_step(self.client, chat_id, int(parts[5]), int(parts[6]))
+                return
+            if data.startswith("admin_fu_step_delete_"):
+                parts = data.split("_")
+                await admin_followups_service.ask_delete_step(self.client, chat_id, int(parts[4]), int(parts[5]))
+                return
+            if data.startswith("admin_fu_step_"):
+                parts = data.split("_")
+                await self.states.clear(user_id)
+                await admin_followups_service.show_step(self.client, chat_id, int(parts[3]), int(parts[4]))
+                return
+            if data.startswith("admin_fu_quiet_"):
+                await admin_followups_service.start_quiet(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_jitter_"):
+                await admin_followups_service.start_jitter(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_delete_yes_"):
+                await admin_followups_service.delete_campaign(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_delete_ask_"):
+                campaign_id = int(data.rsplit("_", 1)[1])
+                await self.client.send_message(chat_id=chat_id, text="Удалить цепочку, её шаги и все ожидающие отправки? Уже отправленные сообщения останутся у пользователей.", attachments=inline_keyboard([[callback_button("Да, удалить", f"admin_fu_delete_yes_{campaign_id}")], [callback_button("⬅️ Назад", f"admin_fu_campaign_{campaign_id}")]]))
+                return
+            if data.startswith("admin_fu_self_test_send_"):
+                await admin_followups_service.send_self_test(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states)
+                return
+            if data.startswith("admin_fu_self_test_"):
+                await admin_followups_service.show_self_test(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states)
+                return
             if data == "admin_stats":
                 await admin_service.show_stats(self.client, chat_id)
                 return

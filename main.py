@@ -34,6 +34,9 @@ from bot_commands import (
 from telegram_client import create_telegram_bot
 from automation_events import process_pending_events
 from followups import FollowupActivityMiddleware, process_due_followups
+from followups import FollowupTransportRegistry
+from max_messenger_bot.api import MaxApiClient
+from max_messenger_bot.settings import get_settings as get_max_settings
 from translation_service import refresh_translation_cache
 
 WEB_SERVER_HOST = '0.0.0.0'
@@ -220,12 +223,24 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
             exception=e,
         )
 
+    max_followup_client = None
+    max_token = os.environ.get("MAX_BOT_TOKEN", "").strip()
+    if max_token:
+        max_settings = get_max_settings()
+        max_followup_client = MaxApiClient(max_token, max_settings.max_api_base)
+        await max_followup_client.__aenter__()
+        dispatcher["_followup_max_client"] = max_followup_client
+    followup_transports = FollowupTransportRegistry(
+        telegram=bot,
+        max_client=max_followup_client,
+    )
+
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
     scheduler.add_job(check_kie_credit_balance, 'interval', minutes=15, args=(bot,))
     scheduler.add_job(process_payment_notification_outbox, 'interval', seconds=30, args=(bot,), max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_events, 'interval', minutes=1, args=(bot,), max_instances=1)
-    scheduler.add_job(process_due_followups, 'interval', minutes=1, args=(bot,), max_instances=1)
+    scheduler.add_job(process_due_followups, 'interval', minutes=1, args=(followup_transports,), max_instances=1)
     scheduler.start()
     dispatcher['_scheduler'] = scheduler
 
@@ -311,6 +326,11 @@ async def on_shutdown(bot: Bot, dispatcher: Dispatcher):
     scheduler = dispatcher.get('_scheduler')
     if scheduler is not None and scheduler.running:
         scheduler.shutdown(wait=False)
+
+    max_followup_client = dispatcher.get("_followup_max_client")
+    if max_followup_client is not None:
+        with suppress(Exception):
+            await max_followup_client.__aexit__(None, None, None)
 
     await bot.session.close()
     logging.info("Shutdown complete.")

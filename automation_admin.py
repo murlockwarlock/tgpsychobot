@@ -54,6 +54,7 @@ from followups import (
 )
 from time_helpers import format_msk
 from translation_pack_manager import commit_readiness_critical_mutation, translation_coordination_lock
+from followup_admin_contract import FOLLOWUP_CAMPAIGN_DETAIL_INTRO, FOLLOWUP_CAMPAIGN_EXPLANATION, FOLLOWUP_STEPS_EXPLANATION
 
 
 import logging
@@ -1426,9 +1427,7 @@ async def _show_followup_campaigns(
     await _safe_edit_text_or_markup(
         callback,
         f"💬 <b>Догоняющие сообщения ({len(campaigns)}){f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
-        "Цепочка начинается после действия пользователя и запускается заново после его нового сообщения или нажатия кнопки. "
-        "При смене темы или создании нового диалога старая цепочка отменяется. "
-        "Сообщения не отправляются в тихие часы."
+        + FOLLOWUP_CAMPAIGN_EXPLANATION
         + ("\n\nЗдесь показаны цепочки этой темы. Новая цепочка привяжется к ней автоматически." if topic else ""),
         reply_markup=builder.as_markup(),
     )
@@ -1558,7 +1557,7 @@ async def _show_campaign(
     warning = "" if valid else "\n\n⚠️ Для включения выберите область и добавьте хотя бы один шаг."
     text = (
         f"💬 <b>{html.escape(item.name)}</b>\n\n"
-        "Цепочка отправляет несколько напоминаний, пока пользователь молчит.\n"
+        f"{FOLLOWUP_CAMPAIGN_DETAIL_INTRO}\n"
         f"Статус: {'✅ включена' if item.is_active else '⏸ выключена'}\n"
         f"Область: {html.escape(scopes)}\n"
         f"Шагов: {len(item.steps)}\n"
@@ -2335,10 +2334,7 @@ async def followup_steps(callback: CallbackQuery, state: FSMContext | None = Non
     builder.adjust(1)
     text = (
         f"🪜 <b>Шаги цепочки ({len(item.steps)})</b>\n\n"
-        "Первое время считается от последнего действия пользователя, следующие — от предыдущего сообщения. "
-        "Новое действие пользователя начинает цепочку заново.\n\n"
-        "Шаг «Обычный текст» отправляет ваш текст. Шаг «Сгенерировать через AI» передаёт AI вашу инструкцию "
-        "и текущий диалог. Нажмите на шаг, чтобы открыть его детали."
+        + FOLLOWUP_STEPS_EXPLANATION
     )
     await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
 
