@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
+import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.base import BaseSession
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods import EditMessageText, SendMessage
+from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User as TelegramUser
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -59,6 +66,35 @@ class _MaxBoundaryClient(MaxApiClient):
         super().__init__("test-token", "https://max.test")
         self.transport = _MaxBoundaryTransport()
         self._session = self.transport
+
+
+class _TelegramBoundarySession(BaseSession):
+    def __init__(self):
+        super().__init__()
+        self.methods = []
+        self.last_message = None
+
+    async def close(self):
+        return None
+
+    async def make_request(self, bot, method, timeout=None):
+        type(method).model_validate(method.model_dump())
+        self.methods.append(method)
+        if isinstance(method, (SendMessage, EditMessageText)):
+            self.last_message = Message(
+                message_id=len(self.methods),
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=int(method.chat_id), type="private"),
+                from_user=TelegramUser(id=999, is_bot=True, first_name="TestBot"),
+                text=getattr(method, "text", ""),
+                reply_markup=getattr(method, "reply_markup", None),
+            ).as_(bot)
+            return self.last_message
+        return True
+
+    async def stream_content(self, *args, **kwargs):
+        if False:
+            yield b""
 
 
 class _RecordedStates:
@@ -254,6 +290,28 @@ async def mailing_db(tmp_path, monkeypatch):
             accepted_disclaimer=True,
         ))
         await session.commit()
+    try:
+        yield sessions
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def telegram_mailing_db(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'telegram-mailing-buttons.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with sessions() as session:
+        session.add(User(
+            id=11,
+            first_name="Администратор",
+            name="Администратор",
+            is_admin=True,
+            accepted_disclaimer=True,
+        ))
+        await session.commit()
+    monkeypatch.setattr(handlers, "async_session_maker", sessions)
     try:
         yield sessions
     finally:
@@ -481,3 +539,102 @@ async def test_max_formatted_mailing_real_admin_journey(mailing_db):
         task.cancel()
     if app.background_tasks:
         await asyncio.gather(*app.background_tasks, return_exceptions=True)
+
+
+def _telegram_inline_buttons(message):
+    return [
+        button
+        for row in (message.reply_markup.inline_keyboard if message.reply_markup else [])
+        for button in row
+        if button.callback_data or button.url
+    ]
+
+
+async def _feed_telegram_button(dispatcher, bot, message, label, update_id):
+    button = next(button for button in _telegram_inline_buttons(message) if button.text == label)
+    callback = CallbackQuery(
+        id=f"telegram-callback-{update_id}",
+        from_user=TelegramUser(id=11, is_bot=False, first_name="Администратор"),
+        chat_instance="mailing",
+        message=message,
+        data=button.callback_data,
+    ).as_(bot)
+    await dispatcher.feed_update(bot, Update(update_id=update_id, callback_query=callback))
+
+
+@pytest.mark.asyncio
+async def test_telegram_formatted_mailing_real_admin_journey(telegram_mailing_db, monkeypatch):
+    telegram_handlers = handlers
+    if telegram_handlers.router.parent_router is not None:
+        telegram_handlers = importlib.reload(telegram_handlers)
+        monkeypatch.setattr(telegram_handlers, "async_session_maker", telegram_mailing_db)
+
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(telegram_handlers.router)
+    session = _TelegramBoundarySession()
+    bot = Bot("123456:test", session=session)
+    admin = TelegramUser(id=11, is_bot=False, first_name="Администратор")
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=Message(
+                message_id=1,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=11, type="private"),
+                from_user=admin,
+                text="/admin",
+            ).as_(bot),
+        ),
+    )
+    await _feed_telegram_button(dispatcher, bot, session.last_message, "✉️ Рассылка", 2)
+    await _feed_telegram_button(dispatcher, bot, session.last_message, "🚀 Создать рассылку", 3)
+    await _feed_telegram_button(dispatcher, bot, session.last_message, "👤 Только себе (тест)", 4)
+
+    text = "Привет\n\n[Продолжить](btn:continue)\n[Сайт](https://example.com)"
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=5,
+            message=Message(
+                message_id=5,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=11, type="private"),
+                from_user=admin,
+                text=text,
+                entities=[MessageEntity(type="bold", offset=0, length=6)],
+            ).as_(bot),
+        ),
+    )
+    preview = session.last_message
+    preview_buttons = _telegram_inline_buttons(preview)
+    assert {button.text for button in preview_buttons} >= {"Продолжить", "Сайт", "✅ Отправить"}
+    await _feed_telegram_button(dispatcher, bot, preview, "✅ Отправить", 6)
+
+    async with telegram_mailing_db() as db_session:
+        mailing = await db_session.scalar(select(Mailing).where(Mailing.creator_id == 11))
+        assert mailing is not None
+        assert mailing.text == '<b>Привет</b>\n\n[Продолжить](btn:continue)\n[Сайт](https://example.com)'
+
+    await send_mailing_content(bot, 11, mailing)
+    delivery = session.last_message
+    assert delivery.text == "<b>Привет</b>"
+    delivery_buttons = _telegram_inline_buttons(delivery)
+    assert [(button.text, button.callback_data, button.url) for button in delivery_buttons] == [
+        ("Продолжить", "ai_btn:continue", None),
+        ("Сайт", None, "https://example.com"),
+    ]
+
+    process = AsyncMock()
+    with patch.object(telegram_handlers, "_get_user_locale", AsyncMock(return_value="ru")), patch.object(
+        telegram_handlers, "process_buffered_messages", process
+    ):
+        callback = CallbackQuery(
+            id="telegram-recipient-callback",
+            from_user=admin,
+            chat_instance="mailing",
+            message=delivery,
+            data=delivery_buttons[0].callback_data,
+        ).as_(bot)
+        await dispatcher.feed_update(bot, Update(update_id=7, callback_query=callback))
+    process.assert_awaited_once()
