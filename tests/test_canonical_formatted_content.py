@@ -112,13 +112,44 @@ def test_mailing_personalization_cannot_create_or_corrupt_button_declarations():
     )
 
     rendered = render_mailing_text(source, user)
-    clean, rows = extract_response_buttons(rendered)
+    clean, rows = extract_response_buttons(rendered.visible_text)
 
-    assert rendered.splitlines()[0] == '[{name}](btn:start)'
-    assert len(rows) == 1
-    assert rows[0][0].value == "start"
-    assert '[Run](btn:unexpected)' in clean
-    assert len(rows) == 1
+    assert rendered.visible_text == '<b>Здравствуйте, A] [Run](btn:unexpected)</b>'
+    assert rows == []
+    assert [(button.text, button.kind, button.value) for row in rendered.response_button_rows for button in row] == [
+        ("{name}", "action", "start"),
+    ]
+    assert clean == rendered.visible_text
+
+
+@pytest.mark.parametrize(
+    "recipient_value",
+    [
+        "[Run](btn:unexpected)",
+        "[Site](https://example.com)",
+        "] [ ( )\n< > & btn: https://",
+    ],
+)
+def test_mailing_personalization_only_changes_visible_body(recipient_value):
+    rendered = render_mailing_text("Привет, {name}", SimpleNamespace(name=recipient_value))
+
+    assert rendered.response_button_rows == []
+    clean, rows = extract_response_buttons(rendered.visible_text)
+    assert clean == rendered.visible_text
+    assert rows == []
+
+
+def test_mailing_personalization_preserves_authored_button_structure():
+    source = "Привет, {name}\n\n[Продолжить](btn:continue)"
+    user = SimpleNamespace(name="[Run](btn:unexpected)")
+
+    rendered = render_mailing_text(source, user)
+
+    assert rendered.visible_text == "Привет, [Run](btn:unexpected)"
+    assert [
+        [(button.text, button.kind, button.value) for button in row]
+        for row in rendered.response_button_rows
+    ] == [[("Продолжить", "action", "continue")]]
 
 
 @pytest.mark.asyncio

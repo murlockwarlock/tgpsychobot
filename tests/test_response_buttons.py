@@ -237,6 +237,22 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertEqual(text, source)
         self.assertEqual(rows, [])
 
+    def test_keeps_escaped_bullet_url_visible(self):
+        source = r"\- [Documentation](https://example.com)"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_escaped_bullet_prose_with_link_visible(self):
+        source = r"\- Read [Documentation](https://example.com) before continuing"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
     def test_keeps_inline_code_button_syntax_visible(self):
         source = "До ` [Run](btn:test) ` и `[Run](btn:test)` после"
 

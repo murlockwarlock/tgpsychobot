@@ -25,7 +25,7 @@ from ..storage import StateStore
 from ..time_utils import utc_now
 from .subscription_access import effective_subscription_filters
 from result_history import non_technical_role_filter
-from mailing_utils import mailing_text_to_html, parse_mailing_text
+from mailing_utils import mailing_text_to_html, parse_mailing_text, render_mailing_text
 
 
 PAGE_SIZE = 10
@@ -364,11 +364,6 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
     if not audience or (not canonical_text and not (media_type and media_token)):
         await client.send_message(chat_id=chat_id, text="Состояние рассылки потеряно.")
         return
-    clean_text, response_button_rows = parse_mailing_text(canonical_text)
-    rendered_text = mailing_text_to_html(clean_text)
-    if not rendered_text and response_button_rows:
-        rendered_text = "Выберите действие:"
-
     async with async_session_maker() as session:
         mailing = Mailing(
             text=canonical_text,
@@ -385,6 +380,14 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
         mailing_id = mailing.id
 
         recipient_ids = await _get_recipient_ids(session, audience, user_id)
+        recipient_users = {}
+        if recipient_ids:
+            recipient_users = {
+                recipient.id: recipient
+                for recipient in (
+                    await session.scalars(select(User).where(User.id.in_(recipient_ids)))
+                ).all()
+            }
         mailing = await session.get(Mailing, mailing_id)
         mailing.status = "sending"
         mailing.start_time = utc_now()
@@ -394,6 +397,13 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
     failure_count = 0
     for recipient_id in recipient_ids:
         try:
+            recipient = recipient_users.get(recipient_id) or User(id=recipient_id)
+            rendered_content = render_mailing_text(canonical_text, recipient)
+            rendered_visible_text = rendered_content or ""
+            response_button_rows = getattr(rendered_content, "response_button_rows", [])
+            rendered_text = mailing_text_to_html(rendered_visible_text)
+            if not rendered_text and response_button_rows:
+                rendered_text = "Выберите действие:"
             attachments = _mailing_attachments(
                 media_type,
                 media_token,

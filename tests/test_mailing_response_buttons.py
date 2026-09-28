@@ -31,7 +31,7 @@ from max_messenger_bot.models import IncomingMessage, Sender
 from max_messenger_bot.services import admin_mailing as max_admin_mailing
 from max_messenger_bot.services import common as max_common
 from max_messenger_bot.storage import StorageBase
-from mailing_utils import send_mailing_content
+from mailing_utils import render_mailing_text, send_mailing_content
 from response_buttons import extract_response_buttons
 
 
@@ -215,6 +215,51 @@ async def test_telegram_mailing_recipient_press_uses_normal_ai_button_handler():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "recipient_value",
+    ["[Run](btn:unexpected)", "[Site](https://example.com)"],
+)
+async def test_telegram_mailing_personalization_cannot_create_buttons(recipient_value):
+    bot = SimpleNamespace(send_message=AsyncMock())
+    source = "Привет, {name}"
+    rendered = render_mailing_text(source, SimpleNamespace(name=recipient_value))
+    mailing = SimpleNamespace(
+        text=source,
+        media_file_id=None,
+        media_file_type=None,
+        media_position="media_top",
+    )
+
+    await send_mailing_content(bot, 42, mailing, rendered_text=rendered)
+
+    delivery = bot.send_message.await_args
+    assert delivery.kwargs["reply_markup"] is None
+    assert recipient_value.split("(", 1)[0].strip("[]") in delivery.args[1]
+    assert recipient_value.split("(", 1)[1].rstrip(")") in delivery.args[1]
+
+
+@pytest.mark.asyncio
+async def test_telegram_mailing_personalization_keeps_one_authored_button():
+    bot = SimpleNamespace(send_message=AsyncMock())
+    source = "Привет, {name}\n\n[Продолжить](btn:continue)"
+    rendered = render_mailing_text(source, SimpleNamespace(name="[Run](btn:unexpected)"))
+    mailing = SimpleNamespace(
+        text=source,
+        media_file_id=None,
+        media_file_type=None,
+        media_position="media_top",
+    )
+
+    await send_mailing_content(bot, 42, mailing, rendered_text=rendered)
+
+    delivery = bot.send_message.await_args
+    buttons = [button for row in delivery.kwargs["reply_markup"].inline_keyboard for button in row]
+    assert len(buttons) == 1
+    assert buttons[0].text == "Продолжить"
+    assert buttons[0].callback_data == "ai_btn:continue"
+
+
+@pytest.mark.asyncio
 async def test_escaped_llm_buttons_render_as_generated_response_buttons_on_both_platforms():
     source = (
         "\\- [Что-то случилось]\\(btn:start_event)\n"
@@ -316,6 +361,70 @@ async def telegram_mailing_db(tmp_path, monkeypatch):
         yield sessions
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "recipient_value",
+    ["[Run](btn:unexpected)", "[Site](https://example.com)"],
+)
+async def test_max_mailing_personalization_cannot_create_buttons(mailing_db, recipient_value):
+    user_id = MAX_ID_OFFSET + 99
+    async with mailing_db() as session:
+        user = await session.get(User, user_id)
+        user.name = recipient_value
+        user.first_name = recipient_value
+        await session.commit()
+    states = _RecordedStates(SimpleNamespace(
+        state="admin_mailing_preview",
+        data={"audience": "self", "canonical_text": "Привет, {name}"},
+    ))
+    client = _MaxBoundaryClient()
+
+    await max_admin_mailing.confirm_send(client, states, 99, user_id)
+
+    delivery = next(
+        request
+        for request in client.transport.requests
+        if request["params"].get("user_id") == 99
+    )
+    assert "unexpected" in delivery["body"]["text"] or "example.com" in delivery["body"]["text"]
+    assert not any(
+        attachment.get("type") == "inline_keyboard"
+        for attachment in delivery["body"].get("attachments", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_max_mailing_personalization_keeps_one_authored_button(mailing_db):
+    user_id = MAX_ID_OFFSET + 99
+    async with mailing_db() as session:
+        user = await session.get(User, user_id)
+        user.name = "[Run](btn:unexpected)"
+        user.first_name = user.name
+        await session.commit()
+    source = "Привет, {name}\n\n[Продолжить](btn:continue)"
+    states = _RecordedStates(SimpleNamespace(
+        state="admin_mailing_preview",
+        data={"audience": "self", "canonical_text": source},
+    ))
+    client = _MaxBoundaryClient()
+
+    await max_admin_mailing.confirm_send(client, states, 99, user_id)
+
+    delivery = next(
+        request
+        for request in client.transport.requests
+        if request["params"].get("user_id") == 99
+    )
+    buttons = [
+        button
+        for attachment in delivery["body"]["attachments"]
+        if attachment.get("type") == "inline_keyboard"
+        for row in attachment["payload"]["buttons"]
+        for button in row
+    ]
+    assert buttons == [{"type": "callback", "text": "Продолжить", "payload": "ai_btn:continue"}]
 
 
 @pytest.mark.asyncio

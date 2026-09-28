@@ -18,6 +18,9 @@ ACTION_CALLBACK_ID_SUFFIX = (
     f"{ACTION_CALLBACK_ID_SEPARATOR}{'0' * ACTION_CALLBACK_ID_WIDTH}"
 )
 BUTTON_RE = re.compile(r"\[([^\]\n]{1,64})\]\((.+)\)")
+ESCAPED_ACTION_BULLET_RE = re.compile(
+    r"\\-\s+\[([^\]\n]{1,64})\]\\\(btn:([^\)\n]*)\)"
+)
 TEST_START_DIRECTIVE_RE = re.compile(
     r"(?<![:\w])\[?\s*(?:START|RUN)\\?_TEST\s*\]?(?!\w)",
     re.IGNORECASE,
@@ -264,19 +267,13 @@ def _normalize_button_declaration_line(line: str) -> str | None:
     if _parse_button_row(candidate):
         return candidate
 
-    if candidate.startswith(r"\-"):
-        candidate = re.sub(r"^\\-\s+", "", candidate, count=1)
-        if not candidate:
-            return None
+    escaped_action = ESCAPED_ACTION_BULLET_RE.fullmatch(candidate)
+    if not escaped_action:
+        return None
 
-    if r"\(" not in candidate and r"\)" not in candidate:
-        return _parse_button_row(candidate) and candidate or None
-
-    normalized = candidate.replace(r"\(", "(").replace(r"\)", ")")
+    normalized = f"[{escaped_action.group(1)}](btn:{escaped_action.group(2)})"
     parsed = _parse_button_row(normalized)
     if not parsed:
-        return None
-    if any(button.kind != "action" for row in parsed for button in row):
         return None
     return normalized
 
