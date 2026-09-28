@@ -358,12 +358,12 @@ async def resource_card(event, kind, identity, locale="ru", page=0):
         for field, title, _ in fields:
             value = await read_content_value(session, kind, resource, field, locale)
             preview = _content_display_value(resource, value, locale) if kind == "content" else value.admin_label()
-            if len(preview) > 250:
-                preview = preview[:247] + "…"
             if kind == "content" and field == "text_content":
                 from handlers import render_admin_content_preview
-                preview = render_admin_content_preview(preview)
+                preview = render_admin_content_preview(preview, max_length=250)
             else:
+                if len(preview) > 250:
+                    preview = preview[:247] + "…"
                 preview = html.escape(preview)
             text.append(f"\n<b>{title}:</b>\n{preview}")
             if field.startswith("option."):

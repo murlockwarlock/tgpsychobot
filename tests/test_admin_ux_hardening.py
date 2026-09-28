@@ -645,6 +645,66 @@ def test_admin_preview_preserves_supported_html_and_escapes_invalid_markup():
     assert "&lt;b&gt;" in render_admin_content_preview("<b>незакрытый")
 
 
+def test_admin_preview_truncates_formatted_html_at_safe_boundaries():
+    from handlers import render_admin_content_preview
+    from admin_html_preview import _HTMLPreviewParser
+
+    source = (
+        '<tg-emoji emoji-id="5404421747296455061">🎅</tg-emoji> Добро пожаловать в мир кинематографа\n\n'
+        "Приглашаем погрузиться в увлекательное путешествие, где мы вместе с проводником составим "
+        'уникальный кино-портрет твоего ребёнка <tg-emoji emoji-id="5384316232289769088">🙏</tg-emoji>\n\n'
+        "Удели 10 минут"
+    )
+
+    preview = render_admin_content_preview(source, max_length=250)
+    parser = _HTMLPreviewParser()
+    parser.feed(preview)
+    parser.finish()
+
+    assert len(preview) <= 250
+    assert "<tg-emoji emoji-id=\"5384316232289769088\">" not in preview
+    assert preview.endswith("…")
+
+
+def test_admin_preview_escapes_incomplete_and_unescaped_html():
+    from handlers import render_admin_content_preview
+
+    assert "&lt;tg-emoji" in render_admin_content_preview('<tg-emoji emoji-id="123')
+    assert "&amp;" in render_admin_content_preview("a & b")
+
+
+@pytest.mark.asyncio
+async def test_content_card_never_sends_truncated_html(factory, monkeypatch):
+    import admin_content_authoring as module
+    from translation_registry import _TelegramHTMLParser
+
+    monkeypatch.setattr(module, "async_session_maker", factory)
+    source = (
+        '<tg-emoji emoji-id="5404421747296455061">🎅</tg-emoji> Добро пожаловать в мир кинематографа\n\n'
+        "Приглашаем погрузиться в увлекательное путешествие, где мы вместе с проводником составим "
+        'уникальный кино-портрет твоего ребёнка <tg-emoji emoji-id="5384316232289769088">🙏</tg-emoji>\n\n'
+        "Удели 10 минут"
+    )
+    async with factory() as session:
+        session.add(Content(key="start_message", button_title="Старт", text_content=source))
+        await session.commit()
+
+    recording = RecordingSession()
+    bot = Bot("123456:TEST", session=recording)
+    await module.resource_card(
+        _callback(bot, _admin_message(bot), "ca:view:content:start_message:ru:0"),
+        "content",
+        "start_message",
+        "ru",
+        0,
+    )
+
+    request = recording.calls[-1]
+    parser = _TelegramHTMLParser()
+    parser.feed(request.text)
+    parser.finish()
+
+
 def test_general_settings_exposes_existing_language_request_setting():
     import keyboards
 

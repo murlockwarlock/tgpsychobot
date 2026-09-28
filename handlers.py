@@ -45,6 +45,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.formatting import Text
 from dialogue_history_export import serialize_human_dialogue_history
 from response_button_renderers import telegram_response_buttons_markup
+from admin_html_preview import truncate_html_preview
 
 from config import OWNER_IDS
 from database import (async_session_maker, User, Message as DBMessage, AIConfig, AIModelSettings, KnowledgeBase, Content, IndexingQueue,
@@ -7203,16 +7204,43 @@ async def process_selection(callback: CallbackQuery, state: FSMContext, bot: Bot
         await admin_ai_keys_models(callback)
 
 
-def render_admin_content_preview(value: str | None) -> str:
+_ADMIN_PREVIEW_TAGS = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "span", "tg-spoiler", "tg-emoji", "a", "code", "pre", "blockquote", "br",
+}
+
+
+def render_admin_content_preview(value: str | None, max_length: int | None = None) -> str:
     source = value or ""
     if not source:
         return "<i>Текст не задан.</i>"
+    safe_source = truncate_html_preview(
+        source,
+        max(len(source), 1),
+        allowed_tags=_ADMIN_PREVIEW_TAGS,
+    )
+    if safe_source != source:
+        if max_length is None:
+            return html.escape(source)
+        return truncate_html_preview(
+            source,
+            max_length,
+            allowed_tags=_ADMIN_PREVIEW_TAGS,
+        )
     try:
         from translation_registry import TranslationSource, validate_translation_value
         validate_translation_value(TranslationSource("admin.preview", source, kind="html"), source)
     except (TypeError, ValueError):
-        return html.escape(source)
-    return source
+        return (
+            truncate_html_preview(source, max_length, allowed_tags=_ADMIN_PREVIEW_TAGS)
+            if max_length is not None
+            else html.escape(source)
+        )
+    return (
+        truncate_html_preview(source, max_length, allowed_tags=_ADMIN_PREVIEW_TAGS)
+        if max_length is not None
+        else source
+    )
 
 
 async def get_content_display(state: FSMContext, bot: Bot = None):
@@ -7271,15 +7299,12 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
 
     text_display = "<i>Текст не задан.</i>"
     if text:
-        truncated_text = text
-        if len(text) > 3500:
-            truncated_text = text[:3500] + "\n\n[...] (Текст слишком длинный для полного отображения)"
-        text_display = render_admin_content_preview(truncated_text)
+        text_display = render_admin_content_preview(text, max_length=3500)
     elif authoring_locale != "ru" and russian_text:
         text_display = (
             "⚠️ Перевод не задан\n"
             "Русский исходник:\n"
-            f"{render_admin_content_preview(russian_text)}"
+            f"{render_admin_content_preview(russian_text, max_length=3500)}"
         )
 
     media_display = "<i>Медиафайлы не добавлены.</i>"
@@ -7303,7 +7328,9 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
 
     btn_info = ""
     if content_key == "start_message":
-        btn_info = f"\n<b><u>Кнопка действия:</u></b>\nНазвание: {btn_text or 'Нет'}\nТекст отправки: {btn_payload or 'Нет'}\n"
+        button_text = html.escape(str(btn_text)) if btn_text else "Нет"
+        button_payload = html.escape(str(btn_payload)) if btn_payload else "Нет"
+        btn_info = f"\n<b><u>Кнопка действия:</u></b>\nНазвание: {button_text}\nТекст отправки: {button_payload}\n"
 
     button_help = (
         "<b>💡 Справка по кнопкам в тексте:</b>\n"
@@ -25217,7 +25244,7 @@ async def admin_ref_tpl_detail(callback: CallbackQuery):
         await callback.answer("Шаблон не найден.")
         return
     status = "✅ Включён" if tpl.is_enabled else "❌ Отключён"
-    preview = tpl.text[:300]
+    preview = render_admin_content_preview(tpl.text, max_length=300)
     text = f"📩 <b>Шаблон #{tpl.order_num + 1}</b>\nСтатус: {status}\n\n{preview}"
     try:
         await callback.message.edit_text(text, parse_mode="HTML",
@@ -25336,7 +25363,7 @@ async def admin_ref_tpl_delete_prompt(callback: CallbackQuery):
     if not tpl:
         await callback.answer("Шаблон не найден.")
         return
-    preview = tpl.text[:80].replace('\n', ' ')
+    preview = render_admin_content_preview(tpl.text, max_length=80).replace('\n', ' ')
     try:
         await callback.message.edit_text(
             f"🗑 Удалить шаблон?\n\n<i>{preview}…</i>",
