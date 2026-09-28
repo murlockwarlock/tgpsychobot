@@ -57,6 +57,32 @@ def is_kie_insufficient_balance(status_code: int, payload: Any) -> bool:
     )
 
 
+def kie_error_classification(status_code: int, payload: Any) -> str | None:
+    if status_code != 200:
+        code = str(status_code)
+    elif isinstance(payload, dict):
+        code = str(payload.get("code", "")).strip()
+    else:
+        code = ""
+    classifications = {
+        "401": "auth",
+        "402": "insufficient_balance_quota",
+        "403": "forbidden_geo",
+        "429": "rate_limit",
+        "400": "provider_rejection",
+        "409": "provider_rejection",
+        "422": "provider_rejection",
+        "500": "provider_5xx",
+        "502": "provider_5xx",
+        "503": "provider_5xx",
+        "504": "provider_5xx",
+    }
+    classification = classifications.get(code)
+    if classification is not None:
+        return classification
+    return "provider_rejection" if status_code == 200 else None
+
+
 def _value(message: Any, key: str, default: Any = None) -> Any:
     if isinstance(message, dict):
         return message.get(key, default)

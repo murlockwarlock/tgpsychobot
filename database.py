@@ -266,6 +266,7 @@ class AIConfig(Base):
     temperature = Column(Float, default=0.7, nullable=False)
     preserve_topic_context = Column(Boolean, default=False, nullable=False)
     memory_mode = Column(String, default=MEMORY_MODE_RESET, nullable=False)
+    metadata_reset_mode = Column(String, default="reset", nullable=False)
     shared_prompt_block = Column(Text, default=DEFAULT_SHARED_PROMPT_BLOCK, nullable=False)
     service_prompt_block = Column(Text, default=DEFAULT_SERVICE_PROMPT_TEMPLATE, nullable=False)
     fallback_provider = Column(String, nullable=True)
@@ -1374,6 +1375,8 @@ async def init_db():
             ai_columns = [c['name'] for c in insp.get_columns('ai_config')]
             if 'memory_mode' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN memory_mode VARCHAR DEFAULT 'reset' NOT NULL"))
+            if 'metadata_reset_mode' not in ai_columns:
+                sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN metadata_reset_mode VARCHAR DEFAULT 'reset' NOT NULL"))
             if 'shared_prompt_block' not in ai_columns:
                 sync_conn.execute(text("ALTER TABLE ai_config ADD COLUMN shared_prompt_block TEXT DEFAULT '' NOT NULL"))
             if 'service_prompt_block' not in ai_columns:
@@ -1604,6 +1607,8 @@ async def init_db():
             if getattr(ai_conf, 'memory_mode', None) is None:
                 ai_conf.memory_mode = get_memory_mode(ai_conf)
             ai_conf.preserve_topic_context = ai_conf.memory_mode == MEMORY_MODE_TOPIC
+            if getattr(ai_conf, 'metadata_reset_mode', None) not in {'reset', 'preserve'}:
+                ai_conf.metadata_reset_mode = 'reset'
             if getattr(ai_conf, 'shared_prompt_block', None) is None:
                 ai_conf.shared_prompt_block = DEFAULT_SHARED_PROMPT_BLOCK
             if getattr(ai_conf, 'service_prompt_block', None) is None:

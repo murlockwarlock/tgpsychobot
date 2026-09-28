@@ -623,6 +623,8 @@ def extract_error_metadata(
             "finish_reason": None,
             "diagnostics": None,
             "provider_response_payload": None,
+            "provider_code": None,
+            "provider_message": None,
         }
 
     chain = exception_chain(exception, include_context=True)
@@ -638,6 +640,8 @@ def extract_error_metadata(
     finish_reason = getattr(exception, "finish_reason", None)
     diagnostics = getattr(exception, "diagnostics", None)
     provider_response_payload = getattr(exception, "provider_response_payload", None)
+    provider_code = getattr(exception, "provider_code", None)
+    provider_message = getattr(exception, "provider_message", None)
 
     for item in chain:
         if finish_reason is None and hasattr(item, "finish_reason"):
@@ -646,6 +650,10 @@ def extract_error_metadata(
             diagnostics = getattr(item, "diagnostics")
         if provider_response_payload is None and hasattr(item, "provider_response_payload"):
             provider_response_payload = getattr(item, "provider_response_payload")
+        if provider_code is None and hasattr(item, "provider_code"):
+            provider_code = getattr(item, "provider_code")
+        if provider_message is None and hasattr(item, "provider_message"):
+            provider_message = getattr(item, "provider_message")
         if provider_response_payload is None and hasattr(item, "response"):
             resp = getattr(item, "response")
             if hasattr(resp, "text"):
@@ -663,6 +671,8 @@ def extract_error_metadata(
         "finish_reason": finish_reason,
         "diagnostics": diagnostics,
         "provider_response_payload": provider_response_payload,
+        "provider_code": provider_code,
+        "provider_message": provider_message,
     }
 
 
@@ -967,5 +977,4 @@ async def send_ai_fallback_used_alert(
         f"{ai_log_line}"
     )
     return await _dispatch_admin_alert_text(bot, text)
-
 

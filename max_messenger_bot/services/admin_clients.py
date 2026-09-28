@@ -22,6 +22,7 @@ from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 from ..time_utils import format_msk
 from result_history import TEST_RESULT_ROLE, non_technical_role_filter
+from dialogue_history_export import serialize_human_dialogue_history
 from client_search import normalize_client_search_query
 from .subscription_access import load_active_subscription
 
@@ -277,12 +278,14 @@ async def run_single_export(
             else f"History: {max_communication_name(user)} (ID max: {raw_max_user_id(user.id)}, Username: {max_username(user)})\n"
         )
         lines = [header + "=" * 50]
+        history_records = []
         for message in messages:
             topic = topic_map.get(message.topic_id, "General")
             role = "Client" if message.role == "user" else "Test" if message.role == TEST_RESULT_ROLE else "Bot"
             timestamp = format_msk(message.timestamp, "%Y-%m-%d %H:%M МСК") if message.timestamp else ""
             text = _remove_markdown(message.content or "") if message.role == "assistant" else (message.content or "")
-            lines.append(f"[{timestamp}] [{topic}] {role}: {text}\n")
+            history_records.append((message.dialogue_id, f"[{timestamp}] [{topic}] {role}: {text}\n"))
+        lines.append(serialize_human_dialogue_history(history_records))
         file_bytes = "\n".join(lines).encode("utf-8")
     else:
         history_data = [

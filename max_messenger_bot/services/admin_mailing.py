@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import math
+import re
 import time
 
 from sqlalchemy import exists, func, not_, or_, select
@@ -15,6 +16,7 @@ from ..keyboards import (
     admin_mailing_input_keyboard,
     admin_mailing_menu_keyboard,
     admin_mailing_preview_keyboard,
+    response_buttons_keyboard,
 )
 from ..logging_utils import get_bot_logger
 from ..legacy import Mailing, Message as DBMessage, User, UserSubscription, async_session_maker
@@ -23,6 +25,7 @@ from ..storage import StateStore
 from ..time_utils import utc_now
 from .subscription_access import effective_subscription_filters
 from result_history import non_technical_role_filter
+from mailing_utils import mailing_text_to_html, parse_mailing_text
 
 
 PAGE_SIZE = 10
@@ -107,9 +110,28 @@ def _preview_attachments(media_type: str | None, media_token: str | None, includ
     return rows or None
 
 
+def _mailing_attachments(
+    media_type: str | None,
+    media_token: str | None,
+    response_button_rows=None,
+    *,
+    include_admin_keyboard: bool,
+) -> list[dict] | None:
+    attachments = []
+    media_type, media_token = _normalize_media(media_type, media_token)
+    if media_type and media_token:
+        attachments.append({"type": media_type, "payload": {"token": media_token}})
+    if response_button_rows:
+        attachments.extend(response_buttons_keyboard(response_button_rows))
+    if include_admin_keyboard:
+        attachments.extend(admin_mailing_preview_keyboard())
+    return attachments or None
+
+
 async def save_input(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, message: IncomingMessage) -> None:
     mailing_text = (message.text or "").strip()
     formatted_text = (message.html_text or "").strip() or None
+    canonical_text = formatted_text or mailing_text
     media_type, media_token = _normalize_media(message.media_type, message.media_token)
     if not mailing_text and not (media_type and media_token):
         await client.send_message(chat_id=chat_id, text="Отправьте текст, медиа или медиа с подписью.")
@@ -127,11 +149,14 @@ async def save_input(client: MaxApiClient, states: StateStore, chat_id: int, use
             "audience": audience,
             "text": mailing_text,
             "formatted_text": formatted_text,
+            "canonical_text": canonical_text,
             "media_type": media_type,
             "media_token": media_token,
         },
     )
-    preview = mailing_text[:3000] + ("..." if len(mailing_text) > 3000 else "")
+    clean_text, response_button_rows = parse_mailing_text(canonical_text)
+    preview = re.sub(r"<[^>]+>", "", clean_text)
+    preview = preview[:3000] + ("..." if len(preview) > 3000 else "")
     try:
         await client.send_message(
             chat_id=chat_id,
@@ -141,7 +166,12 @@ async def save_input(client: MaxApiClient, states: StateStore, chat_id: int, use
                 f"<b>Медиа:</b> {html.escape(media_type or 'нет')}\n\n"
                 f"<pre><code>{html.escape(preview or 'Без текста')}</code></pre>"
             ),
-            attachments=_preview_attachments(media_type, media_token, include_keyboard=True),
+            attachments=_mailing_attachments(
+                media_type,
+                media_token,
+                response_button_rows,
+                include_admin_keyboard=True,
+            ),
         )
     except Exception:
         await states.set(user_id, chat_id, snapshot.state, dict(snapshot.data))
@@ -326,17 +356,22 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
     audience = snapshot.data.get("audience")
     mailing_text = snapshot.data.get("text")
     formatted_text = snapshot.data.get("formatted_text")
+    canonical_text = snapshot.data.get("canonical_text") or formatted_text or mailing_text
     media_type, media_token = _normalize_media(
         snapshot.data.get("media_type"),
         snapshot.data.get("media_token"),
     )
-    if not audience or (not mailing_text and not (media_type and media_token)):
+    if not audience or (not canonical_text and not (media_type and media_token)):
         await client.send_message(chat_id=chat_id, text="Состояние рассылки потеряно.")
         return
+    clean_text, response_button_rows = parse_mailing_text(canonical_text)
+    rendered_text = mailing_text_to_html(clean_text)
+    if not rendered_text and response_button_rows:
+        rendered_text = "Выберите действие:"
 
     async with async_session_maker() as session:
         mailing = Mailing(
-            text=mailing_text,
+            text=canonical_text,
             media_file_id=media_token,
             media_file_type=media_type,
             target_audience=audience,
@@ -359,14 +394,19 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
     failure_count = 0
     for recipient_id in recipient_ids:
         try:
-            attachments = _preview_attachments(media_type, media_token, include_keyboard=False)
+            attachments = _mailing_attachments(
+                media_type,
+                media_token,
+                response_button_rows,
+                include_admin_keyboard=False,
+            )
             from ..models import MAX_ID_OFFSET
             max_api_user_id = recipient_id - MAX_ID_OFFSET if recipient_id >= MAX_ID_OFFSET else recipient_id
             await client.send_message(
                 user_id=max_api_user_id,
-                text=formatted_text or mailing_text,
+                text=rendered_text,
                 attachments=attachments,
-                format_="html" if formatted_text else "",
+                format_="html",
             )
             success_count += 1
             log.info("Mailing delivered mailing_id=%s target_id=%s", mailing_id, recipient_id)
@@ -436,7 +476,9 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
     created = mailing.created_at.strftime("%d.%m.%Y %H:%M") if mailing.created_at else "N/A"
     started = mailing.start_time.strftime("%d.%m.%Y %H:%M") if mailing.start_time else "Еще не запускалась"
     ended = mailing.end_time.strftime("%d.%m.%Y %H:%M") if mailing.end_time else "N/A"
-    preview = mailing.text[:3000] + ("..." if mailing.text and len(mailing.text) > 3000 else "")
+    clean_text, response_button_rows = parse_mailing_text(mailing.text)
+    preview = re.sub(r"<[^>]+>", "", clean_text)
+    preview = preview[:3000] + ("..." if len(preview) > 3000 else "")
     text = (
         f"<b>Рассылка #{mailing.id}</b>\n\n"
         f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES.get(mailing.target_audience or '', mailing.target_audience or ''))}\n"
@@ -456,5 +498,7 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
     media_type, media_token = _normalize_media(mailing.media_file_type, mailing.media_file_id)
     if media_type and media_token:
         attachments.append({"type": media_type, "payload": {"token": media_token}})
+    if response_button_rows:
+        attachments.extend(response_buttons_keyboard(response_button_rows))
     attachments.extend(inline_keyboard(detail_rows))
     await client.send_message(chat_id=chat_id, text=text, attachments=attachments)

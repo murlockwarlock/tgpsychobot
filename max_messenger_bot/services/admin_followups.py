@@ -27,6 +27,13 @@ from followups import (
     parse_followup_csv,
     prepare_followup_step,
 )
+from followup_admin_shared import (
+    allocate_followup_step_sort_order,
+    commit_followup_step_mutation,
+    followup_step_mutation_lock,
+    save_static_followup_text,
+)
+from response_buttons import extract_response_buttons
 from translation_service import resolve_user_effective_locale, translate
 from translation_pack_manager import translation_coordination_lock
 
@@ -51,6 +58,52 @@ def _back(payload: str) -> list[dict]:
 
 
 _max_followup_tests_inflight: dict[tuple[int, int], asyncio.Event] = {}
+
+MAX_FOLLOWUP_INPUT_STATES = frozenset({
+    "max_followup_campaign_name",
+    "max_followup_campaign_rename",
+    "max_followup_stage_values",
+    "max_followup_metadata_field",
+    "max_followup_metadata_operator",
+    "max_followup_metadata_value",
+    "max_followup_stop_events",
+    "max_followup_step_add",
+    "max_followup_step_edit",
+    "max_followup_step_text",
+    "max_followup_quiet",
+    "max_followup_jitter",
+})
+
+
+async def validate_followup_input_state(snapshot) -> bool:
+    if snapshot is None or snapshot.state not in MAX_FOLLOWUP_INPUT_STATES:
+        return True
+    data = snapshot.data or {}
+    if snapshot.state == "max_followup_campaign_name":
+        return True
+    try:
+        campaign_id = int(data["campaign_id"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    async with async_session_maker() as session:
+        campaign = await session.get(FollowupCampaign, campaign_id)
+        if campaign is None:
+            return False
+        if snapshot.state in {"max_followup_step_edit", "max_followup_step_text"}:
+            try:
+                step_id = int(data["step_id"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            step = await session.get(FollowupStep, step_id)
+            if step is None or step.campaign_id != campaign_id:
+                return False
+            if snapshot.state == "max_followup_step_text" and step.message_type != "static":
+                return False
+    if snapshot.state == "max_followup_metadata_operator":
+        return bool(data.get("field"))
+    if snapshot.state == "max_followup_metadata_value":
+        return bool(data.get("field") and data.get("operator") in FOLLOWUP_METADATA_LABELS)
+    return True
 
 
 async def _campaign(session, campaign_id: int):
@@ -368,7 +421,12 @@ async def receive_metadata_field(client: MaxApiClient, states: StateStore, chat_
 async def select_metadata_operator(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, campaign_id: int, operator: str) -> None:
     snapshot = await states.get(user_id)
     field = snapshot.data.get("field") if snapshot else None
-    if not field:
+    if (
+        not field
+        or snapshot.data.get("campaign_id") != campaign_id
+        or operator not in FOLLOWUP_METADATA_LABELS
+    ):
+        await states.clear(user_id)
         await show_conditions(client, chat_id, campaign_id)
         return
     await states.set(user_id, chat_id, "max_followup_metadata_value", {"campaign_id": campaign_id, "field": field, "operator": operator})
@@ -521,7 +579,12 @@ async def start_step_text_edit(client: MaxApiClient, states: StateStore, chat_id
         from content_authoring import read_content_value
 
         value = await read_content_value(session, "followup_step", step, "message_text", locale)
-    await states.set(user_id, chat_id, "max_followup_step_text", {"step_id": step_id, "locale": locale})
+    await states.set(
+        user_id,
+        chat_id,
+        "max_followup_step_text",
+        {"campaign_id": step.campaign_id, "step_id": step_id, "locale": locale},
+    )
     current = value.text or "Не задано"
     await client.send_message(
         chat_id=chat_id,
@@ -530,30 +593,34 @@ async def start_step_text_edit(client: MaxApiClient, states: StateStore, chat_id
     )
 
 
-async def receive_step_text(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, value: str) -> None:
+async def receive_step_text(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    value: str,
+    *,
+    formatted_value: str | None = None,
+) -> None:
     snapshot = await states.get(user_id)
-    text = value.strip()
+    text = (formatted_value or value).strip()
     if not snapshot or not text:
         await client.send_message(chat_id=chat_id, text="Значение не может быть пустым.")
         return
     data = snapshot.data
     async with async_session_maker() as session:
-        step = await session.get(FollowupStep, int(data["step_id"]))
-        if step is None or step.message_type != "static":
-            await states.clear(user_id)
-            return
-        from content_authoring import save_content_value
-
-        try:
-            await save_content_value(session, "followup_step", step, "message_text", data["locale"], text)
-        except ValueError as exc:
-            await client.send_message(chat_id=chat_id, text=str(exc))
-            return
-        await session.commit()
-        step_id = step.id
-    from translation_service import refresh_translation_cache
-
-    await refresh_translation_cache(async_session_maker, force=True)
+        async with followup_step_mutation_lock(session):
+            step = await session.get(FollowupStep, int(data["step_id"]))
+            if step is None or step.message_type != "static":
+                await states.clear(user_id)
+                return
+            try:
+                await save_static_followup_text(session, step, data["locale"], text)
+            except ValueError as exc:
+                await client.send_message(chat_id=chat_id, text=str(exc))
+                return
+            await commit_followup_step_mutation(session)
+            step_id = step.id
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="✅ Сообщение сохранено.")
     await show_step_text(client, chat_id, step_id, data["locale"])
@@ -566,7 +633,15 @@ async def start_step_add(client: MaxApiClient, states: StateStore, chat_id: int,
     await client.send_message(chat_id=chat_id, text=f"<b>Новый шаг</b>\n\nВ первой строке укажите задержку в минутах, ниже — {field}.\n\nПример:\n<code>60\nМягко напомни пользователю о незавершённом упражнении.</code>\n\n{extra}", attachments=inline_keyboard([_back(f"admin_fu_steps_{campaign_id}")]))
 
 
-async def receive_step_add(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, value: str) -> None:
+async def receive_step_add(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    value: str,
+    *,
+    formatted_value: str | None = None,
+) -> None:
     snapshot = await states.get(user_id)
     parsed = parse_followup_step_input(value)
     if not snapshot:
@@ -584,17 +659,21 @@ async def receive_step_add(client: MaxApiClient, states: StateStore, chat_id: in
         await client.send_message(chat_id=chat_id, text="Нужны минуты в первой строке и текст ниже.")
         return
     data = snapshot.data
+    if data.get("message_type") == "static" and formatted_value:
+        formatted_parsed = parse_followup_step_input(formatted_value)
+        if formatted_parsed is not None and formatted_parsed[0] == delay:
+            content = formatted_parsed[1]
     async with async_session_maker() as session:
-        order = await session.scalar(
-            select(func.count(FollowupStep.id)).where(FollowupStep.campaign_id == int(data["campaign_id"]))
-        ) or 0
-        step = FollowupStep(campaign_id=int(data["campaign_id"]), sort_order=order, delay_minutes=delay, message_type=data["message_type"])
-        if data["message_type"] == "ai":
-            step.ai_instruction = content
-        else:
-            step.message_text = content
-        session.add(step)
-        await session.commit()
+        async with followup_step_mutation_lock(session):
+            order = await allocate_followup_step_sort_order(session, int(data["campaign_id"]))
+            step = FollowupStep(campaign_id=int(data["campaign_id"]), sort_order=order, delay_minutes=delay, message_type=data["message_type"])
+            session.add(step)
+            await session.flush()
+            if data["message_type"] == "ai":
+                step.ai_instruction = content
+            else:
+                await save_static_followup_text(session, step, "ru", content)
+            await commit_followup_step_mutation(session)
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="✅ Шаг добавлен.")
     await show_steps(client, chat_id, int(data["campaign_id"]))
@@ -608,12 +687,20 @@ async def start_step_edit(client: MaxApiClient, states: StateStore, chat_id: int
         await client.send_message(chat_id=chat_id, text="Шаг не найден.")
         return
     content = step.ai_instruction if step.message_type == "ai" else step.message_text
-    await states.set(user_id, chat_id, "max_followup_step_edit", {"campaign_id": campaign_id, "step_id": step_id})
+    await states.set(user_id, chat_id, "max_followup_step_edit", {"campaign_id": campaign_id, "step_id": step_id, "message_type": step.message_type})
     label = "текст сообщения" if step.message_type == "static" else "инструкцию для AI"
     await client.send_message(chat_id=chat_id, text=f"<b>Редактирование шага</b>\n\nВ первой строке укажите задержку в минутах, ниже — {label}.", attachments=inline_keyboard([_back(f"admin_fu_step_{campaign_id}_{step_id}")]))
 
 
-async def receive_step_edit(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, value: str) -> None:
+async def receive_step_edit(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    value: str,
+    *,
+    formatted_value: str | None = None,
+) -> None:
     snapshot = await states.get(user_id)
     parsed = parse_followup_step_input(value)
     if not snapshot:
@@ -631,18 +718,23 @@ async def receive_step_edit(client: MaxApiClient, states: StateStore, chat_id: i
         await client.send_message(chat_id=chat_id, text="Нужны минуты в первой строке и текст ниже.")
         return
     data = snapshot.data
+    if data.get("message_type") == "static" and formatted_value:
+        formatted_parsed = parse_followup_step_input(formatted_value)
+        if formatted_parsed is not None and formatted_parsed[0] == delay:
+            content = formatted_parsed[1]
     async with async_session_maker() as session:
-        step = await session.get(FollowupStep, int(data["step_id"]))
-        if step is None or step.campaign_id != int(data["campaign_id"]):
-            await states.clear(user_id)
-            await client.send_message(chat_id=chat_id, text="Шаг не найден.")
-            return
-        step.delay_minutes = delay
-        if step.message_type == "ai":
-            step.ai_instruction = content
-        else:
-            step.message_text = content
-        await session.commit()
+        async with followup_step_mutation_lock(session):
+            step = await session.get(FollowupStep, int(data["step_id"]))
+            if step is None or step.campaign_id != int(data["campaign_id"]):
+                await states.clear(user_id)
+                await client.send_message(chat_id=chat_id, text="Шаг не найден.")
+                return
+            step.delay_minutes = delay
+            if step.message_type == "ai":
+                step.ai_instruction = content
+            else:
+                await save_static_followup_text(session, step, "ru", content)
+            await commit_followup_step_mutation(session)
     await states.clear(user_id)
     await client.send_message(chat_id=chat_id, text="✅ Шаг изменён.")
     await show_step(client, chat_id, int(data["campaign_id"]), int(data["step_id"]))
@@ -828,14 +920,16 @@ async def _self_test_snapshot(session, campaign_id: int, user_id: int, step_inde
     elif step.message_type not in {"static", "ai"}:
         reason = "step_invalid"
     elif step.message_type == "static":
-        locale = await resolve_user_effective_locale(session, user)
+        locale = await resolve_user_effective_locale(session, user, platform="max")
         text = translate(
             f"followup_step.{step.id}.message_text",
             locale,
             source=step.message_text or "",
             fallback=step.message_text or "",
         )
-        reason = "eligible" if text and text.strip() else "step_invalid"
+        visible_text, _ = extract_response_buttons(text)
+        snapshot["step_preview"] = visible_text
+        reason = "eligible" if visible_text and visible_text.strip() else "step_invalid"
     else:
         reason = "eligible"
     snapshot.update(
@@ -915,7 +1009,7 @@ def _self_test_text(snapshot: dict, user_id: int) -> str:
             next_text = "Следующий шаг:\nнет доступного шага"
     else:
         kind = "AI" if next_step.message_type == "ai" else "static"
-        preview = (next_step.ai_instruction if next_step.message_type == "ai" else next_step.message_text) or ""
+        preview = (next_step.ai_instruction if next_step.message_type == "ai" else snapshot.get("step_preview", next_step.message_text)) or ""
         preview = " ".join(preview.split())
         if len(preview) > 120:
             preview = preview[:119] + "…"

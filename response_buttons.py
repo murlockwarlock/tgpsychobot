@@ -257,6 +257,21 @@ def _parse_button_row(line: str) -> list[list[ResponseButton]] | None:
     return rows
 
 
+def _normalize_button_declaration_line(line: str) -> str | None:
+    candidate = line.strip()
+    if not candidate or candidate.startswith(chr(96)) or candidate.endswith(chr(96)):
+        return None
+    candidate = re.sub(r"^(?:\\-|-|•)\s+", "", candidate, count=1)
+    if not candidate or candidate.startswith(chr(96)) or candidate.endswith(chr(96)):
+        return None
+    if r"\(" not in candidate and r"\)" not in candidate:
+        if candidate == line.strip():
+            return candidate if _parse_button_row(candidate) else None
+        return _parse_button_row(candidate) and candidate or None
+    normalized = candidate.replace(r"\(", "(").replace(r"\)", ")")
+    return normalized if _parse_button_row(normalized) else None
+
+
 def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseButton]]]:
     """Remove standalone button rows and return their platform-neutral description."""
     source = text or ""
@@ -264,8 +279,22 @@ def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseB
         source = source.replace(r"\r\n", "\n").replace(r"\n", "\n")
     clean_lines: list[str] = []
     rows: list[list[ResponseButton]] = []
+    fenced_code_marker: str | None = None
     for line in source.splitlines():
-        parsed = _parse_button_row(line) if len(rows) < MAX_BUTTON_ROWS else None
+        stripped_line = line.strip()
+        if stripped_line.startswith(("```", "~~~")):
+            marker = stripped_line[:3]
+            clean_lines.append(line)
+            if fenced_code_marker is None:
+                fenced_code_marker = marker
+            elif marker == fenced_code_marker:
+                fenced_code_marker = None
+            continue
+        if fenced_code_marker is not None:
+            clean_lines.append(line)
+            continue
+        normalized_line = _normalize_button_declaration_line(line)
+        parsed = _parse_button_row(normalized_line or line) if len(rows) < MAX_BUTTON_ROWS else None
         if parsed and len(rows) + len(parsed) <= MAX_BUTTON_ROWS:
             rows.extend(parsed)
         else:

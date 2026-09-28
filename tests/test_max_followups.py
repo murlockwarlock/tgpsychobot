@@ -25,7 +25,7 @@ from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.services import admin_followups as max_admin_followups
 from max_messenger_bot import storage as max_storage
 from max_messenger_bot.storage import StorageBase
-from max_messenger_bot.models import MAX_ID_OFFSET, IncomingMessage, Sender
+from max_messenger_bot.models import MAX_ID_OFFSET, IncomingCallback, IncomingMessage, Sender
 from followup_admin_contract import classify_followup_callback
 
 
@@ -605,6 +605,227 @@ async def test_max_topic_switch_finalizes_after_committed_scope(followup_db, mon
         (1, 0, "cancelled"),
         (1, topic.id, "active"),
     }
+
+
+@pytest.mark.asyncio
+async def test_max_start_payload_topic_switch_finalizes_after_committed_scope(followup_db, monkeypatch):
+    raw_user_id = 713
+    user_id = MAX_ID_OFFSET + raw_user_id
+    topic = Topic(name="Payload scope", is_active=True, show_in_list=True)
+    campaign = FollowupCampaign(
+        name="Payload race",
+        is_active=True,
+        all_topics=True,
+        include_main_dialogue=True,
+        quiet_start_minute=0,
+        quiet_end_minute=0,
+        jitter_min_seconds=0,
+        jitter_max_seconds=0,
+    )
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="Later"))
+    async with followup_db() as session:
+        user = User(id=user_id, first_name="MAX", current_dialogue_id=1, current_topic_id=None)
+        session.add_all([user, topic, campaign])
+        await session.flush()
+        session.add(FollowupRun(
+            campaign_id=campaign.id,
+            user_id=user_id,
+            dialogue_id=1,
+            topic_id=0,
+            due_at=datetime.utcnow(),
+            status="active",
+        ))
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.topics_service, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _false_async())
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_select(client, chat_id, selected_user_id, selected_topic_id, states):
+        started.set()
+        await release.wait()
+        async with followup_db() as session:
+            selected_user = await session.get(User, selected_user_id)
+            selected_user.current_topic_id = selected_topic_id
+            await session.commit()
+        await client.send_message(chat_id=chat_id, text="✅ Тема сохранена.")
+
+    monkeypatch.setattr(max_app_module.topics_service, "select_topic", delayed_select)
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+
+    switch = asyncio.create_task(_send_user_text(app, raw_user_id, 1, f"/start topic_{topic.id}"))
+    await started.wait()
+    assert not switch.done()
+    release.set()
+    await switch
+
+    async with followup_db() as session:
+        saved_user = await session.get(User, user_id)
+        runs = (await session.scalars(
+            select(FollowupRun).where(FollowupRun.user_id == user_id).order_by(FollowupRun.dialogue_id, FollowupRun.topic_id)
+        )).all()
+    assert saved_user.current_topic_id == topic.id
+    assert {(run.dialogue_id, run.topic_id, run.status) for run in runs} == {
+        (1, 0, "cancelled"),
+        (1, topic.id, "active"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_max_visible_topic_name_switch_finalizes_after_committed_scope(followup_db, monkeypatch):
+    raw_user_id = 714
+    user_id = MAX_ID_OFFSET + raw_user_id
+    topic = Topic(name="Visible scope", is_active=True, show_in_list=True, show_in_main_menu=True)
+    campaign = FollowupCampaign(
+        name="Visible race",
+        is_active=True,
+        all_topics=True,
+        include_main_dialogue=True,
+        quiet_start_minute=0,
+        quiet_end_minute=0,
+        jitter_min_seconds=0,
+        jitter_max_seconds=0,
+    )
+    campaign.steps.append(FollowupStep(sort_order=0, delay_minutes=1, message_type="static", message_text="Later"))
+    async with followup_db() as session:
+        user = User(id=user_id, first_name="MAX", current_dialogue_id=1, current_topic_id=None)
+        session.add_all([user, topic, campaign])
+        await session.flush()
+        session.add(FollowupRun(
+            campaign_id=campaign.id,
+            user_id=user_id,
+            dialogue_id=1,
+            topic_id=0,
+            due_at=datetime.utcnow(),
+            status="active",
+        ))
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.topics_service, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _false_async())
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_select(client, chat_id, selected_user_id, selected_topic_id, states):
+        started.set()
+        await release.wait()
+        async with followup_db() as session:
+            selected_user = await session.get(User, selected_user_id)
+            selected_user.current_topic_id = selected_topic_id
+            await session.commit()
+        await client.send_message(chat_id=chat_id, text="✅ Тема сохранена.")
+
+    monkeypatch.setattr(max_app_module.topics_service, "select_topic", delayed_select)
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+
+    await _send_user_text(app, raw_user_id, 1, "/topics")
+    switch = asyncio.create_task(_send_user_text(app, raw_user_id, 2, "Visible scope"))
+    await started.wait()
+    assert not switch.done()
+    release.set()
+    await switch
+
+    async with followup_db() as session:
+        saved_user = await session.get(User, user_id)
+        runs = (await session.scalars(
+            select(FollowupRun).where(FollowupRun.user_id == user_id).order_by(FollowupRun.dialogue_id, FollowupRun.topic_id)
+        )).all()
+    assert saved_user.current_topic_id == topic.id
+    assert {(run.dialogue_id, run.topic_id, run.status) for run in runs} == {
+        (1, 0, "cancelled"),
+        (1, topic.id, "active"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_max_metadata_operator_rejects_campaign_mismatch(monkeypatch):
+    from max_messenger_bot.services import admin_followups
+
+    states = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(
+            state="max_followup_metadata_operator",
+            data={"campaign_id": 10, "field": "profile.outcome"},
+        )),
+        clear=AsyncMock(),
+        set=AsyncMock(),
+    )
+    client = SimpleNamespace(send_message=AsyncMock())
+
+    with patch.object(admin_followups, "show_conditions", AsyncMock()) as show_conditions:
+        await admin_followups.select_metadata_operator(client, states, 321, 703, 11, "equals")
+
+    states.clear.assert_awaited_once_with(703)
+    states.set.assert_not_awaited()
+    show_conditions.assert_awaited_once_with(client, 321, 11)
+
+
+@pytest.mark.asyncio
+async def test_max_revoked_admin_cannot_execute_persisted_followup_input(followup_db, monkeypatch):
+    raw_admin_id = 715
+    user_id = MAX_ID_OFFSET + raw_admin_id
+    async with followup_db() as session:
+        session.add(User(id=user_id, first_name="Former admin", is_admin=False))
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _false_async())
+    receiver = AsyncMock()
+    monkeypatch.setattr(max_app_module.admin_followups_service, "receive_rename", receiver)
+
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+    await app.states.set(user_id, raw_admin_id, "max_followup_campaign_rename", {"campaign_id": 10})
+
+    await _send_admin_text(app, raw_admin_id, 1, "Should not save")
+
+    receiver.assert_not_awaited()
+    assert await app.states.get(user_id) is None
+    assert client.messages[-1]["body"]["text"] == "Недостаточно прав администратора."
+
+
+@pytest.mark.asyncio
+async def test_max_navigation_invalidates_followup_input_state(monkeypatch):
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+    user_id = 716
+    states = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(
+            state="max_followup_step_edit",
+            data={"campaign_id": 10, "step_id": 11},
+        )),
+        clear=AsyncMock(),
+    )
+    app.states = states
+    monkeypatch.setattr(max_app_module.common, "show_menu", AsyncMock())
+
+    await app._handle_callback_impl(IncomingCallback(
+        raw={},
+        callback_id="callback-stale-state",
+        payload="main_menu",
+        chat_id=user_id,
+        message_id=None,
+        sender=Sender(user_id=user_id, username=None, first_name="Admin", last_name=None),
+    ))
+
+    states.clear.assert_awaited_once_with(user_id)
 
 
 @pytest.mark.asyncio
@@ -1295,6 +1516,90 @@ async def test_max_admin_followup_campaign_journey_uses_real_application_routes(
     await callback(f"admin_fu_delete_yes_{campaign.id}")
     async with followup_db() as session:
         assert await session.get(FollowupCampaign, campaign.id) is None
+
+
+@pytest.mark.asyncio
+async def test_max_static_followup_authoring_keeps_incoming_html_formatting(followup_db, monkeypatch):
+    raw_admin_id = 717
+    admin_id = MAX_ID_OFFSET + raw_admin_id
+    async with followup_db() as session:
+        campaign = FollowupCampaign(name="Formatted MAX", include_main_dialogue=True)
+        session.add_all([User(id=admin_id, first_name="Admin", is_admin=True), campaign])
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_storage, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_admin_followups, "async_session_maker", followup_db)
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+
+    client = ValidatingMaxClient()
+    app = MaxBotApplication(client)
+    await app.handle_update({
+        "update_type": "message_callback",
+        "update_id": "formatted-step-start",
+        "callback": {
+            "callback_id": "formatted-step-callback",
+            "payload": f"admin_fu_step_add_{campaign.id}_static",
+            "sender": {"user_id": raw_admin_id, "name": "Admin"},
+        },
+        "message": {"recipient": {"chat_id": raw_admin_id}, "body": {"attachments": []}},
+    })
+    await app.handle_update({
+        "update_type": "message_created",
+        "update_id": "formatted-step-value",
+        "message": {
+            "recipient": {"chat_id": raw_admin_id},
+            "sender": {"user_id": raw_admin_id, "name": "Admin"},
+            "body": {
+                "text": "5\nЖирный",
+                "markup": [{"type": "strong", "from": 2, "length": 6}],
+            },
+        },
+    })
+
+    async with followup_db() as session:
+        step = await session.scalar(select(FollowupStep).where(FollowupStep.campaign_id == campaign.id))
+    assert step is not None
+    assert step.message_text == "<b>Жирный</b>"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_max_step_additions_allocate_unique_order(followup_db, monkeypatch):
+    campaign = FollowupCampaign(name="Concurrent order", include_main_dialogue=True)
+    async with followup_db() as session:
+        session.add(campaign)
+        await session.commit()
+
+    monkeypatch.setattr(max_admin_followups, "async_session_maker", followup_db)
+
+    class States:
+        def __init__(self):
+            self.snapshots = {
+                1: SimpleNamespace(state="max_followup_step_add", data={"campaign_id": campaign.id, "message_type": "ai"}),
+                2: SimpleNamespace(state="max_followup_step_add", data={"campaign_id": campaign.id, "message_type": "ai"}),
+            }
+
+        async def get(self, user_id):
+            return self.snapshots.get(user_id)
+
+        async def clear(self, user_id):
+            self.snapshots.pop(user_id, None)
+
+    states = States()
+    client = SimpleNamespace(send_message=AsyncMock())
+    monkeypatch.setattr(max_admin_followups, "show_steps", AsyncMock())
+    await asyncio.gather(
+        max_admin_followups.receive_step_add(client, states, 1, 1, "5\nПервый"),
+        max_admin_followups.receive_step_add(client, states, 2, 2, "10\nВторой"),
+    )
+
+    async with followup_db() as session:
+        steps = (await session.scalars(
+            select(FollowupStep).where(FollowupStep.campaign_id == campaign.id).order_by(FollowupStep.sort_order)
+        )).all()
+    assert [step.sort_order for step in steps] == [0, 1]
+    assert {step.ai_instruction for step in steps} == {"Первый", "Второй"}
 
 
 @pytest.mark.asyncio

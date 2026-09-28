@@ -8,6 +8,13 @@ MEMORY_MODE_VALUES = {
     MEMORY_MODE_GLOBAL,
 }
 
+METADATA_RESET_MODE_RESET = "reset"
+METADATA_RESET_MODE_PRESERVE = "preserve"
+METADATA_RESET_MODE_VALUES = {
+    METADATA_RESET_MODE_RESET,
+    METADATA_RESET_MODE_PRESERVE,
+}
+
 
 
 def normalize_memory_mode(ai_config) -> str:
@@ -50,6 +57,15 @@ def next_memory_mode(current_mode: str) -> str:
     if current_mode == MEMORY_MODE_TOPIC:
         return MEMORY_MODE_GLOBAL
     return MEMORY_MODE_RESET
+
+
+def get_metadata_reset_mode(ai_config) -> str:
+    mode = getattr(ai_config, "metadata_reset_mode", None)
+    return mode if mode in METADATA_RESET_MODE_VALUES else METADATA_RESET_MODE_RESET
+
+
+def metadata_reset_mode_label(mode: str) -> str:
+    return "Сохранять" if mode == METADATA_RESET_MODE_PRESERVE else "Сбрасывать"
 
 
 def memory_mode_label(mode: str) -> str:

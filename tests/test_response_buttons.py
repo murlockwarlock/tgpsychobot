@@ -204,6 +204,52 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0][0].text, rows[0][0].value), ("Готов", "ready"))
 
+    def test_extracts_escaped_llm_button_lines(self):
+        source = (
+            r"\- [Что-то случилось]\(btn:start_event)\n"
+            r"\- [Просто тяжело]\(btn:start_heavy)\n"
+            r"\- [Хочу разобраться в себе]\(btn:start_self)"
+        )
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for row in rows for button in row],
+            [
+                ("Что-то случилось", "action", "start_event"),
+                ("Просто тяжело", "action", "start_heavy"),
+                ("Хочу разобраться в себе", "action", "start_self"),
+            ],
+        )
+
+    def test_extracts_bulleted_and_escaped_url_button_lines(self):
+        source = "• [Сайт](https://example.com)\n- [Дальше](btn:continue)"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "")
+        self.assertEqual([(button.text, button.kind) for row in rows for button in row], [
+            ("Сайт", "url"),
+            ("Дальше", "action"),
+        ])
+
+    def test_keeps_non_button_bullets_and_escaped_prose(self):
+        source = "- обычный список\nМатематика: a\\(b\\)\n\\[не ссылка\\]"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_button_like_lines_inside_fenced_code(self):
+        source = "```markdown\n[Не кнопка](btn:no)\n```"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
 
 class ApiKeyDisplayTests(unittest.TestCase):
     def test_masks_api_keys_in_telegram_admin_keyboard(self):

@@ -19,6 +19,7 @@ from ..models import MAX_ID_OFFSET
 from ..storage import StateStore
 from ..time_utils import format_msk
 from result_history import TEST_RESULT_ROLE, non_technical_role_filter
+from dialogue_history_export import serialize_human_dialogue_history
 
 
 
@@ -395,11 +396,16 @@ def _build_txt_export(
         if not messages:
             continue
         lines.extend([f"ДАННЫЕ КЛИЕНТА: {_user_label(user, anonymize, index)}", "-" * 40])
+        history_records = []
         for message in messages:
             topic = topic_map.get(message.topic_id, "General")
             role = "Client" if message.role == "user" else "Test" if message.role == TEST_RESULT_ROLE else "Bot"
             timestamp = format_msk(message.timestamp, "%Y-%m-%d %H:%M МСК") if message.timestamp else ""
-            lines.append(f"[{timestamp}] [{topic}] {role}: {message.content or ''}")
+            history_records.append((
+                message.dialogue_id,
+                f"[{timestamp}] [{topic}] {role}: {message.content or ''}",
+            ))
+        lines.extend(serialize_human_dialogue_history(history_records).splitlines())
         lines.extend(["", "=" * 60, ""])
     if len(lines) == 3:
         lines.append("Нет сообщений по выбранным условиям.")

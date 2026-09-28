@@ -211,6 +211,7 @@ def build_ai_attempt_txt_file(log_entry: Any) -> str:
     error_type = getattr(log_entry, "error_type", None) or "не зафиксировано"
     error_cls = getattr(log_entry, "error_classification", None) or "не зафиксировано"
     error_msg = getattr(log_entry, "error_message", None) or "не зафиксировано"
+    diagnostics = getattr(log_entry, "diagnostics_json", None) or "не зафиксировано"
     finish_reason = getattr(log_entry, "finish_reason", None) or "не зафиксирован"
 
     request_payload = getattr(log_entry, "request_payload", None) or "<none>"
@@ -252,6 +253,7 @@ def build_ai_attempt_txt_file(log_entry: Any) -> str:
         f"Error Type: {error_type}\n"
         f"Error Classification: {error_cls}\n"
         f"Error Message: {error_msg}\n"
+        f"Diagnostics: {diagnostics}\n"
         f"Finish Reason: {finish_reason}\n\n"
         f"========================================\n"
         f"📤 [1] FULL REQUEST PAYLOAD:\n"
@@ -270,4 +272,3 @@ def build_ai_attempt_txt_file(log_entry: Any) -> str:
         f"----------------------------------------\n"
         f"{clean_text}\n"
     )
-

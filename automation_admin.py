@@ -48,6 +48,12 @@ from followups import (
     parse_followup_csv,
     send_followup_step,
 )
+from followup_admin_shared import (
+    allocate_followup_step_sort_order,
+    commit_followup_step_mutation,
+    followup_step_mutation_lock,
+    save_static_followup_text,
+)
 from time_helpers import format_msk
 from translation_pack_manager import commit_readiness_critical_mutation, translation_coordination_lock
 from followup_admin_contract import (
@@ -2459,22 +2465,27 @@ async def followup_step_received(message: Message, state: FSMContext):
     if not body:
         await message.answer("Нужны минуты в первой строке и текст ниже.")
         return
+    formatted_body = body
+    if data["step_kind"] == "static":
+        formatted_input = _parse_followup_step_input(getattr(message, "html_text", None))
+        if formatted_input is not None:
+            formatted_body = formatted_input[1]
     async with async_session_maker() as session:
-        order = await session.scalar(
-            select(func.count(FollowupStep.id)).where(FollowupStep.campaign_id == data["campaign_id"])
-        ) or 0
-        values = {
-            "campaign_id": data["campaign_id"],
-            "sort_order": order,
-            "delay_minutes": delay,
-            "message_type": data["step_kind"],
-        }
-        if data["step_kind"] == "ai":
-            values["ai_instruction"] = body.strip()
-        else:
-            values["message_text"] = body.strip()
-        session.add(FollowupStep(**values))
-        await commit_readiness_critical_mutation(session)
+        async with followup_step_mutation_lock(session):
+            order = await allocate_followup_step_sort_order(session, data["campaign_id"])
+            step = FollowupStep(
+                campaign_id=data["campaign_id"],
+                sort_order=order,
+                delay_minutes=delay,
+                message_type=data["step_kind"],
+            )
+            session.add(step)
+            await session.flush()
+            if data["step_kind"] == "ai":
+                step.ai_instruction = body.strip()
+            else:
+                await save_static_followup_text(session, step, "ru", formatted_body.strip())
+            await commit_followup_step_mutation(session)
     return_topic_id = data.get("followup_return_topic_id")
     await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Шаг добавлен.")
@@ -2494,17 +2505,20 @@ async def followup_step_edit_received(message: Message, state: FSMContext):
     delay, body = parsed
     data = await state.get_data()
     async with async_session_maker() as session:
-        step = await session.get(FollowupStep, data["step_id"])
-        if step is None or step.campaign_id != data["campaign_id"]:
-            await state.clear()
-            await message.answer("Шаг не найден.")
-            return
-        step.delay_minutes = delay
-        if step.message_type == "ai":
-            step.ai_instruction = body
-        else:
-            step.message_text = body
-        await commit_readiness_critical_mutation(session)
+        async with followup_step_mutation_lock(session):
+            step = await session.get(FollowupStep, data["step_id"])
+            if step is None or step.campaign_id != data["campaign_id"]:
+                await state.clear()
+                await message.answer("Шаг не найден.")
+                return
+            step.delay_minutes = delay
+            if step.message_type == "ai":
+                step.ai_instruction = body
+            else:
+                formatted_input = _parse_followup_step_input(getattr(message, "html_text", None))
+                formatted_body = formatted_input[1] if formatted_input is not None else body
+                await save_static_followup_text(session, step, "ru", formatted_body.strip())
+            await commit_followup_step_mutation(session)
     return_topic_id = data.get("followup_return_topic_id")
     await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Шаг обновлён.")

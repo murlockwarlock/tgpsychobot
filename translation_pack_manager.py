@@ -428,12 +428,13 @@ async def _deactivate_untranslated_new_resource(session, resource) -> None:
             handler.is_active = False
 
 
-async def commit_readiness_critical_mutation(session) -> None:
-    from content_authoring import bump_revision
+async def commit_readiness_critical_mutation(session, *, bump_revision: bool = True) -> None:
+    from content_authoring import bump_revision as bump_translation_revision
 
     async with translation_coordination_lock(session):
         await session.flush()
-        await bump_revision(session)
+        if bump_revision:
+            await bump_translation_revision(session)
         await session.commit()
 
 

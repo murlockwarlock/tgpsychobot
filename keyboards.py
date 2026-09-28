@@ -844,8 +844,8 @@ def confirm_delete_history_keyboard(token: str = "", locale: str = "ru"):
     builder = InlineKeyboardBuilder()
     confirm_data = f"delete_history_confirm:{token}" if token else "delete_history_confirm"
     cancel_data = f"delete_history_cancel:{token}" if token else "delete_history_cancel"
-    builder.button(text=translate("ui.dialogue.confirm_delete", locale, fallback="🗑️ Да, удалить"), callback_data=confirm_data)
-    builder.button(text=translate("ui.dialogue.cancel_with_icon", locale, fallback="❌ Отмена"), callback_data=cancel_data)
+    builder.button(text=translate("ui.dialogue.confirm_delete", locale, fallback="Да, сбросить диалог"), callback_data=confirm_data)
+    builder.button(text=translate("ui.dialogue.cancel_with_icon", locale, fallback="Отмена"), callback_data=cancel_data)
     return builder.as_markup()
 
 
@@ -854,7 +854,7 @@ def topic_reset_options_keyboard(token: str = "", locale: str = "ru"):
     keep_data = f"reset_topic_keep:{token}" if token else "reset_topic_keep"
     to_main_data = f"reset_topic_to_main:{token}" if token else "reset_topic_to_main"
     cancel_data = f"delete_history_cancel:{token}" if token else "delete_history_cancel"
-    builder.button(text=translate("ui.dialogue.new_topic", locale, fallback="Начать новый диалог в данной теме"), callback_data=keep_data)
+    builder.button(text=translate("ui.dialogue.new_topic", locale, fallback="Да, сбросить диалог"), callback_data=keep_data)
     builder.button(text=translate("ui.dialogue.main_topic", locale, fallback="Перейти в основной диалог"), callback_data=to_main_data)
     builder.button(text=translate("ui.dialogue.cancel", locale, fallback="Отмена"), callback_data=cancel_data)
     builder.adjust(1)

@@ -1,8 +1,12 @@
 import html
+import re
 from typing import Optional
 
 from aiogram import Bot
 
+from max_messenger_bot.formatting import markdown_to_html
+from response_button_renderers import telegram_response_buttons_markup
+from response_buttons import extract_response_buttons
 from telegram_birthdate import format_birthdate
 
 
@@ -72,18 +76,47 @@ def render_mailing_text(text: Optional[str], user) -> Optional[str]:
     return rendered
 
 
+def parse_mailing_text(text: Optional[str]) -> tuple[str, list]:
+    return extract_response_buttons(text or "")
+
+
+def mailing_text_to_html(text: str) -> str:
+    if not text:
+        return ""
+    if re.search(r"</?(?:b|strong|i|em|u|s|code|pre|blockquote|a)(?:\s|>)", text, re.IGNORECASE):
+        return text
+    return markdown_to_html(text)
+
+
 async def send_mailing_content(bot: Bot, user_id: int, mailing, *, rendered_text: Optional[str] = None):
     text = rendered_text if rendered_text is not None else getattr(mailing, "text", None)
     media = getattr(mailing, "media_file_id", None)
     media_type = getattr(mailing, "media_file_type", None)
     position = getattr(mailing, "media_position", None) or "media_top"
+    clean_text, response_button_rows = parse_mailing_text(text)
+    html_text = mailing_text_to_html(clean_text)
+    if not html_text and response_button_rows:
+        html_text = "Выберите действие:"
+    response_markup = telegram_response_buttons_markup(response_button_rows)
 
-    if media and text and len(text) <= 1024 and position == "media_top":
+    if media and html_text and len(html_text) <= 1024 and position == "media_top":
         if media_type == "photo":
-            await bot.send_photo(user_id, media, caption=text, parse_mode="HTML")
+            await bot.send_photo(
+                user_id,
+                media,
+                caption=html_text,
+                parse_mode="HTML",
+                reply_markup=response_markup,
+            )
             return
         if media_type == "video":
-            await bot.send_video(user_id, media, caption=text, parse_mode="HTML")
+            await bot.send_video(
+                user_id,
+                media,
+                caption=html_text,
+                parse_mode="HTML",
+                reply_markup=response_markup,
+            )
             return
 
     async def send_media_only():
@@ -95,8 +128,13 @@ async def send_mailing_content(bot: Bot, user_id: int, mailing, *, rendered_text
             await bot.send_video(user_id, media)
 
     async def send_text_only():
-        if text:
-            await bot.send_message(user_id, text, parse_mode="HTML")
+        if html_text:
+            await bot.send_message(
+                user_id,
+                html_text,
+                parse_mode="HTML",
+                reply_markup=response_markup,
+            )
 
     if position == "media_top":
         await send_media_only()

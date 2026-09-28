@@ -564,25 +564,9 @@ async def emit_followup_step(
 
         await _send_generated_response(bot, user.id, send_result.raw_text or send_result.text)
         return send_result
-    if not send_result.response_button_rows:
-        sent = await bot.send_message(user.id, send_result.text)
-        return FollowupStepSendResult(
-            send_result.text,
-            send_result.history_text,
-            getattr(sent, "message_id", None),
-            send_result.response_button_rows,
-            raw_text=send_result.raw_text,
-            platform="telegram",
-        )
+    from handlers import _telegram_response_buttons_markup, markdown_to_html, split_html_text
 
-    from handlers import (
-        _safe_send_html,
-        _telegram_response_buttons_markup,
-        markdown_to_html,
-        split_html_text,
-    )
-
-    reply_markup = _telegram_response_buttons_markup(send_result.response_button_rows)
+    reply_markup = _telegram_response_buttons_markup(send_result.response_button_rows or [])
     visible_text = send_result.history_text or "Выберите действие:"
     chunks = split_html_text(markdown_to_html(visible_text))
     sent = None
@@ -598,7 +582,7 @@ async def emit_followup_step(
                 reply_markup=markup,
             )
 
-        await _safe_send_html(send_chunk, chunk)
+        await send_chunk(chunk, "HTML")
     return FollowupStepSendResult(
         send_result.text,
         send_result.history_text,

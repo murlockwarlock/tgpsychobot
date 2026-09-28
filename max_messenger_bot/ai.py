@@ -118,6 +118,7 @@ from kie_chat import (
     build_kie_chat_request,
     extract_kie_chat_response_text,
     extract_kie_chat_text,
+    kie_error_classification,
     is_kie_error_payload,
     is_kie_insufficient_balance,
 )
@@ -612,7 +613,17 @@ def _validate_kie_json_response(status_code: int, payload: dict, *, context: str
         else:
             err = AIServiceError(f"{context}: status={status_code} message={detail}")
         err.http_status = status_code
+        err.provider = "KIE"
+        err.provider_message = detail
         err.provider_code = code_val
+        err.diagnostics = {
+            "provider_code": code_val,
+            "provider_message": detail,
+        }
+        if not isinstance(err, InsufficientBalanceError):
+            classification = kie_error_classification(status_code, payload)
+            if classification:
+                err.classification = classification
         err.provider_response_payload = payload_str
         raise err
 
@@ -623,7 +634,17 @@ def _validate_kie_json_response(status_code: int, payload: dict, *, context: str
         else:
             err = AIServiceError(f"{context}: {detail}")
         err.http_status = 200
+        err.provider = "KIE"
+        err.provider_message = detail
         err.provider_code = code
+        err.diagnostics = {
+            "provider_code": code,
+            "provider_message": detail,
+        }
+        if not isinstance(err, InsufficientBalanceError):
+            classification = kie_error_classification(status_code, payload)
+            if classification:
+                err.classification = classification
         err.provider_response_payload = payload_str
         raise err
 
@@ -857,7 +878,9 @@ async def _create_kie_task(api_key: str, base_url: str, model: str, input_payloa
         if not task_id:
             raise AIServiceError(f"KIE task creation returned no taskId: {data}")
         return task_id
-    except (AIServiceError, InsufficientBalanceError):
+    except (AIServiceError, InsufficientBalanceError) as exc:
+        exc.provider = "KIE"
+        exc.model = model
         raise
     except Exception as e:
         logging.error("KIE create task error", exc_info=e)
@@ -1182,7 +1205,9 @@ async def _call_kie_text_chat(
         if not text:
             raise AIServiceError("KIE chat returned empty content")
         return text
-    except (AIServiceError, InsufficientBalanceError):
+    except (AIServiceError, InsufficientBalanceError) as exc:
+        exc.provider = "KIE"
+        exc.model = model
         raise
     except Exception as e:
         log.error("KIE chat error: %s", e, exc_info=True)
