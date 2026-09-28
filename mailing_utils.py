@@ -1,10 +1,9 @@
 import html
-import re
 from typing import Optional
 
 from aiogram import Bot
 
-from max_messenger_bot.formatting import markdown_to_html
+from canonical_content import canonical_markup_to_html
 from response_button_renderers import telegram_response_buttons_markup
 from response_buttons import extract_response_buttons
 from telegram_birthdate import format_birthdate
@@ -64,15 +63,31 @@ def render_mailing_text(text: Optional[str], user) -> Optional[str]:
     ) or ""
 
     replacements = {
-        "{name}": html.escape(first_name),
-        "{first_name}": html.escape(first_name),
-        "{username}": html.escape(username),
-        "{birthdate}": html.escape(birthdate),
+        "{name}": html.escape(first_name).replace("\r", " ").replace("\n", " "),
+        "{first_name}": html.escape(first_name).replace("\r", " ").replace("\n", " "),
+        "{username}": html.escape(username).replace("\r", " ").replace("\n", " "),
+        "{birthdate}": html.escape(birthdate).replace("\r", " ").replace("\n", " "),
     }
 
-    rendered = text
+    protected_lines: dict[str, str] = {}
+    lines = text.splitlines(keepends=True)
+    protected_source: list[str] = []
+    for line in lines:
+        content = line.rstrip("\r\n")
+        suffix = line[len(content):]
+        clean_content, rows = parse_mailing_text(content)
+        if rows and not clean_content.strip():
+            token = f"\ue100MAILING_BUTTON_{len(protected_lines)}\ue101"
+            protected_lines[token] = content
+            protected_source.append(token + suffix)
+        else:
+            protected_source.append(line)
+
+    rendered = "".join(protected_source)
     for placeholder, value in replacements.items():
         rendered = rendered.replace(placeholder, value)
+    for token, value in protected_lines.items():
+        rendered = rendered.replace(token, value)
     return rendered
 
 
@@ -81,11 +96,7 @@ def parse_mailing_text(text: Optional[str]) -> tuple[str, list]:
 
 
 def mailing_text_to_html(text: str) -> str:
-    if not text:
-        return ""
-    if re.search(r"</?(?:b|strong|i|em|u|s|code|pre|blockquote|a)(?:\s|>)", text, re.IGNORECASE):
-        return text
-    return markdown_to_html(text)
+    return canonical_markup_to_html(text)
 
 
 async def send_mailing_content(bot: Bot, user_id: int, mailing, *, rendered_text: Optional[str] = None):

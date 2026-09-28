@@ -188,27 +188,25 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertTrue(should_start_test)
         self.assertEqual(clean_text, "Можно начинать.")
 
-    def test_extracts_buttons_wrapped_in_bold_or_code_markdown(self):
+    def test_extracts_buttons_wrapped_in_bold_markdown_but_keeps_inline_code(self):
         source = "Текст сообщения.\n\n**[Дальше](btn:after_photo)**\n`[Готов](btn:ready)`\n[**Дальше 2**](btn:after_photo_2)"
         text, rows = extract_response_buttons(source)
-        self.assertEqual(text, "Текст сообщения.")
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(text, "Текст сообщения.\n\n`[Готов](btn:ready)`")
+        self.assertEqual(len(rows), 2)
         self.assertEqual((rows[0][0].text, rows[0][0].value), ("Дальше", "after_photo"))
-        self.assertEqual((rows[1][0].text, rows[1][0].value), ("Готов", "ready"))
-        self.assertEqual((rows[2][0].text, rows[2][0].value), ("Дальше 2", "after_photo_2"))
+        self.assertEqual((rows[1][0].text, rows[1][0].value), ("Дальше 2", "after_photo_2"))
 
-    def test_unescapes_literal_newlines_in_text(self):
+    def test_keeps_literal_newlines_in_text(self):
         source = r"Первая строка.\n\nВторая строка.\n\n[Готов](btn:ready)"
         text, rows = extract_response_buttons(source)
-        self.assertEqual(text, "Первая строка.\n\nВторая строка.")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual((rows[0][0].text, rows[0][0].value), ("Готов", "ready"))
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
 
     def test_extracts_escaped_llm_button_lines(self):
         source = (
-            r"\- [Что-то случилось]\(btn:start_event)\n"
-            r"\- [Просто тяжело]\(btn:start_heavy)\n"
-            r"\- [Хочу разобраться в себе]\(btn:start_self)"
+            "\\- [Что-то случилось]\\(btn:start_event)\n"
+            "\\- [Просто тяжело]\\(btn:start_heavy)\n"
+            "\\- [Хочу разобраться в себе]\\(btn:start_self)"
         )
 
         text, rows = extract_response_buttons(source)
@@ -223,16 +221,45 @@ class ResponseButtonsTests(unittest.TestCase):
             ],
         )
 
-    def test_extracts_bulleted_and_escaped_url_button_lines(self):
-        source = "• [Сайт](https://example.com)\n- [Дальше](btn:continue)"
+    def test_keeps_ordinary_markdown_bullets_visible(self):
+        source = "- [Documentation](https://example.com)\n- See [documentation](https://example.com) for details"
 
         text, rows = extract_response_buttons(source)
 
-        self.assertEqual(text, "")
-        self.assertEqual([(button.text, button.kind) for row in rows for button in row], [
-            ("Сайт", "url"),
-            ("Дальше", "action"),
-        ])
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_ordinary_bullet_and_escaped_link_content_visible(self):
+        source = "• [Сайт](https://example.com)\n[Documentation]\\(https://example.com\\)"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_inline_code_button_syntax_visible(self):
+        source = "До ` [Run](btn:test) ` и `[Run](btn:test)` после"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_literal_newline_button_syntax_visible(self):
+        source = r"Описание\n[Run](btn:test)"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_backslash_heavy_mathematical_text_visible(self):
+        source = r"\frac{a\(b\)}{c} and \[x\] and a\\b"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
 
     def test_keeps_non_button_bullets_and_escaped_prose(self):
         source = "- обычный список\nМатематика: a\\(b\\)\n\\[не ссылка\\]"

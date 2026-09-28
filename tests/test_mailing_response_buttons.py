@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test")
@@ -14,9 +15,10 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import handlers
 import max_messenger_bot.storage as max_storage
-from database import Base, User
+from database import Base, Mailing, User
 from max_messenger_bot import app as max_app
 from max_messenger_bot.app import MaxBotApplication
+from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.identity import MAX_ID_OFFSET
 from max_messenger_bot.models import IncomingMessage, Sender
 from max_messenger_bot.services import admin_mailing as max_admin_mailing
@@ -24,6 +26,39 @@ from max_messenger_bot.services import common as max_common
 from max_messenger_bot.storage import StorageBase
 from mailing_utils import send_mailing_content
 from response_buttons import extract_response_buttons
+
+
+class _MaxBoundaryResponse:
+    status = 200
+    content_type = "application/json"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def text(self):
+        return '{"message":{"body":{"mid":"mailing-boundary"}}}'
+
+    async def json(self):
+        return {"message": {"body": {"mid": "mailing-boundary"}}}
+
+
+class _MaxBoundaryTransport:
+    def __init__(self):
+        self.requests = []
+
+    def request(self, method, url, *, params=None, json=None):
+        self.requests.append({"method": method, "url": url, "params": params or {}, "body": json})
+        return _MaxBoundaryResponse()
+
+
+class _MaxBoundaryClient(MaxApiClient):
+    def __init__(self):
+        super().__init__("test-token", "https://max.test")
+        self.transport = _MaxBoundaryTransport()
+        self._session = self.transport
 
 
 class _RecordedStates:
@@ -59,6 +94,39 @@ def _max_callback_update(payload: str, attachments: list[dict]) -> dict:
             "body": {"mid": "mailing-message-1", "attachments": attachments},
         },
     }
+
+
+def _max_admin_callback(update_id: str, payload: str, attachments: list[dict]) -> dict:
+    return {
+        "update_type": "message_callback",
+        "update_id": update_id,
+        "callback": {
+            "callback_id": f"callback-{update_id}",
+            "payload": payload,
+            "sender": {"user_id": 99, "name": "Администратор"},
+        },
+        "message": {
+            "recipient": {"chat_id": 99},
+            "body": {"attachments": attachments},
+        },
+    }
+
+
+def _max_request_buttons(request: dict) -> list[dict]:
+    return [
+        button
+        for attachment in request["body"].get("attachments", [])
+        if attachment.get("type") == "inline_keyboard"
+        for row in attachment["payload"].get("buttons", [])
+        for button in row
+    ]
+
+
+async def _press_max_admin_button(app, client, update_id: str, label: str) -> dict:
+    screen = client.transport.requests[-1]
+    button = next(button for button in _max_request_buttons(screen) if button.get("text") == label)
+    await app.handle_update(_max_admin_callback(update_id, button["payload"], screen["body"].get("attachments", [])))
+    return client.transport.requests[-1]
 
 
 @pytest.mark.asyncio
@@ -261,3 +329,155 @@ async def test_max_mailing_admin_preview_delivery_and_recipient_press(mailing_db
         "[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку \"Продолжить\" (continue)]",
         app.states,
     )
+
+
+@pytest.mark.asyncio
+async def test_max_formatted_mailing_round_trip_media_buttons_and_reopen(mailing_db):
+    user_id = MAX_ID_OFFSET + 99
+    states = _RecordedStates(SimpleNamespace(
+        state="admin_mailing_text",
+        data={"audience": "self"},
+    ))
+    client = _MaxBoundaryClient()
+    source = '<b>Привет</b>\n\n[Продолжить](btn:continue)\n[Сайт](https://example.com)'
+    message = IncomingMessage(
+        raw={},
+        message_id="formatted-mailing-authoring",
+        chat_id=99,
+        sender=Sender(user_id=user_id, username=None, first_name="Администратор", last_name=None),
+        text="Привет\n\n[Продолжить](btn:continue)\n[Сайт](https://example.com)",
+        html_text=source,
+        media_type="image",
+        media_token="photo-token",
+    )
+
+    await max_admin_mailing.save_input(client, states, 99, user_id, message)
+    assert states.snapshot.data["canonical_text"] == source
+    preview_body = client.transport.requests[-1]["body"]
+    preview_buttons = [
+        button
+        for attachment in preview_body["attachments"]
+        if attachment.get("type") == "inline_keyboard"
+        for row in attachment["payload"]["buttons"]
+        for button in row
+    ]
+    assert [button["text"] for button in preview_buttons[:2]] == ["Продолжить", "Сайт"]
+
+    await max_admin_mailing.confirm_send(client, states, 99, user_id)
+    delivery_request = next(
+        request
+        for request in client.transport.requests
+        if request["params"].get("user_id") == 99 and request["body"].get("text") == "<b>Привет</b>"
+    )
+    assert delivery_request["body"]["format"] == "html"
+    assert delivery_request["body"]["attachments"] == [
+        {"type": "image", "payload": {"token": "photo-token"}},
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [{"type": "callback", "text": "Продолжить", "payload": "ai_btn:continue"}],
+                    [{"type": "link", "text": "Сайт", "url": "https://example.com"}],
+                ]
+            },
+        },
+    ]
+
+    async with mailing_db() as session:
+        mailing = await session.scalar(select(Mailing).where(Mailing.creator_id == user_id))
+        assert mailing is not None
+        assert mailing.text == source
+
+    await max_admin_mailing.show_details(client, 99, mailing.id)
+    details_body = client.transport.requests[-1]["body"]
+    detail_buttons = [
+        button
+        for attachment in details_body["attachments"]
+        if attachment.get("type") == "inline_keyboard"
+        for row in attachment["payload"]["buttons"]
+        for button in row
+        if button.get("payload") == "ai_btn:continue" or button.get("type") == "link"
+    ]
+    assert detail_buttons == [
+        {"type": "callback", "text": "Продолжить", "payload": "ai_btn:continue"},
+        {"type": "link", "text": "Сайт", "url": "https://example.com"},
+    ]
+
+    app = MaxBotApplication(client)
+    run_ai = AsyncMock()
+    with patch.object(max_common, "ensure_access_before_chat", AsyncMock(return_value=True)), patch.object(
+        max_common, "run_ai_dialogue", run_ai
+    ):
+        await app.handle_update(_max_callback_update("ai_btn:continue", delivery_request["body"]["attachments"]))
+        if app.background_tasks:
+            await asyncio.gather(*app.background_tasks)
+    run_ai.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_max_formatted_mailing_real_admin_journey(mailing_db):
+    client = _MaxBoundaryClient()
+    app = MaxBotApplication(client)
+
+    await app.handle_update({
+        "update_type": "message_created",
+        "update_id": "journey-admin-start",
+        "message": {
+            "recipient": {"chat_id": 99},
+            "sender": {"user_id": 99, "name": "Администратор"},
+            "body": {"text": "/admin"},
+        },
+    })
+    await _press_max_admin_button(app, client, "journey-mailing-menu", "✉️ Рассылки")
+    await _press_max_admin_button(app, client, "journey-mailing-create", "🚀 Создать рассылку")
+    await _press_max_admin_button(app, client, "journey-mailing-audience", "👤 Только себе")
+
+    text = "Привет\n\n[Продолжить](btn:continue)\n[Сайт](https://example.com)"
+    await app.handle_update({
+        "update_type": "message_created",
+        "update_id": "journey-mailing-text",
+        "message": {
+            "recipient": {"chat_id": 99},
+            "sender": {"user_id": 99, "name": "Администратор"},
+            "body": {
+                "text": text,
+                "markup": [{"type": "strong", "from": 0, "length": 6}],
+                "attachments": [{"type": "image", "payload": {"token": "photo-token"}}],
+            },
+        },
+    })
+    preview = client.transport.requests[-1]
+    preview_buttons = _max_request_buttons(preview)
+    assert {button["text"] for button in preview_buttons} >= {"Продолжить", "Сайт", "✅ Отправить"}
+
+    await _press_max_admin_button(app, client, "journey-mailing-confirm", "✅ Отправить")
+    delivery = next(
+        request
+        for request in client.transport.requests
+        if request["params"].get("user_id") == 99 and request["body"].get("text") == "<b>Привет</b>"
+    )
+    assert {button["text"] for button in _max_request_buttons(delivery)} == {"Продолжить", "Сайт"}
+
+    summary = client.transport.requests[-1]
+    await _press_max_admin_button(app, client, "journey-mailing-history", "📜 История рассылок")
+    history = client.transport.requests[-1]
+    history_button = next(
+        button for button in _max_request_buttons(history) if button["payload"].startswith("mailing_details_")
+    )
+    await app.handle_update(_max_admin_callback("journey-mailing-details", history_button["payload"], history["body"]["attachments"]))
+    details = client.transport.requests[-1]
+    assert {button["text"] for button in _max_request_buttons(details)} >= {"Продолжить", "Сайт"}
+
+    run_ai = AsyncMock()
+    with patch.object(max_common, "ensure_access_before_chat", AsyncMock(return_value=True)), patch.object(
+        max_common, "run_ai_dialogue", run_ai
+    ):
+        await app.handle_update(_max_callback_update("ai_btn:continue", delivery["body"]["attachments"]))
+        if app.background_tasks:
+            await asyncio.gather(*app.background_tasks)
+    run_ai.assert_awaited_once()
+
+    for task in list(app.background_tasks):
+        task.cancel()
+    if app.background_tasks:
+        await asyncio.gather(*app.background_tasks, return_exceptions=True)

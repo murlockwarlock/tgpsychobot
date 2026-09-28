@@ -259,24 +259,35 @@ def _parse_button_row(line: str) -> list[list[ResponseButton]] | None:
 
 def _normalize_button_declaration_line(line: str) -> str | None:
     candidate = line.strip()
-    if not candidate or candidate.startswith(chr(96)) or candidate.endswith(chr(96)):
+    if not candidate or _is_inline_code_line(candidate):
         return None
-    candidate = re.sub(r"^(?:\\-|-|•)\s+", "", candidate, count=1)
-    if not candidate or candidate.startswith(chr(96)) or candidate.endswith(chr(96)):
-        return None
+    if _parse_button_row(candidate):
+        return candidate
+
+    if candidate.startswith(r"\-"):
+        candidate = re.sub(r"^\\-\s+", "", candidate, count=1)
+        if not candidate:
+            return None
+
     if r"\(" not in candidate and r"\)" not in candidate:
-        if candidate == line.strip():
-            return candidate if _parse_button_row(candidate) else None
         return _parse_button_row(candidate) and candidate or None
+
     normalized = candidate.replace(r"\(", "(").replace(r"\)", ")")
-    return normalized if _parse_button_row(normalized) else None
+    parsed = _parse_button_row(normalized)
+    if not parsed:
+        return None
+    if any(button.kind != "action" for row in parsed for button in row):
+        return None
+    return normalized
+
+
+def _is_inline_code_line(line: str) -> bool:
+    return len(line) >= 2 and line.startswith("`") and line.endswith("`") and not line.startswith("```")
 
 
 def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseButton]]]:
     """Remove standalone button rows and return their platform-neutral description."""
     source = text or ""
-    if r"\n" in source:
-        source = source.replace(r"\r\n", "\n").replace(r"\n", "\n")
     clean_lines: list[str] = []
     rows: list[list[ResponseButton]] = []
     fenced_code_marker: str | None = None
@@ -293,8 +304,11 @@ def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseB
         if fenced_code_marker is not None:
             clean_lines.append(line)
             continue
+        if _is_inline_code_line(stripped_line):
+            clean_lines.append(line)
+            continue
         normalized_line = _normalize_button_declaration_line(line)
-        parsed = _parse_button_row(normalized_line or line) if len(rows) < MAX_BUTTON_ROWS else None
+        parsed = _parse_button_row(normalized_line) if normalized_line is not None and len(rows) < MAX_BUTTON_ROWS else None
         if parsed and len(rows) + len(parsed) <= MAX_BUTTON_ROWS:
             rows.extend(parsed)
         else:

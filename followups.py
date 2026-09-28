@@ -29,12 +29,12 @@ from database import (
     async_session_maker,
 )
 from automation_events import condition_value_matches, resolve_condition_path
+from canonical_content import canonical_markup_to_html, split_canonical_html
 from memory_mode import MEMORY_MODE_GLOBAL, get_memory_mode
 from response_buttons import ResponseButton, extract_response_buttons
 from user_metadata import extract_service_data, load_metadata
 from translation_service import refresh_translation_cache, resolve_user_effective_locale, translate
 from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
-from max_messenger_bot.formatting import markdown_to_html as max_markdown_to_html, split_text as max_split_text
 from max_messenger_bot.keyboards import response_buttons_keyboard as max_response_buttons_keyboard
 from max_messenger_bot.models import extract_sent_message_id
 
@@ -537,7 +537,7 @@ async def emit_followup_step(
         from max_messenger_bot.formatting import translate_telegram_links_to_max
 
         display_text = translate_telegram_links_to_max(send_result.history_text or send_result.text)
-        chunks = max_split_text(max_markdown_to_html(display_text))
+        chunks = split_canonical_html(canonical_markup_to_html(display_text), max_length=3900)
         attachments = max_response_buttons_keyboard(send_result.response_button_rows or []) if send_result.response_button_rows else None
         sent = None
         for index, chunk in enumerate(chunks):
@@ -564,11 +564,11 @@ async def emit_followup_step(
 
         await _send_generated_response(bot, user.id, send_result.raw_text or send_result.text)
         return send_result
-    from handlers import _telegram_response_buttons_markup, markdown_to_html, split_html_text
+    from handlers import _telegram_response_buttons_markup
 
     reply_markup = _telegram_response_buttons_markup(send_result.response_button_rows or [])
     visible_text = send_result.history_text or "Выберите действие:"
-    chunks = split_html_text(markdown_to_html(visible_text))
+    chunks = split_canonical_html(canonical_markup_to_html(visible_text))
     sent = None
     for index, chunk in enumerate(chunks):
         chunk_markup = reply_markup if index == len(chunks) - 1 else None

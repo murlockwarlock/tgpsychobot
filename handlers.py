@@ -16852,14 +16852,14 @@ async def admin_process_mailing_content(message: Message, state: FSMContext, bot
         current_media_id = message.photo[-1].file_id
         current_media_type = 'photo'
         if message.caption:
-            current_text = message.html_text
+            current_text = message.html_text or message.caption
     elif message.video:
         current_media_id = message.video.file_id
         current_media_type = 'video'
         if message.caption:
-            current_text = message.html_text
+            current_text = message.html_text or message.caption
     elif message.text:
-        current_text = message.html_text
+        current_text = message.html_text or message.text
 
     # For birthday templates, sending media without caption should not block the template flow.
     if audience == "birthday_today" and current_media_id and not current_text and data.get("authoring_locale", "ru") == "ru":
