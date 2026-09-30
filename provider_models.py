@@ -3,7 +3,7 @@ from hashlib import sha256
 from hmac import compare_digest
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 import httpx
 
 
@@ -175,7 +175,20 @@ class PerplexityCatalogState:
 
 _current_perplexity_catalog_state: PerplexityCatalogState | None = None
 _previous_generation_perplexity_models: tuple[str, ...] = ()
+_previous_generation_created_at: float = 0.0
 PERPLEXITY_CATALOG_TTL_SECONDS = 3600.0
+PERPLEXITY_GENERATION_RETENTION_SECONDS = 300.0
+
+_perplexity_monotonic_time_provider: Callable[[], float] = time.monotonic
+
+
+def _get_perplexity_monotonic_time() -> float:
+    return _perplexity_monotonic_time_provider()
+
+
+def set_perplexity_monotonic_time_provider(provider: Callable[[], float] | None = None) -> None:
+    global _perplexity_monotonic_time_provider
+    _perplexity_monotonic_time_provider = provider if provider is not None else time.monotonic
 
 
 def is_perplexity_preset(model: str | None) -> bool:
@@ -185,25 +198,37 @@ def is_perplexity_preset(model: str | None) -> bool:
 
 
 def get_perplexity_catalog_state() -> PerplexityCatalogState:
-    """Return current synchronous in-memory catalog state without network I/O."""
+    """Return current synchronous in-memory catalog state with dynamic TTL freshness without network I/O."""
     global _current_perplexity_catalog_state
+    now = _get_perplexity_monotonic_time()
     if _current_perplexity_catalog_state is None:
-        _current_perplexity_catalog_state = PerplexityCatalogState(
+        return PerplexityCatalogState(
             models=PERPLEXITY_STATIC_DIRECT_MODELS,
             source="static_fallback",
             is_fresh=False,
             is_authoritative=False,
             fetched_at=0.0,
         )
-    return _current_perplexity_catalog_state
+    state = _current_perplexity_catalog_state
+    if state.source in ("live", "stale_live"):
+        is_fresh = (now - state.fetched_at) < PERPLEXITY_CATALOG_TTL_SECONDS
+        is_authoritative = is_fresh
+        effective_source = "live" if is_fresh else "stale_live"
+        return PerplexityCatalogState(
+            models=state.models,
+            source=effective_source,
+            is_fresh=is_fresh,
+            is_authoritative=is_authoritative,
+            fetched_at=state.fetched_at,
+        )
+    return state
 
 
 def get_perplexity_selectable_models(
     *,
     include_presets: bool = True,
-    include_stale_generations: bool = False,
 ) -> tuple[str, ...]:
-    """Return selectable Perplexity models for registry and callback resolution."""
+    """Return active selectable Perplexity models for visible UI and persistence."""
     state = get_perplexity_catalog_state()
     items: list[str] = []
     if include_presets:
@@ -211,14 +236,39 @@ def get_perplexity_selectable_models(
     for m in state.models:
         if m not in items:
             items.append(m)
-    if include_stale_generations:
+    return tuple(items)
+
+
+def get_perplexity_callback_resolution_models(channel: str = "chat") -> tuple[str, ...]:
+    """Return model candidates for decoding already-rendered Perplexity callbacks.
+
+    Contains active models + unexpired previous generation models + static fallback models.
+    These candidates are strictly used for callback decoding and are NEVER exposed as selectable models.
+    """
+    now = _get_perplexity_monotonic_time()
+    items: list[str] = list(PERPLEXITY_MODES)
+    state = get_perplexity_catalog_state()
+    for m in state.models:
+        if m not in items:
+            items.append(m)
+    global _previous_generation_perplexity_models, _previous_generation_created_at
+    if (now - _previous_generation_created_at) < PERPLEXITY_GENERATION_RETENTION_SECONDS:
         for m in _previous_generation_perplexity_models:
             if m not in items:
                 items.append(m)
-        for m in PERPLEXITY_STATIC_DIRECT_MODELS:
-            if m not in items:
-                items.append(m)
+    for m in PERPLEXITY_STATIC_DIRECT_MODELS:
+        if m not in items:
+            items.append(m)
     return tuple(items)
+
+
+def get_callback_resolution_models(provider: str | None, channel: str = "chat") -> tuple[str, ...]:
+    """Return model candidates for callback resolution (supports bounded retention)."""
+    p_name = _canonical_provider_name(provider)
+    channel_name = (channel or "chat").strip().lower()
+    if p_name == PROVIDER_PERPLEXITY:
+        return get_perplexity_callback_resolution_models(channel=channel_name)
+    return get_selectable_models(p_name, channel=channel_name)
 
 
 async def refresh_perplexity_catalog(
@@ -227,10 +277,10 @@ async def refresh_perplexity_catalog(
     http_client: Any | None = None,
 ) -> PerplexityCatalogState:
     """Async refresh of Perplexity catalog via GET /v1/models (no auth required)."""
-    global _current_perplexity_catalog_state, _previous_generation_perplexity_models
-    now = time.monotonic()
+    global _current_perplexity_catalog_state, _previous_generation_perplexity_models, _previous_generation_created_at
+    now = _get_perplexity_monotonic_time()
     current = get_perplexity_catalog_state()
-    if not force and current.source == "live" and (now - current.fetched_at < PERPLEXITY_CATALOG_TTL_SECONDS):
+    if not force and current.source == "live" and current.is_fresh:
         return current
 
     endpoint = "https://api.perplexity.ai/v1/models"
@@ -261,8 +311,9 @@ async def refresh_perplexity_catalog(
                     parsed_models.append(model_id)
             if parsed_models:
                 parsed_models.sort()
-                if current.models:
+                if current.models and current.models != tuple(parsed_models):
                     _previous_generation_perplexity_models = current.models
+                    _previous_generation_created_at = now
                 _current_perplexity_catalog_state = PerplexityCatalogState(
                     models=tuple(parsed_models),
                     source="live",
@@ -292,6 +343,15 @@ async def refresh_perplexity_catalog(
             fetched_at=0.0,
         )
     return _current_perplexity_catalog_state
+
+
+def reset_perplexity_catalog_state_for_tests() -> None:
+    """Reset catalog state, retention, and time provider for deterministic testing."""
+    global _current_perplexity_catalog_state, _previous_generation_perplexity_models, _previous_generation_created_at
+    _current_perplexity_catalog_state = None
+    _previous_generation_perplexity_models = ()
+    _previous_generation_created_at = 0.0
+    set_perplexity_monotonic_time_provider(None)
 
 
 def get_perplexity_model_label(model_id: str) -> str:
@@ -667,7 +727,7 @@ def resolve_telegram_model_callback(callback_data: str | None) -> tuple[str, str
     digest = match.group(1)
 
     for provider in (*ALL_PROVIDERS, PROVIDER_DEEPGRAM):
-        for model in get_selectable_models(provider, channel=channel):
+        for model in get_callback_resolution_models(provider, channel=channel):
             expected = _telegram_model_callback_digest(channel, provider, model)
             if compare_digest(digest, expected):
                 return provider, channel, model
@@ -781,7 +841,7 @@ def get_selectable_models(provider: str | None, channel: str = "chat") -> tuple[
     p_name = _canonical_provider_name(provider)
     channel_name = (channel or "chat").strip().lower()
     if p_name == PROVIDER_PERPLEXITY:
-        return get_perplexity_selectable_models(include_presets=True, include_stale_generations=True)
+        return get_perplexity_selectable_models(include_presets=True)
     catalog = _SELECTABLE_MODEL_CATALOGS.get(channel_name, SELECTABLE_CHAT_MODELS)
     return catalog.get(p_name, ())
 

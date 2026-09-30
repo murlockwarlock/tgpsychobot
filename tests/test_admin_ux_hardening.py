@@ -1216,6 +1216,7 @@ async def test_telegram_ai_visible_button_contracts_use_complete_dispatcher_jour
     from provider_models import (
         ALL_PROVIDERS,
         PROVIDER_DEEPGRAM,
+        PROVIDER_PERPLEXITY,
         resolve_telegram_model_callback,
     )
 
@@ -1348,17 +1349,30 @@ async def test_telegram_ai_visible_button_contracts_use_complete_dispatcher_jour
             assert config.provider == "Deepseek"
         api_key_passes += 1
 
-        model_picker = await press(f"view_provider_models_{provider}", "Выберите модель")
-        model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "⬅️ Назад")
-        detail = await press(model_back, "Параметры модели" if provider != PROVIDER_DEEPGRAM else provider)
-        nested_back_contracts["provider_model_picker"][0] += 1
-        model_picker = await press(f"view_provider_models_{provider}", "Выберите модель")
-        model_button = next(button for button in _ai_callback_buttons(model_picker.reply_markup) if button.callback_data.startswith("ai_m_"))
-        resolved = resolve_telegram_model_callback(model_button.callback_data)
-        assert resolved and resolved[0] == provider
-        detail = await press(model_button.callback_data, "Провайдер:")
-        assert resolved[2] in detail.text
-        model_picker_passes += 1
+        if provider == PROVIDER_PERPLEXITY:
+            model_picker = await press("ai_ppx_models:0", "Прямые модели Perplexity")
+            model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "К настройкам")
+            detail = await press(model_back, "Параметры модели")
+            nested_back_contracts["provider_model_picker"][0] += 1
+            model_picker = await press("ai_ppx_models:0", "Прямые модели Perplexity")
+            model_button = next(button for button in _ai_callback_buttons(model_picker.reply_markup) if button.callback_data.startswith("ai_m_"))
+            resolved = resolve_telegram_model_callback(model_button.callback_data)
+            assert resolved and resolved[0] == provider
+            detail = await press(model_button.callback_data, "Провайдер:")
+            assert resolved[2] in detail.text
+            model_picker_passes += 1
+        else:
+            model_picker = await press(f"view_provider_models_{provider}", "Выберите модель")
+            model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "⬅️ Назад")
+            detail = await press(model_back, "Параметры модели" if provider != PROVIDER_DEEPGRAM else provider)
+            nested_back_contracts["provider_model_picker"][0] += 1
+            model_picker = await press(f"view_provider_models_{provider}", "Выберите модель")
+            model_button = next(button for button in _ai_callback_buttons(model_picker.reply_markup) if button.callback_data.startswith("ai_m_"))
+            resolved = resolve_telegram_model_callback(model_button.callback_data)
+            assert resolved and resolved[0] == provider
+            detail = await press(model_button.callback_data, "Провайдер:")
+            assert resolved[2] in detail.text
+            model_picker_passes += 1
 
         if provider != PROVIDER_DEEPGRAM:
             max_button = next(button for button in _ai_callback_buttons(detail.reply_markup) if button.callback_data == f"model_setting_max_tokens_{provider}")
@@ -1421,21 +1435,38 @@ async def test_telegram_ai_visible_button_contracts_use_complete_dispatcher_jour
     fallback_provider_buttons = [button for button in _ai_callback_buttons(fallback_picker.reply_markup) if button.callback_data.startswith("admin_ai_fallback_set_provider_")]
     assert fallback_provider_buttons
     for provider_button in fallback_provider_buttons:
+        provider = provider_button.callback_data.replace("admin_ai_fallback_set_provider_", "")
         fallback = await press(provider_button.callback_data, "Резерв текста")
         model_picker = await press("admin_ai_fallback_model", "Выберите модель")
-        model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "⬅️ Назад")
-        fallback = await press(model_back, "Резерв текста")
-        nested_back_contracts["text_fallback"][0] += 1
-        model_picker = await press("admin_ai_fallback_model", "Выберите модель")
-        model_button = next(button for button in _ai_callback_buttons(model_picker.reply_markup) if button.callback_data.startswith("ai_m_"))
-        fallback = await press(model_button.callback_data, "Резерв текста")
+        if provider == PROVIDER_PERPLEXITY:
+            model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "⬅️ Назад")
+            fallback = await press(model_back, "Резерв текста")
+            nested_back_contracts["text_fallback"][0] += 1
+            model_picker = await press("admin_ai_fallback_model", "Выберите модель")
+            presets_screen = await press("ai_ppx_fb_presets", "Пресеты")
+            model_button = next(button for button in _ai_callback_buttons(presets_screen.reply_markup) if button.callback_data.startswith("ai_m_"))
+            fallback = await press(model_button.callback_data, "Резерв текста")
+        else:
+            model_back = next(button.callback_data for button in _ai_callback_buttons(model_picker.reply_markup) if button.text == "⬅️ Назад")
+            fallback = await press(model_back, "Резерв текста")
+            nested_back_contracts["text_fallback"][0] += 1
+            model_picker = await press("admin_ai_fallback_model", "Выберите модель")
+            model_button = next(button for button in _ai_callback_buttons(model_picker.reply_markup) if button.callback_data.startswith("ai_m_"))
+            fallback = await press(model_button.callback_data, "Резерв текста")
         await return_to_keys()
         fallback = await press("admin_ai_text_fallback", "Резерв текста")
         fallback_picker = await press("admin_ai_fallback_provider", "провайдера")
     fallback = await press(fallback_provider_buttons[-1].callback_data, "Резерв текста")
-    await press("admin_ai_fallback_model", "Выберите модель")
-    model_button = next(button for button in _ai_callback_buttons(current_markup) if button.callback_data.startswith("ai_m_"))
-    fallback = await press(model_button.callback_data, "Резерв текста")
+    last_provider = fallback_provider_buttons[-1].callback_data.replace("admin_ai_fallback_set_provider_", "")
+    if last_provider == PROVIDER_PERPLEXITY:
+        await press("admin_ai_fallback_model", "Выберите модель")
+        await press("ai_ppx_fb_presets", "Пресеты")
+        model_button = next(button for button in _ai_callback_buttons(current_markup) if button.callback_data.startswith("ai_m_"))
+        fallback = await press(model_button.callback_data, "Резерв текста")
+    else:
+        await press("admin_ai_fallback_model", "Выберите модель")
+        model_button = next(button for button in _ai_callback_buttons(current_markup) if button.callback_data.startswith("ai_m_"))
+        fallback = await press(model_button.callback_data, "Резерв текста")
     fallback = await press("admin_ai_fallback_toggle", "Резерв текста")
     fallback = await press("admin_ai_fallback_toggle", "Резерв текста")
     await return_to_keys()

@@ -122,8 +122,11 @@ def test_openrouter_response_and_perplexity_citations_are_safe():
     assert "secret" not in repr(capture)
 
     payload = {
-        "output_text": "Ответ [1]",
-        "output": [{"type": "search_results", "results": [{"title": "Источник", "url": "https://example.com"}]}],
+        "status": "completed",
+        "output": [
+            {"type": "search_results", "results": [{"title": "Источник", "url": "https://example.com"}]},
+            {"type": "message", "role": "assistant", "status": "completed", "content": "Ответ [1]"},
+        ],
     }
     assert "Источники:" in format_perplexity_response(payload)
     assert "https://example.com" in format_perplexity_response(payload)

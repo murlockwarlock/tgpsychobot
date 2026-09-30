@@ -94,6 +94,7 @@ def _classify_max_callback(payload):
         "admin_ai_common",
         "admin_ai_provider_models_",
         "admin_ai_ppx_",
+        "admin_ai_fb_ppx_",
     )
     mutation = (
         "admin_ai_key_",
@@ -411,26 +412,46 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
         )
         model_picker = await press(provider_button["payload"], provider_picker.get("attachments", []))
         classify_visible(model_picker.get("attachments"))
-        model_buttons = [
-            item
-            for item in _max_buttons(model_picker.get("attachments"))
-            if item["payload"].startswith(f"admin_ai_save_fallback_{expected_provider}_")
-        ]
-        assert model_buttons
-        model_back = next(item for item in _max_buttons(model_picker.get("attachments")) if item["payload"] == "admin_ai_text_fallback")
-        fallback = await press(model_back["payload"], model_picker.get("attachments", []))
-        assert "Резерв текста" in fallback["text"]
-        journey_counts["text_fallback_model_back"] += 1
-        model_picker = await press("admin_ai_fallback_model", fallback.get("attachments", []))
-        classify_visible(model_picker.get("attachments"))
-        model_buttons = [
-            item
-            for item in _max_buttons(model_picker.get("attachments"))
-            if item["payload"].startswith(f"admin_ai_save_fallback_{expected_provider}_")
-        ]
-        selected_model_button = model_buttons[-1]
-        selected_fallback_model = selected_model_button["payload"].replace(f"admin_ai_save_fallback_{expected_provider}_", "", 1)
-        fallback = await press(selected_model_button["payload"], model_picker.get("attachments", []))
+        if expected_provider == "Perplexity":
+            category_picker = model_picker
+            model_back = next(item for item in _max_buttons(category_picker.get("attachments")) if item["payload"] == "admin_ai_text_fallback")
+            fallback = await press(model_back["payload"], category_picker.get("attachments", []))
+            assert "Резерв текста" in fallback["text"]
+            journey_counts["text_fallback_model_back"] += 1
+            category_picker = await press("admin_ai_fallback_model", fallback.get("attachments", []))
+            classify_visible(category_picker.get("attachments"))
+            presets_screen = await press("admin_ai_fb_ppx_presets", category_picker.get("attachments", []))
+            classify_visible(presets_screen.get("attachments"))
+            model_buttons = [
+                item
+                for item in _max_buttons(presets_screen.get("attachments"))
+                if item["payload"].startswith(f"admin_ai_save_fallback_{expected_provider}_")
+            ]
+            assert model_buttons
+            selected_model_button = model_buttons[-1]
+            selected_fallback_model = selected_model_button["payload"].replace(f"admin_ai_save_fallback_{expected_provider}_", "", 1)
+            fallback = await press(selected_model_button["payload"], presets_screen.get("attachments", []))
+        else:
+            model_buttons = [
+                item
+                for item in _max_buttons(model_picker.get("attachments"))
+                if item["payload"].startswith(f"admin_ai_save_fallback_{expected_provider}_")
+            ]
+            assert model_buttons
+            model_back = next(item for item in _max_buttons(model_picker.get("attachments")) if item["payload"] == "admin_ai_text_fallback")
+            fallback = await press(model_back["payload"], model_picker.get("attachments", []))
+            assert "Резерв текста" in fallback["text"]
+            journey_counts["text_fallback_model_back"] += 1
+            model_picker = await press("admin_ai_fallback_model", fallback.get("attachments", []))
+            classify_visible(model_picker.get("attachments"))
+            model_buttons = [
+                item
+                for item in _max_buttons(model_picker.get("attachments"))
+                if item["payload"].startswith(f"admin_ai_save_fallback_{expected_provider}_")
+            ]
+            selected_model_button = model_buttons[-1]
+            selected_fallback_model = selected_model_button["payload"].replace(f"admin_ai_save_fallback_{expected_provider}_", "", 1)
+            fallback = await press(selected_model_button["payload"], model_picker.get("attachments", []))
         classify_visible(fallback.get("attachments"))
         if "Включён" in fallback["text"]:
             fallback = await press("admin_ai_fallback_toggle", fallback.get("attachments", []))
