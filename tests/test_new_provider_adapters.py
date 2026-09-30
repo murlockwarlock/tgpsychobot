@@ -209,6 +209,7 @@ def test_provider_errors_are_normalized_and_retries_are_bounded():
     assert normalize_provider_error_classification("server_error") == "provider_5xx"
     assert normalize_provider_error_classification("network") == "network_connection"
     assert normalize_provider_error_classification("invalid_model") == "configuration"
+    assert normalize_provider_error_classification("output_budget_exhausted") == "output_budget_exhausted"
 
 
 def test_new_provider_activity_tracker_marks_only_once():

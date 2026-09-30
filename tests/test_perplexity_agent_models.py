@@ -50,6 +50,7 @@ from provider_adapters import (
     build_perplexity_payload,
     call_perplexity,
     format_perplexity_response,
+    normalize_provider_error_classification,
     set_perplexity_jitter_provider,
 )
 import provider_models
@@ -639,6 +640,30 @@ async def test_429_retry_policy_rate_limit_vs_quota():
     assert capture_a["is_retryable"] is True
     assert capture_a["will_retry"] is False
 
+    # Case A2: 429 rate_limit + Retry-After (4.5s) exceeds remaining deadline (1.0s) -> NO RETRY
+    attempts_a2 = 0
+    def mock_rate_limit_deadline(request):
+        nonlocal attempts_a2
+        attempts_a2 += 1
+        return httpx.Response(
+            429,
+            headers={"retry-after": "4.5"},
+            json={"error": {"type": "rate_limit", "code": 429, "message": "Rate limit exceeded"}},
+        )
+
+    capture_a2 = {}
+    with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_rate_limit_deadline))), \
+         patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(ProviderAdapterError) as exc_info_a2:
+            await _post_perplexity_json(url, headers=headers, payload=payload, timeout=1.0, request_capture=capture_a2, max_attempts=2)
+        assert exc_info_a2.value.category == "rate_limit"
+
+    assert attempts_a2 == 1, "429 with Retry-After exceeding deadline must NOT trigger second attempt"
+    assert capture_a2["attempt_count"] == 1
+    assert capture_a2["classification"] == "rate_limit"
+    assert capture_a2["is_retryable"] is True
+    assert capture_a2["will_retry"] is False
+
     # Case B: 429 + "insufficient_quota" -> classification = insufficient_balance_quota, attempts = 1 (NO RETRY)
     attempts_b = 0
     def mock_quota(request):
@@ -689,6 +714,26 @@ async def test_429_retry_policy_rate_limit_vs_quota():
     assert capture_c["classification"] == "timeout"
     assert capture_c["is_retryable"] is True
     assert capture_c["will_retry"] is False
+
+    # Case C2: ConnectTimeout where computed backoff exceeds remaining deadline -> NO RETRY
+    attempts_c2 = 0
+    def mock_connect_deadline(request):
+        nonlocal attempts_c2
+        attempts_c2 += 1
+        raise httpx.ConnectTimeout("Connect timeout")
+
+    capture_c2 = {}
+    with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_connect_deadline))), \
+         patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(ProviderAdapterError) as exc_info_c2:
+            await _post_perplexity_json(url, headers=headers, payload=payload, timeout=0.2, request_capture=capture_c2, max_attempts=2)
+        assert exc_info_c2.value.category == "timeout"
+
+    assert attempts_c2 == 1, "ConnectTimeout with delay exceeding deadline must NOT trigger second attempt"
+    assert capture_c2["attempt_count"] == 1
+    assert capture_c2["classification"] == "timeout"
+    assert capture_c2["is_retryable"] is True
+    assert capture_c2["will_retry"] is False
 
     # Case D: ReadTimeout -> uncertain post-dispatch (attempts = 1, NO RETRY)
     attempts_d = 0
@@ -746,6 +791,87 @@ async def test_429_retry_policy_rate_limit_vs_quota():
     assert capture_success["classification"] == "success"
     assert capture_success["is_retryable"] is False
     assert capture_success["will_retry"] is False
+
+    # Case G: HTTP 500 provider_5xx retry (attempts = 2)
+    attempts_g = 0
+    snapshot_500_1 = {}
+    def mock_500(request):
+        nonlocal attempts_g
+        attempts_g += 1
+        return httpx.Response(
+            500,
+            headers={"retry-after": "0"},
+            json={"error": {"message": "Internal Server Error"}},
+        )
+
+    async def mock_sleep_g(delay):
+        nonlocal snapshot_500_1
+        snapshot_500_1 = dict(capture_g)
+
+    capture_g = {}
+    with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_500))), \
+         patch("asyncio.sleep", mock_sleep_g):
+        with pytest.raises(ProviderAdapterError) as exc_info_g:
+            await _post_perplexity_json(url, headers=headers, payload=payload, timeout=5.0, request_capture=capture_g, max_attempts=2)
+        assert exc_info_g.value.category == "provider_5xx"
+
+    assert attempts_g == 2, "Real HTTP 500 must be retried up to max_attempts=2"
+    # First attempt snapshot
+    assert snapshot_500_1["attempt_count"] == 1
+    assert snapshot_500_1["classification"] == "provider_5xx"
+    assert snapshot_500_1["is_retryable"] is True
+    assert snapshot_500_1["will_retry"] is True
+    # Final exhausted attempt
+    assert capture_g["attempt_count"] == 2
+    assert capture_g["classification"] == "provider_5xx"
+    assert capture_g["is_retryable"] is True
+    assert capture_g["will_retry"] is False
+
+    # Case H: HTTP 403 auth (attempts = 1, NO RETRY)
+    attempts_h = 0
+    def mock_403(request):
+        nonlocal attempts_h
+        attempts_h += 1
+        return httpx.Response(
+            403,
+            json={"error": {"type": "authentication_error", "message": "Access forbidden: invalid account permissions"}},
+        )
+
+    capture_h = {}
+    with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_403))), \
+         patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(ProviderAdapterError) as exc_info_h:
+            await _post_perplexity_json(url, headers=headers, payload=payload, timeout=5.0, request_capture=capture_h, max_attempts=2)
+        assert exc_info_h.value.category == "auth"
+
+    assert attempts_h == 1, "HTTP 403 auth MUST NOT be retried"
+    assert capture_h["attempt_count"] == 1
+    assert capture_h["classification"] == "auth"
+    assert capture_h["is_retryable"] is False
+    assert capture_h["will_retry"] is False
+
+    # Case I: HTTP 400 configuration (attempts = 1, NO RETRY)
+    attempts_i = 0
+    def mock_400(request):
+        nonlocal attempts_i
+        attempts_i += 1
+        return httpx.Response(
+            400,
+            json={"error": {"type": "invalid_request_error", "message": "Invalid model: model not found"}},
+        )
+
+    capture_i = {}
+    with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_400))), \
+         patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(ProviderAdapterError) as exc_info_i:
+            await _post_perplexity_json(url, headers=headers, payload=payload, timeout=5.0, request_capture=capture_i, max_attempts=2)
+        assert exc_info_i.value.category == "configuration"
+
+    assert attempts_i == 1, "HTTP 400 invalid_request MUST NOT be retried"
+    assert capture_i["attempt_count"] == 1
+    assert capture_i["classification"] == "configuration"
+    assert capture_i["is_retryable"] is False
+    assert capture_i["will_retry"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -939,47 +1065,209 @@ def test_strict_agent_response_success_contract():
     assert text == "Clean output text"
 
 
+def test_agent_status_incomplete_distinguishes_output_budget_exhaustion():
+    """Verify Perplexity Agent status="incomplete" handling:
+    - reason="max_output_tokens" maps to output_budget_exhausted category
+    - unknown/missing reason maps to invalid_response category
+    - normalize_provider_error_classification preserves output_budget_exhausted
+    """
+    # Case A: status="incomplete", incomplete_details.reason="max_output_tokens"
+    capture_a = {}
+    with pytest.raises(ProviderAdapterError) as exc_a:
+        _extract_perplexity_text(
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+            request_capture=capture_a,
+        )
+    assert exc_a.value.category == "output_budget_exhausted"
+    assert capture_a["response_status"] == "incomplete"
+    assert capture_a["classification"] == "output_budget_exhausted"
+    assert capture_a["is_retryable"] is False
+    assert capture_a["will_retry"] is False
+    assert capture_a["incomplete_reason"] == "max_output_tokens"
+
+    # Case B: status="incomplete", incomplete_details.reason="unknown_reason"
+    capture_b = {}
+    with pytest.raises(ProviderAdapterError) as exc_b:
+        _extract_perplexity_text(
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "unknown_reason"},
+            },
+            request_capture=capture_b,
+        )
+    assert exc_b.value.category == "invalid_response"
+    assert capture_b["response_status"] == "incomplete"
+    assert capture_b["classification"] == "invalid_response"
+    assert capture_b["is_retryable"] is False
+    assert capture_b["will_retry"] is False
+
+    # Case C: normalize_provider_error_classification preservation
+    assert normalize_provider_error_classification("output_budget_exhausted") == "output_budget_exhausted"
+
+
 # ---------------------------------------------------------------------------
-# 10. Citation Identity & Deduplication
+# 10. Canonical Agent Search Results & Citation Deduplication
 # ---------------------------------------------------------------------------
 
 def test_citation_identity_and_deduplication():
-    """Verify consistent citation mapping: deduplicated URLs and atomically resolved inline markers."""
+    """Verify canonical Agent API search_results citation mapping:
+    - deduplicated URLs (scheme, host, default port, non-root trailing slash)
+    - stable sequential 1-based footer IDs ([1], [2])
+    - upstream result IDs do NOT appear as user-facing citation numbers
+    - inline [1], [2] still correspond to footer entries
+    - no duplicate footer rows
+    """
     payload = {
         "status": "completed",
         "output": [
             {
-                "type": "tool_call",
-                "tool_name": "web_search",
+                "type": "search_results",
+                "queries": ["example query"],
                 "results": [
-                    {"id": "web:1", "title": "Perplexity API Docs", "url": "https://docs.perplexity.ai"},
-                    {"id": "web:2", "title": "Perplexity API Mirror", "url": "https://docs.perplexity.ai"},  # DUPLICATE URL!
-                    {"id": "web:3", "title": "Anthropic Models", "url": "https://docs.anthropic.com"},
+                    {
+                        "id": "arbitrary-provider-id-A",
+                        "title": "Guide",
+                        "url": "https://Example.com/guide/",
+                        "snippet": "...",
+                    },
+                    {
+                        "id": "arbitrary-provider-id-B",
+                        "title": "Guide duplicate",
+                        "url": "https://example.com/guide",
+                        "snippet": "...",
+                    },
+                    {
+                        "id": "another-provider-id",
+                        "title": "Second Source",
+                        "url": "https://example.org/article",
+                        "snippet": "...",
+                    },
                 ],
             },
             {
                 "type": "message",
                 "role": "assistant",
                 "status": "completed",
-                "content": "According to docs [web:1] and mirror [web:2], and also Anthropic [web:3].",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "First claim [1]. Second claim [2].",
+                    }
+                ],
             },
         ],
     }
 
     result = format_perplexity_response(payload)
 
-    # 1. Duplicate URL must not produce duplicate entries in footer
-    assert result.count("https://docs.perplexity.ai") == 1
-    assert result.count("https://docs.anthropic.com") == 1
+    # 1. Duplicate URL variants produce one source
+    assert result.count("https://example.com/guide") == 1
+    assert result.count("https://example.org/article") == 1
 
-    # 2. Duplicate marker [web:2] in text must resolve to the single canonical entry [web:1]
-    assert "[web:1]" in result
-    assert "[web:2]" not in result, "[web:2] pointing to duplicate URL must be normalized to canonical [web:1]"
-    assert "[web:3]" in result
+    # 2. Footer IDs are sequential integers
+    assert "[1] Guide — https://example.com/guide" in result
+    assert "[2] Second Source — https://example.org/article" in result
 
-    # 3. Footer entries match inline markers
-    assert "[web:1] Perplexity API Docs — https://docs.perplexity.ai" in result
-    assert "[web:3] Anthropic Models — https://docs.anthropic.com" in result
+    # 3. Arbitrary upstream result IDs do NOT appear as user-facing citation numbers
+    assert "arbitrary-provider-id-A" not in result
+    assert "arbitrary-provider-id-B" not in result
+    assert "another-provider-id" not in result
+
+    # 4. Inline [1], [2] still correspond to footer entries
+    assert "First claim [1]. Second claim [2]." in result
+
+    # 5. No duplicate footer rows
+    footer_section = result.split("Источники:\n", 1)[1]
+    footer_lines = [line.strip() for line in footer_section.strip().splitlines() if line.strip()]
+    assert len(footer_lines) == 2
+    assert footer_lines[0] == "[1] Guide — https://example.com/guide"
+    assert footer_lines[1] == "[2] Second Source — https://example.org/article"
+
+
+def test_citation_upstream_id_and_web_marker_alias_resolution():
+    """Verify upstream result IDs and web:N markers in text are resolved to sequential display IDs."""
+    payload = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "search_results",
+                "queries": ["example query"],
+                "results": [
+                    {
+                        "id": "arbitrary-provider-id-A",
+                        "title": "Guide",
+                        "url": "https://Example.com/guide/",
+                    },
+                    {
+                        "id": "another-provider-id",
+                        "title": "Second Source",
+                        "url": "https://example.org/article",
+                    },
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": "Using upstream IDs: [arbitrary-provider-id-A] and [another-provider-id].",
+            },
+        ],
+    }
+    result = format_perplexity_response(payload)
+    assert "Using upstream IDs: [1] and [2]." in result
+    assert "[1] Guide — https://example.com/guide" in result
+    assert "[2] Second Source — https://example.org/article" in result
+
+
+def test_citation_legacy_compatibility_fallbacks():
+    """Verify legacy compatibility fallbacks when canonical search_results are absent:
+    1. tool_call fallback (legacy compatibility only)
+    2. top-level citations fallback (legacy compatibility only)
+    """
+    # Fallback 1: tool_call (legacy compatibility only)
+    payload_tool_call = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "tool_call",
+                "tool_name": "web_search",
+                "results": [
+                    {"id": "web:1", "title": "Legacy Tool Doc", "url": "https://docs.legacy.ai"},
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": "From legacy tool [web:1].",
+            },
+        ],
+    }
+    result_tool = format_perplexity_response(payload_tool_call)
+    assert "[1] Legacy Tool Doc — https://docs.legacy.ai" in result_tool
+    assert "From legacy tool [1]." in result_tool
+
+    # Fallback 2: top-level citations (legacy compatibility only)
+    payload_top_level = {
+        "status": "completed",
+        "citations": [
+            "https://docs.legacy-top.ai/page",
+        ],
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": "From top-level citation [1].",
+            },
+        ],
+    }
+    result_top = format_perplexity_response(payload_top_level)
+    assert "[1] https://docs.legacy-top.ai/page — https://docs.legacy-top.ai/page" in result_top
+    assert "From top-level citation [1]." in result_top
 
 
 # ---------------------------------------------------------------------------

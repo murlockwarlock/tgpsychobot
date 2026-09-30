@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -54,6 +54,7 @@ _ADAPTER_CLASSIFICATION_MAP = {
     "malformed_response": "invalid_response",
     "invalid_response": "invalid_response",
     "empty_response": "empty_response",
+    "output_budget_exhausted": "output_budget_exhausted",
     "provider": "unknown",
     "unknown": "unknown",
 }
@@ -366,6 +367,9 @@ def _populate_perplexity_diagnostics(
         request_capture["usage"] = payload["usage"]
     if payload.get("cost") is not None:
         request_capture["cost"] = payload["cost"]
+    incomplete_details = payload.get("incomplete_details")
+    if isinstance(incomplete_details, dict) and incomplete_details.get("reason"):
+        request_capture["incomplete_reason"] = str(incomplete_details["reason"])
 
     err = error_dict or (payload.get("error") if isinstance(payload.get("error"), dict) else None)
     if isinstance(err, dict):
@@ -406,15 +410,25 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
         )
         raise ProviderAdapterError(f"Perplexity статус failed: {msg}", category=cat)
     if normalized_status == "incomplete":
+        incomplete_details = payload.get("incomplete_details") if isinstance(payload.get("incomplete_details"), dict) else {}
+        reason = incomplete_details.get("reason")
+        if reason == "max_output_tokens":
+            cat = "output_budget_exhausted"
+            err_msg = "Perplexity исчерпал лимит токенов вывода (incomplete: max_output_tokens)"
+        else:
+            cat = "invalid_response"
+            err_msg = f"Perplexity вернул неполный ответ (incomplete: {reason or 'unknown'})"
         _populate_perplexity_diagnostics(
             request_capture,
             status_code=200,
             data=payload,
-            classification="invalid_response",
+            classification=cat,
             is_retryable=False,
             will_retry=False,
         )
-        raise ProviderAdapterError("Perplexity вернул неполный ответ (incomplete)", category="invalid_response")
+        if request_capture is not None and reason:
+            request_capture["incomplete_reason"] = str(reason)
+        raise ProviderAdapterError(err_msg, category=cat)
     if normalized_status == "cancelled":
         _populate_perplexity_diagnostics(
             request_capture,
@@ -549,73 +563,142 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
     raise ProviderAdapterError("Perplexity вернул пустой ответ", category="empty_response")
 
 
+def _normalize_citation_url(raw_url: str) -> tuple[str, str]:
+    """Conservative URL normalization helper for citation identity.
+    Normalizes scheme (lower), hostname (lower), strips default ports (:80, :443),
+    and strips trailing slash for non-root paths (e.g. /guide/ -> /guide).
+    Returns (dedup_key, display_url).
+    """
+    raw_url = str(raw_url or "").strip()
+    try:
+        parsed = urlsplit(raw_url)
+    except Exception:
+        return raw_url, raw_url
+
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+
+    if scheme == "http" and netloc.endswith(":80"):
+        netloc = netloc[:-3]
+    elif scheme == "https" and netloc.endswith(":443"):
+        netloc = netloc[:-4]
+
+    path = parsed.path
+    if path and path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+
+    dedup_key = urlunsplit((scheme, netloc, path, parsed.query, parsed.fragment))
+    display_url = dedup_key
+    return dedup_key, display_url
+
+
 def format_perplexity_response(payload: dict[str, Any], request_capture: dict[str, Any] | None = None) -> str:
     text = _extract_perplexity_text(payload, request_capture=request_capture)
     output = payload.get("output")
     if not isinstance(output, list):
         output = []
 
-    # Agent API source extraction:
-    # 1. Canonical source: output[] items with type == "search_results" containing results or content list
-    raw_results: list[dict[str, Any]] = []
+    # Citation source extraction hierarchy:
+    # 1. Canonical Agent API source: output[] items with type == "search_results"
+    canonical_results: list[dict[str, Any]] = []
     for item in output:
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "search_results" or (item.get("type") == "tool_call" and item.get("tool_name") in {"web_search", "search_results", None}):
+        if item.get("type") == "search_results":
             results = item.get("results")
             if isinstance(results, list):
                 for res in results:
                     if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
-                        raw_results.append(res)
+                        canonical_results.append(res)
             content_items = item.get("content")
             if isinstance(content_items, list):
                 for res in content_items:
                     if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
-                        raw_results.append(res)
+                        canonical_results.append(res)
 
-    # 2. Backward compatibility fallback: top-level citations list if no Agent API search_results were present
-    if not raw_results:
-        citations_list = payload.get("citations")
-        if isinstance(citations_list, list):
-            for c in citations_list:
-                if isinstance(c, str) and c.startswith(("http://", "https://")):
-                    raw_results.append({"url": c, "title": c})
+    raw_results: list[dict[str, Any]] = []
+    if canonical_results:
+        raw_results = canonical_results
+    else:
+        # 2. Legacy compatibility fallback: output[] items with type == "tool_call"
+        # Isolated for backward compatibility only when canonical search_results are absent.
+        legacy_tool_results: list[dict[str, Any]] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_call" and item.get("tool_name") in {"web_search", "search_results", None}:
+                results = item.get("results")
+                if isinstance(results, list):
+                    for res in results:
+                        if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
+                            legacy_tool_results.append(res)
+                content_items = item.get("content")
+                if isinstance(content_items, list):
+                    for res in content_items:
+                        if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
+                            legacy_tool_results.append(res)
+
+        if legacy_tool_results:
+            raw_results = legacy_tool_results
+        else:
+            # 3. Legacy compatibility fallback: top-level citations list
+            # Isolated for backward compatibility only when canonical search_results are absent.
+            citations_list = payload.get("citations")
+            if isinstance(citations_list, list):
+                for c in citations_list:
+                    if isinstance(c, str) and c.startswith(("http://", "https://")):
+                        raw_results.append({"url": c, "title": c})
 
     if not raw_results:
         return text
 
-    url_to_canonical_id: dict[str, str] = {}
-    raw_id_to_canonical_id: dict[str, str] = {}
+    url_to_display_id: dict[str, str] = {}
+    alias_to_display_id: dict[str, str] = {}
     unique_citations: list[dict[str, str]] = []
 
-    has_web_prefix = bool(re.search(r"\[web:\d+\]", text))
-
     for idx, res in enumerate(raw_results, start=1):
-        url = str(res.get("url") or "").strip()
-        title = str(res.get("title") or url).strip()
-        raw_id = str(res.get("id") or (f"web:{idx}" if has_web_prefix else str(idx))).strip()
+        raw_url = str(res.get("url") or "").strip()
+        norm_key, display_url = _normalize_citation_url(raw_url)
+        title = str(res.get("title") or "").strip() or display_url
 
-        if url not in url_to_canonical_id:
-            canonical_id = raw_id
-            url_to_canonical_id[url] = canonical_id
-            unique_citations.append({"id": canonical_id, "title": title, "url": url})
+        if norm_key not in url_to_display_id:
+            display_id = str(len(unique_citations) + 1)
+            url_to_display_id[norm_key] = display_id
+            unique_citations.append({"id": display_id, "title": title, "url": display_url})
         else:
-            canonical_id = url_to_canonical_id[url]
+            display_id = url_to_display_id[norm_key]
 
-        raw_id_to_canonical_id[raw_id] = canonical_id
-        if raw_id.startswith("web:"):
-            num = raw_id.split(":", 1)[1]
-            raw_id_to_canonical_id[num] = canonical_id
-            raw_id_to_canonical_id[f"web:{num}"] = canonical_id
+        upstream_id = str(res.get("id") or "").strip()
+        if upstream_id:
+            alias_to_display_id[upstream_id] = display_id
+            if upstream_id.startswith("web:"):
+                num = upstream_id.split(":", 1)[1]
+                alias_to_display_id[f"web:{num}"] = display_id
+                alias_to_display_id[num] = display_id
+
+        # Also register web:idx and positional idx aliases in case assistant output references them
+        alias_to_display_id[f"web:{idx}"] = display_id
+        if str(idx) not in alias_to_display_id:
+            alias_to_display_id[str(idx)] = display_id
+
+    if not unique_citations:
+        return text
 
     def _replace_marker(m: re.Match) -> str:
-        marker_key = m.group(1)
-        canonical = raw_id_to_canonical_id.get(marker_key)
+        key = m.group(1)
+        # If the inline marker is already a sequential 1-based digit corresponding
+        # to an existing unique citation (e.g. [1], [2]), preserve it as-is.
+        if key.isdigit():
+            val = int(key)
+            if 1 <= val <= len(unique_citations):
+                return f"[{val}]"
+        # Otherwise, resolve through known aliases (e.g. upstream provider IDs, web:N)
+        canonical = alias_to_display_id.get(key)
         if canonical:
             return f"[{canonical}]"
         return m.group(0)
 
-    formatted_text = re.sub(r"\[(web:\d+|\d+)\]", _replace_marker, text)
+    formatted_text = re.sub(r"\[([a-zA-Z0-9_\-:]+)\]", _replace_marker, text)
 
     footer_lines = [
         f"[{c['id']}] {c['title']} — {c['url']}"
@@ -807,7 +890,21 @@ async def _post_perplexity_json(
                 # Only true rate limits and 5xx server errors are retryable by policy.
                 # Quota/credit exhaustion, auth errors, and configuration failures MUST NOT be retried.
                 is_retryable = (category in {"rate_limit", "provider_5xx"}) and (response.status_code in {429, 500, 502, 503, 504})
-                will_retry = is_retryable and ((attempt + 1) < max_attempts)
+                attempts_remain = (attempt + 1) < max_attempts
+                delay = 0.0
+                will_retry = False
+                if is_retryable and attempts_remain:
+                    retry_after_str = response.headers.get("retry-after")
+                    if retry_after_str:
+                        try:
+                            delay = max(0.0, float(retry_after_str))
+                        except (ValueError, TypeError):
+                            delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
+                    else:
+                        delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
+
+                    if time.monotonic() + delay <= deadline:
+                        will_retry = True
 
                 _populate_perplexity_diagnostics(
                     request_capture,
@@ -822,17 +919,6 @@ async def _post_perplexity_json(
                 )
 
                 if will_retry:
-                    retry_after_str = response.headers.get("retry-after")
-                    if retry_after_str:
-                        try:
-                            delay = max(0.0, float(retry_after_str))
-                        except (ValueError, TypeError):
-                            delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
-                    else:
-                        delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
-
-                    if time.monotonic() + delay > deadline:
-                        raise error
                     await asyncio.sleep(delay)
                     continue
                 raise error
@@ -870,7 +956,14 @@ async def _post_perplexity_json(
             duration_ms = round((time.monotonic() - start_time) * 1000, 2)
             category = "timeout" if isinstance(exc, httpx.ConnectTimeout) else "network_connection"
             is_retryable = True
-            will_retry = (attempt + 1) < max_attempts
+            attempts_remain = (attempt + 1) < max_attempts
+            delay = 0.0
+            will_retry = False
+            if attempts_remain:
+                delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
+                if time.monotonic() + delay <= deadline:
+                    will_retry = True
+
             if request_capture is not None:
                 _populate_perplexity_diagnostics(
                     request_capture,
@@ -881,10 +974,8 @@ async def _post_perplexity_json(
                     will_retry=will_retry,
                 )
             if will_retry:
-                delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
-                if time.monotonic() + delay <= deadline:
-                    await asyncio.sleep(delay)
-                    continue
+                await asyncio.sleep(delay)
+                continue
             raise ProviderAdapterError(f"Ошибка подключения к Perplexity: {exc}", category=category) from exc
         except (httpx.TimeoutException, TimeoutError) as exc:
             # UNCERTAIN post-dispatch timeout: do NOT automatically resend paid generation!
