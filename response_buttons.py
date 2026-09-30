@@ -278,8 +278,110 @@ def _normalize_button_declaration_line(line: str) -> str | None:
     return normalized
 
 
+INLINE_ACTION_CANDIDATE_RE = re.compile(r"\[([^\]\n]{1,64})\]\(\s*btn:([^\)\n]*)\)")
+INLINE_CODE_SPAN_RE = re.compile(r"`+[^`\n]+`+")
+INLINE_SEPARATOR_RE = re.compile(
+    r"^\s*(?:[,;|]\s*)?(?:(?:или|or)\b\s*)?$",
+    re.IGNORECASE,
+)
+
+
 def _is_inline_code_line(line: str) -> bool:
     return len(line) >= 2 and line.startswith("`") and line.endswith("`") and not line.startswith("```")
+
+
+def _extract_inline_action_buttons(
+    line: str,
+    remaining_row_budget: int,
+) -> tuple[str, list[list[ResponseButton]]]:
+    if not re.search(r"\(\s*btn:", line) or remaining_row_budget <= 0:
+        return line, []
+
+    code_spans = [(m.start(), m.end()) for m in INLINE_CODE_SPAN_RE.finditer(line)]
+
+    def is_in_code(start: int, end: int) -> bool:
+        return any(c_start <= start and end <= c_end for c_start, c_end in code_spans)
+
+    btn_marker_count = sum(
+        1
+        for m in re.finditer(r"\(\s*btn:", line)
+        if not is_in_code(m.start(), m.end())
+    )
+    if btn_marker_count == 0:
+        return line, []
+
+    raw_matches = [
+        m
+        for m in INLINE_ACTION_CANDIDATE_RE.finditer(line)
+        if not is_in_code(m.start(), m.end())
+    ]
+
+    # If any unescaped button declaration is malformed or unclosed, do not perform partial extraction
+    if len(raw_matches) != btn_marker_count:
+        return line, []
+
+    valid_buttons: list[tuple[re.Match[str], ResponseButton]] = []
+    for m in raw_matches:
+        preceding = line[:m.start()]
+        if preceding.endswith("\\") or preceding.endswith(("\\n", "\\r\\n")):
+            return line, []
+        button = _parse_button_part(m.group(0))
+        if button is None or button.kind != "action":
+            return line, []
+        valid_buttons.append((m, button))
+
+    if re.search(r"</?[a-zA-Z][^>]*>", line):
+        return line, []
+
+    if len(valid_buttons) < 2:
+        return line, []
+
+    # Check contiguous cluster: between adjacent action buttons only allowed separators are permitted
+    for i in range(len(valid_buttons) - 1):
+        prev_m = valid_buttons[i][0]
+        next_m = valid_buttons[i + 1][0]
+        sep = line[prev_m.end():next_m.start()]
+        if not INLINE_SEPARATOR_RE.fullmatch(sep):
+            # Arbitrary prose between button declarations -> leave line intact without partial extraction
+            return line, []
+
+    rows: list[list[ResponseButton]] = [[valid_buttons[0][1]]]
+    for i in range(1, len(valid_buttons)):
+        prev_m = valid_buttons[i - 1][0]
+        curr_m = valid_buttons[i][0]
+        btn = valid_buttons[i][1]
+        sep = line[prev_m.end():curr_m.start()]
+        if "|" in sep:
+            rows[-1].append(btn)
+            if len(rows[-1]) > MAX_BUTTONS_PER_ROW:
+                return line, []
+        else:
+            if len(rows) >= MAX_BUTTON_ROWS:
+                return line, []
+            rows.append([btn])
+
+    if len(rows) > remaining_row_budget:
+        return line, []
+
+    first_m = valid_buttons[0][0]
+    last_m = valid_buttons[-1][0]
+    prefix = line[:first_m.start()].rstrip(" \t")
+    suffix = line[last_m.end():].lstrip(" \t")
+
+    if prefix and suffix:
+        if suffix[0] in ".,!?:;)":
+            clean_line = f"{prefix}{suffix}"
+        else:
+            clean_line = f"{prefix} {suffix}"
+    elif prefix:
+        clean_line = prefix
+    else:
+        clean_line = suffix
+
+    clean_line = re.sub(r"[ \t]+", " ", clean_line).strip(" \t")
+    clean_line = re.sub(r"\s+([.,!?:;])", r"\1", clean_line)
+
+    return clean_line, rows
 
 
 def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseButton]]]:
@@ -308,6 +410,16 @@ def extract_response_buttons(text: str | None) -> tuple[str, list[list[ResponseB
         parsed = _parse_button_row(normalized_line) if normalized_line is not None and len(rows) < MAX_BUTTON_ROWS else None
         if parsed and len(rows) + len(parsed) <= MAX_BUTTON_ROWS:
             rows.extend(parsed)
+            continue
+
+        clean_inline_line, inline_rows = _extract_inline_action_buttons(
+            line,
+            remaining_row_budget=MAX_BUTTON_ROWS - len(rows),
+        )
+        if inline_rows:
+            rows.extend(inline_rows)
+            if clean_inline_line:
+                clean_lines.append(clean_inline_line)
         else:
             clean_lines.append(line)
 

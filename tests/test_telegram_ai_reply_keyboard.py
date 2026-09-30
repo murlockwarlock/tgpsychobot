@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -414,3 +414,122 @@ async def test_telegram_ai_settings_shows_effective_openrouter_default(monkeypat
     rendered_text = target_message.edit_text.await_args.args[0]
     assert "<code>openai/gpt-5.6-terra</code>" in rendered_text
     assert "<code>None</code>" not in rendered_text
+
+
+@pytest.mark.asyncio
+async def test_telegram_real_dispatcher_inline_action_journey(pending_store, monkeypatch):
+    from aiogram import Bot, Dispatcher
+    from aiogram.client.session.base import BaseSession
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.methods import EditMessageReplyMarkup, EditMessageText, SendMessage
+    from aiogram.types import CallbackQuery, Chat, Message, Update, User as TelegramUser
+    from datetime import datetime, timezone
+
+    raw_llm_response = (
+        "Денис, я здесь. Расскажите своими словами, что вас привело — так будет проще, чем выбирать из кнопок.\n\n"
+        "Или, если удобнее, начнём с простого: "
+        "[Хочу понять, что это такое](btn:what_is) "
+        "[Меня кое-что беспокоит в ребёнке](btn:concern) "
+        "[Как устроено и сколько стоит](btn:price)"
+    )
+
+    class _TelegramJourneySession(BaseSession):
+        def __init__(self):
+            super().__init__()
+            self.methods = []
+            self.last_message = None
+
+        async def close(self):
+            return None
+
+        async def make_request(self, bot, method, timeout=None):
+            type(method).model_validate(method.model_dump())
+            self.methods.append(method)
+            if isinstance(method, (SendMessage, EditMessageText)):
+                self.last_message = Message(
+                    message_id=len(self.methods),
+                    date=datetime.now(timezone.utc),
+                    chat=Chat(id=int(method.chat_id), type="private"),
+                    from_user=TelegramUser(id=999, is_bot=True, first_name="TestBot"),
+                    text=getattr(method, "text", ""),
+                    reply_markup=getattr(method, "reply_markup", None),
+                ).as_(bot)
+                return self.last_message
+            return True
+
+        async def stream_content(self, *args, **kwargs):
+            if False:
+                yield b""
+
+    session = _TelegramJourneySession()
+    bot = Bot("123456:test", session=session)
+
+    # 1. Feed raw LLM response through real outgoing delivery runtime
+    await handlers._send_generated_response(bot, 42, raw_llm_response)
+
+    # 2. Verify outgoing message validated and sent via SendMessage
+    assert session.last_message is not None
+    expected_visible_body = (
+        "Денис, я здесь. Расскажите своими словами, что вас привело — так будет проще, чем выбирать из кнопок.\n\n"
+        "Или, если удобнее, начнём с простого:"
+    )
+    assert session.last_message.text == expected_visible_body
+    markup = session.last_message.reply_markup
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert len(markup.inline_keyboard) == 3
+
+    rendered_buttons = [button for row in markup.inline_keyboard for button in row]
+    assert len(rendered_buttons) == 3
+    assert [(b.text, b.url) for b in rendered_buttons] == [
+        ("Хочу понять, что это такое", None),
+        ("Меня кое-что беспокоит в ребёнке", None),
+        ("Как устроено и сколько стоит", None),
+    ]
+
+    # Verify callback contract: 3/3 classified action callbacks, 0 missing
+    all_callbacks = [b.callback_data for b in rendered_buttons]
+    assert all(cb is not None and cb.startswith("ai_btn:") for cb in all_callbacks)
+    assert len(all_callbacks) == 3
+
+    # 3. Extract callback_data directly FROM THE REAL RENDERED KEYBOARD
+    chosen_callback_data = markup.inline_keyboard[0][0].callback_data
+    chosen_button_text = markup.inline_keyboard[0][0].text
+    assert chosen_button_text == "Хочу понять, что это такое"
+
+    # 4. Set up real Telegram Dispatcher with handlers.router
+    handlers.user_message_buffers[42] = []
+    prev_parent = handlers.router.parent_router
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(handlers.router)
+
+    callback_user = TelegramUser(id=42, is_bot=False, first_name="Денис")
+    callback = CallbackQuery(
+        id="cb-telegram-101",
+        from_user=callback_user,
+        chat_instance="telegram-chat-instance",
+        message=session.last_message,
+        data=chosen_callback_data,
+    ).as_(bot)
+
+    process = AsyncMock()
+    try:
+        with patch.object(handlers, "process_buffered_messages", process), patch.object(
+            handlers, "_get_user_locale", AsyncMock(return_value="ru")
+        ):
+            await dispatcher.feed_update(bot, Update(update_id=1, callback_query=callback))
+
+        # 5. Verify real routing and normal action semantics
+        process.assert_awaited_once_with(
+            42,
+            bot,
+            ANY,
+            visible_user_text=chosen_button_text,
+        )
+        assert handlers.user_message_buffers[42] == [
+            f'[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку "{chosen_button_text}" (what_is)]'
+        ]
+        # Verify keyboard was edited/disabled in outgoing calls
+        assert any(isinstance(m, EditMessageReplyMarkup) for m in session.methods)
+    finally:
+        handlers.router._parent_router = prev_parent

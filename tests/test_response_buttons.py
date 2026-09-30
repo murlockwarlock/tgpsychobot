@@ -293,6 +293,138 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertEqual(text, source)
         self.assertEqual(rows, [])
 
+    def test_inline_buttons_positive_exact_production_example(self):
+        source = (
+            "Или, если удобнее, начнём с простого: "
+            "[Хочу понять, что это такое](btn:what_is) "
+            "[Меня кое-что беспокоит в ребёнке](btn:concern) "
+            "[Как устроено и сколько стоит](btn:price)"
+        )
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "Или, если удобнее, начнём с простого:")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for row in rows for button in row],
+            [
+                ("Хочу понять, что это такое", "action", "what_is"),
+                ("Меня кое-что беспокоит в ребёнке", "action", "concern"),
+                ("Как устроено и сколько стоит", "action", "price"),
+            ],
+        )
+
+    def test_inline_buttons_positive_multiple_buttons_with_whitespace(self):
+        source = "Текст [A](btn:a) [B](btn:b)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "Текст")
+        self.assertEqual(
+            [[(button.text, button.value) for button in row] for row in rows],
+            [[("A", "a")], [("B", "b")]],
+        )
+
+    def test_inline_buttons_positive_with_punctuation_and_conjunction(self):
+        source = "Выберите: [A](btn:a), [B](btn:b), или [C](btn:c)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "Выберите:")
+        self.assertEqual(
+            [[(button.text, button.value) for button in row] for row in rows],
+            [[("A", "a")], [("B", "b")], [("C", "c")]],
+        )
+
+    def test_inline_buttons_positive_pipe_keeps_same_row(self):
+        source = "Текст [A](btn:a) | [B](btn:b)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "Текст")
+        self.assertEqual(
+            [[(button.text, button.value) for button in row] for row in rows],
+            [[("A", "a"), ("B", "b")]],
+        )
+
+    def test_inline_buttons_positive_multiline_prose_with_inline_cluster(self):
+        source = (
+            "Денис, я здесь. Расскажите своими словами, что вас привело — так будет проще, чем выбирать из кнопок.\n\n"
+            "Или, если удобнее, начнём с простого: "
+            "[Хочу понять, что это такое](btn:what_is) "
+            "[Меня кое-что беспокоит в ребёнке](btn:concern) "
+            "[Как устроено и сколько стоит](btn:price)"
+        )
+        text, rows = extract_response_buttons(source)
+
+        expected_body = (
+            "Денис, я здесь. Расскажите своими словами, что вас привело — так будет проще, чем выбирать из кнопок.\n\n"
+            "Или, если удобнее, начнём с простого:"
+        )
+        self.assertEqual(text, expected_body)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [button.value for row in rows for button in row],
+            ["what_is", "concern", "price"],
+        )
+
+    def test_inline_buttons_negative_keeps_inline_url_markdown_as_text(self):
+        source = "Подробнее в [документации](https://example.com) и продолжайте чтение."
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_fenced_code_untouched(self):
+        source = "```markdown\nТекст [A](btn:a) [B](btn:b)\n```"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_inline_code_untouched(self):
+        source = "Описание команды `[Run](btn:test)` в терминале."
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_escaped_prose_untouched(self):
+        source = r"Формула: \[Run\](btn:test) и обратный слэш a\b."
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_literal_escaped_newline_untouched(self):
+        source = r"Описание\n[Run](btn:test)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_math_and_backslashes_untouched(self):
+        source = r"Математика \frac{a\(b\)}{c} и \[x\] и a\\b"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_malformed_action_in_cluster_prevents_partial_extraction(self):
+        for malformed_source in [
+            "Текст [Да](btn:yes) [Сломано](btn:)",
+            "Текст [Да](btn:yes) [Сломано](btn:test",
+            "Текст [Да](btn:yes) Сломано](btn:test)",
+            f"Текст [Да](btn:yes) [Сломано](btn:{'x' * 31})",
+        ]:
+            text, rows = extract_response_buttons(malformed_source)
+            self.assertEqual(text, malformed_source)
+            self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_arbitrary_prose_between_buttons_prevents_partial_extraction(self):
+        source = "Нажмите [A](btn:a) если согласны, а потом [B](btn:b)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+
 
 class ApiKeyDisplayTests(unittest.TestCase):
     def test_masks_api_keys_in_telegram_admin_keyboard(self):
