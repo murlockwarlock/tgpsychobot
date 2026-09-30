@@ -2116,6 +2116,7 @@ async def get_ai_response(
                             p_api_key,
                             request_layout,
                             p_model,
+                            temperature=request_temperature,
                             max_output_tokens=output_tokens,
                             timeout=timeout,
                             request_capture=capture_dict,

@@ -19,6 +19,8 @@ from provider_models import (
     DEEPGRAM_DEFAULT_MODEL,
     OPENROUTER_MODEL_SPECS,
     PERPLEXITY_MODES,
+    PERPLEXITY_STATIC_DIRECT_MODELS,
+    is_perplexity_preset,
 )
 
 
@@ -30,20 +32,28 @@ class ProviderAdapterError(RuntimeError):
         super().__init__(message)
         self.http_status = status
         self.classification = category
+        self.category = category
 
 
 _ADAPTER_CLASSIFICATION_MAP = {
     "auth": "auth",
     "quota": "insufficient_balance_quota",
+    "insufficient_balance_quota": "insufficient_balance_quota",
     "rate_limit": "rate_limit",
     "timeout": "timeout",
     "server_error": "provider_5xx",
+    "provider_5xx": "provider_5xx",
     "network": "network_connection",
+    "network_connection": "network_connection",
     "invalid_request": "provider_rejection",
+    "provider_rejection": "provider_rejection",
     "invalid_model": "configuration",
+    "configuration": "configuration",
     "malformed_response": "invalid_response",
+    "invalid_response": "invalid_response",
     "empty_response": "empty_response",
     "provider": "unknown",
+    "unknown": "unknown",
 }
 
 
@@ -133,16 +143,26 @@ def build_openrouter_vision_layout(
 
 def build_perplexity_payload(
     layout: AIRequestLayout,
-    preset: str,
+    preset_or_model: str | None = None,
     *,
+    preset: str | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
     max_output_tokens: int | None = None,
 ) -> dict[str, Any]:
-    if preset not in PERPLEXITY_MODES:
-        raise ProviderAdapterError("Недопустимый режим Perplexity", category="invalid_model")
+    target = preset_or_model or preset or model or ""
+    is_preset = is_perplexity_preset(target) or is_perplexity_preset(preset)
+    effective_preset = preset if preset is not None else (target if is_preset else None)
+    effective_model = model if model is not None else (target if not is_preset else None)
+
+    if not is_preset and (not effective_model or "/" not in effective_model):
+        raise ProviderAdapterError(f"Недопустимая модель или режим Perplexity: '{target}'", category="invalid_model")
+
     instruction_blocks = layout.ordered_instruction_blocks
     instructions = "\n\n".join(block for block in instruction_blocks if block)
-    if instructions:
+    if instructions and is_preset:
         instructions += "\n\nИспользуй web_search для актуальных фактов и добавляй inline citations [n] к утверждениям, основанным на найденных источниках."
+
     input_parts: list[str] = []
     for message in layout.history:
         content = message.content if isinstance(message.content, str) else json.dumps(message.content, ensure_ascii=False)
@@ -152,40 +172,137 @@ def build_perplexity_payload(
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
         input_parts.append(f"user: {content}")
-    tools: list[dict[str, Any]] = [{"type": "web_search"}]
-    if preset in {"low", "medium"}:
-        tools.append({"type": "fetch_url", "max_urls": 1})
+
     payload: dict[str, Any] = {
-        "preset": preset,
         "input": "\n\n".join(part for part in input_parts if part),
-        "tools": tools,
     }
+    if effective_preset is not None:
+        payload["preset"] = effective_preset
+    if effective_model is not None:
+        payload["model"] = effective_model
     if instructions:
         payload["instructions"] = instructions
-    if max_output_tokens is not None:
+
+    # Anthropic models via Perplexity REQUIRE max_output_tokens.
+    is_anthropic = bool(effective_model and effective_model.startswith("anthropic/"))
+    if is_anthropic:
+        resolved_tokens = max_output_tokens if max_output_tokens is not None else 8192
+        payload["max_output_tokens"] = resolved_tokens
+    elif max_output_tokens is not None:
         payload["max_output_tokens"] = max_output_tokens
+
+    if temperature is not None and not is_preset:
+        payload["temperature"] = float(temperature)
+
+    if is_anthropic and "max_output_tokens" not in payload:
+        raise ProviderAdapterError(
+            "Для моделей Anthropic в Perplexity параметр max_output_tokens обязателен.",
+            category="configuration",
+        )
+
     return payload
 
 
+def _classify_perplexity_error_dict(err: dict[str, Any]) -> str:
+    code = err.get("code")
+    msg = str(err.get("message") or "").lower()
+    err_type = str(err.get("type") or "").lower()
+
+    if code == 429 or "rate_limit" in err_type:
+        return "rate_limit"
+    if code == 401 or "auth" in err_type:
+        return "auth"
+    if code == 403:
+        if any(k in msg for k in ("tier", "permission", "access", "unauthorized")):
+            return "auth"
+        return "provider_rejection"
+    if "max_output_tokens" in msg or "validation" in msg:
+        return "configuration"
+    if code == 404 or ("model" in msg and ("not found" in msg or "unknown" in msg or "invalid" in msg)):
+        return "configuration"
+    if code == 402 or any(k in msg or k in err_type for k in ("balance", "quota", "credit")):
+        return "insufficient_balance_quota"
+    if isinstance(code, int) and code >= 500:
+        return "provider_5xx"
+    return "provider_rejection"
+
+
+def _classify_perplexity_http_error(status: int, data: dict[str, Any], raw_text: str) -> str:
+    err = data.get("error") if isinstance(data.get("error"), dict) else {}
+    msg = (str(err.get("message") or "") + " " + raw_text).lower()
+
+    if status == 401 or "invalid_api_key" in msg:
+        return "auth"
+    if status == 403:
+        if any(k in msg for k in ("permission", "tier", "access", "unauthorized", "forbidden")):
+            return "auth"
+        return "provider_rejection"
+    if status == 400:
+        if "max_output_tokens" in msg or "validation" in msg:
+            return "configuration"
+        if "model" in msg and ("not found" in msg or "unknown" in msg or "invalid" in msg):
+            return "configuration"
+        return "provider_rejection"
+    if status == 404:
+        return "configuration"
+    if status == 429:
+        return "rate_limit"
+    if status == 402 or any(k in msg for k in ("balance", "quota", "credit", "insufficient")):
+        return "insufficient_balance_quota"
+    if status >= 500:
+        return "provider_5xx"
+    return "provider"
+
+
 def _extract_perplexity_text(payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "").strip().lower()
+    if status:
+        if status == "failed":
+            err = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            msg = err.get("message") or "Запрос к Perplexity завершился ошибкой"
+            cat = _classify_perplexity_error_dict(err)
+            raise ProviderAdapterError(f"Perplexity статус failed: {msg}", category=cat)
+        if status == "incomplete":
+            raise ProviderAdapterError("Perplexity вернул неполный ответ (incomplete)", category="invalid_response")
+        if status == "cancelled":
+            raise ProviderAdapterError("Запрос к Perplexity был отменён (cancelled)", category="provider_rejection")
+        if status in {"queued", "in_progress"}:
+            raise ProviderAdapterError(f"Неожиданный промежуточный статус Perplexity: {status}", category="invalid_response")
+        if status != "completed":
+            raise ProviderAdapterError(f"Неизвестный статус ответа Perplexity: {status}", category="invalid_response")
+    if payload.get("error"):
+        err = payload["error"]
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        cat = _classify_perplexity_error_dict(err if isinstance(err, dict) else {})
+        raise ProviderAdapterError(f"Ошибка Perplexity в ответе: {msg}", category=cat)
+
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in reversed(output):
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            item_role = item.get("role")
+            if item_type == "message" or item_role == "assistant":
+                content = item.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                if isinstance(content, list):
+                    parts: list[str] = []
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            parts.append(part["text"])
+                        elif isinstance(part, str):
+                            parts.append(part)
+                    if parts:
+                        return "\n".join(parts).strip()
+                text_val = item.get("text")
+                if isinstance(text_val, str) and text_val.strip():
+                    return text_val.strip()
+
     direct = payload.get("output_text")
     if isinstance(direct, str) and direct.strip():
         return direct.strip()
-    output = payload.get("output")
-    if isinstance(output, list):
-        chunks: list[str] = []
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        chunks.append(part["text"])
-            elif isinstance(content, str):
-                chunks.append(content)
-        if chunks:
-            return "\n".join(chunks).strip()
     choices = payload.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         message = choices[0].get("message") or {}
@@ -351,11 +468,110 @@ async def call_openrouter(
     return text
 
 
+async def _post_perplexity_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+    request_capture: dict | None,
+    activity_tracker: Any | None = None,
+    retries: int = 1,
+) -> dict[str, Any]:
+    await _mark_activity(activity_tracker)
+    if request_capture is not None:
+        _capture_ai_request(
+            request_capture,
+            provider="Perplexity",
+            endpoint=url,
+            payload=_capture_payload(payload),
+        )
+    last_error: Exception | None = None
+    deadline = time.monotonic() + max(float(timeout), 0.1)
+    for attempt in range(retries + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderAdapterError("Таймаут обращения к Perplexity", category="timeout") from last_error
+        try:
+            async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
+                response = await client.post(url, headers=headers, json=payload)
+            try:
+                data = response.json()
+            except (TypeError, ValueError):
+                data = {}
+            raw_text = response.text if hasattr(response, "text") else ""
+
+            if request_capture is not None:
+                request_capture["http_status"] = response.status_code
+                if "x-request-id" in response.headers:
+                    request_capture["x_request_id"] = response.headers["x-request-id"]
+
+            if response.status_code >= 400:
+                category = _classify_perplexity_http_error(response.status_code, data, raw_text)
+                err_msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else ""
+                if not err_msg:
+                    err_msg = raw_text[:200]
+                error = ProviderAdapterError(
+                    f"Perplexity API вернул HTTP {response.status_code}: {err_msg}",
+                    status=response.status_code,
+                    category=category,
+                )
+                if response.status_code in {429, 500, 502, 503, 504} and attempt < retries:
+                    retry_after_str = response.headers.get("retry-after")
+                    delay = 0.5
+                    if retry_after_str:
+                        try:
+                            delay = min(float(retry_after_str), 2.0)
+                        except ValueError:
+                            pass
+                    await asyncio.sleep(delay)
+                    continue
+                raise error
+
+            if not isinstance(data, dict):
+                raise ProviderAdapterError("Perplexity вернул некорректный JSON", status=response.status_code, category="invalid_response")
+
+            if request_capture is not None:
+                if data.get("id"):
+                    request_capture["response_id"] = data["id"]
+                if data.get("status"):
+                    request_capture["response_status"] = data["status"]
+                if data.get("model"):
+                    request_capture["response_model"] = data["model"]
+                if data.get("service_tier"):
+                    request_capture["service_tier"] = data["service_tier"]
+                if isinstance(data.get("usage"), dict):
+                    request_capture["usage"] = data["usage"]
+                if data.get("cost"):
+                    request_capture["cost"] = data["cost"]
+
+            return data
+        except ProviderAdapterError:
+            raise
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            last_error = exc
+            if attempt < retries:
+                await asyncio.sleep(0.5)
+                continue
+            raise ProviderAdapterError("Таймаут обращения к Perplexity", category="timeout") from exc
+        except httpx.NetworkError as exc:
+            last_error = exc
+            if attempt < retries:
+                await asyncio.sleep(0.5)
+                continue
+            raise ProviderAdapterError("Ошибка сети Perplexity", category="network_connection") from exc
+        except Exception as exc:
+            raise ProviderAdapterError(f"Ошибка обращения к Perplexity: {exc}", category="provider") from exc
+    raise ProviderAdapterError("Ошибка обращения к Perplexity", category="provider") from last_error
+
+
 async def call_perplexity(
     api_key: str,
     layout: AIRequestLayout,
     preset: str,
     *,
+    model: str | None = None,
+    temperature: float | None = None,
     max_output_tokens: int | None = None,
     timeout: float = 90.0,
     request_capture: dict | None = None,
@@ -363,13 +579,18 @@ async def call_perplexity(
 ) -> str:
     if not api_key:
         raise ProviderAdapterError("API ключ Perplexity не задан", category="auth")
-    payload = build_perplexity_payload(layout, preset, max_output_tokens=max_output_tokens)
-    data = await _post_json(
+    payload = build_perplexity_payload(
+        layout,
+        preset,
+        model=model,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+    )
+    data = await _post_perplexity_json(
         "https://api.perplexity.ai/v1/agent",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         payload=payload,
         timeout=timeout,
-        provider="Perplexity",
         request_capture=request_capture,
         activity_tracker=activity_tracker,
     )

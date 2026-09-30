@@ -1542,6 +1542,17 @@ class MaxBotApplication:
             if data.startswith("admin_ai_provider_models_"):
                 await admin_ai_service.show_models(self.client, chat_id, data.replace("admin_ai_provider_models_", "", 1))
                 return
+            if data == "admin_ai_ppx_presets":
+                await admin_ai_service.show_perplexity_presets(self.client, chat_id)
+                return
+            if data.startswith("admin_ai_ppx_models_"):
+                page_str = data.replace("admin_ai_ppx_models_", "", 1)
+                try:
+                    page = int(page_str)
+                except ValueError:
+                    page = 0
+                await admin_ai_service.show_perplexity_models(self.client, chat_id, page=page)
+                return
             if data.startswith("admin_ai_set_model_"):
                 payload = data.replace("admin_ai_set_model_", "", 1)
                 provider, separator, model_name = payload.partition("_")

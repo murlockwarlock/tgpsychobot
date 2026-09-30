@@ -8,6 +8,11 @@ from response_buttons import ResponseButton, build_action_callback_data
 from .legacy import Content, SubscriptionConfig, SubscriptionPlan, TestConfig, Topic, async_session_maker
 from .identity import max_client_list_label
 from .time_utils import format_msk
+from provider_models import (
+    PERPLEXITY_MODES,
+    PERPLEXITY_MODE_INFO,
+    get_perplexity_model_label,
+)
 
 
 def callback_button(text: str, payload: str) -> dict:
@@ -955,6 +960,59 @@ def admin_ai_model_selection_keyboard(provider: str, current_model: str, models:
     for model in models:
         label = f"✅ {model}" if model == current_model else model
         rows.append([callback_button(label, f"admin_ai_set_model_{provider}_{model}")])
+    rows.append([callback_button("⬅️ Назад", back_callback)])
+    return inline_keyboard(rows)
+
+
+def admin_ai_perplexity_category_keyboard(*, back_callback: str = "admin_ai_models_Perplexity") -> list[dict]:
+    rows = [
+        [callback_button("⚡ Пресеты поиска", "admin_ai_ppx_presets")],
+        [callback_button("🤖 Прямые модели", "admin_ai_ppx_models_0")],
+        [callback_button("⬅️ Назад", back_callback)],
+    ]
+    return inline_keyboard(rows)
+
+
+def admin_ai_perplexity_presets_keyboard(current_model: str, *, back_callback: str = "admin_ai_models_Perplexity") -> list[dict]:
+    rows: list[list[dict]] = []
+    for mode in PERPLEXITY_MODES:
+        name = PERPLEXITY_MODE_INFO.get(mode, {}).get("name", mode)
+        label = f"✅ {name}" if current_model == mode else name
+        rows.append([callback_button(label, f"admin_ai_set_model_Perplexity_{mode}")])
+    rows.append([callback_button("⬅️ Назад", back_callback)])
+    return inline_keyboard(rows)
+
+
+def admin_ai_perplexity_models_keyboard(
+    current_model: str,
+    models: list[str],
+    page: int = 0,
+    page_size: int = 6,
+    *,
+    back_callback: str = "admin_ai_models_Perplexity",
+) -> list[dict]:
+    models_list = list(models or [])
+    total_models = len(models_list)
+    total_pages = max(1, (total_models + page_size - 1) // page_size) if total_models > 0 else 1
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * page_size
+    page_models = models_list[start_idx : start_idx + page_size]
+
+    rows: list[list[dict]] = []
+    for model_id in page_models:
+        label = get_perplexity_model_label(model_id)
+        mark = f"✅ {label}" if current_model == model_id else label
+        rows.append([callback_button(mark, f"admin_ai_set_model_Perplexity_{model_id}")])
+
+    if total_pages > 1:
+        prev_page = page - 1 if page > 0 else total_pages - 1
+        next_page = page + 1 if page < total_pages - 1 else 0
+        rows.append([
+            callback_button("⬅️ Пред", f"admin_ai_ppx_models_{prev_page}"),
+            callback_button(f"{page + 1}/{total_pages}", "noop"),
+            callback_button("След ➡️", f"admin_ai_ppx_models_{next_page}"),
+        ])
+
     rows.append([callback_button("⬅️ Назад", back_callback)])
     return inline_keyboard(rows)
 

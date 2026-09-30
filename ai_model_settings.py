@@ -18,6 +18,7 @@ from provider_models import (
     canonical_provider_name,
     get_chat_output_token_limit,
     get_default_model,
+    is_perplexity_preset,
     normalize_deepseek_model,
     should_omit_claude_sampling,
 )
@@ -123,11 +124,13 @@ def get_generation_capabilities(
             reasoning_effort=(),
         )
     if normalized_provider == PROVIDER_PERPLEXITY:
+        is_preset = is_perplexity_preset(normalized_model)
+        is_anthropic = bool(normalized_model and normalized_model.startswith("anthropic/"))
         return GenerationCapabilities(
             max_output_tokens=True,
-            max_output_tokens_required=False,
+            max_output_tokens_required=is_anthropic,
             output_limit=get_chat_output_token_limit(normalized_provider, normalized_model),
-            temperature=False,
+            temperature=not is_preset,
             reasoning_effort=(),
         )
     return GenerationCapabilities(True, False, get_chat_output_token_limit(normalized_provider, normalized_model), True, ())

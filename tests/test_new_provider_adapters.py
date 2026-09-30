@@ -132,7 +132,7 @@ def test_openrouter_response_and_perplexity_citations_are_safe():
 def test_perplexity_payload_uses_official_preset_tools_without_reasoning_control():
     payload = build_perplexity_payload(layout(), "medium", max_output_tokens=2048)
     assert payload["preset"] == "medium"
-    assert payload["tools"] == [{"type": "web_search"}, {"type": "fetch_url", "max_urls": 1}]
+    assert "tools" not in payload
     assert payload["max_output_tokens"] == 2048
     assert payload["instructions"].startswith("Отвечай на языке пользователя.")
     assert "web_search" in payload["instructions"]
@@ -142,9 +142,11 @@ def test_perplexity_payload_uses_official_preset_tools_without_reasoning_control
     assert "reasoning" not in payload
 
 
-def test_perplexity_fast_preset_uses_web_search_only():
-    payload = build_perplexity_payload(layout(), "fast")
-    assert payload["tools"] == [{"type": "web_search"}]
+def test_perplexity_preset_omits_local_tools_for_all_presets():
+    for preset in ("fast", "low", "medium", "high", "xhigh"):
+        payload = build_perplexity_payload(layout(), preset)
+        assert payload["preset"] == preset
+        assert "tools" not in payload
 
 
 def test_deepgram_payload_and_transcript_support_multilingual_audio():

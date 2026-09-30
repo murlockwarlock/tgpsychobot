@@ -2,7 +2,9 @@ from dataclasses import dataclass
 from hashlib import sha256
 from hmac import compare_digest
 import re
+import time
 from typing import Any
+import httpx
 
 
 # ==========================================
@@ -58,6 +60,8 @@ PERPLEXITY_MODE_OUTPUT_LIMITS = {
     "fast": 8192,
     "low": 32768,
     "medium": 128000,
+    "high": 128000,
+    "xhigh": 128000,
 }
 PERPLEXITY_MODE_INFO = {
     "fast": {
@@ -71,6 +75,14 @@ PERPLEXITY_MODE_INFO = {
     "medium": {
         "name": "Расширенное исследование",
         "desc": "Многошаговый поиск по нескольким источникам.",
+    },
+    "high": {
+        "name": "Глубокое исследование",
+        "desc": "Углубленный поиск и анализ сложных тем.",
+    },
+    "xhigh": {
+        "name": "Максимальное исследование",
+        "desc": "Максимальная детализация с кодовым анализом и поиском.",
     },
 }
 
@@ -120,7 +132,178 @@ OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
 
 OPENROUTER_MODELS = tuple(OPENROUTER_MODEL_SPECS)
 OPENROUTER_VISION_MODELS = tuple(spec.model_id for spec in OPENROUTER_MODEL_SPECS.values() if spec.vision)
-PERPLEXITY_MODES = ("fast", "low", "medium")
+PERPLEXITY_MODES = ("fast", "low", "medium", "high", "xhigh")
+
+PERPLEXITY_STATIC_DIRECT_MODELS: tuple[str, ...] = (
+    # Anthropic
+    "anthropic/claude-sonnet-4-6",
+    "anthropic/claude-sonnet-4-5",
+    "anthropic/claude-haiku-4-5",
+    "anthropic/claude-opus-4-6",
+    "anthropic/claude-fable-5",
+    # OpenAI
+    "openai/gpt-5.6-sol",
+    "openai/gpt-5.6-terra",
+    "openai/gpt-5.6-luna",
+    "openai/gpt-6.1-sol",
+    "openai/gpt-6-sol",
+    # Google
+    "google/gemini-3.7-flash",
+    "google/gemini-3.5-flash",
+    "google/gemini-3.1-pro-preview",
+    # xAI
+    "xai/grok-4.20-reasoning",
+    "xai/grok-4.7",
+    "xai/grok-4.5",
+    # Open / Partner models
+    "perplexity/glm-5.3",
+    "perplexity/kimi-k3",
+    "perplexity/nemotron-3-ultra-550b-a55b",
+    # Perplexity
+    "perplexity/sonar",
+)
+
+
+@dataclass(frozen=True)
+class PerplexityCatalogState:
+    models: tuple[str, ...]
+    source: str  # "live", "stale_live", "static_fallback"
+    is_fresh: bool
+    is_authoritative: bool
+    fetched_at: float
+
+
+_current_perplexity_catalog_state: PerplexityCatalogState | None = None
+_previous_generation_perplexity_models: tuple[str, ...] = ()
+PERPLEXITY_CATALOG_TTL_SECONDS = 3600.0
+
+
+def is_perplexity_preset(model: str | None) -> bool:
+    """Return True if model is a recognized Perplexity preset."""
+    normalized = (model or "").strip().lower()
+    return normalized in PERPLEXITY_MODES
+
+
+def get_perplexity_catalog_state() -> PerplexityCatalogState:
+    """Return current synchronous in-memory catalog state without network I/O."""
+    global _current_perplexity_catalog_state
+    if _current_perplexity_catalog_state is None:
+        _current_perplexity_catalog_state = PerplexityCatalogState(
+            models=PERPLEXITY_STATIC_DIRECT_MODELS,
+            source="static_fallback",
+            is_fresh=False,
+            is_authoritative=False,
+            fetched_at=0.0,
+        )
+    return _current_perplexity_catalog_state
+
+
+def get_perplexity_selectable_models(
+    *,
+    include_presets: bool = True,
+    include_stale_generations: bool = False,
+) -> tuple[str, ...]:
+    """Return selectable Perplexity models for registry and callback resolution."""
+    state = get_perplexity_catalog_state()
+    items: list[str] = []
+    if include_presets:
+        items.extend(PERPLEXITY_MODES)
+    for m in state.models:
+        if m not in items:
+            items.append(m)
+    if include_stale_generations:
+        for m in _previous_generation_perplexity_models:
+            if m not in items:
+                items.append(m)
+        for m in PERPLEXITY_STATIC_DIRECT_MODELS:
+            if m not in items:
+                items.append(m)
+    return tuple(items)
+
+
+async def refresh_perplexity_catalog(
+    timeout: float = 5.0,
+    force: bool = False,
+    http_client: Any | None = None,
+) -> PerplexityCatalogState:
+    """Async refresh of Perplexity catalog via GET /v1/models (no auth required)."""
+    global _current_perplexity_catalog_state, _previous_generation_perplexity_models
+    now = time.monotonic()
+    current = get_perplexity_catalog_state()
+    if not force and current.source == "live" and (now - current.fetched_at < PERPLEXITY_CATALOG_TTL_SECONDS):
+        return current
+
+    endpoint = "https://api.perplexity.ai/v1/models"
+    try:
+        if http_client is not None:
+            resp = await http_client.get(endpoint, timeout=timeout)
+        else:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                resp = await client.get(endpoint)
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_list: list[Any] = []
+            if isinstance(data, list):
+                raw_list = data
+            elif isinstance(data, dict):
+                if isinstance(data.get("data"), list):
+                    raw_list = data["data"]
+                elif isinstance(data.get("models"), list):
+                    raw_list = data["models"]
+            parsed_models: list[str] = []
+            for item in raw_list:
+                model_id = ""
+                if isinstance(item, str):
+                    model_id = item.strip()
+                elif isinstance(item, dict):
+                    model_id = str(item.get("id") or item.get("name") or "").strip()
+                if model_id and "/" in model_id and model_id not in parsed_models:
+                    parsed_models.append(model_id)
+            if parsed_models:
+                parsed_models.sort()
+                if current.models:
+                    _previous_generation_perplexity_models = current.models
+                _current_perplexity_catalog_state = PerplexityCatalogState(
+                    models=tuple(parsed_models),
+                    source="live",
+                    is_fresh=True,
+                    is_authoritative=True,
+                    fetched_at=now,
+                )
+                return _current_perplexity_catalog_state
+    except Exception:
+        pass
+
+    # Fallback on network or status failure
+    if current.source in {"live", "stale_live"} and current.models:
+        _current_perplexity_catalog_state = PerplexityCatalogState(
+            models=current.models,
+            source="stale_live",
+            is_fresh=False,
+            is_authoritative=False,
+            fetched_at=current.fetched_at,
+        )
+    else:
+        _current_perplexity_catalog_state = PerplexityCatalogState(
+            models=PERPLEXITY_STATIC_DIRECT_MODELS,
+            source="static_fallback",
+            is_fresh=False,
+            is_authoritative=False,
+            fetched_at=0.0,
+        )
+    return _current_perplexity_catalog_state
+
+
+def get_perplexity_model_label(model_id: str) -> str:
+    """Format human-readable label for a Perplexity preset or model."""
+    if is_perplexity_preset(model_id):
+        info = PERPLEXITY_MODE_INFO.get(model_id)
+        return info["name"] if info else model_id
+    parts = model_id.split("/", 1)
+    if len(parts) == 2:
+        owner, name = parts
+        return f"{name} ({owner.capitalize()})"
+    return model_id
 
 DEFAULT_VISION_MODEL = "gemini-3.7-flash"
 DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2"
@@ -526,6 +709,24 @@ def ensure_model_available(provider: str | None, model: str | None, channel: str
             "Пожалуйста, выберите актуальную модель в настройках."
         )
 
+    if p_name == PROVIDER_PERPLEXITY:
+        if is_perplexity_preset(normalized):
+            return
+        catalog_state = get_perplexity_catalog_state()
+        if catalog_state.is_authoritative:
+            if normalized not in catalog_state.models:
+                raise ModelUnavailableError(
+                    f"Модель '{normalized}' ({p_name}) отключена провайдером. "
+                    "Пожалуйста, выберите актуальную модель в настройках."
+                )
+        else:
+            if "/" not in normalized:
+                raise ModelUnavailableError(
+                    f"Модель '{normalized}' не поддерживается провайдером '{p_name}' "
+                    f"для канала '{channel_name}'. Выберите актуальную модель в настройках."
+                )
+        return
+
     selectable = get_selectable_models(p_name, channel=channel_name)
     if not selectable:
         raise ModelUnavailableError(
@@ -579,6 +780,8 @@ def get_selectable_models(provider: str | None, channel: str = "chat") -> tuple[
     """Return the tuple of active selectable models for a provider and channel."""
     p_name = _canonical_provider_name(provider)
     channel_name = (channel or "chat").strip().lower()
+    if p_name == PROVIDER_PERPLEXITY:
+        return get_perplexity_selectable_models(include_presets=True, include_stale_generations=True)
     catalog = _SELECTABLE_MODEL_CATALOGS.get(channel_name, SELECTABLE_CHAT_MODELS)
     return catalog.get(p_name, ())
 
@@ -617,7 +820,11 @@ def get_chat_output_token_limit(provider: str | None, model: str | None, reasoni
         spec = OPENROUTER_MODEL_SPECS.get((model or "").strip())
         return spec.output_limit if spec else max(spec.output_limit for spec in OPENROUTER_MODEL_SPECS.values())
     if p_name == PROVIDER_PERPLEXITY:
-        return PERPLEXITY_MODE_OUTPUT_LIMITS.get((model or "").strip(), PERPLEXITY_CHAT_MAX_TOKENS)
+        if is_perplexity_preset(model):
+            return PERPLEXITY_MODE_OUTPUT_LIMITS.get((model or "").strip(), PERPLEXITY_CHAT_MAX_TOKENS)
+        if (model or "").startswith("anthropic/"):
+            return 8192
+        return PERPLEXITY_CHAT_MAX_TOKENS
     return 4096
 
 

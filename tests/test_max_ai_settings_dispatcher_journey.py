@@ -93,6 +93,7 @@ def _classify_max_callback(payload):
         "admin_ai_image_edit",
         "admin_ai_common",
         "admin_ai_provider_models_",
+        "admin_ai_ppx_",
     )
     mutation = (
         "admin_ai_key_",

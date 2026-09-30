@@ -97,6 +97,7 @@ from provider_models import (
     PROVIDER_DEEPGRAM,
     DEEPGRAM_DEFAULT_MODEL,
     OPENROUTER_MODEL_SPECS,
+    PERPLEXITY_MODES,
     PERPLEXITY_MODE_INFO,
     ModelUnavailableError,
     SELECTABLE_CHAT_MODELS,
@@ -106,7 +107,9 @@ from provider_models import (
     get_chat_output_token_limit,
     get_default_model,
     get_capability_providers,
+    get_perplexity_catalog_state,
     get_selectable_models,
+    refresh_perplexity_catalog,
     resolve_telegram_model_callback,
     validate_model_selection,
 )
@@ -186,8 +189,33 @@ def _split_model_callback_payload(payload: str) -> tuple[str | None, str]:
     return None, payload or ""
 
 
-async def _reject_model_callback(callback: CallbackQuery) -> None:
-    await callback.answer("Недопустимая модель. Настройки не изменены.", show_alert=True)
+async def _reject_model_callback(callback: CallbackQuery, provider: str | None = None) -> None:
+    await callback.answer("Модель недоступна или каталог был обновлён. Настройки не изменены.", show_alert=True)
+    if getattr(callback, "message", None):
+        try:
+            if provider == PROVIDER_PERPLEXITY:
+                catalog_state = get_perplexity_catalog_state()
+                models = list(catalog_state.models)
+                async with async_session_maker() as session:
+                    config = await session.get(AIConfig, 1)
+                current_model = getattr(config, "perplexity_model", None) if config else None
+                heading = (
+                    "⚠️ <b>Модель больше недоступна в каталоге</b>\n\n"
+                    "Каталог моделей был обновлен. Выберите другую модель:\n"
+                )
+                await callback.message.edit_text(
+                    heading,
+                    reply_markup=kb.perplexity_models_keyboard(current_model, models, page=0, page_size=6),
+                )
+            elif provider:
+                await _render_provider_model_settings(callback, provider)
+            else:
+                async with async_session_maker() as session:
+                    config = await session.get(AIConfig, 1)
+                if config:
+                    await _render_provider_model_settings(callback, _active_chat_model_scope(config)[0])
+        except Exception:
+            pass
 
 
 from memory_mode import (
@@ -529,7 +557,7 @@ async def handle_compact_model_callback(callback: CallbackQuery, state: FSMConte
     try:
         normalized_model = validate_model_selection(provider, model_name, channel=channel)
     except ModelUnavailableError:
-        await _reject_model_callback(callback)
+        await _reject_model_callback(callback, provider=provider)
         return
 
     async with async_session_maker() as session:
@@ -7136,6 +7164,26 @@ async def view_models_by_provider(callback: CallbackQuery):
 async def view_provider_model_choices(callback: CallbackQuery, state: FSMContext | None = None):
     provider = canonical_provider_name(callback.data.replace("view_provider_models_", "", 1))
     channel = "transcription" if provider == PROVIDER_DEEPGRAM else "chat"
+    if provider == PROVIDER_PERPLEXITY:
+        async with async_session_maker() as session:
+            config = await session.get(AIConfig, 1)
+        current_model = getattr(config, "perplexity_model", None) if config else None
+        heading = (
+            f"Выберите модель для <b>{provider}</b>:\n\n"
+            "⚡ <b>Пресеты поиска</b>:\n"
+        )
+        for mode in PERPLEXITY_MODES:
+            info = PERPLEXITY_MODE_INFO.get(mode, {})
+            heading += f"▪️ <b>{info.get('name', mode)}</b>: {info.get('desc', '')}\n"
+        await callback.message.edit_text(
+            heading,
+            reply_markup=kb.perplexity_presets_keyboard(current_model),
+        )
+        if state is not None:
+            await state.update_data(model_picker_return=f"view_models_{provider}")
+        await callback.answer()
+        return
+
     selectable_models = get_selectable_models(provider, channel=channel)
     provider_models = MODELS_INFO.get(provider)
 
@@ -7170,6 +7218,62 @@ async def view_provider_model_choices(callback: CallbackQuery, state: FSMContext
     )
     if state is not None:
         await state.update_data(model_picker_return=f"view_models_{provider}")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ai_ppx_presets")
+async def view_perplexity_presets(callback: CallbackQuery, state: FSMContext | None = None):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    current_model = getattr(config, "perplexity_model", None) if config else None
+    heading = (
+        "⚡ <b>Пресеты поиска Perplexity</b>\n\n"
+        "Выберите системный режим Agent API:\n\n"
+    )
+    for mode in PERPLEXITY_MODES:
+        info = PERPLEXITY_MODE_INFO.get(mode, {})
+        heading += f"▪️ <b>{info.get('name', mode)}</b>: {info.get('desc', '')}\n"
+    await callback.message.edit_text(
+        heading,
+        reply_markup=kb.perplexity_presets_keyboard(current_model),
+    )
+    if state is not None:
+        await state.update_data(model_picker_return=f"view_models_{PROVIDER_PERPLEXITY}")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ai_ppx_models:"))
+async def view_perplexity_models(callback: CallbackQuery, state: FSMContext | None = None):
+    page_str = callback.data.split(":", 1)[1]
+    try:
+        page = int(page_str)
+    except ValueError:
+        page = 0
+
+    await refresh_perplexity_catalog()
+    catalog_state = get_perplexity_catalog_state()
+    models = list(catalog_state.models)
+
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    current_model = getattr(config, "perplexity_model", None) if config else None
+
+    source_desc = (
+        "🟢 Онлайн-каталог"
+        if catalog_state.source == "live"
+        else ("🟡 Кэш каталога" if catalog_state.source == "stale" else "⚪ Статический каталог")
+    )
+    heading = (
+        f"🤖 <b>Прямые модели Perplexity</b>\n"
+        f"<i>({source_desc}, моделей: {len(models)})</i>\n\n"
+        "Выберите модель для генерации ответа:\n"
+    )
+    await callback.message.edit_text(
+        heading,
+        reply_markup=kb.perplexity_models_keyboard(current_model, models, page=page, page_size=6),
+    )
+    if state is not None:
+        await state.update_data(model_picker_return=f"view_models_{PROVIDER_PERPLEXITY}")
     await callback.answer()
 
 
@@ -20690,6 +20794,7 @@ async def get_ai_response_direct(
                     api_key,
                     request_layout,
                     model,
+                    temperature=request_temperature,
                     max_output_tokens=output_tokens,
                     activity_tracker=activity_tracker,
                 )

@@ -209,6 +209,8 @@ def _classify_telegram_ai_callback(callback_data):
         "view_models_",
         "view_provider_models_",
         "cancel_state_",
+        "ai_ppx_",
+        "noop",
     )):
         return "navigation"
     if callback_data.startswith((
