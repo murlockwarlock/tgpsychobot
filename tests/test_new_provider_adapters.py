@@ -140,8 +140,11 @@ def test_perplexity_payload_uses_official_preset_tools_without_reasoning_control
     assert payload["instructions"].startswith("Отвечай на языке пользователя.")
     assert "web_search" in payload["instructions"]
     assert "inline citations" in payload["instructions"]
-    assert "system:" not in payload["input"]
-    assert "user: Текущий вопрос" in payload["input"]
+    assert isinstance(payload["input"], list)
+    assert payload["input"][0] == {"role": "user", "content": "Предыдущий вопрос"}
+    assert payload["input"][1] == {"role": "user", "content": "Текущий вопрос"}
+    assert "user:" not in payload["input"][0]["content"]
+    assert "user:" not in payload["input"][1]["content"]
     assert "reasoning" not in payload
 
 
