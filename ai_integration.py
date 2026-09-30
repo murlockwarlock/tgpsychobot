@@ -120,6 +120,7 @@ from kie_chat import (
     build_kie_chat_request,
     extract_kie_chat_response_text,
     extract_kie_chat_text,
+    kie_error_classification,
     is_kie_error_payload,
     is_kie_insufficient_balance,
 )
@@ -575,8 +576,27 @@ def _validate_kie_json_response(status_code: int, payload: dict, *, context: str
     detail = _nonempty_provider_reason(raw_detail, f"HTTP {status_code} без описания")
     if status_code != 200:
         if is_kie_insufficient_balance(status_code, payload):
-            raise InsufficientBalanceError(f"KIE API Error: {detail}")
-        raise AIServiceError(f"{context}: status={status_code} message={detail}")
+            err = InsufficientBalanceError(f"KIE API Error: {detail}")
+        else:
+            err = AIServiceError(f"{context}: status={status_code} message={detail}")
+        err.http_status = status_code
+        err.provider = "KIE"
+        err.provider_message = detail
+        err.provider_code = payload.get("code") if isinstance(payload, dict) else None
+        err.diagnostics = {
+            "provider_code": err.provider_code,
+            "provider_message": detail,
+        }
+        try:
+            import json
+            err.provider_response_payload = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
+        except Exception:
+            err.provider_response_payload = str(payload)
+        if not isinstance(err, InsufficientBalanceError):
+            classification = kie_error_classification(status_code, payload)
+            if classification:
+                err.classification = classification
+        raise err
 
     code = payload.get("code")
     if code not in (None, 200, "200"):
@@ -585,7 +605,17 @@ def _validate_kie_json_response(status_code: int, payload: dict, *, context: str
         else:
             err = AIServiceError(f"{context}: {detail}")
         err.http_status = status_code
+        err.provider = "KIE"
+        err.provider_message = detail
         err.provider_code = code
+        err.diagnostics = {
+            "provider_code": code,
+            "provider_message": detail,
+        }
+        if not isinstance(err, InsufficientBalanceError):
+            classification = kie_error_classification(status_code, payload)
+            if classification:
+                err.classification = classification
         try:
             import json
             err.provider_response_payload = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
@@ -1014,7 +1044,9 @@ async def _call_kie_chat(
         if not text:
             raise AIResponseError("KIE chat returned empty content")
         return _validate_text_response(text, provider="KIE")
-    except (InsufficientBalanceError, AIServiceError):
+    except (InsufficientBalanceError, AIServiceError) as exc:
+        exc.provider = "KIE"
+        exc.model = target_model
         raise
     except Exception as e:
         logging.error("KIE chat error", exc_info=e)

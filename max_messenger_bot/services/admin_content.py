@@ -8,6 +8,7 @@ from ..api import MaxApiClient
 from ..keyboards import admin_content_editor_keyboard, admin_content_list_keyboard
 from ..legacy import Content, async_session_maker
 from ..storage import MaxContentMedia, StateStore
+from admin_html_preview import truncate_html_preview
 from translation_pack_manager import commit_readiness_critical_mutation
 
 
@@ -92,15 +93,14 @@ async def show_content_editor(
         media_display = "<i>Медиафайлы не добавлены.</i>"
 
     preview_limit = 700
-    if text_content and len(text_content) > preview_limit:
-        truncated = text_content[:preview_limit]
-        from ..formatting import _open_tags
-        unclosed = _open_tags(truncated)
-        rendered_display = truncated + "".join(f"</{t}>" for t in reversed(unclosed)) + "\n... (текст обрезан для предпросмотра)"
+    rendered_display = truncate_html_preview(
+        text_content or "Текст не задан.",
+        preview_limit,
+        allowed_tags={"b", "strong", "i", "em"},
+    )
+    source_display = html.escape(text_content or "Текст не задан.")
+    if len(text_content) > preview_limit:
         source_display = html.escape(text_content[:preview_limit]) + "\n... (исходный код обрезан)"
-    else:
-        rendered_display = text_content or "Текст не задан."
-        source_display = html.escape(text_content or "Текст не задан.")
 
     link_line = ""
     if client.bot_name and isinstance(client.bot_name, str):

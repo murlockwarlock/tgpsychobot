@@ -136,6 +136,7 @@ def admin_panel_keyboard() -> list[dict]:
             [callback_button("📚 База знаний", "admin_kb"), callback_button("✏️ Контент", "admin_content")],
             [callback_button("👮 Админы", "admin_manage_admins"), callback_button("👫 Рефералы", "admin_referral_menu")],
             [callback_button("✉️ Рассылки", "admin_mailing_menu"), callback_button("🎨 Коллекции", "admin_collections_page_0")],
+            [callback_button("💬 Догоняющие сообщения", "admin_followups")],
         ]
     )
 

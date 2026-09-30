@@ -37,11 +37,7 @@ from database import (
 )
 from followups import (
     FOLLOWUP_METADATA_OPERATOR_LABELS,
-    FOLLOWUP_ATTEMPT_CLAIMED,
-    FOLLOWUP_ATTEMPT_RETRYABLE,
-    FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED,
-    FOLLOWUP_ATTEMPT_DELIVERED,
-    FOLLOWUP_ATTEMPT_UNCERTAIN,
+    FOLLOWUP_STEP_DELETE_PROTECTED_ATTEMPT_STATUSES,
     FOLLOWUP_STAGE_MODE_LABELS,
     FOLLOWUP_STAGE_MODES,
     UNSET_STAGE_TOKEN,
@@ -52,8 +48,20 @@ from followups import (
     parse_followup_csv,
     send_followup_step,
 )
+from followup_admin_shared import (
+    allocate_followup_step_sort_order,
+    commit_followup_step_mutation,
+    followup_step_mutation_lock,
+    save_static_followup_text,
+)
 from time_helpers import format_msk
 from translation_pack_manager import commit_readiness_critical_mutation, translation_coordination_lock
+from followup_admin_contract import (
+    FOLLOWUP_CAMPAIGN_DETAIL_INTRO,
+    FOLLOWUP_CAMPAIGN_EXPLANATION,
+    FOLLOWUP_STEPS_EXPLANATION,
+    parse_followup_step_input,
+)
 
 
 import logging
@@ -1426,9 +1434,7 @@ async def _show_followup_campaigns(
     await _safe_edit_text_or_markup(
         callback,
         f"💬 <b>Догоняющие сообщения ({len(campaigns)}){f' — {html.escape(topic.name)}' if topic else ''}</b>\n\n"
-        "Цепочка начинается после действия пользователя и запускается заново после его нового сообщения или нажатия кнопки. "
-        "При смене темы или создании нового диалога старая цепочка отменяется. "
-        "Сообщения не отправляются в тихие часы."
+        + FOLLOWUP_CAMPAIGN_EXPLANATION
         + ("\n\nЗдесь показаны цепочки этой темы. Новая цепочка привяжется к ней автоматически." if topic else ""),
         reply_markup=builder.as_markup(),
     )
@@ -1558,7 +1564,7 @@ async def _show_campaign(
     warning = "" if valid else "\n\n⚠️ Для включения выберите область и добавьте хотя бы один шаг."
     text = (
         f"💬 <b>{html.escape(item.name)}</b>\n\n"
-        "Цепочка отправляет несколько напоминаний, пока пользователь молчит.\n"
+        f"{FOLLOWUP_CAMPAIGN_DETAIL_INTRO}\n"
         f"Статус: {'✅ включена' if item.is_active else '⏸ выключена'}\n"
         f"Область: {html.escape(scopes)}\n"
         f"Шагов: {len(item.steps)}\n"
@@ -2335,10 +2341,7 @@ async def followup_steps(callback: CallbackQuery, state: FSMContext | None = Non
     builder.adjust(1)
     text = (
         f"🪜 <b>Шаги цепочки ({len(item.steps)})</b>\n\n"
-        "Первое время считается от последнего действия пользователя, следующие — от предыдущего сообщения. "
-        "Новое действие пользователя начинает цепочку заново.\n\n"
-        "Шаг «Обычный текст» отправляет ваш текст. Шаг «Сгенерировать через AI» передаёт AI вашу инструкцию "
-        "и текущий диалог. Нажмите на шаг, чтобы открыть его детали."
+        + FOLLOWUP_STEPS_EXPLANATION
     )
     await _safe_edit_text_or_markup(callback, text, reply_markup=builder.as_markup())
 
@@ -2444,13 +2447,7 @@ async def followup_step_edit(callback: CallbackQuery, state: FSMContext):
 
 
 def _parse_followup_step_input(raw_text: str | None) -> tuple[int, str] | None:
-    first, separator, body = (raw_text or "").partition("\n")
-    if not separator or not first.strip().isdigit() or not body.strip():
-        return None
-    delay = int(first.strip())
-    if not 1 <= delay <= 525600:
-        return None
-    return delay, body.strip()
+    return parse_followup_step_input(raw_text)
 
 
 @router.message(AutomationAdminStates.followup_step)
@@ -2468,22 +2465,27 @@ async def followup_step_received(message: Message, state: FSMContext):
     if not body:
         await message.answer("Нужны минуты в первой строке и текст ниже.")
         return
+    formatted_body = body
+    if data["step_kind"] == "static":
+        formatted_input = _parse_followup_step_input(getattr(message, "html_text", None))
+        if formatted_input is not None:
+            formatted_body = formatted_input[1]
     async with async_session_maker() as session:
-        order = await session.scalar(
-            select(func.count(FollowupStep.id)).where(FollowupStep.campaign_id == data["campaign_id"])
-        ) or 0
-        values = {
-            "campaign_id": data["campaign_id"],
-            "sort_order": order,
-            "delay_minutes": delay,
-            "message_type": data["step_kind"],
-        }
-        if data["step_kind"] == "ai":
-            values["ai_instruction"] = body.strip()
-        else:
-            values["message_text"] = body.strip()
-        session.add(FollowupStep(**values))
-        await commit_readiness_critical_mutation(session)
+        async with followup_step_mutation_lock(session):
+            order = await allocate_followup_step_sort_order(session, data["campaign_id"])
+            step = FollowupStep(
+                campaign_id=data["campaign_id"],
+                sort_order=order,
+                delay_minutes=delay,
+                message_type=data["step_kind"],
+            )
+            session.add(step)
+            await session.flush()
+            if data["step_kind"] == "ai":
+                step.ai_instruction = body.strip()
+            else:
+                await save_static_followup_text(session, step, "ru", formatted_body.strip())
+            await commit_followup_step_mutation(session)
     return_topic_id = data.get("followup_return_topic_id")
     await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Шаг добавлен.")
@@ -2503,17 +2505,20 @@ async def followup_step_edit_received(message: Message, state: FSMContext):
     delay, body = parsed
     data = await state.get_data()
     async with async_session_maker() as session:
-        step = await session.get(FollowupStep, data["step_id"])
-        if step is None or step.campaign_id != data["campaign_id"]:
-            await state.clear()
-            await message.answer("Шаг не найден.")
-            return
-        step.delay_minutes = delay
-        if step.message_type == "ai":
-            step.ai_instruction = body
-        else:
-            step.message_text = body
-        await commit_readiness_critical_mutation(session)
+        async with followup_step_mutation_lock(session):
+            step = await session.get(FollowupStep, data["step_id"])
+            if step is None or step.campaign_id != data["campaign_id"]:
+                await state.clear()
+                await message.answer("Шаг не найден.")
+                return
+            step.delay_minutes = delay
+            if step.message_type == "ai":
+                step.ai_instruction = body
+            else:
+                formatted_input = _parse_followup_step_input(getattr(message, "html_text", None))
+                formatted_body = formatted_input[1] if formatted_input is not None else body
+                await save_static_followup_text(session, step, "ru", formatted_body.strip())
+            await commit_followup_step_mutation(session)
     return_topic_id = data.get("followup_return_topic_id")
     await _reset_navigation_context(state, "followup_return_topic_id", return_topic_id)
     await message.answer("✅ Шаг обновлён.")
@@ -2549,11 +2554,7 @@ async def followup_step_delete(callback: CallbackQuery, state: FSMContext | None
                         FollowupDeliveryAttempt.step_id == step.id,
                         FollowupDeliveryAttempt.status.in_(
                             (
-                                FOLLOWUP_ATTEMPT_CLAIMED,
-                                FOLLOWUP_ATTEMPT_RETRYABLE,
-                                FOLLOWUP_ATTEMPT_UNCERTAIN,
-                                FOLLOWUP_ATTEMPT_DELIVERED,
-                                FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED,
+                                *FOLLOWUP_STEP_DELETE_PROTECTED_ATTEMPT_STATUSES,
                             )
                         ),
                     )

@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -476,3 +476,168 @@ async def test_kie_http_200_credit_error_envelope_is_rejected_before_stream_pars
     with patch.object(module.httpx, "AsyncClient", return_value=client):
         with pytest.raises(module.InsufficientBalanceError, match="Insufficient credits"):
             await call(*args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+async def test_kie_http_200_channel_rejection_is_provider_error_with_full_metadata(surface):
+    if surface == "telegram":
+        import ai_integration as module
+
+        call = module._call_kie_chat
+        args = (KIE_API_KEY, "https://api.example", "gemini-3-flash", HISTORY, "", "SYSTEM")
+    else:
+        from max_messenger_bot import ai as module
+
+        call = module._call_kie_text_chat
+        args = (
+            KIE_API_KEY,
+            "https://api.example",
+            "gemini-3-flash",
+            [{"role": "user", "content": "текущий вопрос"}],
+            "SYSTEM",
+            0.25,
+        )
+
+    error_payload = {"code": 422, "msg": "The channel is not supported", "data": None}
+    client = _HttpClient(_Response(error_payload, text=json.dumps(error_payload)))
+    with patch.object(module.httpx, "AsyncClient", return_value=client):
+        with pytest.raises(module.AIServiceError) as raised:
+            await call(*args)
+
+    error = raised.value
+    assert not isinstance(error, module.InsufficientBalanceError)
+    assert error.classification == "provider_rejection"
+    assert error.provider == "KIE"
+    assert error.model == "gemini-3-flash"
+    assert error.provider_code == 422
+    assert error.provider_message == "The channel is not supported"
+    assert error.http_status == 200
+    assert error.diagnostics == {
+        "provider_code": 422,
+        "provider_message": "The channel is not supported",
+    }
+    assert json.loads(error.provider_response_payload) == error_payload
+
+
+@pytest.mark.asyncio
+async def test_kie_rejection_is_visible_in_admin_filters_details_and_exports(tmp_path, monkeypatch):
+    from ai_integration import AIServiceError
+    from ai_log_context import record_ai_attempt_log
+    from database import AILog, Base, User
+    import handlers
+    from max_messenger_bot.services import admin_ai_logs as max_admin_ai_logs
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'kie-admin-log.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    error = AIServiceError("Ошибка при обращении к KIE Chat API: The channel is not supported")
+    error.classification = "provider_rejection"
+    error.provider = "KIE"
+    error.model = "gemini-3-flash"
+    error.provider_code = 422
+    error.provider_message = "The channel is not supported"
+    error.http_status = 200
+    error.diagnostics = {
+        "provider_code": 422,
+        "provider_message": "The channel is not supported",
+    }
+    provider_payload = {"code": 422, "msg": "The channel is not supported", "data": None}
+    error.provider_response_payload = json.dumps(provider_payload)
+    error_meta = {
+        "error_type": "AIServiceError",
+        "error_message": str(error),
+        "error_classification": "provider_rejection",
+        "http_status": 200,
+        "finish_reason": None,
+        "diagnostics": error.diagnostics,
+        "provider_response_payload": error.provider_response_payload,
+    }
+    async with sessions() as session:
+        session.add(User(id=100_000_000_321, first_name="MAX", current_dialogue_id=1))
+        await session.commit()
+        log_id = await record_ai_attempt_log(
+            session,
+            user_id=100_000_000_321,
+            platform="max",
+            provider="KIE",
+            model="gemini-3-flash",
+            raw_response="",
+            status="error",
+            error_type=error_meta["error_type"],
+            error_message=error_meta["error_message"],
+            error_classification=error_meta["error_classification"],
+            http_status=error_meta["http_status"],
+            diagnostics=error_meta["diagnostics"],
+            provider_response_payload=error_meta["provider_response_payload"],
+        )
+    assert log_id is not None
+
+    monkeypatch.setattr(handlers, "async_session_maker", sessions)
+    tg_event = SimpleNamespace(answer=AsyncMock())
+    await handlers.show_ai_log_detail(tg_event, log_id)
+    tg_detail = tg_event.answer.await_args.args[0]
+    assert "KIE" in tg_detail
+    assert "gemini-3-flash" in tg_detail
+    assert "provider_rejection" in tg_detail
+    assert "The channel is not supported" in tg_detail
+
+    monkeypatch.setattr(max_admin_ai_logs, "async_session_maker", sessions)
+    max_client = SimpleNamespace(send_message=AsyncMock(), send_text_file=AsyncMock())
+    await max_admin_ai_logs.show_ai_logs_list(max_client, 321, status="error")
+    assert "Всего вызовов: <b>1</b>" in max_client.send_message.await_args.kwargs["text"]
+    await max_admin_ai_logs.show_ai_logs_list(max_client, 321, status="all")
+    assert "Всего вызовов: <b>1</b>" in max_client.send_message.await_args.kwargs["text"]
+    await max_admin_ai_logs.show_ai_log_detail(max_client, 321, log_id, status="error")
+    max_detail = max_client.send_message.await_args.kwargs["text"]
+    assert "KIE" in max_detail
+    assert "gemini-3-flash" in max_detail
+    assert "provider_rejection" in max_detail
+    assert "The channel is not supported" in max_detail
+    await max_admin_ai_logs.download_ai_log_file(max_client, 321, log_id)
+    downloaded = max_client.send_text_file.await_args.kwargs["content"]
+    assert "Provider: KIE" in downloaded
+    assert "HTTP Status: 200" in downloaded
+    assert "provider_code" in downloaded
+    assert "The channel is not supported" in downloaded
+
+    class ExportClient:
+        def __init__(self):
+            self.archive = None
+            self.sent = None
+
+        async def upload_file(self, _kind, path):
+            self.archive = Path(path).read_bytes()
+            return {"token": "kie-log-export"}
+
+        async def send_media_attachment(self, **kwargs):
+            self.sent = kwargs
+
+        async def send_message(self, **kwargs):
+            self.sent = kwargs
+
+    export_client = ExportClient()
+    await max_admin_ai_logs.export_ai_logs_package(export_client, 321, status="error")
+    assert export_client.archive is not None
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(export_client.archive)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        log_file = archive.read(manifest[0]["file"]).decode("utf-8")
+    assert manifest[0]["provider"] == "KIE"
+    assert manifest[0]["error_classification"] == "provider_rejection"
+    assert manifest[0]["provider_code"] == 422
+    assert manifest[0]["provider_message"] == "The channel is not supported"
+    assert "The channel is not supported" in log_file
+
+    async with sessions() as session:
+        stored = await session.get(AILog, log_id)
+        assert stored.provider == "KIE"
+        assert stored.model == "gemini-3-flash"
+        assert stored.http_status == 200
+        assert stored.error_classification == "provider_rejection"
+    await engine.dispose()

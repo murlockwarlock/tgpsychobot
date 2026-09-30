@@ -7,7 +7,7 @@ from ..api import MaxApiClient
 from ..keyboards import admin_ai_model_selection_keyboard, admin_ai_settings_keyboard, admin_ai_vision_models_keyboard, callback_button, inline_keyboard
 from ..legacy import AIConfig, AIModelSettings, async_session_maker
 from ..storage import StateStore
-from memory_mode import MEMORY_MODE_RESET, memory_mode_label, next_memory_mode, normalize_memory_mode
+from memory_mode import MEMORY_MODE_RESET, get_metadata_reset_mode, memory_mode_label, metadata_reset_mode_label, next_memory_mode, normalize_memory_mode
 from provider_models import (
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
@@ -335,10 +335,37 @@ async def show_common(client: MaxApiClient, chat_id: int) -> None:
     rows = [
         [callback_button("📌 Первые", "admin_ai_set_context_first"), callback_button("🔄 Последние", "admin_ai_set_context_recent")],
         [callback_button("🧠 Память", "admin_ai_cycle_memory_scope"), callback_button("⏱️ Таймаут ИИ", "admin_ai_set_timeout")],
+        [callback_button("Метаданные при новом диалоге", "admin_ai_metadata_reset")],
         [callback_button("💳 Порог KIE", "admin_ai_set_kie_threshold")],
         [callback_button("◀️ Назад", "admin_ai_keys")],
     ]
-    await client.send_message(chat_id=chat_id, text=f"<b>⚙️ Общие настройки</b>\n\nПервые сообщения: <b>{config.context_limit_first}</b>\nПоследние сообщения: <b>{config.context_limit_recent}</b>\nПамять: <b>{memory_mode_label(normalize_memory_mode(config))}</b>\nТаймаут ИИ: <b>{getattr(config, 'fallback_timeout', 60)} сек.</b>", attachments=inline_keyboard(rows))
+    await client.send_message(chat_id=chat_id, text=f"<b>⚙️ Общие настройки</b>\n\nПервые сообщения: <b>{config.context_limit_first}</b>\nПоследние сообщения: <b>{config.context_limit_recent}</b>\nПамять: <b>{memory_mode_label(normalize_memory_mode(config))}</b>\nМетаданные при новом диалоге: <b>{metadata_reset_mode_label(get_metadata_reset_mode(config))}</b>\nТаймаут ИИ: <b>{getattr(config, 'fallback_timeout', 60)} сек.</b>", attachments=inline_keyboard(rows))
+
+
+async def show_metadata_reset(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    mode = get_metadata_reset_mode(config)
+    rows = [
+        [callback_button(f"{'✅ ' if mode == 'reset' else ''}Сбрасывать", "admin_ai_set_metadata_reset_reset")],
+        [callback_button(f"{'✅ ' if mode == 'preserve' else ''}Сохранять", "admin_ai_set_metadata_reset_preserve")],
+        [callback_button("◀️ Назад", "admin_ai_common")],
+    ]
+    await client.send_message(
+        chat_id=chat_id,
+        text="<b>Метаданные при новом диалоге</b>\n\nСбрасывать — очищать диалоговые метаданные.\nСохранять — переносить только диалоговые метаданные, без истории и контекста.",
+        attachments=inline_keyboard(rows),
+    )
+
+
+async def set_metadata_reset(client: MaxApiClient, chat_id: int, mode: str) -> None:
+    if mode not in {"reset", "preserve"}:
+        await client.send_message(chat_id=chat_id, text="Недопустимое значение.")
+        return
+    async with async_session_maker() as session:
+        config = await _ensure_session_config(session)
+        config.metadata_reset_mode = mode
+        await session.commit()
+    await show_metadata_reset(client, chat_id)
 
 
 async def show_main_chat_provider_picker(client: MaxApiClient, chat_id: int) -> None:

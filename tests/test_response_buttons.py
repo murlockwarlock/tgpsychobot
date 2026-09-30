@@ -188,21 +188,242 @@ class ResponseButtonsTests(unittest.TestCase):
         self.assertTrue(should_start_test)
         self.assertEqual(clean_text, "Можно начинать.")
 
-    def test_extracts_buttons_wrapped_in_bold_or_code_markdown(self):
+    def test_extracts_buttons_wrapped_in_bold_markdown_but_keeps_inline_code(self):
         source = "Текст сообщения.\n\n**[Дальше](btn:after_photo)**\n`[Готов](btn:ready)`\n[**Дальше 2**](btn:after_photo_2)"
         text, rows = extract_response_buttons(source)
-        self.assertEqual(text, "Текст сообщения.")
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(text, "Текст сообщения.\n\n`[Готов](btn:ready)`")
+        self.assertEqual(len(rows), 2)
         self.assertEqual((rows[0][0].text, rows[0][0].value), ("Дальше", "after_photo"))
-        self.assertEqual((rows[1][0].text, rows[1][0].value), ("Готов", "ready"))
-        self.assertEqual((rows[2][0].text, rows[2][0].value), ("Дальше 2", "after_photo_2"))
+        self.assertEqual((rows[1][0].text, rows[1][0].value), ("Дальше 2", "after_photo_2"))
 
-    def test_unescapes_literal_newlines_in_text(self):
+    def test_keeps_literal_newlines_in_text(self):
         source = r"Первая строка.\n\nВторая строка.\n\n[Готов](btn:ready)"
         text, rows = extract_response_buttons(source)
-        self.assertEqual(text, "Первая строка.\n\nВторая строка.")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual((rows[0][0].text, rows[0][0].value), ("Готов", "ready"))
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_extracts_escaped_llm_button_lines(self):
+        source = (
+            "\\- [Что-то случилось]\\(btn:start_event)\n"
+            "\\- [Просто тяжело]\\(btn:start_heavy)\n"
+            "\\- [Хочу разобраться в себе]\\(btn:start_self)"
+        )
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for row in rows for button in row],
+            [
+                ("Что-то случилось", "action", "start_event"),
+                ("Просто тяжело", "action", "start_heavy"),
+                ("Хочу разобраться в себе", "action", "start_self"),
+            ],
+        )
+
+    def test_keeps_ordinary_markdown_bullets_visible(self):
+        source = "- [Documentation](https://example.com)\n- See [documentation](https://example.com) for details"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_ordinary_bullet_and_escaped_link_content_visible(self):
+        source = "• [Сайт](https://example.com)\n[Documentation]\\(https://example.com\\)"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_escaped_bullet_url_visible(self):
+        source = r"\- [Documentation](https://example.com)"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_escaped_bullet_prose_with_link_visible(self):
+        source = r"\- Read [Documentation](https://example.com) before continuing"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_inline_code_button_syntax_visible(self):
+        source = "До ` [Run](btn:test) ` и `[Run](btn:test)` после"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_literal_newline_button_syntax_visible(self):
+        source = r"Описание\n[Run](btn:test)"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_backslash_heavy_mathematical_text_visible(self):
+        source = r"\frac{a\(b\)}{c} and \[x\] and a\\b"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_non_button_bullets_and_escaped_prose(self):
+        source = "- обычный список\nМатематика: a\\(b\\)\n\\[не ссылка\\]"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_keeps_button_like_lines_inside_fenced_code(self):
+        source = "```markdown\n[Не кнопка](btn:no)\n```"
+
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_positive_exact_production_example(self):
+        source = (
+            "Или, если удобнее, начнём с простого: "
+            "[Хочу понять, что это такое](btn:what_is) "
+            "[Меня кое-что беспокоит в ребёнке](btn:concern) "
+            "[Как устроено и сколько стоит](btn:price)"
+        )
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "Или, если удобнее, начнём с простого:")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [(button.text, button.kind, button.value) for row in rows for button in row],
+            [
+                ("Хочу понять, что это такое", "action", "what_is"),
+                ("Меня кое-что беспокоит в ребёнке", "action", "concern"),
+                ("Как устроено и сколько стоит", "action", "price"),
+            ],
+        )
+
+    def test_inline_buttons_positive_multiple_buttons_with_whitespace(self):
+        source = "Текст [A](btn:a) [B](btn:b)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "Текст")
+        self.assertEqual(
+            [[(button.text, button.value) for button in row] for row in rows],
+            [[("A", "a")], [("B", "b")]],
+        )
+
+    def test_inline_buttons_positive_with_punctuation_and_conjunction(self):
+        source = "Выберите: [A](btn:a), [B](btn:b), или [C](btn:c)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "Выберите:")
+        self.assertEqual(
+            [[(button.text, button.value) for button in row] for row in rows],
+            [[("A", "a")], [("B", "b")], [("C", "c")]],
+        )
+
+    def test_inline_buttons_positive_pipe_keeps_same_row(self):
+        source = "Текст [A](btn:a) | [B](btn:b)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, "Текст")
+        self.assertEqual(
+            [[(button.text, button.value) for button in row] for row in rows],
+            [[("A", "a"), ("B", "b")]],
+        )
+
+    def test_inline_buttons_positive_multiline_prose_with_inline_cluster(self):
+        source = (
+            "Денис, я здесь. Расскажите своими словами, что вас привело — так будет проще, чем выбирать из кнопок.\n\n"
+            "Или, если удобнее, начнём с простого: "
+            "[Хочу понять, что это такое](btn:what_is) "
+            "[Меня кое-что беспокоит в ребёнке](btn:concern) "
+            "[Как устроено и сколько стоит](btn:price)"
+        )
+        text, rows = extract_response_buttons(source)
+
+        expected_body = (
+            "Денис, я здесь. Расскажите своими словами, что вас привело — так будет проще, чем выбирать из кнопок.\n\n"
+            "Или, если удобнее, начнём с простого:"
+        )
+        self.assertEqual(text, expected_body)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [button.value for row in rows for button in row],
+            ["what_is", "concern", "price"],
+        )
+
+    def test_inline_buttons_negative_keeps_inline_url_markdown_as_text(self):
+        source = "Подробнее в [документации](https://example.com) и продолжайте чтение."
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_fenced_code_untouched(self):
+        source = "```markdown\nТекст [A](btn:a) [B](btn:b)\n```"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_inline_code_untouched(self):
+        source = "Описание команды `[Run](btn:test)` в терминале."
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_escaped_prose_untouched(self):
+        source = r"Формула: \[Run\](btn:test) и обратный слэш a\b."
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_literal_escaped_newline_untouched(self):
+        source = r"Описание\n[Run](btn:test)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_keeps_math_and_backslashes_untouched(self):
+        source = r"Математика \frac{a\(b\)}{c} и \[x\] и a\\b"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_malformed_action_in_cluster_prevents_partial_extraction(self):
+        for malformed_source in [
+            "Текст [Да](btn:yes) [Сломано](btn:)",
+            "Текст [Да](btn:yes) [Сломано](btn:test",
+            "Текст [Да](btn:yes) Сломано](btn:test)",
+            f"Текст [Да](btn:yes) [Сломано](btn:{'x' * 31})",
+        ]:
+            text, rows = extract_response_buttons(malformed_source)
+            self.assertEqual(text, malformed_source)
+            self.assertEqual(rows, [])
+
+    def test_inline_buttons_negative_arbitrary_prose_between_buttons_prevents_partial_extraction(self):
+        source = "Нажмите [A](btn:a) если согласны, а потом [B](btn:b)"
+        text, rows = extract_response_buttons(source)
+
+        self.assertEqual(text, source)
+        self.assertEqual(rows, [])
+
 
 
 class ApiKeyDisplayTests(unittest.TestCase):

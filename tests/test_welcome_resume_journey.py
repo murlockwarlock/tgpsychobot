@@ -573,6 +573,13 @@ async def test_journey_5_technical_role_isolation(db_session, monkeypatch):
             assert m["role"] != "topic_welcome"
             assert m["role"] in ("user", "assistant", "test_result")
 
+    with patch.object(max_admin_clients, "_send_history_file", new_callable=AsyncMock) as mock_send_single:
+        await max_admin_clients.run_single_export(client, chat_id=999, target_user_id=max_uid, fmt="txt", anonymize=False)
+        txt_bytes = mock_send_single.call_args[0][2]
+        txt_content = txt_bytes.decode("utf-8")
+        assert "--- **Начало нового диалога №1** ---" in txt_content
+        assert "Привет MAX" in txt_content
+
     # 4. MAX mass export
     states_mass = StateStore()
     await states_mass.set(999, 999, "admin_export", {"export_all": True})
@@ -584,6 +591,12 @@ async def test_journey_5_technical_role_isolation(db_session, monkeypatch):
         for u in parsed_mass:
             for m in u.get("messages", []):
                 assert m["role"] != "topic_welcome"
+
+    with patch.object(max_admin_export, "_send_export_file", new_callable=AsyncMock) as mock_send_mass:
+        await max_admin_export.run_mass_export(client, states=states_mass, chat_id=999, user_id=999, fmt="txt", anonymize=False)
+        mass_txt = mock_send_mass.call_args[0][2].decode("utf-8")
+        assert "--- **Начало нового диалога №1** ---" in mass_txt
+        assert "Привет MAX" in mass_txt
 
     # 5. TG admin history paging
     callback = SimpleNamespace(
@@ -631,6 +644,43 @@ async def test_journey_5_technical_role_isolation(db_session, monkeypatch):
         assert len(parsed_tg) >= 1
         for m in parsed_tg:
             assert m["role"] != "topic_welcome"
+
+    cb_export_txt = SimpleNamespace(
+        id="cb_exp_txt",
+        from_user=SimpleNamespace(id=999, username="admin"),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=999, type="private"),
+            message_id=10,
+            answer=AsyncMock(return_value=thinking_msg),
+            answer_document=AsyncMock(),
+        ),
+        data="run_single_txt_no_1001_all",
+        answer=AsyncMock(),
+    )
+    with patch.object(handlers, "is_admin", AsyncMock(return_value=True)):
+        await handlers.process_single_export(cb_export_txt, bot)
+        tg_txt_file = cb_export_txt.message.answer_document.call_args[0][0]
+        tg_txt_bytes = tg_txt_file.data if hasattr(tg_txt_file, "data") else tg_txt_file.file.read()
+        assert "--- **Начало нового диалога №1** ---" in tg_txt_bytes.decode("utf-8")
+
+    tg_mass_state = make_mock_state({"export_all": True, "export_kind": "history"})
+    cb_mass_export = SimpleNamespace(
+        id="cb_mass_exp",
+        from_user=SimpleNamespace(id=999, username="admin"),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=999, type="private"),
+            message_id=10,
+            edit_text=AsyncMock(),
+            answer_document=AsyncMock(),
+        ),
+        data="run_export_txt_no",
+        answer=AsyncMock(),
+    )
+    with patch.object(handlers, "is_admin", AsyncMock(return_value=True)):
+        await handlers.process_mass_export(cb_mass_export, tg_mass_state, bot)
+        tg_mass_file = cb_mass_export.message.answer_document.call_args[0][0]
+        tg_mass_bytes = tg_mass_file.data if hasattr(tg_mass_file, "data") else tg_mass_file.file.read()
+        assert "--- **Начало нового диалога №1** ---" in tg_mass_bytes.decode("utf-8")
 
 
 # ==============================================================================
@@ -2648,4 +2698,3 @@ async def test_ux_parity_already_current_topic_preserves_pr22(db_session, monkey
 
         bot.send_message.assert_not_called()
         mock_kickoff.assert_not_called()
-

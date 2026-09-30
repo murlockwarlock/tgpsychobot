@@ -116,6 +116,144 @@ class MaxChunkedResponseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[1][1]["type"], "link")
         self.assertEqual(rows[1][1]["url"], "https://example.com")
 
+    async def test_max_real_handle_update_inline_action_journey(self):
+        import asyncio
+        from max_messenger_bot.api import MaxApiClient
+        from max_messenger_bot.app import MaxBotApplication
+        from max_messenger_bot.services import common as max_common
+        from max_messenger_bot import app as max_app
+        from database import User
+
+        raw_llm_response = (
+            "Денис, я здесь. Расскажите своими словами, что вас привело — так будет проще, чем выбирать из кнопок.\n\n"
+            "Или, если удобнее, начнём с простого: "
+            "[Хочу понять, что это такое](btn:what_is) "
+            "[Меня кое-что беспокоит в ребёнке](btn:concern) "
+            "[Как устроено и сколько стоит](btn:price)"
+        )
+
+        # 1. Shared parser extraction
+        clean_text, response_buttons = extract_response_buttons(raw_llm_response)
+        expected_body = (
+            "Денис, я здесь. Расскажите своими словами, что вас привело — так будет проще, чем выбирать из кнопок.\n\n"
+            "Или, если удобнее, начнём с простого:"
+        )
+        self.assertEqual(clean_text, expected_body)
+        self.assertEqual(len(response_buttons), 3)
+
+        # 2. Actual MaxApiClient boundary recording outgoing requests
+        class _MaxBoundaryClient(MaxApiClient):
+            def __init__(self):
+                super().__init__("test-token", "https://max.test")
+                self.requests = []
+
+            async def _request(self, method: str, path: str, *, params=None, json_data=None):
+                self.requests.append({
+                    "method": method,
+                    "path": path,
+                    "params": params or {},
+                    "body": json_data or {},
+                })
+                return {"message": {"body": {"mid": "journey-mid-1"}}}
+
+        client = _MaxBoundaryClient()
+
+        # Send through MAX delivery runtime
+        await _send_ai_text(client, 12345, "thinking-1", [clean_text], response_buttons=response_buttons)
+
+        # 3. Verify outgoing message and rendered keyboard from actual client request
+        self.assertTrue(len(client.requests) >= 1)
+        sent_request = client.requests[-1]
+        self.assertEqual(sent_request["body"]["text"], expected_body)
+        attachments = sent_request["body"]["attachments"]
+        self.assertTrue(attachments)
+        self.assertEqual(attachments[0]["type"], "inline_keyboard")
+
+        rendered_rows = attachments[0]["payload"]["buttons"]
+        # Exactly 3 action button rows + 1 main menu row
+        self.assertEqual(len(rendered_rows), 4)
+        rendered_action_buttons = [button for row in rendered_rows[:-1] for button in row]
+        self.assertEqual(len(rendered_action_buttons), 3)
+        self.assertEqual(
+            [(b["text"], b["type"], b["payload"]) for b in rendered_action_buttons],
+            [
+                ("Хочу понять, что это такое", "callback", "ai_btn:what_is"),
+                ("Меня кое-что беспокоит в ребёнке", "callback", "ai_btn:concern"),
+                ("Как устроено и сколько стоит", "callback", "ai_btn:price"),
+            ],
+        )
+
+        # Verify callback classification contract: 3/3 classified, 0 missing
+        for b in rendered_action_buttons:
+            self.assertTrue(b["payload"].startswith("ai_btn:"))
+
+        # 4. Extract chosen button directly FROM THE REAL RENDERED KEYBOARD
+        chosen_button = rendered_rows[1][0]
+        chosen_payload = chosen_button["payload"]
+        chosen_label = chosen_button["text"]
+        self.assertEqual(chosen_label, "Меня кое-что беспокоит в ребёнке")
+        self.assertEqual(chosen_payload, "ai_btn:concern")
+
+        # 5. Construct incoming update from rendered payload
+        update = {
+            "update_type": "message_callback",
+            "update_id": "journey-update-101",
+            "callback": {
+                "callback_id": "cb-max-journey-1",
+                "payload": chosen_payload,
+                "user": {
+                    "user_id": 888,
+                    "first_name": "Денис",
+                },
+            },
+            "message": {
+                "recipient": {"chat_id": 12345},
+                "body": {
+                    "mid": "msg-max-1",
+                    "attachments": attachments,
+                },
+            },
+        }
+
+        # 6. Route through real MaxBotApplication.handle_update()
+        app = MaxBotApplication(client=client)
+
+        mock_user = SimpleNamespace(
+            id=888,
+            current_dialogue_id=1,
+            current_topic_id=None,
+            subscription=None,
+        )
+
+        class _MockSession:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def get(self, *args, **kwargs):
+                return mock_user
+
+        run_ai = AsyncMock()
+        with patch.object(max_common, "ensure_user", AsyncMock()), \
+             patch.object(max_app, "async_session_maker", lambda: _MockSession()), \
+             patch.object(max_common, "ensure_access_before_chat", AsyncMock(return_value=True)), \
+             patch.object(max_common, "run_ai_dialogue", run_ai):
+            await app.handle_update(update)
+            if app.background_tasks:
+                await asyncio.gather(*app.background_tasks)
+
+        # 7. Verify callback answered and normal action semantics executed
+        answer_calls = [r for r in client.requests if r["path"] == "/answers" or "callback" in r["path"]]
+        self.assertTrue(answer_calls)
+
+        run_ai.assert_awaited_once()
+        awaited_prompt = run_ai.await_args.args[3]
+        expected_system_prompt = (
+            f'[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь нажал кнопку "{chosen_label}" (concern)]'
+        )
+        self.assertEqual(awaited_prompt, expected_system_prompt)
+
+
 
 class MaxReferralNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_referrer_receives_registration_bonus_notification(self):

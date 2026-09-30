@@ -29,10 +29,14 @@ from database import (
     async_session_maker,
 )
 from automation_events import condition_value_matches, resolve_condition_path
+from canonical_content import canonical_markup_to_html, split_canonical_html
 from memory_mode import MEMORY_MODE_GLOBAL, get_memory_mode
 from response_buttons import ResponseButton, extract_response_buttons
 from user_metadata import extract_service_data, load_metadata
 from translation_service import refresh_translation_cache, resolve_user_effective_locale, translate
+from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
+from max_messenger_bot.keyboards import response_buttons_keyboard as max_response_buttons_keyboard
+from max_messenger_bot.models import extract_sent_message_id
 
 
 log = logging.getLogger(__name__)
@@ -94,6 +98,25 @@ class FollowupStepSendResult:
     history_text: str
     telegram_message_id: int | None
     response_button_rows: list[list[ResponseButton]] | None = None
+    raw_text: str | None = None
+    platform: str | None = None
+    external_message_id: str | None = None
+
+
+@dataclass(frozen=True)
+class FollowupTransportRegistry:
+    telegram: object | None = None
+    max_client: object | None = None
+
+
+def _followup_platform(user_id: int) -> str:
+    return "max" if is_max_user_id(user_id) else "telegram"
+
+
+def _normalize_followup_transports(value) -> FollowupTransportRegistry:
+    if isinstance(value, FollowupTransportRegistry):
+        return value
+    return FollowupTransportRegistry(telegram=value)
 
 
 class FollowupPreparationError(Exception):
@@ -139,6 +162,13 @@ FOLLOWUP_ATTEMPT_CANCELLED = "cancelled"
 FOLLOWUP_ATTEMPT_DELIVERED = "delivered"
 FOLLOWUP_ATTEMPT_UNCERTAIN = "uncertain"
 FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED = "retry_exhausted"
+FOLLOWUP_STEP_DELETE_PROTECTED_ATTEMPT_STATUSES = (
+    FOLLOWUP_ATTEMPT_CLAIMED,
+    FOLLOWUP_ATTEMPT_RETRYABLE,
+    FOLLOWUP_ATTEMPT_UNCERTAIN,
+    FOLLOWUP_ATTEMPT_DELIVERED,
+    FOLLOWUP_ATTEMPT_RETRY_EXHAUSTED,
+)
 FOLLOWUP_RUN_UNCERTAIN = "uncertain"
 FOLLOWUP_RUN_RETRY_EXHAUSTED = "retry_exhausted"
 FOLLOWUP_ATTEMPT_STALE_AFTER = timedelta(minutes=15)
@@ -438,7 +468,7 @@ async def prepare_followup_step(
         recipient_locale = await resolve_user_effective_locale(
             session,
             user,
-            platform="max" if user.id >= 100_000_000_000 else "telegram",
+            platform=_followup_platform(user.id),
         )
     if step.message_type == "ai":
         try:
@@ -460,10 +490,16 @@ async def prepare_followup_step(
             if not isinstance(text, str) or not text.strip():
                 raise FollowupStepExecutionError("AI вернул пустое догоняющее сообщение")
             visible_text, _, _ = extract_service_data(text)
-            history_text, _ = extract_response_buttons(visible_text)
-            if not visible_text or not visible_text.strip():
+            display_text, response_button_rows = extract_response_buttons(visible_text)
+            if not display_text or not display_text.strip():
                 raise FollowupStepExecutionError("AI не подготовил видимое догоняющее сообщение")
-            return FollowupStepSendResult(text, history_text, None)
+            return FollowupStepSendResult(
+                display_text,
+                display_text,
+                None,
+                response_button_rows,
+                raw_text=text,
+            )
         except FollowupStepExecutionError:
             raise
         except Exception as exc:
@@ -485,36 +521,54 @@ async def prepare_followup_step(
 
 
 async def emit_followup_step(
-    bot,
+    transports,
     *,
     user: User,
     step,
     send_result: FollowupStepSendResult,
 ) -> FollowupStepSendResult:
     validate_followup_step(step)
-    if step.message_type == "ai":
-        from handlers import _send_generated_response
+    registry = _normalize_followup_transports(transports)
+    platform = _followup_platform(user.id)
+    if platform == "max":
+        client = registry.max_client
+        if client is None:
+            raise FollowupStepExecutionError("MAX transport is not configured")
+        from max_messenger_bot.formatting import translate_telegram_links_to_max
 
-        await _send_generated_response(bot, user.id, send_result.text)
-        return send_result
-    if not send_result.response_button_rows:
-        sent = await bot.send_message(user.id, send_result.text)
+        display_text = translate_telegram_links_to_max(send_result.history_text or send_result.text)
+        chunks = split_canonical_html(canonical_markup_to_html(display_text), max_length=3900)
+        attachments = max_response_buttons_keyboard(send_result.response_button_rows or []) if send_result.response_button_rows else None
+        sent = None
+        for index, chunk in enumerate(chunks):
+            sent = await client.send_message(
+                user_id=raw_max_user_id(user.id),
+                text=chunk,
+                attachments=attachments if index == len(chunks) - 1 else None,
+            )
         return FollowupStepSendResult(
             send_result.text,
             send_result.history_text,
-            getattr(sent, "message_id", None),
+            None,
+            send_result.response_button_rows,
+            raw_text=send_result.raw_text,
+            platform="max",
+            external_message_id=extract_sent_message_id(sent),
         )
 
-    from handlers import (
-        _safe_send_html,
-        _telegram_response_buttons_markup,
-        markdown_to_html,
-        split_html_text,
-    )
+    bot = registry.telegram
+    if bot is None:
+        raise FollowupStepExecutionError("Telegram transport is not configured")
+    if step.message_type == "ai":
+        from handlers import _send_generated_response
 
-    reply_markup = _telegram_response_buttons_markup(send_result.response_button_rows)
+        await _send_generated_response(bot, user.id, send_result.raw_text or send_result.text)
+        return send_result
+    from handlers import _telegram_response_buttons_markup
+
+    reply_markup = _telegram_response_buttons_markup(send_result.response_button_rows or [])
     visible_text = send_result.history_text or "Выберите действие:"
-    chunks = split_html_text(markdown_to_html(visible_text))
+    chunks = split_canonical_html(canonical_markup_to_html(visible_text))
     sent = None
     for index, chunk in enumerate(chunks):
         chunk_markup = reply_markup if index == len(chunks) - 1 else None
@@ -528,11 +582,14 @@ async def emit_followup_step(
                 reply_markup=markup,
             )
 
-        await _safe_send_html(send_chunk, chunk)
+        await send_chunk(chunk, "HTML")
     return FollowupStepSendResult(
         send_result.text,
         send_result.history_text,
         getattr(sent, "message_id", None),
+        send_result.response_button_rows,
+        raw_text=send_result.raw_text,
+        platform="telegram",
     )
 
 
@@ -551,7 +608,10 @@ async def send_followup_step(
         topic_id=topic_id,
     )
     return await emit_followup_step(
-        bot,
+        FollowupTransportRegistry(
+            max_client=bot if _followup_platform(user.id) == "max" else None,
+            telegram=bot if _followup_platform(user.id) == "telegram" else None,
+        ),
         user=user,
         step=step,
         send_result=send_result,
@@ -1311,7 +1371,7 @@ async def _complete_delivery_claim(
                 user_id=claim.user.id,
                 role="assistant",
                 content=send_result.history_text or "Выберите действие:",
-                ai_context_content=send_result.text if claim.step.message_type == "ai" else None,
+                ai_context_content=(send_result.raw_text or send_result.text) if claim.step.message_type == "ai" else None,
                 dialogue_id=claim.dialogue_id,
                 topic_id=None if claim.topic_id == 0 else claim.topic_id,
             ))
@@ -1320,6 +1380,8 @@ async def _complete_delivery_claim(
                 step_id=claim.step_id,
                 generation=claim.generation,
                 telegram_message_id=send_result.telegram_message_id,
+                platform=send_result.platform or _followup_platform(claim.user.id),
+                external_message_id=send_result.external_message_id,
             ))
         attempt.status = FOLLOWUP_ATTEMPT_DELIVERED
         attempt.finished_at = now
@@ -1462,6 +1524,15 @@ async def process_due_followups(bot, *, limit: int = 100) -> int:
                 f"Follow-up step configuration is invalid: {exc}",
                 cancel_run=True,
             )
+            continue
+        except FollowupStepExecutionError as exc:
+            log.warning(
+                "Follow-up transport is unavailable: run=%s step=%s error=%s",
+                claim.run_id,
+                claim.step_id,
+                exc,
+            )
+            await _schedule_preparation_retry(claim, f"Follow-up transport unavailable: {exc}")
             continue
         except Exception as exc:
             log.exception(

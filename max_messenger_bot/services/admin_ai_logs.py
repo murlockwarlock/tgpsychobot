@@ -580,9 +580,17 @@ async def export_ai_logs_package(
                     "attempt_role": getattr(log_entry, "attempt_role", None) or "primary",
                     "error_type": getattr(log_entry, "error_type", None),
                     "error_classification": getattr(log_entry, "error_classification", None),
+                    "http_status": getattr(log_entry, "http_status", None),
                     "latency_ms": log_entry.latency_ms,
                     "file": filename,
                 }
+                try:
+                    diagnostics = json.loads(getattr(log_entry, "diagnostics_json", None) or "{}")
+                except (TypeError, ValueError):
+                    diagnostics = {}
+                if isinstance(diagnostics, dict):
+                    entry_data["provider_code"] = diagnostics.get("provider_code")
+                    entry_data["provider_message"] = diagnostics.get("provider_message")
                 if platform == "max":
                     entry_data["max_id"] = raw_max_user_id(log_entry.user_id) if log_entry.user_id is not None else None
                 elif platform == "telegram":
@@ -653,4 +661,3 @@ async def export_ai_logs_package(
                 Path(tmp_path).unlink()
             except Exception:
                 pass
-

@@ -5,6 +5,7 @@ from typing import Any
 
 from aiohttp import web
 from sqlalchemy import select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 
 from .api import MaxApiClient
@@ -24,6 +25,7 @@ from .services import admin_kb as admin_kb_service
 from .services import admin_mailing as admin_mailing_service
 from .services import admin_payments as admin_payments_service
 from .services import admin_test_content as admin_test_content_service
+from .services import admin_followups as admin_followups_service
 from .services import admin_tests as admin_tests_service
 from .services import admin_topics as admin_topics_service
 from .services import admin_referral as admin_referral_service
@@ -31,7 +33,7 @@ from .services import admin_collections as admin_collections_service
 from .services import admin_topic_media as admin_topic_media_service
 from .services import common, settings as settings_service, subscriptions as subscriptions_service, tests as tests_service, topics as topics_service
 from .settings import get_settings, validate_webhook_runtime_settings
-from .keyboards import inline_keyboard, main_menu_row
+from .keyboards import callback_button, inline_keyboard, main_menu_row
 from .identity import is_max_user_id
 from response_buttons import MAIN_TOPIC_ACTIONS, build_ai_button_system_message, split_action_callback_data
 from .storage import StateStore, init_storage
@@ -150,13 +152,20 @@ class MaxBotApplication:
         self._processed_updates: set[str] = set()
         self._processed_updates_list: list[str] = []
 
-    def spawn_user_task(self, user_id: int, coro) -> None:
+    def spawn_user_task(self, user_id: int, coro, on_complete=None) -> asyncio.Task[None]:
         lock = self._user_locks.setdefault(user_id, asyncio.Lock())
 
         async def runner() -> None:
             try:
                 async with lock:
-                    await coro
+                    try:
+                        await coro
+                    finally:
+                        if on_complete is not None:
+                            try:
+                                await on_complete()
+                            except Exception:
+                                log.exception("MAX user task completion callback failed user_id=%s", user_id)
             except asyncio.CancelledError:
                 if asyncio.iscoroutine(coro):
                     coro.close()
@@ -166,6 +175,14 @@ class MaxBotApplication:
         self.user_tasks[user_id] = task
         task.add_done_callback(lambda t: self.user_tasks.pop(user_id, None) if self.user_tasks.get(user_id) is t else None)
         _track_task(self.background_tasks, task)
+        return task
+
+    async def _spawn_message_topic_task(self, user_id: int, coro, on_complete=None) -> asyncio.Task[None]:
+        previous_task = self.user_tasks.get(user_id)
+        task = self.spawn_user_task(user_id, coro, on_complete=on_complete)
+        if previous_task is None or previous_task.done():
+            await task
+        return task
 
     def spawn_ai_user_task(self, user_id: int, coro, lease: SingleFlightLease) -> None:
         lock = self._user_locks.setdefault(user_id, asyncio.Lock())
@@ -242,7 +259,7 @@ class MaxBotApplication:
         except Exception:
             log.exception("Failed to notify user about update failure update_type=%s", update_type)
 
-    async def _handle_start_command(self, chat_id: int, user_id: int, start_payload: str | None) -> None:
+    async def _handle_start_command(self, chat_id: int, user_id: int, start_payload: str | None, on_topic_switch_complete=None):
         if start_payload and start_payload.startswith("topic_"):
             try:
                 topic_id = int(start_payload.split("_", 1)[1])
@@ -250,14 +267,113 @@ class MaxBotApplication:
                 topic_id = None
             if topic_id is not None:
                 await common.show_start_screen(self.client, chat_id, user_id, start_payload=None, states=self.states, skip_content=True)
-                self.spawn_user_task(
+                return await self._spawn_message_topic_task(
                     user_id,
                     topics_service.select_topic(self.client, chat_id, user_id, topic_id, self.states),
+                    on_complete=on_topic_switch_complete,
                 )
-                return
         await common.show_start_screen(self.client, chat_id, user_id, start_payload, self.states)
 
+    async def _followup_scope(self, user_id: int) -> tuple[int, int] | None:
+        async with async_session_maker() as session:
+            user = await session.get(User, user_id)
+        if user is None:
+            return None
+        return user.current_dialogue_id or 1, user.current_topic_id or 0
+
+    async def _begin_max_followup_activity(self, user_id: int):
+        if not is_max_user_id(user_id):
+            return None
+        if await common.is_admin(user_id):
+            return None
+        scope = await self._followup_scope(user_id)
+        if scope is None:
+            return None
+        from followups import begin_user_activity
+
+        return await begin_user_activity(user_id, dialogue_id=scope[0], topic_id=scope[1])
+
+    async def _finalize_max_followup_activity(self, user_id: int, ingress) -> None:
+        if ingress is None or not is_max_user_id(user_id):
+            return
+        scope = await self._followup_scope(user_id)
+        if scope is None:
+            return
+        from followups import finalize_user_activity
+
+        await finalize_user_activity(
+            user_id,
+            ingress,
+            dialogue_id=scope[0],
+            topic_id=scope[1],
+        )
+
+    async def _invalidate_stale_followup_callback_state(self, user_id: int, data: str) -> None:
+        try:
+            snapshot = await self.states.get(user_id)
+        except OperationalError:
+            log.warning("MAX follow-up state store is unavailable during callback invalidation user_id=%s", user_id)
+            return
+        if snapshot is None or snapshot.state not in admin_followups_service.MAX_FOLLOWUP_INPUT_STATES:
+            return
+        campaign_id = snapshot.data.get("campaign_id")
+        valid_metadata_callback = (
+            snapshot.state == "max_followup_metadata_operator"
+            and data.startswith(f"admin_fu_metadata_op_{campaign_id}_")
+        ) or (
+            snapshot.state == "max_followup_metadata_value"
+            and data == f"admin_fu_metadata_operator_edit_{campaign_id}"
+        )
+        if valid_metadata_callback:
+            return
+        await self.states.clear(user_id)
+
+    async def _guard_followup_input_state(self, user_id: int, snapshot, chat_id: int) -> bool:
+        if snapshot is None or snapshot.state not in admin_followups_service.MAX_FOLLOWUP_INPUT_STATES:
+            return True
+        if not await common.is_admin(user_id):
+            await self.states.clear(user_id)
+            await self.client.send_message(chat_id=chat_id, text="Недостаточно прав администратора.")
+            return False
+        if not await admin_followups_service.validate_followup_input_state(snapshot):
+            await self.states.clear(user_id)
+            await self.client.send_message(chat_id=chat_id, text="Состояние редактирования устарело. Откройте экран ещё раз.")
+            return False
+        return True
+
     async def handle_message(self, message: IncomingMessage, force_start: bool = False) -> None:
+        await common.ensure_user(
+            message.sender.user_id,
+            message.sender.username,
+            message.sender.full_name,
+            public_name=message.sender.public_name,
+        )
+        ingress = None
+        try:
+            ingress = await self._begin_max_followup_activity(message.sender.user_id)
+        except Exception:
+            log.exception("Could not begin MAX follow-up activity user_id=%s", message.sender.user_id)
+        topic_switch_completion = None
+        if ingress is not None:
+            async def finalize_topic_switch_activity():
+                await self._finalize_max_followup_activity(message.sender.user_id, ingress)
+
+            topic_switch_completion = finalize_topic_switch_activity
+        try:
+            topic_task = await self._handle_message_impl(
+                message,
+                force_start=force_start,
+                on_topic_switch_complete=topic_switch_completion,
+            )
+            if isinstance(topic_task, asyncio.Task):
+                ingress = None
+        finally:
+            try:
+                await self._finalize_max_followup_activity(message.sender.user_id, ingress)
+            except Exception:
+                log.exception("Could not finalize MAX follow-up activity user_id=%s", message.sender.user_id)
+
+    async def _handle_message_impl(self, message: IncomingMessage, force_start: bool = False, on_topic_switch_complete=None):
         log.info(
             "Incoming message user_id=%s chat_id=%s force_start=%s text=%s",
             message.sender.user_id,
@@ -265,15 +381,13 @@ class MaxBotApplication:
             force_start,
             (message.text or "")[:300],
         )
-        await common.ensure_user(
-            message.sender.user_id,
-            message.sender.username,
-            message.sender.full_name,
-            public_name=message.sender.public_name,
-        )
         if force_start:
-            await self._handle_start_command(message.chat_id, message.sender.user_id, message.start_payload)
-            return
+            return await self._handle_start_command(
+                message.chat_id,
+                message.sender.user_id,
+                message.start_payload,
+                on_topic_switch_complete=on_topic_switch_complete,
+            )
 
         text = (message.text or "").strip()
         state = await self.states.get(message.sender.user_id)
@@ -285,7 +399,67 @@ class MaxBotApplication:
         if state and text.startswith("/"):
             await self.states.clear(message.sender.user_id)
             state = None
+        if state and not await self._guard_followup_input_state(
+            message.sender.user_id,
+            state,
+            message.chat_id,
+        ):
+            return
         if state:
+            if state.state == "max_followup_campaign_name":
+                await admin_followups_service.receive_campaign_name(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_campaign_rename":
+                await admin_followups_service.receive_rename(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_stage_values":
+                await admin_followups_service.receive_stage_values(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_metadata_field":
+                await admin_followups_service.receive_metadata_field(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_metadata_value":
+                await admin_followups_service.receive_metadata_value(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_stop_events":
+                await admin_followups_service.receive_stops(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_step_add":
+                await admin_followups_service.receive_step_add(
+                    self.client,
+                    self.states,
+                    message.chat_id,
+                    message.sender.user_id,
+                    text,
+                    formatted_value=message.html_text,
+                )
+                return
+            if state.state == "max_followup_step_edit":
+                await admin_followups_service.receive_step_edit(
+                    self.client,
+                    self.states,
+                    message.chat_id,
+                    message.sender.user_id,
+                    text,
+                    formatted_value=message.html_text,
+                )
+                return
+            if state.state == "max_followup_step_text":
+                await admin_followups_service.receive_step_text(
+                    self.client,
+                    self.states,
+                    message.chat_id,
+                    message.sender.user_id,
+                    text,
+                    formatted_value=message.html_text,
+                )
+                return
+            if state.state == "max_followup_quiet":
+                await admin_followups_service.receive_quiet(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
+            if state.state == "max_followup_jitter":
+                await admin_followups_service.receive_jitter(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                return
             if state.state in common.MEDIA_COLLECTION_ADMIN_STATES and not await common.require_media_collection_admin(
                 self.client,
                 self.states,
@@ -696,11 +870,11 @@ class MaxBotApplication:
 
         topic_by_name = next((topic for topic in topics if topic.name == text and topic.show_in_main_menu), None)
         if topic_by_name:
-            self.spawn_user_task(
+            return await self._spawn_message_topic_task(
                 message.sender.user_id,
                 topics_service.select_topic(self.client, message.chat_id, message.sender.user_id, topic_by_name.id, self.states),
+                on_complete=on_topic_switch_complete,
             )
-            return
 
         async with async_session_maker() as session:
             content = await session.scalar(select(Content).where(Content.button_title == text, Content.is_visible == True).limit(1))
@@ -795,7 +969,6 @@ class MaxBotApplication:
 
 
     async def handle_callback(self, callback: IncomingCallback) -> None:
-        log.info("Incoming callback user_id=%s chat_id=%s payload=%s", callback.sender.user_id, callback.chat_id, callback.payload)
         if is_max_user_id(callback.sender.user_id):
             await common.ensure_user(
                 callback.sender.user_id,
@@ -803,9 +976,25 @@ class MaxBotApplication:
                 callback.sender.full_name,
                 public_name=callback.sender.public_name,
             )
+        ingress = None
+        try:
+            ingress = await self._begin_max_followup_activity(callback.sender.user_id)
+        except Exception:
+            log.exception("Could not begin MAX follow-up activity user_id=%s", callback.sender.user_id)
+        try:
+            await self._handle_callback_impl(callback)
+        finally:
+            try:
+                await self._finalize_max_followup_activity(callback.sender.user_id, ingress)
+            except Exception:
+                log.exception("Could not finalize MAX follow-up activity user_id=%s", callback.sender.user_id)
+
+    async def _handle_callback_impl(self, callback: IncomingCallback) -> None:
+        log.info("Incoming callback user_id=%s chat_id=%s payload=%s", callback.sender.user_id, callback.chat_id, callback.payload)
         data = callback.payload
         user_id = callback.sender.user_id
         chat_id = callback.chat_id
+        await self._invalidate_stale_followup_callback_state(user_id, data)
 
         if data == "main_menu":
             await self.client.answer_callback(callback.callback_id)
@@ -830,11 +1019,11 @@ class MaxBotApplication:
                 await topics_service.show_topics(self.client, chat_id, user_id)
                 return
             if action in MAIN_TOPIC_ACTIONS:
-                self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
+                await self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
                 return
             if (action.startswith("topic_") and action[6:].isdigit() and int(action[6:]) > 0) or (action.startswith("svc:topic:") and action[10:].isdigit() and int(action[10:]) > 0):
                 topic_id = int(action[10:] if action.startswith("svc:topic:") else action[6:])
-                self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, topic_id, self.states))
+                await self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, topic_id, self.states))
                 return
             if action in ("subscription", "svc:subscription"):
                 await subscriptions_service.show_subscription_info(self.client, chat_id, user_id)
@@ -937,11 +1126,11 @@ class MaxBotApplication:
             return
         if data.startswith("select_topic_"):
             await self.client.answer_callback(callback.callback_id)
-            self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states))
+            await self.spawn_user_task(user_id, topics_service.select_topic(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states))
             return
         if data == "reset_topic":
             await self.client.answer_callback(callback.callback_id)
-            self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
+            await self.spawn_user_task(user_id, topics_service.reset_topic(self.client, chat_id, user_id, self.states))
             return
         if data.startswith("confirm_reset_dialogue:"):
             await self.client.answer_callback(callback.callback_id)
@@ -950,11 +1139,11 @@ class MaxBotApplication:
                 token = parts[1]
                 expected_dialogue_id = int(parts[2])
                 expected_topic_id = int(parts[3])
-                self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, token, expected_dialogue_id, expected_topic_id))
+                await self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, token, expected_dialogue_id, expected_topic_id))
             elif len(parts) == 3:
                 expected_dialogue_id = int(parts[1])
                 expected_topic_id = int(parts[2])
-                self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, "", expected_dialogue_id, expected_topic_id))
+                await self.spawn_user_task(user_id, common.execute_dialogue_reset(self.client, self.states, chat_id, user_id, "", expected_dialogue_id, expected_topic_id))
             return
         if data.startswith("cancel_reset_dialogue"):
             await self.client.answer_callback(callback.callback_id)
@@ -1021,6 +1210,130 @@ class MaxBotApplication:
             await self.client.send_message(chat_id=chat_id, text="Я здесь. Можем обсудить результаты или любой другой вопрос.")
             return
         if await common.is_admin(user_id):
+            if data == "admin_followups":
+                await self.states.clear(user_id)
+                await admin_followups_service.show_campaigns(self.client, chat_id)
+                return
+            if data == "admin_fu_list":
+                await self.states.clear(user_id)
+                await admin_followups_service.show_campaigns(self.client, chat_id)
+                return
+            if data == "admin_fu_add":
+                await admin_followups_service.start_campaign_add(self.client, self.states, chat_id, user_id)
+                return
+            if data.startswith("admin_fu_campaign_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_campaign(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_toggle_"):
+                await admin_followups_service.toggle_campaign(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_rename_"):
+                await admin_followups_service.start_rename(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_topics_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_topics(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_scope_all_"):
+                await admin_followups_service.toggle_scope(self.client, chat_id, int(data.rsplit("_", 1)[1]), "all")
+                return
+            if data.startswith("admin_fu_scope_main_"):
+                await admin_followups_service.toggle_scope(self.client, chat_id, int(data.rsplit("_", 1)[1]), "main")
+                return
+            if data.startswith("admin_fu_scope_topic_"):
+                parts = data.split("_")
+                await admin_followups_service.toggle_scope(self.client, chat_id, int(parts[4]), "topic", int(parts[5]))
+                return
+            if data.startswith("admin_fu_conditions_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_conditions(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_stage_mode_"):
+                parts = data.split("_")
+                await admin_followups_service.select_stage_mode(self.client, self.states, chat_id, user_id, int(parts[4]), parts[5])
+                return
+            if data.startswith("admin_fu_stage_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_stage_picker(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_metadata_op_"):
+                parts = data.split("_")
+                await admin_followups_service.select_metadata_operator(self.client, self.states, chat_id, user_id, int(parts[4]), parts[5])
+                return
+            if data.startswith("admin_fu_metadata_operator_edit_"):
+                await admin_followups_service.show_metadata_operator(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_metadata_clear_"):
+                await admin_followups_service.clear_metadata(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_metadata_"):
+                await admin_followups_service.start_metadata(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_stops_clear_"):
+                await admin_followups_service.clear_stops(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_stops_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.start_stops(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_steps_"):
+                await self.states.clear(user_id)
+                await admin_followups_service.show_steps(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_step_add_"):
+                parts = data.split("_")
+                await admin_followups_service.start_step_add(self.client, self.states, chat_id, user_id, int(parts[4]), parts[5])
+                return
+            if data.startswith("admin_fu_step_edit_"):
+                parts = data.split("_")
+                await admin_followups_service.start_step_edit(self.client, self.states, chat_id, user_id, int(parts[4]), int(parts[5]))
+                return
+            if data.startswith("admin_fu_step_text_"):
+                parts = data.split("_")
+                state = await self.states.get(user_id)
+                if state and state.state == "max_followup_step_text":
+                    await self.states.clear(user_id)
+                if len(parts) == 7 and parts[4] == "edit":
+                    await admin_followups_service.start_step_text_edit(self.client, self.states, chat_id, user_id, int(parts[5]), parts[6])
+                    return
+                if len(parts) == 7 and parts[4] == "locale":
+                    await admin_followups_service.show_step_text(self.client, chat_id, int(parts[5]), parts[6])
+                    return
+                await admin_followups_service.show_step_text(self.client, chat_id, int(parts[4]))
+                return
+            if data.startswith("admin_fu_step_delete_yes_"):
+                parts = data.split("_")
+                await admin_followups_service.delete_step(self.client, chat_id, int(parts[5]), int(parts[6]))
+                return
+            if data.startswith("admin_fu_step_delete_"):
+                parts = data.split("_")
+                await admin_followups_service.ask_delete_step(self.client, chat_id, int(parts[4]), int(parts[5]))
+                return
+            if data.startswith("admin_fu_step_"):
+                parts = data.split("_")
+                await self.states.clear(user_id)
+                await admin_followups_service.show_step(self.client, chat_id, int(parts[3]), int(parts[4]))
+                return
+            if data.startswith("admin_fu_quiet_"):
+                await admin_followups_service.start_quiet(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_jitter_"):
+                await admin_followups_service.start_jitter(self.client, self.states, chat_id, user_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_delete_yes_"):
+                await admin_followups_service.delete_campaign(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                return
+            if data.startswith("admin_fu_delete_ask_"):
+                campaign_id = int(data.rsplit("_", 1)[1])
+                await self.client.send_message(chat_id=chat_id, text="Удалить цепочку, её шаги и все ожидающие отправки? Уже отправленные сообщения останутся у пользователей.", attachments=inline_keyboard([[callback_button("Да, удалить", f"admin_fu_delete_yes_{campaign_id}")], [callback_button("⬅️ Назад", f"admin_fu_campaign_{campaign_id}")]]))
+                return
+            if data.startswith("admin_fu_self_test_send_"):
+                await admin_followups_service.send_self_test(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states)
+                return
+            if data.startswith("admin_fu_self_test_"):
+                await admin_followups_service.show_self_test(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states)
+                return
             if data == "admin_stats":
                 await admin_service.show_stats(self.client, chat_id)
                 return
@@ -1100,6 +1413,12 @@ class MaxBotApplication:
                 return
             if data == "admin_ai_common":
                 await admin_ai_service.show_common(self.client, chat_id)
+                return
+            if data == "admin_ai_metadata_reset":
+                await admin_ai_service.show_metadata_reset(self.client, chat_id)
+                return
+            if data.startswith("admin_ai_set_metadata_reset_"):
+                await admin_ai_service.set_metadata_reset(self.client, chat_id, data.rsplit("_", 1)[1])
                 return
             if data == "admin_ai_deepseek_proxy":
                 await admin_ai_service.toggle_deepseek_proxy(self.client, chat_id)

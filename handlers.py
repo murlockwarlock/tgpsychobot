@@ -43,6 +43,9 @@ from aiogram.types import PreCheckoutQuery, SuccessfulPayment
 from aiogram.types import InputMediaPhoto, InputMediaVideo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.formatting import Text
+from dialogue_history_export import serialize_human_dialogue_history
+from response_button_renderers import telegram_response_buttons_markup
+from admin_html_preview import truncate_html_preview
 
 from config import OWNER_IDS
 from database import (async_session_maker, User, Message as DBMessage, AIConfig, AIModelSettings, KnowledgeBase, Content, IndexingQueue,
@@ -191,13 +194,16 @@ from memory_mode import (
     MEMORY_MODE_GLOBAL,
     MEMORY_MODE_RESET,
     MEMORY_MODE_TOPIC,
+    get_metadata_reset_mode,
     get_memory_mode,
     is_global_memory_mode,
     is_topic_memory_mode,
     memory_mode_description,
     memory_mode_label,
+    metadata_reset_mode_label,
     next_memory_mode,
 )
+from dialogue_reset_policy import start_new_dialogue_scope
 from mailing_utils import (
     BIRTHDAY_MAILING_TYPE,
     BIRTHDAY_PLACEHOLDER_HINT,
@@ -205,6 +211,7 @@ from mailing_utils import (
     get_mailing_audience_label,
     get_mailing_status_label,
     is_birthday_mailing,
+    parse_mailing_text,
     render_mailing_text,
     send_mailing_content,
 )
@@ -1643,6 +1650,27 @@ async def _cancel_task(task: asyncio.Task | None) -> None:
         pass
 
 
+async def _invalidate_telegram_dialogue_runtime_state(user_id: int) -> None:
+    async with _get_user_scheduling_lock(user_id):
+        task = user_processing_tasks.pop(user_id, None)
+        user_message_buffers.pop(user_id, None)
+        user_isolated_turn_queues.pop(user_id, None)
+        lease = user_message_buffer_leases.pop(user_id, None)
+    if lease is not None:
+        single_flight.release(lease)
+    if task is not None and task is not asyncio.current_task():
+        await _cancel_task(task)
+
+
+async def _consume_telegram_reset_state(state: FSMContext, *, clear_state: bool = False) -> None:
+    await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
+    if not clear_state:
+        return
+    clear_result = state.clear()
+    if inspect.isawaitable(clear_result):
+        await clear_result
+
+
 async def handle_ai_media_content(bot: Bot, user_id: int, response_text: str):
     audio_pattern = r'\[SEND_AUDIO:\s*(.*?)\]'
     random_img_pattern = r'\[RANDOM_IMG:\s*(.+?)(?:\s*\|\s*(\d+))?\s*\]'
@@ -2048,33 +2076,7 @@ def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None
 
 
 def _telegram_response_buttons_markup(rows: list[list[ResponseButton]]) -> InlineKeyboardMarkup | None:
-    if not rows:
-        return None
-    action_counts: dict[str, int] = {}
-    for row in rows:
-        for button in row:
-            if button.kind == "action":
-                action_counts[button.value] = action_counts.get(button.value, 0) + 1
-
-    keyboard_rows: list[list[InlineKeyboardButton]] = []
-    action_button_index = 0
-    for row in rows:
-        keyboard_row = []
-        for button in row:
-            if button.kind == "url":
-                keyboard_row.append(InlineKeyboardButton(text=button.text, url=button.value))
-            else:
-                callback_data = build_action_callback_data(
-                    button.value,
-                    action_button_index if action_counts[button.value] > 1 else None,
-                )
-                keyboard_row.append(
-                    InlineKeyboardButton(text=button.text, callback_data=callback_data)
-                )
-                action_button_index += 1
-        if keyboard_row:
-            keyboard_rows.append(keyboard_row)
-    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
+    return telegram_response_buttons_markup(rows)
 
 
 def _merge_telegram_inline_markups(
@@ -6329,6 +6331,7 @@ async def open_ai_common_settings(callback: CallbackQuery):
         f"Первые сообщения: <b>{getattr(config, 'context_limit_first', 2)}</b>\n"
         f"Последние сообщения: <b>{getattr(config, 'context_limit_recent', 10)}</b>\n"
         f"Память: <b>{memory_mode_label(get_memory_mode(config))}</b>\n"
+        f"Метаданные при новом диалоге: <b>{metadata_reset_mode_label(get_metadata_reset_mode(config))}</b>\n"
         f"Таймаут ИИ: <b>{getattr(config, 'fallback_timeout', 60)} сек.</b>\n"
         f"Порог KIE: <b>{getattr(config, 'kie_credit_alert_threshold', 0)}</b>"
     )
@@ -6336,12 +6339,56 @@ async def open_ai_common_settings(callback: CallbackQuery):
     builder.button(text="📌 Первые", callback_data="set_context_first")
     builder.button(text="🔄 Последние", callback_data="set_context_recent")
     builder.button(text="🧠 Память", callback_data="toggle_preserve_topic_context")
+    builder.button(text="Метаданные при новом диалоге", callback_data="admin_ai_metadata_reset")
     builder.button(text="⏱️ Таймаут ИИ", callback_data="set_ai_timeout")
     builder.button(text="💳 Порог KIE", callback_data="set_kie_credit_threshold")
     builder.button(text="⬅️ Назад", callback_data="admin_ai_keys")
     builder.adjust(2)
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin_ai_metadata_reset")
+async def open_metadata_reset_settings(callback: CallbackQuery, *, answer: bool = True):
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    mode = get_metadata_reset_mode(config)
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"{'✅ ' if mode == 'reset' else ''}Сбрасывать",
+        callback_data="admin_ai_set_metadata_reset_reset",
+    )
+    builder.button(
+        text=f"{'✅ ' if mode == 'preserve' else ''}Сохранять",
+        callback_data="admin_ai_set_metadata_reset_preserve",
+    )
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_ai_common"))
+    builder.adjust(1)
+    await callback.message.edit_text(
+        "Метаданные при новом диалоге:\n\n"
+        "Сбрасывать — очищать диалоговые метаданные.\n"
+        "Сохранять — переносить только диалоговые метаданные, без истории и контекста.",
+        reply_markup=builder.as_markup(),
+    )
+    if answer:
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_ai_set_metadata_reset_"))
+async def set_metadata_reset_settings(callback: CallbackQuery):
+    mode = callback.data.rsplit("_", 1)[1]
+    if mode not in {"reset", "preserve"}:
+        await callback.answer("Недопустимое значение.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
+            return
+        config.metadata_reset_mode = mode
+        await session.commit()
+    await callback.answer(f"Метаданные при новом диалоге: {metadata_reset_mode_label(mode)}")
+    await open_metadata_reset_settings(callback, answer=False)
 
 
 @router.callback_query(F.data == "admin_ai_audio")
@@ -7157,16 +7204,43 @@ async def process_selection(callback: CallbackQuery, state: FSMContext, bot: Bot
         await admin_ai_keys_models(callback)
 
 
-def render_admin_content_preview(value: str | None) -> str:
+_ADMIN_PREVIEW_TAGS = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "span", "tg-spoiler", "tg-emoji", "a", "code", "pre", "blockquote", "br",
+}
+
+
+def render_admin_content_preview(value: str | None, max_length: int | None = None) -> str:
     source = value or ""
     if not source:
         return "<i>Текст не задан.</i>"
+    safe_source = truncate_html_preview(
+        source,
+        max(len(source), 1),
+        allowed_tags=_ADMIN_PREVIEW_TAGS,
+    )
+    if safe_source != source:
+        if max_length is None:
+            return html.escape(source)
+        return truncate_html_preview(
+            source,
+            max_length,
+            allowed_tags=_ADMIN_PREVIEW_TAGS,
+        )
     try:
         from translation_registry import TranslationSource, validate_translation_value
         validate_translation_value(TranslationSource("admin.preview", source, kind="html"), source)
     except (TypeError, ValueError):
-        return html.escape(source)
-    return source
+        return (
+            truncate_html_preview(source, max_length, allowed_tags=_ADMIN_PREVIEW_TAGS)
+            if max_length is not None
+            else html.escape(source)
+        )
+    return (
+        truncate_html_preview(source, max_length, allowed_tags=_ADMIN_PREVIEW_TAGS)
+        if max_length is not None
+        else source
+    )
 
 
 async def get_content_display(state: FSMContext, bot: Bot = None):
@@ -7225,15 +7299,12 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
 
     text_display = "<i>Текст не задан.</i>"
     if text:
-        truncated_text = text
-        if len(text) > 3500:
-            truncated_text = text[:3500] + "\n\n[...] (Текст слишком длинный для полного отображения)"
-        text_display = render_admin_content_preview(truncated_text)
+        text_display = render_admin_content_preview(text, max_length=3500)
     elif authoring_locale != "ru" and russian_text:
         text_display = (
             "⚠️ Перевод не задан\n"
             "Русский исходник:\n"
-            f"{render_admin_content_preview(russian_text)}"
+            f"{render_admin_content_preview(russian_text, max_length=3500)}"
         )
 
     media_display = "<i>Медиафайлы не добавлены.</i>"
@@ -7257,7 +7328,9 @@ async def get_content_display(state: FSMContext, bot: Bot = None):
 
     btn_info = ""
     if content_key == "start_message":
-        btn_info = f"\n<b><u>Кнопка действия:</u></b>\nНазвание: {btn_text or 'Нет'}\nТекст отправки: {btn_payload or 'Нет'}\n"
+        button_text = html.escape(str(btn_text)) if btn_text else "Нет"
+        button_payload = html.escape(str(btn_payload)) if btn_payload else "Нет"
+        btn_info = f"\n<b><u>Кнопка действия:</u></b>\nНазвание: {button_text}\nТекст отправки: {button_payload}\n"
 
     button_help = (
         "<b>💡 Справка по кнопкам в тексте:</b>\n"
@@ -8015,7 +8088,7 @@ async def export_ai_logs_package(callback: CallbackQuery):
             safe_provider = re.sub(r"[^A-Za-z0-9_.-]+", "_", log_entry.provider or "provider")
             filename = f"ai_log_{log_entry.id}_{safe_provider}.txt"
             archive.writestr(filename, _build_ai_log_file_content(log_entry))
-            manifest.append({
+            manifest_entry = {
                 "id": log_entry.id,
                 "status": getattr(log_entry, "status", None) or "success",
                 "request_group_id": getattr(log_entry, "request_group_id", None),
@@ -8029,8 +8102,17 @@ async def export_ai_logs_package(callback: CallbackQuery):
                 "latency_ms": log_entry.latency_ms,
                 "error_type": getattr(log_entry, "error_type", None),
                 "error_classification": getattr(log_entry, "error_classification", None),
+                "http_status": getattr(log_entry, "http_status", None),
                 "file": filename,
-            })
+            }
+            try:
+                diagnostics = json.loads(getattr(log_entry, "diagnostics_json", None) or "{}")
+            except (TypeError, ValueError):
+                diagnostics = {}
+            if isinstance(diagnostics, dict):
+                manifest_entry["provider_code"] = diagnostics.get("provider_code")
+                manifest_entry["provider_message"] = diagnostics.get("provider_message")
+            manifest.append(manifest_entry)
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     archive_buffer.seek(0)
     user_suffix = (
@@ -8210,7 +8292,7 @@ async def ask_delete_history(message: Message, state: FSMContext):
                     translate(
                         "ui.dialogue.reset_topic_prompt",
                         locale,
-                        fallback="Вы находитесь в диалоге: <b>{topic_name}</b>.\nПри начале нового диалога или переходе в основной память ИИ будет очищена.\nВыберите подходящее действие.",
+                        fallback="Вы находитесь в теме: <b>{topic_name}</b>.\nСбросить диалог и очистить контекст?",
                     ).format(topic_name=html.escape(topic_name)),
                     reply_markup=kb.topic_reset_options_keyboard(token=token, locale=locale),
                     parse_mode="HTML"
@@ -8220,7 +8302,7 @@ async def ask_delete_history(message: Message, state: FSMContext):
                     translate(
                         "ui.dialogue.reset_main_prompt",
                         locale,
-                        fallback="При начале нового диалога память ИИ будет полностью очищена. Вы уверены?",
+                        fallback="Вы уверены, что хотите сбросить диалог и очистить контекст?",
                     ),
                     reply_markup=kb.confirm_delete_history_keyboard(token=token, locale=locale)
                 )
@@ -8248,11 +8330,11 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
 
         expected_dialogue_id = data.get("reset_dialogue_id")
         expected_topic_id = data.get("reset_topic_id")
-        await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
 
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id)
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
+                await _consume_telegram_reset_state(state)
                 locale = await resolve_user_effective_locale(session, user or callback.from_user.id)
                 await callback.message.answer(
                     translate(
@@ -8263,9 +8345,17 @@ async def process_delete_history(callback: CallbackQuery, state: FSMContext, bot
                 )
                 return
 
+            await _consume_telegram_reset_state(state, clear_state=True)
+            await _invalidate_telegram_dialogue_runtime_state(callback.from_user.id)
             ai_config = await session.get(AIConfig, 1)
             memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
-            await _new_dialogue_update_state(session, user, user.current_topic_id or 0, memory_mode)
+            await _new_dialogue_update_state(
+                session,
+                user,
+                user.current_topic_id or 0,
+                memory_mode,
+                get_metadata_reset_mode(ai_config) if ai_config else "reset",
+            )
 
             await session.execute(delete(TestSession).where(TestSession.user_id == user.id))
             await session.commit()
@@ -8293,7 +8383,7 @@ async def cancel_delete_history(callback: CallbackQuery, state: FSMContext):
         expected_token = data.get("reset_token")
         if not expected_token or expected_token != token:
             return
-        await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
+        await _consume_telegram_reset_state(state)
 
     try:
         await callback.message.delete()
@@ -9789,11 +9879,16 @@ async def process_single_export(callback: CallbackQuery, bot: Bot):
             else:
                 header = f"History: {user.name or user.first_name} (ID: {user.id}, @{user.username}){selected_topic_label}\n"
             content_str = header + "=" * 50 + "\n"
+            history_records = []
             for m in messages:
                 t_name = topic_map.get(m.topic_id, "General")
                 role = "Client" if m.role == "user" else "Test" if m.role == TEST_RESULT_ROLE else "Bot"
                 text = remove_markdown(m.content) if m.role == 'assistant' else m.content
-                content_str += f"[{format_msk(m.timestamp, '%Y-%m-%d %H:%M МСК')}] [{t_name}] {role}: {text}\n\n"
+                history_records.append((
+                    m.dialogue_id,
+                    f"[{format_msk(m.timestamp, '%Y-%m-%d %H:%M МСК')}] [{t_name}] {role}: {text}\n",
+                ))
+            content_str += serialize_human_dialogue_history(history_records) + "\n"
         else:
             history_data = []
             for m in messages:
@@ -10794,17 +10889,21 @@ async def _request_profile_onboarding_if_needed(
     return True
 
 
-async def _new_dialogue_update_state(session, user, topic_key: int, memory_mode: str):
-    await _clear_card_spread_state_in_session(session, user.id)
-    user.current_dialogue_id += 1
-    if is_global_memory_mode(memory_mode):
-        return
-    if is_topic_memory_mode(memory_mode):
-        state_rec = await session.get(UserTopicState, (user.id, topic_key))
-        if state_rec:
-            state_rec.dialogue_id = user.current_dialogue_id
-        else:
-            session.add(UserTopicState(user_id=user.id, topic_id=topic_key, dialogue_id=user.current_dialogue_id))
+async def _new_dialogue_update_state(
+    session,
+    user,
+    topic_key: int,
+    memory_mode: str,
+    metadata_reset_mode: str = "reset",
+):
+    await start_new_dialogue_scope(
+        session,
+        user,
+        topic_key,
+        memory_mode,
+        metadata_reset_mode,
+        update_topic_state=True,
+    )
 
 
 @router.message(Command("topics"))
@@ -16780,14 +16879,14 @@ async def admin_process_mailing_content(message: Message, state: FSMContext, bot
         current_media_id = message.photo[-1].file_id
         current_media_type = 'photo'
         if message.caption:
-            current_text = message.html_text
+            current_text = message.html_text or message.caption
     elif message.video:
         current_media_id = message.video.file_id
         current_media_type = 'video'
         if message.caption:
-            current_text = message.html_text
+            current_text = message.html_text or message.caption
     elif message.text:
-        current_text = message.html_text
+        current_text = message.html_text or message.text
 
     # For birthday templates, sending media without caption should not block the template flow.
     if audience == "birthday_today" and current_media_id and not current_text and data.get("authoring_locale", "ru") == "ru":
@@ -16840,7 +16939,6 @@ async def admin_select_mailing_media_position(callback: CallbackQuery, state: FS
 
 
 async def show_mailing_preview(chat_id: int, message_id: int, state: FSMContext, bot: Bot):
-    import re
     data = await state.get_data()
     text = data.get('text') or ""
     media_file_id = data.get('media_file_id')
@@ -16849,7 +16947,8 @@ async def show_mailing_preview(chat_id: int, message_id: int, state: FSMContext,
 
     audience_name = get_mailing_audience_label(data['audience'])
 
-    plain_text = re.sub(r'<[^>]+>', '', text)
+    clean_text, response_button_rows = parse_mailing_text(text)
+    plain_text = re.sub(r'<[^>]+>', '', clean_text)
     display_text = plain_text if len(plain_text) < 500 else plain_text[:500] + "..."
     pos_text = "🖼 Медиа сверху" if position == 'media_top' else "📝 Текст сверху"
 
@@ -16862,6 +16961,10 @@ async def show_mailing_preview(chat_id: int, message_id: int, state: FSMContext,
     if data.get("audience") == "birthday_today":
         preview_caption += f"\nПеременные: <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
 
+    preview_markup = _merge_telegram_inline_markups(
+        _telegram_response_buttons_markup(response_button_rows),
+        keyboards.mailing_confirmation_keyboard(),
+    )
     await state.set_state(AdminStates.mailing_confirmation)
 
     try:
@@ -16873,17 +16976,17 @@ async def show_mailing_preview(chat_id: int, message_id: int, state: FSMContext,
 
             if media_file_type == 'photo':
                 new_msg = await bot.send_photo(chat_id, media_file_id, caption=preview_caption, parse_mode="HTML",
-                                               reply_markup=keyboards.mailing_confirmation_keyboard())
+                                               reply_markup=preview_markup)
             else:
                 new_msg = await bot.send_video(chat_id, media_file_id, caption=preview_caption, parse_mode="HTML",
-                                               reply_markup=keyboards.mailing_confirmation_keyboard())
+                                               reply_markup=preview_markup)
             await state.update_data(message_id=new_msg.message_id)
         else:
             await bot.edit_message_text(preview_caption, chat_id=chat_id, message_id=message_id, parse_mode="HTML",
-                                        reply_markup=keyboards.mailing_confirmation_keyboard())
+                                        reply_markup=preview_markup)
     except Exception:
         new_msg = await bot.send_message(chat_id, preview_caption, parse_mode="HTML",
-                                         reply_markup=keyboards.mailing_confirmation_keyboard())
+                                         reply_markup=preview_markup)
         await state.update_data(message_id=new_msg.message_id)
 
 
@@ -17742,6 +17845,8 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
     start_time_str = to_msk(mailing.start_time).strftime('%d.%m.%Y %H:%M') if mailing.start_time else "Еще не запускалась"
     end_time_str = to_msk(mailing.end_time).strftime('%d.%m.%Y %H:%M') if mailing.end_time else "N/A"
     mailing_type = "Автоматическая ДР-рассылка" if is_birthday_mailing(mailing) else "Обычная рассылка"
+    clean_mailing_text, response_button_rows = parse_mailing_text(mailing.text or "")
+    mailing_display_text = html.escape(re.sub(r"<[^>]+>", "", clean_mailing_text))
 
     if is_birthday_mailing(mailing):
         text = (
@@ -17750,7 +17855,7 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
             f"<b>Создан:</b> {to_msk(mailing.created_at).strftime('%d.%m.%Y %H:%M')}\n"
             f"<b>Отправлено успешно:</b> {mailing.success_count}\n"
             f"<b>Ошибок:</b> {mailing.failure_count}\n\n"
-            f"<b><u>Текст:</u></b>\n{mailing.text or 'Нет текста'}"
+            f"<b><u>Текст:</u></b>\n{mailing_display_text or 'Нет текста'}"
         )
     else:
         text = (
@@ -17762,13 +17867,17 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
             f"<b>Конец:</b> {end_time_str}\n"
             f"<b>Успешно:</b> {mailing.success_count}\n"
             f"<b>Ошибки:</b> {mailing.failure_count}\n\n"
-            f"<b><u>Текст:</u></b>\n{mailing.text or 'Нет текста'}"
+            f"<b><u>Текст:</u></b>\n{mailing_display_text or 'Нет текста'}"
         )
     if is_birthday_mailing(mailing):
         text += f"\n\n<b>Переменные:</b> <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
 
     back_keyboard = kb.mailing_details_keyboard(mailing)
     back_keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="Изменить текст", callback_data=f"ca:view:mailing:{mailing_id}")])
+    details_markup = _merge_telegram_inline_markups(
+        _telegram_response_buttons_markup(response_button_rows),
+        back_keyboard,
+    )
 
     try:
         await callback.message.delete()
@@ -17780,20 +17889,20 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
             media_id = mailing.media_file_id
             if len(text) <= 1024:
                 if mailing.media_file_type == 'photo':
-                    await bot.send_photo(callback.from_user.id, media_id, caption=text, reply_markup=back_keyboard, parse_mode='HTML')
+                    await bot.send_photo(callback.from_user.id, media_id, caption=text, reply_markup=details_markup, parse_mode='HTML')
                 else:
-                    await bot.send_video(callback.from_user.id, media_id, caption=text, reply_markup=back_keyboard, parse_mode='HTML')
+                    await bot.send_video(callback.from_user.id, media_id, caption=text, reply_markup=details_markup, parse_mode='HTML')
             else:
                 if mailing.media_file_type == 'photo':
                     await bot.send_photo(callback.from_user.id, media_id)
                 else:
                     await bot.send_video(callback.from_user.id, media_id)
-                await bot.send_message(callback.from_user.id, text, reply_markup=back_keyboard, parse_mode='HTML')
+                await bot.send_message(callback.from_user.id, text, reply_markup=details_markup, parse_mode='HTML')
         else:
-            await bot.send_message(callback.from_user.id, text, reply_markup=back_keyboard, parse_mode='HTML')
+            await bot.send_message(callback.from_user.id, text, reply_markup=details_markup, parse_mode='HTML')
     except Exception as e:
         logging.error(f"Error showing mailing details: {e}")
-        await bot.send_message(callback.from_user.id, text, reply_markup=back_keyboard, parse_mode='HTML')
+        await bot.send_message(callback.from_user.id, text, reply_markup=details_markup, parse_mode='HTML')
 
     answer_method = getattr(callback, "answer", None)
     if callable(answer_method):
@@ -22734,11 +22843,11 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
 
         expected_dialogue_id = data.get("reset_dialogue_id")
         expected_topic_id = data.get("reset_topic_id")
-        await state.update_data(reset_token=None, reset_dialogue_id=None, reset_topic_id=None)
 
         async with async_session_maker() as session:
             user = await session.get(User, callback.from_user.id, options=[selectinload(User.current_topic)])
             if not user or user.current_dialogue_id != expected_dialogue_id or user.current_topic_id != expected_topic_id:
+                await _consume_telegram_reset_state(state)
                 locale = await resolve_user_effective_locale(session, user or callback.from_user.id)
                 await callback.message.answer(
                     translate(
@@ -22749,9 +22858,17 @@ async def process_reset_topic_keep(callback: CallbackQuery, state: FSMContext, b
                 )
                 return
 
+            await _consume_telegram_reset_state(state, clear_state=True)
+            await _invalidate_telegram_dialogue_runtime_state(callback.from_user.id)
             ai_config = await session.get(AIConfig, 1)
             memory_mode = get_memory_mode(ai_config) if ai_config else MEMORY_MODE_RESET
-            await _new_dialogue_update_state(session, user, user.current_topic_id or 0, memory_mode)
+            await _new_dialogue_update_state(
+                session,
+                user,
+                user.current_topic_id or 0,
+                memory_mode,
+                get_metadata_reset_mode(ai_config) if ai_config else "reset",
+            )
 
             topic = user.current_topic
             topic_id = user.current_topic_id
@@ -24313,10 +24430,16 @@ async def process_mass_export(callback: CallbackQuery, state: FSMContext, bot: B
                 full_content += f"ДАННЫЕ КЛИЕНТА: {user_label}\n"
                 full_content += "-" * 40 + "\n"
 
+                history_records = []
                 for m in messages:
                     t_name = topic_map.get(m.topic_id, "General")
                     role = "Client" if m.role == "user" else "Test" if m.role == TEST_RESULT_ROLE else "Bot"
-                    full_content += f"[{format_msk(m.timestamp, '%Y-%m-%d %H:%M МСК')}] [{t_name}] {role}: {m.content}\n"
+                    history_records.append((
+                        m.dialogue_id,
+                        f"[{format_msk(m.timestamp, '%Y-%m-%d %H:%M МСК')}] [{t_name}] {role}: {m.content}\n",
+                    ))
+
+                full_content += serialize_human_dialogue_history(history_records) + "\n"
 
                 full_content += "\n" + "=" * 60 + "\n\n"
 
@@ -25121,7 +25244,7 @@ async def admin_ref_tpl_detail(callback: CallbackQuery):
         await callback.answer("Шаблон не найден.")
         return
     status = "✅ Включён" if tpl.is_enabled else "❌ Отключён"
-    preview = tpl.text[:300]
+    preview = render_admin_content_preview(tpl.text, max_length=300)
     text = f"📩 <b>Шаблон #{tpl.order_num + 1}</b>\nСтатус: {status}\n\n{preview}"
     try:
         await callback.message.edit_text(text, parse_mode="HTML",
@@ -25240,7 +25363,7 @@ async def admin_ref_tpl_delete_prompt(callback: CallbackQuery):
     if not tpl:
         await callback.answer("Шаблон не найден.")
         return
-    preview = tpl.text[:80].replace('\n', ' ')
+    preview = render_admin_content_preview(tpl.text, max_length=80).replace('\n', ' ')
     try:
         await callback.message.edit_text(
             f"🗑 Удалить шаблон?\n\n<i>{preview}…</i>",

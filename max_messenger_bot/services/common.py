@@ -32,7 +32,8 @@ from ..legacy import (
 from ..storage import MaxContentMedia, StateStore
 from ..time_utils import utc_now
 from .subscription_access import load_active_subscription
-from memory_mode import normalize_memory_mode, start_new_dialogue
+from memory_mode import normalize_memory_mode
+from dialogue_reset_policy import configured_metadata_reset_mode, start_new_dialogue_scope
 from response_buttons import ResponseButton, build_action_callback_data, extract_response_buttons, extract_test_start_directive
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
@@ -584,7 +585,13 @@ async def reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> No
         user = await session.get(User, user_id)
         if user:
             config = await session.get(AIConfig, 1)
-            await start_new_dialogue(session, user, user.current_topic_id or 0, normalize_memory_mode(config))
+            await start_new_dialogue_scope(
+                session,
+                user,
+                user.current_topic_id or 0,
+                normalize_memory_mode(config),
+                configured_metadata_reset_mode(config),
+            )
             await session.execute(
                 delete(DBMessage).where(
                     DBMessage.user_id == user_id,
@@ -668,7 +675,13 @@ async def execute_dialogue_reset(
             return
 
         config = await session.get(AIConfig, 1)
-        await start_new_dialogue(session, user, user.current_topic_id or 0, normalize_memory_mode(config))
+        await start_new_dialogue_scope(
+            session,
+            user,
+            user.current_topic_id or 0,
+            normalize_memory_mode(config),
+            configured_metadata_reset_mode(config),
+        )
         new_dialogue_id = user.current_dialogue_id
         topic = user.current_topic
         topic_id = user.current_topic_id
