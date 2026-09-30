@@ -21,6 +21,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.enums import ChatType
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods import SendMessage
 from aiogram.types import CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User as TgUser
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -28,7 +29,7 @@ from sqlalchemy.pool import StaticPool
 
 import ai_integration
 from ai_request_context import AIRequestLayout, AIRequestMessage
-from database import AIConfig, AIModelSettings, Base, Message as DBMessage, User
+from database import AIConfig, AIModelSettings, Base, BotGeneralConfig, Message as DBMessage, User
 import keyboards as kb
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.app import MaxBotApplication
@@ -95,6 +96,13 @@ class ValidatingTelegramSession(BaseSession):
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
         type(method).model_validate(method.model_dump())
+        if isinstance(method, SendMessage):
+            return Message(
+                message_id=len(self.calls),
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=method.chat_id, type=ChatType.PRIVATE),
+                text=method.text or "",
+            )
         return True
 
     async def stream_content(self, *args, **kwargs):
@@ -139,6 +147,8 @@ async def async_engine():
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        from max_messenger_bot.storage import StorageBase
+        await conn.run_sync(StorageBase.metadata.create_all)
     yield engine
     await engine.dispose()
 
@@ -157,7 +167,8 @@ async def init_ai_config(session_factory):
             fallback_provider=None,
             fallback_model=None,
         )
-        session.add(cfg)
+        gen_cfg = BotGeneralConfig(id=1)
+        session.add_all([cfg, gen_cfg])
         await session.commit()
     return cfg
 
@@ -302,6 +313,8 @@ def test_perplexity_multiturn_history_structured_input():
     assert "assistant: Первый ответ" not in payload_str, "Roles must NOT be prefixed as plain text into content"
     assert "system:" not in payload_str
     assert payload["instructions"].startswith("Ты клинический психолог.")
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
 
     # 2. Single-turn contract (no history)
     layout_st = AIRequestLayout(
@@ -311,6 +324,16 @@ def test_perplexity_multiturn_history_structured_input():
     payload_st = build_perplexity_payload(layout_st, preset="fast")
     assert payload_st["input"] == "Одиночный запрос", "Single-turn request without history should use simple string input"
     assert isinstance(payload_st["input"], str)
+    assert "tools" not in payload_st
+    assert "tool_choice" not in payload_st
+
+    # 3. Direct model multi-turn contract (requires web_search tool and forced tool_choice)
+    payload_dm = build_perplexity_payload(layout, model="openai/gpt-5.6-terra")
+    assert payload_dm["model"] == "openai/gpt-5.6-terra"
+    assert payload_dm["tools"] == [{"type": "web_search"}]
+    assert payload_dm["tool_choice"] == {"type": "web_search"}
+    assert isinstance(payload_dm["input"], list)
+    assert len(payload_dm["input"]) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -581,8 +604,9 @@ async def test_429_retry_policy_rate_limit_vs_quota():
     headers = {"Authorization": "Bearer TEST_KEY"}
     payload = {"model": "sonar-pro", "input": "test"}
 
-    # Case A: 429 + "rate limit" -> classification = rate_limit, attempts = 2
+    # Case A: 429 + "rate limit" -> first attempt: will_retry=True, final attempt: will_retry=False
     attempts_a = 0
+    snapshot_attempt_1 = {}
     def mock_rate_limit(request):
         nonlocal attempts_a
         attempts_a += 1
@@ -592,16 +616,28 @@ async def test_429_retry_policy_rate_limit_vs_quota():
             json={"error": {"type": "rate_limit", "code": 429, "message": "Too many requests"}},
         )
 
+    async def mock_sleep_a(delay):
+        nonlocal snapshot_attempt_1
+        snapshot_attempt_1 = dict(capture_a)
+
     capture_a = {}
     with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_rate_limit))), \
-         patch("asyncio.sleep", AsyncMock()):
+         patch("asyncio.sleep", mock_sleep_a):
         with pytest.raises(ProviderAdapterError) as exc_info_a:
             await _post_perplexity_json(url, headers=headers, payload=payload, timeout=5.0, request_capture=capture_a, max_attempts=2)
         assert exc_info_a.value.category == "rate_limit"
 
     assert attempts_a == 2, "Real 429 rate limit must be retried up to max_attempts=2"
+    # First attempt snapshot
+    assert snapshot_attempt_1["attempt_count"] == 1
+    assert snapshot_attempt_1["classification"] == "rate_limit"
+    assert snapshot_attempt_1["is_retryable"] is True
+    assert snapshot_attempt_1["will_retry"] is True
+    # Final exhausted attempt
     assert capture_a["attempt_count"] == 2
     assert capture_a["classification"] == "rate_limit"
+    assert capture_a["is_retryable"] is True
+    assert capture_a["will_retry"] is False
 
     # Case B: 429 + "insufficient_quota" -> classification = insufficient_balance_quota, attempts = 1 (NO RETRY)
     attempts_b = 0
@@ -625,21 +661,34 @@ async def test_429_retry_policy_rate_limit_vs_quota():
     assert capture_b["attempt_count"] == 1
     assert capture_b["classification"] == "insufficient_balance_quota"
     assert capture_b["is_retryable"] is False
+    assert capture_b["will_retry"] is False
 
     # Case C: ConnectTimeout -> safe pre-dispatch retry (attempts = 2)
     attempts_c = 0
+    snapshot_connect_1 = {}
     def mock_connect(request):
         nonlocal attempts_c
         attempts_c += 1
         raise httpx.ConnectTimeout("Connect timeout")
 
+    async def mock_sleep_c(delay):
+        nonlocal snapshot_connect_1
+        snapshot_connect_1 = dict(capture_c)
+
     capture_c = {}
     with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_connect))), \
-         patch("asyncio.sleep", AsyncMock()):
+         patch("asyncio.sleep", mock_sleep_c):
         with pytest.raises(ProviderAdapterError):
             await _post_perplexity_json(url, headers=headers, payload=payload, timeout=5.0, request_capture=capture_c, max_attempts=2)
     assert attempts_c == 2
+    assert snapshot_connect_1["attempt_count"] == 1
+    assert snapshot_connect_1["classification"] == "timeout"
+    assert snapshot_connect_1["is_retryable"] is True
+    assert snapshot_connect_1["will_retry"] is True
     assert capture_c["attempt_count"] == 2
+    assert capture_c["classification"] == "timeout"
+    assert capture_c["is_retryable"] is True
+    assert capture_c["will_retry"] is False
 
     # Case D: ReadTimeout -> uncertain post-dispatch (attempts = 1, NO RETRY)
     attempts_d = 0
@@ -655,7 +704,48 @@ async def test_429_retry_policy_rate_limit_vs_quota():
             await _post_perplexity_json(url, headers=headers, payload=payload, timeout=5.0, request_capture=capture_d, max_attempts=2)
     assert attempts_d == 1, "Uncertain ReadTimeout must NOT be automatically retried!"
     assert capture_d["attempt_count"] == 1
+    assert capture_d["classification"] == "timeout"
     assert capture_d["is_retryable"] is False
+    assert capture_d["will_retry"] is False
+
+    # Case E: HTTP 200 + Agent status="failed" does NOT leave classification="success"
+    capture_failed = {}
+    with pytest.raises(ProviderAdapterError) as exc_failed:
+        _extract_perplexity_text(
+            {
+                "status": "failed",
+                "error": {"type": "internal_error", "message": "Perplexity backend failure"},
+            },
+            request_capture=capture_failed,
+        )
+    assert exc_failed.value.category in {"provider", "provider_5xx"}
+    assert capture_failed["response_status"] == "failed"
+    assert capture_failed["classification"] != "success"
+    assert capture_failed["classification"] in {"provider", "provider_5xx"}
+    assert capture_failed["is_retryable"] is False
+    assert capture_failed["will_retry"] is False
+
+    # Case F: HTTP 200 + Agent status="completed" leaves classification="success"
+    capture_success = {}
+    res_text = _extract_perplexity_text(
+        {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": "Valid completed answer",
+                }
+            ],
+        },
+        request_capture=capture_success,
+    )
+    assert res_text == "Valid completed answer"
+    assert capture_success["response_status"] == "completed"
+    assert capture_success["classification"] == "success"
+    assert capture_success["is_retryable"] is False
+    assert capture_success["will_retry"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1485,6 +1575,7 @@ async def test_runtime_v1_agent_request_proof():
         assert req_preset["body"]["preset"] == "fast"
         assert req_preset["body"]["max_output_tokens"] == 4096
         assert "tools" not in req_preset["body"], "Presets manage their own search profile without forced tools"
+        assert "tool_choice" not in req_preset["body"], "Presets must not receive forced tool_choice"
         assert "Answer generated with fast [1]" in res_preset
         assert "https://example.com/quantum-teleportation" in res_preset
         assert "Источники:" in res_preset
@@ -1495,6 +1586,7 @@ async def test_runtime_v1_agent_request_proof():
         req_direct = captured_requests[0]
         assert req_direct["body"]["model"] == "anthropic/claude-sonnet-4-6"
         assert req_direct["body"]["tools"] == [{"type": "web_search"}], "Direct models MUST explicitly include web_search tool"
+        assert req_direct["body"]["tool_choice"] == {"type": "web_search"}, "Direct models MUST force tool_choice for web_search"
         assert req_direct["body"]["max_output_tokens"] == 8192, "Anthropic models via Perplexity must have max_output_tokens=8192"
         assert "preset" not in req_direct["body"], "Pure direct model request must not contain preset"
         assert "Answer generated with anthropic/claude-sonnet-4-6 [1]" in res_direct
@@ -1528,7 +1620,7 @@ async def test_fallback_direct_models_full_journey_telegram_and_max(session_fact
         cfg.fallback_provider = PROVIDER_PERPLEXITY
         cfg.provider = "openrouter"
         cfg.openrouter_api_key = "OR_TEST_KEY"
-        cfg.openrouter_model = "openai/gpt-4o"
+        cfg.openrouter_model = "openai/gpt-5.6-terra"
         cfg.perplexity_api_key = "PPLX_FALLBACK_TEST_KEY"
         await s.commit()
 
@@ -1630,6 +1722,45 @@ async def test_fallback_direct_models_full_journey_telegram_and_max(session_fact
     back_fb_btn = reopened_fb_kb.inline_keyboard[-1][0]
     assert back_fb_btn.callback_data == "admin_ai_fallback_model"
 
+    # Actually feed back_fb_btn.callback_data through the real Telegram Dispatcher
+    update_fb_back = Update(
+        update_id=6,
+        callback_query=CallbackQuery(
+            id="cb_fb_back",
+            from_user=user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=chat, text="Fallback Models P1"),
+            data=back_fb_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_fb_back)
+    parent_fb_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+    parent_callbacks = [b.callback_data for row in parent_fb_kb.inline_keyboard for b in row]
+    assert "ai_ppx_fb_presets" in parent_callbacks
+    assert "ai_ppx_fb_models:0" in parent_callbacks
+
+    # Back from parent_fb_kb leads to admin_ai_text_fallback
+    back_to_text_fb = next(b for row in parent_fb_kb.inline_keyboard for b in row if b.callback_data == "admin_ai_text_fallback")
+    update_text_fb_back = Update(
+        update_id=7,
+        callback_query=CallbackQuery(
+            id="cb_text_fb_back",
+            from_user=user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=chat, text="Fallback Category"),
+            data=back_to_text_fb.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_text_fb_back)
+    text_fb_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+    assert any("admin_ai_fallback_model" in (b.callback_data or "") for row in text_fb_kb.inline_keyboard for b in row)
+
+    # Verify fallback provider/model context is preserved
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        assert cfg.fallback_provider == PROVIDER_PERPLEXITY
+        assert cfg.fallback_model == expected_fb_model
+
     # 3. Telegram Runtime Fallback Execution:
     async with session_factory() as s:
         cfg = await s.get(AIConfig, 1)
@@ -1686,15 +1817,24 @@ async def test_fallback_direct_models_full_journey_telegram_and_max(session_fact
         assert fb_req["headers"]["authorization"] == "Bearer PPLX_FALLBACK_TEST_KEY"
         assert fb_req["body"]["model"] == expected_fb_model
         assert fb_req["body"]["tools"] == [{"type": "web_search"}]
+        assert fb_req["body"]["tool_choice"] == {"type": "web_search"}
 
     # 4. MAX: Fallback direct models navigation through MaxBotApplication
     monkeypatch.setattr(max_admin_ai, "async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.legacy.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.ai.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
     from max_messenger_bot.services import common as max_common
-    async def _true(*args, **kwargs):
+
+    async def _is_admin(uid, *args, **kwargs):
         return True
-    monkeypatch.setattr(max_common, "is_admin", _true)
-    monkeypatch.setattr(max_common, "ensure_user", _true)
+
+    monkeypatch.setattr(max_common, "is_admin", _is_admin)
+    monkeypatch.setattr(max_common, "ensure_user", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "maybe_require_disclaimer", AsyncMock(return_value=False))
 
     max_requests = []
     async def fake_max_request(method, path, *, params=None, json_data=None, expected_status=200):
@@ -1729,41 +1869,148 @@ async def test_fallback_direct_models_full_journey_telegram_and_max(session_fact
         assert msgs, f"No message sent for payload: {payload}"
         return msgs[-1]["body"]
 
-    # Open fallback models page 0 on MAX
-    fb_p0_max_msg = await press_max_cb("admin_ai_fb_ppx_models_0")
-    fb_p0_max_att = fb_p0_max_msg["attachments"][0]
-    next_btn_max = next(b for row in fb_p0_max_att["payload"]["buttons"] for b in row if b["payload"] == "admin_ai_fb_ppx_models_1")
-    assert next_btn_max is not None
+    max_primary_attempted = False
+    max_captured_requests = []
+    expected_max_fb_model = None
 
-    # Click "Далее ➡️" to reach Page 1
-    fb_p1_max_msg = await press_max_cb(next_btn_max["payload"])
-    fb_p1_max_att = fb_p1_max_msg["attachments"][0]
-    first_fb_max_btn = fb_p1_max_att["payload"]["buttons"][0][0]
-    expected_max_fb_model = first_fb_max_btn["payload"].replace("admin_ai_save_fallback_Perplexity_", "")
+    def mock_max_runtime_transport(request: httpx.Request):
+        nonlocal max_primary_attempted
+        url_str = str(request.url)
+        if "openrouter.ai" in url_str:
+            max_primary_attempted = True
+            raise httpx.ConnectError("Primary OpenRouter unreachable")
+        if "api.perplexity.ai" in url_str:
+            if "/v1/models" in url_str:
+                return httpx.Response(200, json={"data": [{"id": m} for m in PERPLEXITY_STATIC_DIRECT_MODELS]})
+            body = json.loads(request.content.decode("utf-8"))
+            max_captured_requests.append({
+                "url": url_str,
+                "headers": dict(request.headers),
+                "body": body,
+            })
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp-max-fb-1",
+                    "status": "completed",
+                    "model": expected_max_fb_model or body.get("model", "anthropic/claude-sonnet-4-6"),
+                    "output": [
+                        {
+                            "type": "search_results",
+                            "results": [
+                                {
+                                    "title": "MAX Coping Guide",
+                                    "url": "https://example.com/max-coping",
+                                    "snippet": "Guidelines for stress coping in MAX.",
+                                }
+                            ],
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Ответ резервного ассистента Perplexity в MAX [1].",
+                                }
+                            ],
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(404)
 
-    # Select direct fallback model
-    await press_max_cb(first_fb_max_btn["payload"])
+    with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_max_runtime_transport))):
+        # Open fallback models page 0 on MAX
+        fb_p0_max_msg = await press_max_cb("admin_ai_fb_ppx_models_0")
+        fb_p0_max_att = fb_p0_max_msg["attachments"][0]
+        next_btn_max = next(b for row in fb_p0_max_att["payload"]["buttons"] for b in row if b["payload"] == "admin_ai_fb_ppx_models_1")
+        assert next_btn_max is not None
 
-    # Verify DB persistence in MAX
-    async with session_factory() as s:
-        cfg = await s.get(AIConfig, 1)
-        assert cfg.fallback_provider == PROVIDER_PERPLEXITY
-        assert cfg.fallback_model == expected_max_fb_model
+        # Click "Далее ➡️" to reach Page 1
+        fb_p1_max_msg = await press_max_cb(next_btn_max["payload"])
+        fb_p1_max_att = fb_p1_max_msg["attachments"][0]
+        first_fb_max_btn = fb_p1_max_att["payload"]["buttons"][0][0]
+        expected_max_fb_model = first_fb_max_btn["payload"].replace("admin_ai_save_fallback_Perplexity_", "")
 
-    # Reopen Page 1 on MAX to verify checkmark
-    fb_reopened_max_msg = await press_max_cb("admin_ai_fb_ppx_models_1")
-    fb_reopened_att = fb_reopened_max_msg["attachments"][0]
-    assert "✅" in fb_reopened_att["payload"]["buttons"][0][0]["text"]
+        # Select direct fallback model
+        await press_max_cb(first_fb_max_btn["payload"])
 
-    # Extract Back button ("К настройкам") -> leads to admin_ai_fallback_model
-    fb_back_btn_max = fb_reopened_att["payload"]["buttons"][-1][0]
-    assert fb_back_btn_max["payload"] == "admin_ai_fallback_model"
-    assert fb_back_btn_max["text"] == "К настройкам"
+        # Verify DB persistence in MAX
+        async with session_factory() as s:
+            cfg = await s.get(AIConfig, 1)
+            assert cfg.fallback_provider == PROVIDER_PERPLEXITY
+            assert cfg.fallback_model == expected_max_fb_model
 
-    # Click Back button on MAX -> reaches admin_ai_fallback_model
-    fb_parent_msg = await press_max_cb(fb_back_btn_max["payload"])
-    fb_parent_att = fb_parent_msg["attachments"][0]
-    assert any("admin_ai_fb_ppx" in b["payload"] for row in fb_parent_att["payload"]["buttons"] for b in row)
+        # Reopen Page 1 on MAX to verify checkmark
+        fb_reopened_max_msg = await press_max_cb("admin_ai_fb_ppx_models_1")
+        fb_reopened_att = fb_reopened_max_msg["attachments"][0]
+        assert "✅" in fb_reopened_att["payload"]["buttons"][0][0]["text"]
+
+        # Extract Back button ("К настройкам") -> leads to admin_ai_fallback_model
+        fb_back_btn_max = fb_reopened_att["payload"]["buttons"][-1][0]
+        assert fb_back_btn_max["payload"] == "admin_ai_fallback_model"
+        assert fb_back_btn_max["text"] == "К настройкам"
+
+        # Click Back button on MAX -> reaches admin_ai_fallback_model
+        fb_parent_msg = await press_max_cb(fb_back_btn_max["payload"])
+        fb_parent_att = fb_parent_msg["attachments"][0]
+        assert any("admin_ai_fb_ppx" in b["payload"] for row in fb_parent_att["payload"]["buttons"] for b in row)
+
+        # 5. Enable fallback & execute real MAX user message through MaxBotApplication.handle_update()
+        async with session_factory() as s:
+            cfg = await s.get(AIConfig, 1)
+            cfg.allow_fallback = True
+            await s.commit()
+
+        from max_messenger_bot.models import MAX_ID_OFFSET
+        max_client_raw_id = 999
+        effective_max_uid = max_client_raw_id + MAX_ID_OFFSET
+
+        async with session_factory() as s:
+            max_user = User(
+                id=effective_max_uid,
+                username="max_client",
+                name="Client",
+                first_name="Client",
+                accepted_disclaimer=True,
+            )
+            s.add(max_user)
+            await s.commit()
+
+        max_update_id += 1
+        await max_app.handle_update({
+            "update_type": "message_created",
+            "update_id": max_update_id,
+            "message": {
+                "mid": f"msg_user_{max_update_id}",
+                "recipient": {"chat_id": max_client_raw_id},
+                "sender": {
+                    "user_id": max_client_raw_id,
+                    "name": "Client",
+                    "first_name": "Client",
+                    "username": "max_client",
+                },
+                "body": {"text": "Вопрос пользователя в MAX"},
+            },
+        })
+        user_task = max_app.user_tasks.get(effective_max_uid)
+        if user_task:
+            await user_task
+
+    assert max_primary_attempted is True, "Primary provider OpenRouter must be attempted before fallback"
+    assert len(max_captured_requests) == 1, "Perplexity fallback should be invoked exactly once after primary failure"
+    max_fb_req = max_captured_requests[0]
+    assert max_fb_req["body"]["model"] == expected_max_fb_model
+    assert max_fb_req["body"]["tools"] == [{"type": "web_search"}]
+    assert max_fb_req["body"]["tool_choice"] == {"type": "web_search"}
+
+    max_messages = [r for r in max_requests if r["path"] == "/messages" and "text" in r.get("body", {})]
+    assert max_messages, "Final answer must be sent via MAX /messages API endpoint"
+    final_max_reply = max_messages[-1]["body"]["text"]
+    assert "Ответ резервного ассистента Perplexity в MAX" in final_max_reply
+    assert "https://example.com/max-coping" in final_max_reply
 
 
 # ---------------------------------------------------------------------------
@@ -1772,10 +2019,14 @@ async def test_fallback_direct_models_full_journey_telegram_and_max(session_fact
 
 @pytest.mark.asyncio
 async def test_main_provider_admin_to_runtime_user_journey(session_factory, monkeypatch, init_ai_config):
-    """Verify complete end-to-end flow:
-    Admin selection of Perplexity direct model in DB -> user sends message in a multi-turn conversation ->
-    application runtime reads AIConfig -> builds structured Agent API payload with web_search tools ->
-    sends POST /v1/agent -> parses response with citations footer -> user receives final reply.
+    """Verify complete real end-to-end journey:
+    AI Admin screen -> Perplexity provider screen -> real visible 'Direct Models' button ->
+    actual page 0 -> real visible 'Далее ➡️' -> actual page 1 -> real visible direct-model button ->
+    Dispatcher -> handler -> DB persistence -> reopen -> selected model shows ✅ ->
+    return to appropriate parent -> ordinary user sends a real message through Telegram runtime ->
+    real runtime reads saved AIConfig -> Perplexity /v1/agent HTTP boundary is hit ->
+    real response parser runs -> real Telegram outgoing method is constructed ->
+    aiogram/Pydantic validates it -> user receives final text.
     """
     import handlers
     import ai_integration
@@ -1784,12 +2035,139 @@ async def test_main_provider_admin_to_runtime_user_journey(session_factory, monk
     monkeypatch.setattr(ai_integration, "async_session_maker", session_factory)
     monkeypatch.setattr(handlers, "is_admin", lambda user_id: True)
 
-    # 1. Admin configures Perplexity direct model in DB
+    session = ValidatingTelegramSession()
+    bot = Bot(token="123456:TEST_BOT_TOKEN", session=session)
+    handlers.router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(handlers.router)
+
+    admin_user = TgUser(id=999, is_bot=False, first_name="Admin", username="admin")
+    admin_chat = Chat(id=999, type=ChatType.PRIVATE)
+
+    # Pre-configure Perplexity credentials in DB
     async with session_factory() as s:
         cfg = await s.get(AIConfig, 1)
         cfg.provider = PROVIDER_PERPLEXITY
-        cfg.perplexity_api_key = "PPLX_MAIN_RUNTIME_KEY"
-        cfg.perplexity_model = "anthropic/claude-sonnet-4-6"
+        cfg.perplexity_api_key = "PPLX_MAIN_ADMIN_KEY"
+        cfg.perplexity_model = "fast"
+        await s.commit()
+
+    # 1. AI Admin: Open Perplexity provider settings screen
+    update_prov = Update(
+        update_id=1,
+        callback_query=CallbackQuery(
+            id="cb_prov",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Providers"),
+            data=f"view_models_{PROVIDER_PERPLEXITY}",
+        ),
+    )
+    await dp.feed_update(bot, update_prov)
+    provider_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+
+    # Extract visible "Direct Models" button from actual rendered markup
+    direct_btn = next(b for row in provider_kb.inline_keyboard for b in row if "Прямые модели" in b.text)
+    assert direct_btn.callback_data == "ai_ppx_models:0"
+
+    # 2. Click "Direct Models" to navigate to Page 0
+    update_p0 = Update(
+        update_id=2,
+        callback_query=CallbackQuery(
+            id="cb_p0",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Settings"),
+            data=direct_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_p0)
+    p0_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+
+    # Extract visible "Далее ➡️" button
+    next_btn = next(b for row in p0_kb.inline_keyboard for b in row if "Далее" in b.text)
+    assert next_btn.callback_data == "ai_ppx_models:1"
+
+    # 3. Click "Далее ➡️" to navigate to Page 1
+    update_p1 = Update(
+        update_id=3,
+        callback_query=CallbackQuery(
+            id="cb_p1",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Models P0"),
+            data=next_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_p1)
+    p1_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+
+    # Extract real visible direct-model button from Page 1
+    first_model_btn = p1_kb.inline_keyboard[0][0]
+    resolved_tuple = provider_models.resolve_telegram_model_callback(first_model_btn.callback_data)
+    assert resolved_tuple is not None
+    _, _, expected_admin_model = resolved_tuple
+
+    # 4. Click direct-model button via Dispatcher -> handler -> DB persistence
+    update_select = Update(
+        update_id=4,
+        callback_query=CallbackQuery(
+            id="cb_select",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Models P1"),
+            data=first_model_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_select)
+
+    # Verify selected model came from visible Admin markup and saved DB model equals selected model
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        assert cfg.perplexity_model == expected_admin_model
+
+    # 5. Reopen Page 1 via Dispatcher to confirm active checkmark ✅
+    update_reopen = Update(
+        update_id=5,
+        callback_query=CallbackQuery(
+            id="cb_reopen",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Models P1"),
+            data="ai_ppx_models:1",
+        ),
+    )
+    await dp.feed_update(bot, update_reopen)
+    reopened_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+    assert "✅" in reopened_kb.inline_keyboard[0][0].text
+
+    # 6. Return to appropriate parent via visible Back button ("К настройкам")
+    back_btn = reopened_kb.inline_keyboard[-1][0]
+    assert back_btn.callback_data == f"view_models_{PROVIDER_PERPLEXITY}"
+    update_back = Update(
+        update_id=6,
+        callback_query=CallbackQuery(
+            id="cb_back",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Models P1"),
+            data=back_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_back)
+    prov_reopened_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+    assert any("Прямые модели" in b.text for row in prov_reopened_kb.inline_keyboard for b in row)
+
+    # 7. Ordinary user sends a real message through Telegram production runtime:
+    client_id = 555
+    async with session_factory() as s:
+        client_user = User(id=client_id, username="journey_client", first_name="Client", accepted_disclaimer=True)
+        s.add(client_user)
+        await s.flush()
+        # Add prior multi-turn dialogue history
+        m1 = DBMessage(user_id=client_id, role="user", content="Первый вопрос о бессоннице")
+        m2 = DBMessage(user_id=client_id, role="assistant", content="Первый ответ психолога о режиме сна")
+        s.add_all([m1, m2])
         await s.commit()
 
     captured_requests = []
@@ -1805,15 +2183,15 @@ async def test_main_provider_admin_to_runtime_user_journey(session_factory, monk
             json={
                 "id": "resp-main-runtime-1",
                 "status": "completed",
-                "model": "anthropic/claude-sonnet-4-6",
+                "model": expected_admin_model,
                 "output": [
                     {
                         "type": "search_results",
                         "results": [
                             {
-                                "title": "Therapeutic Approaches",
-                                "url": "https://example.com/therapy-approaches",
-                                "snippet": "Evidence-based therapy techniques for stress reduction.",
+                                "title": "Sleep Hygiene Guidelines",
+                                "url": "https://example.com/sleep-hygiene",
+                                "snippet": "Scientific evidence for relaxation techniques.",
                             }
                         ],
                     },
@@ -1824,7 +2202,7 @@ async def test_main_provider_admin_to_runtime_user_journey(session_factory, monk
                         "content": [
                             {
                                 "type": "output_text",
-                                "text": "Я внимательно прочитал ваш вопрос. Рекомендую техники релаксации [1].",
+                                "text": "Я внимательно прочитал ваш вопрос. Рекомендую дыхательные техники перед сном [1].",
                             }
                         ],
                     },
@@ -1834,54 +2212,43 @@ async def test_main_provider_admin_to_runtime_user_journey(session_factory, monk
 
     transport = httpx.MockTransport(mock_agent_handler)
     with patch("httpx.AsyncClient", mock_httpx_async_client(transport)):
-        session = ValidatingTelegramSession()
-        bot = Bot(token="123456:TEST_BOT_TOKEN", session=session)
+        handlers.user_message_buffers[client_id] = ["Второй вопрос: что делать, если не помогает?"]
+        # Call real production entrypoint handlers.process_buffered_messages
+        await handlers.process_buffered_messages(client_id, bot)
 
-        # Create user with dialogue history
-        async with session_factory() as s:
-            user = User(id=555, username="journey_client", first_name="Client", accepted_disclaimer=True)
-            s.add(user)
-            await s.flush()
-            msg1 = DBMessage(user_id=555, role="user", content="Первый вопрос о бессоннице")
-            msg2 = DBMessage(user_id=555, role="assistant", content="Первый ответ психолога о режиме сна")
-            s.add_all([msg1, msg2])
-            await s.commit()
+    # Assertions:
+    # A. Runtime used exact model chosen in Admin UI
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    assert req["url"] == "https://api.perplexity.ai/v1/agent"
+    assert req["headers"]["authorization"] == "Bearer PPLX_MAIN_ADMIN_KEY"
+    assert req["body"]["model"] == expected_admin_model
 
-        # Run application runtime pipeline
-        response_capture = {}
-        reply_text = await ai_integration.generate_response(
-            555,
-            "Второй вопрос: что делать, если не помогает?",
-            bot=bot,
-            response_capture=response_capture,
-        )
+    # B. Tools and forced tool_choice present
+    assert req["body"]["tools"] == [{"type": "web_search"}]
+    assert req["body"]["tool_choice"] == {"type": "web_search"}
+    assert "preset" not in req["body"]
 
-        # Verify final user response
-        assert "Я внимательно прочитал ваш вопрос" in reply_text
-        assert "https://example.com/therapy-approaches" in reply_text
-        assert "Источники:" in reply_text
+    # C. Structured multi-turn input preserved without role flattening
+    inp = req["body"]["input"]
+    assert isinstance(inp, list)
+    assert len(inp) == 3
+    assert inp[0]["role"] == "user"
+    assert inp[0]["content"] == "Первый вопрос о бессоннице"
+    assert inp[1]["role"] == "assistant"
+    assert inp[1]["content"] == "Первый ответ психолога о режиме сна"
+    assert inp[2]["role"] == "user"
+    assert inp[2]["content"] == "Второй вопрос: что делать, если не помогает?"
+    assert "user: Первый вопрос" not in str(inp)
 
-        # Verify wire request sent to Perplexity Agent API
-        assert len(captured_requests) == 1
-        req = captured_requests[0]
-        assert req["url"] == "https://api.perplexity.ai/v1/agent"
-        assert req["headers"]["authorization"] == "Bearer PPLX_MAIN_RUNTIME_KEY"
-        assert req["body"]["model"] == "anthropic/claude-sonnet-4-6"
-        assert req["body"]["tools"] == [{"type": "web_search"}], "Direct model MUST include web_search tool"
-        assert req["body"]["max_output_tokens"] == 8192, "Anthropic models require max_output_tokens=8192"
-        assert "preset" not in req["body"]
-
-        # Verify structured input with preserved roles and order
-        inp = req["body"]["input"]
-        assert isinstance(inp, list)
-        assert len(inp) == 3
-        assert inp[0]["role"] == "user"
-        assert inp[0]["content"] == "Первый вопрос о бессоннице"
-        assert inp[1]["role"] == "assistant"
-        assert inp[1]["content"] == "Первый ответ психолога о режиме сна"
-        assert inp[2]["role"] == "user"
-        assert inp[2]["content"] == "Второй вопрос: что делать, если не помогает?"
-        assert "user: Первый вопрос" not in str(inp)
+    # D. Final Telegram delivery via real SendMessage passes Pydantic validation
+    outgoing_messages = [c for c in session.calls if isinstance(c, SendMessage) and c.chat_id == client_id]
+    assert outgoing_messages, "Production handler must construct and deliver SendMessage to user"
+    final_telegram_method = outgoing_messages[-1]
+    SendMessage.model_validate(final_telegram_method.model_dump())
+    assert "Я внимательно прочитал ваш вопрос. Рекомендую дыхательные техники перед сном" in final_telegram_method.text
+    assert "https://example.com/sleep-hygiene" in final_telegram_method.text
+    assert "Источники:" in final_telegram_method.text
 
 
 # ---------------------------------------------------------------------------

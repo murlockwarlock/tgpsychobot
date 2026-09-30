@@ -205,10 +205,11 @@ def build_perplexity_payload(
     if instructions:
         payload["instructions"] = instructions
 
-    # Direct models: Explicitly enable web search tool to ground the LLM with search citations.
-    # Presets: Omit tools so that Perplexity manages its preset search & tool profile.
+    # Direct models: Explicitly enable web search tool and force tool_choice to ground the LLM with search citations.
+    # Presets: Omit tools and tool_choice so that Perplexity manages its preset search & tool profile.
     if effective_model is not None and not is_preset:
         payload["tools"] = [{"type": "web_search"}]
+        payload["tool_choice"] = {"type": "web_search"}
 
     # Anthropic models via Perplexity REQUIRE max_output_tokens.
     is_anthropic = bool(effective_model and effective_model.startswith("anthropic/"))
@@ -277,7 +278,7 @@ def _classify_perplexity_error_dict(err: dict[str, Any]) -> str:
         if code == 404:
             return "configuration"
         return "provider_rejection"
-    if isinstance(code, int) and code >= 500:
+    if (isinstance(code, int) and code >= 500) or "internal" in err_type or "server" in err_type or "backend" in msg:
         return "provider_5xx"
     return "provider_rejection"
 
@@ -325,6 +326,7 @@ def _populate_perplexity_diagnostics(
     duration_ms: float | None = None,
     classification: str | None = None,
     is_retryable: bool | None = None,
+    will_retry: bool | None = None,
 ) -> None:
     if request_capture is None:
         return
@@ -338,6 +340,8 @@ def _populate_perplexity_diagnostics(
         request_capture["classification"] = classification
     if is_retryable is not None:
         request_capture["is_retryable"] = is_retryable
+    if will_retry is not None:
+        request_capture["will_retry"] = will_retry
     if headers is not None:
         header_req_id = getattr(headers, "get", lambda k: None)("x-request-id")
         if header_req_id:
@@ -376,6 +380,14 @@ def _populate_perplexity_diagnostics(
 def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str, Any] | None = None) -> str:
     status = payload.get("status")
     if not status or not isinstance(status, str):
+        _populate_perplexity_diagnostics(
+            request_capture,
+            status_code=200,
+            data=payload,
+            classification="invalid_response",
+            is_retryable=False,
+            will_retry=False,
+        )
         raise ProviderAdapterError("Отсутствует обязательный статус ответа Perplexity", category="invalid_response")
 
     normalized_status = status.strip().lower()
@@ -383,22 +395,70 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
         err = payload.get("error") if isinstance(payload.get("error"), dict) else {}
         msg = err.get("message") or "Запрос к Perplexity завершился ошибкой"
         cat = _classify_perplexity_error_dict(err)
-        _populate_perplexity_diagnostics(request_capture, status_code=200, data=payload, error_dict=err)
+        _populate_perplexity_diagnostics(
+            request_capture,
+            status_code=200,
+            data=payload,
+            error_dict=err,
+            classification=cat,
+            is_retryable=False,
+            will_retry=False,
+        )
         raise ProviderAdapterError(f"Perplexity статус failed: {msg}", category=cat)
     if normalized_status == "incomplete":
+        _populate_perplexity_diagnostics(
+            request_capture,
+            status_code=200,
+            data=payload,
+            classification="invalid_response",
+            is_retryable=False,
+            will_retry=False,
+        )
         raise ProviderAdapterError("Perplexity вернул неполный ответ (incomplete)", category="invalid_response")
     if normalized_status == "cancelled":
+        _populate_perplexity_diagnostics(
+            request_capture,
+            status_code=200,
+            data=payload,
+            classification="provider_rejection",
+            is_retryable=False,
+            will_retry=False,
+        )
         raise ProviderAdapterError("Запрос к Perplexity был отменён (cancelled)", category="provider_rejection")
     if normalized_status in {"queued", "in_progress"}:
+        _populate_perplexity_diagnostics(
+            request_capture,
+            status_code=200,
+            data=payload,
+            classification="invalid_response",
+            is_retryable=False,
+            will_retry=False,
+        )
         raise ProviderAdapterError(f"Неожиданный промежуточный статус Perplexity: {normalized_status}", category="invalid_response")
     if normalized_status != "completed":
+        _populate_perplexity_diagnostics(
+            request_capture,
+            status_code=200,
+            data=payload,
+            classification="invalid_response",
+            is_retryable=False,
+            will_retry=False,
+        )
         raise ProviderAdapterError(f"Неизвестный статус ответа Perplexity: {normalized_status}", category="invalid_response")
 
     if payload.get("error"):
         err = payload["error"]
         msg = err.get("message") if isinstance(err, dict) else str(err)
         cat = _classify_perplexity_error_dict(err if isinstance(err, dict) else {})
-        _populate_perplexity_diagnostics(request_capture, status_code=200, data=payload, error_dict=err if isinstance(err, dict) else None)
+        _populate_perplexity_diagnostics(
+            request_capture,
+            status_code=200,
+            data=payload,
+            error_dict=err if isinstance(err, dict) else None,
+            classification=cat,
+            is_retryable=False,
+            will_retry=False,
+        )
         raise ProviderAdapterError(f"Ошибка Perplexity в ответе: {msg}", category=cat)
 
     output = payload.get("output")
@@ -412,6 +472,14 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
             if item_type == "message" and item_role == "assistant" and item_status == "completed":
                 content = item.get("content")
                 if isinstance(content, str) and content.strip():
+                    _populate_perplexity_diagnostics(
+                        request_capture,
+                        status_code=200,
+                        data=payload,
+                        classification="success",
+                        is_retryable=False,
+                        will_retry=False,
+                    )
                     return content.strip()
                 if isinstance(content, list):
                     parts: list[str] = []
@@ -423,13 +491,37 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
                     if parts:
                         text_val = "\n".join(parts).strip()
                         if text_val:
+                            _populate_perplexity_diagnostics(
+                                request_capture,
+                                status_code=200,
+                                data=payload,
+                                classification="success",
+                                is_retryable=False,
+                                will_retry=False,
+                            )
                             return text_val
                 text_val = item.get("text")
                 if isinstance(text_val, str) and text_val.strip():
+                    _populate_perplexity_diagnostics(
+                        request_capture,
+                        status_code=200,
+                        data=payload,
+                        classification="success",
+                        is_retryable=False,
+                        will_retry=False,
+                    )
                     return text_val.strip()
 
     direct = payload.get("output_text")
     if isinstance(direct, str) and direct.strip():
+        _populate_perplexity_diagnostics(
+            request_capture,
+            status_code=200,
+            data=payload,
+            classification="success",
+            is_retryable=False,
+            will_retry=False,
+        )
         return direct.strip()
     choices = payload.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
@@ -437,7 +529,23 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
         content = message.get("content") if isinstance(message, dict) else None
         text = _extract_message_text(content)
         if text:
+            _populate_perplexity_diagnostics(
+                request_capture,
+                status_code=200,
+                data=payload,
+                classification="success",
+                is_retryable=False,
+                will_retry=False,
+            )
             return text
+    _populate_perplexity_diagnostics(
+        request_capture,
+        status_code=200,
+        data=payload,
+        classification="empty_response",
+        is_retryable=False,
+        will_retry=False,
+    )
     raise ProviderAdapterError("Perplexity вернул пустой ответ", category="empty_response")
 
 
@@ -447,26 +555,31 @@ def format_perplexity_response(payload: dict[str, Any], request_capture: dict[st
     if not isinstance(output, list):
         output = []
 
+    # Agent API source extraction:
+    # 1. Canonical source: output[] items with type == "search_results" containing results or content list
     raw_results: list[dict[str, Any]] = []
     for item in output:
         if not isinstance(item, dict):
             continue
-        results = item.get("results")
-        if isinstance(results, list):
-            for res in results:
-                if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
-                    raw_results.append(res)
-        content_items = item.get("content")
-        if isinstance(content_items, list):
-            for res in content_items:
-                if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
-                    raw_results.append(res)
+        if item.get("type") == "search_results" or (item.get("type") == "tool_call" and item.get("tool_name") in {"web_search", "search_results", None}):
+            results = item.get("results")
+            if isinstance(results, list):
+                for res in results:
+                    if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
+                        raw_results.append(res)
+            content_items = item.get("content")
+            if isinstance(content_items, list):
+                for res in content_items:
+                    if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
+                        raw_results.append(res)
 
-    citations_list = payload.get("citations")
-    if isinstance(citations_list, list):
-        for c in citations_list:
-            if isinstance(c, str) and c.startswith(("http://", "https://")):
-                raw_results.append({"url": c, "title": c})
+    # 2. Backward compatibility fallback: top-level citations list if no Agent API search_results were present
+    if not raw_results:
+        citations_list = payload.get("citations")
+        if isinstance(citations_list, list):
+            for c in citations_list:
+                if isinstance(c, str) and c.startswith(("http://", "https://")):
+                    raw_results.append({"url": c, "title": c})
 
     if not raw_results:
         return text
@@ -668,6 +781,7 @@ async def _post_perplexity_json(
                     duration_ms=duration_ms,
                     classification="timeout",
                     is_retryable=False,
+                    will_retry=False,
                 )
             raise ProviderAdapterError("Таймаут обращения к Perplexity", category="timeout") from last_error
         try:
@@ -690,10 +804,10 @@ async def _post_perplexity_json(
                     status=response.status_code,
                     category=category,
                 )
-                # Only true rate limits and 5xx server errors are retryable.
+                # Only true rate limits and 5xx server errors are retryable by policy.
                 # Quota/credit exhaustion, auth errors, and configuration failures MUST NOT be retried.
                 is_retryable = (category in {"rate_limit", "provider_5xx"}) and (response.status_code in {429, 500, 502, 503, 504})
-                can_retry = is_retryable and ((attempt + 1) < max_attempts)
+                will_retry = is_retryable and ((attempt + 1) < max_attempts)
 
                 _populate_perplexity_diagnostics(
                     request_capture,
@@ -703,10 +817,11 @@ async def _post_perplexity_json(
                     attempt_count=attempt + 1,
                     duration_ms=duration_ms,
                     classification=category,
-                    is_retryable=can_retry,
+                    is_retryable=is_retryable,
+                    will_retry=will_retry,
                 )
 
-                if can_retry:
+                if will_retry:
                     retry_after_str = response.headers.get("retry-after")
                     if retry_after_str:
                         try:
@@ -731,6 +846,7 @@ async def _post_perplexity_json(
                     duration_ms=duration_ms,
                     classification="invalid_response",
                     is_retryable=False,
+                    will_retry=False,
                 )
                 raise ProviderAdapterError("Perplexity вернул некорректный JSON", status=response.status_code, category="invalid_response")
 
@@ -743,6 +859,7 @@ async def _post_perplexity_json(
                 duration_ms=duration_ms,
                 classification="success",
                 is_retryable=False,
+                will_retry=False,
             )
             return data
         except ProviderAdapterError:
@@ -752,16 +869,18 @@ async def _post_perplexity_json(
             last_error = exc
             duration_ms = round((time.monotonic() - start_time) * 1000, 2)
             category = "timeout" if isinstance(exc, httpx.ConnectTimeout) else "network_connection"
-            can_retry = (attempt + 1) < max_attempts
+            is_retryable = True
+            will_retry = (attempt + 1) < max_attempts
             if request_capture is not None:
                 _populate_perplexity_diagnostics(
                     request_capture,
                     attempt_count=attempt + 1,
                     duration_ms=duration_ms,
                     classification=category,
-                    is_retryable=can_retry,
+                    is_retryable=is_retryable,
+                    will_retry=will_retry,
                 )
-            if can_retry:
+            if will_retry:
                 delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
                 if time.monotonic() + delay <= deadline:
                     await asyncio.sleep(delay)
@@ -777,6 +896,7 @@ async def _post_perplexity_json(
                     duration_ms=duration_ms,
                     classification="timeout",
                     is_retryable=False,
+                    will_retry=False,
                 )
             raise ProviderAdapterError("Таймаут ожидания ответа Perplexity", category="timeout") from exc
         except httpx.NetworkError as exc:
@@ -789,6 +909,7 @@ async def _post_perplexity_json(
                     duration_ms=duration_ms,
                     classification="network_connection",
                     is_retryable=False,
+                    will_retry=False,
                 )
             raise ProviderAdapterError("Ошибка сети Perplexity", category="network_connection") from exc
         except Exception as exc:
@@ -800,6 +921,7 @@ async def _post_perplexity_json(
                     duration_ms=duration_ms,
                     classification="provider",
                     is_retryable=False,
+                    will_retry=False,
                 )
             raise ProviderAdapterError(f"Ошибка обращения к Perplexity: {exc}", category="provider") from exc
     raise ProviderAdapterError("Ошибка обращения к Perplexity", category="provider") from last_error

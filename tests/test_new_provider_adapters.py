@@ -136,6 +136,7 @@ def test_perplexity_payload_uses_official_preset_tools_without_reasoning_control
     payload = build_perplexity_payload(layout(), "medium", max_output_tokens=2048)
     assert payload["preset"] == "medium"
     assert "tools" not in payload
+    assert "tool_choice" not in payload
     assert payload["max_output_tokens"] == 2048
     assert payload["instructions"].startswith("Отвечай на языке пользователя.")
     assert "web_search" in payload["instructions"]
@@ -153,6 +154,14 @@ def test_perplexity_preset_omits_local_tools_for_all_presets():
         payload = build_perplexity_payload(layout(), preset)
         assert payload["preset"] == preset
         assert "tools" not in payload
+        assert "tool_choice" not in payload
+
+
+def test_perplexity_direct_model_payload_includes_tools_and_forced_tool_choice():
+    payload = build_perplexity_payload(layout(), model="anthropic/claude-sonnet-4-6")
+    assert payload["model"] == "anthropic/claude-sonnet-4-6"
+    assert payload["tools"] == [{"type": "web_search"}]
+    assert payload["tool_choice"] == {"type": "web_search"}
 
 
 def test_deepgram_payload_and_transcript_support_multilingual_audio():
