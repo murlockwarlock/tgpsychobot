@@ -614,7 +614,7 @@ def perplexity_models_keyboard(
     current_model: str | None = None,
     models: list[str] | None = None,
     page: int = 0,
-    page_size: int = 6,
+    page_size: int = 10,
     channel: str = "chat",
     back_callback: str | None = None,
     callback_prefix: str = "ai_ppx_models:",

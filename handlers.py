@@ -205,7 +205,7 @@ async def _reject_model_callback(callback: CallbackQuery, provider: str | None =
                 )
                 await callback.message.edit_text(
                     heading,
-                    reply_markup=kb.perplexity_models_keyboard(current_model, models, page=0, page_size=6),
+                    reply_markup=kb.perplexity_models_keyboard(current_model, models, page=0, page_size=10),
                 )
             elif provider:
                 await _render_provider_model_settings(callback, provider)
@@ -6206,23 +6206,14 @@ async def show_perplexity_fallback_models(callback: CallbackQuery, state: FSMCon
         config = await session.get(AIConfig, 1)
         current_model = getattr(config, "fallback_model", None) if config else None
 
-    source_desc = (
-        "🟢 Актуальный каталог"
-        if catalog_state.source == "live"
-        else ("🟡 Кэш каталога" if catalog_state.source == "stale_live" else "⚪ Статический каталог")
-    )
-    heading = (
-        f"🤖 <b>Прямые модели Perplexity для резерва текста</b>\n"
-        f"<i>({source_desc}, моделей: {len(models)})</i>\n\n"
-        "Выберите модель, которая будет использоваться при сбоях основного провайдера:\n"
-    )
+    heading = "🤖 <b>Прямые модели Perplexity для резерва текста:</b>"
     await callback.message.edit_text(
         heading,
         reply_markup=kb.perplexity_models_keyboard(
             current_model=current_model,
             models=models,
             page=page,
-            page_size=6,
+            page_size=10,
             channel="fallback",
             back_callback="admin_ai_fallback_model",
             callback_prefix="ai_ppx_fb_models:",
@@ -7326,19 +7317,10 @@ async def view_perplexity_models(callback: CallbackQuery, state: FSMContext | No
         config = await session.get(AIConfig, 1)
     current_model = getattr(config, "perplexity_model", None) if config else None
 
-    source_desc = (
-        "🟢 Актуальный каталог"
-        if catalog_state.source == "live"
-        else ("🟡 Кэш каталога" if catalog_state.source == "stale_live" else "⚪ Статический каталог")
-    )
-    heading = (
-        f"🤖 <b>Прямые модели Perplexity</b>\n"
-        f"<i>({source_desc}, моделей: {len(models)})</i>\n\n"
-        "Выберите модель для генерации ответа:\n"
-    )
+    heading = "🤖 <b>Прямые модели Perplexity:</b>"
     await callback.message.edit_text(
         heading,
-        reply_markup=kb.perplexity_models_keyboard(current_model, models, page=page, page_size=6),
+        reply_markup=kb.perplexity_models_keyboard(current_model, models, page=page, page_size=10),
     )
     if state is not None:
         await state.update_data(model_picker_return=f"view_models_{PROVIDER_PERPLEXITY}")

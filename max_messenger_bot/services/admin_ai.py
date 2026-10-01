@@ -847,20 +847,11 @@ async def show_perplexity_models(client: MaxApiClient, chat_id: int, page: int =
     models = list(catalog_state.models)
     config = await _get_config()
     current_model = getattr(config, "perplexity_model", "")
-    source_desc = (
-        "🟢 Актуальный каталог"
-        if catalog_state.source == "live"
-        else ("🟡 Кэш каталога" if catalog_state.source == "stale_live" else "⚪ Статический каталог")
-    )
-    text = (
-        f"<b>🤖 Прямые модели Perplexity</b>\n"
-        f"<i>({source_desc}, моделей: {len(models)})</i>\n\n"
-        "Выберите модель для генерации ответа:\n"
-    )
+    text = "<b>🤖 Прямые модели Perplexity:</b>"
     await client.send_message(
         chat_id=chat_id,
         text=text,
-        attachments=admin_ai_perplexity_models_keyboard(current_model or "", models, page=page, page_size=6, back_callback=f"admin_ai_models_{PROVIDER_PERPLEXITY}"),
+        attachments=admin_ai_perplexity_models_keyboard(current_model or "", models, page=page, page_size=10, back_callback=f"admin_ai_models_{PROVIDER_PERPLEXITY}"),
     )
 
 
@@ -1261,16 +1252,7 @@ async def show_fallback_perplexity_models(client: MaxApiClient, chat_id: int, pa
     models = list(catalog_state.models)
     config = await _get_config()
     current_model = getattr(config, "fallback_model", "")
-    source_desc = (
-        "🟢 Актуальный каталог"
-        if catalog_state.source == "live"
-        else ("🟡 Кэш каталога" if catalog_state.source == "stale_live" else "⚪ Статический каталог")
-    )
-    text = (
-        f"<b>🤖 Прямые модели Perplexity для резерва текста</b>\n"
-        f"<i>({source_desc}, моделей: {len(models)})</i>\n\n"
-        "Выберите модель, которая будет использоваться при сбоях основного провайдера:\n"
-    )
+    text = "<b>🤖 Прямые модели Perplexity для резерва текста:</b>"
     await client.send_message(
         chat_id=chat_id,
         text=text,
@@ -1278,7 +1260,7 @@ async def show_fallback_perplexity_models(client: MaxApiClient, chat_id: int, pa
             current_model or "",
             models,
             page=page,
-            page_size=6,
+            page_size=10,
             back_callback="admin_ai_fallback_model",
             callback_prefix="admin_ai_fb_ppx_models_",
             action_prefix="admin_ai_save_fallback_Perplexity_",

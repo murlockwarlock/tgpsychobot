@@ -997,7 +997,7 @@ def admin_ai_perplexity_models_keyboard(
     current_model: str,
     models: list[str],
     page: int = 0,
-    page_size: int = 6,
+    page_size: int = 10,
     *,
     back_callback: str = "admin_ai_models_Perplexity",
     callback_prefix: str = "admin_ai_ppx_models_",

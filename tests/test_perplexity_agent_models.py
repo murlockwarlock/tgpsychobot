@@ -2613,3 +2613,45 @@ def test_ui_source_labels():
             else ("🟡 Кэш каталога" if state.source == "stale_live" else "⚪ Статический каталог")
         )
         assert label == expected_label
+
+
+# ---------------------------------------------------------------------------
+# 18. Direct Models 10 items per page pagination & concise headings
+# ---------------------------------------------------------------------------
+
+def test_direct_models_heading_and_10_per_page_pagination():
+    """Verify 20 static direct models produce exactly 2 pages with 10 items each, without verbose debug text."""
+    from provider_models import PERPLEXITY_STATIC_DIRECT_MODELS
+
+    assert len(PERPLEXITY_STATIC_DIRECT_MODELS) == 20
+
+    # Telegram: 20 models -> Page 0 (10 items + Далее ➡️) and Page 1 (10 items + ⬅️ Назад)
+    tg_p0 = kb.perplexity_models_keyboard(models=PERPLEXITY_STATIC_DIRECT_MODELS, page=0)
+    assert len(tg_p0.inline_keyboard) == 12  # 10 models + 1 nav row + 1 parent row
+    tg_nav_p0 = tg_p0.inline_keyboard[-2]
+    assert [b.text for b in tg_nav_p0] == ["Далее ➡️"]
+    assert tg_nav_p0[0].callback_data == "ai_ppx_models:1"
+
+    tg_p1 = kb.perplexity_models_keyboard(models=PERPLEXITY_STATIC_DIRECT_MODELS, page=1)
+    assert len(tg_p1.inline_keyboard) == 12  # 10 models + 1 nav row + 1 parent row
+    tg_nav_p1 = tg_p1.inline_keyboard[-2]
+    assert [b.text for b in tg_nav_p1] == ["⬅️ Назад"]
+    assert tg_nav_p1[0].callback_data == "ai_ppx_models:0"
+
+    # Clamping: requesting page 2 should clamp to page 1
+    tg_p2 = kb.perplexity_models_keyboard(models=PERPLEXITY_STATIC_DIRECT_MODELS, page=2)
+    assert [b.text for b in tg_p2.inline_keyboard[-2]] == ["⬅️ Назад"]
+
+    # MAX: 20 models -> Page 0 (10 items + Далее ➡️) and Page 1 (10 items + ⬅️ Назад)
+    max_p0 = admin_ai_perplexity_models_keyboard(current_model="", models=PERPLEXITY_STATIC_DIRECT_MODELS, page=0)
+    max_btns_p0 = max_p0[0]["payload"]["buttons"]
+    assert len(max_btns_p0) == 12
+    assert [b["text"] for b in max_btns_p0[-2]] == ["Далее ➡️"]
+    assert max_btns_p0[-2][0]["payload"] == "admin_ai_ppx_models_1"
+
+    max_p1 = admin_ai_perplexity_models_keyboard(current_model="", models=PERPLEXITY_STATIC_DIRECT_MODELS, page=1)
+    max_btns_p1 = max_p1[0]["payload"]["buttons"]
+    assert len(max_btns_p1) == 12
+    assert [b["text"] for b in max_btns_p1[-2]] == ["⬅️ Назад"]
+    assert max_btns_p1[-2][0]["payload"] == "admin_ai_ppx_models_0"
+
