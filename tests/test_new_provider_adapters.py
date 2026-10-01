@@ -49,8 +49,9 @@ def test_openrouter_catalog_is_curated_and_capability_driven():
     assert OPENROUTER_MODEL_SPECS["google/gemini-3.7-flash"].audio_input is True
     assert validate_model_selection(PROVIDER_OPENROUTER, "openai/gpt-5.6-terra") == "openai/gpt-5.6-terra"
     assert validate_model_selection(PROVIDER_PERPLEXITY, "medium") == "medium"
-    assert get_selectable_models(PROVIDER_DEEPGRAM, "transcription") == ("nova-3",)
+    assert get_selectable_models(PROVIDER_DEEPGRAM, "transcription") == ("nova-3", "nova-2")
     assert validate_model_selection(PROVIDER_DEEPGRAM, "nova-3", channel="transcription") == "nova-3"
+    assert validate_model_selection(PROVIDER_DEEPGRAM, "nova-2", channel="transcription") == "nova-2"
     assert get_default_model(PROVIDER_DEEPGRAM, channel="transcription") == "nova-3"
 
 
@@ -122,8 +123,11 @@ def test_openrouter_response_and_perplexity_citations_are_safe():
     assert "secret" not in repr(capture)
 
     payload = {
-        "output_text": "Ответ [1]",
-        "output": [{"type": "search_results", "results": [{"title": "Источник", "url": "https://example.com"}]}],
+        "status": "completed",
+        "output": [
+            {"type": "search_results", "results": [{"title": "Источник", "url": "https://example.com"}]},
+            {"type": "message", "role": "assistant", "status": "completed", "content": "Ответ [1]"},
+        ],
     }
     assert "Источники:" in format_perplexity_response(payload)
     assert "https://example.com" in format_perplexity_response(payload)
@@ -132,19 +136,33 @@ def test_openrouter_response_and_perplexity_citations_are_safe():
 def test_perplexity_payload_uses_official_preset_tools_without_reasoning_control():
     payload = build_perplexity_payload(layout(), "medium", max_output_tokens=2048)
     assert payload["preset"] == "medium"
-    assert payload["tools"] == [{"type": "web_search"}, {"type": "fetch_url", "max_urls": 1}]
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
     assert payload["max_output_tokens"] == 2048
     assert payload["instructions"].startswith("Отвечай на языке пользователя.")
     assert "web_search" in payload["instructions"]
     assert "inline citations" in payload["instructions"]
-    assert "system:" not in payload["input"]
-    assert "user: Текущий вопрос" in payload["input"]
+    assert isinstance(payload["input"], list)
+    assert payload["input"][0] == {"role": "user", "content": "Предыдущий вопрос"}
+    assert payload["input"][1] == {"role": "user", "content": "Текущий вопрос"}
+    assert "user:" not in payload["input"][0]["content"]
+    assert "user:" not in payload["input"][1]["content"]
     assert "reasoning" not in payload
 
 
-def test_perplexity_fast_preset_uses_web_search_only():
-    payload = build_perplexity_payload(layout(), "fast")
+def test_perplexity_preset_omits_local_tools_for_all_presets():
+    for preset in ("fast", "low", "medium", "high", "xhigh"):
+        payload = build_perplexity_payload(layout(), preset)
+        assert payload["preset"] == preset
+        assert "tools" not in payload
+        assert "tool_choice" not in payload
+
+
+def test_perplexity_direct_model_payload_includes_tools_and_forced_tool_choice():
+    payload = build_perplexity_payload(layout(), model="anthropic/claude-sonnet-4-6")
+    assert payload["model"] == "anthropic/claude-sonnet-4-6"
     assert payload["tools"] == [{"type": "web_search"}]
+    assert payload["tool_choice"] == {"type": "web_search"}
 
 
 def test_deepgram_payload_and_transcript_support_multilingual_audio():
@@ -155,8 +173,22 @@ def test_deepgram_payload_and_transcript_support_multilingual_audio():
     assert transcript == "Olá, мир"
     assert "language=multi" in capture["endpoint"]
     request_url, request_kwargs = FakeClient.requests[-1]
-    assert request_url.endswith("language=multi")
+    assert "language=multi" in request_url
     assert request_kwargs["headers"]["Content-Type"] == "audio/ogg"
+
+    # Nova-2 uses detect_language=true and omits language=multi
+    FakeClient.response = FakeResponse(200, {"results": {"channels": [{"alternatives": [{"transcript": "Привет мир"}]}]}})
+    capture_nova2 = {}
+    with patch("provider_adapters.httpx.AsyncClient", FakeClient):
+        transcript_nova2 = asyncio.run(call_deepgram("secret", b"audio", "voice.ogg", model="nova-2", request_capture=capture_nova2))
+    assert transcript_nova2 == "Привет мир"
+    assert "detect_language=true" in capture_nova2["endpoint"]
+    assert "language=multi" not in capture_nova2["endpoint"]
+    assert capture_nova2["payload"] == {"model": "nova-2", "detect_language": True, "smart_format": True}
+    request_url_n2, _ = FakeClient.requests[-1]
+    assert "model=nova-2" in request_url_n2
+    assert "detect_language=true" in request_url_n2
+    assert "language=multi" not in request_url_n2
 
 
 def test_new_provider_output_budget_respects_model_capability_metadata():
@@ -192,6 +224,7 @@ def test_provider_errors_are_normalized_and_retries_are_bounded():
     assert normalize_provider_error_classification("server_error") == "provider_5xx"
     assert normalize_provider_error_classification("network") == "network_connection"
     assert normalize_provider_error_classification("invalid_model") == "configuration"
+    assert normalize_provider_error_classification("output_budget_exhausted") == "output_budget_exhausted"
 
 
 def test_new_provider_activity_tracker_marks_only_once():

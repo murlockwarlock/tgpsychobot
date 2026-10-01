@@ -20,6 +20,10 @@ from provider_models import (
     canonical_provider_name,
     DEEPGRAM_DEFAULT_MODEL,
     PROVIDER_DEEPSEEK,
+    PROVIDER_PERPLEXITY,
+    PERPLEXITY_MODES,
+    PERPLEXITY_MODE_INFO,
+    get_perplexity_model_label,
 )
 from max_messenger_bot.identity import is_max_user_id, max_client_list_label
 from translation_service import (
@@ -557,11 +561,23 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     return builder.as_markup()
 
 
-def model_selection_keyboard(provider: str, models: dict, channel: str = "chat", back_callback: str | None = None):
+def model_selection_keyboard(
+    provider: str,
+    models: dict,
+    channel: str = "chat",
+    back_callback: str | None = None,
+    current_model: str | None = None,
+):
     builder = InlineKeyboardBuilder()
     for model_key, model_info in models.items():
+        name = model_info['name']
+        is_selected = (
+            current_model == model_key
+            or (current_model and (name == current_model or model_key.endswith(f"/{current_model}")))
+        )
+        button_text = f"✅ {name}" if is_selected and not name.startswith("✅") else name
         builder.button(
-            text=model_info['name'],
+            text=button_text,
             callback_data=build_telegram_model_callback_data(provider, channel, model_key),
         )
     builder.button(
@@ -569,6 +585,80 @@ def model_selection_keyboard(provider: str, models: dict, channel: str = "chat",
         callback_data=back_callback or ("admin_ai_keys" if channel == "chat" else "admin_ai_keys"),
     )
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def perplexity_category_keyboard(
+    channel: str = "chat",
+    back_callback: str | None = None,
+    presets_callback: str = "ai_ppx_presets",
+    models_callback: str = "ai_ppx_models:0",
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚡ Пресеты поиска", callback_data=presets_callback)
+    builder.button(text="🤖 Прямые модели", callback_data=models_callback)
+    builder.button(text="⬅️ Назад", callback_data=back_callback or f"view_models_{PROVIDER_PERPLEXITY}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def perplexity_presets_keyboard(
+    current_model: str | None = None,
+    channel: str = "chat",
+    back_callback: str | None = None,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for mode in PERPLEXITY_MODES:
+        info = PERPLEXITY_MODE_INFO.get(mode, {})
+        name = info.get("name", mode)
+        mark = " ✅" if current_model == mode else ""
+        button_text = f"{name}{mark}"
+        builder.button(
+            text=button_text,
+            callback_data=build_telegram_model_callback_data(PROVIDER_PERPLEXITY, channel, mode),
+        )
+    builder.button(text="⬅️ Назад", callback_data=back_callback or f"view_models_{PROVIDER_PERPLEXITY}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def perplexity_models_keyboard(
+    current_model: str | None = None,
+    models: list[str] | None = None,
+    page: int = 0,
+    page_size: int = 10,
+    channel: str = "chat",
+    back_callback: str | None = None,
+    callback_prefix: str = "ai_ppx_models:",
+) -> InlineKeyboardMarkup:
+    models_list = list(models or [])
+    total_models = len(models_list)
+    total_pages = max(1, (total_models + page_size - 1) // page_size) if total_models > 0 else 1
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * page_size
+    page_models = models_list[start_idx : start_idx + page_size]
+
+    builder = InlineKeyboardBuilder()
+    for model_id in page_models:
+        label = get_perplexity_model_label(model_id)
+        mark = " ✅" if current_model == model_id else ""
+        button_text = f"{label}{mark}"
+        builder.button(
+            text=button_text,
+            callback_data=build_telegram_model_callback_data(PROVIDER_PERPLEXITY, channel, model_id),
+        )
+    builder.adjust(1)
+
+    if total_models > 0 and total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{callback_prefix}{page - 1}"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"{callback_prefix}{page + 1}"))
+        if nav_buttons:
+            builder.row(*nav_buttons)
+
+    builder.row(InlineKeyboardButton(text="К настройкам", callback_data=back_callback or f"view_models_{PROVIDER_PERPLEXITY}"))
     return builder.as_markup()
 
 
@@ -581,7 +671,11 @@ def provider_model_settings_keyboard(
     show_proxy: bool = False,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🤖 Выбрать модель", callback_data=f"view_provider_models_{provider}")
+    if provider == PROVIDER_PERPLEXITY:
+        builder.button(text="⚡ Пресеты поиска", callback_data="ai_ppx_presets")
+        builder.button(text="🤖 Прямые модели", callback_data="ai_ppx_models:0")
+    else:
+        builder.button(text="🤖 Выбрать модель", callback_data=f"view_provider_models_{provider}")
     if not transcription_only:
         builder.button(text="📏 Max tokens", callback_data=f"model_setting_max_tokens_{provider}")
         if show_reasoning:

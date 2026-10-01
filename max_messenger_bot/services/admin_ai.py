@@ -4,7 +4,16 @@ import html
 from pathlib import Path
 
 from ..api import MaxApiClient
-from ..keyboards import admin_ai_model_selection_keyboard, admin_ai_settings_keyboard, admin_ai_vision_models_keyboard, callback_button, inline_keyboard
+from ..keyboards import (
+    admin_ai_model_selection_keyboard,
+    admin_ai_perplexity_category_keyboard,
+    admin_ai_perplexity_presets_keyboard,
+    admin_ai_perplexity_models_keyboard,
+    admin_ai_settings_keyboard,
+    admin_ai_vision_models_keyboard,
+    callback_button,
+    inline_keyboard,
+)
 from ..legacy import AIConfig, AIModelSettings, async_session_maker
 from ..storage import StateStore
 from memory_mode import MEMORY_MODE_RESET, get_metadata_reset_mode, memory_mode_label, metadata_reset_mode_label, next_memory_mode, normalize_memory_mode
@@ -17,11 +26,15 @@ from provider_models import (
     PROVIDER_OPENROUTER,
     PROVIDER_PERPLEXITY,
     PROVIDER_DEEPGRAM,
+    PERPLEXITY_MODES,
+    PERPLEXITY_MODE_INFO,
     ModelUnavailableError,
     canonical_provider_name,
     get_default_model,
     get_capability_providers,
+    get_perplexity_catalog_state,
     get_selectable_models,
+    refresh_perplexity_catalog,
     validate_model_selection,
 )
 from ai_model_settings import (
@@ -632,8 +645,14 @@ async def show_provider_settings(client: MaxApiClient, chat_id: int, provider: s
         rows.append([callback_button("🌡 Temperature", f"admin_ai_model_temperature_{provider}")])
     if provider == PROVIDER_DEEPSEEK:
         rows.append([callback_button("🌍 Proxy", "admin_ai_deepseek_proxy")])
+    if provider == PROVIDER_PERPLEXITY:
+        rows.extend([
+            [callback_button("⚡ Пресеты поиска", "admin_ai_ppx_presets")],
+            [callback_button("🤖 Прямые модели", "admin_ai_ppx_models_0")],
+        ])
+    else:
+        rows.append([callback_button("🤖 Выбрать модель", f"admin_ai_provider_models_{provider}")])
     rows.extend([
-        [callback_button("🤖 Выбрать модель", f"admin_ai_provider_models_{provider}")],
         [callback_button("🔑 API-ключ", f"admin_ai_model_key_{provider}")],
         [callback_button("⬅️ Назад", "admin_ai_keys")],
     ])
@@ -782,6 +801,18 @@ async def save_key(client: MaxApiClient, states: StateStore, chat_id: int, user_
 async def show_models(client: MaxApiClient, chat_id: int, provider: str) -> None:
     config = await _get_config()
     provider = canonical_provider_name(provider)
+    if provider == PROVIDER_PERPLEXITY:
+        text = (
+            "<b>Модели Perplexity</b>\n\n"
+            "⚡ <b>Пресеты поиска</b> — системные поисковые режимы\n"
+            "🤖 <b>Прямые модели</b> — LLM-модели из каталога Perplexity"
+        )
+        await client.send_message(
+            chat_id=chat_id,
+            text=text,
+            attachments=admin_ai_perplexity_category_keyboard(back_callback=f"admin_ai_models_{provider}"),
+        )
+        return
     field = MODEL_FIELDS.get(provider)
     channel = "transcription" if canonical_provider_name(provider) == PROVIDER_DEEPGRAM else "chat"
     models = list(get_selectable_models(provider, channel=channel))
@@ -790,6 +821,37 @@ async def show_models(client: MaxApiClient, chat_id: int, provider: str) -> None
         chat_id=chat_id,
         text=f"Выберите модель для {provider}.",
         attachments=admin_ai_model_selection_keyboard(provider, current_model or "", models, back_callback=f"admin_ai_models_{provider}"),
+    )
+
+
+async def show_perplexity_presets(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    current_model = getattr(config, "perplexity_model", "")
+    text = (
+        "<b>⚡ Пресеты поиска Perplexity</b>\n\n"
+        "Выберите системный режим Agent API:\n\n"
+    )
+    for mode in PERPLEXITY_MODES:
+        info = PERPLEXITY_MODE_INFO.get(mode, {})
+        text += f"▪️ <b>{info.get('name', mode)}</b>: {info.get('desc', '')}\n"
+    await client.send_message(
+        chat_id=chat_id,
+        text=text,
+        attachments=admin_ai_perplexity_presets_keyboard(current_model or "", back_callback=f"admin_ai_models_{PROVIDER_PERPLEXITY}"),
+    )
+
+
+async def show_perplexity_models(client: MaxApiClient, chat_id: int, page: int = 0) -> None:
+    await refresh_perplexity_catalog()
+    catalog_state = get_perplexity_catalog_state()
+    models = list(catalog_state.models)
+    config = await _get_config()
+    current_model = getattr(config, "perplexity_model", "")
+    text = "<b>🤖 Прямые модели Perplexity:</b>"
+    await client.send_message(
+        chat_id=chat_id,
+        text=text,
+        attachments=admin_ai_perplexity_models_keyboard(current_model or "", models, page=page, page_size=10, back_callback=f"admin_ai_models_{PROVIDER_PERPLEXITY}"),
     )
 
 
@@ -1119,9 +1181,11 @@ async def set_fallback_provider(client: MaxApiClient, chat_id: int, provider: st
         config.fallback_provider = provider
         config.fallback_model = normalized_model
         await session.commit()
-        current_model = config.fallback_model
+    if provider == PROVIDER_PERPLEXITY:
+        await show_fallback_model(client, chat_id)
+        return
     models = list(get_selectable_models(provider, channel="fallback"))
-    rows = [[callback_button(f"{'✅ ' if m == current_model else ''}{m}", f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
+    rows = [[callback_button(f"{'✅ ' if m == normalized_model else ''}{m}", f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_text_fallback")])
     await client.send_message(
         chat_id=chat_id,
@@ -1151,10 +1215,57 @@ async def show_fallback_model(client: MaxApiClient, chat_id: int) -> None:
     if not provider:
         await show_fallback_models(client, chat_id)
         return
+    if canonical_provider_name(provider) == PROVIDER_PERPLEXITY:
+        await client.send_message(
+            chat_id=chat_id,
+            text="Настройка резервной модели Perplexity.\nВыберите категорию: пресеты поиска или прямые модели.",
+            attachments=admin_ai_perplexity_category_keyboard(
+                back_callback="admin_ai_text_fallback",
+                presets_callback="admin_ai_fb_ppx_presets",
+                models_callback="admin_ai_fb_ppx_models_0",
+            ),
+        )
+        return
     models = list(get_selectable_models(provider, channel="fallback"))
     rows = [[callback_button(f"{'✅ ' if m == config.fallback_model else ''}{m}", f"admin_ai_save_fallback_{provider}_{m}")] for m in models]
     rows.append([callback_button("◀️ Назад", "admin_ai_text_fallback")])
     await client.send_message(chat_id=chat_id, text=f"Выберите модель резерва текста для {provider}.", attachments=inline_keyboard(rows))
+
+
+async def show_fallback_perplexity_presets(client: MaxApiClient, chat_id: int) -> None:
+    config = await _get_config()
+    current_model = getattr(config, "fallback_model", "")
+    await client.send_message(
+        chat_id=chat_id,
+        text="<b>⚡ Пресеты поиска Perplexity для резерва текста</b>\n\nВыберите желаемый уровень детализации поиска:\n",
+        attachments=admin_ai_perplexity_presets_keyboard(
+            current_model or "",
+            back_callback="admin_ai_fallback_model",
+            action_prefix="admin_ai_save_fallback_Perplexity_",
+        ),
+    )
+
+
+async def show_fallback_perplexity_models(client: MaxApiClient, chat_id: int, page: int = 0) -> None:
+    await refresh_perplexity_catalog()
+    catalog_state = get_perplexity_catalog_state()
+    models = list(catalog_state.models)
+    config = await _get_config()
+    current_model = getattr(config, "fallback_model", "")
+    text = "<b>🤖 Прямые модели Perplexity для резерва текста:</b>"
+    await client.send_message(
+        chat_id=chat_id,
+        text=text,
+        attachments=admin_ai_perplexity_models_keyboard(
+            current_model or "",
+            models,
+            page=page,
+            page_size=10,
+            back_callback="admin_ai_fallback_model",
+            callback_prefix="admin_ai_fb_ppx_models_",
+            action_prefix="admin_ai_save_fallback_Perplexity_",
+        ),
+    )
 
 
 async def toggle_vision_fallback(client: MaxApiClient, chat_id: int) -> None:
