@@ -56,7 +56,8 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      main_dialogue_collection_association,
                      ReferralTemplate, CardSpreadState, AILog, AutomationConversationState, AutomationDialogueState, AutomationEvent,
                      TelegramStartIntent, SubscriptionBenefitGrant,
-                     DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_MAX_LENGTH)
+                     DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_MAX_LENGTH,
+                     AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH)
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
@@ -704,10 +705,10 @@ def serialize_ai_processing_message_text(
     encoded = _AI_PROCESSING_ENTITIES_PREFIX + base64.urlsafe_b64encode(
         zlib.compress(payload, level=9)
     ).decode("ascii")
-    if len(encoded) > AI_PROCESSING_MESSAGE_MAX_LENGTH:
+    if len(encoded) > AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH:
         raise ValueError(
             "Текст с форматированием слишком длинный для сохранения. "
-            f"Максимум — {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов."
+            f"Максимум — {AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH} символов в закодированном виде."
         )
     return encoded
 

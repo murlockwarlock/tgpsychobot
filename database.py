@@ -659,6 +659,11 @@ class TestConfig(Base):
     """).strip())
 
 
+DEFAULT_AI_PROCESSING_MESSAGE_TEXT = "Думаю..."
+AI_PROCESSING_MESSAGE_MAX_LENGTH = 4096
+AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH = 16000
+
+
 class BotGeneralConfig(Base):
     """Settings that apply to onboarding throughout the whole bot."""
 
@@ -668,7 +673,11 @@ class BotGeneralConfig(Base):
     profile_collect_gender = Column(Boolean, default=True, nullable=False)
     profile_collect_age = Column(Boolean, default=False, nullable=False)
     ai_processing_message_enabled = Column(Boolean, default=False, nullable=False)
-    ai_processing_message_text = Column(String(200), default="Думаю...", nullable=False)
+    ai_processing_message_text = Column(
+        Text,
+        default=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
+        nullable=False,
+    )
     telegram_default_language = Column(String(8), default="ru", nullable=False)
     telegram_language_selection_enabled = Column(Boolean, default=False, nullable=False)
     telegram_enabled_languages = Column(Text, default='["ru"]', nullable=False)
@@ -714,8 +723,6 @@ class UserMenuBinding(Base):
     ambiguous = Column(Boolean, nullable=False, default=False)
 
 
-DEFAULT_AI_PROCESSING_MESSAGE_TEXT = "Думаю..."
-AI_PROCESSING_MESSAGE_MAX_LENGTH = 200
 
 
 class SecretTestQuestion(Base):
@@ -1190,6 +1197,7 @@ async def init_db():
 
         def _check_and_migrate(sync_conn):
             insp = sa_inspect(sync_conn)
+            dialect_name = getattr(sync_conn.dialect, "name", "")
             sync_conn.execute(text(
                 "UPDATE media_library SET media_type = 'photo' "
                 "WHERE LOWER(media_type) = 'image'"
@@ -1300,7 +1308,14 @@ async def init_db():
             if 'ai_processing_message_text' not in general_columns:
                 sync_conn.execute(text(
                     "ALTER TABLE bot_general_config "
-                    "ADD COLUMN ai_processing_message_text VARCHAR(200) DEFAULT 'Думаю...' NOT NULL"
+                    "ADD COLUMN ai_processing_message_text TEXT DEFAULT 'Думаю...' NOT NULL"
+                ))
+            elif dialect_name == "postgresql":
+                # Changing VARCHAR to TEXT in PostgreSQL does not rewrite table data,
+                # though DDL operations may briefly acquire a table lock.
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ALTER COLUMN ai_processing_message_text TYPE TEXT"
                 ))
             if 'telegram_default_language' not in general_columns:
                 sync_conn.execute(text(
