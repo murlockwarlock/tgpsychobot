@@ -22,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from database import AIConfig, Base
+from database import AIConfig, Base, User
 import handlers
 import keyboards as kb
 from max_messenger_bot.app import MaxBotApplication
@@ -291,181 +291,43 @@ def test_call_deepgram_error_classification_and_retries():
 
 
 # ---------------------------------------------------------------------------
-# 3. Telegram Admin UI Journey (Audio -> Deepgram -> Select -> Persist -> Reopen -> Back)
+# 3. Telegram Full Admin -> Runtime -> Admin Journey (A -> Я -> A)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_telegram_admin_journey_audio_model_picker(session_factory, monkeypatch, init_ai_config):
-    async def _is_admin(uid, *args, **kwargs):
-        return True
-
-    monkeypatch.setattr(handlers, "async_session_maker", session_factory)
-    monkeypatch.setattr(handlers, "is_admin", _is_admin)
-
-    session = ValidatingTelegramSession()
-    bot = Bot(token="123456:TEST_BOT_TOKEN", session=session)
-    handlers.router._parent_router = None
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(handlers.router)
-
-    admin_user = TgUser(id=999, is_bot=False, first_name="Admin")
-    admin_chat = Chat(id=999, type=ChatType.PRIVATE)
-
-    # 1. Open audio settings
-    update_1 = Update(
-        update_id=1,
-        callback_query=CallbackQuery(
-            id="cb1",
-            from_user=admin_user,
-            chat_instance="ci",
-            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Audio"),
-            data="admin_ai_audio",
-        ),
-    )
-    await dp.feed_update(bot, update_1)
-    audio_kb: InlineKeyboardMarkup = _last_markup(session.calls)
-
-    # Click "🤖 Выбрать модель"
-    model_btn = next(b for row in audio_kb.inline_keyboard for b in row if "Выбрать модель" in b.text)
-    assert model_btn.callback_data == "admin_audio_model"
-
-    # 2. Feed admin_audio_model into Dispatcher
-    update_2 = Update(
-        update_id=2,
-        callback_query=CallbackQuery(
-            id="cb2",
-            from_user=admin_user,
-            chat_instance="ci",
-            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Pick Model"),
-            data=model_btn.callback_data,
-        ),
-    )
-    await dp.feed_update(bot, update_2)
-    picker_kb: InlineKeyboardMarkup = _last_markup(session.calls)
-
-    # Check visible model buttons
-    buttons = [b for row in picker_kb.inline_keyboard for b in row]
-    btn_texts = [b.text for b in buttons]
-    assert any("nova-3" in t for t in btn_texts)
-    assert any("nova-2" in t for t in btn_texts)
-
-    # Currently nova-3 is default, so nova-3 has checkmark
-    nova3_btn = next(b for b in buttons if "nova-3" in b.text)
-    nova2_btn = next(b for b in buttons if "nova-2" in b.text)
-    assert "✅" in nova3_btn.text
-    assert "✅" not in nova2_btn.text
-
-    # 3. Select nova-2 via Dispatcher
-    update_3 = Update(
-        update_id=3,
-        callback_query=CallbackQuery(
-            id="cb3",
-            from_user=admin_user,
-            chat_instance="ci",
-            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Selecting"),
-            data=nova2_btn.callback_data,
-        ),
-    )
-    await dp.feed_update(bot, update_3)
-
-    # Verify DB persistence
-    async with session_factory() as s:
-        cfg = await s.get(AIConfig, 1)
-        assert cfg.deepgram_model == "nova-2"
-
-    # 4. Reopen model picker to verify ✅ is now on nova-2
-    update_4 = Update(
-        update_id=4,
-        callback_query=CallbackQuery(
-            id="cb4",
-            from_user=admin_user,
-            chat_instance="ci",
-            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Reopen"),
-            data="admin_audio_model",
-        ),
-    )
-    await dp.feed_update(bot, update_4)
-    reopened_picker: InlineKeyboardMarkup = _last_markup(session.calls)
-
-    re_buttons = [b for row in reopened_picker.inline_keyboard for b in row]
-    re_nova3 = next(b for b in re_buttons if "nova-3" in b.text)
-    re_nova2 = next(b for b in re_buttons if "nova-2" in b.text)
-    assert "✅" in re_nova2.text
-    assert "✅" not in re_nova3.text
-
-    # 5. Click Back button -> returns to admin_ai_audio
-    back_btn = next(b for b in re_buttons if "Назад" in b.text)
-    assert back_btn.callback_data == "admin_ai_audio"
-
-    update_5 = Update(
-        update_id=5,
-        callback_query=CallbackQuery(
-            id="cb5",
-            from_user=admin_user,
-            chat_instance="ci",
-            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Back"),
-            data=back_btn.callback_data,
-        ),
-    )
-    await dp.feed_update(bot, update_5)
-    last_audio_kb: InlineKeyboardMarkup = _last_markup(session.calls)
-    assert any("Выбрать провайдера" in b.text for row in last_audio_kb.inline_keyboard for b in row)
-
-    # 6. Switch back to nova-3
-    update_6 = Update(
-        update_id=6,
-        callback_query=CallbackQuery(
-            id="cb6",
-            from_user=admin_user,
-            chat_instance="ci",
-            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Pick Model"),
-            data="admin_audio_model",
-        ),
-    )
-    await dp.feed_update(bot, update_6)
-    picker_switch: InlineKeyboardMarkup = _last_markup(session.calls)
-    sw_nova3 = next(b for row in picker_switch.inline_keyboard for b in row if "nova-3" in b.text)
-
-    update_7 = Update(
-        update_id=7,
-        callback_query=CallbackQuery(
-            id="cb7",
-            from_user=admin_user,
-            chat_instance="ci",
-            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Select nova-3"),
-            data=sw_nova3.callback_data,
-        ),
-    )
-    await dp.feed_update(bot, update_7)
-
-    async with session_factory() as s:
-        cfg = await s.get(AIConfig, 1)
-        assert cfg.deepgram_model == "nova-3"
-
-
-# ---------------------------------------------------------------------------
-# 4. Telegram Real User Voice Runtime E2E
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_telegram_real_voice_runtime_e2e(session_factory, monkeypatch, init_ai_config):
-    """Admin configures nova-2 -> user sends voice -> real voice handler downloads -> Deepgram /v1/listen called with nova-2 -> transcript delivered."""
-    # 1. Set DB config to Deepgram nova-2
+async def test_telegram_full_journey_admin_to_runtime_to_admin(session_factory, monkeypatch, init_ai_config):
+    """Real Telegram E2E journey without direct DB mutation:
+    Admin Audio -> visible 'Выбрать модель' -> Dispatcher -> select visible nova-2 ->
+    DB persistence -> reopen shows ✅ -> visible Back -> parent Audio screen ->
+    ordinary user sends Voice update -> file download boundary -> production transcription runtime ->
+    Deepgram /v1/listen MockTransport (nova-2, detect_language=true, no language=multi) ->
+    outgoing aiogram Pydantic validation -> user transcript result ->
+    reopen Admin picker again -> nova-2 still shows ✅.
+    """
+    # 1. Pre-seed DB: transcription_provider is Deepgram, model is DEFAULT nova-3 (NOT nova-2)
     async with session_factory() as s:
         cfg = await s.get(AIConfig, 1)
         cfg.transcription_provider = PROVIDER_DEEPGRAM
-        cfg.deepgram_model = "nova-2"
+        cfg.deepgram_model = "nova-3"
         cfg.deepgram_api_key = "test-live-key"
+
+        # Pre-seed client user
+        client_user_db = await s.get(User, 555)
+        if not client_user_db:
+            client_user_db = User(id=555, first_name="ClientUser", accepted_disclaimer=True)
+            s.add(client_user_db)
+        else:
+            client_user_db.accepted_disclaimer = True
         await s.commit()
 
-    async def _not_admin(uid, *args, **kwargs):
-        return False
+    async def _is_admin(uid, *args, **kwargs):
+        return uid == 999
 
     monkeypatch.setattr(handlers, "async_session_maker", session_factory)
     monkeypatch.setattr("ai_integration.async_session_maker", session_factory)
-    monkeypatch.setattr(handlers, "is_admin", _not_admin)
+    monkeypatch.setattr(handlers, "is_admin", _is_admin)
 
-    # Intercept Deepgram HTTP request
+    # 2. Intercept Deepgram HTTP request
     captured_requests = []
 
     def deepgram_transport_handler(request: httpx.Request) -> httpx.Response:
@@ -490,33 +352,135 @@ async def test_telegram_real_voice_runtime_e2e(session_factory, monkeypatch, ini
     session = ValidatingTelegramSession()
     bot = Bot(token="123456:TEST_BOT_TOKEN", session=session)
 
-    # Mock audio file download in bot
+    # Mock audio file download boundary in bot
     bot.get_file = AsyncMock(return_value=File(file_id="voice_123", file_unique_id="u_123", file_path="voice.ogg"))
     bot.download_file = AsyncMock(return_value=io.BytesIO(b"ogg-audio-binary-data"))
 
-    # Mock dialogue AI generation so the voice handler can complete smoothly
+    # Stop after voice transcription delivery before downstream dialogue AI
     monkeypatch.setattr(handlers, "process_user_prompt", AsyncMock())
 
-    dp = Dispatcher(storage=MemoryStorage())
     handlers.router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(handlers.router)
 
-    user = TgUser(id=555, is_bot=False, first_name="ClientUser")
-    chat = Chat(id=555, type=ChatType.PRIVATE)
+    admin_user = TgUser(id=999, is_bot=False, first_name="Admin")
+    admin_chat = Chat(id=999, type=ChatType.PRIVATE)
 
+    # Step 1: Admin opens audio settings screen
+    update_1 = Update(
+        update_id=1,
+        callback_query=CallbackQuery(
+            id="cb1",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Audio"),
+            data="admin_ai_audio",
+        ),
+    )
+    await dp.feed_update(bot, update_1)
+    audio_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+
+    # Step 2: Admin finds visible "Выбрать модель" button and clicks it through Dispatcher
+    model_btn = next(b for row in audio_kb.inline_keyboard for b in row if "Выбрать модель" in b.text)
+    assert model_btn.callback_data == "admin_audio_model"
+
+    update_2 = Update(
+        update_id=2,
+        callback_query=CallbackQuery(
+            id="cb2",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Pick Model"),
+            data=model_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_2)
+    picker_kb: InlineKeyboardMarkup = _last_markup(session.calls)
+
+    # Check visible model buttons: default nova-3 has checkmark, nova-2 does not
+    buttons = [b for row in picker_kb.inline_keyboard for b in row]
+    nova3_btn = next(b for b in buttons if "nova-3" in b.text)
+    nova2_btn = next(b for b in buttons if "nova-2" in b.text)
+    assert "✅" in nova3_btn.text
+    assert "✅" not in nova2_btn.text
+
+    # Step 3: Admin selects nova-2 via visible button callback through Dispatcher
+    update_3 = Update(
+        update_id=3,
+        callback_query=CallbackQuery(
+            id="cb3",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Selecting"),
+            data=nova2_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_3)
+
+    # Verify DB persistence directly from handler execution (NOT manually written)
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        assert cfg.deepgram_model == "nova-2"
+
+    # Step 4: Reopen picker to verify checkmark moved to nova-2
+    update_4 = Update(
+        update_id=4,
+        callback_query=CallbackQuery(
+            id="cb4",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Reopen"),
+            data="admin_audio_model",
+        ),
+    )
+    await dp.feed_update(bot, update_4)
+    reopened_picker: InlineKeyboardMarkup = _last_markup(session.calls)
+
+    re_buttons = [b for row in reopened_picker.inline_keyboard for b in row]
+    re_nova3 = next(b for b in re_buttons if "nova-3" in b.text)
+    re_nova2 = next(b for b in re_buttons if "nova-2" in b.text)
+    assert "✅" in re_nova2.text
+    assert "✅" not in re_nova3.text
+
+    # Step 5: Press the actual visible Back button through Dispatcher
+    back_btn = next(b for b in re_buttons if "Назад" in b.text)
+    assert back_btn.callback_data == "admin_ai_audio"
+
+    update_5 = Update(
+        update_id=5,
+        callback_query=CallbackQuery(
+            id="cb5",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Back"),
+            data=back_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_5)
+
+    # Verify actual resulting screen is immediate parent (Audio screen) with visible controls
+    parent_call = next(c for c in reversed(session.calls) if isinstance(c, EditMessageText))
+    assert "🎙 <b>Аудио</b>" in parent_call.text
+    assert "Модель: <code>nova-2</code>" in parent_call.text
+    parent_audio_kb: InlineKeyboardMarkup = parent_call.reply_markup
+    parent_btn_texts = [b.text for row in parent_audio_kb.inline_keyboard for b in row]
+    assert any("Выбрать провайдера" in t for t in parent_btn_texts)
+    assert any("Выбрать модель" in t for t in parent_btn_texts)
+
+    # Step 6: Ordinary user sends real voice message through Dispatcher
+    client_user = TgUser(id=555, is_bot=False, first_name="ClientUser")
+    client_chat = Chat(id=555, type=ChatType.PRIVATE)
     voice_msg = Message(
         message_id=42,
         date=datetime.now(timezone.utc),
-        chat=chat,
-        from_user=user,
+        chat=client_chat,
+        from_user=client_user,
         voice=Voice(file_id="voice_123", file_unique_id="u_123", duration=10),
     )
     voice_update = Update(update_id=101, message=voice_msg)
-
-    # 2. Feed voice update through real Dispatcher
     await dp.feed_update(bot, voice_update)
 
-    # 3. Verify outbound Deepgram HTTP request
+    # Step 7: Verify selected model was sent over Deepgram HTTP wire
     assert len(captured_requests) == 1
     req = captured_requests[0]
     parsed = urlparse(req["url"])
@@ -528,49 +492,135 @@ async def test_telegram_real_voice_runtime_e2e(session_factory, monkeypatch, ini
     assert req["headers"]["authorization"] == "Token test-live-key"
     assert req["content"] == b"ogg-audio-binary-data"
 
-    # 4. Verify outgoing aiogram methods passed Pydantic validation and thinking msg was updated with transcript
-    edit_calls = [c for c in session.calls if isinstance(c, EditMessageText)]
-    assert edit_calls, "Thinking message must be edited with transcript"
+    # Step 8: Verify user received the transcript via aiogram validated method
+    edit_calls = [c for c in session.calls if isinstance(c, EditMessageText) and c.chat_id == 555]
+    assert edit_calls, "Thinking message must be edited with transcript for client"
     assert "<i>Мне сегодня очень тревожно, помогите разобраться.</i>" in edit_calls[0].text
+
+    # Step 9: Reopen Admin picker again -> nova-2 still shows ✅
+    update_final = Update(
+        update_id=102,
+        callback_query=CallbackQuery(
+            id="cb_final",
+            from_user=admin_user,
+            chat_instance="ci",
+            message=Message(message_id=10, date=datetime.now(timezone.utc), chat=admin_chat, text="Reopen Again"),
+            data="admin_audio_model",
+        ),
+    )
+    await dp.feed_update(bot, update_final)
+    final_picker: InlineKeyboardMarkup = _last_markup(session.calls)
+    final_buttons = [b for row in final_picker.inline_keyboard for b in row]
+    final_nova2 = next(b for b in final_buttons if "nova-2" in b.text)
+    final_nova3 = next(b for b in final_buttons if "nova-3" in b.text)
+    assert "✅" in final_nova2.text
+    assert "✅" not in final_nova3.text
+
+    # Final DB check confirms no settings loss
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        assert cfg.deepgram_model == "nova-2"
 
 
 # ---------------------------------------------------------------------------
-# 5. MAX Admin UI Journey & Voice Runtime E2E
+# 4. MAX Full Admin -> Runtime -> Admin Journey (A -> Я -> A)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_max_admin_journey_and_runtime_voice_e2e(session_factory, monkeypatch, init_ai_config):
-    """MAX Admin selects nova-2 -> DB persists -> reopen shows ✅ -> normal user voice transcribes via nova-2."""
+async def test_max_full_journey_admin_to_runtime_to_admin(session_factory, monkeypatch, init_ai_config):
+    """Real MAX E2E journey through MaxBotApplication.handle_update():
+    Admin opens Deepgram models -> visible nova-2 button -> handle_update(callback) ->
+    DB persistence -> reopen shows ✅ -> visible Back button -> handle_update(callback) ->
+    parent screen verified -> ordinary user message_created audio update ->
+    production media branch -> _handle_voice -> download_attachment boundary ->
+    transcribe_audio -> call_deepgram -> MockTransport captures /v1/listen (nova-2, detect_language=true) ->
+    transcript delivered to user via MAX API -> reopen Admin picker again -> nova-2 still shows ✅.
+    """
+    from max_messenger_bot.models import MAX_ID_OFFSET
     import max_messenger_bot.services.admin_ai as max_admin_ai
     import max_messenger_bot.ai as max_ai
     import max_messenger_bot.services.common as max_common
+    import followups
+
+    monkeypatch.setattr("database.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.legacy.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
     monkeypatch.setattr(max_admin_ai, "async_session_maker", session_factory)
     monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr(followups, "async_session_maker", session_factory)
+
+    # 1. Pre-seed DB: transcription_provider is Deepgram, model is DEFAULT nova-3 (NOT nova-2)
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        cfg.transcription_provider = PROVIDER_DEEPGRAM
+        cfg.deepgram_model = "nova-3"
+        cfg.deepgram_api_key = "test-live-key"
+
+        client_internal_uid = 777 + MAX_ID_OFFSET
+        client_max_user = await s.get(User, client_internal_uid)
+        if not client_max_user:
+            client_max_user = User(
+                id=client_internal_uid,
+                name="MaxClient",
+                first_name="MaxClient",
+                accepted_disclaimer=True,
+            )
+            s.add(client_max_user)
+        else:
+            client_max_user.name = "MaxClient"
+            client_max_user.accepted_disclaimer = True
+        await s.commit()
 
     async def _is_admin(uid, *args, **kwargs):
-        return True
+        return uid in (888, 888 + MAX_ID_OFFSET)
 
     monkeypatch.setattr(max_common, "is_admin", _is_admin)
+    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+    # Stub dialogue AI generation after transcript delivery
+    monkeypatch.setattr("max_messenger_bot.services.common.run_ai_dialogue", AsyncMock())
 
+    # 2. Intercept MAX API client calls
     sent_messages = []
 
     async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
         sent_messages.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
         if path == "/messages":
-            return {"message": {"body": {"mid": str(len(sent_messages))}}}
+            return {"message": {"body": {"mid": f"mid_{len(sent_messages)}"}}}
         return {}
 
     client = MaxApiClient(token="test_token", base_url="https://max.test")
     client._request = fake_request
+    client.download_attachment = AsyncMock(return_value=b"ogg-binary-audio-for-max")
     app = MaxBotApplication(client=client)
 
-    chat_id = 888
-    user_id = 888
-    up_id = 200
+    # 3. Intercept Deepgram HTTP request
+    captured_max_http = []
 
-    async def press_cb(payload):
+    def max_deepgram_handler(req: httpx.Request) -> httpx.Response:
+        captured_max_http.append({
+            "url": str(req.url),
+            "headers": dict(req.headers),
+            "content": req.read(),
+        })
+        return httpx.Response(200, json={
+            "results": {
+                "channels": [{
+                    "alternatives": [{
+                        "transcript": "Голос в MAX успешно распознан через nova-2"
+                    }]
+                }]
+            }
+        })
+
+    t_max = httpx.MockTransport(max_deepgram_handler)
+    monkeypatch.setattr(httpx, "AsyncClient", mock_httpx_async_client(t_max))
+
+    up_id = 300
+
+    async def press_admin_cb(payload):
         nonlocal up_id
         up_id += 1
         await app.handle_update({
@@ -579,85 +629,129 @@ async def test_max_admin_journey_and_runtime_voice_e2e(session_factory, monkeypa
             "callback": {
                 "callback_id": f"cb_{up_id}",
                 "payload": payload,
-                "sender": {"user_id": user_id, "first_name": "Admin"},
+                "sender": {"user_id": 888, "first_name": "Admin"},
             },
             "message": {
                 "mid": f"msg_{up_id}",
-                "recipient": {"chat_id": chat_id},
+                "recipient": {"chat_id": 888},
                 "body": {"attachments": []},
             },
         })
         messages = [m for m in sent_messages if m["path"] == "/messages"]
-        return messages[-1]["body"]
+        return messages[-1]
 
-    # 1. Open Deepgram model choices in MAX
+    # Step 1: Admin opens Deepgram model choices in MAX
     sent_messages.clear()
-    models_screen = await press_cb(f"admin_ai_provider_models_{PROVIDER_DEEPGRAM}")
-    attachment = models_screen["attachments"][0]
-    buttons = [b for row in attachment["payload"]["buttons"] for b in row]
-
-    # Verify both models visible
-    assert any("nova-3" in b["text"] for b in buttons)
-    assert any("nova-2" in b["text"] for b in buttons)
-
-    # Initial selection shows ✅ on nova-3
-    btn_n3 = next(b for b in buttons if "nova-3" in b["text"])
-    btn_n2 = next(b for b in buttons if "nova-2" in b["text"])
+    screen1 = await press_admin_cb(f"admin_ai_provider_models_{PROVIDER_DEEPGRAM}")
+    buttons1 = [b for row in screen1["body"]["attachments"][0]["payload"]["buttons"] for b in row]
+    btn_n3 = next(b for b in buttons1 if "nova-3" in b["text"])
+    btn_n2 = next(b for b in buttons1 if "nova-2" in b["text"])
     assert "✅" in btn_n3["text"]
     assert "✅" not in btn_n2["text"]
-    assert btn_n2["payload"] == f"admin_ai_set_model_{PROVIDER_DEEPGRAM}_nova-2"
 
-    # 2. Select nova-2
+    # Step 2: Admin selects nova-2 via visible button payload
     sent_messages.clear()
-    await press_cb(btn_n2["payload"])
+    await press_admin_cb(btn_n2["payload"])
 
-    # Verify DB persistence
+    # Verify DB persistence directly from handler
     async with session_factory() as s:
         cfg = await s.get(AIConfig, 1)
         assert cfg.deepgram_model == "nova-2"
 
-    # 3. Reopen model choices in MAX -> verify ✅ on nova-2
+    # Step 3: Reopen model choices in MAX -> verify ✅ on nova-2
     sent_messages.clear()
-    reopen_screen = await press_cb(f"admin_ai_provider_models_{PROVIDER_DEEPGRAM}")
-    re_attachment = reopen_screen["attachments"][0]
-    re_buttons = [b for row in re_attachment["payload"]["buttons"] for b in row]
-    re_n3 = next(b for b in re_buttons if "nova-3" in b["text"])
-    re_n2 = next(b for b in re_buttons if "nova-2" in b["text"])
+    screen2 = await press_admin_cb(f"admin_ai_provider_models_{PROVIDER_DEEPGRAM}")
+    buttons2 = [b for row in screen2["body"]["attachments"][0]["payload"]["buttons"] for b in row]
+    re_n3 = next(b for b in buttons2 if "nova-3" in b["text"])
+    re_n2 = next(b for b in buttons2 if "nova-2" in b["text"])
     assert "✅" in re_n2["text"]
     assert "✅" not in re_n3["text"]
 
-    # 4. Verify Back button leads to Deepgram provider settings
-    back_btn = next(b for b in re_buttons if "Назад" in b["text"])
+    # Step 4: Find actual visible Back button and press it through handle_update
+    back_btn = next(b for b in buttons2 if "Назад" in b["text"])
     assert back_btn["payload"] == f"admin_ai_models_{PROVIDER_DEEPGRAM}"
 
-    # 5. MAX Runtime Voice E2E
-    captured_max_http = []
-
-    def max_deepgram_handler(req: httpx.Request) -> httpx.Response:
-        captured_max_http.append(str(req.url))
-        return httpx.Response(200, json={
-            "results": {
-                "channels": [{
-                    "alternatives": [{
-                        "transcript": "Голос в MAX успешно распознан"
-                    }]
-                }]
-            }
-        })
-
-    t_max = httpx.MockTransport(max_deepgram_handler)
-    monkeypatch.setattr(httpx, "AsyncClient", mock_httpx_async_client(t_max))
-    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
-    monkeypatch.setattr("max_messenger_bot.services.common.run_ai_dialogue", AsyncMock())
-
-    # Run MAX voice dialogue
     sent_messages.clear()
-    await run_ai_dialogue_with_voice(client, chat_id=111, user_id=111, audio_bytes=b"max_audio_bytes", filename="audio.ogg")
+    parent_screen = await press_admin_cb(back_btn["payload"])
+
+    # Verify parent screen shows Deepgram provider settings with nova-2
+    parent_text = parent_screen["body"].get("text", "")
+    assert "<b>Deepgram</b>" in parent_text
+    assert "Модель: <code>nova-2</code>" in parent_text
+    parent_buttons = [b for row in parent_screen["body"]["attachments"][0]["payload"]["buttons"] for b in row]
+    assert any("Выбрать модель" in b["text"] for b in parent_buttons)
+
+    # Step 5: Ordinary MAX user sends realistic message_created audio update
+    sent_messages.clear()
+    up_id += 1
+    user_audio_update = {
+        "update_type": "message_created",
+        "update_id": up_id,
+        "message": {
+            "mid": f"msg_voice_{up_id}",
+            "sender": {"user_id": 777, "first_name": "MaxClient"},
+            "recipient": {"chat_id": 777},
+            "body": {
+                "text": "",
+                "attachments": [
+                    {
+                        "type": "audio",
+                        "payload": {
+                            "token": "tok_audio_voice_file",
+                            "url": "https://max.test/voice.ogg",
+                        },
+                    }
+                ],
+            },
+        },
+    }
+    await app.handle_update(user_audio_update)
+
+    # Await background task spawned for client user
+    user_task = app.user_tasks.get(client_internal_uid)
+    if user_task:
+        await user_task
+    elif app.background_tasks:
+        await asyncio.gather(*list(app.background_tasks))
+
+    # Step 6: Verify download boundary, Deepgram wire request, and user transcript delivery
+    client.download_attachment.assert_awaited_once_with("tok_audio_voice_file", "https://max.test/voice.ogg")
 
     assert len(captured_max_http) == 1
-    assert "model=nova-2" in captured_max_http[0]
-    assert "detect_language=true" in captured_max_http[0]
-    assert "language=multi" not in captured_max_http[0]
+    req_max = captured_max_http[0]
+    parsed_max = urlparse(req_max["url"])
+    assert parsed_max.path == "/v1/listen"
+    qs_max = parse_qs(parsed_max.query)
+    assert qs_max["model"] == ["nova-2"]
+    assert qs_max["detect_language"] == ["true"]
+    assert "language" not in qs_max
+    assert req_max["headers"]["authorization"] == "Token test-live-key"
+    assert req_max["content"] == b"ogg-binary-audio-for-max"
+
+    # Verify transcript reached user in MAX via real edit_message/send_message boundary
+    transcript_msgs = [
+        m for m in sent_messages
+        if "🎙 <i>Голос в MAX успешно распознан через nova-2</i>" in m["body"].get("text", "")
+    ]
+    assert transcript_msgs, "User must receive final transcript in MAX"
+    delivered = transcript_msgs[0]
+    assert delivered["method"] in {"POST", "PUT"}
+    assert delivered["path"] == "/messages"
+    assert "🎙 <i>Голос в MAX успешно распознан через nova-2</i>" in delivered["body"]["text"]
+
+    # Step 7: Reopen Admin picker again -> nova-2 still shows ✅
+    sent_messages.clear()
+    screen_final = await press_admin_cb(f"admin_ai_provider_models_{PROVIDER_DEEPGRAM}")
+    buttons_final = [b for row in screen_final["body"]["attachments"][0]["payload"]["buttons"] for b in row]
+    final_n2 = next(b for b in buttons_final if "nova-2" in b["text"])
+    final_n3 = next(b for b in buttons_final if "nova-3" in b["text"])
+    assert "✅" in final_n2["text"]
+    assert "✅" not in final_n3["text"]
+
+    # Final DB check confirms no settings loss
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        assert cfg.deepgram_model == "nova-2"
 
 
 # ---------------------------------------------------------------------------
