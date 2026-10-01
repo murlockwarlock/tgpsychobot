@@ -8,8 +8,9 @@ from aiogram.types import MessageEntity
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
+import database
 import handlers
-from database import DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+from database import DEFAULT_AI_PROCESSING_MESSAGE_TEXT, AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH
 
 
 class _Session:
@@ -181,7 +182,7 @@ async def test_exact_regression_montage_emoji_custom_entity_roundtrip(monkeypatc
 
     serialized = handlers.serialize_ai_processing_message_text(text, entities)
     assert len(serialized) > 200
-    assert len(serialized) == 203
+    assert len(serialized) <= database.AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH
     assert serialized.startswith(handlers._AI_PROCESSING_ENTITIES_PREFIX)
 
     config = SimpleNamespace(
@@ -330,8 +331,7 @@ def test_database_model_column_is_text():
     assert BotGeneralConfig.ai_processing_message_text.nullable is False
 
 
-@pytest.mark.asyncio
-async def test_init_db_postgresql_widens_existing_column_to_text(monkeypatch):
+def _run_mock_init_db(monkeypatch, dialect_name: str, bot_general_config_cols: list[dict]):
     import database
     from database import init_db
 
@@ -343,7 +343,7 @@ async def test_init_db_postgresql_widens_existing_column_to_text(monkeypatch):
 
         def get_columns(self, table_name):
             if table_name == "bot_general_config":
-                return [{"name": "ai_processing_message_text"}]
+                return bot_general_config_cols
             return [
                 {"name": "response_length"},
                 {"name": "birth_day"},
@@ -360,7 +360,7 @@ async def test_init_db_postgresql_widens_existing_column_to_text(monkeypatch):
             return []
 
     class MockSyncConn:
-        dialect = SimpleNamespace(name="postgresql")
+        dialect = SimpleNamespace(name=dialect_name)
 
         def execute(self, stmt, *args, **kwargs):
             executed_statements.append(str(stmt))
@@ -369,7 +369,7 @@ async def test_init_db_postgresql_widens_existing_column_to_text(monkeypatch):
             pass
 
     class MockConn:
-        dialect = SimpleNamespace(name="postgresql")
+        dialect = SimpleNamespace(name=dialect_name)
 
         async def execute(self, stmt, *args, **kwargs):
             pass
@@ -398,161 +398,66 @@ async def test_init_db_postgresql_widens_existing_column_to_text(monkeypatch):
     monkeypatch.setattr(database, "verify_payment_notification_outbox_schema", lambda conn: None)
     monkeypatch.setattr(database, "async_session_maker", lambda: _Session(None))
 
-    await init_db()
+    return init_db, executed_statements
 
+
+@pytest.mark.asyncio
+async def test_init_db_postgresql_widens_existing_varchar_to_text(monkeypatch):
+    from sqlalchemy.types import String
+
+    init_db, statements = _run_mock_init_db(
+        monkeypatch,
+        dialect_name="postgresql",
+        bot_general_config_cols=[{"name": "ai_processing_message_text", "type": String(200)}],
+    )
+    await init_db()
     assert any(
         "ALTER TABLE bot_general_config ALTER COLUMN ai_processing_message_text TYPE TEXT" in stmt
-        for stmt in executed_statements
+        for stmt in statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_init_db_postgresql_skips_alter_when_column_already_text(monkeypatch):
+    from sqlalchemy.types import Text
+
+    init_db, statements = _run_mock_init_db(
+        monkeypatch,
+        dialect_name="postgresql",
+        bot_general_config_cols=[{"name": "ai_processing_message_text", "type": Text()}],
+    )
+    await init_db()
+    assert not any(
+        "ALTER TABLE bot_general_config ALTER COLUMN ai_processing_message_text" in stmt
+        for stmt in statements
     )
 
 
 @pytest.mark.asyncio
 async def test_init_db_adds_column_as_text_when_missing(monkeypatch):
-    import database
-    from database import init_db
-
-    executed_statements = []
-
-    class MockInspector:
-        def has_table(self, table_name):
-            return True
-
-        def get_columns(self, table_name):
-            if table_name == "bot_general_config":
-                return []
-            return [
-                {"name": "response_length"},
-                {"name": "birth_day"},
-                {"name": "stage_mode"},
-                {"name": "platform"},
-                {"name": "memory_mode"},
-                {"name": "id"},
-            ]
-
-        def get_indexes(self, table_name):
-            return []
-
-        def get_unique_constraints(self, table_name):
-            return []
-
-    class MockSyncConn:
-        dialect = SimpleNamespace(name="postgresql")
-
-        def execute(self, stmt, *args, **kwargs):
-            executed_statements.append(str(stmt))
-
-        def _run_ddl_visitor(self, *args, **kwargs):
-            pass
-
-    class MockConn:
-        dialect = SimpleNamespace(name="postgresql")
-
-        async def execute(self, stmt, *args, **kwargs):
-            pass
-
-        async def run_sync(self, fn):
-            if getattr(fn, "__name__", "") == "_check_and_migrate":
-                fn(MockSyncConn())
-
-    class MockEngine:
-        def begin(self):
-            class MockContext:
-                async def __aenter__(self):
-                    return MockConn()
-
-                async def __aexit__(self, *args):
-                    return False
-
-            return MockContext()
-
-    monkeypatch.setattr(database, "engine", MockEngine())
-    monkeypatch.setattr("sqlalchemy.inspect", lambda conn: MockInspector())
-    monkeypatch.setattr(database, "_acquire_database_init_lock", AsyncMock())
-    monkeypatch.setattr(database, "_migrate_legacy_media_ownership", lambda conn: None)
-    monkeypatch.setattr(database, "_migrate_ai_config_models", lambda conn: None)
-    monkeypatch.setattr(database, "verify_yookassa_recurring_safety_schema", lambda conn: None)
-    monkeypatch.setattr(database, "verify_payment_notification_outbox_schema", lambda conn: None)
-    monkeypatch.setattr(database, "async_session_maker", lambda: _Session(None))
-
+    init_db, statements = _run_mock_init_db(
+        monkeypatch,
+        dialect_name="postgresql",
+        bot_general_config_cols=[],
+    )
     await init_db()
-
     assert any(
         "ALTER TABLE bot_general_config ADD COLUMN ai_processing_message_text TEXT DEFAULT 'Думаю...' NOT NULL" in stmt
-        for stmt in executed_statements
+        for stmt in statements
     )
 
 
 @pytest.mark.asyncio
 async def test_init_db_sqlite_does_not_alter_column_type(monkeypatch):
-    import database
-    from database import init_db
+    from sqlalchemy.types import String
 
-    executed_statements = []
-
-    class MockInspector:
-        def has_table(self, table_name):
-            return True
-
-        def get_columns(self, table_name):
-            if table_name == "bot_general_config":
-                return [{"name": "ai_processing_message_text"}]
-            return [
-                {"name": "response_length"},
-                {"name": "birth_day"},
-                {"name": "stage_mode"},
-                {"name": "platform"},
-                {"name": "memory_mode"},
-                {"name": "id"},
-            ]
-
-        def get_indexes(self, table_name):
-            return []
-
-        def get_unique_constraints(self, table_name):
-            return []
-
-    class MockSyncConn:
-        dialect = SimpleNamespace(name="sqlite")
-
-        def execute(self, stmt, *args, **kwargs):
-            executed_statements.append(str(stmt))
-
-        def _run_ddl_visitor(self, *args, **kwargs):
-            pass
-
-    class MockConn:
-        dialect = SimpleNamespace(name="sqlite")
-
-        async def execute(self, stmt, *args, **kwargs):
-            pass
-
-        async def run_sync(self, fn):
-            if getattr(fn, "__name__", "") == "_check_and_migrate":
-                fn(MockSyncConn())
-
-    class MockEngine:
-        def begin(self):
-            class MockContext:
-                async def __aenter__(self):
-                    return MockConn()
-
-                async def __aexit__(self, *args):
-                    return False
-
-            return MockContext()
-
-    monkeypatch.setattr(database, "engine", MockEngine())
-    monkeypatch.setattr("sqlalchemy.inspect", lambda conn: MockInspector())
-    monkeypatch.setattr(database, "_acquire_database_init_lock", AsyncMock())
-    monkeypatch.setattr(database, "_migrate_legacy_media_ownership", lambda conn: None)
-    monkeypatch.setattr(database, "_migrate_ai_config_models", lambda conn: None)
-    monkeypatch.setattr(database, "verify_yookassa_recurring_safety_schema", lambda conn: None)
-    monkeypatch.setattr(database, "verify_payment_notification_outbox_schema", lambda conn: None)
-    monkeypatch.setattr(database, "async_session_maker", lambda: _Session(None))
-
+    init_db, statements = _run_mock_init_db(
+        monkeypatch,
+        dialect_name="sqlite",
+        bot_general_config_cols=[{"name": "ai_processing_message_text", "type": String(200)}],
+    )
     await init_db()
-
     assert not any(
         "ALTER TABLE bot_general_config ALTER COLUMN ai_processing_message_text" in stmt
-        for stmt in executed_statements
+        for stmt in statements
     )

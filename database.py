@@ -1299,24 +1299,35 @@ async def init_db():
                     "ALTER TABLE followup_deliveries ADD COLUMN external_message_id TEXT"
                 ))
 
-            general_columns = [c['name'] for c in insp.get_columns('bot_general_config')]
+            general_columns_raw = insp.get_columns('bot_general_config')
+            general_columns = [c['name'] for c in general_columns_raw]
             if 'ai_processing_message_enabled' not in general_columns:
                 sync_conn.execute(text(
                     "ALTER TABLE bot_general_config "
                     "ADD COLUMN ai_processing_message_enabled BOOLEAN DEFAULT FALSE NOT NULL"
                 ))
-            if 'ai_processing_message_text' not in general_columns:
+            ai_text_col = next((c for c in general_columns_raw if c.get('name') == 'ai_processing_message_text'), None)
+            if ai_text_col is None:
                 sync_conn.execute(text(
                     "ALTER TABLE bot_general_config "
                     "ADD COLUMN ai_processing_message_text TEXT DEFAULT 'Думаю...' NOT NULL"
                 ))
             elif dialect_name == "postgresql":
-                # Changing VARCHAR to TEXT in PostgreSQL does not rewrite table data,
-                # though DDL operations may briefly acquire a table lock.
-                sync_conn.execute(text(
-                    "ALTER TABLE bot_general_config "
-                    "ALTER COLUMN ai_processing_message_text TYPE TEXT"
-                ))
+                col_type = ai_text_col.get('type')
+                is_text = False
+                if isinstance(col_type, type) and issubclass(col_type, Text):
+                    is_text = True
+                elif isinstance(col_type, Text):
+                    is_text = True
+                elif str(col_type).strip().upper().startswith("TEXT"):
+                    is_text = True
+                if not is_text:
+                    # Changing VARCHAR to TEXT in PostgreSQL does not rewrite table data,
+                    # though DDL operations may briefly acquire a table lock.
+                    sync_conn.execute(text(
+                        "ALTER TABLE bot_general_config "
+                        "ALTER COLUMN ai_processing_message_text TYPE TEXT"
+                    ))
             if 'telegram_default_language' not in general_columns:
                 sync_conn.execute(text(
                     "ALTER TABLE bot_general_config "
