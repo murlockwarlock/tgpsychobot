@@ -19,6 +19,7 @@ import httpx
 from ai_request_context import AIRequestLayout, _capture_ai_request, build_openai_chat_messages
 from provider_models import (
     DEEPGRAM_DEFAULT_MODEL,
+    DEEPGRAM_TRANSCRIPTION_MODELS,
     OPENROUTER_MODEL_SPECS,
     PERPLEXITY_MODES,
     PERPLEXITY_STATIC_DIRECT_MODELS,
@@ -1080,18 +1081,26 @@ async def call_deepgram(
         raise ProviderAdapterError("API ключ Deepgram не задан", category="auth")
     if not file_bytes:
         raise ProviderAdapterError("Пустой аудиофайл", category="invalid_request")
-    if model != DEEPGRAM_DEFAULT_MODEL:
+    if model not in DEEPGRAM_TRANSCRIPTION_MODELS:
         raise ProviderAdapterError("Недопустимая модель Deepgram", category="invalid_model")
     mime_type = mimetypes.guess_type(filename)[0] or "audio/ogg"
-    endpoint = "https://api.deepgram.com/v1/listen?" + urlencode(
-        {"model": model, "smart_format": "true", "language": "multi"}
-    )
+    params = {"model": model, "smart_format": "true"}
+    if model == "nova-2":
+        params["detect_language"] = "true"
+    else:
+        params["language"] = "multi"
+    endpoint = "https://api.deepgram.com/v1/listen?" + urlencode(params)
     if request_capture is not None:
+        payload = {"model": model, "smart_format": True}
+        if model == "nova-2":
+            payload["detect_language"] = True
+        else:
+            payload["language"] = "multi"
         _capture_ai_request(
             request_capture,
             provider="Deepgram",
             endpoint=endpoint,
-            payload={"model": model, "language": "multi", "smart_format": True},
+            payload=payload,
         )
     last_error: Exception | None = None
     await _mark_activity(activity_tracker)

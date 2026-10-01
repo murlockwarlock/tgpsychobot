@@ -561,11 +561,23 @@ def ai_keys_models_keyboard(current_transcription_provider: str, context_first: 
     return builder.as_markup()
 
 
-def model_selection_keyboard(provider: str, models: dict, channel: str = "chat", back_callback: str | None = None):
+def model_selection_keyboard(
+    provider: str,
+    models: dict,
+    channel: str = "chat",
+    back_callback: str | None = None,
+    current_model: str | None = None,
+):
     builder = InlineKeyboardBuilder()
     for model_key, model_info in models.items():
+        name = model_info['name']
+        is_selected = (
+            current_model == model_key
+            or (current_model and (name == current_model or model_key.endswith(f"/{current_model}")))
+        )
+        button_text = f"✅ {name}" if is_selected and not name.startswith("✅") else name
         builder.button(
-            text=model_info['name'],
+            text=button_text,
             callback_data=build_telegram_model_callback_data(provider, channel, model_key),
         )
     builder.button(

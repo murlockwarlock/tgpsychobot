@@ -1145,8 +1145,12 @@ MODELS_INFO = {
     },
     "Deepgram": {
         "nova-3": {
-            "name": "Deepgram Nova-3",
-            "desc": "Распознавание голосовых сообщений.",
+            "name": "nova-3",
+            "desc": "Распознавание голосовых сообщений (Nova-3).",
+        },
+        "nova-2": {
+            "name": "nova-2",
+            "desc": "Распознавание голосовых сообщений (Nova-2).",
         },
     },
 }
@@ -6531,6 +6535,7 @@ async def open_audio_model_picker(callback: CallbackQuery, state: FSMContext | N
         return
     models = get_selectable_models(provider, channel="transcription")
     info = MODELS_INFO.get(provider, {})
+    current_model = getattr(config, "deepgram_model", None) if provider == PROVIDER_DEEPGRAM else getattr(config, "kie_transcription_model", None)
     await callback.message.edit_text(
         f"Выберите модель аудио ({provider}):",
         reply_markup=kb.model_selection_keyboard(
@@ -6538,6 +6543,7 @@ async def open_audio_model_picker(callback: CallbackQuery, state: FSMContext | N
             {model: info.get(model, {"name": model, "desc": "Доступная модель."}) for model in models},
             channel="transcription",
             back_callback="admin_ai_audio",
+            current_model=current_model,
         ),
     )
     if state is not None:
@@ -7260,6 +7266,14 @@ async def view_provider_model_choices(callback: CallbackQuery, state: FSMContext
         text += f"▪️ <b>{model['name']}</b>: {model['desc']}\n"
     text += _provider_pricing_footer(provider, provider_models)
 
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+    current_model = getattr(config, "deepgram_model", None) if provider == PROVIDER_DEEPGRAM else (
+        getattr(config, "kie_transcription_model", None) if channel == "transcription" else (
+            getattr(config, f"{provider.lower()}_model", None) if config else None
+        )
+    )
+
     await callback.message.edit_text(
         text,
         reply_markup=kb.model_selection_keyboard(
@@ -7273,6 +7287,7 @@ async def view_provider_model_choices(callback: CallbackQuery, state: FSMContext
             },
             channel=channel,
             back_callback=f"view_models_{provider}",
+            current_model=current_model,
         )
     )
     if state is not None:

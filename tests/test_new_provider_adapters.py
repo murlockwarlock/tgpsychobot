@@ -49,8 +49,9 @@ def test_openrouter_catalog_is_curated_and_capability_driven():
     assert OPENROUTER_MODEL_SPECS["google/gemini-3.7-flash"].audio_input is True
     assert validate_model_selection(PROVIDER_OPENROUTER, "openai/gpt-5.6-terra") == "openai/gpt-5.6-terra"
     assert validate_model_selection(PROVIDER_PERPLEXITY, "medium") == "medium"
-    assert get_selectable_models(PROVIDER_DEEPGRAM, "transcription") == ("nova-3",)
+    assert get_selectable_models(PROVIDER_DEEPGRAM, "transcription") == ("nova-3", "nova-2")
     assert validate_model_selection(PROVIDER_DEEPGRAM, "nova-3", channel="transcription") == "nova-3"
+    assert validate_model_selection(PROVIDER_DEEPGRAM, "nova-2", channel="transcription") == "nova-2"
     assert get_default_model(PROVIDER_DEEPGRAM, channel="transcription") == "nova-3"
 
 
@@ -172,8 +173,22 @@ def test_deepgram_payload_and_transcript_support_multilingual_audio():
     assert transcript == "Olá, мир"
     assert "language=multi" in capture["endpoint"]
     request_url, request_kwargs = FakeClient.requests[-1]
-    assert request_url.endswith("language=multi")
+    assert "language=multi" in request_url
     assert request_kwargs["headers"]["Content-Type"] == "audio/ogg"
+
+    # Nova-2 uses detect_language=true and omits language=multi
+    FakeClient.response = FakeResponse(200, {"results": {"channels": [{"alternatives": [{"transcript": "Привет мир"}]}]}})
+    capture_nova2 = {}
+    with patch("provider_adapters.httpx.AsyncClient", FakeClient):
+        transcript_nova2 = asyncio.run(call_deepgram("secret", b"audio", "voice.ogg", model="nova-2", request_capture=capture_nova2))
+    assert transcript_nova2 == "Привет мир"
+    assert "detect_language=true" in capture_nova2["endpoint"]
+    assert "language=multi" not in capture_nova2["endpoint"]
+    assert capture_nova2["payload"] == {"model": "nova-2", "detect_language": True, "smart_format": True}
+    request_url_n2, _ = FakeClient.requests[-1]
+    assert "model=nova-2" in request_url_n2
+    assert "detect_language=true" in request_url_n2
+    assert "language=multi" not in request_url_n2
 
 
 def test_new_provider_output_budget_respects_model_capability_metadata():
