@@ -45,6 +45,8 @@ from provider_adapters import (
     _classify_perplexity_error_dict,
     _classify_perplexity_http_error,
     _extract_perplexity_text,
+    _is_http_url,
+    _normalize_citation_url,
     _populate_perplexity_diagnostics,
     _post_perplexity_json,
     build_perplexity_payload,
@@ -1114,7 +1116,8 @@ def test_agent_status_incomplete_distinguishes_output_budget_exhaustion():
 
 def test_citation_identity_and_deduplication():
     """Verify canonical Agent API search_results citation mapping:
-    - deduplicated URLs (scheme, host, default port, non-root trailing slash)
+    - accepts uppercase HTTP/HTTPS schemes and default ports
+    - deduplicated URLs (scheme case, host case, default port :443, non-root trailing slash)
     - stable sequential 1-based footer IDs ([1], [2])
     - upstream result IDs do NOT appear as user-facing citation numbers
     - inline [1], [2] still correspond to footer entries
@@ -1130,7 +1133,7 @@ def test_citation_identity_and_deduplication():
                     {
                         "id": "arbitrary-provider-id-A",
                         "title": "Guide",
-                        "url": "https://Example.com/guide/",
+                        "url": "HTTPS://Example.COM:443/guide/",
                         "snippet": "...",
                     },
                     {
@@ -1165,6 +1168,8 @@ def test_citation_identity_and_deduplication():
 
     # 1. Duplicate URL variants produce one source
     assert result.count("https://example.com/guide") == 1
+    assert "HTTPS://Example.COM:443/guide/" not in result
+    assert "https://example.com:443/guide" not in result
     assert result.count("https://example.org/article") == 1
 
     # 2. Footer IDs are sequential integers
@@ -1179,12 +1184,57 @@ def test_citation_identity_and_deduplication():
     # 4. Inline [1], [2] still correspond to footer entries
     assert "First claim [1]. Second claim [2]." in result
 
-    # 5. No duplicate footer rows
+    # 5. Exactly 2 footer rows without duplicates
     footer_section = result.split("Источники:\n", 1)[1]
     footer_lines = [line.strip() for line in footer_section.strip().splitlines() if line.strip()]
     assert len(footer_lines) == 2
     assert footer_lines[0] == "[1] Guide — https://example.com/guide"
     assert footer_lines[1] == "[2] Second Source — https://example.org/article"
+
+
+def test_citation_url_eligibility_and_normalization():
+    """Verify HTTP(S) URL eligibility helper and conservative normalizer:
+    - HTTPS://Example.COM:443/guide/ -> accepted, normalizes to https://example.com/guide
+    - http://Example.COM:80/page/ -> accepted, normalizes to http://example.com/page
+    - https://example.com/ -> accepted, root slash remains valid (https://example.com/)
+    - ftp://example.com/file -> rejected as non-http(s) citation URL
+    - not-a-url -> rejected as invalid URL
+    """
+    # 1. Uppercase HTTPS with default port 443 and non-root trailing slash
+    url_1 = "HTTPS://Example.COM:443/guide/"
+    assert _is_http_url(url_1) is True
+    dedup_1, display_1 = _normalize_citation_url(url_1)
+    assert dedup_1 == "https://example.com/guide"
+    assert display_1 == "https://example.com/guide"
+
+    # 2. Uppercase HTTP with default port 80 and non-root trailing slash
+    url_2 = "http://Example.COM:80/page/"
+    assert _is_http_url(url_2) is True
+    dedup_2, display_2 = _normalize_citation_url(url_2)
+    assert dedup_2 == "http://example.com/page"
+    assert display_2 == "http://example.com/page"
+
+    # 3. Root slash remains valid
+    url_3 = "https://example.com/"
+    assert _is_http_url(url_3) is True
+    dedup_3, display_3 = _normalize_citation_url(url_3)
+    assert dedup_3 == "https://example.com/"
+    assert display_3 == "https://example.com/"
+
+    # 4. ftp scheme rejected as citation URL
+    url_4 = "ftp://example.com/file"
+    assert _is_http_url(url_4) is False
+
+    # 5. Non-URL rejected
+    url_5 = "not-a-url"
+    assert _is_http_url(url_5) is False
+
+    # 6. Query string preservation
+    url_6 = "https://example.com/page?a=1"
+    assert _is_http_url(url_6) is True
+    dedup_6, display_6 = _normalize_citation_url(url_6)
+    assert dedup_6 == "https://example.com/page?a=1"
+    assert display_6 == "https://example.com/page?a=1"
 
 
 def test_citation_upstream_id_and_web_marker_alias_resolution():

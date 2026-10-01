@@ -563,6 +563,18 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
     raise ProviderAdapterError("Perplexity вернул пустой ответ", category="empty_response")
 
 
+def _is_http_url(raw_url: Any) -> bool:
+    """Check if the provided raw_url is a valid HTTP or HTTPS URL."""
+    value = str(raw_url or "").strip()
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+    except Exception:
+        return False
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
 def _normalize_citation_url(raw_url: str) -> tuple[str, str]:
     """Conservative URL normalization helper for citation identity.
     Normalizes scheme (lower), hostname (lower), strips default ports (:80, :443),
@@ -608,12 +620,12 @@ def format_perplexity_response(payload: dict[str, Any], request_capture: dict[st
             results = item.get("results")
             if isinstance(results, list):
                 for res in results:
-                    if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
+                    if isinstance(res, dict) and _is_http_url(res.get("url")):
                         canonical_results.append(res)
             content_items = item.get("content")
             if isinstance(content_items, list):
                 for res in content_items:
-                    if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
+                    if isinstance(res, dict) and _is_http_url(res.get("url")):
                         canonical_results.append(res)
 
     raw_results: list[dict[str, Any]] = []
@@ -630,12 +642,12 @@ def format_perplexity_response(payload: dict[str, Any], request_capture: dict[st
                 results = item.get("results")
                 if isinstance(results, list):
                     for res in results:
-                        if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
+                        if isinstance(res, dict) and _is_http_url(res.get("url")):
                             legacy_tool_results.append(res)
                 content_items = item.get("content")
                 if isinstance(content_items, list):
                     for res in content_items:
-                        if isinstance(res, dict) and str(res.get("url") or "").startswith(("http://", "https://")):
+                        if isinstance(res, dict) and _is_http_url(res.get("url")):
                             legacy_tool_results.append(res)
 
         if legacy_tool_results:
@@ -646,7 +658,7 @@ def format_perplexity_response(payload: dict[str, Any], request_capture: dict[st
             citations_list = payload.get("citations")
             if isinstance(citations_list, list):
                 for c in citations_list:
-                    if isinstance(c, str) and c.startswith(("http://", "https://")):
+                    if isinstance(c, str) and _is_http_url(c):
                         raw_results.append({"url": c, "title": c})
 
     if not raw_results:
