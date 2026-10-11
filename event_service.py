@@ -137,7 +137,7 @@ async def _reconcile_scheduled_deliveries_for_rejoin(
             d.status in NON_RECOVERABLE_STATUSES
             or d.id in resolved_terminal_ids
             or d.status == "expired"
-            or (d.status == "skipped" and d.skip_reason == "expired")
+            or (d.status == "skipped" and d.skip_reason not in RECOVERABLE_SKIP_REASONS)
             for d in step_deliveries
         )
 
@@ -200,7 +200,7 @@ async def _reconcile_scheduled_deliveries_for_rejoin(
                 extra_d.claimed_at = None
                 extra_d.send_started_at = None
                 extra_d.updated_at = effective_now
-        else:
+        elif not any(d.retry_index == 0 for d in step_deliveries):
             new_deliv = EventDelivery(
                 event_id=scenario.id,
                 user_id=user.id,
@@ -964,6 +964,9 @@ async def rejoin_event_registration(
         scenario = await session.scalar(scen_stmt)
         if scenario is None or scenario.is_archived:
             raise ValueError("Сценарий не найден либо находится в архиве")
+
+        if not scenario.is_active:
+            raise ValueError("Сценарий не активен")
 
         cutoff = scenario.starts_at - timedelta(minutes=15)
         end_time = scenario.starts_at + timedelta(minutes=scenario.duration_minutes)

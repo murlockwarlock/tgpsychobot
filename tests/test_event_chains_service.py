@@ -1406,4 +1406,236 @@ async def test_regression_immediate_start_dynamic_clock_expired_max(sqlite_sessi
         assert deliv.skip_reason == "expired"
 
 
+@pytest.mark.asyncio
+async def test_rejoin_inactive_scenario_rejected_and_callback_ux(sqlite_session_factory):
+    """
+    Regression Test 1:
+    - active registration -> cancel -> scenario.is_active = False -> rejoin
+    - rejoin rejected with ValueError
+    - registration remains cancelled
+    - generation does not change
+    - no new EventDelivery created
+    - no new metadata started/rejoined
+    - Telegram and MAX callback UX: user does not receive success message.
+    """
+    now = datetime.utcnow()
+    user_id = await _create_test_user(sqlite_session_factory, 7001)
+    scen_id = await _create_test_scenario(
+        sqlite_session_factory,
+        code="rejoin_inactive_ev",
+        starts_at=now + timedelta(days=2),
+    )
+
+    # 1. Register user
+    reg_res = await register_user_for_event(
+        sqlite_session_factory, user_id, "rejoin_inactive_ev", platform="telegram", now=now
+    )
+    assert reg_res.status == "registered"
+    reg_id = reg_res.registration.id
+
+    # 2. Cancel registration
+    cancel_res = await cancel_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+    assert cancel_res.cancelled is True
+
+    # 3. Disable scenario
+    async with sqlite_session_factory() as session:
+        scen = await session.get(EventScenario, scen_id)
+        scen.is_active = False
+        await session.commit()
+
+    # Snapshot before failed rejoin
+    async with sqlite_session_factory() as session:
+        delivs_before = (
+            await session.scalars(
+                select(EventDelivery).where(EventDelivery.registration_id == reg_id)
+            )
+        ).all()
+        deliv_count_before = len(delivs_before)
+        deliv_ids_before = {d.id for d in delivs_before}
+
+        u = await session.get(User, user_id)
+        records_before = load_metadata_records(u.metadata_json)
+        reg_before = await session.get(EventRegistration, reg_id)
+        gen_before = reg_before.generation
+        assert reg_before.status == "cancelled"
+
+    # 4. Attempt rejoin -> must fail closed
+    with pytest.raises(ValueError, match="не активен"):
+        await rejoin_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+
+    # Verify state remains completely unchanged
+    async with sqlite_session_factory() as session:
+        reg_after = await session.get(EventRegistration, reg_id)
+        assert reg_after.status == "cancelled"
+        assert reg_after.generation == gen_before
+
+        delivs_after = (
+            await session.scalars(
+                select(EventDelivery).where(EventDelivery.registration_id == reg_id)
+            )
+        ).all()
+        assert len(delivs_after) == deliv_count_before
+        assert {d.id for d in delivs_after} == deliv_ids_before
+
+        u_after = await session.get(User, user_id)
+        records_after = load_metadata_records(u_after.metadata_json)
+        assert len(records_after) == len(records_before)
+        assert not any(
+            r.get("data", {}).get("action") == "rejoined" or r.get("data", {}).get("status") == "started"
+            for r in records_after[len(records_before):]
+        )
+
+    # 5. Telegram Callback UX test
+    cb_tg = MagicMock()
+    cb_tg.data = f"ev_rejoin:{scen_id}"
+    cb_tg.from_user.id = user_id
+    cb_tg.answer = AsyncMock()
+    cb_tg.message = MagicMock()
+    cb_tg.message.edit_text = AsyncMock()
+    cb_tg.message.answer = AsyncMock()
+
+    handled_tg = await handle_event_callback_telegram(cb_tg, session_maker=sqlite_session_factory, now=now)
+    assert handled_tg is True
+    # User does NOT receive success edit_text
+    assert cb_tg.message.edit_text.call_count == 0
+    assert cb_tg.message.answer.call_count == 0
+    # User receives error alert
+    assert cb_tg.answer.called
+    alert_text = cb_tg.answer.call_args[0][0]
+    assert "не активен" in alert_text.lower() or "не удалось" in alert_text.lower()
+
+    # 6. MAX Callback UX test
+    from max_messenger_bot.models import MAX_ID_OFFSET
+    user_max_id = MAX_ID_OFFSET + 7002
+    await _create_test_user(sqlite_session_factory, user_max_id)
+    # Enable scenario temporarily to register and cancel MAX user
+    async with sqlite_session_factory() as session:
+        scen = await session.get(EventScenario, scen_id)
+        scen.is_active = True
+        await session.commit()
+
+    reg_max = await register_user_for_event(
+        sqlite_session_factory, user_max_id, "rejoin_inactive_ev", platform="max", now=now
+    )
+    await cancel_event_registration(sqlite_session_factory, user_max_id, scen_id, now=now)
+
+    # Disable scenario again
+    async with sqlite_session_factory() as session:
+        scen = await session.get(EventScenario, scen_id)
+        scen.is_active = False
+        await session.commit()
+
+    mock_max_client = MagicMock()
+    mock_max_client.send_message = AsyncMock()
+    mock_max_client.answer_callback = AsyncMock()
+
+    cb_max = MagicMock()
+    cb_max.payload = f"ev_rejoin:{scen_id}"
+    cb_max.sender.user_id = user_max_id
+    cb_max.chat_id = 999
+    cb_max.callback_id = "cb_max_inactive_1"
+
+    handled_max = await handle_event_callback_max(
+        mock_max_client, cb_max, session_maker=sqlite_session_factory, now=now
+    )
+    assert handled_max is True
+    # Verify MAX client was called with error message, NOT success message
+    assert mock_max_client.send_message.called
+    sent_text = mock_max_client.send_message.call_args.kwargs["text"]
+    assert "снова зарегистрированы" not in sent_text
+    assert "не активен" in sent_text.lower() or "не удалось" in sent_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_rejoin_with_terminal_skipped_delivery_reconciliation(sqlite_session_factory):
+    """
+    Regression Test 2:
+    - create scheduled r0
+    - set to skipped/step_archived and skipped/disabled_past
+    - registration cancelled
+    - restore scenario/step to active future state where rejoin is possible
+    - perform rejoin
+    - does not fail on UNIQUE constraint
+    - terminal delivery does NOT resurrect
+    - second r0 delivery is NOT created
+    """
+    now = datetime.utcnow()
+    user_id = await _create_test_user(sqlite_session_factory, 7003)
+    scen_id = await _create_test_scenario(
+        sqlite_session_factory,
+        code="term_skip_rejoin_ev",
+        starts_at=now + timedelta(days=2),
+        steps=[
+            (-60, "Напоминание за 1 час"),
+            (-30, "Напоминание за 30 минут"),
+        ],
+    )
+
+    reg_res = await register_user_for_event(
+        sqlite_session_factory, user_id, "term_skip_rejoin_ev", platform="telegram", now=now
+    )
+    assert reg_res.status == "registered"
+    reg_id = reg_res.registration.id
+
+    async with sqlite_session_factory() as session:
+        delivs = (
+            await session.scalars(
+                select(EventDelivery)
+                .where(EventDelivery.registration_id == reg_id, EventDelivery.message_kind == "scheduled_step")
+                .order_by(EventDelivery.id)
+            )
+        ).all()
+        assert len(delivs) == 2
+        d_archived = delivs[0]
+        d_disabled = delivs[1]
+
+        # Simulate non-recoverable skip reasons
+        d_archived.status = "skipped"
+        d_archived.skip_reason = "step_archived"
+        d_archived.finished_at = now
+
+        d_disabled.status = "skipped"
+        d_disabled.skip_reason = "disabled_past"
+        d_disabled.finished_at = now
+        await session.commit()
+
+    # Cancel registration
+    await cancel_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+
+    # Rejoin registration: scenario and steps are in future and active
+    rejoin_res = await rejoin_event_registration(
+        sqlite_session_factory, user_id, scen_id, now=now
+    )
+    assert rejoin_res.generation == 2
+
+    # Verify deliveries in DB
+    async with sqlite_session_factory() as session:
+        all_delivs = (
+            await session.scalars(
+                select(EventDelivery)
+                .where(EventDelivery.registration_id == reg_id)
+                .order_by(EventDelivery.id)
+            )
+        ).all()
+
+        step_delivs = [d for d in all_delivs if d.message_kind == "scheduled_step"]
+        # Exactly 2 scheduled step deliveries exist - no second r0 was created!
+        assert len(step_delivs) == 2
+
+        check_archived = next(d for d in step_delivs if d.id == d_archived.id)
+        assert check_archived.status == "skipped"
+        assert check_archived.skip_reason == "step_archived"
+
+        check_disabled = next(d for d in step_delivs if d.id == d_disabled.id)
+        assert check_disabled.status == "skipped"
+        assert check_disabled.skip_reason == "disabled_past"
+
+        # Unique r0 check
+        step_ids = {d.step_id for d in step_delivs}
+        for sid in step_ids:
+            r0s = [d for d in step_delivs if d.step_id == sid and d.retry_index == 0]
+            assert len(r0s) == 1
+
+
+
 
