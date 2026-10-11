@@ -27,7 +27,8 @@ from database import (
     get_all_admin_ids,
 )
 from memory_mode import MEMORY_MODE_GLOBAL, get_memory_mode
-from user_metadata import append_metadata_records, merge_metadata
+from user_metadata import merge_metadata
+from event_service import get_user_tx_lock, is_sqlite_busy_exception, sync_and_append_user_metadata
 from translation_service import refresh_translation_cache, resolve_user_effective_locale, translate
 
 
@@ -245,10 +246,11 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
                 separators=(",", ":"),
             )
         if payload:
-            user.metadata_json = append_metadata_records(
-                user.metadata_json,
-                [{"data": payload, "raw_json": json.dumps(payload, ensure_ascii=False)}],
-            )
+            metadata_block = {
+                "data": payload,
+                "raw_json": json.dumps(payload, ensure_ascii=False),
+            }
+            await sync_and_append_user_metadata(session, user, [metadata_block])
     else:
         raise ValueError(f"Неизвестный тип действия: {action.action_type}")
 
@@ -286,12 +288,12 @@ async def process_pending_events(bot, *, limit: int = 100, user_id: int | None =
             return 0
 
     for event_id in claimed_ids:
-        # A failed action rolls its session back. Keeping one session per event
-        # prevents that rollback from expiring ORM objects of later events.
+        # Load fresh event & handlers in clean scope
         async with async_session_maker() as session:
             event = await session.get(AutomationEvent, event_id)
             if event is None:
                 continue
+            user_id_val = event.user_id
             handlers = (
                 await session.execute(
                     select(AutomationHandler)
@@ -303,11 +305,12 @@ async def process_pending_events(bot, *, limit: int = 100, user_id: int | None =
                     )
                 )
             ).scalars().all()
-            user = await session.get(User, event.user_id)
+            user = await session.get(User, user_id_val)
             if user is None:
                 event.processed_at = datetime.utcnow()
                 await session.commit()
                 continue
+
             failed = False
             for handler in handlers:
                 if not handler_matches(handler, event):
@@ -315,42 +318,103 @@ async def process_pending_events(bot, *, limit: int = 100, user_id: int | None =
                 for action in handler.actions:
                     handler_id = handler.id
                     action_id = action.id
-                    already_done = await session.scalar(
-                        select(AutomationActionExecution.id).where(
-                            AutomationActionExecution.event_id == event_id,
-                            AutomationActionExecution.action_id == action_id,
-                        )
-                    )
-                    if already_done:
-                        continue
-                    try:
-                        await _execute_action(session, bot, event, handler, action, user)
-                        session.add(AutomationActionExecution(
-                            event_id=event_id,
-                            handler_id=handler_id,
-                            action_id=action_id,
-                        ))
-                        await session.commit()
-                    except Exception:
-                        failed = True
-                        await session.rollback()
-                        log.exception(
-                            "Automation action failed: event=%s handler=%s action=%s",
-                            event_id,
-                            handler_id,
-                            action_id,
-                        )
+
+                    if action.action_type == "save_metadata":
+                        # Short isolated metadata transaction under user lock
+                        async with get_user_tx_lock(user_id_val):
+                            for attempt in range(5):
+                                action_session = async_session_maker()
+                                try:
+                                    async with action_session.begin():
+                                        bind = action_session.get_bind()
+                                        is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
+
+                                        u_stmt = select(User).where(User.id == user_id_val)
+                                        if is_postgres:
+                                            u_stmt = u_stmt.with_for_update()
+                                        fresh_user = await action_session.scalar(u_stmt)
+                                        if not fresh_user:
+                                            break
+
+                                        already_done = await action_session.scalar(
+                                            select(AutomationActionExecution.id).where(
+                                                AutomationActionExecution.event_id == event_id,
+                                                AutomationActionExecution.action_id == action_id,
+                                            )
+                                        )
+                                        if already_done:
+                                            break
+
+                                        fresh_event = await action_session.get(AutomationEvent, event_id)
+                                        fresh_action = await action_session.get(AutomationAction, action_id)
+
+                                        await _execute_action(action_session, bot, fresh_event, handler, fresh_action, fresh_user)
+                                        action_session.add(AutomationActionExecution(
+                                            event_id=event_id,
+                                            handler_id=handler_id,
+                                            action_id=action_id,
+                                        ))
+                                    break
+                                except (OperationalError, DBAPIError) as exc:
+                                    if is_sqlite_busy_exception(exc) and attempt < 4:
+                                        await action_session.rollback()
+                                        await asyncio.sleep(0.05 * (2 ** attempt))
+                                        continue
+                                    await action_session.rollback()
+                                    failed = True
+                                    log.exception("Save metadata action failed: event=%s handler=%s", event_id, handler_id)
+                                    break
+                                except Exception:
+                                    await action_session.rollback()
+                                    failed = True
+                                    log.exception("Save metadata action error: event=%s handler=%s", event_id, handler_id)
+                                    break
+                                finally:
+                                    await action_session.close()
+
+                    else:
+                        # send_message: executed without holding user lock during HTTP
+                        action_session = async_session_maker()
+                        try:
+                            fresh_event = await action_session.get(AutomationEvent, event_id)
+                            fresh_user = await action_session.get(User, user_id_val)
+                            fresh_action = await action_session.get(AutomationAction, action_id)
+
+                            already_done = await action_session.scalar(
+                                select(AutomationActionExecution.id).where(
+                                    AutomationActionExecution.event_id == event_id,
+                                    AutomationActionExecution.action_id == action_id,
+                                )
+                            )
+                            if not already_done and fresh_event and fresh_user and fresh_action:
+                                await _execute_action(action_session, bot, fresh_event, handler, fresh_action, fresh_user)
+                                action_session.add(AutomationActionExecution(
+                                    event_id=event_id,
+                                    handler_id=handler_id,
+                                    action_id=action_id,
+                                ))
+                                await action_session.commit()
+                        except Exception:
+                            await action_session.rollback()
+                            failed = True
+                            log.exception("Automation send_message failed: event=%s handler=%s", event_id, handler_id)
+                        finally:
+                            await action_session.close()
+
+                    if failed:
                         break
                 if failed:
                     break
-            if not failed:
-                completed_event = await session.get(AutomationEvent, event_id)
-                completed_event.processed_at = datetime.utcnow()
-                await session.commit()
-                processed_count += 1
-            else:
-                retry_event = await session.get(AutomationEvent, event_id)
-                if retry_event is not None:
-                    retry_event.processing_started_at = None
-                    await session.commit()
+
+        # Finalize event status in a clean short transaction
+        async with async_session_maker() as final_session:
+            ev = await final_session.get(AutomationEvent, event_id)
+            if ev is not None:
+                if not failed:
+                    ev.processed_at = datetime.utcnow()
+                    processed_count += 1
+                else:
+                    ev.processing_started_at = None
+                await final_session.commit()
+
     return processed_count

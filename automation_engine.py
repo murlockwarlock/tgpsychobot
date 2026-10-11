@@ -25,6 +25,7 @@ from user_metadata import (
     merge_metadata,
     service_data_history_block,
 )
+from event_service import sync_and_append_user_metadata
 
 
 @dataclass(frozen=True)
@@ -227,7 +228,7 @@ async def apply_service_data_blocks(
     ]
     if metadata_blocks:
         # Keep the existing admin export/history fully backward compatible.
-        user.metadata_json = append_metadata_records(user.metadata_json, metadata_blocks)
+        await sync_and_append_user_metadata(session, user, metadata_blocks)
 
     structured_blocks = [block for block in blocks if not block.legacy]
     if not structured_blocks:
