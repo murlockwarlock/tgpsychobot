@@ -39,7 +39,7 @@ from prompt_blocks import (
     format_available_media_text,
     render_prompt_block,
 )
-from automation_engine import apply_service_data_blocks, build_runtime_automation_context
+from automation_engine import apply_service_data_blocks, build_runtime_automation_context, persist_service_data_blocks
 from result_history import (
     TEST_RESULT_ROLE,
     ai_history_role_filter,
@@ -2476,17 +2476,14 @@ async def get_ai_response(
         automation_result = None
         if service_blocks and persist_service_data:
             try:
-                automation_result = await apply_service_data_blocks(
-                    session,
-                    user=user,
+                automation_result = await persist_service_data_blocks(
+                    async_session_maker,
+                    user_id=user.id,
                     dialogue_id=active_dialogue_id,
                     topic_id=active_topic_id,
                     blocks=service_blocks,
                 )
-                await session.commit()
             except Exception as commit_err:
-                if hasattr(session, "rollback"):
-                    await session.rollback()
                 logging.error("Failed to commit service data for user %s: %s", user_id, commit_err)
                 raise AIServiceError(f"Ошибка сохранения служебных данных ИИ: {commit_err}") from commit_err
 

@@ -219,6 +219,40 @@ async def recover_expired_leases(
         return recovered_claimed, recovered_sending
 
 
+async def sweep_expired_pending_deliveries(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """
+    Sweeps deliveries that expired while in 'pending' state before ever being claimed.
+    Transitions them deterministically to 'skipped' with skip_reason='expired'.
+    """
+    effective_now = now or datetime.utcnow()
+    async with session_maker() as session:
+        sweep_stmt = (
+            update(EventDelivery)
+            .where(
+                EventDelivery.status == "pending",
+                EventDelivery.expires_at.is_not(None),
+                EventDelivery.expires_at <= effective_now,
+            )
+            .values(
+                status="skipped",
+                skip_reason="expired",
+                finished_at=effective_now,
+                claim_token=None,
+                lease_until=None,
+                send_started_at=None,
+                claimed_at=None,
+                updated_at=effective_now,
+            )
+        )
+        res = await session.execute(sweep_stmt)
+        await session.commit()
+        return res.rowcount or 0
+
+
 async def finalize_delivery_outcome(
     session_maker: async_sessionmaker[AsyncSession],
     delivery_id: int,
@@ -344,18 +378,18 @@ async def process_single_delivery(
         expected_step_version=expected_step_version,
         rendered_text=rendered_text,
         template_text=template,
-        now=effective_now,
+        now=now,
     )
     if not ok:
         log.info("Pre-send rejected delivery %s: reason=%s", delivery_id, skip_reason)
         return f"pre_send_rejected:{skip_reason}"
 
     # Step 3: Network send OUTSIDE database locks
-    send_started = effective_now
+    send_started = now or datetime.utcnow()
     try:
         if platform == "telegram":
             if bot is None:
-                raise RuntimeError("Telegram bot transport is not configured")
+                raise PreTransmissionError("Telegram bot transport is not configured")
 
             markup = InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -372,7 +406,7 @@ async def process_single_delivery(
 
         elif platform == "max":
             if max_client is None:
-                raise RuntimeError("MAX client transport is not configured")
+                raise PreTransmissionError("MAX client transport is not configured")
 
             attachments = inline_keyboard([
                 [callback_button("❌ Не смогу прийти", f"ev_cancel:{event_id}")]
@@ -390,7 +424,7 @@ async def process_single_delivery(
         else:
             raise ValueError(f"Unknown platform '{platform}'")
 
-        finished_at = effective_now
+        finished_at = now or datetime.utcnow()
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
@@ -399,52 +433,56 @@ async def process_single_delivery(
             sent_at=finished_at,
             finished_at=finished_at,
             external_message_id=external_id,
-            now=effective_now,
+            now=now,
         )
         return "sent"
 
     except TelegramForbiddenError as exc:
+        err_now = now or datetime.utcnow()
         log.warning("Telegram delivery %s blocked by user %s: %s", delivery_id, user_id, exc)
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
             claim_token,
             status="blocked",
-            finished_at=effective_now,
+            finished_at=err_now,
             last_error=str(exc),
-            now=effective_now,
+            now=now,
         )
         return "blocked"
 
     except TelegramRetryAfter as exc:
+        err_now = now or datetime.utcnow()
         retry_delay = getattr(exc, "retry_after", 30)
         log.warning("Telegram delivery %s rate limited, retry after %ss: %s", delivery_id, retry_delay, exc)
-        set_telegram_cooldown(effective_now + timedelta(seconds=retry_delay))
+        set_telegram_cooldown(err_now + timedelta(seconds=retry_delay))
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
             claim_token,
             status="pending",
-            next_attempt_at=effective_now + timedelta(seconds=retry_delay),
+            next_attempt_at=err_now + timedelta(seconds=retry_delay),
             last_error=str(exc),
-            now=effective_now,
+            now=now,
         )
         return "rate_limited"
 
     except TelegramBadRequest as exc:
+        err_now = now or datetime.utcnow()
         log.error("Telegram delivery %s failed with bad request: %s", delivery_id, exc)
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
             claim_token,
             status="failed",
-            finished_at=effective_now,
+            finished_at=err_now,
             last_error=str(exc),
-            now=effective_now,
+            now=now,
         )
         return "failed"
 
     except MaxApiError as exc:
+        err_now = now or datetime.utcnow()
         error_code = getattr(exc, "error_code", "") or ""
         status_code = getattr(exc, "status", None)
         err_msg = str(exc)
@@ -456,100 +494,100 @@ async def process_single_delivery(
                 delivery_id,
                 claim_token,
                 status="blocked",
-                finished_at=effective_now,
+                finished_at=err_now,
                 last_error=err_msg,
-                now=effective_now,
+                now=now,
             )
             return "blocked"
 
         if status_code == 429:
             log.warning("MAX delivery %s rate limited: %s", delivery_id, exc)
-            set_max_cooldown(effective_now + timedelta(seconds=30))
+            set_max_cooldown(err_now + timedelta(seconds=30))
             await finalize_delivery_outcome(
                 session_maker,
                 delivery_id,
                 claim_token,
                 status="pending",
-                next_attempt_at=effective_now + timedelta(seconds=30),
+                next_attempt_at=err_now + timedelta(seconds=30),
                 last_error=err_msg,
-                now=effective_now,
+                now=now,
             )
             return "rate_limited"
 
-        if status_code == 403:
-            log.error("MAX delivery %s failed with 403 configuration error: %s", delivery_id, exc)
-            await finalize_delivery_outcome(
-                session_maker,
+        if (
+            status_code is None
+            or status_code >= 500
+            or "timeout" in err_msg.lower()
+            or "transport error" in err_msg.lower()
+        ):
+            log.error(
+                "MAX delivery %s ambiguous transport outcome (status=%s), marking uncertain: %s",
                 delivery_id,
-                claim_token,
-                status="failed",
-                finished_at=effective_now,
-                last_error=err_msg,
-                now=effective_now,
+                status_code,
+                exc,
             )
-            return "failed"
-
-        if "timeout" in err_msg.lower():
-            log.error("MAX delivery %s timed out, marking uncertain: %s", delivery_id, exc)
             await finalize_delivery_outcome(
                 session_maker,
                 delivery_id,
                 claim_token,
                 status="uncertain",
-                finished_at=effective_now,
+                finished_at=err_now,
                 last_error=err_msg,
-                now=effective_now,
+                now=now,
             )
             return "uncertain"
 
-        log.error("MAX delivery %s failed: %s", delivery_id, exc)
+        log.error("MAX delivery %s failed with permanent API response (status=%s): %s", delivery_id, status_code, exc)
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
             claim_token,
             status="failed",
-            finished_at=effective_now,
+            finished_at=err_now,
             last_error=err_msg,
-            now=effective_now,
+            now=now,
         )
         return "failed"
 
     except (asyncio.TimeoutError, TimeoutError) as exc:
+        err_now = now or datetime.utcnow()
         log.error("Delivery %s timed out post-request, marking uncertain: %s", delivery_id, exc)
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
             claim_token,
             status="uncertain",
-            finished_at=effective_now,
+            finished_at=err_now,
             last_error=f"Timeout after send initiated: {exc}",
-            now=effective_now,
+            now=now,
         )
         return "uncertain"
 
     except PreTransmissionError as exc:
+        err_now = now or datetime.utcnow()
         log.warning("Delivery %s provable pre-transmission error (safe retry): %s", delivery_id, exc)
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
             claim_token,
             status="pending",
-            next_attempt_at=effective_now + timedelta(seconds=60),
+            next_attempt_at=err_now + timedelta(seconds=60),
             last_error=f"Pre-transmission error: {exc}",
-            now=effective_now,
+            now=now,
         )
         return "pre_transmission_retry"
 
     except Exception as exc:
+        err_now = now or datetime.utcnow()
         log.exception("Delivery %s encountered ambiguous error after send began, marking uncertain: %s", delivery_id, exc)
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
             claim_token,
             status="uncertain",
-            finished_at=effective_now,
+            finished_at=err_now,
             last_error=f"Ambiguous network exception: {exc}",
-            now=effective_now,
+            now=now,
         )
         return "uncertain"
 
@@ -566,13 +604,14 @@ async def run_event_delivery_worker_cycle(
     """
     Runs one cycle of the delivery worker:
     1. Lease recovery sweeper.
-    2. Claims due pending deliveries.
-    3. Processes claimed deliveries concurrently.
+    2. Pending expired deliveries sweeper.
+    3. Claims due pending deliveries.
+    4. Processes claimed deliveries safely.
     """
-    effective_now = now or datetime.utcnow()
     stats: dict[str, int] = {
         "recovered_claimed": 0,
         "recovered_sending": 0,
+        "expired_swept": 0,
         "claimed": 0,
         "sent": 0,
         "blocked": 0,
@@ -582,39 +621,51 @@ async def run_event_delivery_worker_cycle(
         "rejected": 0,
     }
 
-    # Step 1: Sweeper
-    rec_c, rec_s = await recover_expired_leases(session_maker, now=effective_now)
-    stats["recovered_claimed"] = rec_c
-    stats["recovered_sending"] = rec_s
+    try:
+        # Step 1: Sweepers
+        rec_c, rec_s = await recover_expired_leases(session_maker, now=now)
+        stats["recovered_claimed"] = rec_c
+        stats["recovered_sending"] = rec_s
 
-    # Step 2: Claim
-    claimed = await claim_pending_deliveries(
-        session_maker, batch_size=batch_size, now=effective_now
-    )
-    stats["claimed"] = len(claimed)
+        exp_swept = await sweep_expired_pending_deliveries(session_maker, now=now)
+        stats["expired_swept"] = exp_swept
 
-    # Step 3: Process
-    for delivery_id, claim_token in claimed:
-        outcome = await process_single_delivery(
-            session_maker,
-            delivery_id,
-            claim_token,
-            bot=bot,
-            max_client=max_client,
-            now=effective_now,
+        # Step 2: Claim
+        claimed = await claim_pending_deliveries(
+            session_maker, batch_size=batch_size, now=now
         )
-        if outcome == "sent":
-            stats["sent"] += 1
-        elif outcome == "blocked":
-            stats["blocked"] += 1
-        elif outcome == "failed":
-            stats["failed"] += 1
-        elif outcome == "uncertain":
-            stats["uncertain"] += 1
-        elif "rate_limited" in outcome or "retry" in outcome:
-            stats["retried"] += 1
-        elif "pre_send_rejected" in outcome:
-            stats["rejected"] += 1
+        stats["claimed"] = len(claimed)
+
+        # Step 3: Process
+        for delivery_id, claim_token in claimed:
+            try:
+                outcome = await process_single_delivery(
+                    session_maker,
+                    delivery_id,
+                    claim_token,
+                    bot=bot,
+                    max_client=max_client,
+                    now=now,
+                )
+            except Exception as exc:
+                log.exception("Delivery %s failed with unhandled error in worker cycle: %s", delivery_id, exc)
+                outcome = "failed"
+
+            if outcome == "sent":
+                stats["sent"] += 1
+            elif outcome == "blocked":
+                stats["blocked"] += 1
+            elif outcome == "failed":
+                stats["failed"] += 1
+            elif outcome == "uncertain":
+                stats["uncertain"] += 1
+            elif "rate_limited" in outcome or "retry" in outcome:
+                stats["retried"] += 1
+            elif "pre_send_rejected" in outcome:
+                stats["rejected"] += 1
+
+    except Exception as exc:
+        log.exception("Event delivery worker cycle encountered error: %s", exc)
 
     return stats
 
@@ -661,6 +712,6 @@ async def dispatch_immediate_delivery(
         claim_token=token,
         bot=bot,
         max_client=max_client,
-        now=effective_now,
+        now=now,
     )
 

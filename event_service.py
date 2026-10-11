@@ -12,6 +12,7 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import re
@@ -39,16 +40,51 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# In-memory per-user locks for local transaction serialization
-_user_tx_locks: dict[int, asyncio.Lock] = {}
+class AsyncReentrantLock:
+    """An asyncio-compatible re-entrant lock for task-level nesting."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._count: int = 0
+
+    async def acquire(self) -> bool:
+        current_task = asyncio.current_task()
+        if self._owner is not None and self._owner == current_task:
+            self._count += 1
+            return True
+        await self._lock.acquire()
+        self._owner = current_task
+        self._count = 1
+        return True
+
+    def release(self) -> None:
+        current_task = asyncio.current_task()
+        if self._owner != current_task:
+            raise RuntimeError(f"Cannot release lock owned by {self._owner} from {current_task}")
+        self._count -= 1
+        if self._count == 0:
+            self._owner = None
+            self._lock.release()
+
+    async def __aenter__(self) -> AsyncReentrantLock:
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
+# In-memory per-user reentrant locks for local transaction serialization
+_user_tx_locks: dict[int, AsyncReentrantLock] = {}
 _locks_guard = asyncio.Lock()
 
 
-def get_user_tx_lock(user_id: int) -> asyncio.Lock:
-    """Returns an asyncio.Lock for the given user_id."""
+def get_user_tx_lock(user_id: int) -> AsyncReentrantLock:
+    """Returns an AsyncReentrantLock for the given user_id."""
     lock = _user_tx_locks.get(user_id)
     if lock is None:
-        lock = asyncio.Lock()
+        lock = AsyncReentrantLock()
         _user_tx_locks[user_id] = lock
     return lock
 
@@ -88,59 +124,67 @@ async def sync_and_append_user_metadata(
     Consistency guarantees:
     1. Executes strictly under session.no_autoflush to prevent flushing dirty User state prematurely.
     2. On PostgreSQL: SELECT ... FOR UPDATE locks the user row until commit().
-    3. Multiset merge preserves uncommitted local records if called multiple times before commit.
-    4. Eliminates duplicate blocks on transaction retries.
+    3. On SQLite: Serializes with get_user_tx_lock(user.id) unless caller already holds it.
+    4. Multiset merge preserves uncommitted local records if called multiple times before commit.
+    5. Eliminates duplicate blocks on transaction retries.
     """
     bind = session.get_bind()
     dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
     is_postgres = dialect_name == "postgresql"
 
-    with session.no_autoflush:
-        stmt = select(User.metadata_json).where(User.id == user.id)
-        if is_postgres:
-            stmt = stmt.with_for_update()
-        fresh_db_raw = await session.scalar(stmt)
+    async def _do_sync() -> str:
+        with session.no_autoflush:
+            stmt = select(User.metadata_json).where(User.id == user.id)
+            if is_postgres:
+                stmt = stmt.with_for_update()
+            fresh_db_raw = await session.scalar(stmt)
 
-    db_records = load_metadata_records(fresh_db_raw)
-    orm_records = load_metadata_records(user.metadata_json)
+        db_records = load_metadata_records(fresh_db_raw)
+        orm_records = load_metadata_records(user.metadata_json)
 
-    # Count frequencies of committed DB records
-    db_counts: dict[str, int] = {}
-    for r in db_records:
-        sig = _record_sig(r)
-        db_counts[sig] = db_counts.get(sig, 0) + 1
+        # Count frequencies of committed DB records
+        db_counts: dict[str, int] = {}
+        for r in db_records:
+            sig = _record_sig(r)
+            db_counts[sig] = db_counts.get(sig, 0) + 1
 
-    # Extract local uncommitted records already in ORM
-    uncommitted_local: list[dict[str, Any]] = []
-    for r in orm_records:
-        sig = _record_sig(r)
-        if db_counts.get(sig, 0) > 0:
-            db_counts[sig] -= 1
-        else:
-            uncommitted_local.append(r)
+        # Extract local uncommitted records already in ORM
+        uncommitted_local: list[dict[str, Any]] = []
+        for r in orm_records:
+            sig = _record_sig(r)
+            if db_counts.get(sig, 0) > 0:
+                db_counts[sig] -= 1
+            else:
+                uncommitted_local.append(r)
 
-    # Base records = fresh committed DB snapshot + local uncommitted ORM records
-    combined_records = list(db_records) + uncommitted_local
+        # Base records = fresh committed DB snapshot + local uncommitted ORM records
+        combined_records = list(db_records) + uncommitted_local
 
-    # Add new incoming blocks
-    timestamp = saved_at or datetime.now(timezone.utc).isoformat()
-    for block in data_blocks:
-        data = block.get("data")
-        if not isinstance(data, dict):
-            continue
-        combined_records.append({
-            "saved_at": timestamp,
-            "data": data,
-            "raw_json": block.get("raw_json") or json.dumps(data, ensure_ascii=False, indent=2),
-        })
+        # Add new incoming blocks
+        timestamp = saved_at or datetime.now(timezone.utc).isoformat()
+        for block in data_blocks:
+            data = block.get("data")
+            if not isinstance(data, dict):
+                continue
+            combined_records.append({
+                "saved_at": timestamp,
+                "data": data,
+                "raw_json": block.get("raw_json") or json.dumps(data, ensure_ascii=False, indent=2),
+            })
 
-    new_raw = json.dumps(
-        {"_format": "records_v1", "records": combined_records},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    user.metadata_json = new_raw
-    return new_raw
+        new_raw = json.dumps(
+            {"_format": "records_v1", "records": combined_records},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        user.metadata_json = new_raw
+        return new_raw
+
+    if not is_postgres:
+        async with get_user_tx_lock(user.id):
+            return await _do_sync()
+    else:
+        return await _do_sync()
 
 
 async def run_user_transaction(
@@ -200,7 +244,6 @@ async def run_user_transaction(
                 raise
             finally:
                 await session.close()
-
 
         raise RuntimeError(f"Exceeded max retries for user_id={user_id}")
 
@@ -402,11 +445,26 @@ async def register_user_for_event(
             reg.rejoined_at = effective_now
             reg.cancelled_at = None
 
-            # Level 6: Deliveries FOR UPDATE
-            deliv_stmt = select(EventDelivery).where(
-                EventDelivery.registration_id == reg.id,
-                EventDelivery.status == "skipped",
-                EventDelivery.skip_reason == "cancelled",
+            # Level 5: Steps FOR SHARE in stable id order
+            steps_stmt = (
+                select(EventStep)
+                .where(EventStep.event_id == scenario.id)
+                .order_by(EventStep.id.asc())
+            )
+            if is_pg:
+                steps_stmt = steps_stmt.with_for_update(read=True)
+            steps = (await session.execute(steps_stmt)).scalars().all()
+            steps_by_id = {s.id: s for s in steps}
+
+            # Level 6: Deliveries FOR UPDATE in stable id order
+            deliv_stmt = (
+                select(EventDelivery)
+                .where(
+                    EventDelivery.registration_id == reg.id,
+                    EventDelivery.status == "skipped",
+                    EventDelivery.skip_reason == "cancelled",
+                )
+                .order_by(EventDelivery.id.asc())
             )
             if is_pg:
                 deliv_stmt = deliv_stmt.with_for_update()
@@ -416,10 +474,7 @@ async def register_user_for_event(
                 for d in cancelled_deliveries:
                     if d.message_kind == "scheduled_step":
                         if d.step_id:
-                            step_stmt = select(EventStep).where(EventStep.id == d.step_id)
-                            if is_pg:
-                                step_stmt = step_stmt.with_for_update(read=True)
-                            step = await session.scalar(step_stmt)
+                            step = steps_by_id.get(d.step_id)
                             if step is None or step.is_archived:
                                 d.status = "skipped"
                                 d.skip_reason = "step_archived"
@@ -784,11 +839,26 @@ async def rejoin_event_registration(
         new_mode = "urgent_late" if is_urgent else "standard"
         reg.registration_mode = new_mode
 
-        # 3. Level 6: EventDelivery FOR UPDATE
-        deliv_stmt = select(EventDelivery).where(
-            EventDelivery.registration_id == reg.id,
-            EventDelivery.status == "skipped",
-            EventDelivery.skip_reason == "cancelled",
+        # 3. Level 5: Steps FOR SHARE in stable id order
+        steps_stmt = (
+            select(EventStep)
+            .where(EventStep.event_id == scenario.id)
+            .order_by(EventStep.id.asc())
+        )
+        if is_pg:
+            steps_stmt = steps_stmt.with_for_update(read=True)
+        steps = (await session.execute(steps_stmt)).scalars().all()
+        steps_by_id = {s.id: s for s in steps}
+
+        # 4. Level 6: EventDelivery FOR UPDATE in stable id order
+        deliv_stmt = (
+            select(EventDelivery)
+            .where(
+                EventDelivery.registration_id == reg.id,
+                EventDelivery.status == "skipped",
+                EventDelivery.skip_reason == "cancelled",
+            )
+            .order_by(EventDelivery.id.asc())
         )
         if is_pg:
             deliv_stmt = deliv_stmt.with_for_update()
@@ -798,10 +868,7 @@ async def rejoin_event_registration(
             for d in cancelled_deliveries:
                 if d.message_kind == "scheduled_step":
                     if d.step_id:
-                        step_stmt = select(EventStep).where(EventStep.id == d.step_id)
-                        if is_pg:
-                            step_stmt = step_stmt.with_for_update(read=True)
-                        step = await session.scalar(step_stmt)
+                        step = steps_by_id.get(d.step_id)
                         if step is None or step.is_archived:
                             d.status = "skipped"
                             d.skip_reason = "step_archived"
@@ -974,8 +1041,13 @@ async def reschedule_event(
                             and_(
                                 EventDelivery.status == "skipped",
                                 EventDelivery.skip_reason.in_(
-                                    ["late_registration", "rescheduled_past", "expired"]
+                                    ["late_registration", "rescheduled_past"]
                                 ),
+                            ),
+                            and_(
+                                EventDelivery.status == "skipped",
+                                EventDelivery.skip_reason == "expired",
+                                EventDelivery.message_kind == "immediate_confirmation",
                             ),
                         ),
                     )
@@ -1130,15 +1202,13 @@ async def prepare_and_lock_delivery_for_sending(
     Point of No Return: commit of CAS update to status='sending' releases all DB locks.
     Network HTTP send must happen ONLY AFTER this function returns success=True.
     """
-    effective_now = now or datetime.utcnow()
-
     for attempt in range(max_retries):
         session = session_maker()
         try:
             bind = session.get_bind()
             dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
             is_postgres = dialect_name == "postgresql"
-            current_now = effective_now
+            current_now = now if now is not None else datetime.utcnow()
             new_lease = current_now + timedelta(seconds=180)
 
             if not is_postgres:
@@ -1268,12 +1338,15 @@ async def prepare_and_lock_delivery_for_sending(
             if delivery.expires_at and delivery.expires_at <= current_now:
                 delivery.status = "skipped"
                 delivery.skip_reason = "expired"
+                delivery.finished_at = current_now
                 delivery.claim_token = None
                 delivery.lease_until = None
                 await session.commit()
                 return False, delivery, "expired"
 
             # Step 6: Atomic CAS UPDATE
+            current_now = now if now is not None else datetime.utcnow()
+            new_lease = current_now + timedelta(seconds=180)
             cas_stmt = (
                 update(EventDelivery)
                 .where(

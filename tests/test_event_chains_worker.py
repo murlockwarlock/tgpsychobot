@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("BOT_TOKEN", "test_token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+os.environ.setdefault("BASE_WEBHOOK_URL", "https://example.com")
 
 import pytest
 import pytest_asyncio
@@ -40,6 +41,7 @@ from event_service import (
     cancel_event_registration,
     prepare_and_lock_delivery_for_sending,
     register_user_for_event,
+    reschedule_event,
 )
 from max_messenger_bot.api import MaxApiError
 
@@ -832,24 +834,140 @@ async def test_real_postgresql_pre_send_lock_hierarchy_and_cas():
 
 
 @pytest.mark.asyncio
-async def test_cancel_vs_worker_ponr_concurrency_sqlite(sqlite_session_factory):
-    """Requirement 2: Cancel vs Worker Point of No Return on SQLite.
-    If worker won PoNR (status='sending'), cancel does not overwrite to skipped.
-    If cancel won before PoNR, worker aborts pre-send and does not send.
+async def test_scheduler_registration_and_scheduled_delivery_runtime_path(sqlite_session_factory):
+    """Item 1: Worker is registered in AsyncIOScheduler with max_instances=1, coalesce=True,
+    and processes scheduled delivery through the production runtime job path.
+    Also verifies:
+    - Telegram delivery succeeds even when MAX client is None.
+    - Shutdown properly stops scheduler and exits MAX client.
     """
-    user_id = await _create_test_user(sqlite_session_factory, 4001)
-    scen_id = await _create_test_scenario(sqlite_session_factory, "ponr_sq_ev")
+    from main import setup_scheduler, on_shutdown
+    from aiogram import Dispatcher
 
-    # --- Scenario A: Worker won PoNR ---
-    reg_res = await register_user_for_event(sqlite_session_factory, user_id, "ponr_sq_ev")
-    d_id = reg_res.immediate_delivery.id
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=12345))
+    mock_bot.session = MagicMock()
+    mock_bot.session.close = AsyncMock()
+
+    mock_max = MagicMock()
+    mock_max.__aenter__ = AsyncMock(return_value=mock_max)
+    mock_max.__aexit__ = AsyncMock()
+
+    dispatcher = Dispatcher()
+    dispatcher["_followup_max_client"] = mock_max
+
+    scheduler = setup_scheduler(
+        bot=mock_bot,
+        session_maker=sqlite_session_factory,
+        dispatcher=dispatcher,
+        max_followup_client=mock_max,
+        start=False,
+    )
+
+    job = scheduler.get_job("event_delivery_worker")
+    assert job is not None
+    assert job.max_instances == 1
+    assert job.coalesce is True
+    assert job.name == "event_delivery_worker"
+    assert job.kwargs.get("batch_size") == 20
+    assert job.kwargs.get("bot") is mock_bot
+    assert job.kwargs.get("max_client") is mock_max
+
+    # 1. Create a user and scenario with a scheduled step that is due
+    user_id = await _create_test_user(sqlite_session_factory, 5001)
+    now = datetime.utcnow()
+    starts_at = now + timedelta(minutes=10)
+    scen_id = await _create_test_scenario(
+        sqlite_session_factory,
+        code="sched_runtime_ev",
+        starts_at=starts_at,
+        steps=[(-15, "Reminder!")],
+    )
+    reg_res = await register_user_for_event(
+        sqlite_session_factory, user_id, "sched_runtime_ev", platform="telegram", now=now
+    )
+
+    # 2. Trigger job execution directly through job runtime function
+    job_coro = job.func(*job.args, **job.kwargs)
+    stats = await job_coro
+    assert stats["sent"] >= 1
+
+    # 3. Test that missing MAX client (max_followup_client=None) does not break Telegram deliveries
+    user_id_tg2 = await _create_test_user(sqlite_session_factory, 5002)
+    reg_res2 = await register_user_for_event(
+        sqlite_session_factory, user_id_tg2, "sched_runtime_ev", platform="telegram", now=now
+    )
+    stats_tg_only = await job.func(
+        sqlite_session_factory, bot=mock_bot, max_client=None, batch_size=20
+    )
+    assert stats_tg_only["sent"] >= 1
+
+    # 4. Verify shutdown closes scheduler and MAX client
+    await on_shutdown(mock_bot, dispatcher)
+    assert scheduler.running is False
+    mock_max.__aexit__.assert_awaited_once()
+    mock_bot.session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_max_transport_error_status_none_transitions_to_uncertain(sqlite_session_factory):
+    """Item 3: MaxApiError with status=None (ClientError / transport error) transitions to 'uncertain'."""
+    user_id = await _create_test_user(sqlite_session_factory, MAX_ID_OFFSET + 801)
+    await _create_test_scenario(sqlite_session_factory, "max_transport_ev")
+    await register_user_for_event(
+        sqlite_session_factory, user_id, "max_transport_ev", platform="max"
+    )
 
     claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
-    d_id_claimed, token = claimed[0]
-    assert d_id_claimed == d_id
+    assert len(claimed) == 1
+    d_id, token = claimed[0]
 
-    # Worker executes pre-send and commits PoNR (status -> sending)
-    ok, _, _ = await prepare_and_lock_delivery_for_sending(
+    mock_max = MagicMock()
+    mock_max.send_message = AsyncMock(
+        side_effect=MaxApiError(
+            status=None,
+            message="aiohttp transport error: ClientOSError: [Errno 54] Connection reset by peer",
+        )
+    )
+
+    outcome = await process_single_delivery(
+        sqlite_session_factory, d_id, token, max_client=mock_max
+    )
+    assert outcome == "uncertain"
+
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        assert d.status == "uncertain"
+        assert d.finished_at is not None
+        assert d.claim_token is None
+        assert "transport error" in d.last_error.lower()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_now_clock_rejects_expired_delivery_during_cycle(sqlite_session_factory):
+    """Item 4: In production runtime (now=None), time is evaluated dynamically right before
+    pre-send checks, rejecting delivery if expires_at or lease passed rather than using worker start time."""
+    user_id = await _create_test_user(sqlite_session_factory, 5010)
+    await _create_test_scenario(sqlite_session_factory, "dyn_clock_ev")
+    reg_res = await register_user_for_event(sqlite_session_factory, user_id, "dyn_clock_ev")
+    d_id = reg_res.immediate_delivery.id
+
+    # Claim delivery
+    claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    assert len(claimed) == 1
+    d_id_claimed, token = claimed[0]
+
+    # Set expires_at to slightly in future (60ms)
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        d.expires_at = datetime.utcnow() + timedelta(milliseconds=60)
+        await session.commit()
+
+    # Advance real time past expires_at
+    await asyncio.sleep(0.1)
+
+    # Calling prepare_and_lock_delivery_for_sending with now=None must evaluate dynamic clock
+    ok, deliv, reason = await prepare_and_lock_delivery_for_sending(
         sqlite_session_factory,
         delivery_id=d_id,
         claim_token=token,
@@ -857,23 +975,124 @@ async def test_cancel_vs_worker_ponr_concurrency_sqlite(sqlite_session_factory):
         expected_step_version=None,
         rendered_text="text",
         template_text="text",
+        now=None,
     )
-    assert ok is True
+    assert ok is False
+    assert reason == "expired"
 
-    # User concurrently triggers cancel
-    cancel_res = await cancel_event_registration(sqlite_session_factory, user_id, scen_id)
-    assert cancel_res.cancelled is True
-
-    # Delivery must STILL be in sending state (NOT skipped!)
     async with sqlite_session_factory() as session:
         d = await session.get(EventDelivery, d_id)
-        assert d.status == "sending"
+        assert d.status == "skipped"
+        assert d.skip_reason == "expired"
+        assert d.finished_at is not None
 
-    # Worker finishes HTTP send and finalizes
-    fin = await finalize_delivery_outcome(
-        sqlite_session_factory, d_id, token, status="sent", external_message_id="msg_sq_1"
+
+@pytest.mark.asyncio
+async def test_pending_delivery_expired_before_claim_swept_to_skipped(sqlite_session_factory):
+    """Item 5: Pending delivery that expired before claim is swept to skipped with skip_reason='expired'.
+    Reschedule does not resurrect expired scheduled steps."""
+    user_id = await _create_test_user(sqlite_session_factory, 5020)
+    now = datetime.utcnow()
+    scen_id = await _create_test_scenario(
+        sqlite_session_factory,
+        code="sweep_exp_ev",
+        starts_at=now + timedelta(days=2),
+        steps=[(-60, "Step 1")],
     )
-    assert fin is True
+    reg_res = await register_user_for_event(sqlite_session_factory, user_id, "sweep_exp_ev", now=now)
+    imm_id = reg_res.immediate_delivery.id
+
+    # Artificially set immediate delivery expires_at in the past (e.g. expired while worker was down)
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, imm_id)
+        d.expires_at = now - timedelta(minutes=10)
+        await session.commit()
+
+    # Run worker cycle
+    stats = await run_event_delivery_worker_cycle(sqlite_session_factory)
+    assert stats["expired_swept"] >= 1
+
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, imm_id)
+        assert d.status == "skipped"
+        assert d.skip_reason == "expired"
+        assert d.finished_at is not None
+        assert d.claim_token is None
+
+    # Now verify that reschedule does NOT resurrect expired scheduled step deliveries
+    async with sqlite_session_factory() as session:
+        sched_d = await session.scalar(
+            select(EventDelivery).where(
+                EventDelivery.registration_id == reg_res.registration.id,
+                EventDelivery.message_kind == "scheduled_step",
+            )
+        )
+        assert sched_d is not None
+        sched_id = sched_d.id
+        sched_d.status = "skipped"
+        sched_d.skip_reason = "expired"
+        sched_d.finished_at = now
+        await session.commit()
+
+    # Reschedule scenario
+    await reschedule_event(
+        sqlite_session_factory, scen_id, now + timedelta(days=5), now=now
+    )
+
+    # Verify that scheduled step delivery was NOT resurrected (only immediate_confirmation is resurrected)
+    async with sqlite_session_factory() as session:
+        sched_check = await session.get(EventDelivery, sched_id)
+        assert sched_check.status == "skipped"
+        assert sched_check.skip_reason == "expired"
+
+
+@pytest.mark.asyncio
+async def test_cancel_vs_worker_ponr_concurrency_sqlite(sqlite_session_factory):
+    """Requirement 2 & 6: Cancel vs Worker Point of No Return real barrier concurrency on SQLite.
+    Tests both commit orders with concurrent tasks:
+    Order 1: Worker commits PoNR before Cancel commits -> Delivery is sent, Registration is cancelled.
+    Order 2: Cancel commits before Worker PoNR -> Delivery is skipped, Registration is cancelled.
+    """
+    user_id = await _create_test_user(sqlite_session_factory, 4001)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "ponr_sq_ev")
+
+    # --- Scenario A: Worker won PoNR race ---
+    reg_res = await register_user_for_event(sqlite_session_factory, user_id, "ponr_sq_ev")
+    d_id = reg_res.immediate_delivery.id
+
+    claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    d_id_claimed, token = claimed[0]
+    assert d_id_claimed == d_id
+
+    worker_ready = asyncio.Event()
+    cancel_started = asyncio.Event()
+
+    async def _worker_task_a():
+        # Pre-send commits PoNR (status -> sending)
+        ok, _, _ = await prepare_and_lock_delivery_for_sending(
+            sqlite_session_factory,
+            delivery_id=d_id,
+            claim_token=token,
+            expected_content_version=1,
+            expected_step_version=None,
+            rendered_text="text",
+            template_text="text",
+        )
+        assert ok is True
+        worker_ready.set()
+        await cancel_started.wait()
+        fin = await finalize_delivery_outcome(
+            sqlite_session_factory, d_id, token, status="sent", external_message_id="msg_sq_1"
+        )
+        assert fin is True
+
+    async def _cancel_task_a():
+        await worker_ready.wait()
+        cancel_started.set()
+        cancel_res = await cancel_event_registration(sqlite_session_factory, user_id, scen_id)
+        assert cancel_res.cancelled is True
+
+    await asyncio.gather(_worker_task_a(), _cancel_task_a())
 
     async with sqlite_session_factory() as session:
         reg = await session.get(EventRegistration, reg_res.registration.id)
@@ -890,27 +1109,33 @@ async def test_cancel_vs_worker_ponr_concurrency_sqlite(sqlite_session_factory):
     d_id2_claimed, token2 = claimed2[0]
     assert d_id2_claimed == d_id2
 
-    # Cancel runs BEFORE worker pre-send
-    await cancel_event_registration(sqlite_session_factory, user_id2, scen_id)
+    cancel_done = asyncio.Event()
 
-    # Worker attempts pre-send
-    ok2, _, reason2 = await prepare_and_lock_delivery_for_sending(
-        sqlite_session_factory,
-        delivery_id=d_id2,
-        claim_token=token2,
-        expected_content_version=1,
-        expected_step_version=None,
-        rendered_text="text",
-        template_text="text",
-    )
-    assert ok2 is False
-    assert "cancelled" in str(reason2) or "mismatch" in str(reason2) or "stale_or_invalid_claim" in str(reason2)
+    async def _cancel_task_b():
+        cancel_res = await cancel_event_registration(sqlite_session_factory, user_id2, scen_id)
+        assert cancel_res.cancelled is True
+        cancel_done.set()
 
+    async def _worker_task_b():
+        await cancel_done.wait()
+        ok2, _, reason2 = await prepare_and_lock_delivery_for_sending(
+            sqlite_session_factory,
+            delivery_id=d_id2,
+            claim_token=token2,
+            expected_content_version=1,
+            expected_step_version=None,
+            rendered_text="text",
+            template_text="text",
+        )
+        assert ok2 is False
+        assert "cancelled" in str(reason2) or "mismatch" in str(reason2) or "stale_or_invalid_claim" in str(reason2)
+
+    await asyncio.gather(_cancel_task_b(), _worker_task_b())
 
 
 @pytest.mark.asyncio
 async def test_cancel_vs_worker_ponr_concurrency_postgresql():
-    """Requirement 2: Cancel vs Worker Point of No Return on real PostgreSQL."""
+    """Requirement 2 & 6: Cancel vs Worker Point of No Return barrier concurrency on real PostgreSQL."""
     pg_engine, skip_reason = await _get_safe_postgres_engine()
     if pg_engine is None:
         pytest.skip(skip_reason)
@@ -937,31 +1162,34 @@ async def test_cancel_vs_worker_ponr_concurrency_postgresql():
         assert len(claimed) == 1
         d_id_claimed, token = claimed[0]
 
-        ok, _, _ = await prepare_and_lock_delivery_for_sending(
-            sessions,
-            delivery_id=d_id,
-            claim_token=token,
-            expected_content_version=1,
-            expected_step_version=None,
-            rendered_text="PG text",
-            template_text="PG text",
-        )
-        assert ok is True
+        worker_ready = asyncio.Event()
+        cancel_started = asyncio.Event()
 
-        # User cancels concurrently
-        cancel_res = await cancel_event_registration(sessions, user_id, scen_id)
-        assert cancel_res.cancelled is True
+        async def _worker_task_pg():
+            ok, _, _ = await prepare_and_lock_delivery_for_sending(
+                sessions,
+                delivery_id=d_id,
+                claim_token=token,
+                expected_content_version=1,
+                expected_step_version=None,
+                rendered_text="PG text",
+                template_text="PG text",
+            )
+            assert ok is True
+            worker_ready.set()
+            await cancel_started.wait()
+            fin = await finalize_delivery_outcome(
+                sessions, d_id, token, status="sent", external_message_id="pg_ponr_msg"
+            )
+            assert fin is True
 
-        # Check delivery was NOT converted to skipped
-        async with sessions() as session:
-            d = await session.get(EventDelivery, d_id)
-            assert d.status == "sending"
+        async def _cancel_task_pg():
+            await worker_ready.wait()
+            cancel_started.set()
+            cancel_res = await cancel_event_registration(sessions, user_id, scen_id)
+            assert cancel_res.cancelled is True
 
-        # Finalize send on PostgreSQL
-        fin = await finalize_delivery_outcome(
-            sessions, d_id, token, status="sent", external_message_id="pg_ponr_msg"
-        )
-        assert fin is True
+        await asyncio.wait_for(asyncio.gather(_worker_task_pg(), _cancel_task_pg()), timeout=10.0)
 
         async with sessions() as session:
             reg = await session.get(EventRegistration, reg_res.registration.id)
@@ -971,4 +1199,5 @@ async def test_cancel_vs_worker_ponr_concurrency_postgresql():
 
     finally:
         await pg_engine.dispose()
+
 

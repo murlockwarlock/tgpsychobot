@@ -890,13 +890,13 @@ async def test_sqlite_concurrency_duplicate_registration(sqlite_session_factory)
 
 
 @pytest.mark.asyncio
-async def test_sqlite_concurrency_cancel_vs_rejoin(sqlite_session_factory):
-    """Requirement 8: Cancel vs Rejoin concurrency handles locks and sequence safely."""
+async def test_sqlite_concurrency_two_cancels(sqlite_session_factory):
+    """Requirement 8: Two concurrent cancels handle locks and sequence safely."""
     user_id = await _create_test_user(sqlite_session_factory, 2041)
-    scen_id = await _create_test_scenario(sqlite_session_factory, "conc_canc_rej_ev")
+    scen_id = await _create_test_scenario(sqlite_session_factory, "conc_canc_ev")
 
     # Start registered
-    await register_user_for_event(sqlite_session_factory, user_id, "conc_canc_rej_ev")
+    await register_user_for_event(sqlite_session_factory, user_id, "conc_canc_ev")
 
     # Run cancel and another cancel concurrently
     c1, c2 = await asyncio.gather(
@@ -908,6 +908,131 @@ async def test_sqlite_concurrency_cancel_vs_rejoin(sqlite_session_factory):
     async with sqlite_session_factory() as session:
         reg = await session.scalar(select(EventRegistration).where(EventRegistration.user_id == user_id))
         assert reg.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_concurrency_cancel_vs_rejoin(sqlite_session_factory):
+    """Requirement 8: True concurrent Cancel vs Rejoin race safely serializes."""
+    user_id = await _create_test_user(sqlite_session_factory, 2042)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "conc_canc_rej_real")
+
+    # Start registered, then cancel
+    await register_user_for_event(sqlite_session_factory, user_id, "conc_canc_rej_real")
+    await cancel_event_registration(sqlite_session_factory, user_id, scen_id)
+
+    # Concurrently launch rejoin and cancel
+    rejoin_task = rejoin_event_registration(sqlite_session_factory, user_id, scen_id)
+    cancel_task = cancel_event_registration(sqlite_session_factory, user_id, scen_id)
+
+    res_rejoin, res_cancel = await asyncio.gather(rejoin_task, cancel_task)
+
+    assert res_rejoin.registration_id is not None
+    assert res_cancel.registration_id is not None
+    assert (res_cancel.cancelled or res_cancel.already_cancelled) is True
+
+    async with sqlite_session_factory() as session:
+        reg = await session.scalar(select(EventRegistration).where(EventRegistration.user_id == user_id))
+        assert reg.status in ("started", "cancelled")
+        assert reg.generation >= 2
+
+
+@pytest.mark.asyncio
+async def test_sqlite_concurrency_registration_vs_ai_service_data(sqlite_session_factory):
+    """Requirement 7: Concurrent event registration and AI persist_service_data_blocks
+    preserve both metadata records without lost updates or deadlocks."""
+    from automation_engine import persist_service_data_blocks
+    from user_metadata import ServiceDataBlock
+
+    user_id = await _create_test_user(sqlite_session_factory, 2046)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "conc_reg_ai_ev")
+
+    ai_block = ServiceDataBlock(
+        current_state={},
+        events=[],
+        metadata={"topic": "psychology", "interest_level": "high"},
+        save_mode="merge",
+        raw_json='{"metadata":{"topic":"psychology"}}',
+        legacy=True,
+    )
+
+    reg_task = register_user_for_event(sqlite_session_factory, user_id, "conc_reg_ai_ev")
+    ai_task = persist_service_data_blocks(
+        sqlite_session_factory,
+        user_id=user_id,
+        dialogue_id=1,
+        topic_id=None,
+        blocks=[ai_block],
+    )
+
+    reg_res, ai_res = await asyncio.gather(reg_task, ai_task)
+    assert reg_res.status == "registered"
+
+    async with sqlite_session_factory() as session:
+        user = await session.get(User, user_id)
+        records = load_metadata_records(user.metadata_json)
+        # Verify event metadata was preserved
+        assert any(
+            (r.get("type") == "event_scenario" or r.get("data", {}).get("type") == "event_scenario")
+            for r in records
+        ), f"Missing event metadata in {records}"
+        # Verify AI metadata was preserved
+        assert any(
+            (r.get("data", {}).get("topic") == "psychology")
+            for r in records
+        ), f"Missing AI metadata in {records}"
+
+
+@pytest.mark.asyncio
+async def test_real_postgresql_rejoin_vs_reschedule_deadlock_free():
+    """Item 2 & Requirement 8: Real PostgreSQL concurrency test for rejoin vs reschedule.
+    Verifies that with strict lock hierarchy (User -> Scenario -> Registration -> Step -> Delivery),
+    concurrent rejoin and reschedule do not deadlock and complete within timeout.
+    """
+    from tests.test_event_chains_db import _get_safe_postgres_engine
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
+
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
+
+        sessions = async_sessionmaker(pg_engine, expire_on_commit=False)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(database, "engine", pg_engine)
+            mp.setattr(database, "async_session_maker", sessions)
+            await database.init_db()
+
+        user_id = await _create_test_user(sessions, 9001)
+        scen_id = await _create_test_scenario(sessions, "pg_rejoin_resched_ev")
+
+        # Start registered, then cancel
+        await register_user_for_event(sessions, user_id, "pg_rejoin_resched_ev")
+        await cancel_event_registration(sessions, user_id, scen_id)
+
+        # Run concurrent rejoin and reschedule with strict timeout
+        now = datetime.utcnow()
+        new_starts = now + timedelta(days=5)
+
+        rejoin_task = rejoin_event_registration(sessions, user_id, scen_id, now=now)
+        resched_task = reschedule_event(sessions, scen_id, new_starts, now=now)
+
+        rejoin_res, resched_res = await asyncio.wait_for(
+            asyncio.gather(rejoin_task, resched_task),
+            timeout=10.0,
+        )
+
+        assert rejoin_res.registration_id is not None
+        assert resched_res.schedule_revision >= 2
+
+        async with sessions() as session:
+            reg = await session.scalar(select(EventRegistration).where(EventRegistration.user_id == user_id))
+            assert reg.status in ("started", "cancelled")
+            assert reg.generation >= 2
+    finally:
+        await pg_engine.dispose()
+
 
 
 @pytest.mark.asyncio

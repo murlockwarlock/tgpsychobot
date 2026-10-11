@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from sqlalchemy import distinct, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from database import (
     AIConfig,
@@ -325,3 +325,33 @@ async def apply_service_data_blocks(
         current_step=current_step,
         event_names=tuple(event_names),
     )
+
+
+async def persist_service_data_blocks(
+    session_maker: async_sessionmaker[AsyncSession],
+    user_id: int,
+    *,
+    dialogue_id: int,
+    topic_id: int | None,
+    blocks: Iterable[ServiceDataBlock],
+    memory_mode: str | None = None,
+) -> AutomationApplyResult:
+    """
+    Persists AI service data blocks in a dedicated short transaction with per-user locking
+    and SQLite WAL busy retry resilience.
+    """
+    from event_service import run_user_transaction
+
+    blocks_list = list(blocks)
+
+    async def _op(session: AsyncSession, user: User) -> AutomationApplyResult:
+        return await apply_service_data_blocks(
+            session,
+            user=user,
+            dialogue_id=dialogue_id,
+            topic_id=topic_id,
+            blocks=blocks_list,
+            memory_mode=memory_mode,
+        )
+
+    return await run_user_transaction(session_maker, user_id, _op)

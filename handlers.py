@@ -258,7 +258,7 @@ from provider_models import (
     KIE_DEFAULT_CHAT_MODEL,
 )
 from user_metadata import append_metadata_records, extract_data_blocks, extract_service_data, load_metadata_records
-from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary
+from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary, persist_service_data_blocks
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
 from response_buttons import (
@@ -20886,22 +20886,17 @@ async def get_ai_response_direct(
     if invalid_data_blocks:
         logging.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
     if service_blocks:
-        async with async_session_maker() as session:
-            user = await session.get(User, user_id)
-            if user:
-                try:
-                    await apply_service_data_blocks(
-                        session,
-                        user=user,
-                        dialogue_id=active_dialogue_id,
-                        topic_id=active_topic_id,
-                        blocks=service_blocks,
-                    )
-                    await session.commit()
-                except Exception as exc:
-                    await session.rollback()
-                    logging.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
-                    raise
+        try:
+            await persist_service_data_blocks(
+                async_session_maker,
+                user_id=user_id,
+                dialogue_id=active_dialogue_id,
+                topic_id=active_topic_id,
+                blocks=service_blocks,
+            )
+        except Exception as exc:
+            logging.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
+            raise
     return visible_text or response_text
 
 
@@ -23612,23 +23607,17 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
 
         if service_blocks:
-            async with async_session_maker() as session:
-                user = await session.get(User, user_id)
-                if not user:
-                    raise AIServiceError(f"User {user_id} not found")
-                try:
-                    await apply_service_data_blocks(
-                        session,
-                        user=user,
-                        dialogue_id=current_dialogue_id,
-                        topic_id=current_topic_id,
-                        blocks=service_blocks,
-                    )
-                    await session.commit()
-                except Exception as exc:
-                    await session.rollback()
-                    logging.exception("Failed to commit service data for user %s: %s", user_id, exc)
-                    raise AIServiceError(f"Ошибка сохранения служебных данных ИИ: {exc}") from exc
+            try:
+                await persist_service_data_blocks(
+                    async_session_maker,
+                    user_id=user_id,
+                    dialogue_id=current_dialogue_id,
+                    topic_id=current_topic_id,
+                    blocks=service_blocks,
+                )
+            except Exception as exc:
+                logging.exception("Failed to commit service data for user %s: %s", user_id, exc)
+                raise AIServiceError(f"Ошибка сохранения служебных данных ИИ: {exc}") from exc
 
         # Process automation events after successful DATA commit
         if service_blocks:
