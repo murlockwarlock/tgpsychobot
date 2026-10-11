@@ -1136,3 +1136,274 @@ async def test_automation_events_sqlite_busy_retry(sqlite_session_factory):
         assert call_count >= 2
 
 
+@pytest.mark.asyncio
+async def test_regression_multi_generation_rejoin_urgent_to_standard(sqlite_session_factory):
+    """
+    Regression Test A:
+    urgent registration -> cancel -> reschedule far future -> standard rejoin.
+    Verifies:
+    - Future scheduled steps are pending again.
+    - registration_generation == current registration.generation.
+    - schedule_revision == current scenario.schedule_revision.
+    - Worker really sends them and does NOT encounter generation mismatch.
+    """
+    from event_delivery_worker import run_event_delivery_worker_cycle
+    user_id = await _create_test_user(sqlite_session_factory, 2060)
+    now = datetime.utcnow()
+    # Event in 10 minutes (urgent threshold is 15 min -> urgent_late)
+    scen_id = await _create_test_scenario(
+        sqlite_session_factory,
+        code="urgent_to_std_rejoin_ev",
+        starts_at=now + timedelta(minutes=10),
+        steps=[(-5, "Напоминание за 5 минут")],
+    )
+
+    # 1. Urgent registration
+    reg_res = await register_user_for_event(
+        sqlite_session_factory, user_id, "urgent_to_std_rejoin_ev", platform="telegram", now=now
+    )
+    assert reg_res.status == "registered"
+    assert reg_res.mode == "urgent_late"
+
+    # Verify scheduled step suppressed
+    async with sqlite_session_factory() as session:
+        sched_d = await session.scalar(
+            select(EventDelivery).where(
+                EventDelivery.registration_id == reg_res.registration.id,
+                EventDelivery.message_kind == "scheduled_step",
+            )
+        )
+        assert sched_d is not None
+        assert sched_d.status == "skipped"
+        assert sched_d.skip_reason == "late_mode_suppressed"
+        gen_1 = reg_res.registration.generation
+
+    # 2. Cancel registration
+    cancel_res = await cancel_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+    assert cancel_res.cancelled is True
+
+    # 3. Reschedule event far into the future (e.g. 5 days)
+    far_future = now + timedelta(days=5)
+    await reschedule_event(sqlite_session_factory, scen_id, far_future, now=now)
+
+    # 4. Standard rejoin
+    rejoin_res = await rejoin_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+    assert rejoin_res.generation > gen_1
+    current_gen = rejoin_res.generation
+
+    async with sqlite_session_factory() as session:
+        scen = await session.get(EventScenario, scen_id)
+        current_rev = scen.schedule_revision
+        sched_d_rejoined = await session.get(EventDelivery, sched_d.id)
+        assert sched_d_rejoined.status == "pending"
+        assert sched_d_rejoined.skip_reason is None
+        assert sched_d_rejoined.registration_generation == current_gen
+        assert sched_d_rejoined.schedule_revision == current_rev
+        assert sched_d_rejoined.due_at == far_future - timedelta(minutes=5)
+        assert sched_d_rejoined.claim_token is None
+        assert sched_d_rejoined.lease_until is None
+        assert sched_d_rejoined.claimed_at is None
+        assert sched_d_rejoined.send_started_at is None
+
+    # 5. Worker cycle actually sends scheduled step without generation mismatch
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=99991))
+    send_time = far_future - timedelta(minutes=4)
+    stats = await run_event_delivery_worker_cycle(sqlite_session_factory, bot=mock_bot, now=send_time)
+    assert stats["sent"] >= 1
+    assert stats["rejected"] == 0
+
+    async with sqlite_session_factory() as session:
+        sched_final = await session.get(EventDelivery, sched_d.id)
+        assert sched_final.status == "sent"
+        assert sched_final.external_message_id == "99991"
+
+
+@pytest.mark.asyncio
+async def test_regression_multi_generation_rejoin_late_step_rescheduled_future(sqlite_session_factory):
+    """
+    Regression Test B:
+    standard -> cancel -> standard rejoin, one step already became late_registration ->
+    reschedule step back to future.
+    Verifies:
+    - Revived delivery gets current generation.
+    - Worker accepts and sends it without generation mismatch.
+    """
+    from event_delivery_worker import run_event_delivery_worker_cycle
+    user_id = await _create_test_user(sqlite_session_factory, 2061)
+    now = datetime.utcnow()
+    # Event in 40 minutes: step at -50 min is already in past (late_registration),
+    # step at -20 min is in future (pending)
+    scen_id = await _create_test_scenario(
+        sqlite_session_factory,
+        code="std_cancel_resched_ev",
+        starts_at=now + timedelta(minutes=40),
+        steps=[
+            (-50, "50m reminder (past)"),
+            (-20, "20m reminder (future)"),
+        ],
+    )
+
+    # 1. Standard registration
+    reg_res = await register_user_for_event(
+        sqlite_session_factory, user_id, "std_cancel_resched_ev", platform="telegram", now=now
+    )
+    assert reg_res.status == "registered"
+
+    async with sqlite_session_factory() as session:
+        delivs = (
+            await session.scalars(
+                select(EventDelivery)
+                .where(EventDelivery.registration_id == reg_res.registration.id)
+                .order_by(EventDelivery.id)
+            )
+        ).all()
+        # Find the -50m delivery
+        late_deliv = next(d for d in delivs if d.step_id and d.status == "skipped" and d.skip_reason == "late_registration")
+        assert late_deliv is not None
+
+    # 2. Cancel registration
+    await cancel_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+
+    # 3. Standard rejoin
+    rejoin_res = await rejoin_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+    current_gen = rejoin_res.generation
+
+    # 4. Reschedule scenario into far future so that -50m step becomes future!
+    new_starts_at = now + timedelta(days=2)
+    await reschedule_event(sqlite_session_factory, scen_id, new_starts_at, now=now)
+
+    # Verify that revived delivery gets current generation
+    async with sqlite_session_factory() as session:
+        scen = await session.get(EventScenario, scen_id)
+        revived = await session.get(EventDelivery, late_deliv.id)
+        assert revived.status == "pending"
+        assert revived.skip_reason is None
+        assert revived.registration_generation == current_gen
+        assert revived.schedule_revision == scen.schedule_revision
+
+    # 5. Worker accepts and sends it
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=99992))
+    send_time = new_starts_at - timedelta(minutes=49)
+    stats = await run_event_delivery_worker_cycle(sqlite_session_factory, bot=mock_bot, now=send_time)
+    assert stats["sent"] >= 1
+    assert stats["rejected"] == 0
+
+    async with sqlite_session_factory() as session:
+        check = await session.get(EventDelivery, late_deliv.id)
+        assert check.status == "sent"
+        assert check.external_message_id == "99992"
+
+
+@pytest.mark.asyncio
+async def test_regression_immediate_start_dynamic_clock_expired_telegram(sqlite_session_factory):
+    """
+    Regression Test (Blocker 2):
+    Event ends almost immediately after registration.
+    Registration is still valid when handle_event_start_telegram starts,
+    but before immediate pre-send execution real time passes past expires_at (now=None).
+    Verifies:
+    - HTTP send is NOT called.
+    - Delivery is marked skipped / expired.
+    """
+    import event_delivery_worker
+    user_id = await _create_test_user(sqlite_session_factory, 2062)
+    # Event duration 120 min, started 119m 59.95s ago -> expires in 50ms
+    starts_at = datetime.utcnow() - timedelta(minutes=120) + timedelta(milliseconds=60)
+    scen_id = await _create_test_scenario(
+        sqlite_session_factory,
+        code="dyn_clock_start_tg_ev",
+        starts_at=starts_at,
+        duration=120,
+    )
+
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+
+    orig_prepare = event_delivery_worker.prepare_and_lock_delivery_for_sending
+
+    async def delayed_prepare(*args, **kwargs):
+        # Simulate processing/network delay so that dynamic clock passes expires_at
+        await asyncio.sleep(0.08)
+        return await orig_prepare(*args, **kwargs)
+
+    from unittest.mock import patch
+    with patch("event_delivery_worker.prepare_and_lock_delivery_for_sending", side_effect=delayed_prepare):
+        handled = await handle_event_start_telegram(
+            mock_bot,
+            chat_id=2062,
+            user_id=user_id,
+            start_arg="dyn_clock_start_tg_ev",
+            session_maker=sqlite_session_factory,
+            now=None,  # dynamic clock
+        )
+        assert handled is True
+        # HTTP send_message must NOT be called because delivery expired before pre-send
+        assert mock_bot.send_message.call_count == 0
+
+    async with sqlite_session_factory() as session:
+        deliv = await session.scalar(
+            select(EventDelivery).where(
+                EventDelivery.user_id == user_id,
+                EventDelivery.event_id == scen_id,
+            )
+        )
+        assert deliv is not None
+        assert deliv.status == "skipped"
+        assert deliv.skip_reason == "expired"
+
+
+@pytest.mark.asyncio
+async def test_regression_immediate_start_dynamic_clock_expired_max(sqlite_session_factory):
+    """
+    Regression Test (Blocker 2 for MAX):
+    Same check for handle_event_start_max with dynamic clock (now=None).
+    """
+    import event_delivery_worker
+    from max_messenger_bot.models import MAX_ID_OFFSET
+    user_id = MAX_ID_OFFSET + 3063
+    await _create_test_user(sqlite_session_factory, user_id)
+    starts_at = datetime.utcnow() - timedelta(minutes=120) + timedelta(milliseconds=60)
+    scen_id = await _create_test_scenario(
+        sqlite_session_factory,
+        code="dyn_clock_start_max_ev",
+        starts_at=starts_at,
+        duration=120,
+    )
+
+    mock_client = MagicMock()
+    mock_client.send_message = AsyncMock()
+
+    orig_prepare = event_delivery_worker.prepare_and_lock_delivery_for_sending
+
+    async def delayed_prepare(*args, **kwargs):
+        await asyncio.sleep(0.08)
+        return await orig_prepare(*args, **kwargs)
+
+    from unittest.mock import patch
+    with patch("event_delivery_worker.prepare_and_lock_delivery_for_sending", side_effect=delayed_prepare):
+        handled = await handle_event_start_max(
+            mock_client,
+            chat_id=100,
+            user_id=user_id,
+            start_payload="dyn_clock_start_max_ev",
+            session_maker=sqlite_session_factory,
+            now=None,  # dynamic clock
+        )
+        assert handled is True
+        assert mock_client.send_message.call_count == 0
+
+    async with sqlite_session_factory() as session:
+        deliv = await session.scalar(
+            select(EventDelivery).where(
+                EventDelivery.user_id == user_id,
+                EventDelivery.event_id == scen_id,
+            )
+        )
+        assert deliv is not None
+        assert deliv.status == "skipped"
+        assert deliv.skip_reason == "expired"
+
+
+

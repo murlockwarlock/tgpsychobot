@@ -1863,6 +1863,7 @@ async def get_ai_response(
                     dialogue_id=active_dialogue_id,
                     topic_id=active_topic_id,
                     blocks=service_blocks,
+                    apply_fn=apply_service_data_blocks,
                 )
             except Exception as exc:
                 log.exception("Could not save shared AI service data for user %s: %s", user_id, exc)
@@ -1883,6 +1884,8 @@ async def get_ai_response_direct(
     minutes_since_last_visit: int | None = None,
     minutes_since_last_message: int | None = None,
 ) -> str:
+    request_time = activity_tracker.request_time if activity_tracker is not None else datetime.utcnow()
+
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
@@ -1893,7 +1896,6 @@ async def get_ai_response_direct(
         active_dialogue_id = dialogue_id or user.current_dialogue_id or 1
         active_topic_id = topic_id if topic_id is not None else user.current_topic_id
 
-        request_time = activity_tracker.request_time if activity_tracker is not None else datetime.utcnow()
         if minutes_since_last_visit is None or minutes_since_last_message is None:
             gap_visit, gap_msg = await get_user_ai_activity_gaps(
                 session,
@@ -1905,15 +1907,6 @@ async def get_ai_response_direct(
                 minutes_since_last_visit = gap_visit
             if minutes_since_last_message is None:
                 minutes_since_last_message = gap_msg
-
-        if activity_tracker is None and track_user_activity:
-            activity_tracker = ActivityTracker(
-                async_session_maker,
-                user_id=user.id,
-                topic_id=active_topic_id,
-                request_time=request_time,
-                track_user_activity=True,
-            )
 
         request_layout = await build_isolated_request_layout(
             session,
@@ -1928,32 +1921,43 @@ async def get_ai_response_direct(
             service_capabilities=MAX_CAPABILITIES,
         )
 
-        try:
-            result = await _dispatch_provider(ai_config, request_layout, activity_tracker=activity_tracker)
-            log.info("AI direct response generated user_id=%s provider=%s", user_id, ai_config.provider)
-        except AIServiceError:
-            log.exception("AI direct request failed user_id=%s provider=%s", user_id, ai_config.provider)
-            raise
-        except Exception as exc:
-            log.exception("Unexpected AI direct request failure user_id=%s provider=%s", user_id, ai_config.provider)
-            raise AIServiceError(f"Ошибка при прямом обращении к AI-провайдеру: {exc}") from exc
+    # Session closed BEFORE external provider call
+    if activity_tracker is None and track_user_activity:
+        activity_tracker = ActivityTracker(
+            async_session_maker,
+            user_id=user_id,
+            topic_id=active_topic_id,
+            request_time=request_time,
+            track_user_activity=True,
+        )
 
-        visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
-        if invalid_data_blocks:
-            log.warning("Direct AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
-        if service_blocks:
-            try:
-                await persist_service_data_blocks(
-                    async_session_maker,
-                    user_id=user.id,
-                    dialogue_id=active_dialogue_id,
-                    topic_id=active_topic_id,
-                    blocks=service_blocks,
-                )
-            except Exception as exc:
-                log.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
-                raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
-        return visible_text
+    try:
+        result = await _dispatch_provider(ai_config, request_layout, activity_tracker=activity_tracker)
+        log.info("AI direct response generated user_id=%s provider=%s", user_id, ai_config.provider)
+    except AIServiceError:
+        log.exception("AI direct request failed user_id=%s provider=%s", user_id, ai_config.provider)
+        raise
+    except Exception as exc:
+        log.exception("Unexpected AI direct request failure user_id=%s provider=%s", user_id, ai_config.provider)
+        raise AIServiceError(f"Ошибка при прямом обращении к AI-провайдеру: {exc}") from exc
+
+    visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+    if invalid_data_blocks:
+        log.warning("Direct AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+    if service_blocks:
+        try:
+            await persist_service_data_blocks(
+                async_session_maker,
+                user_id=user_id,
+                dialogue_id=active_dialogue_id,
+                topic_id=active_topic_id,
+                blocks=service_blocks,
+                apply_fn=apply_service_data_blocks,
+            )
+        except Exception as exc:
+            log.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
+            raise AIServiceError(f"Ошибка сохранения метаданных диалога: {exc}") from exc
+    return visible_text
 
 
 # ---------------------------------------------------------------------------

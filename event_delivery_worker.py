@@ -369,6 +369,45 @@ async def process_single_delivery(
         user_id = delivery.user_id
         platform = delivery.platform
 
+    # Step 1.5: Platform cooldown check before Point of No Return
+    current_time = now or datetime.utcnow()
+    cooldown_until: datetime | None = None
+    if platform == "telegram":
+        tg_cd = get_telegram_cooldown()
+        if tg_cd and tg_cd > current_time:
+            cooldown_until = tg_cd
+    elif platform == "max":
+        max_cd = get_max_cooldown()
+        if max_cd and max_cd > current_time:
+            cooldown_until = max_cd
+
+    if cooldown_until is not None:
+        async with session_maker() as session:
+            revert_stmt = (
+                update(EventDelivery)
+                .where(
+                    EventDelivery.id == delivery_id,
+                    EventDelivery.status == "claimed",
+                    EventDelivery.claim_token == claim_token,
+                )
+                .values(
+                    status="pending",
+                    claim_token=None,
+                    claimed_at=None,
+                    lease_until=None,
+                    send_started_at=None,
+                    next_attempt_at=cooldown_until,
+                    updated_at=current_time,
+                )
+            )
+            await session.execute(revert_stmt)
+            await session.commit()
+        log.info(
+            "Delivery %s reverted to pending due to active %s cooldown until %s",
+            delivery_id, platform, cooldown_until,
+        )
+        return f"cooldown_reverted:{platform}"
+
     # Step 2: Pre-send lock and CAS validation (Point of No Return inside)
     ok, locked_delivery, skip_reason = await prepare_and_lock_delivery_for_sending(
         session_maker,
@@ -659,7 +698,7 @@ async def run_event_delivery_worker_cycle(
                 stats["failed"] += 1
             elif outcome == "uncertain":
                 stats["uncertain"] += 1
-            elif "rate_limited" in outcome or "retry" in outcome:
+            elif "rate_limited" in outcome or "retry" in outcome or "cooldown_reverted" in outcome:
                 stats["retried"] += 1
             elif "pre_send_rejected" in outcome:
                 stats["rejected"] += 1
@@ -687,6 +726,32 @@ async def dispatch_immediate_delivery(
     lease_until = effective_now + timedelta(seconds=60)
 
     async with session_maker() as session:
+        delivery = await session.get(EventDelivery, delivery_id)
+        if not delivery or delivery.status != "pending":
+            return None
+
+        # Check platform cooldown before claiming
+        cooldown_until: datetime | None = None
+        if delivery.platform == "telegram":
+            tg_cd = get_telegram_cooldown()
+            if tg_cd and tg_cd > effective_now:
+                cooldown_until = tg_cd
+        elif delivery.platform == "max":
+            max_cd = get_max_cooldown()
+            if max_cd and max_cd > effective_now:
+                cooldown_until = max_cd
+
+        if cooldown_until is not None:
+            if delivery.next_attempt_at is None or delivery.next_attempt_at < cooldown_until:
+                delivery.next_attempt_at = cooldown_until
+                delivery.updated_at = effective_now
+                await session.commit()
+            log.info(
+                "Immediate delivery %s postponed due to active %s cooldown until %s",
+                delivery_id, delivery.platform, cooldown_until,
+            )
+            return f"cooldown_active:{delivery.platform}"
+
         claim_stmt = (
             update(EventDelivery)
             .where(

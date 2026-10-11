@@ -2482,6 +2482,7 @@ async def get_ai_response(
                     dialogue_id=active_dialogue_id,
                     topic_id=active_topic_id,
                     blocks=service_blocks,
+                    apply_fn=apply_service_data_blocks,
                 )
             except Exception as commit_err:
                 logging.error("Failed to commit service data for user %s: %s", user_id, commit_err)

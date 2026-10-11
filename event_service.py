@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from database import (
     DeepLinkNamespace,
     EventDelivery,
+    EventDeliveryResolution,
     EventRegistration,
     EventScenario,
     EventStep,
@@ -39,6 +40,240 @@ from user_metadata import load_metadata_records
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+RECOVERABLE_SKIP_REASONS = {
+    "cancelled",
+    "late_mode_suppressed",
+    "late_registration",
+    "rescheduled_past",
+}
+
+NON_RECOVERABLE_STATUSES = {
+    "sent",
+    "uncertain",
+    "blocked",
+    "failed",
+    "resolved_sent",
+    "resolved_skipped",
+}
+
+
+async def _reconcile_scheduled_deliveries_for_rejoin(
+    session: AsyncSession,
+    scenario: EventScenario,
+    reg: EventRegistration,
+    user: User,
+    target_mode: str,
+    effective_now: datetime,
+    target_platform: str,
+    end_time: datetime,
+) -> EventDelivery:
+    """
+    Reconciles scheduled deliveries across registration generations during rejoin.
+
+    Contract:
+    - Only reuse existing scheduled delivery if:
+      * not sent, uncertain, blocked, failed, expired, or resolved terminal;
+      * step exists and is not archived.
+    - Recoverable skip reasons include cancelled, late_mode_suppressed,
+      late_registration, and rescheduled_past.
+    - Recalculates due_at = scenario.starts_at + step.offset_minutes.
+    - Sets registration_generation = reg.generation, schedule_revision = scenario.schedule_revision,
+      due_at = recalculated_due, next_attempt_at = recalculated_due, clears claim/lease fields.
+    - If recalculated due <= effective_now: status='skipped', skip_reason='late_registration'.
+    - If target_mode == 'urgent_late': status='skipped', skip_reason='late_mode_suppressed'.
+    - If target_mode == 'standard' and due > now: status='pending', skip_reason=None.
+    - Creates a single new immediate delivery for the new generation and returns it.
+    """
+    is_pg = session.bind and session.bind.dialect.name == "postgresql"
+
+    # 1. Level 5: Steps FOR SHARE in stable id order
+    steps_stmt = (
+        select(EventStep)
+        .where(EventStep.event_id == scenario.id)
+        .order_by(EventStep.offset_minutes.asc(), EventStep.sort_order.asc(), EventStep.id.asc())
+    )
+    if is_pg:
+        steps_stmt = steps_stmt.with_for_update(read=True)
+    steps = (await session.execute(steps_stmt)).scalars().all()
+    steps_by_id = {s.id: s for s in steps}
+
+    # 2. Level 6: Deliveries FOR UPDATE in stable id order
+    deliv_stmt = (
+        select(EventDelivery)
+        .where(EventDelivery.registration_id == reg.id)
+        .order_by(EventDelivery.id.asc())
+    )
+    if is_pg:
+        deliv_stmt = deliv_stmt.with_for_update()
+    existing_deliveries = (await session.execute(deliv_stmt)).scalars().all()
+
+    # Find terminal resolutions
+    resolved_terminal_ids: set[int] = set()
+    if existing_deliveries:
+        res_stmt = (
+            select(EventDeliveryResolution.delivery_id)
+            .where(
+                EventDeliveryResolution.delivery_id.in_([d.id for d in existing_deliveries]),
+                EventDeliveryResolution.resolution_type.in_(["mark_skipped", "mark_sent"]),
+            )
+        )
+        resolved_terminal_ids = set((await session.execute(res_stmt)).scalars().all())
+
+    # Map existing scheduled step deliveries
+    scheduled_by_step: dict[int, list[EventDelivery]] = {}
+    for d in existing_deliveries:
+        if d.message_kind == "scheduled_step" and d.step_id is not None:
+            scheduled_by_step.setdefault(d.step_id, []).append(d)
+
+    handled_step_ids: set[int] = set()
+
+    for step in steps:
+        step_deliveries = scheduled_by_step.get(step.id, [])
+        handled_step_ids.add(step.id)
+
+        # Check if step has any non-recoverable delivery
+        has_terminal = any(
+            d.status in NON_RECOVERABLE_STATUSES
+            or d.id in resolved_terminal_ids
+            or d.status == "expired"
+            or (d.status == "skipped" and d.skip_reason == "expired")
+            for d in step_deliveries
+        )
+
+        if has_terminal:
+            # Step is permanently terminal/expired; do not resurrect or recreate
+            continue
+
+        recoverable = [
+            d for d in step_deliveries
+            if (d.status == "skipped" and d.skip_reason in RECOVERABLE_SKIP_REASONS)
+            or d.status in ("pending", "claimed")
+        ]
+
+        if step.is_archived:
+            for d in recoverable:
+                d.status = "skipped"
+                d.skip_reason = "step_archived"
+                d.registration_generation = reg.generation
+                d.schedule_revision = scenario.schedule_revision
+                d.claim_token = None
+                d.lease_until = None
+                d.claimed_at = None
+                d.send_started_at = None
+                d.updated_at = effective_now
+            continue
+
+        recalculated_due = scenario.starts_at + timedelta(minutes=step.offset_minutes)
+        if target_mode == "standard":
+            if recalculated_due > effective_now:
+                target_status = "pending"
+                target_skip_reason = None
+            else:
+                target_status = "skipped"
+                target_skip_reason = "late_registration"
+        else:
+            target_status = "skipped"
+            target_skip_reason = "late_mode_suppressed"
+
+        if recoverable:
+            d = recoverable[0]
+            d.due_at = recalculated_due
+            d.next_attempt_at = recalculated_due
+            d.registration_generation = reg.generation
+            d.schedule_revision = scenario.schedule_revision
+            d.status = target_status
+            d.skip_reason = target_skip_reason
+            d.claim_token = None
+            d.lease_until = None
+            d.claimed_at = None
+            d.send_started_at = None
+            d.updated_at = effective_now
+
+            for extra_d in recoverable[1:]:
+                extra_d.status = "skipped"
+                extra_d.skip_reason = "superseded"
+                extra_d.registration_generation = reg.generation
+                extra_d.schedule_revision = scenario.schedule_revision
+                extra_d.claim_token = None
+                extra_d.lease_until = None
+                extra_d.claimed_at = None
+                extra_d.send_started_at = None
+                extra_d.updated_at = effective_now
+        else:
+            new_deliv = EventDelivery(
+                event_id=scenario.id,
+                user_id=user.id,
+                registration_id=reg.id,
+                step_id=step.id,
+                retry_index=0,
+                message_kind="scheduled_step",
+                delivery_key=f"ev:{scenario.id}:reg:{reg.id}:step:{step.id}:r0",
+                due_at=recalculated_due,
+                next_attempt_at=recalculated_due,
+                schedule_revision=scenario.schedule_revision,
+                registration_generation=reg.generation,
+                platform=target_platform,
+                status=target_status,
+                skip_reason=target_skip_reason,
+            )
+            session.add(new_deliv)
+
+    for step_id, step_deliveries in scheduled_by_step.items():
+        if step_id not in handled_step_ids:
+            for d in step_deliveries:
+                if (d.status == "skipped" and d.skip_reason in RECOVERABLE_SKIP_REASONS) or d.status in ("pending", "claimed"):
+                    d.status = "skipped"
+                    d.skip_reason = "step_archived"
+                    d.registration_generation = reg.generation
+                    d.schedule_revision = scenario.schedule_revision
+                    d.claim_token = None
+                    d.lease_until = None
+                    d.claimed_at = None
+                    d.send_started_at = None
+                    d.updated_at = effective_now
+
+    new_gen = reg.generation
+    if target_mode == "standard":
+        confirm_key = f"ev:{scenario.id}:reg:{reg.id}:gen:{new_gen}:kind:immediate_confirmation:r0"
+        imm = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=None,
+            retry_index=0,
+            message_kind="immediate_confirmation",
+            delivery_key=confirm_key,
+            due_at=effective_now,
+            next_attempt_at=effective_now,
+            expires_at=end_time,
+            schedule_revision=scenario.schedule_revision,
+            registration_generation=new_gen,
+            platform=target_platform,
+            status="pending",
+        )
+        session.add(imm)
+    else:
+        live_key = f"ev:{scenario.id}:reg:{reg.id}:gen:{new_gen}:kind:immediate_live:r0"
+        imm = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=None,
+            retry_index=0,
+            message_kind="immediate_live",
+            delivery_key=live_key,
+            due_at=effective_now,
+            next_attempt_at=effective_now,
+            expires_at=end_time,
+            schedule_revision=scenario.schedule_revision,
+            registration_generation=new_gen,
+            platform=target_platform,
+            status="pending",
+        )
+        session.add(imm)
+
+    return imm
 
 class AsyncReentrantLock:
     """An asyncio-compatible re-entrant lock for task-level nesting."""
@@ -445,99 +680,16 @@ async def register_user_for_event(
             reg.rejoined_at = effective_now
             reg.cancelled_at = None
 
-            # Level 5: Steps FOR SHARE in stable id order
-            steps_stmt = (
-                select(EventStep)
-                .where(EventStep.event_id == scenario.id)
-                .order_by(EventStep.id.asc())
+            imm = await _reconcile_scheduled_deliveries_for_rejoin(
+                session=session,
+                scenario=scenario,
+                reg=reg,
+                user=user,
+                target_mode=target_mode,
+                effective_now=effective_now,
+                target_platform=platform,
+                end_time=end_time,
             )
-            if is_pg:
-                steps_stmt = steps_stmt.with_for_update(read=True)
-            steps = (await session.execute(steps_stmt)).scalars().all()
-            steps_by_id = {s.id: s for s in steps}
-
-            # Level 6: Deliveries FOR UPDATE in stable id order
-            deliv_stmt = (
-                select(EventDelivery)
-                .where(
-                    EventDelivery.registration_id == reg.id,
-                    EventDelivery.status == "skipped",
-                    EventDelivery.skip_reason == "cancelled",
-                )
-                .order_by(EventDelivery.id.asc())
-            )
-            if is_pg:
-                deliv_stmt = deliv_stmt.with_for_update()
-            cancelled_deliveries = (await session.execute(deliv_stmt)).scalars().all()
-
-            if target_mode == "standard":
-                for d in cancelled_deliveries:
-                    if d.message_kind == "scheduled_step":
-                        if d.step_id:
-                            step = steps_by_id.get(d.step_id)
-                            if step is None or step.is_archived:
-                                d.status = "skipped"
-                                d.skip_reason = "step_archived"
-                                continue
-                            new_due = scenario.starts_at + timedelta(minutes=step.offset_minutes)
-                            if new_due <= effective_now:
-                                d.status = "skipped"
-                                d.skip_reason = "late_registration"
-                                continue
-                            d.due_at = new_due
-                            d.next_attempt_at = new_due
-                            d.schedule_revision = scenario.schedule_revision
-                            d.registration_generation = new_gen
-                            d.status = "pending"
-                            d.skip_reason = None
-                            d.claim_token = None
-                            d.lease_until = None
-                            d.send_started_at = None
-                            d.claimed_at = None
-                            d.updated_at = effective_now
-
-                confirm_key = f"ev:{scenario.id}:reg:{reg.id}:gen:{new_gen}:kind:immediate_confirmation:r0"
-                imm = EventDelivery(
-                    event_id=scenario.id,
-                    user_id=user.id,
-                    registration_id=reg.id,
-                    step_id=None,
-                    retry_index=0,
-                    message_kind="immediate_confirmation",
-                    delivery_key=confirm_key,
-                    due_at=effective_now,
-                    next_attempt_at=effective_now,
-                    expires_at=end_time,
-                    schedule_revision=scenario.schedule_revision,
-                    registration_generation=new_gen,
-                    platform=platform,
-                    status="pending",
-                )
-                session.add(imm)
-            else:
-                for d in cancelled_deliveries:
-                    if d.message_kind == "scheduled_step":
-                        d.status = "skipped"
-                        d.skip_reason = "late_mode_suppressed"
-
-                live_key = f"ev:{scenario.id}:reg:{reg.id}:gen:{new_gen}:kind:immediate_live:r0"
-                imm = EventDelivery(
-                    event_id=scenario.id,
-                    user_id=user.id,
-                    registration_id=reg.id,
-                    step_id=None,
-                    retry_index=0,
-                    message_kind="immediate_live",
-                    delivery_key=live_key,
-                    due_at=effective_now,
-                    next_attempt_at=effective_now,
-                    expires_at=end_time,
-                    schedule_revision=scenario.schedule_revision,
-                    registration_generation=new_gen,
-                    platform=platform,
-                    status="pending",
-                )
-                session.add(imm)
 
             rejoin_payload = {
                 "type": "event_scenario",
@@ -839,99 +991,16 @@ async def rejoin_event_registration(
         new_mode = "urgent_late" if is_urgent else "standard"
         reg.registration_mode = new_mode
 
-        # 3. Level 5: Steps FOR SHARE in stable id order
-        steps_stmt = (
-            select(EventStep)
-            .where(EventStep.event_id == scenario.id)
-            .order_by(EventStep.id.asc())
+        imm = await _reconcile_scheduled_deliveries_for_rejoin(
+            session=session,
+            scenario=scenario,
+            reg=reg,
+            user=user,
+            target_mode=new_mode,
+            effective_now=effective_now,
+            target_platform=target_platform,
+            end_time=end_time,
         )
-        if is_pg:
-            steps_stmt = steps_stmt.with_for_update(read=True)
-        steps = (await session.execute(steps_stmt)).scalars().all()
-        steps_by_id = {s.id: s for s in steps}
-
-        # 4. Level 6: EventDelivery FOR UPDATE in stable id order
-        deliv_stmt = (
-            select(EventDelivery)
-            .where(
-                EventDelivery.registration_id == reg.id,
-                EventDelivery.status == "skipped",
-                EventDelivery.skip_reason == "cancelled",
-            )
-            .order_by(EventDelivery.id.asc())
-        )
-        if is_pg:
-            deliv_stmt = deliv_stmt.with_for_update()
-        cancelled_deliveries = (await session.execute(deliv_stmt)).scalars().all()
-
-        if new_mode == "standard":
-            for d in cancelled_deliveries:
-                if d.message_kind == "scheduled_step":
-                    if d.step_id:
-                        step = steps_by_id.get(d.step_id)
-                        if step is None or step.is_archived:
-                            d.status = "skipped"
-                            d.skip_reason = "step_archived"
-                            continue
-                        new_due = scenario.starts_at + timedelta(minutes=step.offset_minutes)
-                        if new_due <= effective_now:
-                            d.status = "skipped"
-                            d.skip_reason = "late_registration"
-                            continue
-                        d.due_at = new_due
-                        d.next_attempt_at = new_due
-                        d.schedule_revision = scenario.schedule_revision
-                        d.registration_generation = new_gen
-                        d.status = "pending"
-                        d.skip_reason = None
-                        d.claim_token = None
-                        d.lease_until = None
-                        d.send_started_at = None
-                        d.claimed_at = None
-                        d.updated_at = effective_now
-
-            confirm_key = f"ev:{event_id}:reg:{reg.id}:gen:{new_gen}:kind:immediate_confirmation:r0"
-            imm = EventDelivery(
-                event_id=event_id,
-                user_id=user.id,
-                registration_id=reg.id,
-                step_id=None,
-                retry_index=0,
-                message_kind="immediate_confirmation",
-                delivery_key=confirm_key,
-                due_at=effective_now,
-                next_attempt_at=effective_now,
-                expires_at=end_time,
-                schedule_revision=scenario.schedule_revision,
-                registration_generation=new_gen,
-                platform=target_platform,
-                status="pending",
-            )
-            session.add(imm)
-        else:
-            for d in cancelled_deliveries:
-                if d.message_kind == "scheduled_step":
-                    d.status = "skipped"
-                    d.skip_reason = "late_mode_suppressed"
-
-            live_key = f"ev:{event_id}:reg:{reg.id}:gen:{new_gen}:kind:immediate_live:r0"
-            imm = EventDelivery(
-                event_id=event_id,
-                user_id=user.id,
-                registration_id=reg.id,
-                step_id=None,
-                retry_index=0,
-                message_kind="immediate_live",
-                delivery_key=live_key,
-                due_at=effective_now,
-                next_attempt_at=effective_now,
-                expires_at=end_time,
-                schedule_revision=scenario.schedule_revision,
-                registration_generation=new_gen,
-                platform=target_platform,
-                status="pending",
-            )
-            session.add(imm)
 
         rejoin_payload = {
             "type": "event_scenario",
@@ -1074,8 +1143,11 @@ async def reschedule_event(
                         d.claimed_at = None
 
                     elif d.message_kind == "immediate_confirmation":
+                        reg = reg_map.get(d.registration_id)
                         d.expires_at = end_time
                         d.schedule_revision = new_rev
+                        if reg:
+                            d.registration_generation = reg.generation
                         if d.status == "skipped" and d.skip_reason == "expired":
                             if end_time > effective_now:
                                 d.status = "pending"
@@ -1084,6 +1156,7 @@ async def reschedule_event(
                                 d.lease_until = None
                                 d.send_started_at = None
                                 d.claimed_at = None
+                                d.updated_at = effective_now
 
                     elif d.step_id is not None:
                         reg = reg_map.get(d.registration_id)
@@ -1096,6 +1169,8 @@ async def reschedule_event(
                         d.due_at = new_due_at
                         d.next_attempt_at = new_due_at
                         d.schedule_revision = new_rev
+                        if reg:
+                            d.registration_generation = reg.generation
 
                         if new_due_at <= effective_now:
                             d.status = "skipped"
@@ -1103,10 +1178,11 @@ async def reschedule_event(
                         else:
                             d.status = "pending"
                             d.skip_reason = None
-                            d.claim_token = None
-                            d.lease_until = None
-                            d.send_started_at = None
-                            d.claimed_at = None
+                        d.claim_token = None
+                        d.lease_until = None
+                        d.send_started_at = None
+                        d.claimed_at = None
+                        d.updated_at = effective_now
 
             # 5. Create up-to-date notices for each active registration
             for reg in registrations:
@@ -1480,7 +1556,7 @@ async def handle_event_start_telegram(
                 sm,
                 reg_res.immediate_delivery.id,
                 bot=bot,
-                now=effective_now,
+                now=now,
             )
         return True
 
@@ -1628,7 +1704,7 @@ async def handle_event_start_max(
                 sm,
                 reg_res.immediate_delivery.id,
                 max_client=client,
-                now=effective_now,
+                now=now,
             )
         return True
 

@@ -32,10 +32,14 @@ from event_delivery_worker import (
     PreTransmissionError,
     claim_pending_deliveries,
     finalize_delivery_outcome,
+    get_max_cooldown,
+    get_telegram_cooldown,
     process_single_delivery,
     recover_expired_leases,
     reset_cooldowns,
     run_event_delivery_worker_cycle,
+    set_max_cooldown,
+    set_telegram_cooldown,
 )
 from event_service import (
     cancel_event_registration,
@@ -1199,5 +1203,210 @@ async def test_cancel_vs_worker_ponr_concurrency_postgresql():
 
     finally:
         await pg_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_telegram_rate_limit_cooldown_applies_to_already_claimed_batch(sqlite_session_factory):
+    """
+    Requirement (Blocker 4):
+    Two Telegram deliveries claimed in one batch;
+    1st receives 429 and triggers platform cooldown;
+    2nd delivery in the SAME cycle does NOT call Telegram HTTP;
+    2nd delivery is safely reverted to pending with next_attempt_at >= cooldown_until.
+    MAX cooldown remains unaffected.
+    """
+    reset_cooldowns()
+    now = datetime.utcnow()
+    user_1 = await _create_test_user(sqlite_session_factory, 6001)
+    user_2 = await _create_test_user(sqlite_session_factory, 6002)
+
+    scen_id = await _create_test_scenario(sqlite_session_factory, "tg_batch_429_ev")
+    reg_1 = await register_user_for_event(
+        sqlite_session_factory, user_1, "tg_batch_429_ev", platform="telegram", now=now
+    )
+    reg_2 = await register_user_for_event(
+        sqlite_session_factory, user_2, "tg_batch_429_ev", platform="telegram", now=now
+    )
+
+    d1_id = reg_1.immediate_delivery.id
+    d2_id = reg_2.immediate_delivery.id
+
+    mock_bot = MagicMock()
+    # 1st call raises 429 RetryAfter 45s
+    mock_bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="Too Many Requests", retry_after=45),
+            AsyncMock(),
+        ]
+    )
+
+    stats = await run_event_delivery_worker_cycle(
+        sqlite_session_factory, bot=mock_bot, batch_size=10, now=now
+    )
+
+    # Exactly 1 HTTP call made! Second delivery was NOT called via HTTP!
+    assert mock_bot.send_message.call_count == 1
+    assert stats["claimed"] == 2
+    assert stats["retried"] == 2
+
+    # Verify Telegram cooldown is active, MAX cooldown is NOT active
+    assert get_telegram_cooldown() is not None
+    assert get_telegram_cooldown() >= now + timedelta(seconds=45)
+    assert get_max_cooldown() is None
+
+    # Verify both deliveries in DB
+    async with sqlite_session_factory() as session:
+        d1 = await session.get(EventDelivery, d1_id)
+        d2 = await session.get(EventDelivery, d2_id)
+
+        # D1 is pending, rate_limited
+        assert d1.status == "pending"
+        assert d1.claim_token is None
+        assert d1.lease_until is None
+        assert d1.next_attempt_at >= now + timedelta(seconds=45)
+
+        # D2 was safely reverted from claimed to pending, attempt state cleared
+        assert d2.status == "pending"
+        assert d2.claim_token is None
+        assert d2.claimed_at is None
+        assert d2.lease_until is None
+        assert d2.send_started_at is None
+        assert d2.next_attempt_at >= now + timedelta(seconds=45)
+
+    reset_cooldowns()
+
+
+@pytest.mark.asyncio
+async def test_max_rate_limit_cooldown_applies_to_already_claimed_batch(sqlite_session_factory):
+    """
+    Requirement (Blocker 4):
+    Two MAX deliveries claimed in one batch;
+    1st receives 429 and triggers platform cooldown;
+    2nd delivery in the SAME cycle does NOT call MAX HTTP;
+    2nd delivery is safely reverted to pending with next_attempt_at >= cooldown_until.
+    Telegram cooldown remains unaffected.
+    """
+    reset_cooldowns()
+    now = datetime.utcnow()
+    user_1 = await _create_test_user(sqlite_session_factory, MAX_ID_OFFSET + 6011)
+    user_2 = await _create_test_user(sqlite_session_factory, MAX_ID_OFFSET + 6012)
+
+    scen_id = await _create_test_scenario(sqlite_session_factory, "max_batch_429_ev")
+    reg_1 = await register_user_for_event(
+        sqlite_session_factory, user_1, "max_batch_429_ev", platform="max", now=now
+    )
+    reg_2 = await register_user_for_event(
+        sqlite_session_factory, user_2, "max_batch_429_ev", platform="max", now=now
+    )
+
+    d1_id = reg_1.immediate_delivery.id
+    d2_id = reg_2.immediate_delivery.id
+
+    mock_max = MagicMock()
+    mock_max.send_message = AsyncMock(
+        side_effect=[
+            MaxApiError(status=429, message="Rate limited by MAX"),
+            AsyncMock(),
+        ]
+    )
+
+    stats = await run_event_delivery_worker_cycle(
+        sqlite_session_factory, max_client=mock_max, batch_size=10, now=now
+    )
+
+    assert mock_max.send_message.call_count == 1
+    assert stats["claimed"] == 2
+    assert stats["retried"] == 2
+
+    # Verify MAX cooldown active, Telegram cooldown NOT active
+    assert get_max_cooldown() is not None
+    assert get_max_cooldown() >= now + timedelta(seconds=30)
+    assert get_telegram_cooldown() is None
+
+    async with sqlite_session_factory() as session:
+        d1 = await session.get(EventDelivery, d1_id)
+        d2 = await session.get(EventDelivery, d2_id)
+
+        assert d1.status == "pending"
+        assert d1.claim_token is None
+        assert d1.next_attempt_at >= now + timedelta(seconds=30)
+
+        assert d2.status == "pending"
+        assert d2.claim_token is None
+        assert d2.claimed_at is None
+        assert d2.lease_until is None
+        assert d2.send_started_at is None
+        assert d2.next_attempt_at >= now + timedelta(seconds=30)
+
+    reset_cooldowns()
+
+
+@pytest.mark.asyncio
+async def test_immediate_dispatch_during_active_cooldown_does_not_call_transport(sqlite_session_factory):
+    """
+    Requirement (Blocker 4):
+    Immediate dispatch (/start path) during active platform cooldown:
+    - Does NOT call transport HTTP.
+    - Postpones delivery and updates next_attempt_at to cooldown deadline.
+    - Delivery remains durable pending in DB.
+    """
+    from event_delivery_worker import dispatch_immediate_delivery
+    reset_cooldowns()
+    now = datetime.utcnow()
+
+    # 1. Telegram test
+    user_tg = await _create_test_user(sqlite_session_factory, 6021)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "tg_imm_cd_ev")
+    reg_tg = await register_user_for_event(
+        sqlite_session_factory, user_tg, "tg_imm_cd_ev", platform="telegram", now=now
+    )
+    d_tg_id = reg_tg.immediate_delivery.id
+
+    # Active cooldown for Telegram until now + 60s
+    cd_until = now + timedelta(seconds=60)
+    set_telegram_cooldown(cd_until)
+
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+
+    res = await dispatch_immediate_delivery(
+        sqlite_session_factory, d_tg_id, bot=mock_bot, now=now
+    )
+    assert res == "cooldown_active:telegram"
+    assert mock_bot.send_message.call_count == 0
+
+    async with sqlite_session_factory() as session:
+        d_tg = await session.get(EventDelivery, d_tg_id)
+        assert d_tg.status == "pending"
+        assert d_tg.claim_token is None
+        assert d_tg.next_attempt_at >= cd_until
+
+    # 2. MAX test
+    user_max = await _create_test_user(sqlite_session_factory, MAX_ID_OFFSET + 6022)
+    reg_max = await register_user_for_event(
+        sqlite_session_factory, user_max, "tg_imm_cd_ev", platform="max", now=now
+    )
+    d_max_id = reg_max.immediate_delivery.id
+
+    cd_max_until = now + timedelta(seconds=45)
+    set_max_cooldown(cd_max_until)
+
+    mock_max = MagicMock()
+    mock_max.send_message = AsyncMock()
+
+    res_max = await dispatch_immediate_delivery(
+        sqlite_session_factory, d_max_id, max_client=mock_max, now=now
+    )
+    assert res_max == "cooldown_active:max"
+    assert mock_max.send_message.call_count == 0
+
+    async with sqlite_session_factory() as session:
+        d_max = await session.get(EventDelivery, d_max_id)
+        assert d_max.status == "pending"
+        assert d_max.claim_token is None
+        assert d_max.next_attempt_at >= cd_max_until
+
+    reset_cooldowns()
+
 
 
