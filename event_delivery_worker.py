@@ -45,7 +45,13 @@ from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
 from max_messenger_bot.keyboards import callback_button, inline_keyboard
 from max_messenger_bot.models import extract_sent_message_id
 
+class PreTransmissionError(Exception):
+    """Raised when an error occurs strictly before HTTP transport transmission begins."""
+    pass
+
+
 log = logging.getLogger(__name__)
+
 
 # Global platform cooldown trackers (MSK / UTC naive)
 _telegram_rate_limited_until: datetime | None = None
@@ -239,7 +245,11 @@ async def finalize_delivery_outcome(
             "lease_until": None,
             "updated_at": effective_now,
         }
+        if status == "pending":
+            values["send_started_at"] = None
+            values["claimed_at"] = None
         if sent_at is not None:
+
             values["sent_at"] = sent_at
         if finished_at is not None:
             values["finished_at"] = finished_at
@@ -517,24 +527,21 @@ async def process_single_delivery(
         )
         return "uncertain"
 
-    except Exception as exc:
-        # Check if pre-request connection error or unknown exception
-        err_str = str(exc)
-        if "connect" in err_str.lower() or "connection refused" in err_str.lower():
-            # Connection error before network transmission
-            log.warning("Delivery %s connection error (retryable): %s", delivery_id, exc)
-            await finalize_delivery_outcome(
-                session_maker,
-                delivery_id,
-                claim_token,
-                status="pending",
-                next_attempt_at=effective_now + timedelta(seconds=60),
-                last_error=err_str,
-                now=effective_now,
-            )
-            return "connection_error_retry"
+    except PreTransmissionError as exc:
+        log.warning("Delivery %s provable pre-transmission error (safe retry): %s", delivery_id, exc)
+        await finalize_delivery_outcome(
+            session_maker,
+            delivery_id,
+            claim_token,
+            status="pending",
+            next_attempt_at=effective_now + timedelta(seconds=60),
+            last_error=f"Pre-transmission error: {exc}",
+            now=effective_now,
+        )
+        return "pre_transmission_retry"
 
-        log.exception("Delivery %s encountered ambiguous error, marking uncertain: %s", delivery_id, exc)
+    except Exception as exc:
+        log.exception("Delivery %s encountered ambiguous error after send began, marking uncertain: %s", delivery_id, exc)
         await finalize_delivery_outcome(
             session_maker,
             delivery_id,
@@ -545,6 +552,7 @@ async def process_single_delivery(
             now=effective_now,
         )
         return "uncertain"
+
 
 
 async def run_event_delivery_worker_cycle(
@@ -609,3 +617,50 @@ async def run_event_delivery_worker_cycle(
             stats["rejected"] += 1
 
     return stats
+
+
+async def dispatch_immediate_delivery(
+    session_maker: async_sessionmaker[AsyncSession],
+    delivery_id: int,
+    *,
+    bot: Bot | None = None,
+    max_client: MaxApiClient | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """
+    Attempts to atomically claim and dispatch a specific pending delivery immediately
+    using the durable delivery worker protocol.
+    """
+    effective_now = now or datetime.utcnow()
+    token = secrets.token_hex(16)
+    lease_until = effective_now + timedelta(seconds=60)
+
+    async with session_maker() as session:
+        claim_stmt = (
+            update(EventDelivery)
+            .where(
+                EventDelivery.id == delivery_id,
+                EventDelivery.status == "pending",
+            )
+            .values(
+                status="claimed",
+                claim_token=token,
+                claimed_at=effective_now,
+                lease_until=lease_until,
+                updated_at=effective_now,
+            )
+        )
+        res = await session.execute(claim_stmt)
+        await session.commit()
+        if (res.rowcount or 0) == 0:
+            return None
+
+    return await process_single_delivery(
+        session_maker,
+        delivery_id=delivery_id,
+        claim_token=token,
+        bot=bot,
+        max_client=max_client,
+        now=effective_now,
+    )
+

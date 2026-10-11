@@ -28,6 +28,7 @@ from database import (
     create_event_delivery_force_retry,
 )
 from event_delivery_worker import (
+    PreTransmissionError,
     claim_pending_deliveries,
     finalize_delivery_outcome,
     process_single_delivery,
@@ -36,10 +37,12 @@ from event_delivery_worker import (
     run_event_delivery_worker_cycle,
 )
 from event_service import (
+    cancel_event_registration,
     prepare_and_lock_delivery_for_sending,
     register_user_for_event,
 )
 from max_messenger_bot.api import MaxApiError
+
 from max_messenger_bot.models import MAX_ID_OFFSET
 
 
@@ -562,27 +565,135 @@ async def test_timeout_post_request_transitions_to_uncertain(sqlite_session_fact
 
 
 @pytest.mark.asyncio
-async def test_pre_request_connection_error_is_retryable(sqlite_session_factory):
-    """Requirement E: Local connection error before transmission is safely returned to pending."""
+async def test_connection_reset_after_send_transitions_to_uncertain(sqlite_session_factory):
+    """Requirement 3: ConnectionResetError during transport call transitions to 'uncertain'."""
     user_id = await _create_test_user(sqlite_session_factory, 1015)
-    scen_id = await _create_test_scenario(sqlite_session_factory, "conn_ev")
-    await register_user_for_event(sqlite_session_factory, user_id, "conn_ev", platform="telegram")
+    await _create_test_scenario(sqlite_session_factory, "reset_ev")
+    await register_user_for_event(sqlite_session_factory, user_id, "reset_ev", platform="telegram")
 
     claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
     d_id, token = claimed[0]
 
     mock_bot = MagicMock()
-    mock_bot.send_message = AsyncMock(side_effect=ConnectionRefusedError("Connection refused to Telegram gateway"))
+    mock_bot.send_message = AsyncMock(side_effect=ConnectionResetError("Connection reset by peer"))
 
     outcome = await process_single_delivery(
         sqlite_session_factory, d_id, token, bot=mock_bot
     )
-    assert outcome == "connection_error_retry"
+    assert outcome == "uncertain"
+
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        assert d.status == "uncertain"
+        assert "Ambiguous" in d.last_error
+
+
+@pytest.mark.asyncio
+async def test_generic_network_exception_after_send_transitions_to_uncertain(sqlite_session_factory):
+    """Requirement 3: Generic network exception during transport call transitions to 'uncertain'."""
+    user_id = await _create_test_user(sqlite_session_factory, 1016)
+    await _create_test_scenario(sqlite_session_factory, "generic_net_ev")
+    await register_user_for_event(sqlite_session_factory, user_id, "generic_net_ev", platform="telegram")
+
+    claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    d_id, token = claimed[0]
+
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock(side_effect=RuntimeError("ClientConnectorError: Cannot connect to host"))
+
+    outcome = await process_single_delivery(
+        sqlite_session_factory, d_id, token, bot=mock_bot
+    )
+    assert outcome == "uncertain"
+
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        assert d.status == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_provable_pre_transmission_error_is_retryable(sqlite_session_factory):
+    """Requirement 3: Provable PreTransmissionError transitions safely to retryable 'pending'."""
+    user_id = await _create_test_user(sqlite_session_factory, 1017)
+    await _create_test_scenario(sqlite_session_factory, "pre_tx_ev")
+    await register_user_for_event(sqlite_session_factory, user_id, "pre_tx_ev", platform="telegram")
+
+    claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    d_id, token = claimed[0]
+
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock(side_effect=PreTransmissionError("Local credential loading failed before network"))
+
+    outcome = await process_single_delivery(
+        sqlite_session_factory, d_id, token, bot=mock_bot
+    )
+    assert outcome == "pre_transmission_retry"
 
     async with sqlite_session_factory() as session:
         d = await session.get(EventDelivery, d_id)
         assert d.status == "pending"
         assert d.next_attempt_at is not None
+        assert d.send_started_at is None
+        assert d.claim_token is None
+
+
+@pytest.mark.asyncio
+async def test_attempt_local_state_reset_after_rate_limit_retry(sqlite_session_factory):
+    """Requirement 4: 429 clears send_started_at so subsequent claim crash is recoverable by sweeper."""
+    user_id = await _create_test_user(sqlite_session_factory, 1018)
+    await _create_test_scenario(sqlite_session_factory, "rl_reset_ev")
+    await register_user_for_event(sqlite_session_factory, user_id, "rl_reset_ev", platform="telegram")
+
+    # 1. First claim and 429 send
+    claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    d_id, token = claimed[0]
+
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock(
+        side_effect=TelegramRetryAfter(method=MagicMock(), message="Rate limit", retry_after=1)
+    )
+    outcome = await process_single_delivery(sqlite_session_factory, d_id, token, bot=mock_bot)
+    assert outcome == "rate_limited"
+
+    # Verify attempt-local state is cleared
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        assert d.status == "pending"
+        assert d.send_started_at is None
+        assert d.claim_token is None
+        assert d.lease_until is None
+
+    # Clear rate limit cooldown and due time for re-claim
+    reset_cooldowns()
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        d.due_at = datetime.utcnow() - timedelta(seconds=5)
+        d.next_attempt_at = datetime.utcnow() - timedelta(seconds=5)
+        await session.commit()
+
+    # 2. Re-claim delivery
+    claimed2 = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    assert len(claimed2) == 1
+    d_id2, token2 = claimed2[0]
+    assert d_id2 == d_id
+
+    # 3. Simulate worker crash before PoNR (send_started_at remains None, lease expires)
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        assert d.status == "claimed"
+        assert d.send_started_at is None
+        d.lease_until = datetime.utcnow() - timedelta(seconds=10)
+        await session.commit()
+
+    # 4. Sweeper runs: must recover delivery to pending!
+    rec_c, rec_s = await recover_expired_leases(sqlite_session_factory)
+    assert rec_c == 1
+
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        assert d.status == "pending"
+        assert d.claim_token is None
+
 
 
 @pytest.mark.asyncio
@@ -718,3 +829,146 @@ async def test_real_postgresql_pre_send_lock_hierarchy_and_cas():
 
     finally:
         await pg_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_vs_worker_ponr_concurrency_sqlite(sqlite_session_factory):
+    """Requirement 2: Cancel vs Worker Point of No Return on SQLite.
+    If worker won PoNR (status='sending'), cancel does not overwrite to skipped.
+    If cancel won before PoNR, worker aborts pre-send and does not send.
+    """
+    user_id = await _create_test_user(sqlite_session_factory, 4001)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "ponr_sq_ev")
+
+    # --- Scenario A: Worker won PoNR ---
+    reg_res = await register_user_for_event(sqlite_session_factory, user_id, "ponr_sq_ev")
+    d_id = reg_res.immediate_delivery.id
+
+    claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    d_id_claimed, token = claimed[0]
+    assert d_id_claimed == d_id
+
+    # Worker executes pre-send and commits PoNR (status -> sending)
+    ok, _, _ = await prepare_and_lock_delivery_for_sending(
+        sqlite_session_factory,
+        delivery_id=d_id,
+        claim_token=token,
+        expected_content_version=1,
+        expected_step_version=None,
+        rendered_text="text",
+        template_text="text",
+    )
+    assert ok is True
+
+    # User concurrently triggers cancel
+    cancel_res = await cancel_event_registration(sqlite_session_factory, user_id, scen_id)
+    assert cancel_res.cancelled is True
+
+    # Delivery must STILL be in sending state (NOT skipped!)
+    async with sqlite_session_factory() as session:
+        d = await session.get(EventDelivery, d_id)
+        assert d.status == "sending"
+
+    # Worker finishes HTTP send and finalizes
+    fin = await finalize_delivery_outcome(
+        sqlite_session_factory, d_id, token, status="sent", external_message_id="msg_sq_1"
+    )
+    assert fin is True
+
+    async with sqlite_session_factory() as session:
+        reg = await session.get(EventRegistration, reg_res.registration.id)
+        d = await session.get(EventDelivery, d_id)
+        assert reg.status == "cancelled"
+        assert d.status == "sent"
+
+    # --- Scenario B: Cancel won before PoNR ---
+    user_id2 = await _create_test_user(sqlite_session_factory, 4002)
+    reg_res2 = await register_user_for_event(sqlite_session_factory, user_id2, "ponr_sq_ev")
+    d_id2 = reg_res2.immediate_delivery.id
+
+    claimed2 = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    d_id2_claimed, token2 = claimed2[0]
+    assert d_id2_claimed == d_id2
+
+    # Cancel runs BEFORE worker pre-send
+    await cancel_event_registration(sqlite_session_factory, user_id2, scen_id)
+
+    # Worker attempts pre-send
+    ok2, _, reason2 = await prepare_and_lock_delivery_for_sending(
+        sqlite_session_factory,
+        delivery_id=d_id2,
+        claim_token=token2,
+        expected_content_version=1,
+        expected_step_version=None,
+        rendered_text="text",
+        template_text="text",
+    )
+    assert ok2 is False
+    assert "cancelled" in str(reason2) or "mismatch" in str(reason2) or "stale_or_invalid_claim" in str(reason2)
+
+
+
+@pytest.mark.asyncio
+async def test_cancel_vs_worker_ponr_concurrency_postgresql():
+    """Requirement 2: Cancel vs Worker Point of No Return on real PostgreSQL."""
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
+
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
+
+        sessions = async_sessionmaker(pg_engine, expire_on_commit=False)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(database, "engine", pg_engine)
+            mp.setattr(database, "async_session_maker", sessions)
+            await database.init_db()
+
+        user_id = await _create_test_user(sessions, 4011)
+        scen_id = await _create_test_scenario(sessions, "ponr_pg_ev")
+
+        # --- Worker won PoNR on PostgreSQL ---
+        reg_res = await register_user_for_event(sessions, user_id, "ponr_pg_ev")
+        d_id = reg_res.immediate_delivery.id
+
+        claimed = await claim_pending_deliveries(sessions, batch_size=10)
+        assert len(claimed) == 1
+        d_id_claimed, token = claimed[0]
+
+        ok, _, _ = await prepare_and_lock_delivery_for_sending(
+            sessions,
+            delivery_id=d_id,
+            claim_token=token,
+            expected_content_version=1,
+            expected_step_version=None,
+            rendered_text="PG text",
+            template_text="PG text",
+        )
+        assert ok is True
+
+        # User cancels concurrently
+        cancel_res = await cancel_event_registration(sessions, user_id, scen_id)
+        assert cancel_res.cancelled is True
+
+        # Check delivery was NOT converted to skipped
+        async with sessions() as session:
+            d = await session.get(EventDelivery, d_id)
+            assert d.status == "sending"
+
+        # Finalize send on PostgreSQL
+        fin = await finalize_delivery_outcome(
+            sessions, d_id, token, status="sent", external_message_id="pg_ponr_msg"
+        )
+        assert fin is True
+
+        async with sessions() as session:
+            reg = await session.get(EventRegistration, reg_res.registration.id)
+            d = await session.get(EventDelivery, d_id)
+            assert reg.status == "cancelled"
+            assert d.status == "sent"
+
+    finally:
+        await pg_engine.dispose()
+

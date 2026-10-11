@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import selectinload
 
 from database import (

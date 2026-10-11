@@ -163,21 +163,26 @@ async def run_user_transaction(
         for attempt in range(max_retries):
             session = session_maker()
             try:
-                async with session.begin():
-                    bind = session.get_bind()
-                    dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
-                    is_postgres = dialect_name == "postgresql"
+                bind = session.get_bind()
+                dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+                is_postgres = dialect_name == "postgresql"
 
-                    stmt = select(User).where(User.id == user_id)
-                    if is_postgres:
-                        stmt = stmt.with_for_update()
+                if not is_postgres:
+                    await session.execute(text("BEGIN IMMEDIATE"))
+                else:
+                    await session.begin()
 
-                    user = await session.scalar(stmt)
-                    if user is None:
-                        raise ValueError(f"Пользователь {user_id} не найден")
+                stmt = select(User).where(User.id == user_id)
+                if is_postgres:
+                    stmt = stmt.with_for_update()
 
-                    result = await operation_fn(session, user)
-                    return result
+                user = await session.scalar(stmt)
+                if user is None:
+                    raise ValueError(f"Пользователь {user_id} не найден")
+
+                result = await operation_fn(session, user)
+                await session.commit()
+                return result
 
             except (OperationalError, DBAPIError) as exc:
                 if is_sqlite_busy_exception(exc) and attempt < max_retries - 1:
@@ -195,6 +200,7 @@ async def run_user_transaction(
                 raise
             finally:
                 await session.close()
+
 
         raise RuntimeError(f"Exceeded max retries for user_id={user_id}")
 
@@ -310,10 +316,11 @@ async def register_user_for_event(
     session_maker: async_sessionmaker[AsyncSession],
     user_id: int,
     event_code: str,
-    platform: str,
+    platform: str = "telegram",
     *,
     now: datetime | None = None,
 ) -> RegistrationResult:
+
     """
     Registers user for an event scenario.
 
@@ -327,10 +334,13 @@ async def register_user_for_event(
     norm_code = event_code.strip().lower()
 
     async def _op(session: AsyncSession, user: User) -> RegistrationResult:
-        # 1. Level 3: EventScenario FOR SHARE / FOR UPDATE
-        scenario = await session.scalar(
-            select(EventScenario).where(EventScenario.code == norm_code)
-        )
+        # 1. Level 3: EventScenario FOR SHARE
+        is_pg = session.bind and session.bind.dialect.name == "postgresql"
+        scen_stmt = select(EventScenario).where(EventScenario.code == norm_code)
+        if is_pg:
+            scen_stmt = scen_stmt.with_for_update(read=True)
+        scenario = await session.scalar(scen_stmt)
+
         if scenario is None or scenario.is_archived:
             return RegistrationResult(
                 status="scenario_not_found",
@@ -360,14 +370,14 @@ async def register_user_for_event(
                 immediate_delivery=None,
             )
 
-        # 2. Level 4: Check existing registration
-        reg = await session.scalar(
-            select(EventRegistration)
-            .where(
-                EventRegistration.event_id == scenario.id,
-                EventRegistration.user_id == user.id,
-            )
+        # 2. Level 4: Check existing registration FOR UPDATE
+        reg_stmt = select(EventRegistration).where(
+            EventRegistration.event_id == scenario.id,
+            EventRegistration.user_id == user.id,
         )
+        if is_pg:
+            reg_stmt = reg_stmt.with_for_update()
+        reg = await session.scalar(reg_stmt)
 
         if reg is not None and reg.status == "started":
             # Already actively registered: idempotent return, no duplicate delivery or gen increment
@@ -392,26 +402,44 @@ async def register_user_for_event(
             reg.rejoined_at = effective_now
             reg.cancelled_at = None
 
-            cancelled_deliveries = (
-                await session.execute(
-                    select(EventDelivery).where(
-                        EventDelivery.registration_id == reg.id,
-                        EventDelivery.status == "skipped",
-                        EventDelivery.skip_reason == "cancelled",
-                    )
-                )
-            ).scalars().all()
+            # Level 6: Deliveries FOR UPDATE
+            deliv_stmt = select(EventDelivery).where(
+                EventDelivery.registration_id == reg.id,
+                EventDelivery.status == "skipped",
+                EventDelivery.skip_reason == "cancelled",
+            )
+            if is_pg:
+                deliv_stmt = deliv_stmt.with_for_update()
+            cancelled_deliveries = (await session.execute(deliv_stmt)).scalars().all()
 
             if target_mode == "standard":
                 for d in cancelled_deliveries:
                     if d.message_kind == "scheduled_step":
-                        if d.due_at > effective_now:
+                        if d.step_id:
+                            step_stmt = select(EventStep).where(EventStep.id == d.step_id)
+                            if is_pg:
+                                step_stmt = step_stmt.with_for_update(read=True)
+                            step = await session.scalar(step_stmt)
+                            if step is None or step.is_archived:
+                                d.status = "skipped"
+                                d.skip_reason = "step_archived"
+                                continue
+                            new_due = scenario.starts_at + timedelta(minutes=step.offset_minutes)
+                            if new_due <= effective_now:
+                                d.status = "skipped"
+                                d.skip_reason = "late_registration"
+                                continue
+                            d.due_at = new_due
+                            d.next_attempt_at = new_due
+                            d.schedule_revision = scenario.schedule_revision
+                            d.registration_generation = new_gen
                             d.status = "pending"
                             d.skip_reason = None
-                            d.registration_generation = new_gen
-                            d.next_attempt_at = d.due_at
                             d.claim_token = None
                             d.lease_until = None
+                            d.send_started_at = None
+                            d.claimed_at = None
+                            d.updated_at = effective_now
 
                 confirm_key = f"ev:{scenario.id}:reg:{reg.id}:gen:{new_gen}:kind:immediate_confirmation:r0"
                 imm = EventDelivery(
@@ -460,7 +488,8 @@ async def register_user_for_event(
                 "type": "event_scenario",
                 "scenario_id": scenario.id,
                 "code": scenario.code,
-                "status": "rejoined",
+                "status": "started",
+                "action": "rejoined",
                 "generation": new_gen,
                 "timestamp": effective_now.isoformat(),
             }
@@ -489,13 +518,15 @@ async def register_user_for_event(
         session.add(reg)
         await session.flush()
 
-        steps = (
-            await session.execute(
-                select(EventStep)
-                .where(EventStep.event_id == scenario.id, EventStep.is_archived.is_(False))
-                .order_by(EventStep.offset_minutes.asc(), EventStep.sort_order.asc(), EventStep.id.asc())
-            )
-        ).scalars().all()
+        steps_stmt = (
+            select(EventStep)
+            .where(EventStep.event_id == scenario.id, EventStep.is_archived.is_(False))
+            .order_by(EventStep.offset_minutes.asc(), EventStep.sort_order.asc(), EventStep.id.asc())
+        )
+        if is_pg:
+            steps_stmt = steps_stmt.with_for_update(read=True)
+        steps = (await session.execute(steps_stmt)).scalars().all()
+
 
         if target_mode == "standard":
             confirm_key = f"ev:{scenario.id}:reg:{reg.id}:gen:1:kind:immediate_confirmation:r0"
@@ -632,16 +663,21 @@ async def cancel_event_registration(
     effective_now = now or datetime.utcnow()
 
     async def _op(session: AsyncSession, user: User) -> CancelResult:
-        scenario = await session.get(EventScenario, event_id)
+        is_pg = session.bind and session.bind.dialect.name == "postgresql"
+        scen_stmt = select(EventScenario).where(EventScenario.id == event_id)
+        if is_pg:
+            scen_stmt = scen_stmt.with_for_update(read=True)
+        scenario = await session.scalar(scen_stmt)
         if scenario is None:
             raise ValueError(f"Мероприятие {event_id} не найдено")
 
-        reg = await session.scalar(
-            select(EventRegistration).where(
-                EventRegistration.event_id == event_id,
-                EventRegistration.user_id == user.id,
-            )
+        reg_stmt = select(EventRegistration).where(
+            EventRegistration.event_id == event_id,
+            EventRegistration.user_id == user.id,
         )
+        if is_pg:
+            reg_stmt = reg_stmt.with_for_update()
+        reg = await session.scalar(reg_stmt)
         if reg is None:
             raise ValueError(f"Регистрация на мероприятие {event_id} не найдена")
 
@@ -651,21 +687,25 @@ async def cancel_event_registration(
         reg.status = "cancelled"
         reg.cancelled_at = effective_now
 
-        cancellable_deliveries = (
-            await session.execute(
-                select(EventDelivery).where(
-                    EventDelivery.registration_id == reg.id,
-                    EventDelivery.registration_generation == reg.generation,
-                    EventDelivery.status.in_(["pending", "claimed"]),
-                )
-            )
-        ).scalars().all()
+        deliv_stmt = select(EventDelivery).where(
+            EventDelivery.registration_id == reg.id,
+            EventDelivery.registration_generation == reg.generation,
+            EventDelivery.status.in_(["pending", "claimed"]),
+        )
+        if is_pg:
+            deliv_stmt = deliv_stmt.with_for_update()
+        cancellable_deliveries = (await session.execute(deliv_stmt)).scalars().all()
 
         for d in cancellable_deliveries:
-            d.status = "skipped"
-            d.skip_reason = "cancelled"
-            d.claim_token = None
-            d.lease_until = None
+            if d.status in ("pending", "claimed"):
+                d.status = "skipped"
+                d.skip_reason = "cancelled"
+                d.claim_token = None
+                d.lease_until = None
+                d.send_started_at = None
+                d.claimed_at = None
+                d.updated_at = effective_now
+
 
         cancel_payload = {
             "type": "event_scenario",
@@ -709,10 +749,12 @@ async def rejoin_event_registration(
     target_platform = platform or ("max" if is_max_user_id(user_id) else "telegram")
 
     async def _op(session: AsyncSession, user: User) -> RejoinResult:
-        # 1. Level 3: EventScenario FOR UPDATE
-        scenario = await session.scalar(
-            select(EventScenario).where(EventScenario.id == event_id).with_for_update()
-        )
+        is_pg = session.bind and session.bind.dialect.name == "postgresql"
+        # 1. Level 3: EventScenario FOR SHARE
+        scen_stmt = select(EventScenario).where(EventScenario.id == event_id)
+        if is_pg:
+            scen_stmt = scen_stmt.with_for_update(read=True)
+        scenario = await session.scalar(scen_stmt)
         if scenario is None or scenario.is_archived:
             raise ValueError("Сценарий не найден либо находится в архиве")
 
@@ -722,11 +764,13 @@ async def rejoin_event_registration(
             raise ValueError("Мероприятие уже завершено")
 
         # 2. Level 4: EventRegistration FOR UPDATE
-        reg = await session.scalar(
-            select(EventRegistration)
-            .where(EventRegistration.event_id == event_id, EventRegistration.user_id == user.id)
-            .with_for_update()
+        reg_stmt = select(EventRegistration).where(
+            EventRegistration.event_id == event_id,
+            EventRegistration.user_id == user.id,
         )
+        if is_pg:
+            reg_stmt = reg_stmt.with_for_update()
+        reg = await session.scalar(reg_stmt)
         if reg is None or reg.status != "cancelled":
             raise ValueError("Регистрация не найдена либо уже активна")
 
@@ -741,28 +785,43 @@ async def rejoin_event_registration(
         reg.registration_mode = new_mode
 
         # 3. Level 6: EventDelivery FOR UPDATE
-        cancelled_deliveries = (
-            await session.execute(
-                select(EventDelivery)
-                .where(
-                    EventDelivery.registration_id == reg.id,
-                    EventDelivery.status == "skipped",
-                    EventDelivery.skip_reason == "cancelled",
-                )
-                .with_for_update()
-            )
-        ).scalars().all()
+        deliv_stmt = select(EventDelivery).where(
+            EventDelivery.registration_id == reg.id,
+            EventDelivery.status == "skipped",
+            EventDelivery.skip_reason == "cancelled",
+        )
+        if is_pg:
+            deliv_stmt = deliv_stmt.with_for_update()
+        cancelled_deliveries = (await session.execute(deliv_stmt)).scalars().all()
 
         if new_mode == "standard":
             for d in cancelled_deliveries:
                 if d.message_kind == "scheduled_step":
-                    if d.due_at > effective_now:
+                    if d.step_id:
+                        step_stmt = select(EventStep).where(EventStep.id == d.step_id)
+                        if is_pg:
+                            step_stmt = step_stmt.with_for_update(read=True)
+                        step = await session.scalar(step_stmt)
+                        if step is None or step.is_archived:
+                            d.status = "skipped"
+                            d.skip_reason = "step_archived"
+                            continue
+                        new_due = scenario.starts_at + timedelta(minutes=step.offset_minutes)
+                        if new_due <= effective_now:
+                            d.status = "skipped"
+                            d.skip_reason = "late_registration"
+                            continue
+                        d.due_at = new_due
+                        d.next_attempt_at = new_due
+                        d.schedule_revision = scenario.schedule_revision
+                        d.registration_generation = new_gen
                         d.status = "pending"
                         d.skip_reason = None
-                        d.registration_generation = new_gen
-                        d.next_attempt_at = d.due_at
                         d.claim_token = None
                         d.lease_until = None
+                        d.send_started_at = None
+                        d.claimed_at = None
+                        d.updated_at = effective_now
 
             confirm_key = f"ev:{event_id}:reg:{reg.id}:gen:{new_gen}:kind:immediate_confirmation:r0"
             imm = EventDelivery(
@@ -811,7 +870,8 @@ async def rejoin_event_registration(
             "type": "event_scenario",
             "scenario_id": event_id,
             "code": scenario.code,
-            "status": "rejoined",
+            "status": "started",
+            "action": "rejoined",
             "generation": new_gen,
             "timestamp": effective_now.isoformat(),
         }
@@ -820,6 +880,7 @@ async def rejoin_event_registration(
             user,
             [{"data": rejoin_payload, "raw_json": json.dumps(rejoin_payload, ensure_ascii=False)}],
         )
+
 
         return RejoinResult(
             registration_id=reg.id,
@@ -851,46 +912,59 @@ async def reschedule_event(
     - Rejects reschedule into completely past window (new_starts_at + duration <= now).
     """
     effective_now = now or datetime.utcnow()
+    max_retries = 5
 
-    async with session_maker() as session:
-        # 1. Level 3: EventScenario FOR UPDATE
-        scenario = await session.get(EventScenario, event_id, with_for_update=True)
-        if scenario is None or scenario.is_archived:
-            raise ValueError(f"Сценарий {event_id} не найден либо архивирован")
+    for attempt in range(max_retries):
+        session = session_maker()
+        try:
+            bind = session.get_bind()
+            dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+            is_postgres = dialect_name == "postgresql"
 
-        duration = timedelta(minutes=scenario.duration_minutes)
-        end_time = new_starts_at + duration
-        if end_time <= effective_now:
-            raise ValueError("Нельзя перенести мероприятие на время, которое уже полностью завершилось")
+            if not is_postgres:
+                await session.execute(text("BEGIN IMMEDIATE"))
+            else:
+                await session.begin()
 
-        scenario.starts_at = new_starts_at
-        scenario.schedule_revision += 1
-        scenario.content_version += 1
-        new_rev = scenario.schedule_revision
+            # 1. Level 3: EventScenario FOR UPDATE
+            scen_stmt = select(EventScenario).where(EventScenario.id == event_id)
+            if is_postgres:
+                scen_stmt = scen_stmt.with_for_update()
+            scenario = await session.scalar(scen_stmt)
+            if scenario is None or scenario.is_archived:
+                raise ValueError(f"Сценарий {event_id} не найден либо архивирован")
 
-        steps = (
-            await session.execute(
-                select(EventStep).where(EventStep.event_id == event_id)
+            duration = timedelta(minutes=scenario.duration_minutes)
+            end_time = new_starts_at + duration
+            if end_time <= effective_now:
+                raise ValueError("Нельзя перенести мероприятие на время, которое уже полностью завершилось")
+
+            scenario.starts_at = new_starts_at
+            scenario.schedule_revision += 1
+            scenario.content_version += 1
+            new_rev = scenario.schedule_revision
+
+            # 2. Level 4: Active registrations FOR UPDATE
+            reg_stmt = select(EventRegistration).where(
+                EventRegistration.event_id == event_id,
+                EventRegistration.status == "started",
             )
-        ).scalars().all()
-        step_offsets = {step.id: step.offset_minutes for step in steps}
+            if is_postgres:
+                reg_stmt = reg_stmt.with_for_update()
+            registrations = (await session.execute(reg_stmt)).scalars().all()
+            reg_map = {reg.id: reg for reg in registrations}
+            reg_ids = list(reg_map.keys())
 
-        # 2. Level 4: Active registrations
-        registrations = (
-            await session.execute(
-                select(EventRegistration).where(
-                    EventRegistration.event_id == event_id,
-                    EventRegistration.status == "started",
-                )
-            )
-        ).scalars().all()
-        reg_map = {reg.id: reg for reg in registrations}
-        reg_ids = list(reg_map.keys())
+            # 3. Level 5: Steps FOR SHARE
+            steps_stmt = select(EventStep).where(EventStep.event_id == event_id)
+            if is_postgres:
+                steps_stmt = steps_stmt.with_for_update(read=True)
+            steps = (await session.execute(steps_stmt)).scalars().all()
+            step_offsets = {step.id: step.offset_minutes for step in steps}
 
-        if reg_ids:
-            # 3. Level 6: EventDeliveries for active registrations
-            deliveries = (
-                await session.execute(
+            if reg_ids:
+                # 4. Level 6: EventDeliveries for active registrations FOR UPDATE
+                deliv_stmt = (
                     select(EventDelivery)
                     .where(
                         EventDelivery.event_id == event_id,
@@ -905,77 +979,68 @@ async def reschedule_event(
                             ),
                         ),
                     )
-                    .with_for_update()
                 )
-            ).scalars().all()
+                if is_postgres:
+                    deliv_stmt = deliv_stmt.with_for_update()
+                deliveries = (await session.execute(deliv_stmt)).scalars().all()
 
-            for d in deliveries:
-                if d.status == "claimed":
-                    d.status = "pending"
-                    d.claim_token = None
-                    d.lease_until = None
+                for d in deliveries:
+                    if d.status == "claimed":
+                        d.status = "pending"
+                        d.claim_token = None
+                        d.lease_until = None
+                        d.send_started_at = None
+                        d.claimed_at = None
 
-                if d.message_kind in ("reschedule_notice", "immediate_live"):
-                    # Stale notices and live links are invalidated, preserving their original revision
-                    d.status = "skipped"
-                    d.skip_reason = "rescheduled_past"
-                    d.claim_token = None
-                    d.lease_until = None
-
-                elif d.message_kind == "immediate_confirmation":
-                    d.expires_at = end_time
-                    d.schedule_revision = new_rev
-                    if d.status == "skipped" and d.skip_reason == "expired":
-                        if end_time > effective_now:
-                            d.status = "pending"
-                            d.skip_reason = None
-
-                elif d.step_id is not None:
-                    reg = reg_map.get(d.registration_id)
-                    if reg and reg.registration_mode == "urgent_late":
-                        # Urgent late registrations keep steps suppressed
-                        continue
-
-                    offset = step_offsets.get(d.step_id, 0)
-                    new_due_at = new_starts_at + timedelta(minutes=offset)
-                    d.due_at = new_due_at
-                    d.next_attempt_at = new_due_at
-                    d.schedule_revision = new_rev
-
-                    if new_due_at <= effective_now:
+                    if d.message_kind in ("reschedule_notice", "immediate_live"):
+                        # Stale notices and live links are invalidated, preserving their original revision
                         d.status = "skipped"
                         d.skip_reason = "rescheduled_past"
-                    else:
-                        d.status = "pending"
-                        d.skip_reason = None
+                        d.claim_token = None
+                        d.lease_until = None
+                        d.send_started_at = None
+                        d.claimed_at = None
 
-        # 4. Create up-to-date notices for each active registration
-        for reg in registrations:
-            reg_platform = "max" if is_max_user_id(reg.user_id) else "telegram"
+                    elif d.message_kind == "immediate_confirmation":
+                        d.expires_at = end_time
+                        d.schedule_revision = new_rev
+                        if d.status == "skipped" and d.skip_reason == "expired":
+                            if end_time > effective_now:
+                                d.status = "pending"
+                                d.skip_reason = None
+                                d.claim_token = None
+                                d.lease_until = None
+                                d.send_started_at = None
+                                d.claimed_at = None
 
-            notice_key = f"ev:{event_id}:reg:{reg.id}:gen:{reg.generation}:rev:{new_rev}:kind:reschedule_notice:r0"
-            session.add(
-                EventDelivery(
-                    event_id=event_id,
-                    user_id=reg.user_id,
-                    registration_id=reg.id,
-                    step_id=None,
-                    retry_index=0,
-                    message_kind="reschedule_notice",
-                    delivery_key=notice_key,
-                    due_at=effective_now,
-                    next_attempt_at=effective_now,
-                    expires_at=end_time,
-                    schedule_revision=new_rev,
-                    registration_generation=reg.generation,
-                    platform=reg_platform,
-                    status="pending",
-                )
-            )
+                    elif d.step_id is not None:
+                        reg = reg_map.get(d.registration_id)
+                        if reg and reg.registration_mode == "urgent_late":
+                            # Urgent late registrations keep steps suppressed
+                            continue
 
-            if reg.registration_mode == "urgent_late":
-                live_key = f"ev:{event_id}:reg:{reg.id}:gen:{reg.generation}:rev:{new_rev}:kind:immediate_live:r0"
-                live_due_at = max(effective_now, new_starts_at - timedelta(minutes=15))
+                        offset = step_offsets.get(d.step_id, 0)
+                        new_due_at = new_starts_at + timedelta(minutes=offset)
+                        d.due_at = new_due_at
+                        d.next_attempt_at = new_due_at
+                        d.schedule_revision = new_rev
+
+                        if new_due_at <= effective_now:
+                            d.status = "skipped"
+                            d.skip_reason = "rescheduled_past"
+                        else:
+                            d.status = "pending"
+                            d.skip_reason = None
+                            d.claim_token = None
+                            d.lease_until = None
+                            d.send_started_at = None
+                            d.claimed_at = None
+
+            # 5. Create up-to-date notices for each active registration
+            for reg in registrations:
+                reg_platform = "max" if is_max_user_id(reg.user_id) else "telegram"
+
+                notice_key = f"ev:{event_id}:reg:{reg.id}:gen:{reg.generation}:rev:{new_rev}:kind:reschedule_notice:r0"
                 session.add(
                     EventDelivery(
                         event_id=event_id,
@@ -983,10 +1048,10 @@ async def reschedule_event(
                         registration_id=reg.id,
                         step_id=None,
                         retry_index=0,
-                        message_kind="immediate_live",
-                        delivery_key=live_key,
-                        due_at=live_due_at,
-                        next_attempt_at=live_due_at,
+                        message_kind="reschedule_notice",
+                        delivery_key=notice_key,
+                        due_at=effective_now,
+                        next_attempt_at=effective_now,
                         expires_at=end_time,
                         schedule_revision=new_rev,
                         registration_generation=reg.generation,
@@ -995,13 +1060,52 @@ async def reschedule_event(
                     )
                 )
 
-        await session.commit()
-        return RescheduleResult(
-            event_id=event_id,
-            new_starts_at=new_starts_at,
-            schedule_revision=new_rev,
-            registrations_count=len(registrations),
-        )
+                if reg.registration_mode == "urgent_late":
+                    live_key = f"ev:{event_id}:reg:{reg.id}:gen:{reg.generation}:rev:{new_rev}:kind:immediate_live:r0"
+                    live_due_at = max(effective_now, new_starts_at - timedelta(minutes=15))
+                    session.add(
+                        EventDelivery(
+                            event_id=event_id,
+                            user_id=reg.user_id,
+                            registration_id=reg.id,
+                            step_id=None,
+                            retry_index=0,
+                            message_kind="immediate_live",
+                            delivery_key=live_key,
+                            due_at=live_due_at,
+                            next_attempt_at=live_due_at,
+                            expires_at=end_time,
+                            schedule_revision=new_rev,
+                            registration_generation=reg.generation,
+                            platform=reg_platform,
+                            status="pending",
+                        )
+                    )
+
+            await session.commit()
+            return RescheduleResult(
+                event_id=event_id,
+                new_starts_at=new_starts_at,
+                schedule_revision=new_rev,
+                registrations_count=len(registrations),
+            )
+
+        except (OperationalError, DBAPIError) as exc:
+            if is_sqlite_busy_exception(exc) and attempt < max_retries - 1:
+                log.warning("SQLite busy during reschedule_event (attempt %s), retrying: %s", attempt + 1, exc)
+                await session.rollback()
+                await asyncio.sleep(0.05 * (2 ** attempt))
+                continue
+            await session.rollback()
+            raise
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+    raise RuntimeError(f"Exceeded max retries for reschedule_event(event_id={event_id})")
+
 
 
 async def prepare_and_lock_delivery_for_sending(
@@ -1297,24 +1401,18 @@ async def handle_event_start_telegram(
         return True
 
     if reg_res.status in ("registered", "rejoined"):
-        prefix = "Вы успешно зарегистрированы" if reg_res.status == "registered" else "Вы возобновили участие в"
-        if reg_res.mode == "urgent_late":
-            text_body = (
-                f"{prefix} мероприятии «{scen.title}»!\n\n"
-                f"Мероприятие скоро начнётся или уже в эфире!\n"
-                f"🔗 Ссылка для подключения: {scen.link or scen.place}"
+        if reg_res.immediate_delivery:
+            from event_delivery_worker import dispatch_immediate_delivery
+            await dispatch_immediate_delivery(
+                sm,
+                reg_res.immediate_delivery.id,
+                bot=bot,
+                now=effective_now,
             )
-        else:
-            text_body = (
-                f"{prefix} мероприятии «{scen.title}»!\n\n"
-                f"📅 Дата: {format_msk(scen.starts_at, '%d.%m.%Y')}\n"
-                f"⏰ Время: {format_msk(scen.starts_at, '%H:%M')} (МСК)\n\n"
-                f"Мы пришлем вам напоминания перед началом."
-            )
-        await bot.send_message(chat_id=chat_id, text=text_body, parse_mode="HTML", reply_markup=markup)
         return True
 
     return False
+
 
 
 async def handle_event_callback_telegram(
@@ -1451,24 +1549,18 @@ async def handle_event_start_max(
         return True
 
     if reg_res.status in ("registered", "rejoined"):
-        prefix = "Вы успешно зарегистрированы" if reg_res.status == "registered" else "Вы возобновили участие в"
-        if reg_res.mode == "urgent_late":
-            text_body = (
-                f"{prefix} мероприятии «{scen.title}»!\n\n"
-                f"Мероприятие скоро начнётся или уже в эфире!\n"
-                f"🔗 Ссылка для подключения: {scen.link or scen.place}"
+        if reg_res.immediate_delivery:
+            from event_delivery_worker import dispatch_immediate_delivery
+            await dispatch_immediate_delivery(
+                sm,
+                reg_res.immediate_delivery.id,
+                max_client=client,
+                now=effective_now,
             )
-        else:
-            text_body = (
-                f"{prefix} мероприятии «{scen.title}»!\n\n"
-                f"📅 Дата: {format_msk(scen.starts_at, '%d.%m.%Y')}\n"
-                f"⏰ Время: {format_msk(scen.starts_at, '%H:%M')} (МСК)\n\n"
-                f"Мы пришлем вам напоминания перед началом."
-            )
-        await client.send_message(chat_id=chat_id, text=text_body, attachments=attachments)
         return True
 
     return False
+
 
 
 async def handle_event_callback_max(

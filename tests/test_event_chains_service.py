@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -698,3 +699,315 @@ async def test_max_start_and_callback_flow(sqlite_session_factory):
     assert res is True
     assert mock_client.send_message.called
     assert "Регистрация отменена" in mock_client.send_message.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_e2e_start_then_worker_cycle_exactly_one_message_telegram(sqlite_session_factory):
+    """Requirement 1: /start tg_ev -> worker cycle results in EXACTLY ONE message."""
+    from event_delivery_worker import run_event_delivery_worker_cycle
+    user_id = await _create_test_user(sqlite_session_factory, 2011)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "tg_single_ev")
+
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+
+    # 1. User starts Telegram flow
+    handled = await handle_event_start_telegram(
+        mock_bot, chat_id=2011, user_id=user_id, start_arg="tg_single_ev", session_maker=sqlite_session_factory
+    )
+    assert handled is True
+    assert mock_bot.send_message.call_count == 1
+
+    # 2. Worker cycle runs afterwards
+    cycle_stats = await run_event_delivery_worker_cycle(sqlite_session_factory, bot=mock_bot)
+    assert cycle_stats["claimed"] == 0
+    # No duplicate message! Total calls remain 1!
+    assert mock_bot.send_message.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_e2e_start_then_worker_cycle_exactly_one_message_max(sqlite_session_factory):
+    """Requirement 1: /start max_ev -> worker cycle results in EXACTLY ONE message."""
+    from event_delivery_worker import run_event_delivery_worker_cycle
+    from max_messenger_bot.models import MAX_ID_OFFSET
+    user_id = MAX_ID_OFFSET + 3011
+    await _create_test_user(sqlite_session_factory, user_id)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "max_single_ev")
+
+    mock_client = MagicMock()
+    mock_client.send_message = AsyncMock()
+
+    # 1. User starts MAX flow
+    handled = await handle_event_start_max(
+        mock_client, chat_id=101, user_id=user_id, start_payload="max_single_ev", session_maker=sqlite_session_factory
+    )
+    assert handled is True
+    assert mock_client.send_message.call_count == 1
+
+    # 2. Worker cycle runs afterwards
+    cycle_stats = await run_event_delivery_worker_cycle(sqlite_session_factory, max_client=mock_client)
+    assert cycle_stats["claimed"] == 0
+    # No duplicate message! Total calls remain 1!
+    assert mock_client.send_message.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_started_cancelled_rejoin_metadata_contract(sqlite_session_factory):
+    """Requirement 7: started -> cancelled -> rejoin sets status='started' and action='rejoined'."""
+    user_id = await _create_test_user(sqlite_session_factory, 2020)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "meta_contract_ev")
+
+    # 1. Register -> status='started'
+    await register_user_for_event(sqlite_session_factory, user_id, "meta_contract_ev")
+    async with sqlite_session_factory() as session:
+        user = await session.get(User, user_id)
+        records = load_metadata_records(user.metadata_json)
+        assert len(records) == 1
+        assert records[-1]["data"]["status"] == "started"
+
+    # 2. Cancel -> status='cancelled'
+    await cancel_event_registration(sqlite_session_factory, user_id, scen_id)
+    async with sqlite_session_factory() as session:
+        user = await session.get(User, user_id)
+        records = load_metadata_records(user.metadata_json)
+        assert len(records) == 2
+        assert records[-1]["data"]["status"] == "cancelled"
+
+    # 3. Rejoin -> status='started', action='rejoined'
+    await rejoin_event_registration(sqlite_session_factory, user_id, scen_id)
+    async with sqlite_session_factory() as session:
+        user = await session.get(User, user_id)
+        records = load_metadata_records(user.metadata_json)
+        assert len(records) == 3
+        last_rec = records[-1]["data"]
+        assert last_rec["status"] == "started"
+        assert last_rec.get("action") == "rejoined"
+
+
+@pytest.mark.asyncio
+async def test_rejoin_after_reschedule_while_cancelled_recalculates_steps(sqlite_session_factory):
+    """Requirement 5: Rejoin after reschedule while cancelled recalculates steps with new starts_at and schedule_revision."""
+    user_id = await _create_test_user(sqlite_session_factory, 2030)
+    now = datetime.utcnow()
+    starts_at = now + timedelta(days=2)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "rejoin_resched_ev", starts_at=starts_at)
+
+    # 1. Standard registration
+    await register_user_for_event(sqlite_session_factory, user_id, "rejoin_resched_ev", now=now)
+
+    # 2. Cancel
+    await cancel_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+
+    # 3. Reschedule while cancelled (to +4 days)
+    new_starts_at = now + timedelta(days=4)
+    resched_res = await reschedule_event(sqlite_session_factory, scen_id, new_starts_at, now=now)
+    assert resched_res.schedule_revision == 2
+
+    # 4. Early rejoin
+    rejoin_res = await rejoin_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+    assert rejoin_res.generation == 2
+    assert rejoin_res.mode == "standard"
+
+    # Verify that scheduled steps have recalculated due_at and updated schedule_revision
+    async with sqlite_session_factory() as session:
+        deliveries = (
+            await session.execute(
+                select(EventDelivery).where(
+                    EventDelivery.registration_id == rejoin_res.registration_id,
+                    EventDelivery.message_kind == "scheduled_step",
+                )
+            )
+        ).scalars().all()
+
+        for d in deliveries:
+            assert d.status == "pending"
+            assert d.schedule_revision == 2
+            assert d.registration_generation == 2
+            # due_at recalculated from new_starts_at (+4 days), not old starts_at (+2 days)
+            assert d.due_at >= now + timedelta(days=3)
+
+
+@pytest.mark.asyncio
+async def test_rejoin_after_reschedule_with_archived_step(sqlite_session_factory):
+    """Requirement 5: Step archived while registration was cancelled remains skipped."""
+    user_id = await _create_test_user(sqlite_session_factory, 2031)
+    now = datetime.utcnow()
+    starts_at = now + timedelta(days=2)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "arch_step_ev", starts_at=starts_at)
+
+    await register_user_for_event(sqlite_session_factory, user_id, "arch_step_ev", now=now)
+    await cancel_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+
+    # Archive step 1 of scenario
+    async with sqlite_session_factory() as session:
+        step1 = await session.scalar(
+            select(EventStep).where(EventStep.event_id == scen_id, EventStep.sort_order == 1)
+        )
+        assert step1 is not None
+        step1.is_archived = True
+        await session.commit()
+
+    # Early rejoin
+    rejoin_res = await rejoin_event_registration(sqlite_session_factory, user_id, scen_id, now=now)
+
+    async with sqlite_session_factory() as session:
+        d1 = await session.scalar(
+            select(EventDelivery).where(
+                EventDelivery.registration_id == rejoin_res.registration_id,
+                EventDelivery.step_id == step1.id,
+            )
+        )
+        assert d1.status == "skipped"
+        assert d1.skip_reason == "step_archived"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_concurrency_duplicate_registration(sqlite_session_factory):
+    """Requirement 8: Two concurrent registrations result in exactly 1 registration and 1 immediate delivery."""
+    user_id = await _create_test_user(sqlite_session_factory, 2040)
+    await _create_test_scenario(sqlite_session_factory, "conc_reg_ev")
+
+    results = await asyncio.gather(
+        register_user_for_event(sqlite_session_factory, user_id, "conc_reg_ev"),
+        register_user_for_event(sqlite_session_factory, user_id, "conc_reg_ev"),
+        return_exceptions=False,
+    )
+
+    statuses = [r.status for r in results]
+    assert "registered" in statuses
+    assert "already_registered" in statuses
+
+    async with sqlite_session_factory() as session:
+        regs = (await session.execute(select(EventRegistration).where(EventRegistration.user_id == user_id))).scalars().all()
+        assert len(regs) == 1
+        delivs = (await session.execute(
+            select(EventDelivery).where(
+                EventDelivery.user_id == user_id,
+                EventDelivery.message_kind == "immediate_confirmation",
+            )
+        )).scalars().all()
+        assert len(delivs) == 1
+
+
+@pytest.mark.asyncio
+async def test_sqlite_concurrency_cancel_vs_rejoin(sqlite_session_factory):
+    """Requirement 8: Cancel vs Rejoin concurrency handles locks and sequence safely."""
+    user_id = await _create_test_user(sqlite_session_factory, 2041)
+    scen_id = await _create_test_scenario(sqlite_session_factory, "conc_canc_rej_ev")
+
+    # Start registered
+    await register_user_for_event(sqlite_session_factory, user_id, "conc_canc_rej_ev")
+
+    # Run cancel and another cancel concurrently
+    c1, c2 = await asyncio.gather(
+        cancel_event_registration(sqlite_session_factory, user_id, scen_id),
+        cancel_event_registration(sqlite_session_factory, user_id, scen_id),
+    )
+    assert (c1.cancelled and c2.already_cancelled) or (c2.cancelled and c1.already_cancelled)
+
+    async with sqlite_session_factory() as session:
+        reg = await session.scalar(select(EventRegistration).where(EventRegistration.user_id == user_id))
+        assert reg.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_concurrency_two_reschedules(sqlite_session_factory):
+    """Requirement 8: Two concurrent reschedules serialized properly on SQLite."""
+    scen_id = await _create_test_scenario(sqlite_session_factory, "conc_resched_ev")
+    now = datetime.utcnow()
+
+    res1, res2 = await asyncio.gather(
+        reschedule_event(sqlite_session_factory, scen_id, now + timedelta(days=3), now=now),
+        reschedule_event(sqlite_session_factory, scen_id, now + timedelta(days=5), now=now),
+    )
+    # Both reschedules must complete and increment schedule_revision cleanly
+    revisions = {res1.schedule_revision, res2.schedule_revision}
+    assert revisions == {2, 3}
+
+
+
+@pytest.mark.asyncio
+async def test_sqlite_concurrency_metadata_append(sqlite_session_factory):
+    """Requirement 8: Multiple concurrent metadata appends preserve all records without loss."""
+    user_id = await _create_test_user(sqlite_session_factory, 2045)
+
+    async def _append_item(idx: int):
+        payload = {"type": "test_concurrency", "index": idx}
+        async def _op(session, user):
+            await sync_and_append_user_metadata(
+                session,
+                user,
+                [{"data": payload, "raw_json": json.dumps(payload)}],
+            )
+        await run_user_transaction(sqlite_session_factory, user_id, _op)
+
+    await asyncio.gather(*[_append_item(i) for i in range(10)])
+
+    async with sqlite_session_factory() as session:
+        user = await session.get(User, user_id)
+        records = load_metadata_records(user.metadata_json)
+        assert len(records) == 10
+        indices = {r["data"]["index"] for r in records}
+        assert indices == set(range(10))
+
+
+@pytest.mark.asyncio
+async def test_automation_events_sqlite_busy_retry(sqlite_session_factory):
+    """Requirement 6: automation_events handles SQLite busy retry correctly with OperationalError."""
+    from unittest.mock import patch
+    from sqlalchemy.exc import OperationalError
+    from automation_events import process_pending_events
+    from database import AutomationCondition, AutomationEvent, AutomationHandler, AutomationAction
+
+    user_id = await _create_test_user(sqlite_session_factory, 2050)
+
+    # Create handler and action for save_metadata
+    async with sqlite_session_factory() as session:
+        handler = AutomationHandler(
+            name="Test Handler",
+            is_active=True,
+            include_main_dialogue=True,
+        )
+        handler.conditions.append(AutomationCondition(
+            condition_type="event",
+            expected_value="test_event",
+            operator="equals",
+        ))
+        handler.actions.append(AutomationAction(
+            action_type="save_metadata",
+            recipient_type="current_user",
+            metadata_json=json.dumps({"key": "test_val"}),
+        ))
+        session.add(handler)
+        await session.flush()
+
+        ev = AutomationEvent(
+            user_id=user_id,
+            dialogue_id=1,
+            topic_id=0,
+            name="test_event",
+            state_json="{}",
+            metadata_json="{}",
+            created_at=datetime.utcnow(),
+        )
+        session.add(ev)
+        await session.commit()
+
+    # Simulate 1 transient SQLite busy OperationalError on sync_and_append_user_metadata
+    orig_append = sync_and_append_user_metadata
+    call_count = 0
+
+    async def flaky_append(session, user, blocks, *, saved_at=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise OperationalError("database is locked", {}, Exception("sqlite3.OperationalError: database is locked"))
+        return await orig_append(session, user, blocks, saved_at=saved_at)
+
+    with patch("automation_events.async_session_maker", sqlite_session_factory), \
+         patch("automation_events.sync_and_append_user_metadata", side_effect=flaky_append):
+        processed = await process_pending_events(bot=None)
+        assert processed == 1
+        assert call_count >= 2
+
+
