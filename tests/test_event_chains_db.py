@@ -18,12 +18,14 @@ from database import (
     Base,
     Content,
     DeepLinkNamespace,
+    DeliveryRetryError,
     EventDelivery,
     EventDeliveryResolution,
     EventRegistration,
     EventScenario,
     EventStep,
     User,
+    create_event_delivery_force_retry,
     init_db,
     reserve_start_code,
     sync_deep_link_namespace,
@@ -280,6 +282,8 @@ async def test_event_scenario_check_constraints(async_engine_session):
             title="Test",
             starts_at=datetime.utcnow() + timedelta(days=1),
             duration_minutes=120,
+            link="https://zoom.us",
+            place=None,
         )
         session.add(bad_type)
         with pytest.raises(IntegrityError):
@@ -293,6 +297,8 @@ async def test_event_scenario_check_constraints(async_engine_session):
             title="Test",
             starts_at=datetime.utcnow() + timedelta(days=1),
             duration_minutes=10,
+            link="https://zoom.us",
+            place=None,
         )
         session.add(bad_duration_low)
         with pytest.raises(IntegrityError):
@@ -306,6 +312,8 @@ async def test_event_scenario_check_constraints(async_engine_session):
             title="Test",
             starts_at=datetime.utcnow() + timedelta(days=1),
             duration_minutes=2000,
+            link="https://zoom.us",
+            place=None,
         )
         session.add(bad_duration_high)
         with pytest.raises(IntegrityError):
@@ -320,6 +328,8 @@ async def test_event_scenario_check_constraints(async_engine_session):
             starts_at=datetime.utcnow() + timedelta(days=1),
             duration_minutes=120,
             schedule_revision=0,
+            link="https://zoom.us",
+            place=None,
         )
         session.add(bad_revision)
         with pytest.raises(IntegrityError):
@@ -642,46 +652,996 @@ async def test_foreign_key_restrict_prevents_scenario_hard_delete_with_registrat
 
 
 @pytest.mark.asyncio
-async def test_postgresql_migration_sql_generation():
-    """Verifies PostgreSQL-specific DDL/INSERT statements executed in _check_and_migrate."""
-    mock_conn = MagicMock()
-    mock_conn.dialect.name = "postgresql"
+def _build_valid_mock_insp():
     mock_insp = MagicMock()
     mock_insp.has_table.return_value = True
 
-    columns_by_table = {
-        "deep_link_namespace": ["code", "kind", "reference_id", "created_at"],
-        "event_scenarios": ["id", "code", "event_type", "title", "starts_at", "duration_minutes",
-                            "place", "link", "is_active", "is_archived", "archived_at",
-                            "schedule_revision", "content_version", "created_at", "updated_at"],
-        "event_steps": ["id", "event_id", "offset_minutes", "message_text", "step_version",
-                        "sort_order", "is_archived", "created_at", "updated_at"],
-        "event_registrations": ["id", "event_id", "user_id", "status", "generation",
-                                "registration_mode", "registered_at", "cancelled_at", "rejoined_at", "updated_at"],
-        "event_deliveries": ["id", "event_id", "user_id", "registration_id", "step_id",
-                             "retry_index", "parent_delivery_id", "message_kind", "delivery_key",
-                             "due_at", "next_attempt_at", "expires_at", "schedule_revision",
-                             "registration_generation", "platform", "status", "skip_reason",
-                             "claim_token", "claimed_at", "lease_until", "send_started_at",
-                             "sent_at", "finished_at", "attempt_count", "last_error",
-                             "external_message_id", "rendered_text_snapshot", "template_text_snapshot",
-                             "created_at", "updated_at"],
-        "event_delivery_resolutions": ["id", "delivery_id", "admin_id", "resolution_type", "resolution_reason", "resolved_at"],
+    columns_specs = {
+        "deep_link_namespace": [("code", False), ("kind", False), ("reference_id", True), ("created_at", False)],
+        "event_scenarios": [
+            ("id", False), ("code", False), ("event_type", False), ("title", False),
+            ("starts_at", False), ("duration_minutes", False), ("place", True),
+            ("link", True), ("is_active", False), ("is_archived", False),
+            ("archived_at", True), ("schedule_revision", False), ("content_version", False),
+            ("created_at", False), ("updated_at", False),
+        ],
+        "event_steps": [
+            ("id", False), ("event_id", False), ("offset_minutes", False),
+            ("message_text", False), ("step_version", False), ("sort_order", False),
+            ("is_archived", False), ("created_at", False), ("updated_at", False),
+        ],
+        "event_registrations": [
+            ("id", False), ("event_id", False), ("user_id", False), ("status", False),
+            ("generation", False), ("registration_mode", False), ("registered_at", False),
+            ("cancelled_at", True), ("rejoined_at", True), ("updated_at", False),
+        ],
+        "event_deliveries": [
+            ("id", False), ("event_id", False), ("user_id", False), ("registration_id", False),
+            ("step_id", True), ("retry_index", False), ("parent_delivery_id", True),
+            ("message_kind", False), ("delivery_key", False), ("due_at", False),
+            ("next_attempt_at", False), ("expires_at", True), ("schedule_revision", False),
+            ("registration_generation", False), ("platform", False), ("status", False),
+            ("skip_reason", True), ("claim_token", True), ("claimed_at", True),
+            ("lease_until", True), ("send_started_at", True), ("sent_at", True),
+            ("finished_at", True), ("attempt_count", False), ("last_error", True),
+            ("external_message_id", True), ("rendered_text_snapshot", True),
+            ("template_text_snapshot", True), ("created_at", False), ("updated_at", False),
+        ],
+        "event_delivery_resolutions": [
+            ("id", False), ("delivery_id", False), ("admin_id", False),
+            ("resolution_type", False), ("resolution_reason", False), ("resolved_at", False),
+        ],
     }
-    mock_insp.get_columns.side_effect = lambda t: [{"name": c} for c in columns_by_table.get(t, ["id"])]
-    mock_insp.get_pk_constraint.return_value = {"constrained_columns": ["code"]}
-    mock_insp.get_unique_constraints.return_value = [
-        {"column_names": ["code"]},
-        {"column_names": ["event_id", "user_id"]},
-        {"column_names": ["delivery_key"]},
-        {"column_names": ["registration_id", "step_id", "retry_index"]},
+    mock_insp.get_columns.side_effect = lambda tbl: [
+        {"name": name, "nullable": nullable}
+        for name, nullable in columns_specs.get(tbl, [("id", False)])
     ]
-    mock_insp.get_indexes.return_value = [
-        {"unique": False, "column_names": ["status", "next_attempt_at", "due_at"]},
-        {"unique": False, "column_names": ["event_id", "offset_minutes", "sort_order", "id"]},
-    ]
+    mock_insp.get_foreign_keys.side_effect = lambda tbl: {
+        "event_steps": [
+            {"constrained_columns": ["event_id"], "referred_table": "event_scenarios", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+        ],
+        "event_registrations": [
+            {"constrained_columns": ["event_id"], "referred_table": "event_scenarios", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+            {"constrained_columns": ["user_id"], "referred_table": "users", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+        ],
+        "event_deliveries": [
+            {"constrained_columns": ["event_id"], "referred_table": "event_scenarios", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+            {"constrained_columns": ["user_id"], "referred_table": "users", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+            {"constrained_columns": ["registration_id"], "referred_table": "event_registrations", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+            {"constrained_columns": ["step_id"], "referred_table": "event_steps", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+            {"constrained_columns": ["parent_delivery_id"], "referred_table": "event_deliveries", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+        ],
+        "event_delivery_resolutions": [
+            {"constrained_columns": ["delivery_id"], "referred_table": "event_deliveries", "referred_columns": ["id"], "options": {"ondelete": "RESTRICT"}},
+        ],
+    }.get(tbl, [])
+    mock_insp.get_check_constraints.side_effect = lambda tbl: {
+        "event_scenarios": [
+            {"name": "ck_event_scenarios_type"},
+            {"name": "ck_event_scenarios_duration"},
+            {"name": "ck_event_scenarios_revision"},
+            {"name": "ck_event_scenarios_content_version"},
+            {"name": "ck_event_scenarios_location"},
+        ],
+        "event_steps": [
+            {"name": "ck_event_steps_step_version"},
+        ],
+        "event_registrations": [
+            {"name": "ck_event_registrations_status"},
+            {"name": "ck_event_registrations_mode"},
+            {"name": "ck_event_registrations_generation"},
+        ],
+        "event_deliveries": [
+            {"name": "ck_event_deliveries_kind"},
+            {"name": "ck_event_deliveries_status"},
+            {"name": "ck_event_deliveries_step_kind"},
+            {"name": "ck_event_deliveries_platform"},
+            {"name": "ck_event_deliveries_retry_index"},
+            {"name": "ck_event_deliveries_reg_gen"},
+            {"name": "ck_event_deliveries_attempt_count"},
+        ],
+        "event_delivery_resolutions": [
+            {"name": "ck_event_delivery_resolution_type"},
+        ],
+    }.get(tbl, [])
+    mock_insp.get_pk_constraint.side_effect = lambda tbl: (
+        {"constrained_columns": ["code"]} if tbl == "deep_link_namespace" else {"constrained_columns": ["id"]}
+    )
+    mock_insp.get_unique_constraints.side_effect = lambda tbl: {
+        "event_scenarios": [{"column_names": ["code"]}],
+        "event_registrations": [{"column_names": ["event_id", "user_id"]}],
+        "event_deliveries": [
+            {"column_names": ["delivery_key"]},
+            {"column_names": ["registration_id", "step_id", "retry_index"]},
+        ],
+    }.get(tbl, [])
+    mock_insp.get_indexes.side_effect = lambda tbl: {
+        "event_scenarios": [{"name": "ix_event_scenarios_code", "unique": True, "column_names": ["code"]}],
+        "event_steps": [
+            {"name": "ix_event_steps_execution_order", "unique": False, "column_names": ["event_id", "offset_minutes", "sort_order", "id"]},
+        ],
+        "event_deliveries": [
+            {"name": "ix_event_deliveries_poll", "unique": False, "column_names": ["status", "next_attempt_at", "due_at"]},
+            {"name": "uq_event_deliveries_parent_delivery_id", "unique": True, "column_names": ["parent_delivery_id"]},
+        ],
+    }.get(tbl, [])
+    return mock_insp
 
+
+@pytest.mark.asyncio
+async def test_verify_schema_mock_inspection_pass():
+    """Unit test: verifier succeeds when inspection matches all fail-closed criteria."""
+    mock_conn = MagicMock()
+    mock_insp = _build_valid_mock_insp()
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp)
-        # Verify schema verifier succeeds with mocked PG inspection
         verify_event_reminder_chains_schema(mock_conn)
+
+
+@pytest.mark.asyncio
+async def test_verify_schema_fails_closed_on_nullable_column():
+    """Fail-closed verifier must raise RuntimeError if any critical NOT NULL column is nullable."""
+    mock_conn = MagicMock()
+    mock_insp = _build_valid_mock_insp()
+    def bad_get_columns(tbl):
+        cols = _build_valid_mock_insp().get_columns(tbl)
+        if tbl == "event_scenarios":
+            for c in cols:
+                if c["name"] == "starts_at":
+                    c["nullable"] = True
+        return cols
+    mock_insp.get_columns.side_effect = bad_get_columns
+
+    with pytest.raises(RuntimeError, match="Critical column starts_at in event_scenarios must be NOT NULL"):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp)
+            verify_event_reminder_chains_schema(mock_conn)
+
+
+@pytest.mark.asyncio
+async def test_verify_schema_fails_closed_on_missing_or_bad_foreign_key():
+    """Fail-closed verifier must raise RuntimeError if FK is missing or has invalid ondelete action."""
+    mock_conn = MagicMock()
+    mock_insp = _build_valid_mock_insp()
+    # 1. Missing FK
+    mock_insp.get_foreign_keys.side_effect = lambda tbl: [] if tbl == "event_steps" else _build_valid_mock_insp().get_foreign_keys(tbl)
+    with pytest.raises(RuntimeError, match="Critical foreign key missing: event_steps.*event_id"):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp)
+            verify_event_reminder_chains_schema(mock_conn)
+
+    # 2. Bad ondelete (CASCADE instead of RESTRICT)
+    mock_insp2 = _build_valid_mock_insp()
+    def cascade_fks(tbl):
+        fks = _build_valid_mock_insp().get_foreign_keys(tbl)
+        if tbl == "event_steps":
+            for fk in fks:
+                fk["options"]["ondelete"] = "CASCADE"
+        return fks
+    mock_insp2.get_foreign_keys.side_effect = cascade_fks
+    with pytest.raises(RuntimeError, match="has ondelete='CASCADE', expected 'RESTRICT'"):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp2)
+            verify_event_reminder_chains_schema(mock_conn)
+
+
+@pytest.mark.asyncio
+async def test_verify_schema_fails_closed_on_missing_check_constraint():
+    """Fail-closed verifier must raise RuntimeError if any critical CheckConstraint is missing."""
+    mock_conn = MagicMock()
+    mock_insp = _build_valid_mock_insp()
+    mock_insp.get_check_constraints.side_effect = lambda tbl: [
+        c for c in _build_valid_mock_insp().get_check_constraints(tbl)
+        if c["name"] != "ck_event_scenarios_location"
+    ]
+    with pytest.raises(RuntimeError, match="Critical check constraint ck_event_scenarios_location missing on event_scenarios"):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp)
+            verify_event_reminder_chains_schema(mock_conn)
+
+
+@pytest.mark.asyncio
+async def test_verify_schema_fails_closed_on_unordered_composite_index():
+    """Fail-closed verifier must raise RuntimeError if composite index column order is scrambled."""
+    mock_conn = MagicMock()
+
+    # 1. Scrambled poll index columns: (due_at, status, next_attempt_at) instead of (status, next_attempt_at, due_at)
+    mock_insp = _build_valid_mock_insp()
+    def scrambled_poll_indexes(tbl):
+        idxs = _build_valid_mock_insp().get_indexes(tbl)
+        if tbl == "event_deliveries":
+            for idx in idxs:
+                if idx["name"] == "ix_event_deliveries_poll":
+                    idx["column_names"] = ["due_at", "status", "next_attempt_at"]
+        return idxs
+    mock_insp.get_indexes.side_effect = scrambled_poll_indexes
+
+    with pytest.raises(RuntimeError, match="Critical index ix_event_deliveries_poll with ordered columns"):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp)
+            verify_event_reminder_chains_schema(mock_conn)
+
+    # 2. Scrambled execution order index: (id, sort_order, offset_minutes, event_id)
+    mock_insp2 = _build_valid_mock_insp()
+    def scrambled_exec_indexes(tbl):
+        idxs = _build_valid_mock_insp().get_indexes(tbl)
+        if tbl == "event_steps":
+            for idx in idxs:
+                if idx["name"] == "ix_event_steps_execution_order":
+                    idx["column_names"] = ["id", "sort_order", "offset_minutes", "event_id"]
+        return idxs
+    mock_insp2.get_indexes.side_effect = scrambled_exec_indexes
+
+    with pytest.raises(RuntimeError, match="Critical index ix_event_steps_execution_order with ordered columns"):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp2)
+            verify_event_reminder_chains_schema(mock_conn)
+
+
+@pytest.mark.asyncio
+async def test_event_scenario_and_version_invariants(async_engine_session):
+    """Verifies webinar/meeting location invariants and content_version/step_version/generation invariants."""
+    engine, session_factory = async_engine_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        user_id = 5001
+        user = User(id=user_id, first_name="Sergey")
+        session.add(user)
+        await session.commit()
+
+        # 1. Webinar without link -> FAILS
+        webinar_no_link = EventScenario(
+            code="wb_no_link",
+            event_type="webinar",
+            title="Webinar without link",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            link=None,
+            place=None,
+        )
+        session.add(webinar_no_link)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 2. Webinar with empty/whitespace link -> FAILS
+        webinar_empty_link = EventScenario(
+            code="wb_empty_link",
+            event_type="webinar",
+            title="Webinar with empty link",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            link="   ",
+            place=None,
+        )
+        session.add(webinar_empty_link)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 3. Webinar with place -> FAILS
+        webinar_with_place = EventScenario(
+            code="wb_with_place",
+            event_type="webinar",
+            title="Webinar with place",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            link="https://zoom.us",
+            place="Room 101",
+        )
+        session.add(webinar_with_place)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 4. Valid webinar -> SUCCEEDS
+        webinar_ok = EventScenario(
+            code="wb_ok",
+            event_type="webinar",
+            title="Valid Webinar",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            link="https://zoom.us/valid",
+            place=None,
+        )
+        session.add(webinar_ok)
+        await session.flush()
+        webinar_ok_id = webinar_ok.id
+        await session.commit()
+
+        # 5. Meeting without place -> FAILS
+        meeting_no_place = EventScenario(
+            code="mt_no_place",
+            event_type="meeting",
+            title="Meeting without place",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            place=None,
+            link=None,
+        )
+        session.add(meeting_no_place)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 6. Meeting with empty/whitespace place -> FAILS
+        meeting_empty_place = EventScenario(
+            code="mt_empty_place",
+            event_type="meeting",
+            title="Meeting with empty place",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            place="   ",
+            link=None,
+        )
+        session.add(meeting_empty_place)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 7. Meeting with valid place and link=None -> SUCCEEDS
+        meeting_ok_no_link = EventScenario(
+            code="mt_ok_no_link",
+            event_type="meeting",
+            title="Valid Meeting No Link",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            place="г. Москва, ул. Арбат, 10",
+            link=None,
+        )
+        session.add(meeting_ok_no_link)
+        await session.commit()
+
+        # 8. Meeting with valid place and link -> SUCCEEDS
+        meeting_ok_with_link = EventScenario(
+            code="mt_ok_with_link",
+            event_type="meeting",
+            title="Valid Meeting With Link",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            place="г. Москва, ул. Арбат, 10",
+            link="https://yandex.ru/maps/1",
+        )
+        session.add(meeting_ok_with_link)
+        await session.commit()
+
+        # 9. content_version < 1 -> FAILS
+        bad_cv = EventScenario(
+            code="ev_bad_cv",
+            event_type="webinar",
+            title="Bad content version",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            link="https://zoom.us",
+            content_version=0,
+        )
+        session.add(bad_cv)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 10. step_version < 1 -> FAILS
+        bad_step = EventStep(
+            event_id=webinar_ok_id,
+            offset_minutes=-60,
+            message_text="Step text",
+            step_version=0,
+        )
+        session.add(bad_step)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 11. generation < 1 -> FAILS
+        bad_gen = EventRegistration(
+            event_id=webinar_ok_id,
+            user_id=user_id,
+            generation=0,
+        )
+        session.add(bad_gen)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_event_delivery_structural_invariants(async_engine_session):
+    """Verifies EventDelivery structural CHECK invariants at DB level."""
+    engine, session_factory = async_engine_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        user = User(id=6001, first_name="Elena")
+        session.add(user)
+        scenario = EventScenario(
+            code="delivery_inv_scenario",
+            event_type="webinar",
+            title="Webinar",
+            starts_at=datetime.utcnow() + timedelta(days=2),
+            link="https://zoom.us",
+        )
+        session.add(scenario)
+        await session.flush()
+
+        step = EventStep(
+            event_id=scenario.id,
+            offset_minutes=-60,
+            message_text="Reminder",
+        )
+        session.add(step)
+        reg = EventRegistration(
+            event_id=scenario.id,
+            user_id=user.id,
+        )
+        session.add(reg)
+        await session.flush()
+        scenario_id = scenario.id
+        user_id = user.id
+        step_id = step.id
+        reg_id = reg.id
+        await session.commit()
+
+        # 1. message_kind='scheduled_step' without step_id -> FAILS
+        d_bad_sched = EventDelivery(
+            event_id=scenario_id,
+            user_id=user_id,
+            registration_id=reg_id,
+            step_id=None,
+            message_kind="scheduled_step",
+            delivery_key="bad:sched:no:step",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+        )
+        session.add(d_bad_sched)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 2. immediate kinds with step_id NOT NULL -> FAILS
+        for imm_kind in ("immediate_confirmation", "immediate_live", "reschedule_notice"):
+            d_bad_imm = EventDelivery(
+                event_id=scenario_id,
+                user_id=user_id,
+                registration_id=reg_id,
+                step_id=step_id,  # MUST be NULL!
+                message_kind=imm_kind,
+                delivery_key=f"bad:imm:{imm_kind}:has:step",
+                due_at=datetime.utcnow(),
+                next_attempt_at=datetime.utcnow(),
+                platform="telegram",
+            )
+            session.add(d_bad_imm)
+            with pytest.raises(IntegrityError):
+                await session.commit()
+            await session.rollback()
+
+        # 3. Invalid platform -> FAILS
+        d_bad_platform = EventDelivery(
+            event_id=scenario_id,
+            user_id=user_id,
+            registration_id=reg_id,
+            step_id=step_id,
+            message_kind="scheduled_step",
+            delivery_key="bad:platform",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="vk",  # only telegram or max
+        )
+        session.add(d_bad_platform)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 4. retry_index < 0 -> FAILS
+        d_bad_retry = EventDelivery(
+            event_id=scenario_id,
+            user_id=user_id,
+            registration_id=reg_id,
+            step_id=step_id,
+            retry_index=-1,
+            message_kind="scheduled_step",
+            delivery_key="bad:retry_idx",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+        )
+        session.add(d_bad_retry)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 5. registration_generation < 1 -> FAILS
+        d_bad_gen = EventDelivery(
+            event_id=scenario_id,
+            user_id=user_id,
+            registration_id=reg_id,
+            step_id=step_id,
+            registration_generation=0,
+            message_kind="scheduled_step",
+            delivery_key="bad:reg_gen",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+        )
+        session.add(d_bad_gen)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # 6. attempt_count < 0 -> FAILS
+        d_bad_att = EventDelivery(
+            event_id=scenario_id,
+            user_id=user_id,
+            registration_id=reg_id,
+            step_id=step_id,
+            attempt_count=-1,
+            message_kind="scheduled_step",
+            delivery_key="bad:attempt_count",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+        )
+        session.add(d_bad_att)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_manual_force_retry_scheduled_parent_idempotent(async_engine_session):
+    """Verifies manual force_retry on scheduled delivery is idempotent and enforces single retry child."""
+    engine, session_factory = async_engine_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        user = User(id=7001, first_name="Maxim")
+        session.add(user)
+        scenario = EventScenario(
+            code="retry_sched_test",
+            event_type="webinar",
+            title="Webinar",
+            starts_at=datetime.utcnow() + timedelta(days=2),
+            link="https://zoom.us",
+        )
+        session.add(scenario)
+        await session.flush()
+        step = EventStep(
+            event_id=scenario.id,
+            offset_minutes=-120,
+            message_text="2h reminder",
+        )
+        session.add(step)
+        reg = EventRegistration(event_id=scenario.id, user_id=user.id)
+        session.add(reg)
+        await session.flush()
+
+        # Scheduled delivery (retry_index=0) that ended up uncertain
+        parent_delivery = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=step.id,
+            retry_index=0,
+            parent_delivery_id=None,
+            message_kind="scheduled_step",
+            delivery_key=f"ev:{scenario.id}:reg:{reg.id}:step:{step.id}:r0",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+            status="uncertain",
+        )
+        session.add(parent_delivery)
+        await session.commit()
+        parent_id = parent_delivery.id
+
+        # 1. First force_retry creates child (created=True, retry_index=1, parent_delivery_id=parent.id)
+        child1, created1 = await create_event_delivery_force_retry(
+            session, parent_id, admin_id=888, resolution_reason="Admin manual retry"
+        )
+        await session.commit()
+        assert created1 is True
+        assert child1.id is not None
+        assert child1.retry_index == 1
+        assert child1.parent_delivery_id == parent_id
+        assert child1.step_id == step.id
+        assert child1.status == "pending"
+
+        # 2. Repeated force_retry on the same parent is idempotently rejected (returns child1, created=False)
+        child2, created2 = await create_event_delivery_force_retry(
+            session, parent_id, admin_id=888, resolution_reason="Repeated retry request"
+        )
+        assert created2 is False
+        assert child2.id == child1.id
+
+        # 3. Repeated force_retry with raise_on_duplicate=True raises DeliveryRetryError
+        with pytest.raises(DeliveryRetryError, match="already has a retry-child"):
+            await create_event_delivery_force_retry(
+                session, parent_id, admin_id=888, resolution_reason="Repeated retry with raise",
+                raise_on_duplicate=True
+            )
+
+        # 4. DB guarantee: direct insert of duplicate child with same parent_delivery_id fails via partial unique index
+        child_dup = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=step.id,
+            retry_index=2,
+            parent_delivery_id=parent_id,  # duplicate parent reference!
+            message_kind="scheduled_step",
+            delivery_key=f"ev:{scenario.id}:reg:{reg.id}:step:{step.id}:manual_dup",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+            status="pending",
+        )
+        session.add(child_dup)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_manual_force_retry_immediate_parent_idempotent(async_engine_session):
+    """Verifies manual force_retry on immediate delivery (step_id IS NULL) is idempotent and DB-enforced."""
+    engine, session_factory = async_engine_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        user = User(id=8001, first_name="Tatyana")
+        session.add(user)
+        scenario = EventScenario(
+            code="retry_imm_test",
+            event_type="webinar",
+            title="Webinar",
+            starts_at=datetime.utcnow() + timedelta(days=2),
+            link="https://zoom.us",
+        )
+        session.add(scenario)
+        await session.flush()
+        reg = EventRegistration(event_id=scenario.id, user_id=user.id)
+        session.add(reg)
+        await session.flush()
+
+        # Immediate confirmation delivery (step_id IS NULL) that ended up uncertain
+        parent_delivery = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=None,
+            retry_index=0,
+            parent_delivery_id=None,
+            message_kind="immediate_confirmation",
+            delivery_key=f"ev:{scenario.id}:reg:{reg.id}:kind:imm_conf:r0",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+            status="uncertain",
+        )
+        session.add(parent_delivery)
+        await session.commit()
+        parent_id = parent_delivery.id
+
+        # 1. First force_retry creates immediate child
+        child1, created1 = await create_event_delivery_force_retry(
+            session, parent_id, admin_id=999, resolution_reason="Manual retry immediate"
+        )
+        await session.commit()
+        assert created1 is True
+        assert child1.retry_index == 1
+        assert child1.parent_delivery_id == parent_id
+        assert child1.step_id is None
+        assert child1.message_kind == "immediate_confirmation"
+
+        # 2. Repeated force_retry returns existing child idempotently
+        child2, created2 = await create_event_delivery_force_retry(
+            session, parent_id, admin_id=999, resolution_reason="Repeated immediate retry"
+        )
+        assert created2 is False
+        assert child2.id == child1.id
+
+        # 3. DB guarantee: direct insert of duplicate child with same parent_delivery_id fails even with step_id IS NULL
+        child_dup = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=None,
+            retry_index=2,
+            parent_delivery_id=parent_id,
+            message_kind="immediate_confirmation",
+            delivery_key=f"ev:{scenario.id}:reg:{reg.id}:kind:imm_conf:manual_dup",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+            status="pending",
+        )
+        session.add(child_dup)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_manual_force_retry_chained_uncertain_child(async_engine_session):
+    """Verifies that if a retry-child itself becomes uncertain, subsequent retry is created from child and chains."""
+    engine, session_factory = async_engine_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        user = User(id=9001, first_name="Konstantin")
+        session.add(user)
+        scenario = EventScenario(
+            code="retry_chain_test",
+            event_type="webinar",
+            title="Webinar",
+            starts_at=datetime.utcnow() + timedelta(days=2),
+            link="https://zoom.us",
+        )
+        session.add(scenario)
+        await session.flush()
+        step = EventStep(event_id=scenario.id, offset_minutes=-15, message_text="15m reminder")
+        session.add(step)
+        reg = EventRegistration(event_id=scenario.id, user_id=user.id)
+        session.add(reg)
+        await session.flush()
+
+        # Step 1: Root delivery fails and becomes uncertain (retry_index=0)
+        root = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=step.id,
+            retry_index=0,
+            parent_delivery_id=None,
+            message_kind="scheduled_step",
+            delivery_key=f"ev:{scenario.id}:reg:{reg.id}:step:{step.id}:r0",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+            status="uncertain",
+        )
+        session.add(root)
+        await session.commit()
+
+        # Step 2: Admin retries root -> creates Child (retry_index=1, parent=root.id)
+        child, c_created = await create_event_delivery_force_retry(
+            session, root.id, admin_id=111, resolution_reason="First manual retry"
+        )
+        await session.commit()
+        assert c_created is True
+        assert child.retry_index == 1
+        assert child.parent_delivery_id == root.id
+
+        # Step 3: Child delivery also encounters uncertain network failure
+        child.status = "uncertain"
+        child.last_error = "Second network failure"
+        await session.commit()
+
+        # Step 4: Admin retries from the child -> creates Grandchild (retry_index=2, parent=child.id)
+        grandchild, gc_created = await create_event_delivery_force_retry(
+            session, child.id, admin_id=111, resolution_reason="Second manual retry after child uncertain"
+        )
+        await session.commit()
+        assert gc_created is True
+        assert grandchild.retry_index == 2
+        assert grandchild.parent_delivery_id == child.id
+        assert grandchild.step_id == step.id
+        assert grandchild.status == "pending"
+
+        # Step 5: Verify the full chain in DB
+        chain = (await session.execute(
+            select(EventDelivery).where(EventDelivery.registration_id == reg.id).order_by(EventDelivery.retry_index)
+        )).scalars().all()
+        assert len(chain) == 3
+        # Root (r0)
+        assert chain[0].retry_index == 0
+        assert chain[0].parent_delivery_id is None
+        assert chain[0].status == "uncertain"
+        # Child (r1)
+        assert chain[1].retry_index == 1
+        assert chain[1].parent_delivery_id == chain[0].id
+        assert chain[1].status == "uncertain"
+        # Grandchild (r2)
+        assert chain[2].retry_index == 2
+        assert chain[2].parent_delivery_id == chain[1].id
+        assert chain[2].status == "pending"
+
+
+# --- Real PostgreSQL Integration Tests ---
+
+POSTGRES_TEST_URL = os.environ.get(
+    "POSTGRES_TEST_DATABASE_URL",
+    "postgresql+asyncpg://ivankorakin@localhost:5432/test_tgpsychobot_events",
+)
+
+
+async def _can_connect_to_postgres() -> bool:
+    try:
+        test_engine = create_async_engine(POSTGRES_TEST_URL)
+        async with test_engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        await test_engine.dispose()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_real_postgresql_init_and_schema_verification():
+    """Real PostgreSQL integration test: verifies init_db and fail-closed schema verification on PostgreSQL."""
+    if not await _can_connect_to_postgres():
+        pytest.skip("Real PostgreSQL is not reachable in this environment; CI/integration environment required")
+
+    pg_engine = create_async_engine(POSTGRES_TEST_URL)
+    try:
+        # Reset public schema
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
+
+        sessions = async_sessionmaker(pg_engine, expire_on_commit=False)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(database, "engine", pg_engine)
+            mp.setattr(database, "async_session_maker", sessions)
+
+            await database.init_db()
+
+            async with pg_engine.connect() as conn:
+                await conn.run_sync(verify_event_reminder_chains_schema)
+    finally:
+        await pg_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_real_postgresql_structural_invariants_and_retry_model():
+    """Real PostgreSQL integration test: verifies CHECK constraints, partial unique index, and retry chaining on PostgreSQL."""
+    if not await _can_connect_to_postgres():
+        pytest.skip("Real PostgreSQL is not reachable in this environment; CI/integration environment required")
+
+    pg_engine = create_async_engine(POSTGRES_TEST_URL)
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
+            await conn.run_sync(Base.metadata.create_all)
+
+        sessions = async_sessionmaker(pg_engine, expire_on_commit=False)
+        async with sessions() as session:
+            user = User(id=9901, first_name="PG User")
+            session.add(user)
+
+            # 1. Webinar location check on real PostgreSQL: webinar without link FAILS
+            bad_wb = EventScenario(
+                code="pg_bad_wb",
+                event_type="webinar",
+                title="PG Bad Webinar",
+                starts_at=datetime.utcnow() + timedelta(days=1),
+                link=None,
+                place=None,
+            )
+            session.add(bad_wb)
+            with pytest.raises(IntegrityError):
+                await session.commit()
+            await session.rollback()
+
+            # 2. Valid webinar and meeting on real PostgreSQL
+            wb = EventScenario(
+                code="pg_good_wb",
+                event_type="webinar",
+                title="PG Good Webinar",
+                starts_at=datetime.utcnow() + timedelta(days=1),
+                link="https://zoom.us/pg",
+                place=None,
+            )
+            session.add(wb)
+            mt = EventScenario(
+                code="pg_good_mt",
+                event_type="meeting",
+                title="PG Good Meeting",
+                starts_at=datetime.utcnow() + timedelta(days=1),
+                place="Москва, Офис",
+                link=None,
+            )
+            session.add(mt)
+            user_fresh = User(id=9902, first_name="PG User 2")
+            session.add(user_fresh)
+            await session.flush()
+            wb_id = wb.id
+            user_fresh_id = user_fresh.id
+            await session.commit()
+
+            # 3. Delivery invariants on PostgreSQL: scheduled without step_id FAILS
+            reg = EventRegistration(event_id=wb_id, user_id=user_fresh_id)
+            session.add(reg)
+            await session.commit()
+            reg_id = reg.id
+
+            bad_del = EventDelivery(
+                event_id=wb_id,
+                user_id=user_fresh_id,
+                registration_id=reg_id,
+                step_id=None,
+                message_kind="scheduled_step",
+                delivery_key="pg:bad:sched",
+                due_at=datetime.utcnow(),
+                next_attempt_at=datetime.utcnow(),
+                platform="telegram",
+            )
+            session.add(bad_del)
+            with pytest.raises(IntegrityError):
+                await session.commit()
+            await session.rollback()
+
+            # 4. Immediate delivery and retry model on real PostgreSQL
+            imm_del = EventDelivery(
+                event_id=wb_id,
+                user_id=user_fresh_id,
+                registration_id=reg_id,
+                step_id=None,
+                message_kind="immediate_confirmation",
+                delivery_key="pg:imm:r0",
+                due_at=datetime.utcnow(),
+                next_attempt_at=datetime.utcnow(),
+                platform="telegram",
+                status="uncertain",
+            )
+            session.add(imm_del)
+            await session.commit()
+            imm_del_id = imm_del.id
+
+            # First retry
+            child, created = await create_event_delivery_force_retry(
+                session, imm_del_id, admin_id=1, resolution_reason="PG retry"
+            )
+            await session.commit()
+            assert created is True
+            assert child.retry_index == 1
+            assert child.parent_delivery_id == imm_del_id
+            child_id = child.id
+
+            # Idempotent rejection of second retry
+            child2, created2 = await create_event_delivery_force_retry(
+                session, imm_del_id, admin_id=1, resolution_reason="PG second retry"
+            )
+            assert created2 is False
+            assert child2.id == child_id
+
+            # Child itself becomes uncertain -> retry created from child
+            child_db = await session.get(EventDelivery, child_id)
+            child_db.status = "uncertain"
+            child_db.last_error = "PG network timeout"
+            await session.commit()
+
+            grandchild, gc_created = await create_event_delivery_force_retry(
+                session, child_id, admin_id=1, resolution_reason="PG retry grandchild"
+            )
+            await session.commit()
+            assert gc_created is True
+            assert grandchild.retry_index == 2
+            assert grandchild.parent_delivery_id == child_id
+
+            # PostgreSQL partial unique index enforcement:
+            # direct insert with same parent_delivery_id fails
+            child_dup = EventDelivery(
+                event_id=wb_id,
+                user_id=user_fresh_id,
+                registration_id=reg_id,
+                step_id=None,
+                retry_index=3,
+                parent_delivery_id=imm_del_id,
+                message_kind="immediate_confirmation",
+                delivery_key="pg:imm:manual_dup",
+                due_at=datetime.utcnow(),
+                next_attempt_at=datetime.utcnow(),
+                platform="telegram",
+                status="pending",
+            )
+            session.add(child_dup)
+            with pytest.raises(IntegrityError):
+                await session.commit()
+            await session.rollback()
+    finally:
+        await pg_engine.dispose()
