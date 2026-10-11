@@ -1372,6 +1372,9 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
 
     # 4. Check Constraints
     expected_check_constraints = {
+        "deep_link_namespace": {
+            "ck_deep_link_namespace_kind",
+        },
         "event_scenarios": {
             "ck_event_scenarios_type",
             "ck_event_scenarios_duration",
@@ -1872,6 +1875,17 @@ async def init_db():
 
             # Event Reminder Chains subsystem migrations & verification
             DeepLinkNamespace.__table__.create(sync_conn, checkfirst=True)
+            if dialect_name == "postgresql" and insp.has_table('deep_link_namespace'):
+                try:
+                    actual_cks = {c.get("name") for c in insp.get_check_constraints("deep_link_namespace")}
+                    if "ck_deep_link_namespace_kind" not in actual_cks:
+                        sync_conn.execute(text(
+                            "ALTER TABLE deep_link_namespace "
+                            "ADD CONSTRAINT ck_deep_link_namespace_kind "
+                            "CHECK (kind IN ('event', 'content', 'system'))"
+                        ))
+                except Exception:
+                    pass
             EventScenario.__table__.create(sync_conn, checkfirst=True)
             EventStep.__table__.create(sync_conn, checkfirst=True)
             EventRegistration.__table__.create(sync_conn, checkfirst=True)
@@ -2546,6 +2560,9 @@ class DeepLinkNamespace(Base):
     """Unified start code reservation registry protecting start deep-links."""
 
     __tablename__ = 'deep_link_namespace'
+    __table_args__ = (
+        CheckConstraint("kind IN ('event', 'content', 'system')", name="ck_deep_link_namespace_kind"),
+    )
 
     # Unbounded String matches Content.key without truncation (> 255 chars preserved)
     code = Column(String, primary_key=True)
@@ -2777,6 +2794,8 @@ async def reserve_start_code(
     reference_id: str | None = None,
 ) -> None:
     """Резервирует стартовый код в таблице deep_link_namespace с защитой от race condition."""
+    if kind not in ("event", "content", "system"):
+        raise ValueError(f"Недопустимый kind '{kind}' (ожидается 'event', 'content' или 'system')")
     norm_code = code.strip().lower()
     if kind == "event" and not re.match(r"^[a-z0-9_-]{3,64}$", norm_code):
         raise ValueError("Недопустимый формат кода события (3-64 символа, a-z, 0-9, _, -)")
@@ -2808,18 +2827,19 @@ async def create_event_delivery_force_retry(
     raise_on_duplicate: bool = False,
 ) -> tuple[EventDelivery, bool]:
     """
-    Creates an administrative force_retry for an uncertain or failed delivery.
+    Creates an administrative force_retry for an uncertain delivery.
 
     Contract:
-    - Target delivery must be in 'uncertain' or 'failed' status.
+    - Target delivery must be strictly in 'uncertain' status (status 'failed' is terminal and rejected).
     - At most one immediate retry-child per parent delivery (enforced in DB via
       partial unique index on parent_delivery_id).
     - Repeated force_retry of the same parent delivery is idempotently rejected:
       if raise_on_duplicate=False, returns (existing_child, False);
       if raise_on_duplicate=True, raises DeliveryRetryError.
-    - If a retry-child itself becomes uncertain or failed, a new retry can be
+    - If a retry-child itself becomes uncertain, a new retry can be
       created referencing that child as parent.
     - retry_index increments monotonically along the chain (parent.retry_index + 1).
+    - expires_at is preserved from parent.expires_at to maintain the business validity window.
     - Writes an audit log record into event_delivery_resolutions.
     """
     from sqlalchemy import select
@@ -2827,10 +2847,10 @@ async def create_event_delivery_force_retry(
     if not parent:
         raise ValueError(f"Event delivery {delivery_id} not found")
 
-    if parent.status not in ("uncertain", "failed"):
+    if parent.status != "uncertain":
         raise ValueError(
             f"Delivery {delivery_id} with status '{parent.status}' cannot be force-retried "
-            "(expected 'uncertain' or 'failed')"
+            "(expected 'uncertain')"
         )
 
     # Check if a direct retry-child already exists for this parent
@@ -2876,6 +2896,7 @@ async def create_event_delivery_force_retry(
         delivery_key=new_delivery_key,
         due_at=parent.due_at,
         next_attempt_at=now,
+        expires_at=parent.expires_at,
         schedule_revision=parent.schedule_revision,
         registration_generation=parent.registration_generation,
         platform=parent.platform,

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_asyncio
 from sqlalchemy import inspect, select, text
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -208,6 +209,33 @@ async def test_reserve_start_code_c1_rejection_of_system_and_invalid_codes(async
 
         with pytest.raises(ValueError, match="Код не может быть пустым"):
             await reserve_start_code(session, "   ", kind="content")
+
+        # Validation: kind must be one of 'event', 'content', 'system'
+        for invalid_kind in ("unknown", "payment", "custom", "event_wrong"):
+            with pytest.raises(ValueError, match="Недопустимый kind"):
+                await reserve_start_code(session, "valid_code_123", kind=invalid_kind)
+
+
+@pytest.mark.asyncio
+async def test_deep_link_namespace_kind_db_check_constraint(async_engine_session):
+    """DB check constraint ck_deep_link_namespace_kind must reject direct insertion of unknown kind."""
+    engine, session_factory = async_engine_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        bad_entry = DeepLinkNamespace(code="test_bad_kind", kind="hacked")
+        session.add(bad_entry)
+        with pytest.raises(IntegrityError):
+            await session.commit()
+        await session.rollback()
+
+        # Valid kinds pass
+        for valid_kind in ("event", "content", "system"):
+            entry = DeepLinkNamespace(code=f"code_{valid_kind}", kind=valid_kind)
+            session.add(entry)
+        await session.commit()
 
 
 @pytest.mark.asyncio
@@ -716,6 +744,9 @@ def _build_valid_mock_insp():
         ],
     }.get(tbl, [])
     mock_insp.get_check_constraints.side_effect = lambda tbl: {
+        "deep_link_namespace": [
+            {"name": "ck_deep_link_namespace_kind"},
+        ],
         "event_scenarios": [
             {"name": "ck_event_scenarios_type"},
             {"name": "ck_event_scenarios_duration"},
@@ -829,6 +860,7 @@ async def test_verify_schema_fails_closed_on_missing_or_bad_foreign_key():
 async def test_verify_schema_fails_closed_on_missing_check_constraint():
     """Fail-closed verifier must raise RuntimeError if any critical CheckConstraint is missing."""
     mock_conn = MagicMock()
+    # 1. Missing ck_event_scenarios_location
     mock_insp = _build_valid_mock_insp()
     mock_insp.get_check_constraints.side_effect = lambda tbl: [
         c for c in _build_valid_mock_insp().get_check_constraints(tbl)
@@ -837,6 +869,17 @@ async def test_verify_schema_fails_closed_on_missing_check_constraint():
     with pytest.raises(RuntimeError, match="Critical check constraint ck_event_scenarios_location missing on event_scenarios"):
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp)
+            verify_event_reminder_chains_schema(mock_conn)
+
+    # 2. Missing ck_deep_link_namespace_kind
+    mock_insp2 = _build_valid_mock_insp()
+    mock_insp2.get_check_constraints.side_effect = lambda tbl: [
+        c for c in _build_valid_mock_insp().get_check_constraints(tbl)
+        if c["name"] != "ck_deep_link_namespace_kind"
+    ]
+    with pytest.raises(RuntimeError, match="Critical check constraint ck_deep_link_namespace_kind missing on deep_link_namespace"):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("sqlalchemy.inspect", lambda _c: mock_insp2)
             verify_event_reminder_chains_schema(mock_conn)
 
 
@@ -1450,34 +1493,248 @@ async def test_manual_force_retry_chained_uncertain_child(async_engine_session):
         assert chain[2].status == "pending"
 
 
-# --- Real PostgreSQL Integration Tests ---
+# --- Manual Retry Contract Tests (Revision 11) ---
 
-POSTGRES_TEST_URL = os.environ.get(
-    "POSTGRES_TEST_DATABASE_URL",
-    "postgresql+asyncpg://ivankorakin@localhost:5432/test_tgpsychobot_events",
-)
+@pytest.mark.asyncio
+async def test_manual_force_retry_preserves_expires_at(async_engine_session):
+    """
+    Verifies that create_event_delivery_force_retry strictly preserves parent.expires_at.
+    Essential for immediate_live, immediate_confirmation, and reschedule_notice so that
+    retried deliveries do not lose their business expiration window.
+    """
+    engine, session_factory = async_engine_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        user = User(id=9101, first_name="Dmitry")
+        session.add(user)
+        scenario = EventScenario(
+            code="retry_expires_test",
+            event_type="webinar",
+            title="Webinar",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            link="https://zoom.us",
+        )
+        session.add(scenario)
+        await session.flush()
+        reg = EventRegistration(event_id=scenario.id, user_id=user.id)
+        session.add(reg)
+        await session.flush()
+
+        # 1. immediate_live with non-null expires_at
+        expected_expiry_live = datetime.utcnow() + timedelta(hours=2)
+        live_del = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=None,
+            message_kind="immediate_live",
+            delivery_key=f"ev:{scenario.id}:reg:{reg.id}:live:r0",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            expires_at=expected_expiry_live,
+            platform="telegram",
+            status="uncertain",
+        )
+        session.add(live_del)
+        await session.commit()
+
+        live_child, created_live = await create_event_delivery_force_retry(
+            session, live_del.id, admin_id=10, resolution_reason="Retry live broadcast reminder"
+        )
+        await session.commit()
+        assert created_live is True
+        assert live_child.expires_at is not None
+        assert live_child.expires_at == expected_expiry_live
+
+        # 2. immediate_confirmation with non-null expires_at
+        expected_expiry_conf = datetime.utcnow() + timedelta(hours=1)
+        conf_del = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=None,
+            message_kind="immediate_confirmation",
+            delivery_key=f"ev:{scenario.id}:reg:{reg.id}:conf:r0",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            expires_at=expected_expiry_conf,
+            platform="telegram",
+            status="uncertain",
+        )
+        session.add(conf_del)
+        await session.commit()
+
+        conf_child, created_conf = await create_event_delivery_force_retry(
+            session, conf_del.id, admin_id=10, resolution_reason="Retry confirmation"
+        )
+        await session.commit()
+        assert created_conf is True
+        assert conf_child.expires_at is not None
+        assert conf_child.expires_at == expected_expiry_conf
 
 
-async def _can_connect_to_postgres() -> bool:
+@pytest.mark.asyncio
+async def test_manual_force_retry_rejects_failed_status(async_engine_session):
+    """
+    Per Revision 11, 'failed' is strictly a terminal status.
+    Manual force_retry is exclusively permitted for 'uncertain'.
+    Attempting force_retry on a 'failed' delivery must be rejected and must NOT
+    create a child delivery or an EventDeliveryResolution record.
+    """
+    engine, session_factory = async_engine_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        user = User(id=9201, first_name="Anna")
+        session.add(user)
+        scenario = EventScenario(
+            code="retry_failed_rejection_test",
+            event_type="webinar",
+            title="Webinar",
+            starts_at=datetime.utcnow() + timedelta(days=1),
+            link="https://zoom.us",
+        )
+        session.add(scenario)
+        await session.flush()
+        reg = EventRegistration(event_id=scenario.id, user_id=user.id)
+        session.add(reg)
+        await session.flush()
+
+        failed_del = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=reg.id,
+            step_id=None,
+            message_kind="immediate_confirmation",
+            delivery_key=f"ev:{scenario.id}:reg:{reg.id}:failed:r0",
+            due_at=datetime.utcnow(),
+            next_attempt_at=datetime.utcnow(),
+            platform="telegram",
+            status="failed",
+            last_error="Permanent rejection: user blocked bot",
+        )
+        session.add(failed_del)
+        await session.commit()
+        failed_id = failed_del.id
+
+        # Attempting force_retry must raise ValueError
+        with pytest.raises(ValueError, match="cannot be force-retried.*expected 'uncertain'"):
+            await create_event_delivery_force_retry(
+                session, failed_id, admin_id=10, resolution_reason="Invalid retry of failed delivery"
+            )
+
+        # Assert no child delivery was created
+        child = (await session.execute(
+            select(EventDelivery).where(EventDelivery.parent_delivery_id == failed_id)
+        )).scalars().first()
+        assert child is None
+
+        # Assert no EventDeliveryResolution was created
+        resolution = (await session.execute(
+            select(EventDeliveryResolution).where(EventDeliveryResolution.delivery_id == failed_id)
+        )).scalars().first()
+        assert resolution is None
+
+
+# --- Real PostgreSQL Integration Tests (Protected Destructive Suite) ---
+
+def validate_safe_test_db_name(db_name: str | None) -> str:
+    """
+    Validates that a database name is explicitly disposable/test.
+    Rejects any database that does not start with 'test_' or contains prod/staging/live markers.
+    """
+    if not db_name or not db_name.strip():
+        raise ValueError("SAFETY ABORT: Database name is empty or not provided.")
+    lowered = db_name.strip().lower()
+    if not lowered.startswith("test_"):
+        raise ValueError(
+            f"SAFETY ABORT: Refusing destructive test on database '{db_name}'. "
+            "Database name must strictly start with 'test_' prefix (e.g. 'test_tgpsychobot_events')."
+        )
+    for forbidden in ("prod", "stage", "staging", "live", "main", "master"):
+        if forbidden in lowered:
+            raise ValueError(
+                f"SAFETY ABORT: Refusing destructive test on database '{db_name}'. "
+                f"Name contains forbidden keyword '{forbidden}'."
+            )
+    return lowered
+
+
+def test_validate_safe_test_db_name_safety_guard():
+    """Unit test: verifies that disposable database validator rejects dangerous/unintended DB names."""
+    assert validate_safe_test_db_name("test_tgpsychobot_events") == "test_tgpsychobot_events"
+    assert validate_safe_test_db_name("test_db") == "test_db"
+    assert validate_safe_test_db_name("test_temp_ci_123") == "test_temp_ci_123"
+
+    for unsafe in (
+        None,
+        "",
+        "   ",
+        "psychobot",
+        "tgpsychobot",
+        "postgres",
+        "production",
+        "test_prod",
+        "test_production",
+        "test_staging",
+        "test_stage",
+        "test_live",
+        "test_master",
+        "test_main",
+    ):
+        with pytest.raises(ValueError, match="SAFETY ABORT"):
+            validate_safe_test_db_name(unsafe)
+
+
+async def _get_safe_postgres_engine():
+    """
+    Returns (engine, None) ONLY if POSTGRES_TEST_DATABASE_URL is explicitly set and points
+    to a strictly validated disposable test database.
+    Otherwise returns (None, skip_reason).
+    """
+    postgres_test_url = os.environ.get("POSTGRES_TEST_DATABASE_URL")
+    if not postgres_test_url or not postgres_test_url.strip():
+        return None, (
+            "POSTGRES_TEST_DATABASE_URL environment variable is not explicitly set; "
+            "skipping real destructive PostgreSQL integration tests. "
+            "Destructive PostgreSQL tests require an explicit POSTGRES_TEST_DATABASE_URL."
+        )
+
+    url_str = postgres_test_url.strip()
     try:
-        test_engine = create_async_engine(POSTGRES_TEST_URL)
-        async with test_engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        await test_engine.dispose()
-        return True
-    except Exception:
-        return False
+        parsed_url = make_url(url_str)
+        validate_safe_test_db_name(parsed_url.database)
+    except ValueError as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, f"SAFETY ABORT: Invalid POSTGRES_TEST_DATABASE_URL: {exc}"
+
+    try:
+        engine = create_async_engine(url_str)
+        async with engine.connect() as conn:
+            actual_db = (await conn.execute(text("SELECT current_database()"))).scalar()
+            validate_safe_test_db_name(actual_db)
+        return engine, None
+    except Exception as exc:
+        return None, f"Failed to connect to validated PostgreSQL test database: {exc}"
 
 
 @pytest.mark.asyncio
 async def test_real_postgresql_init_and_schema_verification():
     """Real PostgreSQL integration test: verifies init_db and fail-closed schema verification on PostgreSQL."""
-    if not await _can_connect_to_postgres():
-        pytest.skip("Real PostgreSQL is not reachable in this environment; CI/integration environment required")
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
 
-    pg_engine = create_async_engine(POSTGRES_TEST_URL)
     try:
-        # Reset public schema
+        # SAFETY WARNING: DROP SCHEMA public CASCADE is strictly destructive and is allowed
+        # ONLY because we verified that POSTGRES_TEST_DATABASE_URL was explicitly set,
+        # current_database() strictly starts with 'test_', and contains no production/staging keywords.
         async with pg_engine.begin() as conn:
             await conn.execute(text("DROP SCHEMA public CASCADE;"))
             await conn.execute(text("CREATE SCHEMA public;"))
@@ -1498,11 +1755,14 @@ async def test_real_postgresql_init_and_schema_verification():
 @pytest.mark.asyncio
 async def test_real_postgresql_structural_invariants_and_retry_model():
     """Real PostgreSQL integration test: verifies CHECK constraints, partial unique index, and retry chaining on PostgreSQL."""
-    if not await _can_connect_to_postgres():
-        pytest.skip("Real PostgreSQL is not reachable in this environment; CI/integration environment required")
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
 
-    pg_engine = create_async_engine(POSTGRES_TEST_URL)
     try:
+        # SAFETY WARNING: DROP SCHEMA public CASCADE is strictly destructive and is allowed
+        # ONLY because we verified that POSTGRES_TEST_DATABASE_URL was explicitly set,
+        # current_database() strictly starts with 'test_', and contains no production/staging keywords.
         async with pg_engine.begin() as conn:
             await conn.execute(text("DROP SCHEMA public CASCADE;"))
             await conn.execute(text("CREATE SCHEMA public;"))
