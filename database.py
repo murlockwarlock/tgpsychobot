@@ -1,9 +1,11 @@
 import asyncio
 import hashlib
+import re
 import textwrap
 from sqlalchemy import (create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, BigInteger, Table,
-                        Float, Interval, Index, UniqueConstraint, func, text)
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+                        Float, Interval, Index, UniqueConstraint, CheckConstraint, func, text)
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, validates
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession as SQLAlchemyAsyncSession
 from datetime import datetime, timedelta
 from config import DATABASE_URL
@@ -1187,6 +1189,280 @@ def verify_payment_notification_outbox_schema(sync_conn) -> None:
         raise RuntimeError("Critical composite index on payment_notification_outbox(status, lease_until) is missing")
 
 
+def verify_event_reminder_chains_schema(sync_conn) -> None:
+    """
+    Fail-closed structural safety verifier for event reminder chains subsystem (Revision 11).
+    Asserts presence and correct definition of:
+    1. Tables deep_link_namespace, event_scenarios, event_steps, event_registrations,
+       event_deliveries, event_delivery_resolutions.
+    2. Required columns and NOT NULL nullability constraints on all tables.
+    3. Critical foreign keys and ondelete='RESTRICT' actions.
+    4. Model CheckConstraints.
+    5. Critical unique constraints and composite indexes with strict column order.
+    """
+    from sqlalchemy import inspect as sa_inspect
+    insp = sa_inspect(sync_conn)
+
+    # 1. Table presence
+    required_tables = [
+        "deep_link_namespace",
+        "event_scenarios",
+        "event_steps",
+        "event_registrations",
+        "event_deliveries",
+        "event_delivery_resolutions",
+    ]
+    for tbl in required_tables:
+        if not insp.has_table(tbl):
+            raise RuntimeError(f"Critical table {tbl} is missing")
+
+    # 2. Column presence and NOT NULL nullability
+    table_column_specs = {
+        "deep_link_namespace": {
+            "required_not_null": {"code", "kind", "created_at"},
+            "optional_nullable": {"reference_id"},
+        },
+        "event_scenarios": {
+            "required_not_null": {
+                "id", "code", "event_type", "title", "starts_at", "duration_minutes",
+                "is_active", "is_archived", "schedule_revision", "content_version",
+                "created_at", "updated_at",
+            },
+            "optional_nullable": {"place", "link", "archived_at"},
+        },
+        "event_steps": {
+            "required_not_null": {
+                "id", "event_id", "offset_minutes", "message_text", "step_version",
+                "sort_order", "is_archived", "created_at", "updated_at",
+            },
+            "optional_nullable": set(),
+        },
+        "event_registrations": {
+            "required_not_null": {
+                "id", "event_id", "user_id", "status", "generation",
+                "registration_mode", "registered_at", "updated_at",
+            },
+            "optional_nullable": {"cancelled_at", "rejoined_at"},
+        },
+        "event_deliveries": {
+            "required_not_null": {
+                "id", "event_id", "user_id", "registration_id", "retry_index",
+                "message_kind", "delivery_key", "due_at", "next_attempt_at",
+                "schedule_revision", "registration_generation", "platform",
+                "status", "attempt_count", "created_at", "updated_at",
+            },
+            "optional_nullable": {
+                "step_id", "parent_delivery_id", "expires_at", "skip_reason",
+                "claim_token", "claimed_at", "lease_until", "send_started_at",
+                "sent_at", "finished_at", "last_error", "external_message_id",
+                "rendered_text_snapshot", "template_text_snapshot",
+            },
+        },
+        "event_delivery_resolutions": {
+            "required_not_null": {
+                "id", "delivery_id", "admin_id", "resolution_type",
+                "resolution_reason", "resolved_at",
+            },
+            "optional_nullable": set(),
+        },
+    }
+
+    for tbl, specs in table_column_specs.items():
+        cols = {c["name"]: c for c in insp.get_columns(tbl)}
+        all_expected = specs["required_not_null"] | specs["optional_nullable"]
+        for col_name in all_expected:
+            if col_name not in cols:
+                raise RuntimeError(f"Critical column {col_name} missing in {tbl}")
+        for col_name in specs["required_not_null"]:
+            if cols[col_name].get("nullable") is not False:
+                raise RuntimeError(f"Critical column {col_name} in {tbl} must be NOT NULL")
+
+    # 3. Foreign Keys and ondelete actions (RESTRICT)
+    expected_foreign_keys = {
+        "event_steps": [
+            {
+                "constrained_columns": ["event_id"],
+                "referred_table": "event_scenarios",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+        ],
+        "event_registrations": [
+            {
+                "constrained_columns": ["event_id"],
+                "referred_table": "event_scenarios",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+            {
+                "constrained_columns": ["user_id"],
+                "referred_table": "users",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+        ],
+        "event_deliveries": [
+            {
+                "constrained_columns": ["event_id"],
+                "referred_table": "event_scenarios",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+            {
+                "constrained_columns": ["user_id"],
+                "referred_table": "users",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+            {
+                "constrained_columns": ["registration_id"],
+                "referred_table": "event_registrations",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+            {
+                "constrained_columns": ["step_id"],
+                "referred_table": "event_steps",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+            {
+                "constrained_columns": ["parent_delivery_id"],
+                "referred_table": "event_deliveries",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+        ],
+        "event_delivery_resolutions": [
+            {
+                "constrained_columns": ["delivery_id"],
+                "referred_table": "event_deliveries",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+        ],
+    }
+
+    for tbl, fks_expected in expected_foreign_keys.items():
+        actual_fks = insp.get_foreign_keys(tbl)
+        for exp in fks_expected:
+            exp_cols = exp["constrained_columns"]
+            exp_ref_tbl = exp["referred_table"]
+            exp_ref_cols = exp["referred_columns"]
+            exp_ondelete = exp["ondelete"].upper()
+
+            matched = False
+            for act in actual_fks:
+                act_cols = act.get("constrained_columns") or []
+                act_ref_tbl = act.get("referred_table")
+                act_ref_cols = act.get("referred_columns") or []
+                act_ondelete = str((act.get("options") or {}).get("ondelete") or "").upper()
+
+                if act_cols == exp_cols and act_ref_tbl == exp_ref_tbl and act_ref_cols == exp_ref_cols:
+                    if act_ondelete != exp_ondelete:
+                        raise RuntimeError(
+                            f"ForeignKey {tbl}.{exp_cols} -> {exp_ref_tbl} has ondelete='{act_ondelete}', expected '{exp_ondelete}'"
+                        )
+                    matched = True
+                    break
+            if not matched:
+                raise RuntimeError(
+                    f"Critical foreign key missing: {tbl}.{exp_cols} -> {exp_ref_tbl}.{exp_ref_cols}"
+                )
+
+    # 4. Check Constraints
+    expected_check_constraints = {
+        "deep_link_namespace": {
+            "ck_deep_link_namespace_kind",
+        },
+        "event_scenarios": {
+            "ck_event_scenarios_type",
+            "ck_event_scenarios_duration",
+            "ck_event_scenarios_revision",
+            "ck_event_scenarios_content_version",
+            "ck_event_scenarios_location",
+        },
+        "event_steps": {
+            "ck_event_steps_step_version",
+        },
+        "event_registrations": {
+            "ck_event_registrations_status",
+            "ck_event_registrations_mode",
+            "ck_event_registrations_generation",
+        },
+        "event_deliveries": {
+            "ck_event_deliveries_kind",
+            "ck_event_deliveries_status",
+            "ck_event_deliveries_step_kind",
+            "ck_event_deliveries_platform",
+            "ck_event_deliveries_retry_index",
+            "ck_event_deliveries_reg_gen",
+            "ck_event_deliveries_attempt_count",
+        },
+        "event_delivery_resolutions": {
+            "ck_event_delivery_resolution_type",
+        },
+    }
+
+    for tbl, expected_cks in expected_check_constraints.items():
+        actual_ck_names = {ck.get("name") for ck in insp.get_check_constraints(tbl)}
+        for ck_name in expected_cks:
+            if ck_name not in actual_ck_names:
+                raise RuntimeError(f"Critical check constraint {ck_name} missing on {tbl}")
+
+    # 5. Composite indexes (strict order, no set()) and unique constraints
+    def _has_ordered_index(table_name: str, expected_cols: list[str], unique: bool | None = None) -> bool:
+        for idx in insp.get_indexes(table_name):
+            col_names = idx.get("column_names") or []
+            if col_names == expected_cols:
+                if unique is None or bool(idx.get("unique")) == unique:
+                    return True
+        return False
+
+    def _has_ordered_unique(table_name: str, expected_cols: list[str]) -> bool:
+        pk = insp.get_pk_constraint(table_name)
+        if pk and (pk.get("constrained_columns") or []) == expected_cols:
+            return True
+        for uc in insp.get_unique_constraints(table_name):
+            if (uc.get("column_names") or []) == expected_cols:
+                return True
+        for idx in insp.get_indexes(table_name):
+            if bool(idx.get("unique")) and (idx.get("column_names") or []) == expected_cols:
+                return True
+        return False
+
+    if not _has_ordered_unique("deep_link_namespace", ["code"]):
+        raise RuntimeError("Critical unique constraint or PK on deep_link_namespace.code is missing")
+
+    if not _has_ordered_unique("event_scenarios", ["code"]):
+        raise RuntimeError("Critical unique constraint on event_scenarios.code is missing")
+
+    if not _has_ordered_unique("event_registrations", ["event_id", "user_id"]):
+        raise RuntimeError("Critical unique constraint uq_event_registrations_event_user is missing")
+
+    if not _has_ordered_unique("event_deliveries", ["delivery_key"]):
+        raise RuntimeError("Critical unique constraint on event_deliveries.delivery_key is missing")
+
+    if not _has_ordered_unique("event_deliveries", ["registration_id", "step_id", "retry_index"]):
+        raise RuntimeError("Critical unique constraint uq_event_delivery_scheduled is missing")
+
+    if not _has_ordered_index("event_deliveries", ["parent_delivery_id"], unique=True):
+        raise RuntimeError("Critical unique index uq_event_deliveries_parent_delivery_id is missing")
+
+    # Strict column order check for composite poll index
+    if not _has_ordered_index("event_deliveries", ["status", "next_attempt_at", "due_at"], unique=False):
+        raise RuntimeError(
+            "Critical index ix_event_deliveries_poll with ordered columns (status, next_attempt_at, due_at) is missing"
+        )
+
+    # Strict column order check for composite execution order index
+    if not _has_ordered_index("event_steps", ["event_id", "offset_minutes", "sort_order", "id"], unique=False):
+        raise RuntimeError(
+            "Critical index ix_event_steps_execution_order with ordered columns (event_id, offset_minutes, sort_order, id) is missing"
+        )
+
+
+
 
 async def init_db():
     async with engine.begin() as conn:
@@ -1597,6 +1873,95 @@ async def init_db():
             verify_yookassa_recurring_safety_schema(sync_conn)
             verify_payment_notification_outbox_schema(sync_conn)
 
+            # Event Reminder Chains subsystem migrations & verification
+            DeepLinkNamespace.__table__.create(sync_conn, checkfirst=True)
+            if dialect_name == "postgresql" and insp.has_table('deep_link_namespace'):
+                try:
+                    actual_cks = {c.get("name") for c in insp.get_check_constraints("deep_link_namespace")}
+                    if "ck_deep_link_namespace_kind" not in actual_cks:
+                        sync_conn.execute(text(
+                            "ALTER TABLE deep_link_namespace "
+                            "ADD CONSTRAINT ck_deep_link_namespace_kind "
+                            "CHECK (kind IN ('event', 'content', 'system'))"
+                        ))
+                except Exception:
+                    pass
+            EventScenario.__table__.create(sync_conn, checkfirst=True)
+            EventStep.__table__.create(sync_conn, checkfirst=True)
+            EventRegistration.__table__.create(sync_conn, checkfirst=True)
+            EventDelivery.__table__.create(sync_conn, checkfirst=True)
+            EventDeliveryResolution.__table__.create(sync_conn, checkfirst=True)
+
+            # Seed system reserved codes in deep_link_namespace
+            system_codes = [
+                ("sub", "system", None),
+                ("ref", "system", None),
+                ("test", "system", None),
+                ("admin", "system", None),
+                ("promo", "system", None),
+                ("start_message", "system", "content"),
+                ("menu", "system", "content"),
+            ]
+            if dialect_name == "postgresql":
+                sync_conn.execute(text(
+                    "INSERT INTO deep_link_namespace (code, kind, reference_id, created_at) "
+                    "VALUES (:code, :kind, :ref_id, CURRENT_TIMESTAMP) "
+                    "ON CONFLICT (code) DO NOTHING"
+                ), [{"code": c, "kind": k, "ref_id": r} for c, k, r in system_codes])
+                if insp.has_table('content'):
+                    sync_conn.execute(text(
+                        "INSERT INTO deep_link_namespace (code, kind, reference_id, created_at) "
+                        "SELECT LOWER(TRIM(key)), 'content', key, CURRENT_TIMESTAMP "
+                        "FROM content WHERE key IS NOT NULL "
+                        "ON CONFLICT (code) DO NOTHING"
+                    ))
+            else:
+                sync_conn.execute(text(
+                    "INSERT OR IGNORE INTO deep_link_namespace (code, kind, reference_id, created_at) "
+                    "VALUES (:code, :kind, :ref_id, CURRENT_TIMESTAMP)"
+                ), [{"code": c, "kind": k, "ref_id": r} for c, k, r in system_codes])
+                if insp.has_table('content'):
+                    sync_conn.execute(text(
+                        "INSERT OR IGNORE INTO deep_link_namespace (code, kind, reference_id, created_at) "
+                        "SELECT LOWER(TRIM(key)), 'content', key, CURRENT_TIMESTAMP "
+                        "FROM content WHERE key IS NOT NULL"
+                    ))
+
+            # Ensure critical composite indexes exist
+            try:
+                sync_conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_event_delivery_scheduled "
+                    "ON event_deliveries (registration_id, step_id, retry_index)"
+                ))
+            except Exception:
+                pass
+
+            try:
+                sync_conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_event_deliveries_poll "
+                    "ON event_deliveries (status, next_attempt_at, due_at)"
+                ))
+            except Exception:
+                pass
+
+            try:
+                sync_conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_event_steps_execution_order "
+                    "ON event_steps (event_id, offset_minutes, sort_order, id)"
+                ))
+            except Exception:
+                pass
+
+            try:
+                sync_conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_event_deliveries_parent_delivery_id "
+                    "ON event_deliveries (parent_delivery_id) WHERE parent_delivery_id IS NOT NULL"
+                ))
+            except Exception:
+                pass
+
+            verify_event_reminder_chains_schema(sync_conn)
+
         await conn.run_sync(_check_and_migrate)
 
     async with async_session_maker() as session:
@@ -1761,6 +2126,8 @@ async def init_db():
 
         await backfill_test_history_messages(session)
         await session.commit()
+
+        await sync_deep_link_namespace(session)
 
 
 class UserTopicState(Base):
@@ -2183,3 +2550,362 @@ class PaymentNotificationOutbox(Base):
     delivered_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+# ============================================================================
+# Event Reminder Chains Subsystem Models (Revision 11)
+# ============================================================================
+
+class DeepLinkNamespace(Base):
+    """Unified start code reservation registry protecting start deep-links."""
+
+    __tablename__ = 'deep_link_namespace'
+    __table_args__ = (
+        CheckConstraint("kind IN ('event', 'content', 'system')", name="ck_deep_link_namespace_kind"),
+    )
+
+    # Unbounded String matches Content.key without truncation (> 255 chars preserved)
+    code = Column(String, primary_key=True)
+    kind = Column(String(16), nullable=False)  # 'event', 'content', 'system'
+    reference_id = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class EventScenario(Base):
+    """Event scenario definition for webinars and in-person meetings."""
+
+    __tablename__ = 'event_scenarios'
+    __table_args__ = (
+        CheckConstraint("event_type IN ('webinar', 'meeting')", name="ck_event_scenarios_type"),
+        CheckConstraint("duration_minutes >= 15 AND duration_minutes <= 1440", name="ck_event_scenarios_duration"),
+        CheckConstraint("schedule_revision >= 1", name="ck_event_scenarios_revision"),
+        CheckConstraint("content_version >= 1", name="ck_event_scenarios_content_version"),
+        CheckConstraint(
+            "((event_type = 'webinar' AND link IS NOT NULL AND length(trim(link)) > 0 AND place IS NULL) "
+            "OR (event_type = 'meeting' AND place IS NOT NULL AND length(trim(place)) > 0))",
+            name="ck_event_scenarios_location",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(64), unique=True, nullable=False, index=True)
+    event_type = Column(String(16), nullable=False)
+    title = Column(String(255), nullable=False)
+    starts_at = Column(DateTime, nullable=False)  # naive UTC
+    duration_minutes = Column(Integer, default=120, nullable=False)
+    place = Column(Text, nullable=True)  # Strictly NULL for webinar; NOT NULL for meeting
+    link = Column(Text, nullable=True)  # Strictly NOT NULL for webinar; nullable for meeting
+    is_active = Column(Boolean, default=False, nullable=False)
+    is_archived = Column(Boolean, default=False, nullable=False)
+    archived_at = Column(DateTime, nullable=True)
+    schedule_revision = Column(Integer, default=1, nullable=False)
+    content_version = Column(Integer, default=1, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    steps = relationship("EventStep", back_populates="event")
+    registrations = relationship("EventRegistration", back_populates="event")
+    deliveries = relationship("EventDelivery", back_populates="event")
+
+    @validates("code")
+    def _validate_code_immutable(self, key, value):
+        current = getattr(self, "code", None)
+        if current is not None and current != value:
+            raise ValueError("EventScenario.code is immutable and cannot be changed")
+        return value
+
+
+class EventStep(Base):
+    """Scheduled reminder chain step with signed offset from event start time."""
+
+    __tablename__ = 'event_steps'
+    __table_args__ = (
+        CheckConstraint("step_version >= 1", name="ck_event_steps_step_version"),
+        Index('ix_event_steps_execution_order', 'event_id', 'offset_minutes', 'sort_order', 'id'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(Integer, ForeignKey('event_scenarios.id', ondelete='RESTRICT'), nullable=False, index=True)
+    offset_minutes = Column(Integer, nullable=False)  # signed offset (e.g., -1440 = 24h before)
+    message_text = Column(Text, nullable=False)
+    step_version = Column(Integer, default=1, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    is_archived = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    event = relationship("EventScenario", back_populates="steps")
+    deliveries = relationship("EventDelivery", back_populates="step")
+
+
+class EventRegistration(Base):
+    """User registration record for an event scenario."""
+
+    __tablename__ = 'event_registrations'
+    __table_args__ = (
+        UniqueConstraint('event_id', 'user_id', name='uq_event_registrations_event_user'),
+        CheckConstraint("status IN ('started', 'cancelled')", name="ck_event_registrations_status"),
+        CheckConstraint("registration_mode IN ('standard', 'urgent_late')", name="ck_event_registrations_mode"),
+        CheckConstraint("generation >= 1", name="ck_event_registrations_generation"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(Integer, ForeignKey('event_scenarios.id', ondelete='RESTRICT'), nullable=False, index=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False, index=True)
+    status = Column(String(16), default='started', nullable=False)
+    generation = Column(Integer, default=1, nullable=False)
+    registration_mode = Column(String(16), default='standard', nullable=False)
+    registered_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    cancelled_at = Column(DateTime, nullable=True)
+    rejoined_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    event = relationship("EventScenario", back_populates="registrations")
+    user = relationship("User")
+    deliveries = relationship("EventDelivery", back_populates="registration")
+
+
+class EventDelivery(Base):
+    """Durable delivery record for event messages with retry index support."""
+
+    __tablename__ = 'event_deliveries'
+    __table_args__ = (
+        UniqueConstraint('registration_id', 'step_id', 'retry_index', name='uq_event_delivery_scheduled'),
+        Index(
+            'uq_event_deliveries_parent_delivery_id',
+            'parent_delivery_id',
+            unique=True,
+            sqlite_where=text("parent_delivery_id IS NOT NULL"),
+            postgresql_where=text("parent_delivery_id IS NOT NULL"),
+        ),
+        CheckConstraint("message_kind IN ('scheduled_step', 'immediate_confirmation', 'immediate_live', 'reschedule_notice')", name="ck_event_deliveries_kind"),
+        CheckConstraint("status IN ('pending', 'claimed', 'sending', 'sent', 'skipped', 'blocked', 'failed', 'uncertain', 'resolved_sent', 'resolved_skipped')", name="ck_event_deliveries_status"),
+        CheckConstraint(
+            "((message_kind = 'scheduled_step' AND step_id IS NOT NULL) "
+            "OR (message_kind IN ('immediate_confirmation', 'immediate_live', 'reschedule_notice') AND step_id IS NULL))",
+            name="ck_event_deliveries_step_kind",
+        ),
+        CheckConstraint("platform IN ('telegram', 'max')", name="ck_event_deliveries_platform"),
+        CheckConstraint("retry_index >= 0", name="ck_event_deliveries_retry_index"),
+        CheckConstraint("registration_generation >= 1", name="ck_event_deliveries_reg_gen"),
+        CheckConstraint("attempt_count >= 0", name="ck_event_deliveries_attempt_count"),
+        Index('ix_event_deliveries_poll', 'status', 'next_attempt_at', 'due_at'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(Integer, ForeignKey('event_scenarios.id', ondelete='RESTRICT'), nullable=False, index=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False, index=True)
+    registration_id = Column(Integer, ForeignKey('event_registrations.id', ondelete='RESTRICT'), nullable=False, index=True)
+    step_id = Column(Integer, ForeignKey('event_steps.id', ondelete='RESTRICT'), nullable=True, index=True)
+    retry_index = Column(Integer, default=0, nullable=False)
+    parent_delivery_id = Column(Integer, ForeignKey('event_deliveries.id', ondelete='RESTRICT'), nullable=True)
+    message_kind = Column(String(32), nullable=False)
+    delivery_key = Column(String(128), unique=True, nullable=False, index=True)
+    due_at = Column(DateTime, nullable=False, index=True)
+    next_attempt_at = Column(DateTime, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=True)
+    schedule_revision = Column(Integer, default=1, nullable=False)
+    registration_generation = Column(Integer, default=1, nullable=False)
+    platform = Column(String(16), nullable=False)  # 'telegram' | 'max'
+    status = Column(String(16), default='pending', nullable=False)
+    skip_reason = Column(String(32), nullable=True)
+    claim_token = Column(String(64), nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    send_started_at = Column(DateTime, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    attempt_count = Column(Integer, default=0, nullable=False)
+    last_error = Column(Text, nullable=True)
+    external_message_id = Column(String(128), nullable=True)
+    rendered_text_snapshot = Column(Text, nullable=True)
+    template_text_snapshot = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    event = relationship("EventScenario", back_populates="deliveries")
+    user = relationship("User")
+    registration = relationship("EventRegistration", back_populates="deliveries")
+    step = relationship("EventStep", back_populates="deliveries")
+    parent_delivery = relationship("EventDelivery", remote_side=[id])
+    resolutions = relationship("EventDeliveryResolution", back_populates="delivery")
+
+
+class EventDeliveryResolution(Base):
+    """Audit log of administrative resolutions for uncertain or manual event deliveries."""
+
+    __tablename__ = 'event_delivery_resolutions'
+    __table_args__ = (
+        CheckConstraint("resolution_type IN ('force_retry', 'mark_skipped', 'mark_sent')", name="ck_event_delivery_resolution_type"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    delivery_id = Column(Integer, ForeignKey('event_deliveries.id', ondelete='RESTRICT'), nullable=False, index=True)
+    admin_id = Column(BigInteger, nullable=False)
+    resolution_type = Column(String(32), nullable=False)
+    resolution_reason = Column(Text, nullable=False)
+    resolved_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    delivery = relationship("EventDelivery", back_populates="resolutions")
+
+
+async def sync_deep_link_namespace(session: AsyncSession) -> None:
+    """Синхронизирует системные коды и ключи контента с deep_link_namespace."""
+    from sqlalchemy import select
+
+    system_entries = [
+        {"code": "sub", "kind": "system", "reference_id": None},
+        {"code": "ref", "kind": "system", "reference_id": None},
+        {"code": "test", "kind": "system", "reference_id": None},
+        {"code": "admin", "kind": "system", "reference_id": None},
+        {"code": "promo", "kind": "system", "reference_id": None},
+        {"code": "start_message", "kind": "system", "reference_id": "content"},
+        {"code": "menu", "kind": "system", "reference_id": "content"},
+    ]
+
+    for item in system_entries:
+        existing = await session.get(DeepLinkNamespace, item["code"])
+        if not existing:
+            session.add(DeepLinkNamespace(
+                code=item["code"],
+                kind=item["kind"],
+                reference_id=item["reference_id"],
+            ))
+
+    content_rows = (await session.execute(select(Content.key))).scalars().all()
+    for raw_key in content_rows:
+        if raw_key:
+            norm_code = str(raw_key).strip().lower()
+            existing = await session.get(DeepLinkNamespace, norm_code)
+            if not existing:
+                session.add(DeepLinkNamespace(
+                    code=norm_code,
+                    kind="content",
+                    reference_id=str(raw_key),
+                ))
+
+    await session.commit()
+
+
+async def reserve_start_code(
+    session: AsyncSession,
+    code: str,
+    kind: str,
+    reference_id: str | None = None,
+) -> None:
+    """Резервирует стартовый код в таблице deep_link_namespace с защитой от race condition."""
+    if kind not in ("event", "content", "system"):
+        raise ValueError(f"Недопустимый kind '{kind}' (ожидается 'event', 'content' или 'system')")
+    norm_code = code.strip().lower()
+    if kind == "event" and not re.match(r"^[a-z0-9_-]{3,64}$", norm_code):
+        raise ValueError("Недопустимый формат кода события (3-64 символа, a-z, 0-9, _, -)")
+    if not norm_code:
+        raise ValueError("Код не может быть пустым")
+    if norm_code in {"sub", "ref", "test", "menu", "start_message", "admin", "promo"} or \
+       any(norm_code.startswith(p) for p in ("topic_", "ref_", "ev_", "admin_")):
+        raise ValueError("Код зарезервирован системой")
+
+    async with session.begin_nested():
+        try:
+            session.add(DeepLinkNamespace(code=norm_code, kind=kind, reference_id=reference_id))
+            await session.flush()
+        except IntegrityError as exc:
+            raise ValueError(f"Код '{norm_code}' уже занят в пространстве start-кодов") from exc
+
+
+class DeliveryRetryError(ValueError):
+    """Raised when a manual force-retry cannot be created or already exists."""
+    pass
+
+
+async def create_event_delivery_force_retry(
+    session: AsyncSession,
+    delivery_id: int,
+    admin_id: int,
+    resolution_reason: str,
+    *,
+    raise_on_duplicate: bool = False,
+) -> tuple[EventDelivery, bool]:
+    """
+    Creates an administrative force_retry for an uncertain delivery.
+
+    Contract:
+    - Target delivery must be strictly in 'uncertain' status (status 'failed' is terminal and rejected).
+    - At most one immediate retry-child per parent delivery (enforced in DB via
+      partial unique index on parent_delivery_id).
+    - Repeated force_retry of the same parent delivery is idempotently rejected:
+      if raise_on_duplicate=False, returns (existing_child, False);
+      if raise_on_duplicate=True, raises DeliveryRetryError.
+    - If a retry-child itself becomes uncertain, a new retry can be
+      created referencing that child as parent.
+    - retry_index increments monotonically along the chain (parent.retry_index + 1).
+    - expires_at is preserved from parent.expires_at to maintain the business validity window.
+    - Writes an audit log record into event_delivery_resolutions.
+    """
+    from sqlalchemy import select
+    parent = await session.get(EventDelivery, delivery_id)
+    if not parent:
+        raise ValueError(f"Event delivery {delivery_id} not found")
+
+    if parent.status != "uncertain":
+        raise ValueError(
+            f"Delivery {delivery_id} with status '{parent.status}' cannot be force-retried "
+            "(expected 'uncertain')"
+        )
+
+    # Check if a direct retry-child already exists for this parent
+    existing_stmt = select(EventDelivery).where(EventDelivery.parent_delivery_id == parent.id)
+    existing_child = (await session.execute(existing_stmt)).scalars().first()
+    if existing_child is not None:
+        if raise_on_duplicate:
+            raise DeliveryRetryError(
+                f"Parent delivery {delivery_id} already has a retry-child delivery {existing_child.id}"
+            )
+        return existing_child, False
+
+    resolution = EventDeliveryResolution(
+        delivery_id=parent.id,
+        admin_id=admin_id,
+        resolution_type="force_retry",
+        resolution_reason=resolution_reason,
+    )
+    session.add(resolution)
+    await session.flush()
+
+    new_retry_index = parent.retry_index + 1
+    if parent.step_id is not None:
+        new_delivery_key = (
+            f"ev:{parent.event_id}:reg:{parent.registration_id}:step:{parent.step_id}:"
+            f"r{new_retry_index}:p{parent.id}:res:{resolution.id}"
+        )
+    else:
+        new_delivery_key = (
+            f"ev:{parent.event_id}:reg:{parent.registration_id}:kind:{parent.message_kind}:"
+            f"r{new_retry_index}:p{parent.id}:res:{resolution.id}"
+        )
+
+    now = datetime.utcnow()
+    child_delivery = EventDelivery(
+        event_id=parent.event_id,
+        user_id=parent.user_id,
+        registration_id=parent.registration_id,
+        step_id=parent.step_id,
+        retry_index=new_retry_index,
+        parent_delivery_id=parent.id,
+        message_kind=parent.message_kind,
+        delivery_key=new_delivery_key,
+        due_at=parent.due_at,
+        next_attempt_at=now,
+        expires_at=parent.expires_at,
+        schedule_revision=parent.schedule_revision,
+        registration_generation=parent.registration_generation,
+        platform=parent.platform,
+        status="pending",
+        rendered_text_snapshot=parent.rendered_text_snapshot,
+        template_text_snapshot=parent.template_text_snapshot,
+    )
+    session.add(child_delivery)
+    await session.flush()
+
+    return child_delivery, True
+
