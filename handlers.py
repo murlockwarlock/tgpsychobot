@@ -4203,6 +4203,12 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
     )
 
 
+@router.callback_query(F.data.startswith("ev_cancel:") | F.data.startswith("ev_rejoin:"))
+async def cb_event_reminder_actions(callback: CallbackQuery):
+    from event_service import handle_event_callback_telegram
+    await handle_event_callback_telegram(callback)
+
+
 @router.callback_query(F.data.startswith("select_telegram_language:"))
 async def select_telegram_language(callback: CallbackQuery, state: FSMContext, bot: Bot):
     locale = normalize_locale((callback.data or "").split(":", 1)[-1])
@@ -4457,6 +4463,13 @@ async def _run_start_business(
                 pass
 
             else:
+                from event_service import handle_event_start_telegram
+                if await handle_event_start_telegram(bot, message.chat.id, user_id, args):
+                    if bonus_messages:
+                        await send_bonus_messages()
+                    await complete_start_intent_if_safe()
+                    return
+
                 rendered = await render_static_content_telegram(bot, message.chat.id, user_id, args)
                 if rendered:
                     if bonus_messages:

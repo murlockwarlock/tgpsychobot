@@ -996,6 +996,11 @@ class MaxBotApplication:
         chat_id = callback.chat_id
         await self._invalidate_stale_followup_callback_state(user_id, data)
 
+        if data.startswith("ev_cancel:") or data.startswith("ev_rejoin:"):
+            from event_service import handle_event_callback_max
+            await handle_event_callback_max(self.client, callback)
+            return
+
         if data == "main_menu":
             await self.client.answer_callback(callback.callback_id)
             await common.show_menu(self.client, chat_id, user_id=user_id)
