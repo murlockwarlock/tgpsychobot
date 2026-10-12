@@ -253,6 +253,51 @@ async def sweep_expired_pending_deliveries(
         return res.rowcount or 0
 
 
+async def sweep_missed_inactive_scenario_deliveries(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """
+    Sweeps pending deliveries belonging to inactive (paused) scenarios whose due_at
+    has already passed (due_at <= now).
+    Transitions them deterministically to 'skipped' with skip_reason='disabled_past'.
+    """
+    effective_now = now or datetime.utcnow()
+    async with session_maker() as session:
+        stmt = (
+            select(EventDelivery.id)
+            .join(EventScenario, EventDelivery.event_id == EventScenario.id)
+            .where(
+                EventDelivery.status == "pending",
+                EventDelivery.due_at <= effective_now,
+                EventScenario.is_active.is_(False),
+            )
+        )
+        res = await session.execute(stmt)
+        deliv_ids = [row[0] for row in res.all()]
+        if not deliv_ids:
+            return 0
+
+        upd = (
+            update(EventDelivery)
+            .where(EventDelivery.id.in_(deliv_ids), EventDelivery.status == "pending")
+            .values(
+                status="skipped",
+                skip_reason="disabled_past",
+                finished_at=effective_now,
+                claim_token=None,
+                lease_until=None,
+                send_started_at=None,
+                claimed_at=None,
+                updated_at=effective_now,
+            )
+        )
+        upd_res = await session.execute(upd)
+        await session.commit()
+        return upd_res.rowcount or 0
+
+
 async def finalize_delivery_outcome(
     session_maker: async_sessionmaker[AsyncSession],
     delivery_id: int,
@@ -651,6 +696,7 @@ async def run_event_delivery_worker_cycle(
         "recovered_claimed": 0,
         "recovered_sending": 0,
         "expired_swept": 0,
+        "inactive_swept": 0,
         "claimed": 0,
         "sent": 0,
         "blocked": 0,
@@ -668,6 +714,9 @@ async def run_event_delivery_worker_cycle(
 
         exp_swept = await sweep_expired_pending_deliveries(session_maker, now=now)
         stats["expired_swept"] = exp_swept
+
+        inact_swept = await sweep_missed_inactive_scenario_deliveries(session_maker, now=now)
+        stats["inactive_swept"] = inact_swept
 
         # Step 2: Claim
         claimed = await claim_pending_deliveries(

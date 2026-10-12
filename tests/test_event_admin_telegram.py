@@ -10,7 +10,8 @@ import pytest_asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Chat, Message, User as TgUser
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
+from aiogram.types import CallbackQuery, Chat, Message, Update, User as TgUser
 
 from database import (
     Base,
@@ -380,3 +381,229 @@ async def test_telegram_test_send_to_self(db_session_maker, monkeypatch, mock_bo
     assert "ТЕСТОВОЕ НАПОМИНАНИЕ" in sent_text
     assert "https://webinar.com/live" in sent_text
     assert "Привет, Admin!" in sent_text
+
+
+async def _feed_callback(dp: Dispatcher, bot: Bot, data: str, user_id: int = 12345, message_id: int = 100):
+    user = TgUser(id=user_id, is_bot=False, first_name="Admin", username="admin_user")
+    chat = Chat(id=user_id, type="private")
+    msg = Message(message_id=message_id, date=datetime.now(), chat=chat, text="Original text")
+    cb = CallbackQuery(id=f"cb_{data}_{message_id}", from_user=user, chat_instance="inst", data=data, message=msg)
+    update = Update(update_id=1, callback_query=cb)
+    bot.reset_mock()
+    await dp.feed_update(bot, update)
+    return [call.args[0] for call in bot.call_args_list if call.args and hasattr(call.args[0], "__class__")]
+
+
+async def _feed_message(dp: Dispatcher, bot: Bot, text: str, user_id: int = 12345, message_id: int = 101):
+    user = TgUser(id=user_id, is_bot=False, first_name="Admin", username="admin_user")
+    chat = Chat(id=user_id, type="private")
+    msg = Message(message_id=message_id, date=datetime.now(), chat=chat, text=text, from_user=user)
+    update = Update(update_id=2, message=msg)
+    bot.reset_mock()
+    await dp.feed_update(bot, update)
+    return [call.args[0] for call in bot.call_args_list if call.args and hasattr(call.args[0], "__class__")]
+
+
+@pytest.mark.asyncio
+async def test_telegram_dispatcher_step_routing_and_ordering(db_session_maker, monkeypatch):
+    """
+    Dispatcher-level integration test verifying that:
+    1. Generic step card callback 'admin_ev_step_<id>' does NOT collide with specialized step callbacks:
+       - edit text: 'admin_ev_step_edit_text_<id>'
+       - edit offset: 'admin_ev_step_edit_offset_<id>'
+       - move up: 'admin_ev_step_up_<id>'
+       - move down: 'admin_ev_step_down_<id>'
+       - delete ask/yes: 'admin_ev_step_del_ask_<id>', 'admin_ev_step_del_yes_<id>'
+    2. move up / down handles real state dependency without unconfigured FSMContext errors.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr("event_admin_telegram.get_all_admin_ids", AsyncMock(return_value={12345}))
+
+    from event_admin_service import add_step, create_scenario, get_step_item, list_steps
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="dispatch_steps",
+        event_type="webinar",
+        title="Dispatch Steps",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://webinar.com/dispatch",
+    )
+    step1 = await add_step(db_session_maker, scen.id, -1440, "Шаг 1: За сутки {event_title}")
+    step2 = await add_step(db_session_maker, scen.id, -120, "Шаг 2: За 2 часа {event_title}")
+
+    event_admin_router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(event_admin_router)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+
+    # 1. Open step card directly
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_{step1.id}")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Шаг напоминания" in edit_methods[0].text
+    assert "Шаг 1" in edit_methods[0].text
+
+    # 2. Click Edit Text (must NOT open step card!)
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_edit_text_{step1.id}")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Введите новый текст сообщения" in edit_methods[0].text
+
+    # Provide new text via Message update
+    methods = await _feed_message(dp, bot, "Обновлённый текст шага 1: {link}")
+    send_methods = [m for m in methods if isinstance(m, SendMessage)]
+    assert len(send_methods) >= 1
+    assert "Текст шага обновлен" in send_methods[0].text
+    updated_step1 = await get_step_item(db_session_maker, step1.id)
+    assert updated_step1.message_text == "Обновлённый текст шага 1: {link}"
+
+    # 3. Click Edit Offset (must NOT open step card!)
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_edit_offset_{step1.id}")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Выберите новое время отправки" in edit_methods[0].text
+
+    # Select preset offset (-60)
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_edit_preset_{step1.id}_-60")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert any("Время отправки обновлено" in m.text for m in edit_methods)
+    updated_step1 = await get_step_item(db_session_maker, step1.id)
+    assert updated_step1.offset_minutes == -60
+
+    # 4. Click Move Up on step2
+    # Before fix, step_move_up called open_step_card(callback, FSMContext()) without storage/key
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_up_{step2.id}")
+    # Verify card re-rendered cleanly and step moved
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Шаг напоминания" in edit_methods[0].text
+
+    # Verify order in DB: step2 is now first
+    steps = await list_steps(db_session_maker, scen.id, include_archived=False)
+    assert steps[0].id == step2.id
+    assert steps[1].id == step1.id
+
+    # 5. Click Move Down on step2
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_down_{step2.id}")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Шаг напоминания" in edit_methods[0].text
+
+    steps = await list_steps(db_session_maker, scen.id, include_archived=False)
+    assert steps[0].id == step1.id
+    assert steps[1].id == step2.id
+
+    # 6. Click Delete / Archive Ask on step1
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_del_ask_{step1.id}")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Удалить/архивировать шаг" in edit_methods[0].text
+
+    # Confirm Delete Yes
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_del_yes_{step1.id}")
+    answer_methods = [m for m in methods if isinstance(m, AnswerCallbackQuery)]
+    assert any("Шаг архивирован" in (m.text or "") for m in answer_methods)
+    steps_remaining = await list_steps(db_session_maker, scen.id, include_archived=False)
+    assert len(steps_remaining) == 1
+    assert steps_remaining[0].id == step2.id
+
+
+@pytest.mark.asyncio
+async def test_telegram_dispatcher_lifecycle_monitoring_and_test_send(db_session_maker, monkeypatch):
+    """
+    Dispatcher-level integration tests for:
+    - archive flow (ask & yes)
+    - stats monitoring
+    - uncertain resolution flow (prompt & reason)
+    - test send
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr("event_admin_telegram.get_all_admin_ids", AsyncMock(return_value={12345}))
+
+    from event_admin_service import add_step, create_scenario, get_scenario_summary
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="dispatch_lifecycle",
+        event_type="webinar",
+        title="Dispatch Lifecycle",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://webinar.com/life",
+    )
+    step = await add_step(db_session_maker, scen.id, -120, "Привет, {name}! Ссылка: {link}")
+
+    async with db_session_maker() as session:
+        u = User(id=888, first_name="UncertainUser")
+        session.add(u)
+        await session.flush()
+        reg = EventRegistration(event_id=scen.id, user_id=888, status="started")
+        session.add(reg)
+        await session.flush()
+        deliv = EventDelivery(
+            event_id=scen.id,
+            user_id=888,
+            registration_id=reg.id,
+            message_kind="immediate_confirmation",
+            delivery_key="dispatch_deliv_key",
+            due_at=utc_now(),
+            next_attempt_at=utc_now(),
+            platform="telegram",
+            status="uncertain",
+            last_error="Client network timeout",
+        )
+        session.add(deliv)
+        await session.commit()
+        deliv_id = deliv.id
+
+    event_admin_router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(event_admin_router)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=999))
+
+    # 1. Stats callback
+    methods = await _feed_callback(dp, bot, f"admin_ev_stats_{scen.id}")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Мониторинг отправок" in edit_methods[0].text
+    assert "(uncertain): <b>1</b>" in edit_methods[0].text
+
+    # 2. Uncertain resolution: click resolve sent
+    methods = await _feed_callback(dp, bot, f"admin_ev_resolve_sent_{deliv_id}")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Введите причину разрешения" in edit_methods[0].text
+
+    # Submit reason via Message
+    methods = await _feed_message(dp, bot, "Пользователь подтвердил получение в чате поддержки")
+    send_methods = [m for m in methods if isinstance(m, SendMessage)]
+    assert len(send_methods) >= 1
+    assert "успешно разрешена" in send_methods[0].text
+
+    async with db_session_maker() as session:
+        d = await session.get(EventDelivery, deliv_id)
+        assert d.status == "resolved_sent"
+
+    # 3. Test send step
+    methods = await _feed_callback(dp, bot, f"admin_ev_test_step_{step.id}")
+    # In test_send_single_step, it calls bot.send_message
+    assert bot.send_message.called
+    sent_text = bot.send_message.call_args.kwargs["text"]
+    assert "ТЕСТОВОЕ НАПОМИНАНИЕ" in sent_text
+
+    # 4. Archive flow: ask
+    methods = await _feed_callback(dp, bot, f"admin_ev_archive_ask_{scen.id}")
+    edit_methods = [m for m in methods if isinstance(m, EditMessageText)]
+    assert len(edit_methods) >= 1
+    assert "Вы уверены, что хотите архивировать" in edit_methods[0].text
+
+    # Archive flow: yes
+    methods = await _feed_callback(dp, bot, f"admin_ev_archive_yes_{scen.id}")
+    answer_methods = [m for m in methods if isinstance(m, AnswerCallbackQuery)]
+    assert any("Мероприятие архивировано" in (m.text or "") for m in answer_methods)
+    summary = await get_scenario_summary(db_session_maker, scen.id)
+    assert summary.is_archived is True
+

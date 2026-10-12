@@ -1518,7 +1518,7 @@ class MaxBotApplication:
                 step_id = int(data.split("_")[-1])
                 await admin_events_service.confirm_delete_step(self.client, chat_id, step_id)
                 return
-            if data.startswith("admin_ev_step_"):
+            if data.startswith("admin_ev_step_") and data[len("admin_ev_step_"):].isdigit():
                 step_id = int(data.split("_")[-1])
                 await admin_events_service.show_step(self.client, chat_id, step_id)
                 return

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -40,6 +41,7 @@ from event_service import (
     render_event_template,
     reschedule_event,
 )
+from max_messenger_bot.identity import is_max_user_id
 from time_helpers import MSK, format_msk, to_msk, utc_now
 
 log = logging.getLogger(__name__)
@@ -297,6 +299,7 @@ def validate_scenario_input(
     place: str | None,
     link: str | None,
     now_utc: datetime | None = None,
+    allow_ended: bool = False,
 ) -> None:
     """Pre-commit validation of scenario fields."""
     validate_event_code(code)
@@ -325,7 +328,7 @@ def validate_scenario_input(
 
     eff_now = now_utc or datetime.utcnow()
     end_time = starts_at_utc + timedelta(minutes=duration_minutes)
-    if end_time <= eff_now:
+    if not allow_ended and end_time <= eff_now:
         raise ValueError("Нельзя создать или перенести мероприятие на уже завершившееся время.")
 
 
@@ -433,6 +436,7 @@ async def create_scenario(
     place: str | None = None,
     link: str | None = None,
     is_active: bool = False,
+    now_utc: datetime | None = None,
 ) -> ScenarioSummary:
     """
     Creates a new scenario with deep-link reservation according to lock order:
@@ -446,8 +450,10 @@ async def create_scenario(
         duration_minutes=duration_minutes,
         place=place,
         link=link,
+        now_utc=now_utc,
     )
     norm_code = validate_event_code(code)
+    eff_now = now_utc or utc_now()
 
     async with session_maker() as session:
         bind = session.get_bind()
@@ -474,6 +480,8 @@ async def create_scenario(
             is_archived=False,
             schedule_revision=1,
             content_version=1,
+            created_at=eff_now,
+            updated_at=eff_now,
         )
         session.add(scen)
         await session.flush()
@@ -511,8 +519,10 @@ async def update_scenario_fields(
     duration_minutes: int | None = None,
     place: str | None = None,
     link: str | None = None,
+    now_utc: datetime | None = None,
 ) -> ScenarioSummary:
-    """Updates content fields of a scenario in a short locked transaction."""
+    """Updates content fields of a scenario in a short locked transaction, adjusting expiry for unsent immediate deliveries."""
+    eff_now = now_utc or utc_now()
     async with session_maker() as session:
         bind = session.get_bind()
         is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
@@ -545,14 +555,46 @@ async def update_scenario_fields(
             duration_minutes=new_dur,
             place=new_place,
             link=new_link,
+            now_utc=eff_now,
+            allow_ended=True,
         )
+
+        duration_changed = (new_dur != scen.duration_minutes)
 
         scen.title = new_title
         scen.duration_minutes = new_dur
         scen.place = new_place if new_place else None
         scen.link = new_link if new_link else None
         scen.content_version += 1
-        scen.updated_at = utc_now()
+        scen.updated_at = eff_now
+
+        if duration_changed:
+            new_end_time = scen.starts_at + timedelta(minutes=new_dur)
+            imm_delivs_stmt = (
+                select(EventDelivery)
+                .join(EventRegistration, EventDelivery.registration_id == EventRegistration.id)
+                .where(
+                    EventDelivery.event_id == event_id,
+                    EventDelivery.message_kind.in_(("immediate_confirmation", "immediate_live", "reschedule_notice")),
+                    EventDelivery.status.in_(("pending", "claimed")),
+                    EventDelivery.schedule_revision == scen.schedule_revision,
+                    EventDelivery.registration_generation == EventRegistration.generation,
+                    EventRegistration.status == "started",
+                )
+            )
+            if is_postgres:
+                imm_delivs_stmt = imm_delivs_stmt.with_for_update()
+            imm_delivs = (await session.execute(imm_delivs_stmt)).scalars().all()
+            for d in imm_delivs:
+                if new_end_time <= eff_now:
+                    d.status = "skipped"
+                    d.skip_reason = "expired"
+                    d.finished_at = eff_now
+                    d.claim_token = None
+                    d.lease_until = None
+                else:
+                    d.expires_at = new_end_time
+                d.updated_at = eff_now
 
         await session.commit()
         return await get_scenario_summary(session_maker, event_id)  # type: ignore[return-value]
@@ -561,8 +603,11 @@ async def update_scenario_fields(
 async def toggle_scenario_active(
     session_maker: async_sessionmaker[AsyncSession],
     event_id: int,
+    *,
+    now_utc: datetime | None = None,
 ) -> bool:
-    """Toggles active state of a scenario. Rejects activating archived scenario."""
+    """Toggles active state of a scenario. Rejects activating archived scenario. Sweeps overdue deliveries."""
+    eff_now = now_utc or utc_now()
     async with session_maker() as session:
         bind = session.get_bind()
         is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
@@ -583,8 +628,28 @@ async def toggle_scenario_active(
             raise ValueError("Нельзя активировать архивный сценарий.")
 
         scen.is_active = not scen.is_active
-        scen.updated_at = utc_now()
+        scen.updated_at = eff_now
         new_val = scen.is_active
+
+        # Reconcile pending deliveries that were missed / overdue during pause:
+        # Missed scheduled deliveries whose due_at has already passed must become terminal skipped,
+        # so that when the scenario is reactivated, worker never blasts old reminders.
+        past_delivs_stmt = (
+            select(EventDelivery)
+            .where(
+                EventDelivery.event_id == event_id,
+                EventDelivery.status == "pending",
+                EventDelivery.due_at <= eff_now,
+            )
+        )
+        if is_postgres:
+            past_delivs_stmt = past_delivs_stmt.with_for_update()
+        past_delivs = (await session.execute(past_delivs_stmt)).scalars().all()
+        for d in past_delivs:
+            d.status = "skipped"
+            d.skip_reason = "disabled_past"
+            d.finished_at = eff_now
+            d.updated_at = eff_now
 
         await session.commit()
         return new_val
@@ -593,8 +658,11 @@ async def toggle_scenario_active(
 async def archive_scenario(
     session_maker: async_sessionmaker[AsyncSession],
     event_id: int,
+    *,
+    now_utc: datetime | None = None,
 ) -> None:
-    """Archives a scenario while preserving registrations, deliveries and audit."""
+    """Archives a scenario while safely skipping unsent deliveries and preserving sent history and audit."""
+    eff_now = now_utc or utc_now()
     async with session_maker() as session:
         bind = session.get_bind()
         is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
@@ -614,8 +682,45 @@ async def archive_scenario(
 
         scen.is_archived = True
         scen.is_active = False
-        scen.archived_at = utc_now()
-        scen.updated_at = utc_now()
+        scen.archived_at = eff_now
+        scen.updated_at = eff_now
+
+        # Safe unsent pending deliveries become terminal skipped
+        pending_stmt = (
+            select(EventDelivery)
+            .where(
+                EventDelivery.event_id == event_id,
+                EventDelivery.status == "pending",
+            )
+        )
+        if is_postgres:
+            pending_stmt = pending_stmt.with_for_update()
+        pending_delivs = (await session.execute(pending_stmt)).scalars().all()
+        for d in pending_delivs:
+            d.status = "skipped"
+            d.skip_reason = "scenario_archived"
+            d.finished_at = eff_now
+            d.updated_at = eff_now
+
+        # Safe un-started claimed deliveries with expired lease also become skipped
+        claimed_expired_stmt = (
+            select(EventDelivery)
+            .where(
+                EventDelivery.event_id == event_id,
+                EventDelivery.status == "claimed",
+                EventDelivery.lease_until <= eff_now,
+            )
+        )
+        if is_postgres:
+            claimed_expired_stmt = claimed_expired_stmt.with_for_update()
+        claimed_delivs = (await session.execute(claimed_expired_stmt)).scalars().all()
+        for d in claimed_delivs:
+            d.status = "skipped"
+            d.skip_reason = "scenario_archived"
+            d.finished_at = eff_now
+            d.claim_token = None
+            d.lease_until = None
+            d.updated_at = eff_now
 
         await session.commit()
 
@@ -806,9 +911,12 @@ async def add_step(
     event_id: int,
     offset_minutes: int,
     message_text: str,
+    *,
+    now_utc: datetime | None = None,
 ) -> StepItem:
-    """Adds a new reminder step to scenario."""
+    """Adds a new reminder step to scenario and schedules deliveries for current active registrations."""
     validate_step_input(offset_minutes, message_text)
+    eff_now = now_utc or utc_now()
 
     async with session_maker() as session:
         bind = session.get_bind()
@@ -819,6 +927,7 @@ async def add_step(
         else:
             await session.begin()
 
+        # Level 3: Scenario FOR UPDATE
         scen_stmt = select(EventScenario).where(EventScenario.id == event_id)
         if is_postgres:
             scen_stmt = scen_stmt.with_for_update()
@@ -828,11 +937,25 @@ async def add_step(
         if scen.is_archived:
             raise ValueError("Нельзя добавлять шаги в архивный сценарий.")
 
+        # Level 4: Active Registrations in stable order
+        active_regs_stmt = (
+            select(EventRegistration)
+            .where(
+                EventRegistration.event_id == event_id,
+                EventRegistration.status == "started",
+            )
+            .order_by(EventRegistration.id.asc())
+        )
+        if is_postgres:
+            active_regs_stmt = active_regs_stmt.with_for_update(read=True)
+        active_regs = (await session.execute(active_regs_stmt)).scalars().all()
+
         max_order = await session.scalar(
             select(func.coalesce(func.max(EventStep.sort_order), -1)).where(EventStep.event_id == event_id)
         )
         sort_order = int(max_order if max_order is not None else -1) + 1
 
+        # Level 5: Step
         step = EventStep(
             event_id=event_id,
             offset_minutes=offset_minutes,
@@ -842,7 +965,45 @@ async def add_step(
             is_archived=False,
         )
         session.add(step)
+        await session.flush()  # populate step.id
+
+        # Level 6: Deliveries for each active registration
+        step_due = scen.starts_at + timedelta(minutes=offset_minutes)
+        for reg in active_regs:
+            step_key = f"ev:{scen.id}:reg:{reg.id}:step:{step.id}:r0"
+            if reg.registration_mode == "urgent_late":
+                step_status = "skipped"
+                step_skip_reason = "late_mode_suppressed"
+            else:
+                if step_due > eff_now:
+                    step_status = "pending"
+                    step_skip_reason = None
+                else:
+                    step_status = "skipped"
+                    step_skip_reason = "late_registration"
+
+            reg_platform = "max" if is_max_user_id(reg.user_id) else "telegram"
+            session.add(
+                EventDelivery(
+                    event_id=scen.id,
+                    user_id=reg.user_id,
+                    registration_id=reg.id,
+                    step_id=step.id,
+                    retry_index=0,
+                    message_kind="scheduled_step",
+                    delivery_key=step_key,
+                    due_at=step_due,
+                    next_attempt_at=max(eff_now, step_due),
+                    schedule_revision=scen.schedule_revision,
+                    registration_generation=reg.generation,
+                    platform=reg_platform,
+                    status=step_status,
+                    skip_reason=step_skip_reason,
+                )
+            )
+
         scen.content_version += 1
+        scen.updated_at = eff_now
         await session.commit()
 
         return StepItem(
@@ -863,17 +1024,20 @@ async def update_step(
     *,
     offset_minutes: int | None = None,
     message_text: str | None = None,
+    now_utc: datetime | None = None,
 ) -> StepItem:
     """
     Updates an existing reminder step.
 
     Semantics:
-    - Increments step_version.
-    - Increments scenario content_version.
-    - If offset_minutes changed, recalculates due_at / next_attempt_at for future unsent
-      pending deliveries.
+    - Lock order: Scenario -> Step -> Deliveries.
+    - Increments step_version and scenario content_version.
+    - If offset_minutes changed:
+      - recalculated due in the future remains pending with new due.
+      - recalculated due in the past becomes terminal skipped with skip_reason='step_rescheduled_past'.
     - Does NOT mutate Point of No Return deliveries (sent, sending, claimed, uncertain, terminal).
     """
+    eff_now = now_utc or utc_now()
     async with session_maker() as session:
         bind = session.get_bind()
         is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
@@ -883,6 +1047,24 @@ async def update_step(
         else:
             await session.begin()
 
+        # Step 0: Non-locking preliminary read of event_id
+        target_event_id = await session.scalar(
+            select(EventStep.event_id).where(EventStep.id == step_id)
+        )
+        if target_event_id is None:
+            raise ValueError(f"Шаг {step_id} не найден.")
+
+        # Level 3: Scenario FOR UPDATE
+        scen_stmt = select(EventScenario).where(EventScenario.id == target_event_id)
+        if is_postgres:
+            scen_stmt = scen_stmt.with_for_update()
+        scen = await session.scalar(scen_stmt)
+        if not scen:
+            raise ValueError("Сценарий шага не найден.")
+        if scen.is_archived:
+            raise ValueError("Нельзя редактировать шаг архивного сценария.")
+
+        # Level 5: Step FOR UPDATE
         step_stmt = select(EventStep).where(EventStep.id == step_id)
         if is_postgres:
             step_stmt = step_stmt.with_for_update()
@@ -891,15 +1073,6 @@ async def update_step(
             raise ValueError(f"Шаг {step_id} не найден.")
         if step.is_archived:
             raise ValueError("Нельзя редактировать архивный шаг.")
-
-        scen_stmt = select(EventScenario).where(EventScenario.id == step.event_id)
-        if is_postgres:
-            scen_stmt = scen_stmt.with_for_update()
-        scen = await session.scalar(scen_stmt)
-        if not scen:
-            raise ValueError("Сценарий шага не найден.")
-        if scen.is_archived:
-            raise ValueError("Нельзя редактировать шаг архивного сценария.")
 
         new_offset = offset_minutes if offset_minutes is not None else step.offset_minutes
         new_text = message_text.strip() if message_text is not None else step.message_text
@@ -910,11 +1083,11 @@ async def update_step(
         step.offset_minutes = new_offset
         step.message_text = new_text
         step.step_version += 1
-        step.updated_at = utc_now()
+        step.updated_at = eff_now
         scen.content_version += 1
-        scen.updated_at = utc_now()
+        scen.updated_at = eff_now
 
-        # If offset changed, recalculate due_at for pending deliveries of this step
+        # Level 6: If offset changed, update/skip pending deliveries of this step
         if offset_changed:
             new_due_at = scen.starts_at + timedelta(minutes=new_offset)
             pending_deliveries_stmt = (
@@ -928,9 +1101,14 @@ async def update_step(
                 pending_deliveries_stmt = pending_deliveries_stmt.with_for_update()
             pending_deliveries = (await session.execute(pending_deliveries_stmt)).scalars().all()
             for d in pending_deliveries:
-                d.due_at = new_due_at
-                d.next_attempt_at = new_due_at
-                d.updated_at = utc_now()
+                if new_due_at > eff_now:
+                    d.due_at = new_due_at
+                    d.next_attempt_at = new_due_at
+                else:
+                    d.status = "skipped"
+                    d.skip_reason = "step_rescheduled_past"
+                    d.finished_at = eff_now
+                d.updated_at = eff_now
 
         await session.commit()
 
@@ -949,11 +1127,14 @@ async def update_step(
 async def archive_step(
     session_maker: async_sessionmaker[AsyncSession],
     step_id: int,
+    *,
+    now_utc: datetime | None = None,
 ) -> None:
     """
     Archives a reminder step.
     Unsent pending deliveries for this step are safely skipped.
     """
+    eff_now = now_utc or utc_now()
     async with session_maker() as session:
         bind = session.get_bind()
         is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
@@ -963,6 +1144,24 @@ async def archive_step(
         else:
             await session.begin()
 
+        # Preliminary non-locking read
+        target_event_id = await session.scalar(
+            select(EventStep.event_id).where(EventStep.id == step_id)
+        )
+        if target_event_id is None:
+            raise ValueError(f"Шаг {step_id} не найден.")
+
+        # Level 3: Scenario lock
+        scen_stmt = select(EventScenario).where(EventScenario.id == target_event_id)
+        if is_postgres:
+            scen_stmt = scen_stmt.with_for_update()
+        scen = await session.scalar(scen_stmt)
+        if not scen:
+            raise ValueError("Сценарий шага не найден.")
+        if scen.is_archived:
+            raise ValueError("Нельзя архивировать шаг архивного сценария.")
+
+        # Level 5: Step lock
         step_stmt = select(EventStep).where(EventStep.id == step_id)
         if is_postgres:
             step_stmt = step_stmt.with_for_update()
@@ -971,9 +1170,9 @@ async def archive_step(
             raise ValueError(f"Шаг {step_id} не найден.")
 
         step.is_archived = True
-        step.updated_at = utc_now()
+        step.updated_at = eff_now
 
-        # Safely skip pending unsent deliveries
+        # Level 6: Deliveries lock
         pending_deliveries_stmt = (
             select(EventDelivery)
             .where(
@@ -984,13 +1183,14 @@ async def archive_step(
         if is_postgres:
             pending_deliveries_stmt = pending_deliveries_stmt.with_for_update()
         pending_deliveries = (await session.execute(pending_deliveries_stmt)).scalars().all()
-        now = utc_now()
         for d in pending_deliveries:
             d.status = "skipped"
             d.skip_reason = "step_archived"
-            d.finished_at = now
-            d.updated_at = now
+            d.finished_at = eff_now
+            d.updated_at = eff_now
 
+        scen.content_version += 1
+        scen.updated_at = eff_now
         await session.commit()
 
 
@@ -999,7 +1199,10 @@ async def reorder_steps(
     event_id: int,
     ordered_step_ids: list[int],
 ) -> None:
-    """Updates sort_order of steps according to ordered_step_ids."""
+    """Updates sort_order of steps according to ordered_step_ids safely under lock."""
+    if len(ordered_step_ids) != len(set(ordered_step_ids)):
+        raise ValueError("Список ID шагов содержит дубликаты.")
+
     async with session_maker() as session:
         bind = session.get_bind()
         is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
@@ -1009,12 +1212,39 @@ async def reorder_steps(
         else:
             await session.begin()
 
-        for idx, sid in enumerate(ordered_step_ids):
-            step = await session.get(EventStep, sid)
-            if step and step.event_id == event_id:
-                step.sort_order = idx
-                step.updated_at = utc_now()
+        # Level 3: Scenario lock
+        scen_stmt = select(EventScenario).where(EventScenario.id == event_id)
+        if is_postgres:
+            scen_stmt = scen_stmt.with_for_update()
+        scen = await session.scalar(scen_stmt)
+        if not scen:
+            raise ValueError(f"Сценарий {event_id} не найден.")
+        if scen.is_archived:
+            raise ValueError("Нельзя менять порядок шагов в архивном сценарии.")
 
+        # Level 5: Target active Steps locked in stable order
+        steps_stmt = (
+            select(EventStep)
+            .where(
+                EventStep.event_id == event_id,
+                EventStep.is_archived.is_(False),
+            )
+            .order_by(EventStep.id.asc())
+        )
+        if is_postgres:
+            steps_stmt = steps_stmt.with_for_update()
+        active_steps = (await session.execute(steps_stmt)).scalars().all()
+        step_map = {s.id: s for s in active_steps}
+
+        if set(ordered_step_ids) != set(step_map.keys()):
+            raise ValueError("Передан неполный или некорректный список шагов для изменения порядка.")
+
+        now = utc_now()
+        for idx, sid in enumerate(ordered_step_ids):
+            step_map[sid].sort_order = idx
+            step_map[sid].updated_at = now
+
+        scen.updated_at = now
         await session.commit()
 
 
@@ -1203,16 +1433,25 @@ async def resolve_uncertain_delivery(
             await session.begin()
 
         if resolution_type == "force_retry":
-            # Delegate to existing backend helper
-            res, created = await create_event_delivery_force_retry(
-                session=session,
-                delivery_id=delivery_id,
-                admin_id=admin_id,
-                resolution_reason=reason_clean,
-                raise_on_duplicate=False,
-            )
-            await session.commit()
-            return res, created
+            try:
+                # Delegate to existing backend helper
+                res, created = await create_event_delivery_force_retry(
+                    session=session,
+                    delivery_id=delivery_id,
+                    admin_id=admin_id,
+                    resolution_reason=reason_clean,
+                    raise_on_duplicate=False,
+                )
+                await session.commit()
+                return res, created
+            except IntegrityError:
+                await session.rollback()
+                async with session_maker() as s2:
+                    child_stmt = select(EventDelivery).where(EventDelivery.parent_delivery_id == delivery_id)
+                    existing_child = (await s2.execute(child_stmt)).scalars().first()
+                    if existing_child:
+                        return existing_child, False
+                raise
 
         # Handling 'mark_sent' and 'mark_skipped'
         stmt = select(EventDelivery).where(EventDelivery.id == delivery_id)

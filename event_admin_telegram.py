@@ -1133,22 +1133,7 @@ async def process_step_text(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ Ошибка: {exc}")
 
 
-@router.callback_query(F.data.startswith("admin_ev_step_"))
-async def open_step_card(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    data = callback.data
-
-    # Avoid clash with sub-actions
-    if any(data.startswith(p) for p in (
-        "admin_ev_step_add_",
-        "admin_ev_step_edit_",
-        "admin_ev_step_up_",
-        "admin_ev_step_down_",
-        "admin_ev_step_del_",
-    )):
-        return
-
-    step_id = int(data.split("_")[-1])
+async def _render_step_card_view(callback: CallbackQuery, step_id: int) -> None:
     step = await get_step_item(async_session_maker, step_id)
     if not step:
         await callback.answer("Шаг не найден.", show_alert=True)
@@ -1173,11 +1158,19 @@ async def open_step_card(callback: CallbackQuery, state: FSMContext) -> None:
         f"<blockquote>{html.escape(step.message_text)}</blockquote>"
     )
 
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=_step_card_keyboard(step.event_id, step, is_first, is_last, scen.is_archived),
-    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=_step_card_keyboard(step.event_id, step, is_first, is_last, scen.is_archived),
+        )
+
+
+@router.callback_query(F.data.regexp(r"^admin_ev_step_(\d+)$"))
+async def open_step_card(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    step_id = int(callback.data.split("_")[-1])
+    await _render_step_card_view(callback, step_id)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_edit_text_"))
@@ -1310,15 +1303,17 @@ async def step_move_up(callback: CallbackQuery) -> None:
     step_id = int(callback.data.split("_")[-1])
     step = await get_step_item(async_session_maker, step_id)
     if not step:
+        await callback.answer("Шаг не найден.", show_alert=True)
         return
     all_steps = await list_steps(async_session_maker, step.event_id, include_archived=False)
     ids = [s.id for s in all_steps]
-    idx = ids.index(step_id)
-    if idx > 0:
-        ids[idx - 1], ids[idx] = ids[idx], ids[idx - 1]
-        await reorder_steps(async_session_maker, step.event_id, ids)
-        await callback.answer("Перемещено выше")
-    await open_step_card(callback, FSMContext())  # type: ignore[arg-type]
+    if step_id in ids:
+        idx = ids.index(step_id)
+        if idx > 0:
+            ids[idx - 1], ids[idx] = ids[idx], ids[idx - 1]
+            await reorder_steps(async_session_maker, step.event_id, ids)
+            await callback.answer("Перемещено выше")
+    await _render_step_card_view(callback, step_id)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_down_"))
@@ -1326,15 +1321,17 @@ async def step_move_down(callback: CallbackQuery) -> None:
     step_id = int(callback.data.split("_")[-1])
     step = await get_step_item(async_session_maker, step_id)
     if not step:
+        await callback.answer("Шаг не найден.", show_alert=True)
         return
     all_steps = await list_steps(async_session_maker, step.event_id, include_archived=False)
     ids = [s.id for s in all_steps]
-    idx = ids.index(step_id)
-    if idx < len(ids) - 1:
-        ids[idx + 1], ids[idx] = ids[idx], ids[idx + 1]
-        await reorder_steps(async_session_maker, step.event_id, ids)
-        await callback.answer("Перемещено ниже")
-    await open_step_card(callback, FSMContext())  # type: ignore[arg-type]
+    if step_id in ids:
+        idx = ids.index(step_id)
+        if idx < len(ids) - 1:
+            ids[idx + 1], ids[idx] = ids[idx], ids[idx + 1]
+            await reorder_steps(async_session_maker, step.event_id, ids)
+            await callback.answer("Перемещено ниже")
+    await _render_step_card_view(callback, step_id)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_del_ask_"))

@@ -1905,3 +1905,87 @@ async def test_real_postgresql_structural_invariants_and_retry_model():
             await session.rollback()
     finally:
         await pg_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_real_postgresql_update_step_vs_reschedule_concurrency():
+    """
+    Defect 3 concurrency test on real PostgreSQL (disposable test DB guard):
+    Verifies that update_step and reschedule_scenario respect lock hierarchy:
+    Scenario -> Registration -> Step -> Delivery
+    and do not deadlock under concurrent execution.
+    """
+    import asyncio
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from event_admin_service import add_step, create_scenario, reschedule_scenario, update_step
+
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
+
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+            await conn.run_sync(Base.metadata.create_all)
+
+        session_maker = async_sessionmaker(pg_engine, expire_on_commit=False, class_=AsyncSession)
+
+        base_now = datetime.utcnow()
+        starts_at = base_now + timedelta(days=2)
+        scen = await create_scenario(
+            session_maker,
+            code="pg_lock_test",
+            event_type="webinar",
+            title="PG Lock Order Webinar",
+            starts_at_utc=starts_at,
+            link="https://live.link",
+        )
+        step = await add_step(session_maker, scen.id, -120, "PG Reminder step")
+
+        async with session_maker() as session:
+            u = User(id=9991, first_name="PGUser")
+            session.add(u)
+            await session.flush()
+            reg = EventRegistration(
+                event_id=scen.id,
+                user_id=9991,
+                status="started",
+                registration_mode="standard",
+            )
+            session.add(reg)
+            await session.flush()
+            deliv = EventDelivery(
+                event_id=scen.id,
+                user_id=9991,
+                registration_id=reg.id,
+                step_id=step.id,
+                message_kind="scheduled_step",
+                delivery_key=f"ev:{scen.id}:reg:{reg.id}:step:{step.id}:r0",
+                due_at=starts_at - timedelta(hours=2),
+                next_attempt_at=starts_at - timedelta(hours=2),
+                schedule_revision=1,
+                registration_generation=1,
+                platform="telegram",
+                status="pending",
+            )
+            session.add(deliv)
+            await session.commit()
+
+        # Concurrent execution of update_step and reschedule_scenario
+        task_update = update_step(session_maker, step.id, offset_minutes=-60)
+        task_resched = reschedule_scenario(
+            session_maker,
+            scen.id,
+            new_starts_at_utc=starts_at + timedelta(days=1),
+        )
+
+        res_update, res_resched = await asyncio.wait_for(
+            asyncio.gather(task_update, task_resched),
+            timeout=10.0,
+        )
+
+        assert res_update is not None
+        assert res_resched is not None
+    finally:
+        await pg_engine.dispose()
+

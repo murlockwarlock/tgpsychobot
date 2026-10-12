@@ -1,5 +1,7 @@
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 os.environ.setdefault("BOT_TOKEN", "test_token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -8,6 +10,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from event_delivery_worker import run_event_delivery_worker_cycle
 
 from database import (
     Base,
@@ -550,3 +553,574 @@ async def test_test_send_to_self_rendering(test_session_maker):
         delivs = (await session.execute(select(EventDelivery))).scalars().all()
         assert len(regs) == 0
         assert len(delivs) == 0
+
+
+@pytest.mark.asyncio
+async def test_update_step_offset_to_past_marks_pending_skipped(test_session_maker):
+    """
+    Defect 4 regression test:
+    - active registration with pending reminder due in the future
+    - admin edits step offset such that new due_at <= now
+    - delivery becomes skipped with skip_reason='step_rescheduled_past'
+    - worker cycle runs and never invokes transport for this delivery
+    """
+    base_now = datetime(2026, 10, 25, 12, 0, 0)
+    starts_at = base_now + timedelta(hours=2)  # 14:00
+
+    scen = await create_scenario(
+        test_session_maker,
+        code="offset_past_test",
+        event_type="webinar",
+        title="Offset Past Webinar",
+        starts_at_utc=starts_at,
+        link="https://live.link",
+        now_utc=base_now,
+    )
+    # Step originally at -60 min (due at 13:00, which is > 12:00 base_now)
+    step = await add_step(test_session_maker, scen.id, -60, "Напоминание за час", now_utc=base_now)
+
+    async with test_session_maker() as session:
+        u = User(id=701, first_name="OffsetUser")
+        session.add(u)
+        await session.flush()
+        reg = EventRegistration(
+            event_id=scen.id,
+            user_id=701,
+            status="started",
+            registration_mode="standard",
+            registered_at=base_now,
+        )
+        session.add(reg)
+        await session.flush()
+        deliv = EventDelivery(
+            event_id=scen.id,
+            user_id=701,
+            registration_id=reg.id,
+            step_id=step.id,
+            message_kind="scheduled_step",
+            delivery_key=f"ev:{scen.id}:reg:{reg.id}:step:{step.id}:r0",
+            due_at=starts_at - timedelta(minutes=60),  # 13:00
+            next_attempt_at=starts_at - timedelta(minutes=60),
+            schedule_revision=1,
+            registration_generation=1,
+            platform="telegram",
+            status="pending",
+        )
+        session.add(deliv)
+        await session.commit()
+        deliv_id = deliv.id
+
+    # Admin edits step offset to -180 min (due at 11:00, which is < base_now 12:00)
+    await update_step(test_session_maker, step.id, offset_minutes=-180, now_utc=base_now)
+
+    async with test_session_maker() as session:
+        updated_deliv = await session.get(EventDelivery, deliv_id)
+        assert updated_deliv.status == "skipped"
+        assert updated_deliv.skip_reason == "step_rescheduled_past"
+        assert updated_deliv.finished_at == base_now
+
+    # Run worker cycle to ensure no transport is triggered
+    mock_bot = AsyncMock()
+    mock_bot.send_message = AsyncMock()
+    stats = await run_event_delivery_worker_cycle(test_session_maker, bot=mock_bot, now=base_now + timedelta(hours=3))
+    assert stats["sent"] == 0
+    assert not mock_bot.send_message.called
+
+
+@pytest.mark.asyncio
+async def test_concurrent_force_retry_idempotency(tmp_path):
+    """
+    Defect 5 concurrency test:
+    - delivery in 'uncertain' status
+    - two concurrent force_retry requests execute simultaneously across separate DB connections
+    - exactly one retry child is created
+    - exactly one force_retry audit resolution is recorded
+    - one call returns created=True, the other created=False
+    - no unique constraint violation / IntegrityError is raised to callers
+    """
+    db_file = tmp_path / "concurrent_retry.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}?timeout=30", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+    try:
+        scen = await create_scenario(
+            session_maker,
+            code="force_retry_race",
+            event_type="webinar",
+            title="Retry Race Webinar",
+            starts_at_utc=datetime.utcnow() + timedelta(days=2),
+            link="https://live.link",
+        )
+
+        async with session_maker() as session:
+            u = User(id=702, first_name="RaceUser")
+            session.add(u)
+            await session.flush()
+            reg = EventRegistration(event_id=scen.id, user_id=702, status="started")
+            session.add(reg)
+            await session.flush()
+            deliv = EventDelivery(
+                event_id=scen.id,
+                user_id=702,
+                registration_id=reg.id,
+                message_kind="immediate_confirmation",
+                delivery_key="race_deliv_key",
+                due_at=utc_now(),
+                next_attempt_at=utc_now(),
+                platform="telegram",
+                status="uncertain",
+                last_error="Network timeout",
+            )
+            session.add(deliv)
+            await session.commit()
+            deliv_id = deliv.id
+
+        task1 = resolve_uncertain_delivery(
+            session_maker,
+            deliv_id,
+            admin_id=1,
+            resolution_type="force_retry",
+            resolution_reason="Manual retry call 1",
+        )
+        task2 = resolve_uncertain_delivery(
+            session_maker,
+            deliv_id,
+            admin_id=2,
+            resolution_type="force_retry",
+            resolution_reason="Manual retry call 2",
+        )
+
+        (res1, created1), (res2, created2) = await asyncio.gather(task1, task2)
+
+        assert (created1 is True and created2 is False) or (created1 is False and created2 is True)
+        assert res1.id == res2.id
+
+        async with session_maker() as session:
+            children = (
+                await session.execute(
+                    select(EventDelivery).where(EventDelivery.parent_delivery_id == deliv_id)
+                )
+            ).scalars().all()
+            assert len(children) == 1
+
+            resolutions = (
+                await session.execute(
+                    select(EventDeliveryResolution).where(
+                        EventDeliveryResolution.delivery_id == deliv_id,
+                        EventDeliveryResolution.resolution_type == "force_retry",
+                    )
+                )
+            ).scalars().all()
+            assert len(resolutions) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_deactivate_reactivate_lifecycle_skips_missed_reminders(test_session_maker):
+    """
+    Defect 6 acceptance test:
+    - register -> disable scenario -> reminder due passes -> enable scenario -> worker
+    - transport for missed reminder is NOT called
+    - delivery becomes skipped with skip_reason='disabled_past'
+    """
+    base_now = datetime(2026, 10, 25, 10, 0, 0)
+    starts_at = base_now + timedelta(hours=2)  # 12:00
+
+    scen = await create_scenario(
+        test_session_maker,
+        code="deact_react_test",
+        event_type="webinar",
+        title="Deact React Webinar",
+        starts_at_utc=starts_at,
+        link="https://live.link",
+        now_utc=base_now,
+    )
+    # Reminder due at 11:30 (-30 min)
+    step = await add_step(test_session_maker, scen.id, -30, "Скоро начало!", now_utc=base_now)
+
+    async with test_session_maker() as session:
+        u = User(id=703, first_name="LifecycleUser")
+        session.add(u)
+        await session.flush()
+        reg = EventRegistration(
+            event_id=scen.id,
+            user_id=703,
+            status="started",
+            registration_mode="standard",
+            registered_at=base_now,
+        )
+        session.add(reg)
+        await session.flush()
+        deliv = EventDelivery(
+            event_id=scen.id,
+            user_id=703,
+            registration_id=reg.id,
+            step_id=step.id,
+            message_kind="scheduled_step",
+            delivery_key=f"ev:{scen.id}:reg:{reg.id}:step:{step.id}:r0",
+            due_at=starts_at - timedelta(minutes=30),  # 11:30
+            next_attempt_at=starts_at - timedelta(minutes=30),
+            schedule_revision=1,
+            registration_generation=1,
+            platform="telegram",
+            status="pending",
+        )
+        session.add(deliv)
+        await session.commit()
+        deliv_id = deliv.id
+
+    # 1. Admin disables scenario at 10:30
+    time_disable = base_now + timedelta(minutes=30)
+    await toggle_scenario_active(test_session_maker, scen.id, now_utc=time_disable)
+
+    # 2. Due passes while disabled: advance time to 11:45
+    time_after_due = base_now + timedelta(minutes=105)
+
+    # 3. Admin re-enables scenario at 11:45
+    await toggle_scenario_active(test_session_maker, scen.id, now_utc=time_after_due)
+
+    # 4. Check delivery status in DB
+    async with test_session_maker() as session:
+        deliv_check = await session.get(EventDelivery, deliv_id)
+        assert deliv_check.status == "skipped"
+        assert deliv_check.skip_reason == "disabled_past"
+
+    # 5. Worker runs at 11:46 -> transport is NEVER called
+    mock_bot = AsyncMock()
+    mock_bot.send_message = AsyncMock()
+    stats = await run_event_delivery_worker_cycle(test_session_maker, bot=mock_bot, now=time_after_due + timedelta(minutes=1))
+    assert stats["sent"] == 0
+    assert not mock_bot.send_message.called
+
+
+@pytest.mark.asyncio
+async def test_archive_scenario_lifecycle_terminates_pending_deliveries(test_session_maker):
+    """
+    Defect 7 lifecycle test:
+    - scenario with pending future deliveries, plus past sent and failed history
+    - admin archives scenario
+    - pending deliveries become skipped with skip_reason='scenario_archived'
+    - monitoring shows 0 pending deliveries
+    - historical sent and failed deliveries are preserved
+    - worker sends nothing
+    """
+    base_now = datetime(2026, 10, 25, 10, 0, 0)
+    starts_at = base_now + timedelta(days=2)
+
+    scen = await create_scenario(
+        test_session_maker,
+        code="archive_test",
+        event_type="webinar",
+        title="Archive Webinar",
+        starts_at_utc=starts_at,
+        link="https://live.link",
+        now_utc=base_now,
+    )
+    step = await add_step(test_session_maker, scen.id, -120, "За 2 часа", now_utc=base_now)
+
+    async with test_session_maker() as session:
+        u = User(id=704, first_name="ArchiveUser")
+        session.add(u)
+        await session.flush()
+        reg = EventRegistration(
+            event_id=scen.id,
+            user_id=704,
+            status="started",
+            registration_mode="standard",
+            registered_at=base_now,
+        )
+        session.add(reg)
+        await session.flush()
+
+        # 1. Pending future reminder
+        d_pending = EventDelivery(
+            event_id=scen.id,
+            user_id=704,
+            registration_id=reg.id,
+            step_id=step.id,
+            message_kind="scheduled_step",
+            delivery_key="arch:pending",
+            due_at=starts_at - timedelta(hours=2),
+            next_attempt_at=starts_at - timedelta(hours=2),
+            schedule_revision=1,
+            registration_generation=1,
+            platform="telegram",
+            status="pending",
+        )
+        # 2. Past sent immediate confirmation
+        d_sent = EventDelivery(
+            event_id=scen.id,
+            user_id=704,
+            registration_id=reg.id,
+            message_kind="immediate_confirmation",
+            delivery_key="arch:sent",
+            due_at=base_now,
+            next_attempt_at=base_now,
+            platform="telegram",
+            status="sent",
+            sent_at=base_now,
+            finished_at=base_now,
+        )
+        # 3. Past failed delivery
+        d_failed = EventDelivery(
+            event_id=scen.id,
+            user_id=704,
+            registration_id=reg.id,
+            message_kind="immediate_live",
+            delivery_key="arch:failed",
+            due_at=base_now,
+            next_attempt_at=base_now,
+            platform="telegram",
+            status="failed",
+            last_error="Permanent block",
+            finished_at=base_now,
+        )
+        session.add_all([d_pending, d_sent, d_failed])
+        await session.commit()
+        pending_id = d_pending.id
+        sent_id = d_sent.id
+        failed_id = d_failed.id
+
+    # Admin archives scenario
+    await archive_scenario(test_session_maker, scen.id, now_utc=base_now)
+
+    # Verify monitoring shows 0 pending
+    stats = await get_scenario_delivery_stats(test_session_maker, scen.id)
+    assert stats.pending == 0
+    assert stats.sent == 1
+    assert stats.failed == 1
+    assert stats.skipped >= 1
+
+    # Verify delivery records
+    async with test_session_maker() as session:
+        d_p = await session.get(EventDelivery, pending_id)
+        assert d_p.status == "skipped"
+        assert d_p.skip_reason == "scenario_archived"
+
+        d_s = await session.get(EventDelivery, sent_id)
+        assert d_s.status == "sent"
+
+        d_f = await session.get(EventDelivery, failed_id)
+        assert d_f.status == "failed"
+
+    # Worker sends nothing
+    mock_bot = AsyncMock()
+    mock_bot.send_message = AsyncMock()
+    worker_stats = await run_event_delivery_worker_cycle(test_session_maker, bot=mock_bot, now=starts_at)
+    assert worker_stats["sent"] == 0
+    assert not mock_bot.send_message.called
+
+
+@pytest.mark.asyncio
+async def test_add_step_for_active_registrations(test_session_maker):
+    """
+    Defect 8 regression test:
+    - when admin calls add_step(), scheduled deliveries are created for active registrations:
+      - standard active registration with future due -> pending
+      - standard active registration with past due -> skipped (late_registration)
+      - urgent_late active registration -> skipped (late_mode_suppressed)
+      - cancelled registration -> no delivery created
+    """
+    base_now = datetime(2026, 10, 25, 12, 0, 0)
+    starts_at = base_now + timedelta(hours=3)  # 15:00
+
+    scen = await create_scenario(
+        test_session_maker,
+        code="add_step_active_regs",
+        event_type="webinar",
+        title="Add Step Active Regs",
+        starts_at_utc=starts_at,
+        link="https://live.link",
+        now_utc=base_now,
+    )
+
+    async with test_session_maker() as session:
+        u1 = User(id=711, first_name="StandardUser")
+        u2 = User(id=712, first_name="UrgentUser")
+        u3 = User(id=713, first_name="CancelledUser")
+        session.add_all([u1, u2, u3])
+        await session.flush()
+
+        reg_std = EventRegistration(
+            event_id=scen.id,
+            user_id=711,
+            status="started",
+            registration_mode="standard",
+            registered_at=base_now,
+        )
+        reg_urg = EventRegistration(
+            event_id=scen.id,
+            user_id=712,
+            status="started",
+            registration_mode="urgent_late",
+            registered_at=base_now,
+        )
+        reg_canc = EventRegistration(
+            event_id=scen.id,
+            user_id=713,
+            status="cancelled",
+            registration_mode="standard",
+            registered_at=base_now,
+        )
+        session.add_all([reg_std, reg_urg, reg_canc])
+        await session.commit()
+        std_id = reg_std.id
+        urg_id = reg_urg.id
+        canc_id = reg_canc.id
+
+    # 1. Admin adds future step (-60 min -> due at 14:00, future relative to base_now 12:00)
+    future_step = await add_step(test_session_maker, scen.id, -60, "Напоминание за час", now_utc=base_now)
+
+    async with test_session_maker() as session:
+        d_std = (await session.execute(
+            select(EventDelivery).where(EventDelivery.registration_id == std_id, EventDelivery.step_id == future_step.id)
+        )).scalar_one()
+        assert d_std.status == "pending"
+        assert d_std.due_at == starts_at - timedelta(minutes=60)
+
+        d_urg = (await session.execute(
+            select(EventDelivery).where(EventDelivery.registration_id == urg_id, EventDelivery.step_id == future_step.id)
+        )).scalar_one()
+        assert d_urg.status == "skipped"
+        assert d_urg.skip_reason == "late_mode_suppressed"
+
+        d_canc = (await session.execute(
+            select(EventDelivery).where(EventDelivery.registration_id == canc_id, EventDelivery.step_id == future_step.id)
+        )).scalar_one_or_none()
+        assert d_canc is None
+
+    # 2. Admin adds past step (-240 min -> due at 11:00, past relative to base_now 12:00)
+    past_step = await add_step(test_session_maker, scen.id, -240, "Напоминание за 4 часа", now_utc=base_now)
+
+    async with test_session_maker() as session:
+        d_std_past = (await session.execute(
+            select(EventDelivery).where(EventDelivery.registration_id == std_id, EventDelivery.step_id == past_step.id)
+        )).scalar_one()
+        assert d_std_past.status == "skipped"
+        assert d_std_past.skip_reason == "late_registration"
+
+
+@pytest.mark.asyncio
+async def test_duration_edit_updates_immediate_deliveries_expiry(test_session_maker):
+    """
+    Defect 9 regression test:
+    - update_scenario_fields(duration_minutes=...) updates business expiry for unsent immediate deliveries:
+      - duration decrease where new expiry <= now: delivery becomes skipped with skip_reason='expired'
+      - duration increase: delivery's expires_at is pushed out to starts_at + new_duration
+    """
+    base_now = datetime(2026, 10, 25, 12, 0, 0)
+    starts_at = datetime(2026, 10, 25, 11, 0, 0)  # Event started 1 hr ago
+
+    scen = await create_scenario(
+        test_session_maker,
+        code="dur_edit_test",
+        event_type="webinar",
+        title="Duration Edit Webinar",
+        starts_at_utc=starts_at,
+        duration_minutes=120,  # Originally expires at 13:00
+        link="https://live.link",
+        now_utc=base_now,
+    )
+
+    async with test_session_maker() as session:
+        u = User(id=721, first_name="DurUser")
+        session.add(u)
+        await session.flush()
+        reg = EventRegistration(event_id=scen.id, user_id=721, status="started")
+        session.add(reg)
+        await session.flush()
+        # Unsent immediate live delivery
+        deliv = EventDelivery(
+            event_id=scen.id,
+            user_id=721,
+            registration_id=reg.id,
+            message_kind="immediate_live",
+            delivery_key="dur:live",
+            due_at=starts_at,
+            next_attempt_at=base_now,
+            expires_at=starts_at + timedelta(minutes=120),  # 13:00
+            schedule_revision=1,
+            registration_generation=1,
+            platform="telegram",
+            status="pending",
+        )
+        session.add(deliv)
+        await session.commit()
+        deliv_id = deliv.id
+
+    # 1. Duration decrease: change duration to 45 mins -> new expiry is 11:45 (< base_now 12:00)
+    await update_scenario_fields(test_session_maker, scen.id, duration_minutes=45, now_utc=base_now)
+
+    async with test_session_maker() as session:
+        d = await session.get(EventDelivery, deliv_id)
+        assert d.status == "skipped"
+        assert d.skip_reason == "expired"
+        assert d.finished_at == base_now
+
+    # 2. Duration increase test with a fresh pending delivery
+    async with test_session_maker() as session:
+        deliv2 = EventDelivery(
+            event_id=scen.id,
+            user_id=721,
+            registration_id=reg.id,
+            message_kind="immediate_live",
+            delivery_key="dur:live2",
+            due_at=base_now,
+            next_attempt_at=base_now,
+            expires_at=starts_at + timedelta(minutes=45),
+            schedule_revision=1,
+            registration_generation=1,
+            platform="telegram",
+            status="pending",
+        )
+        session.add(deliv2)
+        await session.commit()
+        deliv2_id = deliv2.id
+
+    # Change duration to 180 mins -> new expiry is 11:00 + 180 min = 14:00 (> base_now 12:00)
+    await update_scenario_fields(test_session_maker, scen.id, duration_minutes=180, now_utc=base_now)
+
+    async with test_session_maker() as session:
+        d2 = await session.get(EventDelivery, deliv2_id)
+        assert d2.status == "pending"
+        assert d2.expires_at == starts_at + timedelta(minutes=180)
+
+
+@pytest.mark.asyncio
+async def test_reorder_steps_validation_and_atomicity(test_session_maker):
+    """
+    Defect 10 test:
+    - reorder_steps() validates that step IDs match exactly active steps of scenario
+    - rejects duplicates or mismatched IDs
+    - atomically updates sort_order
+    """
+    scen = await create_scenario(
+        test_session_maker,
+        code="reorder_test",
+        event_type="webinar",
+        title="Reorder Webinar",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://live.link",
+    )
+    s1 = await add_step(test_session_maker, scen.id, -1440, "Шаг 1")
+    s2 = await add_step(test_session_maker, scen.id, -120, "Шаг 2")
+    s3 = await add_step(test_session_maker, scen.id, -15, "Шаг 3")
+
+    # Reject duplicate IDs
+    with pytest.raises(ValueError, match="[Дд]убликаты"):
+        await reorder_steps(test_session_maker, scen.id, [s1.id, s1.id, s3.id])
+
+    # Reject missing or foreign IDs
+    with pytest.raises(ValueError, match="неполный|некорректный"):
+        await reorder_steps(test_session_maker, scen.id, [s1.id, s2.id, 99999])
+
+    # Valid reorder [s3, s1, s2]
+    await reorder_steps(test_session_maker, scen.id, [s3.id, s1.id, s2.id])
+
+    steps = await list_steps(test_session_maker, scen.id, include_archived=False)
+    assert [s.id for s in steps] == [s3.id, s1.id, s2.id]
+    assert [s.sort_order for s in steps] == [0, 1, 2]
+
