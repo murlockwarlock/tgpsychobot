@@ -1297,3 +1297,41 @@ def test_ai_log_unpopulated_request_payload_displays_unrecorded():
     file_content = handlers._build_ai_log_file_content(log_entry)
     assert "[1] FULL REQUEST PAYLOAD:\n----------------------------------------\nне зафиксирован\n" in file_content
     assert "только саммари без payload" not in file_content.split("[2] RAW RESPONSE")[0]
+
+
+@pytest.mark.asyncio
+async def test_telegram_ai_log_detail_text_is_bounded_under_limit(monkeypatch):
+    user = SimpleNamespace(
+        id=1392180097,
+        username="testuser",
+        name="Мафу",
+        first_name="Мафу",
+        tg_user_id=1392180097,
+    )
+    huge_raw = "— " * 5000  # 10000 chars of dashes
+    huge_payload = '{"messages": [{"role": "user", "content": "test"}]}' * 100  # 5000+ chars
+    log_entry = AILog(
+        id=4135,
+        user_id=user.id,
+        provider="Deepseek",
+        model="deepseek-v4-flash",
+        prompt_summary="test",
+        request_payload=huge_payload,
+        raw_response=huge_raw,
+        clean_text=huge_raw,
+        created_at=datetime(2026, 10, 12, 17, 9),
+        platform="telegram",
+        context_kind="main",
+        status="success",
+    )
+    session = _DetailSession(log_entry, user)
+    event = SimpleNamespace(answer=AsyncMock())
+    monkeypatch.setattr(handlers, "async_session_maker", lambda: _SessionContext(session))
+
+    await handlers.show_ai_log_detail(event, log_entry.id)
+
+    text_value = event.answer.await_args.args[0]
+    assert len(text_value) <= 3900, f"Expected text <= 3900, got {len(text_value)}"
+    assert "Детали лога ИИ #4135" in text_value
+    assert "Полный сырой файл скачайте по кнопке ниже" in text_value
+

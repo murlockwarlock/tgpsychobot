@@ -17,6 +17,7 @@ import html
 import logging
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 from event_admin_service import (
     PRESET_OFFSETS,
@@ -190,9 +191,19 @@ async def show_scenario(
 
     loc_block = "\n".join(loc_lines)
 
+    bot_name = getattr(client, "bot_name", None)
+    if isinstance(bot_name, str) and bot_name:
+        reg_link = f"https://max.ru/{quote(bot_name)}?start={s.code}"
+        link_block = (
+            f"• <b>Ссылка для регистрации:</b> <code>{reg_link}</code>\n"
+            f"• <b>Код события:</b> <code>{s.code}</code>\n"
+        )
+    else:
+        link_block = f"• <b>Код события:</b> <code>{s.code}</code>\n"
+
     text = (
         f"📅 <b>Карточка мероприятия: {html.escape(s.title)}</b>\n\n"
-        f"• <b>Код события:</b> <code>{s.code}</code>\n"
+        f"{link_block}"
         f"• <b>Тип:</b> {kind_str}\n"
         f"• <b>Дата и время начала:</b> {s.starts_at_msk}\n"
         f"• <b>Длительность:</b> {s.duration_minutes} мин.\n"

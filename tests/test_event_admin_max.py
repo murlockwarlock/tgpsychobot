@@ -314,3 +314,34 @@ async def test_max_test_send_to_self(db_session_maker, mock_client, states, monk
     assert "ТЕСТОВОЕ СООБЩЕНИЕ MAX" in text
     assert "MAX Test Send Meet" in text
     assert "Conference Room B" in text
+
+
+@pytest.mark.asyncio
+async def test_max_scenario_card_registration_link(db_session_maker, mock_client, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_link_test",
+        event_type="webinar",
+        title="MAX Link Test Webinar",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.com/webinar",
+    )
+
+    # 1. Without bot_name attribute on client -> falls back to code
+    mock_client.bot_name = None
+    mock_client.send_message.reset_mock()
+    await max_admin_events.show_scenario(mock_client, chat_id=123, event_id=scen.id)
+    text = mock_client.send_message.call_args.kwargs["text"]
+    assert "• <b>Код события:</b> <code>max_link_test</code>" in text
+    assert "• <b>Ссылка для регистрации:</b>" not in text
+
+    # 2. With bot_name on client -> includes registration link
+    mock_client.bot_name = "test_bot"
+    mock_client.send_message.reset_mock()
+    await max_admin_events.show_scenario(mock_client, chat_id=123, event_id=scen.id)
+    text = mock_client.send_message.call_args.kwargs["text"]
+    assert "• <b>Ссылка для регистрации:</b> <code>https://max.ru/test_bot?start=max_link_test</code>" in text
+    assert "• <b>Код события:</b> <code>max_link_test</code>" in text
