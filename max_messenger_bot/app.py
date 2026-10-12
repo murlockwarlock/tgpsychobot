@@ -26,6 +26,7 @@ from .services import admin_mailing as admin_mailing_service
 from .services import admin_payments as admin_payments_service
 from .services import admin_test_content as admin_test_content_service
 from .services import admin_followups as admin_followups_service
+from .services import admin_events as admin_events_service
 from .services import admin_tests as admin_tests_service
 from .services import admin_topics as admin_topics_service
 from .services import admin_referral as admin_referral_service
@@ -460,6 +461,68 @@ class MaxBotApplication:
             if state.state == "max_followup_jitter":
                 await admin_followups_service.receive_jitter(self.client, self.states, message.chat_id, message.sender.user_id, text)
                 return
+            if state.state in admin_events_service.MAX_EVENT_INPUT_STATES:
+                if not await common.is_admin(message.sender.user_id):
+                    await self.states.clear(message.sender.user_id)
+                    await self.client.send_message(chat_id=message.chat_id, text="Недостаточно прав администратора.")
+                    return
+                if state.state == "max_event_create_code":
+                    await admin_events_service.receive_create_code(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_create_title":
+                    await admin_events_service.receive_create_title(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_create_starts_at":
+                    await admin_events_service.receive_create_starts_at(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_create_duration":
+                    await admin_events_service.receive_create_duration(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_create_link":
+                    await admin_events_service.receive_create_link(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_create_place":
+                    await admin_events_service.receive_create_place(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_create_meeting_link":
+                    await admin_events_service.receive_create_meeting_link(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_edit_title":
+                    await admin_events_service.receive_edit_title(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_edit_duration":
+                    await admin_events_service.receive_edit_duration(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_edit_link":
+                    await admin_events_service.receive_edit_link(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_edit_place":
+                    await admin_events_service.receive_edit_place(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_reschedule_starts_at":
+                    await admin_events_service.receive_reschedule(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_copy_code":
+                    await admin_events_service.receive_copy_code(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_copy_starts_at":
+                    await admin_events_service.receive_copy_starts_at(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_step_offset_custom":
+                    await admin_events_service.receive_step_offset_custom(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_step_text":
+                    await admin_events_service.receive_step_text(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_step_edit_offset_custom":
+                    await admin_events_service.receive_edit_step_offset_custom(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_step_edit_text":
+                    await admin_events_service.receive_edit_step_text(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
+                if state.state == "max_event_resolve_reason":
+                    await admin_events_service.receive_resolve_reason(self.client, self.states, message.chat_id, message.sender.user_id, text)
+                    return
             if state.state in common.MEDIA_COLLECTION_ADMIN_STATES and not await common.require_media_collection_admin(
                 self.client,
                 self.states,
@@ -1338,6 +1401,160 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_fu_self_test_"):
                 await admin_followups_service.show_self_test(self.client, chat_id, user_id, int(data.rsplit("_", 1)[1]), self.states)
+                return
+            # Event Reminders Admin Callbacks
+            if data == "admin_events" or data == "admin_ev_list":
+                await self.states.clear(user_id)
+                await admin_events_service.show_scenarios(self.client, chat_id, page=0, include_archived=False)
+                return
+            if data.startswith("admin_ev_page_"):
+                page = int(data.split("_")[-1])
+                await admin_events_service.show_scenarios(self.client, chat_id, page=page)
+                return
+            if data.startswith("admin_ev_toggle_archive_view_"):
+                inc_arch = data.endswith("_1")
+                await admin_events_service.show_scenarios(self.client, chat_id, page=0, include_archived=inc_arch)
+                return
+            if data.startswith("admin_ev_open_"):
+                await self.states.clear(user_id)
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.show_scenario(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_toggle_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.toggle_scenario(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_archive_ask_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.archive_scenario_ask(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_archive_yes_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.archive_scenario_confirm(self.client, chat_id, event_id)
+                return
+            if data == "admin_ev_create_webinar":
+                await admin_events_service.start_scenario_create(self.client, self.states, chat_id, user_id, "webinar")
+                return
+            if data == "admin_ev_create_meeting":
+                await admin_events_service.start_scenario_create(self.client, self.states, chat_id, user_id, "meeting")
+                return
+            if data == "admin_ev_skip_meeting_link":
+                await admin_events_service.skip_meeting_link(self.client, self.states, chat_id, user_id)
+                return
+            if data.startswith("admin_ev_edit_menu_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.show_edit_menu(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_edit_title_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_edit_title(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_edit_duration_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_edit_duration(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_edit_link_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_edit_link(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_edit_place_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_edit_place(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_reschedule_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_reschedule(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_copy_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_copy(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_steps_"):
+                await self.states.clear(user_id)
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.show_steps(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_step_add_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_step_add(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_offset_preset_"):
+                parts = data.split("_")
+                await admin_events_service.select_step_offset_preset(self.client, self.states, chat_id, user_id, int(parts[4]), int(parts[5]))
+                return
+            if data.startswith("admin_ev_offset_custom_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_step_offset_custom(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_step_edit_text_"):
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.start_edit_step_text(self.client, self.states, chat_id, user_id, step_id)
+                return
+            if data.startswith("admin_ev_step_edit_offset_"):
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.start_edit_step_offset(self.client, self.states, chat_id, user_id, step_id)
+                return
+            if data.startswith("admin_ev_step_edit_preset_"):
+                parts = data.split("_")
+                await admin_events_service.select_edit_step_offset_preset(self.client, self.states, chat_id, user_id, int(parts[5]), int(parts[6]))
+                return
+            if data.startswith("admin_ev_step_edit_custom_"):
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.start_edit_step_offset_custom(self.client, self.states, chat_id, user_id, step_id)
+                return
+            if data.startswith("admin_ev_step_up_"):
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.step_move_up(self.client, chat_id, step_id)
+                return
+            if data.startswith("admin_ev_step_down_"):
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.step_move_down(self.client, chat_id, step_id)
+                return
+            if data.startswith("admin_ev_step_del_ask_"):
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.ask_delete_step(self.client, chat_id, step_id)
+                return
+            if data.startswith("admin_ev_step_del_yes_"):
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.confirm_delete_step(self.client, chat_id, step_id)
+                return
+            if data.startswith("admin_ev_step_") and data[len("admin_ev_step_"):].isdigit():
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.show_step(self.client, chat_id, step_id)
+                return
+            if data.startswith("admin_ev_stats_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.show_stats(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_problems_"):
+                parts = data.split("_")
+                await admin_events_service.show_problems(self.client, chat_id, int(parts[3]), int(parts[4]))
+                return
+            if data.startswith("admin_ev_problem_item_"):
+                delivery_id = int(data.split("_")[-1])
+                await admin_events_service.show_problem_detail(self.client, chat_id, delivery_id)
+                return
+            if data.startswith("admin_ev_resolve_"):
+                parts = data.split("_")
+                await admin_events_service.start_resolve(self.client, self.states, chat_id, user_id, int(parts[4]), parts[3])
+                return
+            if data.startswith("admin_ev_test_send_menu_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.show_test_send_menu(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_test_step_"):
+                step_id = int(data.split("_")[-1])
+                from event_admin_service import get_step_item as _get_step_item
+                st = await _get_step_item(async_session_maker, step_id)
+                if st:
+                    await admin_events_service.do_test_send(self.client, chat_id, user_id, st.event_id, st.id)
+                return
+            if data.startswith("admin_ev_do_test_send_"):
+                parts = data.split("_")
+                event_id = int(parts[5])
+                step_id = int(parts[6])
+                target_step_id = None if step_id == 0 else step_id
+                await admin_events_service.do_test_send(self.client, chat_id, user_id, event_id, target_step_id)
                 return
             if data == "admin_stats":
                 await admin_service.show_stats(self.client, chat_id)

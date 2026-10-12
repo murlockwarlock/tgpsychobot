@@ -175,6 +175,7 @@ def _automation_menu_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="⚡ Обработчики событий", callback_data="automation_handlers")
     builder.button(text="💬 Догоняющие сообщения", callback_data="followup_campaigns")
+    builder.button(text="📅 Мероприятия", callback_data="admin_events")
     builder.button(text="📊 Статистика этапов", callback_data="automation_stage_stats")
     builder.button(text="📋 Формат DATA", callback_data="automation_data_help")
     builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")

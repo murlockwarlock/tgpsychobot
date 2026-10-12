@@ -2843,7 +2843,14 @@ async def create_event_delivery_force_retry(
     - Writes an audit log record into event_delivery_resolutions.
     """
     from sqlalchemy import select
-    parent = await session.get(EventDelivery, delivery_id)
+    bind = session.get_bind()
+    dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+    is_postgres = dialect_name == "postgresql"
+
+    parent_stmt = select(EventDelivery).where(EventDelivery.id == delivery_id)
+    if is_postgres:
+        parent_stmt = parent_stmt.with_for_update()
+    parent = await session.scalar(parent_stmt)
     if not parent:
         raise ValueError(f"Event delivery {delivery_id} not found")
 
@@ -2855,6 +2862,8 @@ async def create_event_delivery_force_retry(
 
     # Check if a direct retry-child already exists for this parent
     existing_stmt = select(EventDelivery).where(EventDelivery.parent_delivery_id == parent.id)
+    if is_postgres:
+        existing_stmt = existing_stmt.with_for_update()
     existing_child = (await session.execute(existing_stmt)).scalars().first()
     if existing_child is not None:
         if raise_on_duplicate:
@@ -2905,7 +2914,22 @@ async def create_event_delivery_force_retry(
         template_text_snapshot=parent.template_text_snapshot,
     )
     session.add(child_delivery)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        # Concurrent transaction created the child
+        existing_child = (
+            await session.execute(
+                select(EventDelivery).where(EventDelivery.parent_delivery_id == parent.id)
+            )
+        ).scalars().first()
+        if existing_child is not None:
+            if raise_on_duplicate:
+                raise DeliveryRetryError(
+                    f"Parent delivery {delivery_id} already has a retry-child delivery {existing_child.id}"
+                )
+            return existing_child, False
+        raise
 
     return child_delivery, True
 
