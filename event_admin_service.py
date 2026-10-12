@@ -1033,9 +1033,9 @@ async def update_step(
     - Lock order: Scenario -> Step -> Deliveries.
     - Increments step_version and scenario content_version.
     - If offset_minutes changed:
-      - recalculated due in the future remains pending with new due.
-      - recalculated due in the past becomes terminal skipped with skip_reason='step_rescheduled_past'.
-    - Does NOT mutate Point of No Return deliveries (sent, sending, claimed, uncertain, terminal).
+      - recalculated due in the future: safe pending/claimed deliveries remain/revert to pending with new due and cleared claim.
+      - recalculated due in the past: safe pending/claimed deliveries become terminal skipped with skip_reason='step_rescheduled_past'.
+    - Does NOT mutate Point of No Return deliveries (sent, sending, uncertain, blocked, failed, terminal).
     """
     eff_now = now_utc or utc_now()
     async with session_maker() as session:
@@ -1087,27 +1087,39 @@ async def update_step(
         scen.content_version += 1
         scen.updated_at = eff_now
 
-        # Level 6: If offset changed, update/skip pending deliveries of this step
+        # Level 6: If offset changed, update/skip safe pending and claimed deliveries of this step
         if offset_changed:
             new_due_at = scen.starts_at + timedelta(minutes=new_offset)
-            pending_deliveries_stmt = (
+            safe_deliveries_stmt = (
                 select(EventDelivery)
                 .where(
                     EventDelivery.step_id == step.id,
-                    EventDelivery.status == "pending",
+                    EventDelivery.status.in_(("pending", "claimed")),
                 )
+                .order_by(EventDelivery.id.asc())
             )
             if is_postgres:
-                pending_deliveries_stmt = pending_deliveries_stmt.with_for_update()
-            pending_deliveries = (await session.execute(pending_deliveries_stmt)).scalars().all()
-            for d in pending_deliveries:
+                safe_deliveries_stmt = safe_deliveries_stmt.with_for_update()
+            safe_deliveries = (await session.execute(safe_deliveries_stmt)).scalars().all()
+            for d in safe_deliveries:
                 if new_due_at > eff_now:
+                    d.status = "pending"
                     d.due_at = new_due_at
                     d.next_attempt_at = new_due_at
+                    d.claim_token = None
+                    d.claimed_at = None
+                    d.lease_until = None
+                    d.send_started_at = None
+                    d.skip_reason = None
+                    d.finished_at = None
                 else:
                     d.status = "skipped"
                     d.skip_reason = "step_rescheduled_past"
                     d.finished_at = eff_now
+                    d.claim_token = None
+                    d.claimed_at = None
+                    d.lease_until = None
+                    d.send_started_at = None
                 d.updated_at = eff_now
 
         await session.commit()

@@ -1,7 +1,7 @@
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 os.environ.setdefault("BOT_TOKEN", "test_token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -10,7 +10,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from event_delivery_worker import run_event_delivery_worker_cycle
+from event_delivery_worker import claim_pending_deliveries, run_event_delivery_worker_cycle
 
 from database import (
     Base,
@@ -1123,4 +1123,205 @@ async def test_reorder_steps_validation_and_atomicity(test_session_maker):
     steps = await list_steps(test_session_maker, scen.id, include_archived=False)
     assert [s.id for s in steps] == [s3.id, s1.id, s2.id]
     assert [s.sort_order for s in steps] == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_claimed_delivery_offset_moved_future_reschedules(test_session_maker):
+    """
+    Pre-PoNR race regression test A:
+    - active scenario/registration/step
+    - delivery due now
+    - worker poller claims delivery via real claim_pending_deliveries()
+    - pre-send has NOT started
+    - admin updates step offset into the future
+    - delivery reverts to 'pending', due_at & next_attempt_at updated, claim/lease fields cleared
+    - worker run at old time does not invoke transport
+    - worker run after new due sends message exactly once
+    """
+    base_now = datetime(2026, 10, 25, 12, 0, 0)
+    starts_at = base_now + timedelta(hours=2)  # 14:00
+
+    scen = await create_scenario(
+        test_session_maker,
+        code="claimed_future_test",
+        event_type="webinar",
+        title="Claimed Future Webinar",
+        starts_at_utc=starts_at,
+        link="https://live.link",
+        now_utc=base_now,
+    )
+    await toggle_scenario_active(test_session_maker, scen.id, now_utc=base_now)
+
+    # Step originally at -120 min -> starts_at - 2 hours = 12:00 = base_now
+    step = await add_step(test_session_maker, scen.id, -120, "Напоминание сейчас", now_utc=base_now - timedelta(minutes=5))
+
+    async with test_session_maker() as session:
+        u = User(id=801, first_name="ClaimedUser")
+        session.add(u)
+        await session.flush()
+        reg = EventRegistration(
+            event_id=scen.id,
+            user_id=801,
+            status="started",
+            registration_mode="standard",
+            registered_at=base_now - timedelta(hours=1),
+        )
+        session.add(reg)
+        await session.flush()
+        deliv = EventDelivery(
+            event_id=scen.id,
+            user_id=801,
+            registration_id=reg.id,
+            step_id=step.id,
+            message_kind="scheduled_step",
+            delivery_key=f"ev:{scen.id}:reg:{reg.id}:step:{step.id}:r0",
+            due_at=base_now,
+            next_attempt_at=base_now,
+            schedule_revision=1,
+            registration_generation=1,
+            platform="telegram",
+            status="pending",
+        )
+        session.add(deliv)
+        await session.commit()
+        deliv_id = deliv.id
+
+    # Claim delivery via real claim_pending_deliveries()
+    claimed = await claim_pending_deliveries(test_session_maker, batch_size=10, now=base_now)
+    assert len(claimed) == 1
+    assert claimed[0][0] == deliv_id
+    token = claimed[0][1]
+    assert token is not None
+
+    async with test_session_maker() as session:
+        d_in_db = await session.get(EventDelivery, deliv_id)
+        assert d_in_db.status == "claimed"
+        assert d_in_db.claim_token == token
+        assert d_in_db.claimed_at is not None
+        assert d_in_db.lease_until is not None
+
+    # Pre-send has NOT started. Admin updates step offset to future: -60 min (due at 13:00 > 12:00)
+    new_offset = -60
+    new_due = starts_at + timedelta(minutes=new_offset)
+    await update_step(test_session_maker, step.id, offset_minutes=new_offset, now_utc=base_now)
+
+    # Delivery must be pending with cleared claim fields
+    async with test_session_maker() as session:
+        updated_deliv = await session.get(EventDelivery, deliv_id)
+        assert updated_deliv.status == "pending"
+        assert updated_deliv.due_at == new_due
+        assert updated_deliv.next_attempt_at == new_due
+        assert updated_deliv.claim_token is None
+        assert updated_deliv.claimed_at is None
+        assert updated_deliv.lease_until is None
+        assert updated_deliv.send_started_at is None
+        assert updated_deliv.skip_reason is None
+        assert updated_deliv.finished_at is None
+
+    # Worker run at old time (12:00): transport NOT called
+    mock_bot = AsyncMock()
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=9999))
+    stats_old = await run_event_delivery_worker_cycle(test_session_maker, bot=mock_bot, now=base_now)
+    assert stats_old["sent"] == 0
+    assert not mock_bot.send_message.called
+
+    # Worker run after new due (13:05): message sent exactly once
+    stats_new = await run_event_delivery_worker_cycle(test_session_maker, bot=mock_bot, now=new_due + timedelta(minutes=5))
+    assert stats_new["sent"] == 1
+    assert mock_bot.send_message.call_count == 1
+
+    # Worker run again (13:10): no duplicate send
+    stats_again = await run_event_delivery_worker_cycle(test_session_maker, bot=mock_bot, now=new_due + timedelta(minutes=10))
+    assert stats_again["sent"] == 0
+    assert mock_bot.send_message.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_claimed_delivery_offset_moved_past_skips(test_session_maker):
+    """
+    Pre-PoNR race regression test B:
+    - delivery claimed before PoNR
+    - admin edits step offset such that recalculated due <= now
+    - delivery becomes skipped with skip_reason='step_rescheduled_past'
+    - claim fields are cleared
+    - worker transport is never called
+    """
+    base_now = datetime(2026, 10, 25, 12, 0, 0)
+    starts_at = base_now + timedelta(hours=2)  # 14:00
+
+    scen = await create_scenario(
+        test_session_maker,
+        code="claimed_past_test",
+        event_type="webinar",
+        title="Claimed Past Webinar",
+        starts_at_utc=starts_at,
+        link="https://live.link",
+        now_utc=base_now,
+    )
+    await toggle_scenario_active(test_session_maker, scen.id, now_utc=base_now)
+
+    step = await add_step(test_session_maker, scen.id, -120, "Напоминание сейчас", now_utc=base_now - timedelta(minutes=5))
+
+    async with test_session_maker() as session:
+        u = User(id=802, first_name="ClaimedPastUser")
+        session.add(u)
+        await session.flush()
+        reg = EventRegistration(
+            event_id=scen.id,
+            user_id=802,
+            status="started",
+            registration_mode="standard",
+            registered_at=base_now - timedelta(hours=1),
+        )
+        session.add(reg)
+        await session.flush()
+        deliv = EventDelivery(
+            event_id=scen.id,
+            user_id=802,
+            registration_id=reg.id,
+            step_id=step.id,
+            message_kind="scheduled_step",
+            delivery_key=f"ev:{scen.id}:reg:{reg.id}:step:{step.id}:r0",
+            due_at=base_now,
+            next_attempt_at=base_now,
+            schedule_revision=1,
+            registration_generation=1,
+            platform="telegram",
+            status="pending",
+        )
+        session.add(deliv)
+        await session.commit()
+        deliv_id = deliv.id
+
+    # Claim delivery via real claim_pending_deliveries()
+    claimed = await claim_pending_deliveries(test_session_maker, batch_size=10, now=base_now)
+    assert len(claimed) == 1
+    assert claimed[0][0] == deliv_id
+    token = claimed[0][1]
+
+    async with test_session_maker() as session:
+        d_in_db = await session.get(EventDelivery, deliv_id)
+        assert d_in_db.status == "claimed"
+        assert d_in_db.claim_token == token
+
+    # Admin changes offset so recalculated due <= base_now (e.g. -180 min -> 11:00 <= 12:00)
+    await update_step(test_session_maker, step.id, offset_minutes=-180, now_utc=base_now)
+
+    # Verify delivery becomes skipped with skip_reason='step_rescheduled_past' and cleared claim fields
+    async with test_session_maker() as session:
+        updated_deliv = await session.get(EventDelivery, deliv_id)
+        assert updated_deliv.status == "skipped"
+        assert updated_deliv.skip_reason == "step_rescheduled_past"
+        assert updated_deliv.finished_at == base_now
+        assert updated_deliv.claim_token is None
+        assert updated_deliv.claimed_at is None
+        assert updated_deliv.lease_until is None
+        assert updated_deliv.send_started_at is None
+
+    # Worker runs after this: transport is NEVER called
+    mock_bot = AsyncMock()
+    mock_bot.send_message = AsyncMock()
+    stats = await run_event_delivery_worker_cycle(test_session_maker, bot=mock_bot, now=base_now + timedelta(hours=5))
+    assert stats["sent"] == 0
+    assert not mock_bot.send_message.called
 

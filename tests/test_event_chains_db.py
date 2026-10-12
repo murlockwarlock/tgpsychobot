@@ -1989,3 +1989,131 @@ async def test_real_postgresql_update_step_vs_reschedule_concurrency():
     finally:
         await pg_engine.dispose()
 
+
+@pytest.mark.asyncio
+async def test_real_postgresql_claimed_update_step_vs_presend_barrier():
+    """
+    Concurrency barrier test on real PostgreSQL (disposable test DB guard):
+    - poller claim of due delivery
+    - concurrent race: admin update_step (new future offset) vs worker prepare_and_lock_delivery_for_sending (pre-send / PoNR)
+    - Valid outcomes:
+      1) Admin wins before PoNR:
+         worker pre-send rejected (ok=False), delivery in DB is rescheduled to 'pending' with new due_at and claim cleared
+      2) Worker wins PoNR:
+         pre-send succeeds (ok=True, status='sending'), admin update_step does not mutate sending delivery
+    - Invariant: delivery is NEVER left in an inconsistent state or sent with stale schedule after admin update_step commit.
+    """
+    import asyncio
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from event_admin_service import add_step, create_scenario, toggle_scenario_active, update_step
+    from event_delivery_worker import claim_pending_deliveries
+    from event_service import prepare_and_lock_delivery_for_sending
+
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
+
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+            await conn.run_sync(Base.metadata.create_all)
+
+        session_maker = async_sessionmaker(pg_engine, expire_on_commit=False, class_=AsyncSession)
+
+        base_now = datetime.utcnow()
+        starts_at = base_now + timedelta(hours=2)
+        scen = await create_scenario(
+            session_maker,
+            code="pg_barrier_test",
+            event_type="webinar",
+            title="PG Concurrency Barrier Webinar",
+            starts_at_utc=starts_at,
+            link="https://live.link",
+            now_utc=base_now,
+        )
+        await toggle_scenario_active(session_maker, scen.id, now_utc=base_now)
+
+        # Step originally at -120 min (due right at base_now)
+        step = await add_step(session_maker, scen.id, -120, "Barrier reminder step", now_utc=base_now - timedelta(minutes=5))
+
+        async with session_maker() as session:
+            u = User(id=9992, first_name="PGUserBarrier")
+            session.add(u)
+            await session.flush()
+            reg = EventRegistration(
+                event_id=scen.id,
+                user_id=9992,
+                status="started",
+                registration_mode="standard",
+                registered_at=base_now - timedelta(hours=1),
+            )
+            session.add(reg)
+            await session.flush()
+            deliv = EventDelivery(
+                event_id=scen.id,
+                user_id=9992,
+                registration_id=reg.id,
+                step_id=step.id,
+                message_kind="scheduled_step",
+                delivery_key=f"ev:{scen.id}:reg:{reg.id}:step:{step.id}:r0",
+                due_at=base_now,
+                next_attempt_at=base_now,
+                schedule_revision=1,
+                registration_generation=1,
+                platform="telegram",
+                status="pending",
+            )
+            session.add(deliv)
+            await session.commit()
+            deliv_id = deliv.id
+
+        # 1. Poller claim
+        claimed = await claim_pending_deliveries(session_maker, batch_size=10, now=base_now)
+        assert len(claimed) == 1
+        assert claimed[0][0] == deliv_id
+        token = claimed[0][1]
+
+        # 2. Race: admin update_step (-60 min -> new due at starts_at - 1h = 13:00) vs worker pre-send
+        new_due = starts_at - timedelta(minutes=60)
+        async def run_admin():
+            return await update_step(session_maker, step.id, offset_minutes=-60, now_utc=base_now)
+
+        async def run_worker():
+            return await prepare_and_lock_delivery_for_sending(
+                session_maker,
+                delivery_id=deliv_id,
+                claim_token=token,
+                expected_content_version=1,
+                expected_step_version=1,
+                rendered_text="Rendered reminder",
+                template_text="Barrier reminder step",
+                now=base_now,
+            )
+
+        admin_res, worker_res = await asyncio.gather(run_admin(), run_worker())
+        ok, locked_deliv, reject_reason = worker_res
+
+        async with session_maker() as session:
+            final_deliv = await session.get(EventDelivery, deliv_id)
+
+            if ok:
+                # Worker won PoNR before admin update_step
+                # Delivery was committed to 'sending' before admin lock, so admin did not mutate it
+                assert final_deliv.status == "sending"
+                assert final_deliv.attempt_count >= 1
+            else:
+                # Admin won before PoNR: worker pre-send was rejected
+                # Delivery was safely rescheduled to 'pending' with new due_at and cleared claim fields
+                assert final_deliv.status == "pending"
+                assert final_deliv.due_at == new_due
+                assert final_deliv.claim_token is None
+                assert final_deliv.claimed_at is None
+                assert final_deliv.lease_until is None
+                assert final_deliv.send_started_at is None
+                assert reject_reason in ("step_version_mismatch", "content_version_mismatch", "stale_or_invalid_claim")
+
+            # Invariant: delivery is NEVER in an inconsistent claimed state with stale schedule
+            assert final_deliv.status in ("pending", "sending")
+    finally:
+        await pg_engine.dispose()
+
