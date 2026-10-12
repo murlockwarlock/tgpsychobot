@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from sqlalchemy import distinct, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from database import (
     AIConfig,
@@ -25,6 +25,7 @@ from user_metadata import (
     merge_metadata,
     service_data_history_block,
 )
+from event_service import sync_and_append_user_metadata
 
 
 @dataclass(frozen=True)
@@ -189,13 +190,37 @@ async def build_runtime_automation_context(
     current_state = _load_object(getattr(row, "current_state_json", None)) if row is not None else {}
 
     if mode == MEMORY_MODE_GLOBAL:
-        dialogue_state = await get_or_lazy_init_dialogue_automation_state(
+        dialogue_state = await get_dialogue_automation_state(
             session,
             user_id=user_id,
             dialogue_id=dialogue_id,
-            active_topic_id=topic_id,
         )
-        metadata = _load_object(getattr(dialogue_state, "metadata_json", None)) if dialogue_state is not None else {}
+        if dialogue_state is not None:
+            metadata = _load_object(getattr(dialogue_state, "metadata_json", None))
+        else:
+            # Zero-Conflict seed dictionary computed in-memory without uncommitted row creation
+            scope_active_topic = topic_id or 0
+            active_state = await session.scalar(
+                select(AutomationConversationState).where(
+                    AutomationConversationState.user_id == user_id,
+                    AutomationConversationState.dialogue_id == dialogue_id,
+                    AutomationConversationState.topic_id == scope_active_topic,
+                )
+            )
+            if active_state and _load_object(active_state.metadata_json):
+                metadata = _load_object(active_state.metadata_json)
+            else:
+                topic_states = (await session.execute(
+                    select(AutomationConversationState).where(
+                        AutomationConversationState.user_id == user_id,
+                        AutomationConversationState.dialogue_id == dialogue_id,
+                    )
+                )).scalars().all()
+                non_empty = [
+                    m for s in topic_states
+                    if (m := _load_object(s.metadata_json))
+                ]
+                metadata = non_empty[0] if len(non_empty) == 1 else {}
     else:
         metadata = _load_object(getattr(row, "metadata_json", None)) if row is not None else {}
 
@@ -227,7 +252,7 @@ async def apply_service_data_blocks(
     ]
     if metadata_blocks:
         # Keep the existing admin export/history fully backward compatible.
-        user.metadata_json = append_metadata_records(user.metadata_json, metadata_blocks)
+        await sync_and_append_user_metadata(session, user, metadata_blocks)
 
     structured_blocks = [block for block in blocks if not block.legacy]
     if not structured_blocks:
@@ -324,3 +349,35 @@ async def apply_service_data_blocks(
         current_step=current_step,
         event_names=tuple(event_names),
     )
+
+
+async def persist_service_data_blocks(
+    session_maker: async_sessionmaker[AsyncSession],
+    user_id: int,
+    *,
+    dialogue_id: int,
+    topic_id: int | None,
+    blocks: Iterable[ServiceDataBlock],
+    memory_mode: str | None = None,
+    apply_fn: Any = None,
+) -> AutomationApplyResult:
+    """
+    Persists AI service data blocks in a dedicated short transaction with per-user locking
+    and SQLite WAL busy retry resilience.
+    """
+    from event_service import run_user_transaction
+
+    blocks_list = list(blocks)
+    actual_apply = apply_fn or apply_service_data_blocks
+
+    async def _op(session: AsyncSession, user: User) -> AutomationApplyResult:
+        return await actual_apply(
+            session,
+            user=user,
+            dialogue_id=dialogue_id,
+            topic_id=topic_id,
+            blocks=blocks_list,
+            memory_mode=memory_mode,
+        )
+
+    return await run_user_transaction(session_maker, user_id, _op)

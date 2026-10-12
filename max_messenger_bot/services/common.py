@@ -570,6 +570,10 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
 
             await start_test(client, chat_id, user_id, states)
             return
+        from event_service import handle_event_start_max
+        if await handle_event_start_max(client, chat_id, user_id, start_payload):
+            return
+
         rendered = await render_static_content(client, chat_id, user_id, start_payload)
         if rendered:
             return

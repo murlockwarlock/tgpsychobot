@@ -35,6 +35,7 @@ from telegram_client import create_telegram_bot
 from automation_events import process_pending_events
 from followups import FollowupActivityMiddleware, process_due_followups
 from followups import FollowupTransportRegistry
+from event_delivery_worker import run_event_delivery_worker_cycle
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.settings import get_settings as get_max_settings
 from translation_service import refresh_translation_cache
@@ -126,6 +127,40 @@ async def _configure_telegram_delivery(bot: Bot, dispatcher: Dispatcher) -> str:
         logging.warning("Webhook setup failed, falling back to polling mode: %s", e)
         await _start_polling_fallback(bot, dispatcher)
         return "polling"
+
+
+def setup_scheduler(
+    bot: Bot,
+    session_maker,
+    dispatcher: Dispatcher,
+    max_followup_client: MaxApiClient | None = None,
+    start: bool = True,
+) -> AsyncIOScheduler:
+    followup_transports = FollowupTransportRegistry(
+        telegram=bot,
+        max_client=max_followup_client,
+    )
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
+    scheduler.add_job(check_kie_credit_balance, 'interval', minutes=15, args=(bot,))
+    scheduler.add_job(process_payment_notification_outbox, 'interval', seconds=30, args=(bot,), max_instances=1, coalesce=True)
+    scheduler.add_job(process_pending_events, 'interval', minutes=1, args=(bot,), max_instances=1)
+    scheduler.add_job(process_due_followups, 'interval', minutes=1, args=(followup_transports,), max_instances=1)
+    scheduler.add_job(
+        run_event_delivery_worker_cycle,
+        'interval',
+        seconds=15,
+        args=(session_maker,),
+        kwargs={"bot": bot, "max_client": max_followup_client, "batch_size": 20},
+        max_instances=1,
+        coalesce=True,
+        id="event_delivery_worker",
+        name="event_delivery_worker",
+    )
+    if start:
+        scheduler.start()
+    dispatcher['_scheduler'] = scheduler
+    return scheduler
 
 
 async def on_startup(bot: Bot, dispatcher: Dispatcher):
@@ -230,19 +265,13 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
         max_followup_client = MaxApiClient(max_token, max_settings.max_api_base)
         await max_followup_client.__aenter__()
         dispatcher["_followup_max_client"] = max_followup_client
-    followup_transports = FollowupTransportRegistry(
-        telegram=bot,
-        max_client=max_followup_client,
+    scheduler = setup_scheduler(
+        bot=bot,
+        session_maker=async_session_maker,
+        dispatcher=dispatcher,
+        max_followup_client=max_followup_client,
+        start=True,
     )
-
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
-    scheduler.add_job(check_kie_credit_balance, 'interval', minutes=15, args=(bot,))
-    scheduler.add_job(process_payment_notification_outbox, 'interval', seconds=30, args=(bot,), max_instances=1, coalesce=True)
-    scheduler.add_job(process_pending_events, 'interval', minutes=1, args=(bot,), max_instances=1)
-    scheduler.add_job(process_due_followups, 'interval', minutes=1, args=(followup_transports,), max_instances=1)
-    scheduler.start()
-    dispatcher['_scheduler'] = scheduler
 
     bg_task_factories = {
         'process_queue': lambda: process_queue(bot),

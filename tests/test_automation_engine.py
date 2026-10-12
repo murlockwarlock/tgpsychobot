@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -14,6 +15,7 @@ from automation_engine import apply_service_data_blocks, build_runtime_automatio
 from database import (
     AIConfig,
     AutomationConversationState,
+    AutomationDialogueState,
     AutomationEvent,
     AutomationMetadataRecord,
     AutomationStepTransition,
@@ -31,6 +33,7 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
             AIConfig.__table__,
             User.__table__,
             AutomationConversationState.__table__,
+            AutomationDialogueState.__table__,
             AutomationStepTransition.__table__,
             AutomationMetadataRecord.__table__,
             AutomationEvent.__table__,
@@ -39,7 +42,7 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
             await connection.run_sync(lambda conn: Base.metadata.create_all(conn, tables=tables))
         async with self.sessions() as session:
             session.add(User(id=42, first_name="Иван", current_dialogue_id=1, metadata_json="{}"))
-            session.add(AIConfig(id=1, provider="Gemini", gemini_api_key="test", gemini_model="test"))
+            session.add(AIConfig(id=1, provider="Gemini", gemini_api_key="test", gemini_model="test", memory_mode="reset"))
             await session.commit()
 
     async def asyncTearDown(self):
@@ -380,3 +383,134 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state.current_step, "MAX_STEP")
         self.assertEqual(load_metadata(state.metadata_json), {"max_key": "max_val"})
+
+    async def test_global_memory_mode_direct_ai_request_lazy_init_persistence_sqlite(self):
+        """
+        Regression test: Global Memory Mode direct AI request builds context when
+        AutomationDialogueState is initially absent. Fake provider returns <DATA>.
+        Persistence completes without deadlock / SQLITE_BUSY exhaustion.
+        Exactly one AutomationDialogueState row exists.
+        DATA metadata and User.metadata_json are preserved.
+        """
+        from max_messenger_bot import ai as max_ai
+
+        # Setup: global memory mode, initial user metadata
+        async with self.sessions() as session:
+            conf = await session.get(AIConfig, 1)
+            conf.memory_mode = "global"
+            user = await session.get(User, 42)
+            user.metadata_json = json.dumps({"initial_key": "initial_val"})
+            await session.commit()
+
+        # Verify AutomationDialogueState initially absent
+        async with self.sessions() as session:
+            init_diag_states = (
+                await session.execute(
+                    select(AutomationDialogueState).where(
+                        AutomationDialogueState.user_id == 42,
+                        AutomationDialogueState.dialogue_id == 5,
+                    )
+                )
+            ).scalars().all()
+            self.assertEqual(len(init_diag_states), 0)
+
+        fake_reply = 'Ответ прямой модели.<DATA>{"metadata":{"fav_color":"cyan"}}</DATA>'
+
+        with (
+            patch.object(max_ai, "async_session_maker", self.sessions),
+            patch.object(max_ai, "_dispatch_provider", AsyncMock(return_value=fake_reply)),
+        ):
+            visible = await max_ai.get_ai_response_direct(
+                42,
+                "Системный промпт direct",
+                "Пользовательский вопрос direct",
+                dialogue_id=5,
+                topic_id=1,
+            )
+
+        self.assertEqual(visible, "Ответ прямой модели.")
+
+        # Post-condition verification
+        async with self.sessions() as session:
+            diag_states = (
+                await session.execute(
+                    select(AutomationDialogueState).where(
+                        AutomationDialogueState.user_id == 42,
+                        AutomationDialogueState.dialogue_id == 5,
+                    )
+                )
+            ).scalars().all()
+            # Exactly one AutomationDialogueState exists
+            self.assertEqual(len(diag_states), 1)
+            saved_metadata = json.loads(diag_states[0].metadata_json)
+            self.assertEqual(saved_metadata.get("fav_color"), "cyan")
+
+            # User metadata is not lost
+            user_check = await session.get(User, 42)
+            self.assertIsNotNone(user_check.metadata_json)
+            user_meta = load_metadata_records(user_check.metadata_json)
+            self.assertTrue(any(
+                rec.get("data", {}).get("metadata", {}).get("fav_color") == "cyan"
+                or rec.get("data", {}).get("fav_color") == "cyan"
+                for rec in user_meta
+            ))
+            self.assertTrue(any(rec.get("data", {}).get("initial_key") == "initial_val" for rec in user_meta))
+
+    async def test_global_memory_mode_direct_ai_request_lazy_init_persistence_postgres(self):
+        """Verifies the same Global Memory Mode lazy init persistence on PostgreSQL if available."""
+        from tests.test_event_chains_db import _get_safe_postgres_engine
+        pg_engine, skip_reason = await _get_safe_postgres_engine()
+        if pg_engine is None:
+            self.skipTest(f"Disposable PostgreSQL not available: {skip_reason}")
+
+        try:
+            async with pg_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+
+            pg_sessions = async_sessionmaker(pg_engine, expire_on_commit=False)
+            async with pg_sessions() as session:
+                session.add(User(id=942, first_name="PG_User", current_dialogue_id=1, metadata_json=json.dumps({"pg_init": 1})))
+                session.add(AIConfig(id=1, provider="Gemini", gemini_api_key="test", gemini_model="test", memory_mode="global"))
+                await session.commit()
+
+            from max_messenger_bot import ai as max_ai
+            fake_reply = 'PG direct response.<DATA>{"metadata":{"pg_color":"emerald"}}</DATA>'
+
+            with (
+                patch.object(max_ai, "async_session_maker", pg_sessions),
+                patch.object(max_ai, "_dispatch_provider", AsyncMock(return_value=fake_reply)),
+            ):
+                visible = await max_ai.get_ai_response_direct(
+                    942,
+                    "PG sys prompt",
+                    "PG user prompt",
+                    dialogue_id=7,
+                    topic_id=1,
+                )
+
+            self.assertEqual(visible, "PG direct response.")
+
+            async with pg_sessions() as session:
+                diag_states = (
+                    await session.execute(
+                        select(AutomationDialogueState).where(
+                            AutomationDialogueState.user_id == 942,
+                            AutomationDialogueState.dialogue_id == 7,
+                        )
+                    )
+                ).scalars().all()
+                self.assertEqual(len(diag_states), 1)
+                saved_metadata = json.loads(diag_states[0].metadata_json)
+                self.assertEqual(saved_metadata.get("pg_color"), "emerald")
+
+                user_check = await session.get(User, 942)
+                user_meta = load_metadata_records(user_check.metadata_json)
+                self.assertTrue(any(
+                    rec.get("data", {}).get("metadata", {}).get("pg_color") == "emerald"
+                    or rec.get("data", {}).get("pg_color") == "emerald"
+                    for rec in user_meta
+                ))
+                self.assertTrue(any(rec.get("data", {}).get("pg_init") == 1 for rec in user_meta))
+        finally:
+            await pg_engine.dispose()
+
