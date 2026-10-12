@@ -8080,6 +8080,30 @@ async def callback_admin_ai_log_detail(callback: CallbackQuery):
     )
 
 
+def _safe_truncate_escaped(raw_text: str, max_escaped_len: int, truncation_suffix: str = "...") -> str:
+    escaped_full = html.escape(raw_text)
+    if len(escaped_full) <= max_escaped_len:
+        return escaped_full
+
+    budget = max(0, max_escaped_len - len(truncation_suffix))
+    if budget == 0:
+        return truncation_suffix[:max_escaped_len]
+
+    low = 0
+    high = min(len(raw_text), budget)
+    best_k = 0
+    while low <= high:
+        mid = (low + high) // 2
+        escaped_prefix = html.escape(raw_text[:mid])
+        if len(escaped_prefix) <= budget:
+            best_k = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    return html.escape(raw_text[:best_k]) + truncation_suffix
+
+
 async def show_ai_log_detail(
     event: Message | CallbackQuery,
     log_id: int,
@@ -8143,9 +8167,7 @@ async def show_ai_log_detail(
     dt_str = format_msk(log_entry.created_at, "%d-%m-%Y %H:%M:%S МСК")
     log_type = getattr(log_entry, "request_type", "chat") or "chat"
     request_preview = log_entry.request_payload or "не зафиксирован"
-    prompt_str = html.escape(request_preview)
-    if len(prompt_str) > 1200:
-        prompt_str = prompt_str[:1200] + "..."
+    prompt_str = _safe_truncate_escaped(request_preview, 650, "...")
 
     log_status = getattr(log_entry, "status", None) or "success"
     attempt_no = getattr(log_entry, "attempt_no", None) or 1
@@ -8156,15 +8178,18 @@ async def show_ai_log_detail(
 
     if log_status == "error":
         err_type = log_entry.error_type or "UnknownError"
-        err_msg = log_entry.error_message or "не указано"
+        err_msg = _safe_truncate_escaped(log_entry.error_message or "не указано", 350, "...")
         err_cls = log_entry.error_classification or "не классифицировано"
         raw_resp_preview = log_entry.provider_response_payload or log_entry.raw_response or "не зафиксирован"
-        if len(raw_resp_preview) > 1500:
-            raw_resp_preview = raw_resp_preview[:1500] + "\n\n[...] (Полный файл скачайте по кнопке ниже)"
+        raw_preview = _safe_truncate_escaped(
+            raw_resp_preview,
+            1200,
+            "\n\n[...] (Полный файл скачайте по кнопке ниже)",
+        )
 
         diag_info = ""
         if log_entry.diagnostics_json:
-            diag_info = f"🔬 <b>Диагностика:</b>\n<code>{html.escape(log_entry.diagnostics_json[:500])}</code>\n\n"
+            diag_info = f"🔬 <b>Диагностика:</b>\n<code>{_safe_truncate_escaped(log_entry.diagnostics_json, 350, '...')}</code>\n\n"
 
         text = (
             f"❌ <b>Ошибка вызова ИИ #{log_entry.id}</b>\n\n"
@@ -8178,21 +8203,17 @@ async def show_ai_log_detail(
             f"⏱ <b>Время до ошибки:</b> <code>{lat_text}</code>\n"
             f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
             f"🚨 <b>Ошибка приложения:</b>\n"
-            f"<code>{html.escape(err_type)}</code>: <code>{html.escape(err_msg[:500])}</code>\n\n"
+            f"<code>{html.escape(err_type)}</code>: <code>{err_msg}</code>\n\n"
             f"🏷 <b>Классификация ошибки:</b>\n"
             f"<code>{html.escape(err_cls)}</code>\n\n"
             f"{diag_info}"
             f"📤 <b>Полный payload запроса (превью):</b>\n<code>{prompt_str}</code>\n\n"
             f"📥 <b>Сырой ответ провайдера (Raw Response / Payload):</b>\n"
-            f"<code>{html.escape(raw_resp_preview)}</code>"
+            f"<code>{raw_preview}</code>"
         )
     else:
         raw_resp = log_entry.raw_response or ""
-        display_raw = html.escape(raw_resp)
-        if len(display_raw) > 2500:
-            display_raw = display_raw[:2500] + "\n\n[...] (Полный сырой файл скачайте по кнопке ниже)"
-
-        text = (
+        header_text = (
             f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
             + "\n".join(identity_lines)
             + "\n"
@@ -8204,9 +8225,16 @@ async def show_ai_log_detail(
             f"⏱ <b>Время ответа:</b> <code>{lat_text}</code>\n"
             f"📅 <b>Дата вызова:</b> {dt_str}\n\n"
             f"📤 <b>Полный payload запроса (превью):</b>\n<code>{prompt_str}</code>\n\n"
-            f"📥 <b>Сырой ответ модели (Raw LLM Output):</b>\n"
-            f"<code>{display_raw}</code>"
+            f"📥 <b>Сырой ответ модели (Raw LLM Output):</b>\n<code>"
         )
+        suffix_text = "</code>"
+        max_allowed_raw = max(200, 3800 - len(header_text) - len(suffix_text))
+        display_raw = _safe_truncate_escaped(
+            raw_resp,
+            min(1800, max_allowed_raw),
+            "\n\n[...] (Полный сырой файл скачайте по кнопке ниже)",
+        )
+        text = f"{header_text}{display_raw}{suffix_text}"
 
     markup = kb.admin_ai_log_detail_keyboard(
         log_id,
@@ -8216,10 +8244,26 @@ async def show_ai_log_detail(
         request_type=request_type,
         status=status,
     )
-    if isinstance(event, CallbackQuery):
-        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-    else:
-        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    try:
+        if isinstance(event, CallbackQuery):
+            await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    except Exception as exc:
+        if "MESSAGE_TOO_LONG" in str(exc) or "message is too long" in str(exc).lower():
+            tight_raw = _safe_truncate_escaped(log_entry.raw_response or "", 500, "\n\n[...] (Скачайте файл по кнопке)")
+            fallback_text = (
+                f"📄 <b>Детали лога ИИ #{log_entry.id}</b>\n\n"
+                f"🤖 <b>Провайдер:</b> <b>{html.escape(log_entry.provider)}</b> | 🧠 <code>{html.escape(log_entry.model)}</code>\n"
+                f"📅 <b>Дата:</b> {dt_str}\n\n"
+                f"📥 <b>Сырой ответ модели (сокращено):</b>\n<code>{tight_raw}</code>"
+            )
+            if isinstance(event, CallbackQuery):
+                await event.message.edit_text(fallback_text, reply_markup=markup, parse_mode="HTML")
+            else:
+                await event.answer(fallback_text, reply_markup=markup, parse_mode="HTML")
+        else:
+            raise
 
 
 def _build_ai_log_file_content(log_entry: AILog) -> str:

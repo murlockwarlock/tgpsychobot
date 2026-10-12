@@ -607,3 +607,35 @@ async def test_telegram_dispatcher_lifecycle_monitoring_and_test_send(db_session
     summary = await get_scenario_summary(db_session_maker, scen.id)
     assert summary.is_archived is True
 
+
+def test_scenario_card_text_with_and_without_bot_username():
+    from event_admin_telegram import _format_scenario_card_text
+    from event_admin_service import ScenarioSummary
+
+    scen = ScenarioSummary(
+        id=1,
+        code="webinar_ai",
+        event_type="webinar",
+        title="Webinar AI",
+        starts_at=datetime.utcnow() + timedelta(days=2),
+        starts_at_msk="15.10.2026 19:00 (МСК)",
+        duration_minutes=60,
+        place=None,
+        link="https://example.com/join",
+        is_active=True,
+        is_archived=False,
+        schedule_revision=1,
+        content_version=1,
+        registrations_count=10,
+    )
+
+    # 1. Without bot username: fallback to just code
+    text_without = _format_scenario_card_text(scen, bot_username=None)
+    assert "• <b>Код события (/start):</b> <code>webinar_ai</code>" in text_without
+    assert "• <b>Ссылка для регистрации:</b>" not in text_without
+
+    # 2. With bot username: displays full clickable deep link and code
+    text_with = _format_scenario_card_text(scen, bot_username="psycho_bot")
+    assert "• <b>Ссылка для регистрации:</b> <code>https://t.me/psycho_bot?start=webinar_ai</code>" in text_with
+    assert "• <b>Код события (/start):</b> <code>webinar_ai</code>" in text_with
+

@@ -424,6 +424,18 @@ async def _show_scenarios_page(callback: CallbackQuery, page: int, include_archi
 # SCENARIO CARD & LIFECYCLE
 # ==============================================================================
 
+async def _get_bot_username(bot: Bot | None) -> str | None:
+    if not bot:
+        return None
+    try:
+        me = await bot.get_me()
+        if hasattr(me, "username") and isinstance(me.username, str) and me.username:
+            return me.username
+    except Exception:
+        pass
+    return None
+
+
 @router.callback_query(F.data.startswith("admin_ev_open_"))
 async def open_scenario_card(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -433,7 +445,8 @@ async def open_scenario_card(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer("Мероприятие не найдено.", show_alert=True)
         return
 
-    text = _format_scenario_card_text(scen)
+    bot_username = await _get_bot_username(callback.bot)
+    text = _format_scenario_card_text(scen, bot_username=bot_username)
     await callback.message.edit_text(
         text,
         parse_mode="HTML",
@@ -441,7 +454,7 @@ async def open_scenario_card(callback: CallbackQuery, state: FSMContext) -> None
     )
 
 
-def _format_scenario_card_text(s: ScenarioSummary) -> str:
+def _format_scenario_card_text(s: ScenarioSummary, bot_username: str | None = None) -> str:
     status_str = "📦 В архиве" if s.is_archived else ("🟢 Активно (регистрация включена)" if s.is_active else "⚪️ Выключено (регистрация приостановлена)")
     kind_str = "Вебинар" if s.event_type == "webinar" else "Очная встреча"
 
@@ -455,9 +468,18 @@ def _format_scenario_card_text(s: ScenarioSummary) -> str:
 
     loc_block = "\n".join(loc_lines)
 
+    if bot_username:
+        reg_link = f"https://t.me/{html.escape(bot_username)}?start={html.escape(s.code)}"
+        code_and_link = (
+            f"• <b>Ссылка для регистрации:</b> <code>{reg_link}</code>\n"
+            f"• <b>Код события (/start):</b> <code>{s.code}</code>\n"
+        )
+    else:
+        code_and_link = f"• <b>Код события (/start):</b> <code>{s.code}</code>\n"
+
     return (
         f"📅 <b>Карточка мероприятия: {html.escape(s.title)}</b>\n\n"
-        f"• <b>Код события (/start):</b> <code>{s.code}</code>\n"
+        f"{code_and_link}"
         f"• <b>Тип:</b> {kind_str}\n"
         f"• <b>Дата и время начала:</b> {s.starts_at_msk}\n"
         f"• <b>Длительность:</b> {s.duration_minutes} мин.\n"
@@ -481,8 +503,9 @@ async def toggle_active_handler(callback: CallbackQuery) -> None:
 
     scen = await get_scenario_summary(async_session_maker, event_id)
     if scen:
+        bot_username = await _get_bot_username(callback.bot)
         await callback.message.edit_text(
-            _format_scenario_card_text(scen),
+            _format_scenario_card_text(scen, bot_username=bot_username),
             parse_mode="HTML",
             reply_markup=_scenario_card_keyboard(scen),
         )
@@ -520,8 +543,9 @@ async def archive_yes_handler(callback: CallbackQuery) -> None:
 
     scen = await get_scenario_summary(async_session_maker, event_id)
     if scen:
+        bot_username = await _get_bot_username(callback.bot)
         await callback.message.edit_text(
-            _format_scenario_card_text(scen),
+            _format_scenario_card_text(scen, bot_username=bot_username),
             parse_mode="HTML",
             reply_markup=_scenario_card_keyboard(scen),
         )
@@ -704,7 +728,8 @@ async def _finalize_scenario_creation(
             is_active=False,
         )
         await state.clear()
-        card_text = _format_scenario_card_text(scen)
+        bot_username = await _get_bot_username(target_msg.bot)
+        card_text = _format_scenario_card_text(scen, bot_username=bot_username)
         await target_msg.answer(
             f"🎉 <b>Мероприятие успешно создано!</b>\n\n{card_text}",
             parse_mode="HTML",
@@ -974,7 +999,8 @@ async def process_copy_starts_at(message: Message, state: FSMContext) -> None:
             new_starts_at_utc=utc_dt,
         )
         await state.clear()
-        card_text = _format_scenario_card_text(new_scen)
+        bot_username = await _get_bot_username(message.bot)
+        card_text = _format_scenario_card_text(new_scen, bot_username=bot_username)
         await message.answer(
             f"🎉 <b>Сценарий успешно скопирован!</b>\n\n{card_text}",
             parse_mode="HTML",
