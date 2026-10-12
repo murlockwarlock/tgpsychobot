@@ -4464,7 +4464,7 @@ async def _run_start_business(
 
             else:
                 from event_service import handle_event_start_telegram
-                if await handle_event_start_telegram(bot, message.chat.id, user_id, args):
+                if await handle_event_start_telegram(bot, message.chat.id, user_id, args, session_maker=async_session_maker):
                     if bonus_messages:
                         await send_bonus_messages()
                     await complete_start_intent_if_safe()

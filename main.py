@@ -14,6 +14,7 @@ from config import BOT_TOKEN, OWNER_IDS
 from handlers import router
 from automation_admin import router as automation_admin_router
 from admin_content_authoring import router as content_authoring_router
+from event_admin_telegram import router as event_admin_router
 from admin_authoring_context import AdminAuthoringMiddleware
 from content_runtime import ContentRuntimeMiddleware
 from database import async_session_maker, init_db
@@ -424,9 +425,10 @@ def main():
     # FSM messages from automation settings must be routed before the general
     # dialogue handler.
     dp.include_router(content_authoring_router)
-    for admin_router in (automation_admin_router, router):
+    for admin_router in (event_admin_router, automation_admin_router, router):
         admin_router.message.middleware(AdminAuthoringMiddleware())
         admin_router.callback_query.middleware(AdminAuthoringMiddleware())
+    dp.include_router(event_admin_router)
     dp.include_router(automation_admin_router)
     dp.include_router(router)
 

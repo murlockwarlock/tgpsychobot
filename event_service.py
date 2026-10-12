@@ -534,8 +534,16 @@ def render_event_template(
         if raw_name:
             user_name = raw_name
 
-    link_val = (scenario.link or scenario.place or "").strip()
-    place_val = (scenario.place or scenario.link or "").strip()
+    if scenario.link and scenario.link.strip():
+        link_val = scenario.link.strip()
+    elif scenario.event_type == "webinar":
+        link_val = (scenario.link or "").strip()
+    else:
+        # Meeting without link
+        link_val = ""
+
+    place_val = (scenario.place or "").strip()
+    link_or_place_val = (scenario.link or scenario.place or "").strip()
     date_val = format_msk(scenario.starts_at, "%d.%m.%Y")
     time_val = format_msk(scenario.starts_at, "%H:%M")
 
@@ -548,7 +556,7 @@ def render_event_template(
         "event_time": time_val,
         "new_time_msk": time_val,
         "link": link_val,
-        "link_or_place": link_val,
+        "link_or_place": link_or_place_val,
         "place": place_val,
     }
 
@@ -1497,12 +1505,17 @@ async def handle_event_start_telegram(
     norm_code = start_arg.strip().lower()
     effective_now = now or datetime.utcnow()
 
-    async with sm() as session:
-        scenario = await session.scalar(
-            select(EventScenario).where(EventScenario.code == norm_code)
-        )
-        if scenario is None or scenario.is_archived:
+    try:
+        async with sm() as session:
+            scenario = await session.scalar(
+                select(EventScenario).where(EventScenario.code == norm_code)
+            )
+            if scenario is None or scenario.is_archived:
+                return False
+    except Exception as exc:
+        if "no such table" in str(exc).lower():
             return False
+        raise
 
     reg_res = await register_user_for_event(sm, user_id, norm_code, platform="telegram", now=effective_now)
 
