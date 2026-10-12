@@ -1925,7 +1925,8 @@ async def test_real_postgresql_update_step_vs_reschedule_concurrency():
 
     try:
         async with pg_engine.begin() as conn:
-            await conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
             await conn.run_sync(Base.metadata.create_all)
 
         session_maker = async_sessionmaker(pg_engine, expire_on_commit=False, class_=AsyncSession)
@@ -2015,7 +2016,8 @@ async def test_real_postgresql_claimed_update_step_vs_presend_barrier():
 
     try:
         async with pg_engine.begin() as conn:
-            await conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
             await conn.run_sync(Base.metadata.create_all)
 
         session_maker = async_sessionmaker(pg_engine, expire_on_commit=False, class_=AsyncSession)
