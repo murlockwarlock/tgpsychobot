@@ -22,6 +22,7 @@ from sqlalchemy.orm import selectinload
 import gemini_image
 
 from prompt_blocks import MAX_CAPABILITIES
+from ai_integration import _build_ai_attempt
 from ai_log_context import apply_ai_log_context, record_ai_attempt_log
 from ai_request_builder import (
     ActivityTracker,
@@ -1634,223 +1635,371 @@ async def get_ai_response(
 
             # Try fallback provider if configured
             fb_provider = getattr(ai_config, "fallback_provider", None)
+            if isinstance(fb_provider, str):
+                fb_provider = fb_provider.strip() or None
             fb_model = getattr(ai_config, "fallback_model", None)
-            allow_fallback = getattr(ai_config, "allow_fallback", False)
+            if isinstance(fb_model, str):
+                fb_model = fb_model.strip() or None
+            allow_fallback = bool(getattr(ai_config, "allow_fallback", False))
             fallback_succeeded = False
-            if allow_fallback and fb_provider and fb_model:
+
+            if allow_fallback and (not fb_provider or not fb_model):
+                real_reason = "Fallback AI provider configuration is incomplete: provider and model are required"
+                fb_prov = str(fb_provider or "unconfigured")
+                fb_mod = str(fb_model or "unconfigured")
+                log.error(
+                    "Fallback is enabled but configuration is incomplete for user %s: provider=%s model=%s",
+                    user_id, fb_provider, fb_model,
+                )
+                fb_diag = {}
+                if exclude_message_id is not None:
+                    fb_diag["user_message_id"] = exclude_message_id
+                fb_log_id = await record_ai_attempt_log(
+                    session,
+                    user_id=user_id,
+                    platform="max",
+                    dialogue_id=active_dialogue_id,
+                    topic_id=active_topic_id,
+                    topic_name=active_topic.name if active_topic else None,
+                    request_type=request_type or "chat",
+                    provider=fb_prov,
+                    model=fb_mod,
+                    prompt_summary=user_prompt if user_prompt else None,
+                    request_capture=None,
+                    raw_response="",
+                    latency_ms=0,
+                    status="error",
+                    request_group_id=request_group_id,
+                    attempt_no=2,
+                    attempt_role="fallback",
+                    error_type="AIServiceError",
+                    error_message=real_reason,
+                    error_classification="configuration",
+                    http_status=None,
+                    finish_reason=None,
+                    diagnostics=fb_diag if fb_diag else None,
+                    provider_response_payload=None,
+                )
+                ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None]
+                await send_terminal_ai_failure_alert(
+                    bot=None,
+                    platform="max",
+                    user_id=user_id,
+                    primary_provider=primary_prov,
+                    primary_model=primary_mod,
+                    fallback_provider=fb_provider,
+                    fallback_model=fb_model,
+                    exception=primary_err,
+                    classification="configuration",
+                    ai_log_ids=ai_log_ids if ai_log_ids else None,
+                )
+                fallback_config_error = AIServiceError(real_reason)
+                fallback_config_error.classification = "configuration"
+                service_err = AIServiceError(
+                    "Основной AI-провайдер не сработал, резервный провайдер не настроен"
+                )
+                service_err.ai_outcome = "PRIMARY_FAILED + FALLBACK_CONFIGURATION_ERROR"
+                service_err.provider_attempts = (
+                    _build_ai_attempt(primary_prov, primary_mod, primary_err),
+                    _build_ai_attempt(
+                        fb_provider,
+                        fb_model,
+                        fallback_config_error,
+                        status="CONFIGURATION_ERROR",
+                        classification="configuration",
+                    ),
+                )
+                service_err.classification = "configuration"
+                service_err.ai_log_ids = ai_log_ids
+                service_err.ai_log_id = fb_log_id or primary_log_id
+                service_err.request_group_id = request_group_id
+                raise service_err from primary_err
+
+            elif allow_fallback and fb_provider and fb_model:
                 fb_key = fb_provider.strip().lower()
                 if fb_key in {"claude", "anthropic"}:
                     fb_api_key = getattr(ai_config, "claude_api_key", None) or getattr(ai_config, "anthropic_api_key", None)
                 else:
                     fb_api_key = getattr(ai_config, f"{fb_key}_api_key", None)
-                if fb_api_key:
-                    log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
-                    fb_start = time.monotonic()
-                    fb_timeout = float(getattr(ai_config, "fallback_timeout", 60) or 60.0)
+                if isinstance(fb_api_key, str):
+                    fb_api_key = fb_api_key.strip() or None
 
-                    async def _invoke_fb():
-                        fb_settings_provider = {
-                            "openai": PROVIDER_OPENAI,
-                            "claude": PROVIDER_CLAUDE,
-                            "anthropic": PROVIDER_CLAUDE,
-                            "gemini": PROVIDER_GEMINI,
-                            "deepseek": PROVIDER_DEEPSEEK,
-                            "kie": PROVIDER_KIE,
-                            "openrouter": PROVIDER_OPENROUTER,
-                            "perplexity": PROVIDER_PERPLEXITY,
-                        }.get(fb_key, fb_provider)
-                        async with async_session_maker() as settings_session:
-                            fb_model_settings = await resolve_model_settings(
-                                settings_session,
-                                fb_settings_provider,
-                                fb_model,
-                                "chat",
-                                config=ai_config,
-                            )
-                        fb_tokens = wire_max_output_tokens(fb_model_settings)
-                        fb_temperature = wire_temperature(fb_model_settings)
-                        fb_reasoning_effort = wire_reasoning_effort(fb_model_settings)
-                        if fb_key == "openai":
-                            return await _call_openai(
-                                fb_api_key, fb_model, [], fb_temperature,
-                                request_layout=request_layout,
-                                request_capture=fallback_capture,
-                                activity_tracker=activity_tracker,
-                                max_completion_tokens=fb_tokens,
-                            )
-                        elif fb_key in {"claude", "anthropic"}:
-                            return await _call_claude(
-                                fb_api_key, fb_model, [], stable_system_prompt, fb_temperature,
-                                request_layout=request_layout,
-                                request_capture=fallback_capture,
-                                activity_tracker=activity_tracker,
-                                max_output_tokens=fb_tokens,
-                            )
-                        elif fb_key == "gemini":
-                            return await _call_gemini(
-                                fb_api_key, fb_model, [], stable_system_prompt, fb_temperature,
-                                request_layout=request_layout,
-                                request_capture=fallback_capture,
-                                activity_tracker=activity_tracker,
-                                max_output_tokens=fb_tokens,
-                            )
-                        elif fb_key == "deepseek":
-                            return await _call_deepseek(
-                                fb_api_key, fb_model, [], fb_temperature,
-                                request_layout=request_layout,
-                                request_capture=fallback_capture,
-                                activity_tracker=activity_tracker,
-                                max_output_tokens=fb_tokens,
-                                reasoning_effort=fb_reasoning_effort,
-                            )
-                        elif fb_key == "kie":
-                            return await _call_kie_text_chat(
-                                fb_api_key, _get_kie_base_url(ai_config), fb_model, [],
-                                stable_system_prompt, fb_temperature,
-                                request_layout=request_layout,
-                                request_capture=fallback_capture,
-                                activity_tracker=activity_tracker,
-                                max_output_tokens=fb_tokens,
-                            )
-                        elif fb_key == "openrouter":
-                            try:
-                                return await call_openrouter(
-                                    fb_api_key,
-                                    request_layout,
-                                    fb_model,
-                                    temperature=fb_temperature,
-                                    max_output_tokens=fb_tokens,
-                                    timeout=fb_timeout,
-                                    request_capture=fallback_capture,
-                                    activity_tracker=activity_tracker,
-                                )
-                            except ProviderAdapterError as exc:
-                                raise _wrap_provider_adapter_error(exc) from exc
-                        elif fb_key == "perplexity":
-                            try:
-                                return await call_perplexity(
-                                    fb_api_key,
-                                    request_layout,
-                                    fb_model,
-                                    temperature=fb_temperature,
-                                    max_output_tokens=fb_tokens,
-                                    timeout=fb_timeout,
-                                    request_capture=fallback_capture,
-                                    activity_tracker=activity_tracker,
-                                )
-                            except ProviderAdapterError as exc:
-                                raise _wrap_provider_adapter_error(exc) from exc
-                        else:
-                            raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
+                if not fb_api_key:
+                    real_reason = f"API key for fallback AI provider '{fb_provider}' is not configured"
+                    fb_prov = str(fb_provider)
+                    fb_mod = str(fb_model)
+                    log.error("Fallback provider '%s' has no API key configured for user %s", fb_provider, user_id)
+                    fb_diag = {}
+                    if exclude_message_id is not None:
+                        fb_diag["user_message_id"] = exclude_message_id
+                    fb_log_id = await record_ai_attempt_log(
+                        session,
+                        user_id=user_id,
+                        platform="max",
+                        dialogue_id=active_dialogue_id,
+                        topic_id=active_topic_id,
+                        topic_name=active_topic.name if active_topic else None,
+                        request_type=request_type or "chat",
+                        provider=fb_prov,
+                        model=fb_mod,
+                        prompt_summary=user_prompt if user_prompt else None,
+                        request_capture=None,
+                        raw_response="",
+                        latency_ms=0,
+                        status="error",
+                        request_group_id=request_group_id,
+                        attempt_no=2,
+                        attempt_role="fallback",
+                        error_type="AIServiceError",
+                        error_message=real_reason,
+                        error_classification="configuration",
+                        http_status=None,
+                        finish_reason=None,
+                        diagnostics=fb_diag if fb_diag else None,
+                        provider_response_payload=None,
+                    )
+                    ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None]
+                    await send_terminal_ai_failure_alert(
+                        bot=None,
+                        platform="max",
+                        user_id=user_id,
+                        primary_provider=primary_prov,
+                        primary_model=primary_mod,
+                        fallback_provider=fb_provider,
+                        fallback_model=fb_model,
+                        exception=primary_err,
+                        classification="configuration",
+                        ai_log_ids=ai_log_ids if ai_log_ids else None,
+                    )
+                    fallback_config_error = AIServiceError(real_reason)
+                    fallback_config_error.classification = "configuration"
+                    service_err = AIServiceError(
+                        "Основной AI-провайдер не сработал, резервный провайдер не настроен"
+                    )
+                    service_err.ai_outcome = "PRIMARY_FAILED + FALLBACK_CONFIGURATION_ERROR"
+                    service_err.provider_attempts = (
+                        _build_ai_attempt(primary_prov, primary_mod, primary_err),
+                        _build_ai_attempt(
+                            fb_provider,
+                            fb_model,
+                            fallback_config_error,
+                            status="CONFIGURATION_ERROR",
+                            classification="configuration",
+                        ),
+                    )
+                    service_err.classification = "configuration"
+                    service_err.ai_log_ids = ai_log_ids
+                    service_err.ai_log_id = fb_log_id or primary_log_id
+                    service_err.request_group_id = request_group_id
+                    raise service_err from primary_err
 
-                    try:
+                log.warning("Primary provider '%s' failed (%s), falling back to '%s'", ai_config.provider, primary_err, fb_provider)
+                fb_start = time.monotonic()
+                fb_timeout = float(getattr(ai_config, "fallback_timeout", 60) or 60.0)
+
+                async def _invoke_fb():
+                    fb_settings_provider = {
+                        "openai": PROVIDER_OPENAI,
+                        "claude": PROVIDER_CLAUDE,
+                        "anthropic": PROVIDER_CLAUDE,
+                        "gemini": PROVIDER_GEMINI,
+                        "deepseek": PROVIDER_DEEPSEEK,
+                        "kie": PROVIDER_KIE,
+                        "openrouter": PROVIDER_OPENROUTER,
+                        "perplexity": PROVIDER_PERPLEXITY,
+                    }.get(fb_key, fb_provider)
+                    async with async_session_maker() as settings_session:
+                        fb_model_settings = await resolve_model_settings(
+                            settings_session,
+                            fb_settings_provider,
+                            fb_model,
+                            "chat",
+                            config=ai_config,
+                        )
+                    fb_tokens = wire_max_output_tokens(fb_model_settings)
+                    fb_temperature = wire_temperature(fb_model_settings)
+                    fb_reasoning_effort = wire_reasoning_effort(fb_model_settings)
+                    if fb_key == "openai":
+                        return await _call_openai(
+                            fb_api_key, fb_model, [], fb_temperature,
+                            request_layout=request_layout,
+                            request_capture=fallback_capture,
+                            activity_tracker=activity_tracker,
+                            max_completion_tokens=fb_tokens,
+                        )
+                    elif fb_key in {"claude", "anthropic"}:
+                        return await _call_claude(
+                            fb_api_key, fb_model, [], stable_system_prompt, fb_temperature,
+                            request_layout=request_layout,
+                            request_capture=fallback_capture,
+                            activity_tracker=activity_tracker,
+                            max_output_tokens=fb_tokens,
+                        )
+                    elif fb_key == "gemini":
+                        return await _call_gemini(
+                            fb_api_key, fb_model, [], stable_system_prompt, fb_temperature,
+                            request_layout=request_layout,
+                            request_capture=fallback_capture,
+                            activity_tracker=activity_tracker,
+                            max_output_tokens=fb_tokens,
+                        )
+                    elif fb_key == "deepseek":
+                        return await _call_deepseek(
+                            fb_api_key, fb_model, [], fb_temperature,
+                            request_layout=request_layout,
+                            request_capture=fallback_capture,
+                            activity_tracker=activity_tracker,
+                            max_output_tokens=fb_tokens,
+                            reasoning_effort=fb_reasoning_effort,
+                        )
+                    elif fb_key == "kie":
+                        return await _call_kie_text_chat(
+                            fb_api_key, _get_kie_base_url(ai_config), fb_model, [],
+                            stable_system_prompt, fb_temperature,
+                            request_layout=request_layout,
+                            request_capture=fallback_capture,
+                            activity_tracker=activity_tracker,
+                            max_output_tokens=fb_tokens,
+                        )
+                    elif fb_key == "openrouter":
                         try:
-                            result = await asyncio.wait_for(_invoke_fb(), timeout=fb_timeout)
-                        except asyncio.CancelledError:
-                            raise
-                        except (asyncio.TimeoutError, TimeoutError) as timeout_exc:
-                            err = AIServiceError(f"Fallback AI provider {fb_provider} timed out after {fb_timeout}s")
-                            err.classification = "timeout"
-                            raise err from timeout_exc
+                            return await call_openrouter(
+                                fb_api_key,
+                                request_layout,
+                                fb_model,
+                                temperature=fb_temperature,
+                                max_output_tokens=fb_tokens,
+                                timeout=fb_timeout,
+                                request_capture=fallback_capture,
+                                activity_tracker=activity_tracker,
+                            )
+                        except ProviderAdapterError as exc:
+                            raise _wrap_provider_adapter_error(exc) from exc
+                    elif fb_key == "perplexity":
+                        try:
+                            return await call_perplexity(
+                                fb_api_key,
+                                request_layout,
+                                fb_model,
+                                temperature=fb_temperature,
+                                max_output_tokens=fb_tokens,
+                                timeout=fb_timeout,
+                                request_capture=fallback_capture,
+                                activity_tracker=activity_tracker,
+                            )
+                        except ProviderAdapterError as exc:
+                            raise _wrap_provider_adapter_error(exc) from exc
+                    else:
+                        raise AIServiceError(f"Неизвестный фолбэк провайдер: {fb_provider}")
 
-                        result = _validate_text_response(result, provider=fb_key)
-                        fb_latency = int((time.monotonic() - fb_start) * 1000)
-                        actual_provider, actual_model = _extract_effective_provider_and_model(
-                            fallback_capture,
-                            default_provider=str(fb_provider),
-                            default_model=str(fb_model),
-                        )
-                        visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
-                        if invalid_data_blocks:
-                            log.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+                try:
+                    try:
+                        result = await asyncio.wait_for(_invoke_fb(), timeout=fb_timeout)
+                    except asyncio.CancelledError:
+                        raise
+                    except (asyncio.TimeoutError, TimeoutError) as timeout_exc:
+                        err = AIServiceError(f"Fallback AI provider {fb_provider} timed out after {fb_timeout}s")
+                        err.classification = "timeout"
+                        raise err from timeout_exc
 
-                        fb_log_id = await record_ai_attempt_log(
-                            session,
-                            user_id=user_id,
-                            platform="max",
-                            dialogue_id=active_dialogue_id,
-                            topic_id=active_topic_id,
-                            topic_name=active_topic.name if active_topic else None,
-                            request_type=request_type or "chat",
-                            provider=actual_provider,
-                            model=actual_model,
-                            prompt_summary=user_prompt if user_prompt else None,
-                            request_capture=fallback_capture,
-                            raw_response=result,
-                            clean_text=visible_text,
-                            latency_ms=fb_latency,
-                            status="success",
-                            request_group_id=request_group_id,
-                            attempt_no=2,
-                            attempt_role="fallback",
-                        )
-                        fallback_succeeded = True
-                        log.info("Fallback response generated user_id=%s provider=%s", user_id, actual_provider)
-                    except Exception as fb_err:
-                        fb_latency = int((time.monotonic() - fb_start) * 1000)
-                        fb_prov, fb_mod = _extract_effective_provider_and_model(
-                            fallback_capture,
-                            default_provider=str(fb_provider),
-                            default_model=str(fb_model),
-                        )
-                        fb_err_meta = extract_error_metadata(fb_err, provider=fb_prov)
-                        raw_fb_diag = fb_err_meta.get("diagnostics")
-                        if isinstance(raw_fb_diag, dict):
-                            fb_diag = dict(raw_fb_diag)
-                        elif hasattr(raw_fb_diag, "__dict__"):
-                            fb_diag = {k: v for k, v in raw_fb_diag.__dict__.items() if not k.startswith("_")}
-                        else:
-                            fb_diag = {}
-                        if exclude_message_id is not None:
-                            fb_diag["user_message_id"] = exclude_message_id
-                        fb_log_id = await record_ai_attempt_log(
-                            session,
-                            user_id=user_id,
-                            platform="max",
-                            dialogue_id=active_dialogue_id,
-                            topic_id=active_topic_id,
-                            topic_name=active_topic.name if active_topic else None,
-                            request_type=request_type or "chat",
-                            provider=fb_prov,
-                            model=fb_mod,
-                            prompt_summary=user_prompt if user_prompt else None,
-                            request_capture=fallback_capture,
-                            raw_response="",
-                            latency_ms=fb_latency,
-                            status="error",
-                            request_group_id=request_group_id,
-                            attempt_no=2,
-                            attempt_role="fallback",
-                            error_type=fb_err_meta["error_type"],
-                            error_message=fb_err_meta["error_message"],
-                            error_classification=fb_err_meta["error_classification"],
-                            http_status=fb_err_meta["http_status"],
-                            finish_reason=fb_err_meta["finish_reason"],
-                            diagnostics=fb_diag if fb_diag else None,
-                            provider_response_payload=fb_err_meta["provider_response_payload"],
-                        )
-                        log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
-                        ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None]
-                        await send_terminal_ai_failure_alert(
-                            bot=None,
-                            platform="max",
-                            user_id=user_id,
-                            primary_provider=primary_prov,
-                            primary_model=primary_mod,
-                            fallback_provider=fb_prov,
-                            fallback_model=fb_mod,
-                            exception=fb_err,
-                            classification=fb_err_meta["error_classification"],
-                            ai_log_ids=ai_log_ids if ai_log_ids else None,
-                        )
-                        service_err = AIServiceError(
-                            f"Основной провайдер ({ai_config.provider}) и резервный ({fb_provider}) недоступны"
-                        )
-                        service_err.ai_log_ids = ai_log_ids
-                        service_err.ai_log_id = fb_log_id or primary_log_id
-                        service_err.request_group_id = request_group_id
-                        service_err.classification = getattr(fb_err, "classification", fb_err_meta["error_classification"])
-                        raise service_err from fb_err
+                    result = _validate_text_response(result, provider=fb_key)
+                    fb_latency = int((time.monotonic() - fb_start) * 1000)
+                    actual_provider, actual_model = _extract_effective_provider_and_model(
+                        fallback_capture,
+                        default_provider=str(fb_provider),
+                        default_model=str(fb_model),
+                    )
+                    visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+                    if invalid_data_blocks:
+                        log.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
+
+                    fb_log_id = await record_ai_attempt_log(
+                        session,
+                        user_id=user_id,
+                        platform="max",
+                        dialogue_id=active_dialogue_id,
+                        topic_id=active_topic_id,
+                        topic_name=active_topic.name if active_topic else None,
+                        request_type=request_type or "chat",
+                        provider=actual_provider,
+                        model=actual_model,
+                        prompt_summary=user_prompt if user_prompt else None,
+                        request_capture=fallback_capture,
+                        raw_response=result,
+                        clean_text=visible_text,
+                        latency_ms=fb_latency,
+                        status="success",
+                        request_group_id=request_group_id,
+                        attempt_no=2,
+                        attempt_role="fallback",
+                    )
+                    fallback_succeeded = True
+                    log.info("Fallback response generated user_id=%s provider=%s", user_id, actual_provider)
+                except Exception as fb_err:
+                    fb_latency = int((time.monotonic() - fb_start) * 1000)
+                    fb_prov, fb_mod = _extract_effective_provider_and_model(
+                        fallback_capture,
+                        default_provider=str(fb_provider),
+                        default_model=str(fb_model),
+                    )
+                    fb_err_meta = extract_error_metadata(fb_err, provider=fb_prov)
+                    raw_fb_diag = fb_err_meta.get("diagnostics")
+                    if isinstance(raw_fb_diag, dict):
+                        fb_diag = dict(raw_fb_diag)
+                    elif hasattr(raw_fb_diag, "__dict__"):
+                        fb_diag = {k: v for k, v in raw_fb_diag.__dict__.items() if not k.startswith("_")}
+                    else:
+                        fb_diag = {}
+                    if exclude_message_id is not None:
+                        fb_diag["user_message_id"] = exclude_message_id
+                    fb_log_id = await record_ai_attempt_log(
+                        session,
+                        user_id=user_id,
+                        platform="max",
+                        dialogue_id=active_dialogue_id,
+                        topic_id=active_topic_id,
+                        topic_name=active_topic.name if active_topic else None,
+                        request_type=request_type or "chat",
+                        provider=fb_prov,
+                        model=fb_mod,
+                        prompt_summary=user_prompt if user_prompt else None,
+                        request_capture=fallback_capture,
+                        raw_response="",
+                        latency_ms=fb_latency,
+                        status="error",
+                        request_group_id=request_group_id,
+                        attempt_no=2,
+                        attempt_role="fallback",
+                        error_type=fb_err_meta["error_type"],
+                        error_message=fb_err_meta["error_message"],
+                        error_classification=fb_err_meta["error_classification"],
+                        http_status=fb_err_meta["http_status"],
+                        finish_reason=fb_err_meta["finish_reason"],
+                        diagnostics=fb_diag if fb_diag else None,
+                        provider_response_payload=fb_err_meta["provider_response_payload"],
+                    )
+                    log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
+                    ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None]
+                    await send_terminal_ai_failure_alert(
+                        bot=None,
+                        platform="max",
+                        user_id=user_id,
+                        primary_provider=primary_prov,
+                        primary_model=primary_mod,
+                        fallback_provider=fb_prov,
+                        fallback_model=fb_mod,
+                        exception=fb_err,
+                        classification=fb_err_meta["error_classification"],
+                        ai_log_ids=ai_log_ids if ai_log_ids else None,
+                    )
+                    service_err = AIServiceError(
+                        f"Основной провайдер ({ai_config.provider}) и резервный ({fb_provider}) недоступны"
+                    )
+                    service_err.ai_log_ids = ai_log_ids
+                    service_err.ai_log_id = fb_log_id or primary_log_id
+                    service_err.request_group_id = request_group_id
+                    service_err.classification = getattr(fb_err, "classification", fb_err_meta["error_classification"])
+                    raise service_err from fb_err
 
             if not fallback_succeeded:
                 ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None]

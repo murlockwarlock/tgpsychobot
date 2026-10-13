@@ -2490,3 +2490,473 @@ async def test_max_identical_prompt_collision_identity_authorization(session_fac
         asst = (await s.scalars(select(DBMessage).where(DBMessage.user_id == max_user_id, DBMessage.role == "assistant"))).all()
         assert len(asst) == 1
         assert "Дышите глубже" in asst[0].content
+
+
+# ---------------------------------------------------------------------------
+# 10. MAX Fallback Configuration Parity Tests (PR #64 Blocker Fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_max_fallback_missing_api_key_configuration_outcome(session_factory, monkeypatch):
+    """Test A: MAX missing fallback API key produces terminal configuration failure.
+    Real journey: message_created -> MaxBotApplication.handle_update() ->
+    primary provider fails transiently -> fallback enabled, provider/model configured ->
+    fallback API key missing -> fallback provider function NOT called ->
+    terminal failure message emitted -> NO Retry attachment on MAX API wire.
+    AILog audit: 2 attempts (primary error, fallback configuration error).
+    """
+    monkeypatch.setattr("database.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.legacy.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
+
+    max_user_id = 801 + MAX_ID_OFFSET
+    chat_id = 801
+
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(
+                id=1,
+                provider="Gemini",
+                gemini_model="gemini-2.5-flash",
+                gemini_api_key="test-key",
+                fallback_provider="OpenAI",
+                fallback_model="gpt-5.6-terra",
+                openai_model="gpt-5.6-terra",
+                openai_api_key="",  # Missing fallback API key!
+                allow_fallback=True,
+            )
+            s.add(cfg)
+        else:
+            cfg.provider = "Gemini"
+            cfg.gemini_model = "gemini-2.5-flash"
+            cfg.gemini_api_key = "test-key"
+            cfg.fallback_provider = "OpenAI"
+            cfg.fallback_model = "gpt-5.6-terra"
+            cfg.openai_model = "gpt-5.6-terra"
+            cfg.openai_api_key = ""  # Missing fallback API key!
+            cfg.allow_fallback = True
+
+        sub_cfg = await s.get(SubscriptionConfig, 1)
+        if not sub_cfg:
+            s.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        else:
+            sub_cfg.subscriptions_enabled = False
+
+        user = await s.get(User, max_user_id)
+        if not user:
+            user = User(
+                id=max_user_id,
+                first_name="MaxUserA",
+                name="MaxUserA",
+                accepted_disclaimer=True,
+                current_dialogue_id=1,
+                current_topic_id=None,
+            )
+            s.add(user)
+        else:
+            user.accepted_disclaimer = True
+        await s.commit()
+
+    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+
+    api_calls = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        call_entry = {"method": method, "path": path, "params": params or {}, "body": json_data or {}}
+        api_calls.append(call_entry)
+        if path == "/messages":
+            return {"message": {"body": {"mid": f"mid_{len(api_calls)}"}}}
+        return {}
+
+    client = MaxApiClient(token="test_token", base_url="https://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+
+    primary_calls = []
+    fallback_calls = []
+
+    async def mock_primary_fail(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        primary_calls.append(prompt)
+        err = AIServiceError("P1 503 Service Unavailable")
+        err.classification = "provider_5xx"
+        raise err
+
+    async def mock_fallback(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        fallback_calls.append(prompt)
+        return "Should never be called"
+
+    monkeypatch.setattr(max_ai, "_call_gemini", mock_primary_fail)
+    monkeypatch.setattr(max_ai, "_call_openai", mock_fallback)
+
+    user_msg_update = {
+        "update_id": "max_up_fb_missing_key",
+        "update_type": "message_created",
+        "message": {
+            "mid": "mid_user_fb_1",
+            "chat_id": chat_id,
+            "sender": {"user_id": 801, "first_name": "MaxUserA"},
+            "recipient": {"chat_id": chat_id},
+            "text": "Вопрос при отсутствии ключа фолбэка",
+        },
+    }
+
+    await app.handle_update(user_msg_update)
+    if max_user_id in app.user_tasks:
+        await app.user_tasks[max_user_id]
+
+    # Primary called once, fallback provider NEVER called
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 0
+
+    # Wire check: failure message emitted, attachments MUST NOT contain ai_retry
+    failure_api_call = next(
+        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        None,
+    )
+    assert failure_api_call is not None
+    attachments = failure_api_call["body"].get("attachments", [])
+    assert not any("ai_retry" in json.dumps(att) for att in attachments)
+
+    # DB AILog verification
+    async with session_factory() as s:
+        logs = (await s.scalars(
+            select(AILog).where(AILog.user_id == max_user_id).order_by(AILog.attempt_no.asc())
+        )).all()
+        assert len(logs) == 2
+
+        # Attempt 1: primary error preserved
+        log_1 = logs[0]
+        assert log_1.attempt_no == 1
+        assert log_1.attempt_role == "primary"
+        assert log_1.status == "error"
+        assert log_1.error_classification == "provider_5xx"
+        assert log_1.provider.lower() == "gemini"
+
+        # Attempt 2: fallback configuration error
+        log_2 = logs[1]
+        assert log_2.attempt_no == 2
+        assert log_2.attempt_role == "fallback"
+        assert log_2.status == "error"
+        assert log_2.error_classification == "configuration"
+        assert "API key for fallback AI provider 'OpenAI' is not configured" in log_2.error_message
+        assert log_2.provider == "OpenAI"
+        assert log_2.model == "gpt-5.6-terra"
+        assert log_2.request_group_id == log_1.request_group_id
+        assert log_2.diagnostics_json is not None
+        diag_data = json.loads(log_2.diagnostics_json)
+        assert "user_message_id" in diag_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", ["provider", "model"])
+async def test_max_fallback_incomplete_provider_model_configuration_outcome(session_factory, monkeypatch, missing_field):
+    """Test B: MAX incomplete fallback provider or model produces terminal configuration failure.
+    allow_fallback=True, but fallback_provider or fallback_model is missing.
+    Primary fails transiently (timeout). Fallback provider NOT called.
+    Terminal failure message emitted with NO Retry attachment.
+    AILog audit records attempt 1 primary error and attempt 2 fallback configuration error.
+    """
+    monkeypatch.setattr("database.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.legacy.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
+
+    user_seed = 810 if missing_field == "provider" else 820
+    max_user_id = user_seed + MAX_ID_OFFSET
+    chat_id = user_seed
+
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        fb_prov = None if missing_field == "provider" else "OpenAI"
+        fb_mod = None if missing_field == "model" else "gpt-5.6-terra"
+        if not cfg:
+            cfg = AIConfig(
+                id=1,
+                provider="Gemini",
+                gemini_model="gemini-2.5-flash",
+                gemini_api_key="test-key",
+                fallback_provider=fb_prov,
+                fallback_model=fb_mod,
+                openai_model="gpt-5.6-terra",
+                openai_api_key="test-openai-key",
+                allow_fallback=True,
+            )
+            s.add(cfg)
+        else:
+            cfg.provider = "Gemini"
+            cfg.gemini_model = "gemini-2.5-flash"
+            cfg.gemini_api_key = "test-key"
+            cfg.fallback_provider = fb_prov
+            cfg.fallback_model = fb_mod
+            cfg.openai_model = "gpt-5.6-terra"
+            cfg.openai_api_key = "test-openai-key"
+            cfg.allow_fallback = True
+
+        sub_cfg = await s.get(SubscriptionConfig, 1)
+        if not sub_cfg:
+            s.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        else:
+            sub_cfg.subscriptions_enabled = False
+
+        user = await s.get(User, max_user_id)
+        if not user:
+            user = User(
+                id=max_user_id,
+                first_name=f"MaxUserB_{missing_field}",
+                name=f"MaxUserB_{missing_field}",
+                accepted_disclaimer=True,
+                current_dialogue_id=1,
+                current_topic_id=None,
+            )
+            s.add(user)
+        else:
+            user.accepted_disclaimer = True
+        await s.commit()
+
+    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+
+    api_calls = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        call_entry = {"method": method, "path": path, "params": params or {}, "body": json_data or {}}
+        api_calls.append(call_entry)
+        if path == "/messages":
+            return {"message": {"body": {"mid": f"mid_{len(api_calls)}"}}}
+        return {}
+
+    client = MaxApiClient(token="test_token", base_url="https://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+
+    primary_calls = []
+    fallback_calls = []
+
+    async def mock_primary_fail(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        primary_calls.append(prompt)
+        err = AIServiceError("P1 timeout")
+        err.classification = "timeout"
+        raise err
+
+    async def mock_fallback(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        fallback_calls.append(prompt)
+        return "Should never be called"
+
+    monkeypatch.setattr(max_ai, "_call_gemini", mock_primary_fail)
+    monkeypatch.setattr(max_ai, "_call_openai", mock_fallback)
+
+    user_msg_update = {
+        "update_id": f"max_up_fb_incomplete_{missing_field}",
+        "update_type": "message_created",
+        "message": {
+            "mid": f"mid_user_fb_b_{missing_field}",
+            "chat_id": chat_id,
+            "sender": {"user_id": user_seed, "first_name": "MaxUserB"},
+            "recipient": {"chat_id": chat_id},
+            "text": f"Вопрос при неполной конфигурации ({missing_field})",
+        },
+    }
+
+    await app.handle_update(user_msg_update)
+    if max_user_id in app.user_tasks:
+        await app.user_tasks[max_user_id]
+
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 0
+
+    failure_api_call = next(
+        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        None,
+    )
+    assert failure_api_call is not None
+    attachments = failure_api_call["body"].get("attachments", [])
+    assert not any("ai_retry" in json.dumps(att) for att in attachments)
+
+    async with session_factory() as s:
+        logs = (await s.scalars(
+            select(AILog).where(AILog.user_id == max_user_id).order_by(AILog.attempt_no.asc())
+        )).all()
+        assert len(logs) == 2
+
+        log_1 = logs[0]
+        assert log_1.attempt_no == 1
+        assert log_1.attempt_role == "primary"
+        assert log_1.status == "error"
+        assert log_1.error_classification == "timeout"
+
+        log_2 = logs[1]
+        assert log_2.attempt_no == 2
+        assert log_2.attempt_role == "fallback"
+        assert log_2.status == "error"
+        assert log_2.error_classification == "configuration"
+        assert "Fallback AI provider configuration is incomplete" in log_2.error_message
+        assert log_2.request_group_id == log_1.request_group_id
+        assert log_2.diagnostics_json is not None
+        diag_data = json.loads(log_2.diagnostics_json)
+        assert "user_message_id" in diag_data
+
+
+@pytest.mark.asyncio
+async def test_max_fallback_transient_both_fail_still_retryable(session_factory, monkeypatch):
+    """Test C: Regression guard — primary timeout + fallback timeout is retryable.
+    Real journey: message_created -> MaxBotApplication.handle_update() ->
+    primary timeout -> fallback timeout -> terminal failure message WITH visible Retry attachment.
+    AILog audit records both attempts, and attempt 2 retains retryable classification and diagnostics.
+    """
+    monkeypatch.setattr("database.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.legacy.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
+
+    max_user_id = 830 + MAX_ID_OFFSET
+    chat_id = 830
+
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(
+                id=1,
+                provider="Gemini",
+                gemini_model="gemini-2.5-flash",
+                gemini_api_key="test-key",
+                fallback_provider="OpenAI",
+                fallback_model="gpt-5.6-terra",
+                openai_model="gpt-5.6-terra",
+                openai_api_key="test-key-valid",
+                allow_fallback=True,
+            )
+            s.add(cfg)
+        else:
+            cfg.provider = "Gemini"
+            cfg.gemini_model = "gemini-2.5-flash"
+            cfg.gemini_api_key = "test-key"
+            cfg.fallback_provider = "OpenAI"
+            cfg.fallback_model = "gpt-5.6-terra"
+            cfg.openai_model = "gpt-5.6-terra"
+            cfg.openai_api_key = "test-key-valid"
+            cfg.allow_fallback = True
+
+        sub_cfg = await s.get(SubscriptionConfig, 1)
+        if not sub_cfg:
+            s.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        else:
+            sub_cfg.subscriptions_enabled = False
+
+        user = await s.get(User, max_user_id)
+        if not user:
+            user = User(
+                id=max_user_id,
+                first_name="MaxUserC",
+                name="MaxUserC",
+                accepted_disclaimer=True,
+                current_dialogue_id=1,
+                current_topic_id=None,
+            )
+            s.add(user)
+        else:
+            user.accepted_disclaimer = True
+        await s.commit()
+
+    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+
+    api_calls = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        call_entry = {"method": method, "path": path, "params": params or {}, "body": json_data or {}}
+        api_calls.append(call_entry)
+        if path == "/messages":
+            return {"message": {"body": {"mid": f"mid_{len(api_calls)}"}}}
+        return {}
+
+    client = MaxApiClient(token="test_token", base_url="https://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+
+    primary_calls = []
+    fallback_calls = []
+
+    async def mock_primary_fail(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        primary_calls.append(prompt)
+        err = AIServiceError("Primary timeout")
+        err.classification = "timeout"
+        raise err
+
+    async def mock_fallback_fail(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        fallback_calls.append(prompt)
+        err = AIServiceError("Fallback timeout")
+        err.classification = "timeout"
+        raise err
+
+    monkeypatch.setattr(max_ai, "_call_gemini", mock_primary_fail)
+    monkeypatch.setattr(max_ai, "_call_openai", mock_fallback_fail)
+
+    user_msg_update = {
+        "update_id": "max_up_fb_transient_both",
+        "update_type": "message_created",
+        "message": {
+            "mid": "mid_user_fb_c",
+            "chat_id": chat_id,
+            "sender": {"user_id": 830, "first_name": "MaxUserC"},
+            "recipient": {"chat_id": chat_id},
+            "text": "Вопрос при таймауте обоих провайдеров",
+        },
+    }
+
+    await app.handle_update(user_msg_update)
+    if max_user_id in app.user_tasks:
+        await app.user_tasks[max_user_id]
+
+    # Both primary and fallback were called
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 1
+
+    # Wire check: Retry button IS present
+    failure_api_call = next(
+        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        None,
+    )
+    assert failure_api_call is not None
+    attachments = failure_api_call["body"].get("attachments", [])
+    assert attachments
+    rendered_btn = attachments[0]["payload"]["buttons"][0][0]
+    assert rendered_btn["text"] == "🔄 Повторить запрос"
+    assert rendered_btn["payload"].startswith("ai_retry:")
+
+    # DB AILog check
+    async with session_factory() as s:
+        logs = (await s.scalars(
+            select(AILog).where(AILog.user_id == max_user_id).order_by(AILog.attempt_no.asc())
+        )).all()
+        assert len(logs) == 2
+
+        log_1 = logs[0]
+        assert log_1.attempt_no == 1
+        assert log_1.attempt_role == "primary"
+        assert log_1.status == "error"
+        assert log_1.error_classification == "timeout"
+
+        log_2 = logs[1]
+        assert log_2.attempt_no == 2
+        assert log_2.attempt_role == "fallback"
+        assert log_2.status == "error"
+        assert log_2.error_classification == "timeout"
+        assert log_2.request_group_id == log_1.request_group_id
+        assert log_2.diagnostics_json is not None
+        diag_data = json.loads(log_2.diagnostics_json)
+        assert "user_message_id" in diag_data
