@@ -22,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from database import AIConfig, AILog, Base, BotGeneralConfig, Message as DBMessage, SubscriptionConfig, User
+from database import AIConfig, AILog, Base, BotGeneralConfig, Message as DBMessage, SubscriptionConfig, Topic, User
 import handlers
 import keyboards as kb
 from max_messenger_bot.api import MaxApiClient
@@ -37,6 +37,7 @@ from ai_request_singleflight import AI_BUSY_MESSAGE, single_flight
 from ai_retry_policy import (
     NON_RETRYABLE_ERROR_CLASSIFICATIONS,
     RETRYABLE_ERROR_CLASSIFICATIONS,
+    SCOPE_UNSET,
     claim_retry_token,
     clear_retry_claims,
     is_retryable_ai_error,
@@ -1191,6 +1192,31 @@ async def test_request_group_terminal_outcome_eligibility(session_factory):
         assert ok is False
         assert reason == "group_already_succeeded"
 
+        # Topic scope exact matching tests
+        topic_log = AILog(id=601, user_id=user_id, platform="telegram", request_type="chat", status="error",
+                          error_classification="provider_5xx", prompt_summary="Промпт в теме 123", dialogue_id=1, topic_id=123,
+                          provider="p", model="m", raw_response="")
+        s.add(topic_log)
+        await s.commit()
+
+        # When current topic is None -> rejected as stale_topic!
+        ok, reason, term = await validate_terminal_failure_retry_eligibility(s, "telegram", user_id, 601, expected_dialogue_id=1, expected_topic_id=None)
+        assert ok is False
+        assert reason == "stale_topic"
+
+        # When current topic is 456 -> rejected as stale_topic!
+        ok, reason, term = await validate_terminal_failure_retry_eligibility(s, "telegram", user_id, 601, expected_dialogue_id=1, expected_topic_id=456)
+        assert ok is False
+        assert reason == "stale_topic"
+
+        # When current topic matches 123 -> accepted!
+        ok, reason, term = await validate_terminal_failure_retry_eligibility(s, "telegram", user_id, 601, expected_dialogue_id=1, expected_topic_id=123)
+        assert ok is True
+
+        # When expected_topic_id is SCOPE_UNSET (omitted) -> topic not checked, accepted!
+        ok, reason, term = await validate_terminal_failure_retry_eligibility(s, "telegram", user_id, 601, expected_dialogue_id=1)
+        assert ok is True
+
 
 # ---------------------------------------------------------------------------
 # 8. MAX Mandatory A → Я → A Journey
@@ -1465,6 +1491,7 @@ async def test_max_stale_scope_rejected(session_factory, monkeypatch):
             provider="gemini",
             model="gemini-2.5-flash",
             raw_response="",
+            diagnostics_json=json.dumps({"user_message_id": 501}),
         )
         s.add(failed_log)
         await s.commit()
@@ -1554,6 +1581,7 @@ async def test_max_double_click_concurrency(session_factory, monkeypatch):
             provider="gemini",
             model="gemini-2.5-flash",
             raw_response="",
+            diagnostics_json=json.dumps({"user_message_id": 601}),
         )
         s.add(failed_log)
         await s.commit()
@@ -1815,3 +1843,650 @@ async def test_existing_successful_primary_path_unchanged(session_factory, setup
     delivered = [c for c in session.calls if isinstance(c, SendMessage) and "Обычный успешный ответ" in (c.text or "")]
     assert len(delivered) == 1
     assert delivered[0].reply_markup is None
+
+
+# ---------------------------------------------------------------------------
+# 14. Telegram Stale Topic Journey (Real Dispatcher route)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_telegram_terminal_failure_retry_stale_topic_journey(setup_tg_user, session_factory, monkeypatch):
+    """Real Telegram stale topic journey:
+    1. User is in dialogue 1 / topic 123.
+    2. Sends normal text through Dispatcher -> primary fails -> fallback fails -> real terminal message -> real visible Retry button.
+    3. User changes to: dialogue 1 / topic None.
+    4. Press OLD Retry button through Dispatcher -> callback rejected as stale -> zero primary provider calls -> zero fallback provider calls -> no DB user/assistant retry turn -> stale localized response -> old button disabled.
+    5. Also test: topic 123 -> topic 456 -> old Retry rejected.
+    """
+    user_id = setup_tg_user
+    session = ValidatingTelegramSession()
+    bot = Bot(token="123456:TEST_BOT_TOKEN", session=session)
+
+    handlers.router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(handlers.router)
+
+    async with session_factory() as s:
+        topic123 = await s.get(Topic, 123)
+        if not topic123:
+            s.add(Topic(id=123, name="Тема 123", is_active=True))
+        topic456 = await s.get(Topic, 456)
+        if not topic456:
+            s.add(Topic(id=456, name="Тема 456", is_active=True))
+        user = await s.get(User, user_id)
+        user.current_dialogue_id = 1
+        user.current_topic_id = 123
+        await s.commit()
+
+    primary_calls = []
+    fallback_calls = []
+
+    async def mock_primary_fail(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        primary_calls.append(prompt)
+        err = AIServiceError("P1 500")
+        err.classification = "provider_5xx"
+        raise err
+
+    async def mock_fallback_fail(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        fallback_calls.append(prompt)
+        err = AIServiceError("FB timeout")
+        err.classification = "timeout"
+        raise err
+
+    monkeypatch.setattr(ai_integration, "_call_gemini_api", mock_primary_fail)
+    monkeypatch.setattr(ai_integration, "_call_openai_api", mock_fallback_fail)
+
+    test_prompt = "Как победить бессонницу в теме 123?"
+
+    # 1. User sends message in topic 123
+    msg_update = Update(
+        update_id=1,
+        message=Message(
+            message_id=10,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=user_id, type=ChatType.PRIVATE),
+            from_user=TgUser(id=user_id, is_bot=False, first_name="Alice"),
+            text=test_prompt,
+        ).as_(bot),
+    )
+    await dp.feed_update(bot, msg_update)
+    if user_id in handlers.user_processing_tasks:
+        await handlers.user_processing_tasks[user_id]
+
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 1
+
+    # Verify failure message with retry button was delivered
+    send_messages = [c for c in session.calls if isinstance(c, SendMessage)]
+    failure_msg = send_messages[-1]
+    assert failure_msg.reply_markup is not None
+    retry_btn = failure_msg.reply_markup.inline_keyboard[0][0]
+    assert retry_btn.text == "🔄 Повторить запрос"
+    assert retry_btn.callback_data.startswith("ai_retry:")
+
+    # Verify DB AILog was recorded with topic_id=123
+    async with session_factory() as s:
+        ailog = (await s.scalars(select(AILog).where(AILog.user_id == user_id, AILog.status == "error"))).first()
+        assert ailog is not None
+        assert ailog.topic_id == 123
+        failed_log_id = ailog.id
+
+    # 2. User changes topic to None (returns to main dialogue)
+    async with session_factory() as s:
+        user = await s.get(User, user_id)
+        user.current_topic_id = None
+        await s.commit()
+
+    # 3. Press OLD Retry button through Dispatcher
+    cb_stale = Update(
+        update_id=2,
+        callback_query=CallbackQuery(
+            id="cb_stale_click",
+            from_user=TgUser(id=user_id, is_bot=False, first_name="Alice"),
+            chat_instance="ci_stale",
+            message=Message(
+                message_id=11,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=user_id, type=ChatType.PRIVATE),
+                text=failure_msg.text,
+                reply_markup=failure_msg.reply_markup,
+            ).as_(bot),
+            data=retry_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, cb_stale)
+    if user_id in handlers.user_processing_tasks:
+        await handlers.user_processing_tasks[user_id]
+
+    # Assertions for topic 123 -> None:
+    # Zero new provider calls!
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 1
+
+    # Stale localized alert returned
+    answers = [c for c in session.calls if isinstance(c, AnswerCallbackQuery)]
+    assert answers
+    assert answers[-1].show_alert is True
+    assert "предыдущему диалогу" in answers[-1].text
+
+    # Old button keyboard disabled
+    disabled_edits = [c for c in session.calls if isinstance(c, EditMessageReplyMarkup)]
+    assert len(disabled_edits) >= 1
+
+    # No DB assistant turn created
+    async with session_factory() as s:
+        asst_msgs = (await s.scalars(select(DBMessage).where(DBMessage.user_id == user_id, DBMessage.role == "assistant"))).all()
+        assert len(asst_msgs) == 0
+
+    # 4. Now test topic 123 -> topic 456
+    async with session_factory() as s:
+        user = await s.get(User, user_id)
+        user.current_topic_id = 456
+        await s.commit()
+
+    cb_stale_456 = Update(
+        update_id=3,
+        callback_query=CallbackQuery(
+            id="cb_stale_456_click",
+            from_user=TgUser(id=user_id, is_bot=False, first_name="Alice"),
+            chat_instance="ci_stale_456",
+            message=Message(
+                message_id=11,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=user_id, type=ChatType.PRIVATE),
+                text=failure_msg.text,
+                reply_markup=failure_msg.reply_markup,
+            ).as_(bot),
+            data=f"ai_retry:{failed_log_id}",
+        ),
+    )
+    await dp.feed_update(bot, cb_stale_456)
+    if user_id in handlers.user_processing_tasks:
+        await handlers.user_processing_tasks[user_id]
+
+    # Zero new provider calls!
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 1
+    answers = [c for c in session.calls if isinstance(c, AnswerCallbackQuery)]
+    assert "предыдущему диалогу" in answers[-1].text
+
+
+# ---------------------------------------------------------------------------
+# 15. MAX Stale Topic Journey (Real message_callback route)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, monkeypatch):
+    """Real MAX stale topic journey:
+    1. User is in dialogue 1 / topic 123.
+    2. message_created in dialogue 1 / topic 123 -> terminal failure -> real Retry attachment.
+    3. User current topic changes to None.
+    4. Send actual message_callback through MaxBotApplication.handle_update() -> rejected -> zero provider calls -> no assistant DB row -> old attachment removed -> localized stale notification.
+    5. Also test topic 123 -> 456.
+    """
+    monkeypatch.setattr("database.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.legacy.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
+
+    max_user_id = 888 + MAX_ID_OFFSET
+    chat_id = 888
+
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="Gemini", gemini_model="gemini-2.5-flash", gemini_api_key="key",
+                           fallback_provider="OpenAI", fallback_model="gpt-5.6-terra", openai_model="gpt-5.6-terra", openai_api_key="key", allow_fallback=True)
+            s.add(cfg)
+        else:
+            cfg.provider = "Gemini"
+            cfg.fallback_provider = "OpenAI"
+            cfg.allow_fallback = True
+
+        sub_cfg = await s.get(SubscriptionConfig, 1)
+        if not sub_cfg:
+            s.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        else:
+            sub_cfg.subscriptions_enabled = False
+
+        topic123 = await s.get(Topic, 123)
+        if not topic123:
+            s.add(Topic(id=123, name="Тема 123", is_active=True))
+        topic456 = await s.get(Topic, 456)
+        if not topic456:
+            s.add(Topic(id=456, name="Тема 456", is_active=True))
+
+        user = await s.get(User, max_user_id)
+        if not user:
+            user = User(id=max_user_id, first_name="MaxAlice", name="MaxAlice", gender="female", age=25,
+                        accepted_disclaimer=True, current_dialogue_id=1, current_topic_id=123)
+            s.add(user)
+        else:
+            user.current_dialogue_id = 1
+            user.current_topic_id = 123
+            user.accepted_disclaimer = True
+        await s.commit()
+
+    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+
+    api_calls = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        call_entry = {"method": method, "path": path, "params": params or {}, "body": json_data or {}}
+        api_calls.append(call_entry)
+        if path == "/messages":
+            return {"message": {"body": {"mid": f"mid_{len(api_calls)}"}}}
+        return {}
+
+    client = MaxApiClient(token="test_token", base_url="https://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+
+    primary_calls = []
+    fallback_calls = []
+
+    async def mock_primary_fail(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        primary_calls.append(prompt)
+        err = AIServiceError("P1 500")
+        err.classification = "provider_5xx"
+        raise err
+
+    async def mock_fallback_fail(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        fallback_calls.append(prompt)
+        err = AIServiceError("FB timeout")
+        err.classification = "timeout"
+        raise err
+
+    monkeypatch.setattr(max_ai, "_call_gemini", mock_primary_fail)
+    monkeypatch.setattr(max_ai, "_call_openai", mock_fallback_fail)
+
+    test_prompt = "Как справиться с тревогой в теме 123?"
+
+    # 1. User sends message in topic 123
+    msg_update = {
+        "update_id": "up_topic_1",
+        "update_type": "message_created",
+        "message": {
+            "mid": "mid_u_123",
+            "chat_id": chat_id,
+            "sender": {"user_id": 888, "first_name": "MaxAlice", "name": "MaxAlice"},
+            "recipient": {"chat_id": chat_id},
+            "text": test_prompt,
+        },
+    }
+    await app.handle_update(msg_update)
+    if max_user_id in app.user_tasks:
+        await app.user_tasks[max_user_id]
+
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 1
+
+    failure_call = next(
+        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        None,
+    )
+    assert failure_call is not None
+    rendered_btn = failure_call["body"]["attachments"][0]["payload"]["buttons"][0][0]
+    callback_payload = rendered_btn["payload"]
+    assert callback_payload.startswith("ai_retry:")
+
+    # 2. User current topic changes to None
+    async with session_factory() as s:
+        user = await s.get(User, max_user_id)
+        user.current_topic_id = None
+        await s.commit()
+
+    # 3. Send actual message_callback through MaxBotApplication.handle_update()
+    cb_update_none = {
+        "update_id": "up_cb_none",
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "cb_id_none",
+            "payload": callback_payload,
+            "user": {"user_id": 888, "first_name": "MaxAlice", "name": "MaxAlice"},
+            "message": {"mid": "mid_fail_msg", "chat_id": chat_id},
+        },
+    }
+    await app.handle_update(cb_update_none)
+    if max_user_id in app.user_tasks:
+        await app.user_tasks[max_user_id]
+
+    # Assert: zero new provider calls
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 1
+
+    # Assert: old attachment removed
+    edit_call = next(
+        (c for c in reversed(api_calls) if c["method"] == "PUT" and c["body"].get("attachments") == []),
+        None,
+    )
+    assert edit_call is not None
+
+    # Assert: answer_callback called with notification ui.ai.retry_stale
+    ans_call = next(
+        (c for c in reversed(api_calls) if "/answers" in c["path"] and "предыдущему диалогу" in c["body"].get("notification", "")),
+        None,
+    )
+    assert ans_call is not None
+
+    # Assert: no assistant DB row
+    async with session_factory() as s:
+        asst = (await s.scalars(select(DBMessage).where(DBMessage.user_id == max_user_id, DBMessage.role == "assistant"))).all()
+        assert len(asst) == 0
+
+    # 4. Also test topic 123 -> 456
+    async with session_factory() as s:
+        user = await s.get(User, max_user_id)
+        user.current_topic_id = 456
+        await s.commit()
+
+    cb_update_456 = {
+        "update_id": "up_cb_456",
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "cb_id_456",
+            "payload": callback_payload,
+            "user": {"user_id": 888, "first_name": "MaxAlice", "name": "MaxAlice"},
+            "message": {"mid": "mid_fail_msg", "chat_id": chat_id},
+        },
+    }
+    await app.handle_update(cb_update_456)
+    if max_user_id in app.user_tasks:
+        await app.user_tasks[max_user_id]
+
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 16. MAX Forged / Malformed Binding Validation Matrix
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_max_terminal_failure_retry_mandatory_binding_validation_matrix(session_factory, monkeypatch):
+    """MAX forged/malformed binding tests:
+    A. DBMessage exists, AILog is retryable, diagnostics_json = NULL -> rejected
+    B. diagnostics_json = malformed JSON -> rejected
+    C. diagnostics_json = {} -> rejected
+    D. diagnostics_json.user_message_id points to another message -> rejected
+    E. diagnostics_json.user_message_id is malformed non-integer -> rejected
+    F. valid exact binding -> accepted
+    All through MaxBotApplication.handle_update() with realistic message_callback.
+    """
+    monkeypatch.setattr("database.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.legacy.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
+
+    max_user_id = 770 + MAX_ID_OFFSET
+    chat_id = 770
+
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="Gemini", gemini_model="gemini-2.5-flash", gemini_api_key="key")
+            s.add(cfg)
+        sub_cfg = await s.get(SubscriptionConfig, 1)
+        if not sub_cfg:
+            s.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        else:
+            sub_cfg.subscriptions_enabled = False
+        user = await s.get(User, max_user_id)
+        if not user:
+            user = User(id=max_user_id, first_name="MaxBindingUser", current_dialogue_id=1, current_topic_id=None, accepted_disclaimer=True)
+            s.add(user)
+        else:
+            user.current_dialogue_id = 1
+            user.current_topic_id = None
+        # User message id = 500
+        msg_500 = await s.get(DBMessage, 500)
+        if not msg_500:
+            msg_500 = DBMessage(id=500, user_id=max_user_id, role="user", content="Мне очень трудно", dialogue_id=1, topic_id=None)
+            s.add(msg_500)
+        await s.commit()
+
+    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+
+    api_calls = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        call_entry = {"method": method, "path": path, "params": params or {}, "body": json_data or {}}
+        api_calls.append(call_entry)
+        if path == "/messages":
+            return {"message": {"body": {"mid": f"mid_{len(api_calls)}"}}}
+        return {}
+
+    client = MaxApiClient(token="test_token", base_url="https://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+
+    provider_calls = []
+    async def mock_gemini(*args, **kwargs):
+        provider_calls.append(args)
+        return "Всё наладится."
+    monkeypatch.setattr(max_ai, "_call_gemini", mock_gemini)
+
+    async def make_failed_log(log_id: int, diagnostics_val: str | None):
+        async with session_factory() as s:
+            existing = await s.get(AILog, log_id)
+            if existing:
+                await s.delete(existing)
+            log_entry = AILog(
+                id=log_id,
+                user_id=max_user_id,
+                platform="max",
+                request_type="chat",
+                provider="Gemini",
+                model="gemini-2.5-flash",
+                raw_response="",
+                status="error",
+                error_classification="provider_5xx",
+                prompt_summary="Мне очень трудно",
+                dialogue_id=1,
+                topic_id=None,
+                diagnostics_json=diagnostics_val,
+            )
+            s.add(log_entry)
+            await s.commit()
+
+    async def send_cb(cb_id: str, payload_str: str):
+        update = {
+            "update_id": f"up_{cb_id}",
+            "update_type": "message_callback",
+            "callback": {
+                "callback_id": cb_id,
+                "payload": payload_str,
+                "user": {"user_id": 770, "first_name": "MaxBindingUser"},
+                "message": {"mid": "mid_fail", "chat_id": chat_id},
+            },
+        }
+        await app.handle_update(update)
+        if max_user_id in app.user_tasks:
+            await app.user_tasks[max_user_id]
+
+    # Test A: diagnostics_json = None (NULL) -> rejected
+    await make_failed_log(801, None)
+    await send_cb("cb_a", "ai_retry:500:801")
+    assert len(provider_calls) == 0
+
+    # Test B: diagnostics_json = malformed JSON -> rejected
+    await make_failed_log(802, "bad_json{")
+    await send_cb("cb_b", "ai_retry:500:802")
+    assert len(provider_calls) == 0
+
+    # Test C: diagnostics_json = {} -> rejected
+    await make_failed_log(803, "{}")
+    await send_cb("cb_c", "ai_retry:500:803")
+    assert len(provider_calls) == 0
+
+    # Test D: diagnostics_json.user_message_id points to another message (e.g. 99999) -> rejected
+    await make_failed_log(804, json.dumps({"user_message_id": 99999}))
+    await send_cb("cb_d", "ai_retry:500:804")
+    assert len(provider_calls) == 0
+
+    # Test E: diagnostics_json.user_message_id wrong type / malformed -> rejected
+    await make_failed_log(805, json.dumps({"user_message_id": "not_digits"}))
+    await send_cb("cb_e", "ai_retry:500:805")
+    assert len(provider_calls) == 0
+
+    # Test F: valid exact binding -> accepted
+    await make_failed_log(806, json.dumps({"user_message_id": 500}))
+    await send_cb("cb_f", "ai_retry:500:806")
+    assert len(provider_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 17. Identical Prompt Collision is Mandatory
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_max_identical_prompt_collision_identity_authorization(session_factory, monkeypatch):
+    """Requirement 7: Identical prompt collision is mandatory.
+    Create:
+    Message A: id=101 text="Мне тревожно"
+    Message B: id=102 text="Мне тревожно"
+    Same: user, dialogue, topic, text.
+    Failed AILog is durably bound to: user_message_id=101.
+    Craft: ai_retry:102:<failed_log_id_for_101>
+    Expected: REJECT, zero provider calls.
+    Then: ai_retry:101:<failed_log_id_for_101>
+    Expected: ACCEPT, exactly 1 provider call.
+    Proves authorization is based on identity, not text coincidence.
+    """
+    monkeypatch.setattr("database.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.legacy.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
+    monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
+
+    max_user_id = 660 + MAX_ID_OFFSET
+    chat_id = 660
+
+    async with session_factory() as s:
+        cfg = await s.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="Gemini", gemini_model="gemini-2.5-flash", gemini_api_key="key")
+            s.add(cfg)
+        sub_cfg = await s.get(SubscriptionConfig, 1)
+        if not sub_cfg:
+            s.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        else:
+            sub_cfg.subscriptions_enabled = False
+        user = await s.get(User, max_user_id)
+        if not user:
+            user = User(id=max_user_id, first_name="CollUser", current_dialogue_id=1, current_topic_id=None, accepted_disclaimer=True)
+            s.add(user)
+        else:
+            user.current_dialogue_id = 1
+            user.current_topic_id = None
+
+        msg_a = await s.get(DBMessage, 101)
+        if not msg_a:
+            msg_a = DBMessage(id=101, user_id=max_user_id, role="user", content="Мне тревожно", dialogue_id=1, topic_id=None)
+            s.add(msg_a)
+        msg_b = await s.get(DBMessage, 102)
+        if not msg_b:
+            msg_b = DBMessage(id=102, user_id=max_user_id, role="user", content="Мне тревожно", dialogue_id=1, topic_id=None)
+            s.add(msg_b)
+
+        failed_log = await s.get(AILog, 701)
+        if not failed_log:
+            failed_log = AILog(
+                id=701,
+                user_id=max_user_id,
+                platform="max",
+                request_type="chat",
+                provider="Gemini",
+                model="gemini-2.5-flash",
+                raw_response="",
+                status="error",
+                error_classification="timeout",
+                prompt_summary="Мне тревожно",
+                dialogue_id=1,
+                topic_id=None,
+                diagnostics_json=json.dumps({"user_message_id": 101}),
+            )
+            s.add(failed_log)
+        await s.commit()
+
+    monkeypatch.setattr(max_common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+
+    api_calls = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        call_entry = {"method": method, "path": path, "params": params or {}, "body": json_data or {}}
+        api_calls.append(call_entry)
+        if path == "/messages":
+            return {"message": {"body": {"mid": f"mid_{len(api_calls)}"}}}
+        return {}
+
+    client = MaxApiClient(token="test_token", base_url="https://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+
+    provider_calls = []
+    async def mock_gemini(*args, **kwargs):
+        provider_calls.append(args)
+        return "Дышите глубже, тревога отступит."
+    monkeypatch.setattr(max_ai, "_call_gemini", mock_gemini)
+
+    # 1. Craft callback referencing Message B (102) with Log 701 (which is bound to 101)
+    cb_crafted_wrong = {
+        "update_id": "up_col_1",
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "cb_col_wrong",
+            "payload": "ai_retry:102:701",
+            "user": {"user_id": 660, "first_name": "CollUser"},
+            "message": {"mid": "mid_fail", "chat_id": chat_id},
+        },
+    }
+    await app.handle_update(cb_crafted_wrong)
+    if max_user_id in app.user_tasks:
+        await app.user_tasks[max_user_id]
+
+    # REJECTED: zero provider calls!
+    assert len(provider_calls) == 0
+
+    # Old attachment removed via edit_message
+    edit_call = next(
+        (c for c in reversed(api_calls) if c["method"] == "PUT" and c["body"].get("attachments") == []),
+        None,
+    )
+    assert edit_call is not None
+
+    # 2. Send correct callback referencing Message A (101)
+    cb_correct = {
+        "update_id": "up_col_2",
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "cb_col_correct",
+            "payload": "ai_retry:101:701",
+            "user": {"user_id": 660, "first_name": "CollUser"},
+            "message": {"mid": "mid_fail", "chat_id": chat_id},
+        },
+    }
+    await app.handle_update(cb_correct)
+    if max_user_id in app.user_tasks:
+        await app.user_tasks[max_user_id]
+
+    # ACCEPTED: provider called exactly once!
+    assert len(provider_calls) == 1
+
+    # Assistant message saved in DB
+    async with session_factory() as s:
+        asst = (await s.scalars(select(DBMessage).where(DBMessage.user_id == max_user_id, DBMessage.role == "assistant"))).all()
+        assert len(asst) == 1
+        assert "Дышите глубже" in asst[0].content

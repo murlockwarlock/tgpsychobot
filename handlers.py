@@ -23796,6 +23796,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     dialogue_id=current_dialogue_id,
                     topic_id=current_topic_id,
                     blocks=service_blocks,
+                    apply_fn=apply_service_data_blocks,
                 )
             except Exception as exc:
                 logging.exception("Failed to commit service data for user %s: %s", user_id, exc)

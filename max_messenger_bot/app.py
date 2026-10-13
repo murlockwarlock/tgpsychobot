@@ -1141,7 +1141,68 @@ class MaxBotApplication:
                         await self.client.answer_callback(callback.callback_id)
                     return
 
-                # Verify binding between msg and terminal_row
+                # Mandatory durable binding: terminal failed AILog MUST contain valid diagnostics_json
+                # with diagnostics.user_message_id == original_message_id (DBMessage.id)
+                if not terminal_row.diagnostics_json:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                try:
+                    diag = json.loads(terminal_row.diagnostics_json)
+                except Exception:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                if not isinstance(diag, dict):
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                if "user_message_id" not in diag:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                diag_user_msg_id = diag["user_message_id"]
+                if not isinstance(diag_user_msg_id, int) and not (
+                    isinstance(diag_user_msg_id, str) and diag_user_msg_id.isdigit()
+                ):
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                if int(diag_user_msg_id) != original_message_id:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                # Additional defense: verify prompt consistency between DBMessage and terminal AILog
                 prompt = (terminal_row.prompt_summary or "").strip()
                 msg_text = (msg.content or "").strip()
                 matches_prompt = (prompt == msg_text) or prompt.startswith(f"{msg_text}\n\nКонтекст для ответа:")
@@ -1153,21 +1214,6 @@ class MaxBotApplication:
                             pass
                     await self.client.answer_callback(callback.callback_id)
                     return
-
-                if terminal_row.diagnostics_json:
-                    try:
-                        diag = json.loads(terminal_row.diagnostics_json)
-                        if isinstance(diag, dict) and "user_message_id" in diag:
-                            if diag["user_message_id"] != original_message_id:
-                                if callback.message_id:
-                                    try:
-                                        await self.client.edit_message(callback.message_id, attachments=[])
-                                    except Exception:
-                                        pass
-                                await self.client.answer_callback(callback.callback_id)
-                                return
-                    except Exception:
-                        pass
 
             if not claim_retry_token("max", claim_key):
                 if callback.message_id:

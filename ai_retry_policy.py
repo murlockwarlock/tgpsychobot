@@ -76,14 +76,17 @@ def clear_retry_claims() -> None:
     _claimed_retry_tokens.clear()
 
 
+SCOPE_UNSET = object()
+
+
 async def validate_terminal_failure_retry_eligibility(
     session: Any,
     platform: str,
     user_id: int,
     failed_log_id: int,
     *,
-    expected_dialogue_id: int | None = None,
-    expected_topic_id: int | None = None,
+    expected_dialogue_id: int | None | object = SCOPE_UNSET,
+    expected_topic_id: int | None | object = SCOPE_UNSET,
 ) -> tuple[bool, str, Any | None]:
     """Validate that the referenced AILog represents a genuine, unfulfilled, retryable terminal failure."""
     from database import AILog
@@ -113,10 +116,10 @@ async def validate_terminal_failure_retry_eligibility(
     if not prompt:
         return False, "empty_prompt", None
 
-    if expected_dialogue_id is not None and failed_log.dialogue_id != expected_dialogue_id:
+    if expected_dialogue_id is not SCOPE_UNSET and failed_log.dialogue_id != expected_dialogue_id:
         return False, "stale_dialogue", None
 
-    if expected_topic_id is not None and failed_log.topic_id != expected_topic_id:
+    if expected_topic_id is not SCOPE_UNSET and failed_log.topic_id != expected_topic_id:
         return False, "stale_topic", None
 
     # Determine effective terminal failure outcome across the entire request group

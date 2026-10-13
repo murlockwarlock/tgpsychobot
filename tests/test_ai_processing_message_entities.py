@@ -396,6 +396,7 @@ def _run_mock_init_db(monkeypatch, dialect_name: str, bot_general_config_cols: l
     monkeypatch.setattr(database, "_migrate_ai_config_models", lambda conn: None)
     monkeypatch.setattr(database, "verify_yookassa_recurring_safety_schema", lambda conn: None)
     monkeypatch.setattr(database, "verify_payment_notification_outbox_schema", lambda conn: None)
+    monkeypatch.setattr(database, "verify_event_reminder_chains_schema", lambda conn: None)
     monkeypatch.setattr(database, "async_session_maker", lambda: _Session(None))
 
     return init_db, executed_statements

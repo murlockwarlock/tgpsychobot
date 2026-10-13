@@ -1572,7 +1572,13 @@ async def get_ai_response(
                 default_model=actual_model,
             )
             err_meta = extract_error_metadata(primary_err, provider=primary_prov)
-            primary_diag = dict(err_meta["diagnostics"]) if isinstance(err_meta.get("diagnostics"), dict) else {}
+            raw_diag = err_meta.get("diagnostics")
+            if isinstance(raw_diag, dict):
+                primary_diag = dict(raw_diag)
+            elif hasattr(raw_diag, "__dict__"):
+                primary_diag = {k: v for k, v in raw_diag.__dict__.items() if not k.startswith("_")}
+            else:
+                primary_diag = {}
             if exclude_message_id is not None:
                 primary_diag["user_message_id"] = exclude_message_id
             primary_log_id = await record_ai_attempt_log(
@@ -1598,7 +1604,7 @@ async def get_ai_response(
                 error_classification=err_meta["error_classification"],
                 http_status=err_meta["http_status"],
                 finish_reason=err_meta["finish_reason"],
-                diagnostics=primary_diag if primary_diag else err_meta["diagnostics"],
+                diagnostics=primary_diag if primary_diag else None,
                 provider_response_payload=err_meta["provider_response_payload"],
             )
 
@@ -1788,7 +1794,13 @@ async def get_ai_response(
                             default_model=str(fb_model),
                         )
                         fb_err_meta = extract_error_metadata(fb_err, provider=fb_prov)
-                        fb_diag = dict(fb_err_meta["diagnostics"]) if isinstance(fb_err_meta.get("diagnostics"), dict) else {}
+                        raw_fb_diag = fb_err_meta.get("diagnostics")
+                        if isinstance(raw_fb_diag, dict):
+                            fb_diag = dict(raw_fb_diag)
+                        elif hasattr(raw_fb_diag, "__dict__"):
+                            fb_diag = {k: v for k, v in raw_fb_diag.__dict__.items() if not k.startswith("_")}
+                        else:
+                            fb_diag = {}
                         if exclude_message_id is not None:
                             fb_diag["user_message_id"] = exclude_message_id
                         fb_log_id = await record_ai_attempt_log(
@@ -1814,7 +1826,7 @@ async def get_ai_response(
                             error_classification=fb_err_meta["error_classification"],
                             http_status=fb_err_meta["http_status"],
                             finish_reason=fb_err_meta["finish_reason"],
-                            diagnostics=fb_diag if fb_diag else fb_err_meta["diagnostics"],
+                            diagnostics=fb_diag if fb_diag else None,
                             provider_response_payload=fb_err_meta["provider_response_payload"],
                         )
                         log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
