@@ -4,6 +4,7 @@ import asyncio
 import html
 import re
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from ..time_utils import utc_now
 from .subscription_access import load_active_subscription
 from memory_mode import normalize_memory_mode
 from dialogue_reset_policy import configured_metadata_reset_mode, start_new_dialogue_scope
+from ai_retry_policy import is_retryable_ai_error
 from response_buttons import ResponseButton, build_action_callback_data, extract_response_buttons, extract_test_start_directive
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
@@ -898,10 +900,16 @@ async def _transition_image_progress_status(
     return progress_mid, None
 
 
-async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prompt_text: str, states: StateStore | None = None) -> None:
-    log.info("AI dialogue requested user_id=%s chat_id=%s", user_id, chat_id)
-    user_msg = await save_user_message(user_id, prompt_text)
-    exclude_message_id = user_msg.id if user_msg else None
+async def _execute_ai_dialogue_turn(
+    client: MaxApiClient,
+    chat_id: int,
+    user_id: int,
+    prompt_text: str,
+    *,
+    exclude_message_id: int | None = None,
+    original_message_id: int | None = None,
+    states: StateStore | None = None,
+) -> None:
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Думаю...")
     thinking_message_id = extract_sent_message_id(thinking)
 
@@ -1030,11 +1038,17 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
         log.info("AI dialogue completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)
+        attachments = []
+        if original_message_id and is_retryable_ai_error(exc):
+            from ..keyboards import ai_retry_keyboard_max
+            token = uuid.uuid4().hex[:8]
+            attachments = ai_retry_keyboard_max(original_message_id, token=token)
+        text = "Сервис ИИ временно недоступен. Попробуйте позже."
         if thinking_message_id:
-            await client.edit_message(thinking_message_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
+            await client.edit_message(thinking_message_id, text=text, attachments=attachments)
             thinking_message_id = None
         else:
-            await client.send_message(chat_id=chat_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
+            await client.send_message(chat_id=chat_id, text=text, attachments=attachments)
     except Exception:
         log.exception("Unexpected bot dialogue failure user_id=%s chat_id=%s", user_id, chat_id)
         if thinking_message_id:
@@ -1042,6 +1056,54 @@ async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prom
             thinking_message_id = None
         else:
             await client.send_message(chat_id=chat_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+
+
+async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prompt_text: str, states: StateStore | None = None) -> None:
+    log.info("AI dialogue requested user_id=%s chat_id=%s", user_id, chat_id)
+    user_msg = await save_user_message(user_id, prompt_text)
+    exclude_message_id = user_msg.id if user_msg else None
+    await _execute_ai_dialogue_turn(
+        client,
+        chat_id,
+        user_id,
+        prompt_text,
+        exclude_message_id=exclude_message_id,
+        original_message_id=exclude_message_id,
+        states=states,
+    )
+
+
+async def retry_ai_dialogue(
+    client: MaxApiClient,
+    chat_id: int,
+    user_id: int,
+    original_message_id: int,
+    states: StateStore | None = None,
+) -> None:
+    log.info("AI dialogue retry requested user_id=%s chat_id=%s original_message_id=%s", user_id, chat_id, original_message_id)
+    async with async_session_maker() as session:
+        original_msg = await session.get(DBMessage, original_message_id)
+        user = await session.get(User, user_id)
+        if not original_msg or not user:
+            log.warning("Original message or user not found for retry: msg=%s user=%s", original_message_id, user_id)
+            return
+        if original_msg.user_id != user_id or original_msg.role != "user":
+            log.warning("Original message does not match user or role for retry: %s", original_msg)
+            return
+        if original_msg.dialogue_id != user.current_dialogue_id or original_msg.topic_id != user.current_topic_id:
+            log.warning("Original message scope does not match user current scope for retry")
+            return
+        prompt_text = original_msg.content
+
+    await _execute_ai_dialogue_turn(
+        client,
+        chat_id,
+        user_id,
+        prompt_text,
+        exclude_message_id=original_message_id,
+        original_message_id=original_message_id,
+        states=states,
+    )
 
 
 async def run_hidden_ai_kickoff(

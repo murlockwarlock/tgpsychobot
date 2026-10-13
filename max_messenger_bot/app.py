@@ -9,7 +9,8 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 
 from .api import MaxApiClient
-from .legacy import Content, SubscriptionConfig, Topic, User, async_session_maker, init_db
+from .legacy import Content, Message as DBMessage, SubscriptionConfig, Topic, User, async_session_maker, init_db
+from ai_retry_policy import claim_retry_token, unclaim_retry_token
 from .logging_utils import configure_logging, get_bot_logger, get_max_logger
 from .models import IncomingCallback, IncomingMessage, canonical_media_type, parse_callback, parse_message
 from .services import admin as admin_service
@@ -1074,6 +1075,72 @@ class MaxBotApplication:
             return
         if data == "noop":
             await self.client.answer_callback(callback.callback_id)
+            return
+        if data.startswith("ai_retry:"):
+            parts = data.split(":")
+            if len(parts) < 2 or not parts[1].isdigit():
+                await self.client.answer_callback(callback.callback_id)
+                return
+            original_message_id = int(parts[1])
+            claim_token = parts[2] if len(parts) > 2 else str(original_message_id)
+            claim_key = f"{original_message_id}:{claim_token}"
+
+            async with async_session_maker() as session:
+                msg = await session.get(DBMessage, original_message_id)
+                user = await session.get(User, user_id, options=[selectinload(User.subscription)])
+
+            if not msg or not user or msg.user_id != user_id or msg.role != "user":
+                await self.client.answer_callback(callback.callback_id)
+                return
+
+            if msg.dialogue_id != user.current_dialogue_id or msg.topic_id != user.current_topic_id:
+                if callback.message_id:
+                    try:
+                        await self.client.edit_message(callback.message_id, attachments=[])
+                    except Exception:
+                        pass
+                await self.client.answer_callback(
+                    callback.callback_id,
+                    notification="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
+                )
+                return
+
+            if not claim_retry_token("max", claim_key):
+                if callback.message_id:
+                    try:
+                        await self.client.edit_message(callback.message_id, attachments=[])
+                    except Exception:
+                        pass
+                await self.client.answer_callback(
+                    callback.callback_id,
+                    notification="Этот запрос уже был отправлен на повторную обработку.",
+                )
+                return
+
+            if not await common.ensure_access_before_chat(self.client, chat_id, user):
+                unclaim_retry_token("max", claim_key)
+                await self.client.answer_callback(callback.callback_id)
+                return
+
+            lease = single_flight.try_claim("max", user_id)
+            if lease is None:
+                unclaim_retry_token("max", claim_key)
+                await self.client.answer_callback(callback.callback_id)
+                await self.client.send_message(chat_id=chat_id, text=AI_BUSY_MESSAGE)
+                return
+
+            await self.client.answer_callback(callback.callback_id)
+            if callback.message_id:
+                try:
+                    await self.client.edit_message(callback.message_id, attachments=[])
+                except Exception:
+                    pass
+
+            self.spawn_ai_user_task(
+                user_id,
+                common.retry_ai_dialogue(self.client, chat_id, user_id, original_message_id, self.states),
+                lease,
+            )
             return
         if data.startswith("ai_btn:") or data.startswith("action:") or data.startswith("svc:"):
             action, _ = split_action_callback_data(data)

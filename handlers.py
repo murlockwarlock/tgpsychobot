@@ -391,6 +391,7 @@ from universal_tests import (
 )
 
 from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
+from ai_retry_policy import is_retryable_ai_error, claim_retry_token, unclaim_retry_token
 
 router = Router()
 
@@ -2782,6 +2783,11 @@ async def process_buffered_messages(
         )
         if not await _check_scope_guard():
             return
+        reply_markup = None
+        failed_log_id = getattr(e, "ai_log_id", None) or (e.ai_log_ids[-1] if getattr(e, "ai_log_ids", None) else None)
+        is_hidden_job = bool(scoped_kickoff and scoped_kickoff.is_hidden)
+        if failed_log_id and is_retryable_ai_error(e) and not is_hidden_job:
+            reply_markup = kb.ai_retry_keyboard(failed_log_id, locale=locale)
         await bot.send_message(
             chat_id=user_id,
             text=translate(
@@ -2789,6 +2795,7 @@ async def process_buffered_messages(
                 locale,
                 fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
             ),
+            reply_markup=reply_markup,
         )
     except Exception as e:
         if typing_task: typing_task.cancel()
@@ -3351,6 +3358,104 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         )
     finally:
         single_flight.release(lease)
+
+
+@router.callback_query(F.data.startswith("ai_retry:"))
+async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    callback_data = callback.data or ""
+    parts = callback_data.split(":", 1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await callback.answer()
+        return
+    failed_log_id = int(parts[1])
+    user_id = callback.from_user.id
+
+    async with async_session_maker() as session:
+        failed_log = await session.get(AILog, failed_log_id)
+        user = await session.get(User, user_id)
+
+    if not failed_log or not user or failed_log.user_id != user_id:
+        await callback.answer()
+        return
+
+    if (
+        (failed_log.platform or "").lower() not in {"telegram", ""}
+        or failed_log.request_type != "chat"
+        or failed_log.status != "error"
+        or not (failed_log.prompt_summary and failed_log.prompt_summary.strip())
+    ):
+        await callback.answer()
+        return
+
+    if failed_log.request_group_id:
+        async with async_session_maker() as session:
+            stmt = select(AILog.id).where(
+                AILog.request_group_id == failed_log.request_group_id,
+                AILog.status == "success",
+            ).limit(1)
+            has_success = (await session.scalar(stmt)) is not None
+            if has_success:
+                await _disable_ai_button_keyboard(callback)
+                await callback.answer()
+                return
+
+    if failed_log.dialogue_id != user.current_dialogue_id or failed_log.topic_id != user.current_topic_id:
+        await _disable_ai_button_keyboard(callback)
+        locale = await _get_user_locale(user_id)
+        await callback.answer(
+            translate(
+                "ui.ai.retry_stale",
+                locale,
+                fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
+            ),
+            show_alert=True,
+        )
+        return
+
+    if not _claim_ai_button_message(callback) or not claim_retry_token("telegram", failed_log_id):
+        await _disable_ai_button_keyboard(callback)
+        locale = await _get_user_locale(user_id)
+        await callback.answer(
+            translate(
+                "ui.ai.retry_already_used",
+                locale,
+                fallback="Этот запрос уже был отправлен на повторную обработку.",
+            ),
+        )
+        return
+
+    busy = False
+    async with _get_user_scheduling_lock(user_id):
+        lease = single_flight.try_claim("telegram", user_id)
+        if lease is None:
+            busy = True
+        else:
+            try:
+                if user_id not in user_message_buffers:
+                    user_message_buffers[user_id] = []
+                user_message_buffers[user_id].append(failed_log.prompt_summary)
+                user_message_buffer_leases[user_id] = lease
+                _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.0)
+            except BaseException:
+                user_message_buffer_leases.pop(user_id, None)
+                if user_id in user_message_buffers:
+                    user_message_buffers[user_id].pop()
+                    if not user_message_buffers[user_id]:
+                        user_message_buffers.pop(user_id, None)
+                single_flight.release(lease)
+                raise
+
+    if busy:
+        unclaim_retry_token("telegram", failed_log_id)
+        locale = await _get_user_locale(user_id)
+        await callback.answer(
+            translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE),
+            show_alert=True,
+        )
+        return
+
+    await _disable_ai_button_keyboard(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("card_select_"))

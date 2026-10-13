@@ -1283,3 +1283,8 @@ def admin_ai_log_detail_keyboard(
             [callback_button("⬅️ Назад к логам", back_cb)],
         ]
     )
+
+
+def ai_retry_keyboard_max(message_id: int, *, token: str | None = None) -> list[dict]:
+    payload = f"ai_retry:{message_id}:{token}" if token else f"ai_retry:{message_id}"
+    return inline_keyboard([[callback_button("🔄 Повторить запрос", payload)]])
