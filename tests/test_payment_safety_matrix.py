@@ -2871,7 +2871,7 @@ async def test_sqlite_wal_concurrent_webhook_vs_caller_success():
         await conn.execute(text("PRAGMA busy_timeout=30000;"))
         await conn.run_sync(Base.metadata.create_all)
 
-    active_end = datetime(2026, 10, 1, 12, 0, 0)
+    active_end = datetime.utcnow().replace(microsecond=0) + timedelta(days=20)
     async with wal_session_maker() as session:
         u = User(id=1505, username="test1505")
         p = SubscriptionPlan(id=1508, name="Plan WAL", price=195.0, duration_value=1, duration_unit="months")

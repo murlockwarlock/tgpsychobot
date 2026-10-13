@@ -391,6 +391,13 @@ from universal_tests import (
 )
 
 from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
+from ai_retry_policy import (
+    is_retryable_ai_error,
+    claim_retry_token,
+    unclaim_retry_token,
+    is_retry_token_claimed,
+    validate_terminal_failure_retry_eligibility,
+)
 
 router = Router()
 
@@ -650,6 +657,12 @@ def _claim_ai_button_message(callback: CallbackQuery) -> bool:
     while len(_ai_button_claims) > _AI_BUTTON_CLAIMS_MAX:
         _ai_button_claims.popitem(last=False)
     return True
+
+
+def _unclaim_ai_button_message(callback: CallbackQuery) -> None:
+    identity = _ai_button_message_identity(callback)
+    if identity is not None:
+        _ai_button_claims.pop(identity, None)
 
 
 def _resolve_ai_button_label(callback: CallbackQuery, callback_data: str) -> str | None:
@@ -2782,6 +2795,11 @@ async def process_buffered_messages(
         )
         if not await _check_scope_guard():
             return
+        reply_markup = None
+        failed_log_id = getattr(e, "ai_log_id", None) or (e.ai_log_ids[-1] if getattr(e, "ai_log_ids", None) else None)
+        is_hidden_job = bool(scoped_kickoff and scoped_kickoff.is_hidden)
+        if failed_log_id and is_retryable_ai_error(e) and not is_hidden_job:
+            reply_markup = kb.ai_retry_keyboard(failed_log_id, locale=locale)
         await bot.send_message(
             chat_id=user_id,
             text=translate(
@@ -2789,6 +2807,7 @@ async def process_buffered_messages(
                 locale,
                 fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
             ),
+            reply_markup=reply_markup,
         )
     except Exception as e:
         if typing_task: typing_task.cancel()
@@ -3351,6 +3370,125 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         )
     finally:
         single_flight.release(lease)
+
+
+@router.callback_query(F.data.startswith("ai_retry:"))
+async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    callback_data = callback.data or ""
+    parts = callback_data.split(":", 1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await callback.answer()
+        return
+    failed_log_id = int(parts[1])
+    user_id = callback.from_user.id
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await callback.answer()
+            return
+
+        eligible, reason, terminal_row = await validate_terminal_failure_retry_eligibility(
+            session,
+            platform="telegram",
+            user_id=user_id,
+            failed_log_id=failed_log_id,
+            expected_dialogue_id=user.current_dialogue_id,
+            expected_topic_id=user.current_topic_id,
+        )
+
+    if not eligible:
+        if reason in {"stale_dialogue", "stale_topic"}:
+            await _disable_ai_button_keyboard(callback)
+            locale = await _get_user_locale(user_id)
+            await callback.answer(
+                translate(
+                    "ui.ai.retry_stale",
+                    locale,
+                    fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
+                ),
+                show_alert=True,
+            )
+            return
+        await _disable_ai_button_keyboard(callback)
+        await callback.answer()
+        return
+
+    identity = _ai_button_message_identity(callback)
+    if (identity is not None and identity in _ai_button_claims) or is_retry_token_claimed("telegram", failed_log_id):
+        await _disable_ai_button_keyboard(callback)
+        locale = await _get_user_locale(user_id)
+        await callback.answer(
+            translate(
+                "ui.ai.retry_already_used",
+                locale,
+                fallback="Этот запрос уже был отправлен на повторную обработку.",
+            ),
+        )
+        return
+
+    prompt_to_retry = terminal_row.prompt_summary
+    busy = False
+
+    async with _get_user_scheduling_lock(user_id):
+        if (identity is not None and identity in _ai_button_claims) or is_retry_token_claimed("telegram", failed_log_id):
+            await _disable_ai_button_keyboard(callback)
+            locale = await _get_user_locale(user_id)
+            await callback.answer(
+                translate(
+                    "ui.ai.retry_already_used",
+                    locale,
+                    fallback="Этот запрос уже был отправлен на повторную обработку.",
+                ),
+            )
+            return
+
+        lease = single_flight.try_claim("telegram", user_id)
+        if lease is None:
+            busy = True
+        else:
+            if not _claim_ai_button_message(callback) or not claim_retry_token("telegram", failed_log_id):
+                _unclaim_ai_button_message(callback)
+                unclaim_retry_token("telegram", failed_log_id)
+                single_flight.release(lease)
+                await _disable_ai_button_keyboard(callback)
+                locale = await _get_user_locale(user_id)
+                await callback.answer(
+                    translate(
+                        "ui.ai.retry_already_used",
+                        locale,
+                        fallback="Этот запрос уже был отправлен на повторную обработку.",
+                    ),
+                )
+                return
+
+            try:
+                if user_id not in user_message_buffers:
+                    user_message_buffers[user_id] = []
+                user_message_buffers[user_id].append(prompt_to_retry)
+                user_message_buffer_leases[user_id] = lease
+                _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.0)
+            except BaseException:
+                _unclaim_ai_button_message(callback)
+                unclaim_retry_token("telegram", failed_log_id)
+                user_message_buffer_leases.pop(user_id, None)
+                if user_id in user_message_buffers:
+                    user_message_buffers[user_id].pop()
+                    if not user_message_buffers[user_id]:
+                        user_message_buffers.pop(user_id, None)
+                single_flight.release(lease)
+                raise
+
+    if busy:
+        locale = await _get_user_locale(user_id)
+        await callback.answer(
+            translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE),
+            show_alert=True,
+        )
+        return
+
+    await _disable_ai_button_keyboard(callback)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("card_select_"))
@@ -23658,6 +23796,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                     dialogue_id=current_dialogue_id,
                     topic_id=current_topic_id,
                     blocks=service_blocks,
+                    apply_fn=apply_service_data_blocks,
                 )
             except Exception as exc:
                 logging.exception("Failed to commit service data for user %s: %s", user_id, exc)

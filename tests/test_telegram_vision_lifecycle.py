@@ -21,6 +21,7 @@ from database import (
     AIConfig,
     AILog,
     AutomationConversationState,
+    AutomationEvent,
     AutomationMetadataRecord,
     Base,
     Message as DBMessage,
@@ -43,12 +44,16 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
             await conn.run_sync(Base.metadata.create_all)
 
+        import automation_events
         self._orig_handlers_sessions = handlers.async_session_maker
         self._orig_ai_sessions = ai_integration.async_session_maker
+        self._orig_auto_sessions = automation_events.async_session_maker
         handlers.async_session_maker = self.sessions
         ai_integration.async_session_maker = self.sessions
+        automation_events.async_session_maker = self.sessions
 
         async with self.sessions() as session:
             self.topic = Topic(
@@ -92,8 +97,10 @@ class TelegramVisionLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
     async def asyncTearDown(self):
+        import automation_events
         handlers.async_session_maker = self._orig_handlers_sessions
         ai_integration.async_session_maker = self._orig_ai_sessions
+        automation_events.async_session_maker = self._orig_auto_sessions
         await self.engine.dispose()
 
     def _make_mock_bot(self):

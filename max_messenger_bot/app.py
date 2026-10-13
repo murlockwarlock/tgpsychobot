@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from aiohttp import web
@@ -9,7 +10,9 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 
 from .api import MaxApiClient
-from .legacy import Content, SubscriptionConfig, Topic, User, async_session_maker, init_db
+from .legacy import Content, Message as DBMessage, SubscriptionConfig, Topic, User, async_session_maker, init_db
+from ai_retry_policy import claim_retry_token, unclaim_retry_token, validate_terminal_failure_retry_eligibility
+from translation_service import translate
 from .logging_utils import configure_logging, get_bot_logger, get_max_logger
 from .models import IncomingCallback, IncomingMessage, canonical_media_type, parse_callback, parse_message
 from .services import admin as admin_service
@@ -1074,6 +1077,184 @@ class MaxBotApplication:
             return
         if data == "noop":
             await self.client.answer_callback(callback.callback_id)
+            return
+        if data.startswith("ai_retry:"):
+            parts = data.split(":")
+            if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+                await self.client.answer_callback(callback.callback_id)
+                return
+            original_message_id = int(parts[1])
+            failed_log_id = int(parts[2])
+            claim_key = f"{original_message_id}:{failed_log_id}"
+
+            async with async_session_maker() as session:
+                msg = await session.get(DBMessage, original_message_id)
+                user = await session.get(User, user_id, options=[selectinload(User.subscription)])
+
+                if not msg or not user or msg.user_id != user_id or msg.role != "user":
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                user_locale = getattr(user, "language_code", None) or "ru"
+
+                if msg.dialogue_id != user.current_dialogue_id or msg.topic_id != user.current_topic_id:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(
+                        callback.callback_id,
+                        notification=translate(
+                            "ui.ai.retry_stale",
+                            user_locale,
+                            fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
+                        ),
+                    )
+                    return
+
+                eligible, reason, terminal_row = await validate_terminal_failure_retry_eligibility(
+                    session,
+                    platform="max",
+                    user_id=user_id,
+                    failed_log_id=failed_log_id,
+                    expected_dialogue_id=user.current_dialogue_id,
+                    expected_topic_id=user.current_topic_id,
+                )
+
+                if not eligible:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    if reason in {"stale_dialogue", "stale_topic"}:
+                        await self.client.answer_callback(
+                            callback.callback_id,
+                            notification=translate(
+                                "ui.ai.retry_stale",
+                                user_locale,
+                                fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
+                            ),
+                        )
+                    else:
+                        await self.client.answer_callback(callback.callback_id)
+                    return
+
+                # Mandatory durable binding: terminal failed AILog MUST contain valid diagnostics_json
+                # with diagnostics.user_message_id == original_message_id (DBMessage.id)
+                if not terminal_row.diagnostics_json:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                try:
+                    diag = json.loads(terminal_row.diagnostics_json)
+                except Exception:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                if not isinstance(diag, dict):
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                if "user_message_id" not in diag:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                diag_user_msg_id = diag["user_message_id"]
+                if not isinstance(diag_user_msg_id, int) and not (
+                    isinstance(diag_user_msg_id, str) and diag_user_msg_id.isdigit()
+                ):
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                if int(diag_user_msg_id) != original_message_id:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                # Additional defense: verify prompt consistency between DBMessage and terminal AILog
+                prompt = (terminal_row.prompt_summary or "").strip()
+                msg_text = (msg.content or "").strip()
+                matches_prompt = (prompt == msg_text) or prompt.startswith(f"{msg_text}\n\nКонтекст для ответа:")
+                if not matches_prompt:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+            if not claim_retry_token("max", claim_key):
+                if callback.message_id:
+                    try:
+                        await self.client.edit_message(callback.message_id, attachments=[])
+                    except Exception:
+                        pass
+                await self.client.answer_callback(
+                    callback.callback_id,
+                    notification=translate(
+                        "ui.ai.retry_already_used",
+                        user_locale,
+                        fallback="Этот запрос уже был отправлен на повторную обработку.",
+                    ),
+                )
+                return
+
+            if not await common.ensure_access_before_chat(self.client, chat_id, user):
+                unclaim_retry_token("max", claim_key)
+                await self.client.answer_callback(callback.callback_id)
+                return
+
+            lease = single_flight.try_claim("max", user_id)
+            if lease is None:
+                unclaim_retry_token("max", claim_key)
+                await self.client.answer_callback(callback.callback_id)
+                await self.client.send_message(chat_id=chat_id, text=AI_BUSY_MESSAGE)
+                return
+
+            await self.client.answer_callback(callback.callback_id)
+            if callback.message_id:
+                try:
+                    await self.client.edit_message(callback.message_id, attachments=[])
+                except Exception:
+                    pass
+
+            self.spawn_ai_user_task(
+                user_id,
+                common.retry_ai_dialogue(self.client, chat_id, user_id, original_message_id, self.states),
+                lease,
+            )
             return
         if data.startswith("ai_btn:") or data.startswith("action:") or data.startswith("svc:"):
             action, _ = split_action_callback_data(data)

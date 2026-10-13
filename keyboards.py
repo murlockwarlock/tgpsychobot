@@ -2456,3 +2456,10 @@ def admin_ai_log_detail_keyboard(
     builder.button(text="⬅️ Назад к логам", callback_data=back_cb)
     builder.adjust(1)
     return builder.as_markup()
+
+
+def ai_retry_keyboard(log_id: int, *, locale: str = "ru") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    text = translate("ui.ai.retry_request", locale, fallback="🔄 Повторить запрос")
+    builder.button(text=text, callback_data=f"ai_retry:{log_id}")
+    return builder.as_markup()

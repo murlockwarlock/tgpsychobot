@@ -45,7 +45,7 @@ with patch.object(sqlalchemy_asyncio, "create_async_engine", _sqlite_compatible_
 class SubscriptionVisibilityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await init_db()
-        self.now = datetime(2026, 9, 11, 12, 0, 0)
+        self.now = datetime.utcnow()
 
     def test_backward_compatibility_symbols(self):
         """Verify max_messenger_bot.services.subscription_access re-exports all 6 symbols."""

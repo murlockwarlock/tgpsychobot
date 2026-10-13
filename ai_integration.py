@@ -2295,10 +2295,21 @@ async def get_ai_response(
                             classification="configuration",
                         ),
                     )
+                    service_err.classification = "configuration"
+                    service_err.ai_log_ids = [primary_log_id] if primary_log_id else None
+                    service_err.ai_log_id = primary_log_id
+                    service_err.request_group_id = request_group_id
                     raise service_err from primary_err
                 if isinstance(primary_err, AIServiceError):
+                    primary_err.ai_log_ids = [primary_log_id] if primary_log_id else None
+                    primary_err.ai_log_id = primary_log_id
+                    primary_err.request_group_id = request_group_id
                     raise
-                raise AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}") from primary_err
+                err = AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}")
+                err.ai_log_ids = [primary_log_id] if primary_log_id else None
+                err.ai_log_id = primary_log_id
+                err.request_group_id = request_group_id
+                raise err from primary_err
 
             fb_key = fb_provider.strip().lower()
             fb_api_key = _normalize_config_value(getattr(ai_config, f"{fb_key}_api_key", None))
@@ -2338,6 +2349,10 @@ async def get_ai_response(
                         classification="configuration",
                     ),
                 )
+                service_err.classification = "configuration"
+                service_err.ai_log_ids = [primary_log_id] if primary_log_id else None
+                service_err.ai_log_id = primary_log_id
+                service_err.request_group_id = request_group_id
                 raise service_err from primary_err
 
             logging.warning(
@@ -2471,6 +2486,9 @@ async def get_ai_response(
                     else "BOTH_FAILED"
                 )
                 service_err.classification = getattr(fb_err, "classification", fallback_classification)
+                service_err.ai_log_ids = ai_log_ids
+                service_err.ai_log_id = fb_log_id or primary_log_id
+                service_err.request_group_id = request_group_id
                 raise service_err from fb_err
 
         automation_result = None
