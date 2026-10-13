@@ -1285,6 +1285,9 @@ def admin_ai_log_detail_keyboard(
     )
 
 
-def ai_retry_keyboard_max(message_id: int, *, token: str | None = None) -> list[dict]:
-    payload = f"ai_retry:{message_id}:{token}" if token else f"ai_retry:{message_id}"
-    return inline_keyboard([[callback_button("🔄 Повторить запрос", payload)]])
+def ai_retry_keyboard_max(message_id: int, *, failed_log_id: int | str | None = None, token: str | None = None, locale: str = "ru") -> list[dict]:
+    from translation_service import translate
+    text = translate("ui.ai.retry_request", locale, fallback="🔄 Повторить запрос")
+    ref = failed_log_id if failed_log_id is not None else token
+    payload = f"ai_retry:{message_id}:{ref}" if ref is not None else f"ai_retry:{message_id}"
+    return inline_keyboard([[callback_button(text, payload)]])

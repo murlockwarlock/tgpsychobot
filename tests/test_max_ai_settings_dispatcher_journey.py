@@ -128,6 +128,8 @@ def _classify_max_callback(payload):
         )
     if payload.startswith(navigation) or payload.startswith(mutation):
         return "mutation" if payload.startswith(mutation) else "navigation"
+    if payload.startswith("ai_retry:"):
+        return "external"
     raise AssertionError(f"unclassified changed MAX AI callback: {payload}")
 
 

@@ -1039,10 +1039,12 @@ async def _execute_ai_dialogue_turn(
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)
         attachments = []
-        if original_message_id and is_retryable_ai_error(exc):
+        failed_log_id = getattr(exc, "ai_log_id", None)
+        if not failed_log_id and getattr(exc, "ai_log_ids", None):
+            failed_log_id = exc.ai_log_ids[-1]
+        if original_message_id and failed_log_id and is_retryable_ai_error(exc):
             from ..keyboards import ai_retry_keyboard_max
-            token = uuid.uuid4().hex[:8]
-            attachments = ai_retry_keyboard_max(original_message_id, token=token)
+            attachments = ai_retry_keyboard_max(original_message_id, failed_log_id=failed_log_id)
         text = "Сервис ИИ временно недоступен. Попробуйте позже."
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text=text, attachments=attachments)

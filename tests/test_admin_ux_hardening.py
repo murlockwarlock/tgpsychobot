@@ -239,6 +239,8 @@ def _classify_telegram_ai_callback(callback_data):
         "set_kie_credit_threshold",
     }:
         return "mutation"
+    if callback_data.startswith("ai_retry:"):
+        return "external"
     raise AssertionError(f"unclassified changed Telegram AI callback: {callback_data}")
 
 

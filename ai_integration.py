@@ -2344,6 +2344,7 @@ async def get_ai_response(
                     _build_ai_attempt(
                         fb_provider,
                         fb_model,
+                        fallback_config_error,
                         status="CONFIGURATION_ERROR",
                         classification="configuration",
                     ),

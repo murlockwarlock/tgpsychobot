@@ -1572,6 +1572,9 @@ async def get_ai_response(
                 default_model=actual_model,
             )
             err_meta = extract_error_metadata(primary_err, provider=primary_prov)
+            primary_diag = dict(err_meta["diagnostics"]) if isinstance(err_meta.get("diagnostics"), dict) else {}
+            if exclude_message_id is not None:
+                primary_diag["user_message_id"] = exclude_message_id
             primary_log_id = await record_ai_attempt_log(
                 session,
                 user_id=user_id,
@@ -1595,7 +1598,7 @@ async def get_ai_response(
                 error_classification=err_meta["error_classification"],
                 http_status=err_meta["http_status"],
                 finish_reason=err_meta["finish_reason"],
-                diagnostics=err_meta["diagnostics"],
+                diagnostics=primary_diag if primary_diag else err_meta["diagnostics"],
                 provider_response_payload=err_meta["provider_response_payload"],
             )
 
@@ -1785,6 +1788,9 @@ async def get_ai_response(
                             default_model=str(fb_model),
                         )
                         fb_err_meta = extract_error_metadata(fb_err, provider=fb_prov)
+                        fb_diag = dict(fb_err_meta["diagnostics"]) if isinstance(fb_err_meta.get("diagnostics"), dict) else {}
+                        if exclude_message_id is not None:
+                            fb_diag["user_message_id"] = exclude_message_id
                         fb_log_id = await record_ai_attempt_log(
                             session,
                             user_id=user_id,
@@ -1808,7 +1814,7 @@ async def get_ai_response(
                             error_classification=fb_err_meta["error_classification"],
                             http_status=fb_err_meta["http_status"],
                             finish_reason=fb_err_meta["finish_reason"],
-                            diagnostics=fb_err_meta["diagnostics"],
+                            diagnostics=fb_diag if fb_diag else fb_err_meta["diagnostics"],
                             provider_response_payload=fb_err_meta["provider_response_payload"],
                         )
                         log.error("Fallback provider '%s' also failed: %s", fb_provider, fb_err)
@@ -1851,10 +1857,14 @@ async def get_ai_response(
                 if isinstance(primary_err, AIServiceError):
                     log.exception("AI request failed user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
                     primary_err.ai_log_ids = ai_log_ids
+                    primary_err.ai_log_id = primary_log_id
+                    primary_err.request_group_id = request_group_id
                     raise
                 log.exception("Unexpected AI request failure user_id=%s provider=%s topic_id=%s", user_id, ai_config.provider, user.current_topic_id)
                 service_err = AIServiceError(f"Ошибка при обращении к AI-провайдеру: {primary_err}")
                 service_err.ai_log_ids = ai_log_ids
+                service_err.ai_log_id = primary_log_id
+                service_err.request_group_id = request_group_id
                 raise service_err from primary_err
 
         if service_blocks:

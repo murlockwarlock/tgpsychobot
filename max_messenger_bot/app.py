@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from aiohttp import web
@@ -10,7 +11,8 @@ from sqlalchemy.orm import selectinload
 
 from .api import MaxApiClient
 from .legacy import Content, Message as DBMessage, SubscriptionConfig, Topic, User, async_session_maker, init_db
-from ai_retry_policy import claim_retry_token, unclaim_retry_token
+from ai_retry_policy import claim_retry_token, unclaim_retry_token, validate_terminal_failure_retry_eligibility
+from translation_service import translate
 from .logging_utils import configure_logging, get_bot_logger, get_max_logger
 from .models import IncomingCallback, IncomingMessage, canonical_media_type, parse_callback, parse_message
 from .services import admin as admin_service
@@ -1078,32 +1080,94 @@ class MaxBotApplication:
             return
         if data.startswith("ai_retry:"):
             parts = data.split(":")
-            if len(parts) < 2 or not parts[1].isdigit():
+            if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
                 await self.client.answer_callback(callback.callback_id)
                 return
             original_message_id = int(parts[1])
-            claim_token = parts[2] if len(parts) > 2 else str(original_message_id)
-            claim_key = f"{original_message_id}:{claim_token}"
+            failed_log_id = int(parts[2])
+            claim_key = f"{original_message_id}:{failed_log_id}"
 
             async with async_session_maker() as session:
                 msg = await session.get(DBMessage, original_message_id)
                 user = await session.get(User, user_id, options=[selectinload(User.subscription)])
 
-            if not msg or not user or msg.user_id != user_id or msg.role != "user":
-                await self.client.answer_callback(callback.callback_id)
-                return
+                if not msg or not user or msg.user_id != user_id or msg.role != "user":
+                    await self.client.answer_callback(callback.callback_id)
+                    return
 
-            if msg.dialogue_id != user.current_dialogue_id or msg.topic_id != user.current_topic_id:
-                if callback.message_id:
+                user_locale = getattr(user, "language_code", None) or "ru"
+
+                if msg.dialogue_id != user.current_dialogue_id or msg.topic_id != user.current_topic_id:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(
+                        callback.callback_id,
+                        notification=translate(
+                            "ui.ai.retry_stale",
+                            user_locale,
+                            fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
+                        ),
+                    )
+                    return
+
+                eligible, reason, terminal_row = await validate_terminal_failure_retry_eligibility(
+                    session,
+                    platform="max",
+                    user_id=user_id,
+                    failed_log_id=failed_log_id,
+                    expected_dialogue_id=user.current_dialogue_id,
+                    expected_topic_id=user.current_topic_id,
+                )
+
+                if not eligible:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    if reason in {"stale_dialogue", "stale_topic"}:
+                        await self.client.answer_callback(
+                            callback.callback_id,
+                            notification=translate(
+                                "ui.ai.retry_stale",
+                                user_locale,
+                                fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
+                            ),
+                        )
+                    else:
+                        await self.client.answer_callback(callback.callback_id)
+                    return
+
+                # Verify binding between msg and terminal_row
+                prompt = (terminal_row.prompt_summary or "").strip()
+                msg_text = (msg.content or "").strip()
+                matches_prompt = (prompt == msg_text) or prompt.startswith(f"{msg_text}\n\nКонтекст для ответа:")
+                if not matches_prompt:
+                    if callback.message_id:
+                        try:
+                            await self.client.edit_message(callback.message_id, attachments=[])
+                        except Exception:
+                            pass
+                    await self.client.answer_callback(callback.callback_id)
+                    return
+
+                if terminal_row.diagnostics_json:
                     try:
-                        await self.client.edit_message(callback.message_id, attachments=[])
+                        diag = json.loads(terminal_row.diagnostics_json)
+                        if isinstance(diag, dict) and "user_message_id" in diag:
+                            if diag["user_message_id"] != original_message_id:
+                                if callback.message_id:
+                                    try:
+                                        await self.client.edit_message(callback.message_id, attachments=[])
+                                    except Exception:
+                                        pass
+                                await self.client.answer_callback(callback.callback_id)
+                                return
                     except Exception:
                         pass
-                await self.client.answer_callback(
-                    callback.callback_id,
-                    notification="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
-                )
-                return
 
             if not claim_retry_token("max", claim_key):
                 if callback.message_id:
@@ -1113,7 +1177,11 @@ class MaxBotApplication:
                         pass
                 await self.client.answer_callback(
                     callback.callback_id,
-                    notification="Этот запрос уже был отправлен на повторную обработку.",
+                    notification=translate(
+                        "ui.ai.retry_already_used",
+                        user_locale,
+                        fallback="Этот запрос уже был отправлен на повторную обработку.",
+                    ),
                 )
                 return
 

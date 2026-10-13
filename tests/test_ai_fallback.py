@@ -131,7 +131,7 @@ def _failure(module, kind):
     raise AssertionError(f"unknown failure kind: {kind}")
 
 
-def _config(*, fallback_enabled, fallback_configured=None):
+def _config(*, fallback_enabled, fallback_configured=None, fallback_has_key=True):
     if fallback_configured is None:
         fallback_configured = fallback_enabled
     return SimpleNamespace(
@@ -141,7 +141,7 @@ def _config(*, fallback_enabled, fallback_configured=None):
         prompt_filename=None,
         gemini_api_key="primary-key",
         gemini_model="primary-model",
-        openai_api_key="fallback-key",
+        openai_api_key="fallback-key" if fallback_has_key else None,
         openai_model="fallback-model",
         fallback_provider="openai" if fallback_configured else None,
         fallback_model="fallback-model" if fallback_configured else None,
@@ -180,6 +180,7 @@ async def _run_telegram(
     *,
     fallback_enabled,
     fallback_configured=None,
+    fallback_has_key=True,
     fallback_call=None,
     commit_error=None,
     bot=None,
@@ -189,6 +190,7 @@ async def _run_telegram(
     config = _config(
         fallback_enabled=fallback_enabled,
         fallback_configured=fallback_configured,
+        fallback_has_key=fallback_has_key,
     )
     session = _Session(ai_integration, _user(), config, telegram=True, commit_error=commit_error)
     primary = (
@@ -542,8 +544,37 @@ async def test_fallback_configuration_error_preserves_primary_cause(monkeypatch)
         "CONFIGURATION_ERROR",
     ]
     assert error.provider_attempts[0]["error"] == "KIE chat returned empty content"
+    assert error.provider_attempts[1]["status"] == "CONFIGURATION_ERROR"
     assert error.provider_attempts[1]["classification"] == "configuration"
+    assert "Fallback AI provider configuration is incomplete" in error.provider_attempts[1]["error"]
     assert error_reporting.exception_summary(error) == "KIE chat returned empty content"
+
+
+@pytest.mark.asyncio
+async def test_fallback_missing_key_configuration_error_preserves_reason(monkeypatch):
+    import ai_integration
+    import error_reporting
+
+    primary_error = ai_integration.AIResponseError("Primary service error")
+    with pytest.raises(ai_integration.AIServiceError) as raised:
+        await _run_telegram(
+            monkeypatch,
+            primary_error,
+            fallback_enabled=True,
+            fallback_configured=True,
+            fallback_has_key=False,
+        )
+
+    error = raised.value
+    assert error.ai_outcome == "PRIMARY_FAILED + FALLBACK_CONFIGURATION_ERROR"
+    assert [attempt["status"] for attempt in error.provider_attempts] == [
+        "FAILED",
+        "CONFIGURATION_ERROR",
+    ]
+    assert error.provider_attempts[1]["status"] == "CONFIGURATION_ERROR"
+    assert error.provider_attempts[1]["classification"] == "configuration"
+    assert "API key for fallback AI provider 'openai' is not configured" in error.provider_attempts[1]["error"]
+    assert error_reporting.exception_summary(error) == "Primary service error"
 
 
 @pytest.mark.asyncio

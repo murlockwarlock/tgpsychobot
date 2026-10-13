@@ -391,7 +391,13 @@ from universal_tests import (
 )
 
 from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
-from ai_retry_policy import is_retryable_ai_error, claim_retry_token, unclaim_retry_token
+from ai_retry_policy import (
+    is_retryable_ai_error,
+    claim_retry_token,
+    unclaim_retry_token,
+    is_retry_token_claimed,
+    validate_terminal_failure_retry_eligibility,
+)
 
 router = Router()
 
@@ -651,6 +657,12 @@ def _claim_ai_button_message(callback: CallbackQuery) -> bool:
     while len(_ai_button_claims) > _AI_BUTTON_CLAIMS_MAX:
         _ai_button_claims.popitem(last=False)
     return True
+
+
+def _unclaim_ai_button_message(callback: CallbackQuery) -> None:
+    identity = _ai_button_message_identity(callback)
+    if identity is not None:
+        _ai_button_claims.pop(identity, None)
 
 
 def _resolve_ai_button_label(callback: CallbackQuery, callback_data: str) -> str | None:
@@ -3371,48 +3383,39 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
     user_id = callback.from_user.id
 
     async with async_session_maker() as session:
-        failed_log = await session.get(AILog, failed_log_id)
         user = await session.get(User, user_id)
+        if not user:
+            await callback.answer()
+            return
 
-    if not failed_log or not user or failed_log.user_id != user_id:
-        await callback.answer()
-        return
-
-    if (
-        (failed_log.platform or "").lower() not in {"telegram", ""}
-        or failed_log.request_type != "chat"
-        or failed_log.status != "error"
-        or not (failed_log.prompt_summary and failed_log.prompt_summary.strip())
-    ):
-        await callback.answer()
-        return
-
-    if failed_log.request_group_id:
-        async with async_session_maker() as session:
-            stmt = select(AILog.id).where(
-                AILog.request_group_id == failed_log.request_group_id,
-                AILog.status == "success",
-            ).limit(1)
-            has_success = (await session.scalar(stmt)) is not None
-            if has_success:
-                await _disable_ai_button_keyboard(callback)
-                await callback.answer()
-                return
-
-    if failed_log.dialogue_id != user.current_dialogue_id or failed_log.topic_id != user.current_topic_id:
-        await _disable_ai_button_keyboard(callback)
-        locale = await _get_user_locale(user_id)
-        await callback.answer(
-            translate(
-                "ui.ai.retry_stale",
-                locale,
-                fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
-            ),
-            show_alert=True,
+        eligible, reason, terminal_row = await validate_terminal_failure_retry_eligibility(
+            session,
+            platform="telegram",
+            user_id=user_id,
+            failed_log_id=failed_log_id,
+            expected_dialogue_id=user.current_dialogue_id,
+            expected_topic_id=user.current_topic_id,
         )
+
+    if not eligible:
+        if reason in {"stale_dialogue", "stale_topic"}:
+            await _disable_ai_button_keyboard(callback)
+            locale = await _get_user_locale(user_id)
+            await callback.answer(
+                translate(
+                    "ui.ai.retry_stale",
+                    locale,
+                    fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
+                ),
+                show_alert=True,
+            )
+            return
+        await _disable_ai_button_keyboard(callback)
+        await callback.answer()
         return
 
-    if not _claim_ai_button_message(callback) or not claim_retry_token("telegram", failed_log_id):
+    identity = _ai_button_message_identity(callback)
+    if (identity is not None and identity in _ai_button_claims) or is_retry_token_claimed("telegram", failed_log_id):
         await _disable_ai_button_keyboard(callback)
         locale = await _get_user_locale(user_id)
         await callback.answer(
@@ -3424,19 +3427,50 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
         )
         return
 
+    prompt_to_retry = terminal_row.prompt_summary
     busy = False
+
     async with _get_user_scheduling_lock(user_id):
+        if (identity is not None and identity in _ai_button_claims) or is_retry_token_claimed("telegram", failed_log_id):
+            await _disable_ai_button_keyboard(callback)
+            locale = await _get_user_locale(user_id)
+            await callback.answer(
+                translate(
+                    "ui.ai.retry_already_used",
+                    locale,
+                    fallback="Этот запрос уже был отправлен на повторную обработку.",
+                ),
+            )
+            return
+
         lease = single_flight.try_claim("telegram", user_id)
         if lease is None:
             busy = True
         else:
+            if not _claim_ai_button_message(callback) or not claim_retry_token("telegram", failed_log_id):
+                _unclaim_ai_button_message(callback)
+                unclaim_retry_token("telegram", failed_log_id)
+                single_flight.release(lease)
+                await _disable_ai_button_keyboard(callback)
+                locale = await _get_user_locale(user_id)
+                await callback.answer(
+                    translate(
+                        "ui.ai.retry_already_used",
+                        locale,
+                        fallback="Этот запрос уже был отправлен на повторную обработку.",
+                    ),
+                )
+                return
+
             try:
                 if user_id not in user_message_buffers:
                     user_message_buffers[user_id] = []
-                user_message_buffers[user_id].append(failed_log.prompt_summary)
+                user_message_buffers[user_id].append(prompt_to_retry)
                 user_message_buffer_leases[user_id] = lease
                 _ensure_telegram_drain_runner(user_id, bot, state, initial_delay=0.0)
             except BaseException:
+                _unclaim_ai_button_message(callback)
+                unclaim_retry_token("telegram", failed_log_id)
                 user_message_buffer_leases.pop(user_id, None)
                 if user_id in user_message_buffers:
                     user_message_buffers[user_id].pop()
@@ -3446,7 +3480,6 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
                 raise
 
     if busy:
-        unclaim_retry_token("telegram", failed_log_id)
         locale = await _get_user_locale(user_id)
         await callback.answer(
             translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE),
