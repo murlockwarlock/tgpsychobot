@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import mimetypes
+import os
 import random
 import re
 import time
@@ -30,12 +31,97 @@ from provider_models import (
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ProviderNetworkRoute:
+    proxy_url: str | None
+    proxy_source: str
+    is_proxied: bool
+
+
+def redact_proxy_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        if parts.username or parts.password:
+            hostname = parts.hostname or ""
+            port = f":{parts.port}" if parts.port else ""
+            netloc = f"***:***@{hostname}{port}"
+            return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        return url
+    except Exception:
+        return "<redacted_proxy_url>"
+
+
+def resolve_provider_network_route(provider: str) -> ProviderNetworkRoute:
+    norm = provider.strip().lower()
+    if norm in ("openrouter", "open_router"):
+        for var_name in ("OPENROUTER_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
+            raw = os.getenv(var_name)
+            if raw and raw.strip():
+                clean = raw.strip().strip('"').strip("'")
+                if clean:
+                    return ProviderNetworkRoute(proxy_url=clean, proxy_source=var_name, is_proxied=True)
+        return ProviderNetworkRoute(proxy_url=None, proxy_source="direct", is_proxied=False)
+
+    if norm == "perplexity":
+        val = os.getenv("PERPLEXITY_PROXY")
+        if val and val.strip():
+            clean = val.strip().strip('"').strip("'")
+            if clean:
+                return ProviderNetworkRoute(proxy_url=clean, proxy_source="PERPLEXITY_PROXY", is_proxied=True)
+        return ProviderNetworkRoute(proxy_url=None, proxy_source="direct", is_proxied=False)
+
+    if norm == "deepgram":
+        val = os.getenv("DEEPGRAM_PROXY")
+        if val and val.strip():
+            clean = val.strip().strip('"').strip("'")
+            if clean:
+                return ProviderNetworkRoute(proxy_url=clean, proxy_source="DEEPGRAM_PROXY", is_proxied=True)
+        return ProviderNetworkRoute(proxy_url=None, proxy_source="direct", is_proxied=False)
+
+    return ProviderNetworkRoute(proxy_url=None, proxy_source="direct", is_proxied=False)
+
+
+def build_provider_http_client(
+    provider: str,
+    *,
+    timeout: float,
+    route: ProviderNetworkRoute | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[httpx.AsyncClient, ProviderNetworkRoute]:
+    effective_route = route or resolve_provider_network_route(provider)
+    if transport is not None:
+        client = httpx.AsyncClient(transport=transport, timeout=timeout, trust_env=False)
+        return client, effective_route
+    if effective_route.is_proxied and effective_route.proxy_url:
+        eff_transport = httpx.AsyncHTTPTransport(proxy=effective_route.proxy_url)
+        client = httpx.AsyncClient(transport=eff_transport, timeout=timeout, trust_env=False)
+        return client, effective_route
+    client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+    return client, effective_route
+
+
 class ProviderAdapterError(RuntimeError):
-    def __init__(self, message: str, *, status: int | None = None, category: str = "provider"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        category: str = "provider",
+        provider_error_message: str | None = None,
+        request_id: str | None = None,
+        proxy_used: bool | None = None,
+        proxy_source: str | None = None,
+    ):
         super().__init__(message)
         self.http_status = status
         self.classification = category
         self.category = category
+        self.provider_error_message = provider_error_message
+        self.request_id = request_id
+        self.proxy_used = proxy_used
+        self.proxy_source = proxy_source
 
 
 _ADAPTER_CLASSIFICATION_MAP = {
@@ -724,22 +810,84 @@ def _retryable_status(status: int) -> bool:
     return status in {408, 425, 429} or status >= 500
 
 
-def _status_category(status: int) -> str:
-    if status in {401, 403}:
-        return "auth"
-    if status == 402:
+def _extract_provider_error_message(data: Any, raw_text: str | None = None, max_len: int = 500) -> str:
+    err_msg = ""
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, str):
+            err_msg = err.strip()
+        elif isinstance(err, dict):
+            msg = err.get("message") or err.get("detail")
+            if msg:
+                err_msg = str(msg).strip()
+        if not err_msg:
+            msg = data.get("message") or data.get("detail")
+            if msg:
+                err_msg = str(msg).strip()
+    if not err_msg and raw_text:
+        cleaned = " ".join(str(raw_text).split())
+        if cleaned:
+            err_msg = cleaned[:max_len].strip()
+    if len(err_msg) > max_len:
+        err_msg = err_msg[:max_len].rstrip() + "..."
+    return err_msg
+
+
+def _classify_provider_http_error(
+    provider: str,
+    status: int,
+    data: Any = None,
+    raw_text: str = "",
+) -> str:
+    err_text = ""
+    err_type = ""
+    code = status
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, str):
+            err_text = err
+        elif isinstance(err, dict):
+            err_text = str(err.get("message") or "")
+            err_type = str(err.get("type") or "")
+            code = err.get("code") or status
+        if not err_text:
+            err_text = str(data.get("message") or data.get("detail") or "")
+    combined = f"{err_text} {raw_text}".lower()
+    err_type_lower = err_type.lower()
+
+    if status == 402 or _is_balance_quota_evidence(combined, err_type_lower, code):
         return "quota"
-    if status == 429:
+    if status == 401 or "invalid_api_key" in combined or "unauthorized" in err_type_lower:
+        return "auth"
+    if status == 403:
+        if any(k in combined for k in ("security policy", "cloudflare", "waf", "access denied", "blocked")):
+            return "provider_rejection"
+        if any(k in combined or k in err_type_lower for k in ("invalid_api_key", "unauthorized", "api_key", "authentication")):
+            return "auth"
+        if any(k in combined or k in err_type_lower for k in ("permission", "tier", "forbidden", "account")):
+            return "auth"
+        return "provider_rejection"
+    if status == 429 or "rate_limit" in err_type_lower:
+        if "quota" in combined or "credit" in combined:
+            return "quota"
         return "rate_limit"
     if status in {408, 425}:
         return "timeout"
     if status == 400:
+        if "model" in combined and any(k in combined for k in ("not found", "unknown", "invalid model", "does not exist")):
+            return "invalid_model"
+        if "max_output_tokens" in combined or "max_tokens" in combined:
+            return "invalid_model"
         return "invalid_request"
     if status == 404:
         return "invalid_model"
     if status >= 500:
         return "server_error"
     return "provider"
+
+
+def _status_category(status: int, data: Any = None, raw_text: str = "") -> str:
+    return _classify_provider_http_error("generic", status, data, raw_text)
 
 
 async def _post_json(
@@ -752,49 +900,140 @@ async def _post_json(
     request_capture: dict | None,
     activity_tracker: Any | None = None,
     retries: int = 1,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
     await _mark_activity(activity_tracker)
+    route = resolve_provider_network_route(provider)
     if request_capture is not None:
         _capture_ai_request(request_capture, provider=provider, endpoint=url, payload=_capture_payload(payload))
+        request_capture["proxy_used"] = route.is_proxied
+        request_capture["proxy_source"] = route.proxy_source
+        if route.is_proxied and route.proxy_url:
+            request_capture["proxy_url"] = redact_proxy_url(route.proxy_url)
+
     last_error: Exception | None = None
     deadline = time.monotonic() + max(float(timeout), 0.1)
     for attempt in range(retries + 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ProviderAdapterError(f"Таймаут обращения к {provider}", category="timeout") from last_error
+            raise ProviderAdapterError(
+                f"Таймаут обращения к {provider}",
+                category="timeout",
+                proxy_used=route.is_proxied,
+                proxy_source=route.proxy_source,
+            ) from last_error
         try:
-            async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
+            client, _ = build_provider_http_client(
+                provider,
+                timeout=remaining,
+                route=route,
+                transport=transport,
+            )
+            async with client:
                 response = await client.post(url, headers=headers, json=payload)
+
+            raw_text = response.text if hasattr(response, "text") else ""
             try:
                 data = response.json()
             except (TypeError, ValueError):
                 data = {}
+
+            error_msg = _extract_provider_error_message(data, raw_text)
+            category = _classify_provider_http_error(provider, response.status_code, data, raw_text)
+            resp_headers = getattr(response, "headers", None) or {}
+            req_id = resp_headers.get("x-request-id") or resp_headers.get("cf-ray")
+
             if response.status_code >= 400:
+                if error_msg:
+                    err_text = f"{provider} API вернул HTTP {response.status_code}: {error_msg}"
+                else:
+                    err_text = f"{provider} API вернул HTTP {response.status_code}"
                 error = ProviderAdapterError(
-                    f"{provider} API вернул HTTP {response.status_code}",
+                    err_text,
                     status=response.status_code,
-                    category=_status_category(response.status_code),
+                    category=category,
+                    provider_error_message=error_msg or None,
+                    request_id=req_id,
+                    proxy_used=route.is_proxied,
+                    proxy_source=route.proxy_source,
                 )
+                if request_capture is not None:
+                    request_capture["http_status"] = response.status_code
+                    request_capture["classification"] = normalize_provider_error_classification(category)
+                    if error_msg:
+                        request_capture["provider_error_message"] = error_msg
+                    if req_id:
+                        request_capture["request_id"] = req_id
                 if _retryable_status(response.status_code) and attempt < retries:
                     await asyncio.sleep(0)
                     continue
                 raise error
+
             if not isinstance(data, dict):
-                raise ProviderAdapterError(f"{provider} вернул некорректный JSON", status=response.status_code, category="malformed_response")
+                raise ProviderAdapterError(
+                    f"{provider} вернул некорректный JSON",
+                    status=response.status_code,
+                    category="malformed_response",
+                    proxy_used=route.is_proxied,
+                    proxy_source=route.proxy_source,
+                )
             if request_capture is not None:
                 request_capture["http_status"] = response.status_code
+                request_capture["classification"] = "success"
+                if req_id:
+                    request_capture["request_id"] = req_id
             return data
         except ProviderAdapterError:
             raise
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_error = exc
+            is_proxy_err = isinstance(exc, getattr(httpx, "ProxyError", ()))
+            # If explicit proxy was configured and proxy failed, fail closed immediately
+            if route.is_proxied and is_proxy_err:
+                cat = "network"
+                if request_capture is not None:
+                    request_capture["classification"] = normalize_provider_error_classification(cat)
+                    request_capture["provider_error_message"] = str(exc)
+                raise ProviderAdapterError(
+                    f"Ошибка прокси {provider}: {exc}",
+                    category=cat,
+                    provider_error_message=str(exc),
+                    proxy_used=route.is_proxied,
+                    proxy_source=route.proxy_source,
+                ) from exc
+
             if attempt < retries:
                 await asyncio.sleep(0)
                 continue
-            raise ProviderAdapterError(f"Ошибка сети {provider}", category="network") from exc
+            cat = "timeout" if isinstance(exc, httpx.TimeoutException) else "network"
+            msg = f"Таймаут обращения к {provider}" if isinstance(exc, httpx.TimeoutException) else f"Ошибка сети {provider}"
+            if request_capture is not None:
+                request_capture["classification"] = normalize_provider_error_classification(cat)
+                request_capture["provider_error_message"] = str(exc)
+            raise ProviderAdapterError(
+                msg,
+                category=cat,
+                provider_error_message=str(exc),
+                proxy_used=route.is_proxied,
+                proxy_source=route.proxy_source,
+            ) from exc
         except (OSError, TypeError, ValueError) as exc:
-            raise ProviderAdapterError(f"Ошибка ответа {provider}", category="provider") from exc
-    raise ProviderAdapterError(f"Ошибка обращения к {provider}", category="provider") from last_error
+            if request_capture is not None:
+                request_capture["classification"] = "provider"
+                request_capture["provider_error_message"] = str(exc)
+            raise ProviderAdapterError(
+                f"Ошибка ответа {provider}",
+                category="provider",
+                provider_error_message=str(exc),
+                proxy_used=route.is_proxied,
+                proxy_source=route.proxy_source,
+            ) from exc
+    raise ProviderAdapterError(
+        f"Ошибка обращения к {provider}",
+        category="provider",
+        proxy_used=route.is_proxied,
+        proxy_source=route.proxy_source,
+    ) from last_error
 
 
 async def call_openrouter(
@@ -807,6 +1046,7 @@ async def call_openrouter(
     timeout: float = 60.0,
     request_capture: dict | None = None,
     activity_tracker: Any | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> str:
     if not api_key:
         raise ProviderAdapterError("API ключ OpenRouter не задан", category="auth")
@@ -819,6 +1059,7 @@ async def call_openrouter(
         provider="OpenRouter",
         request_capture=request_capture,
         activity_tracker=activity_tracker,
+        transport=transport,
     )
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -881,7 +1122,14 @@ async def _post_perplexity_json(
                 )
             raise ProviderAdapterError("Таймаут обращения к Perplexity", category="timeout") from last_error
         try:
-            async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
+            route = resolve_provider_network_route("Perplexity")
+            if request_capture is not None and "proxy_used" not in request_capture:
+                request_capture["proxy_used"] = route.is_proxied
+                request_capture["proxy_source"] = route.proxy_source
+                if route.is_proxied and route.proxy_url:
+                    request_capture["proxy_url"] = redact_proxy_url(route.proxy_url)
+            client, _ = build_provider_http_client("Perplexity", timeout=remaining, route=route)
+            async with client:
                 response = await client.post(url, headers=headers, json=payload)
             try:
                 data = response.json()
@@ -1109,8 +1357,15 @@ async def call_deepgram(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ProviderAdapterError("Таймаут обращения к Deepgram", category="timeout") from last_error
+        route = resolve_provider_network_route("Deepgram")
+        if request_capture is not None and "proxy_used" not in request_capture:
+            request_capture["proxy_used"] = route.is_proxied
+            request_capture["proxy_source"] = route.proxy_source
+            if route.is_proxied and route.proxy_url:
+                request_capture["proxy_url"] = redact_proxy_url(route.proxy_url)
         try:
-            async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
+            client, _ = build_provider_http_client("Deepgram", timeout=remaining, route=route)
+            async with client:
                 response = await client.post(
                     endpoint,
                     headers={"Authorization": f"Token {api_key}", "Content-Type": mime_type},
@@ -1151,8 +1406,13 @@ async def call_deepgram(
     raise ProviderAdapterError("Ошибка обращения к Deepgram", category="provider") from last_error
 
 
-async def verify_openrouter_catalog(timeout: float = 20.0) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+async def verify_openrouter_catalog(
+    timeout: float = 20.0,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    client, _ = build_provider_http_client("OpenRouter", timeout=timeout, transport=transport)
+    async with client:
         response = await client.get("https://openrouter.ai/api/v1/models")
     if response.status_code != 200:
         raise ProviderAdapterError("OpenRouter catalog unavailable", status=response.status_code, category="provider")

@@ -2,6 +2,9 @@ const PM2_LOG_DIR = `${process.env.PM2_HOME || "/root/.pm2"}/logs`;
 const GEMINI_PROXY = process.env.GEMINI_PROXY || "";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "";
 const DEEPSEEK_PROXY = process.env.DEEPSEEK_PROXY || "";
+const OPENROUTER_PROXY = process.env.OPENROUTER_PROXY || "";
+const PERPLEXITY_PROXY = process.env.PERPLEXITY_PROXY || "";
+const DEEPGRAM_PROXY = process.env.DEEPGRAM_PROXY || "";
 const TELEGRAM_PROXY = process.env.TELEGRAM_PROXY || "";
 const HTTPS_PROXY = process.env.HTTPS_PROXY || "";
 const HTTP_PROXY = process.env.HTTP_PROXY || "";
@@ -331,6 +334,15 @@ apps.forEach(app => {
   }
   if (DEEPSEEK_PROXY) {
     app.env.DEEPSEEK_PROXY = DEEPSEEK_PROXY;
+  }
+  if (OPENROUTER_PROXY) {
+    app.env.OPENROUTER_PROXY = OPENROUTER_PROXY;
+  }
+  if (PERPLEXITY_PROXY) {
+    app.env.PERPLEXITY_PROXY = PERPLEXITY_PROXY;
+  }
+  if (DEEPGRAM_PROXY) {
+    app.env.DEEPGRAM_PROXY = DEEPGRAM_PROXY;
   }
   if (TELEGRAM_PROXY) {
     app.env.TELEGRAM_PROXY = TELEGRAM_PROXY;
