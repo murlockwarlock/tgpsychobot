@@ -147,6 +147,14 @@ def _wrap_provider_adapter_error(exc: ProviderAdapterError) -> AIServiceError:
     error.http_status = getattr(exc, "http_status", None)
     if getattr(exc, "provider_response_payload", None) is not None:
         error.provider_response_payload = exc.provider_response_payload
+    if getattr(exc, "provider_error_message", None) is not None:
+        error.provider_error_message = exc.provider_error_message
+    if getattr(exc, "request_id", None) is not None:
+        error.request_id = exc.request_id
+    if getattr(exc, "proxy_used", None) is not None:
+        error.proxy_used = exc.proxy_used
+    if getattr(exc, "proxy_source", None) is not None:
+        error.proxy_source = exc.proxy_source
     return error
 
 
