@@ -293,7 +293,7 @@ async def test_max_handle_update_journey(session_factory, media_setup, monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('platform', ['telegram', 'max'])
+@pytest.mark.parametrize('platform', ['telegram', 'max', 'max_hidden'])
 @pytest.mark.parametrize('other', ['[START_TEST]', 'RUN_TEST', '[SHOW_IMG: portrait]', '[SEND_AUDIO: audio]', '[RANDOM_IMG: cards]', '[CHOICE_IMG: cards | 2]', '[CHOICE_IMG_HIDDEN: cards | 2]', 'GEN_IMG: [blue sky]', 'EDIT_IMG: change uploaded image'])
 async def test_mixed_directives_fail_closed(session_factory, media_setup, monkeypatch, platform, other):
     import media_image_edit
@@ -330,7 +330,10 @@ async def test_mixed_directives_fail_closed(session_factory, media_setup, monkey
         monkeypatch.setattr(max_ai, '_edit_kie', edit)
         client = MaxTransport()
         application = max_app.MaxBotApplication(client)
-        await application.handle_update({'update_type': 'message_created', 'update_id': 'mixed', 'message': {'sender': {'user_id': 7, 'name': 'Max'}, 'recipient': {'chat_id': 100}, 'body': {'mid': 'mixed-incoming', 'text': 'Измени портрет'}}})
+        if platform == 'max_hidden':
+            await common.run_hidden_ai_kickoff(client, 100, 100000000007, 'Измени портрет', expected_dialogue_id=1, expected_topic_id=1, states=application.states)
+        else:
+            await application.handle_update({'update_type': 'message_created', 'update_id': 'mixed', 'message': {'sender': {'user_id': 7, 'name': 'Max'}, 'recipient': {'chat_id': 100}, 'body': {'mid': 'mixed-incoming', 'text': 'Измени портрет'}}})
         if application.background_tasks:
             await asyncio.gather(*list(application.background_tasks))
         assert client.uploads == []

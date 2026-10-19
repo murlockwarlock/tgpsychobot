@@ -1267,11 +1267,11 @@ async def run_hidden_ai_kickoff(
                         pass
                 return
 
-        should_start_test, response_without_test_directive = extract_test_start_directive(response_text)
-        if await _deliver_media_edit(client, chat_id, user_id, response_without_test_directive, expected_dialogue_id, expected_topic_id):
+        if await _deliver_media_edit(client, chat_id, user_id, response_text, expected_dialogue_id, expected_topic_id):
             if thinking_message_id:
                 await client.delete_message(thinking_message_id)
             return
+        should_start_test, response_without_test_directive = extract_test_start_directive(response_text)
         await save_ai_message(user_id, response_without_test_directive, dialogue_id=expected_dialogue_id, topic_id=expected_topic_id)
 
         if should_start_test:
