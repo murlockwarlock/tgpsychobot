@@ -376,7 +376,8 @@ class MaxApiClient:
                         return await resp.read()
                     log.warning("MAX attachment direct download failed status=%s url=%s", resp.status, url)
 
-        result = await self._request("GET", f"/uploads/{token}")
+        from urllib.parse import quote
+        result = await self._request("GET", f"/uploads/{quote(token, safe='')}")
         download_url = result.get("url") or result.get("download_url")
         if download_url:
             async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=60)) as http:

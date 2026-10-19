@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.methods import GetFile, SendPhoto, SendMessage
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Chat, File, Message, PhotoSize, Update, User as TelegramUser
 from sqlalchemy import select
 from sqlalchemy import text
@@ -110,11 +111,14 @@ async def media_setup(session_factory, setup_tg_user, monkeypatch):
             MediaLibrary(id=20, file_id='other-source', file_name='foreign', media_type='photo', source_platform='telegram'),
             MediaLibrary(id=30, file_id='audio', file_name='audio', media_type='audio'),
             MediaLibrary(id=40, file_id='max-source', file_name='max-portrait', media_type='photo', source_platform='max', source_url='https://img.oneme.ru/source.jpg'),
+            MediaLibrary(id=41, file_id='max-token-only', file_name='max-token', media_type='photo', source_platform='max'),
+            MediaLibrary(id=42, file_id='legacy-max-source', file_name='legacy-max', media_type='photo'),
         ])
         await session.flush()
         await session.execute(topic_collection_association.insert(), [{'topic_id': 1, 'collection_id': 1}, {'topic_id': 2, 'collection_id': 2}])
         await session.execute(main_dialogue_collection_association.insert().values(collection_id=1))
         await session.execute(media_collection_items.insert(), [{'collection_id': 1, 'media_id': 10}, {'collection_id': 2, 'media_id': 20}, {'collection_id': 1, 'media_id': 30}, {'collection_id': 1, 'media_id': 40}])
+        await session.execute(media_collection_items.insert(), [{'collection_id':1,'media_id':41},{'collection_id':1,'media_id':42}])
         user = await session.get(User, setup_tg_user)
         user.current_topic_id = 1
         session.add(User(id=100000000007, name='Max', first_name='Max', gender='male', age='25', accepted_disclaimer=True, current_dialogue_id=1, current_topic_id=1))
@@ -143,6 +147,8 @@ class TelegramTransport(ValidatingTelegramSession):
         type(method).model_validate(method.model_dump())
         if isinstance(method, GetFile):
             self.calls.append(method)
+            if method.file_id == 'legacy-max-source':
+                raise TelegramBadRequest(method=method,message='wrong file identifier/HTTP URL specified')
             assert method.file_id == 'telegram-source'
             return File(file_id=method.file_id, file_unique_id='unique', file_path='photos/source.jpg')
         return await super().make_request(bot, method, timeout)
@@ -187,10 +193,15 @@ async def test_telegram_dispatcher_journey(session_factory, media_setup, monkeyp
             assert photos[0].photo.data == b'edited-output'
         assert edits == ([('seedream/4.5-edit', 'make the sky blue', b'original-telegram-image')] if media_id == 10 and not download_failure else [])
         assert all('EDIT_IMG_MEDIA' not in (getattr(call, 'text', '') or '') for call in transport.calls)
+        if stale:
+            assert not any('Вот вариант' in (getattr(call,'text','') or '') for call in transport.calls)
         assert await dispatcher.fsm.get_context(bot=bot, chat_id=media_setup, user_id=media_setup).get_state() is None
         async with session_factory() as session:
             history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == media_setup, DBMessage.role == 'assistant'))).all()
             assert bool(history) is (not stale)
+            if history and (media_id != 10 or download_failure):
+                assert '[Изображение]' not in history[0].content
+                assert 'недоступно' in history[0].content or 'Не удалось' in history[0].content
     finally:
         dispatcher.sub_routers.clear()
         handlers.router._parent_router = None
@@ -212,13 +223,18 @@ class MaxTransport(MaxApiClient):
         self.sources.append(url)
         return b'original-max-image'
 
+    async def download_attachment(self, token, url=None):
+        assert token in ('max-token-only','legacy-max-source')
+        self.sources.append(token)
+        return b'original-max-image'
+
     async def upload_file(self, media_type, path):
         self.uploads.append((media_type, Path(path).read_bytes()))
         return {'token': 'edited-token'}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('media_id,stale', [(10,False),(40,False),(20,False),(30,False),(999,False),(40,True)])
+@pytest.mark.parametrize('media_id,stale', [(10,False),(40,False),(41,False),(42,False),(20,False),(30,False),(999,False),(40,True)])
 async def test_max_handle_update_journey(session_factory, media_setup, monkeypatch, media_id, stale):
     import telegram_client
     monkeypatch.setattr(telegram_client,'create_telegram_bot',lambda token: Bot('123456:TEST_BOT_TOKEN',session=TelegramTransport()))
@@ -249,14 +265,16 @@ async def test_max_handle_update_journey(session_factory, media_setup, monkeypat
     assert all(command not in prompt for command in ('SEND_AUDIO','RANDOM_IMG','CHOICE_IMG','SHOW_IMG'))
     attachments = [kwargs['json_data']['attachments'] for method,path,kwargs in client.wire if method == 'POST' and kwargs.get('json_data', {}).get('attachments')]
     image_payloads = [item for group in attachments for item in group if item['type'] == 'image']
-    assert image_payloads == ([{'type':'image','payload':{'token':'edited-token'}}] if media_id in (10,40) and not stale else [])
+    assert image_payloads == ([{'type':'image','payload':{'token':'edited-token'}}] if media_id in (10,40,41,42) and not stale else [])
     expected_source = b'original-telegram-image' if media_id == 10 else b'original-max-image'
-    assert edits == ([('seedream/4.5-edit','make the sky blue',expected_source)] if media_id in (10,40) else [])
-    assert client.uploads == ([('image',b'edited-output')] if media_id in (10,40) and not stale else [])
+    assert edits == ([('seedream/4.5-edit','make the sky blue',expected_source)] if media_id in (10,40,41,42) else [])
+    assert client.uploads == ([('image',b'edited-output')] if media_id in (10,40,41,42) and not stale else [])
     assert all('EDIT_IMG_MEDIA' not in (kwargs.get('json_data', {}).get('text') or '') for _,_,kwargs in client.wire)
     async with session_factory() as session:
         history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == 100000000007, DBMessage.role == 'assistant'))).all()
-        assert bool(history) is (media_id in (10,40) and not stale)
+        assert bool(history) is (media_id in (10,40,41,42) and not stale)
+    if stale:
+        assert not any('Вот вариант' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)
 
 
 @pytest.mark.asyncio
@@ -343,7 +361,7 @@ async def test_max_stale_dialogue(session_factory, media_setup, monkeypatch, pha
     async def chat(*args,**kwargs):
         if phase == 'inference':
             await switch()
-        return '[EDIT_IMG_MEDIA: 40 | blue sky]'
+        return 'Вот вариант:\n[EDIT_IMG_MEDIA: 40 | blue sky]'
     async def download(url):
         if phase == 'download':
             await switch()
@@ -362,6 +380,7 @@ async def test_max_stale_dialogue(session_factory, media_setup, monkeypatch, pha
     monkeypatch.setattr(client,'upload_file',upload)
     await common.run_ai_dialogue(client,100,100000000007,'Измени портрет')
     assert not any(item.get('type') == 'image' for _,_,kwargs in client.wire for item in kwargs.get('json_data',{}).get('attachments',[]))
+    assert not any('Вот вариант' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)
 
 
 @pytest.mark.asyncio
@@ -410,7 +429,7 @@ async def test_additive_migration_preserves_legacy_media(async_engine, media_set
         await connection.run_sync(_migrate_media_edit_sources)
         await connection.run_sync(_migrate_media_edit_sources)
         rows = (await connection.execute(text('SELECT id, file_id, source_platform, source_url, source_image_bytes FROM media_library ORDER BY id'))).all()
-        assert rows == [(10,'telegram-source',None,None,None),(20,'other-source',None,None,None),(30,'audio',None,None,None),(40,'max-source',None,None,None)]
+        assert rows == [(10,'telegram-source',None,None,None),(20,'other-source',None,None,None),(30,'audio',None,None,None),(40,'max-source',None,None,None),(41,'max-token-only',None,None,None),(42,'legacy-max-source',None,None,None)]
 
 
 @pytest.mark.asyncio
@@ -435,3 +454,40 @@ async def test_edit_sources_preserve_text_history_dedup(session_factory,media_se
         from ai_request_context import build_openai_chat_messages
         messages = build_openai_chat_messages(layout)
         assert [message['content'] for message in messages if message['role'] == 'user'] == ['Повтор']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('platform,error_kind',[(None,'network'),(None,'invalid_id'),('telegram','invalid_id'),('max','unavailable')])
+async def test_unavailable_source_never_guesses_success(platform,error_kind):
+    media = SimpleNamespace(source_platform=platform,source_url=None,source_image_bytes=None,file_id='opaque-token')
+    error = TelegramBadRequest(method=GetFile(file_id='opaque-token'),message='wrong file identifier') if error_kind == 'invalid_id' else RuntimeError('network unavailable')
+    bot = SimpleNamespace(get_file=AsyncMock(side_effect=error))
+    client = SimpleNamespace(download_attachment=AsyncMock(side_effect=RuntimeError('MAX cannot resolve token')))
+    with pytest.raises(MediaSourceError):
+        await load_media_image_bytes(media,telegram_bot=bot,max_client=client)
+    assert client.download_attachment.await_count == int(platform == 'max' or (platform is None and error_kind == 'invalid_id'))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase',['edit','upload'])
+async def test_scope_revoked_during_media_work(session_factory,media_setup,monkeypatch,phase):
+    from sqlalchemy import delete
+    client = MaxTransport()
+    async def revoke():
+        async with session_factory() as session:
+            await session.execute(delete(topic_collection_association).where(topic_collection_association.c.topic_id == 1))
+            await session.commit()
+    async def edit(*args):
+        if phase == 'edit':
+            await revoke()
+        return b'edited'
+    async def upload(*args):
+        if phase == 'upload':
+            await revoke()
+        return {'token':'edited-token'}
+    monkeypatch.setattr(max_ai,'_dispatch_provider',AsyncMock(return_value='Вот вариант:\n[EDIT_IMG_MEDIA: 40 | blue sky]'))
+    monkeypatch.setattr(max_ai,'_edit_kie',edit)
+    monkeypatch.setattr(client,'upload_file',upload)
+    await common.run_ai_dialogue(client,100,100000000007,'Измени портрет')
+    assert not any(item.get('type') == 'image' for _,_,kwargs in client.wire for item in kwargs.get('json_data',{}).get('attachments',[]))
+    assert not any('Вот вариант' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)

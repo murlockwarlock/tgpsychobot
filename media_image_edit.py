@@ -4,6 +4,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from aiogram.exceptions import TelegramBadRequest
+
 from sqlalchemy import select
 from sqlalchemy.orm import undefer
 
@@ -58,21 +60,40 @@ async def media_edit_context_is_current(session_factory, user_id, dialogue_id, t
 
 
 async def load_media_image_bytes(media, *, telegram_bot=None, max_client=None) -> bytes:
+    async def load_max():
+        async def download(client):
+            if media.source_url:
+                return await client.download_attachment_url(media.source_url)
+            return await client.download_attachment(media.file_id)
+
+        if max_client is not None:
+            return await download(max_client)
+        from max_messenger_bot.api import MaxApiClient
+        from max_messenger_bot.settings import get_settings
+        settings = get_settings()
+        if not settings.max_token:
+            raise MediaSourceError("Источник изображения недоступен.")
+        async with MaxApiClient(settings.max_token, settings.max_api_base) as client:
+            return await download(client)
+
+    async def load_telegram(bot):
+        try:
+            file = await bot.get_file(media.file_id)
+        except TelegramBadRequest as exc:
+            invalid_id = any(value in str(exc).lower() for value in ('wrong file identifier', 'wrong remote file identifier', 'invalid file_id'))
+            if media.source_platform is None and invalid_id:
+                return await load_max()
+            raise
+        downloaded = await bot.download_file(file.file_path)
+        return downloaded.read()
+
     try:
         platform = media.source_platform
         if platform == "max":
             if getattr(media, 'source_image_bytes', None):
-                return media.source_image_bytes
-            if not media.source_url:
-                raise MediaSourceError("Источник изображения недоступен. Обновите файл в медиатеке.")
-            if max_client is None:
-                from max_messenger_bot.api import MaxApiClient
-                from max_messenger_bot.settings import get_settings
-                settings = get_settings()
-                async with MaxApiClient(settings.max_token, settings.max_api_base) as client:
-                    content = await client.download_attachment_url(media.source_url)
+                content = media.source_image_bytes
             else:
-                content = await max_client.download_attachment_url(media.source_url)
+                content = await load_max()
         elif platform in (None, "telegram"):
             if telegram_bot is None:
                 from telegram_client import create_telegram_bot
@@ -80,12 +101,9 @@ async def load_media_image_bytes(media, *, telegram_bot=None, max_client=None) -
                 if not token:
                     raise MediaSourceError("Источник изображения недоступен.")
                 async with create_telegram_bot(token) as bot:
-                    file = await bot.get_file(media.file_id)
-                    downloaded = await bot.download_file(file.file_path)
+                    content = await load_telegram(bot)
             else:
-                file = await telegram_bot.get_file(media.file_id)
-                downloaded = await telegram_bot.download_file(file.file_path)
-            content = downloaded.read()
+                content = await load_telegram(telegram_bot)
         else:
             raise MediaSourceError("Источник изображения недоступен.")
         if not isinstance(content, bytes) or not content:
