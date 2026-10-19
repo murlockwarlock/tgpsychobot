@@ -876,6 +876,46 @@ async def test_429_retry_policy_rate_limit_vs_quota():
     assert capture_i["will_retry"] is False
 
 
+@pytest.mark.asyncio
+async def test_429_credits_exhausted_without_typed_code_stops_after_one_physical_call():
+    url = "https://api.perplexity.ai/v1/agent"
+    payload = {"model": "sonar-pro", "input": "test"}
+    calls = 0
+    capture = {}
+
+    def mock_credits_exhausted(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429,
+            headers={"x-request-id": "ppx-credit-429", "retry-after": "0"},
+            json={"error": {"message": "credits exhausted"}},
+        )
+
+    with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_credits_exhausted))), \
+         patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(ProviderAdapterError) as exc_info:
+            await _post_perplexity_json(
+                url,
+                headers={"Authorization": "Bearer TEST_KEY"},
+                payload=payload,
+                timeout=5.0,
+                request_capture=capture,
+                max_attempts=2,
+            )
+
+    failure = exc_info.value.failure
+    assert calls == 1
+    assert exc_info.value.category == "insufficient_balance_quota"
+    assert failure.classification == "insufficient_balance_quota"
+    assert failure.retryable is False
+    assert failure.operator_action_required is True
+    assert failure.request_id == "ppx-credit-429"
+    assert capture["classification"] == "insufficient_balance_quota"
+    assert capture["is_retryable"] is False
+    assert capture["will_retry"] is False
+
+
 # ---------------------------------------------------------------------------
 # 7. Table-Driven Error Classification with Realistic Full Bodies
 # ---------------------------------------------------------------------------

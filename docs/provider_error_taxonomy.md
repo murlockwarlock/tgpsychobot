@@ -70,6 +70,7 @@ KIE body codes and OpenRouter embedded codes do not overwrite it.
 | DeepSeek / chat | 401; 402 | error fields | auth; insufficient_balance_quota | P | no/no | — | operator |
 | DeepSeek / chat | 429; 500; 503 | error fields | rate_limit; provider_5xx; provider_overloaded | T | bounded/yes | yes | wait |
 | OpenRouter / chat+vision | any, including 200; context_length_exceeded, string_too_long | error.metadata.error_type | context_limit | P | no/no | — | change |
+| OpenRouter / chat+vision | HTTP 200 with recognized numeric `error.code` 401, 402, 429, 500, 503 when `metadata.error_type` is absent or unrecognized | error.code, error.message | auth; insufficient_balance_quota; rate_limit; provider_5xx / numeric code | conditional | bounded/yes for transient codes; no/no for account codes | yes for transient | wait/operator |
 | OpenRouter / chat+vision | max_tokens_exceeded; token_limit_exceeded | error.metadata.error_type | output_budget_exhausted; context_limit | P | no/no | — | change |
 | OpenRouter / chat+vision | authentication; permission_denied; payment_required | error.metadata.error_type | auth; permission; insufficient_balance_quota | P | no/no | — | operator |
 | OpenRouter / chat+vision | rate_limit_exceeded; provider_overloaded; provider_unavailable; server; timeout | error.metadata.error_type | rate_limit; provider_overloaded; provider_unavailable; provider_5xx; timeout | T | bounded/yes | yes | wait |
@@ -89,6 +90,8 @@ KIE body codes and OpenRouter embedded codes do not overwrite it.
 | Deepgram / listen | 402 ASR_PAYMENT_REQUIRED; 422 ASR_UNPROCESSABLE_ENTITY; corrupt audio 400 | same | insufficient_balance_quota; invalid_request | P | no/no | — | operator/change |
 | Deepgram / listen | 429 TOO_MANY_REQUESTS; 408; 500/502/503/504 | same | rate_limit; timeout; provider_5xx/provider_unavailable/timeout | T | bounded/no voice button | yes | wait |
 | Perplexity / agent | HTTP errors; ErrorInfo | error.type/code/message, x-request-id | defensive typed mapping before HTTP fallback; unknown type is unknown | conditional | bounded only safe stages | yes | code-dependent |
+| Perplexity / agent | HTTP 429 with explicit credit, balance, billing, spend-limit or quota-exhaustion message | error.message, error.type/code | insufficient_balance_quota / billing_or_credit_exhaustion | P | no/no | — | operator/reset |
+| Perplexity / agent | HTTP 429 without billing/credit evidence | error.type/code/message, Retry-After | rate_limit / provider code | T | bounded/yes | yes | wait |
 | Perplexity / agent | completed | status/output | success only if valid final text | — | no/no | — | — |
 | Perplexity / agent | failed | status/error | normalized ErrorInfo | conditional | no automatic paid replay | yes | code-dependent |
 | Perplexity / agent | incomplete | status, incomplete_details if supplied (defensive) | output_budget_exhausted for explicit max_output_tokens, otherwise invalid_response | P | no/no | — | change/investigate |

@@ -1,6 +1,7 @@
 import asyncio
 import os
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_BOT_TOKEN")
@@ -108,6 +109,30 @@ def test_openrouter_embedded_200_errors(error_type, expected, retryable):
     assert (failure.classification, failure.detail_code, failure.retryable) == (expected, error_type, retryable)
 
 
+@pytest.mark.parametrize(
+    ("code", "expected", "retryable"),
+    [
+        (401, "auth", False),
+        (402, "insufficient_balance_quota", False),
+        (429, "rate_limit", True),
+        (500, "provider_5xx", True),
+        (503, "provider_5xx", True),
+    ],
+)
+def test_openrouter_embedded_numeric_code_uses_provider_code_without_replacing_transport_status(code, expected, retryable):
+    failure = parse_provider_failure(
+        "OpenRouter",
+        200,
+        {"error": {"code": code, "message": "upstream unavailable"}},
+    )
+    assert failure is not None
+    assert failure.http_status == 200
+    assert failure.provider_error_code == str(code)
+    assert failure.classification == expected
+    assert failure.classification_source == "provider_structured"
+    assert failure.retryable is retryable
+
+
 def test_openrouter_choice_error_and_inflight_budget():
     choice = parse_provider_failure("OpenRouter", 200, {"choices": [{"finish_reason": "error", "error": {"metadata": {"error_type": "provider_overloaded"}}}]})
     assert choice.classification == "provider_overloaded"
@@ -150,6 +175,74 @@ def test_openrouter_adapter_rejects_http_200_structured_error_before_empty_respo
     assert error.failure.provider_error_type == "provider_overloaded"
     assert capture["classification"] == "provider_overloaded"
     assert capture["request_id"] == "or-request-123"
+
+
+def test_openrouter_embedded_numeric_transient_code_retries_through_real_adapter():
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={"error": {"code": 503, "message": "upstream unavailable"}},
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "recovered"}, "finish_reason": "stop"}]},
+        )
+
+    with patch("provider_adapters.asyncio.sleep", new=AsyncMock()):
+        result = asyncio.run(
+            call_openrouter(
+                "secret",
+                AIRequestLayout(current_user_content="hello"),
+                "openai/gpt-5.6-terra",
+                transport=httpx.MockTransport(handler),
+            )
+        )
+
+    assert result == "recovered"
+    assert calls == 2
+
+
+def test_perplexity_429_credits_exhausted_beats_generic_rate_limit():
+    failure = parse_provider_failure(
+        "Perplexity",
+        429,
+        {"error": {"message": "credits exhausted"}},
+    )
+    assert failure is not None
+    assert failure.classification == "insufficient_balance_quota"
+    assert failure.retryable is False
+    assert failure.operator_action_required is True
+    assert failure.classification_source == "message_fallback"
+
+
+def test_new_provider_failures_reach_shared_group_retry_evaluator():
+    openrouter = parse_provider_failure(
+        "OpenRouter",
+        200,
+        {"error": {"code": 503, "message": "upstream unavailable"}},
+    )
+    perplexity = parse_provider_failure(
+        "Perplexity",
+        429,
+        {"error": {"message": "credits exhausted"}},
+    )
+    assert evaluate_request_group_retryability([{
+        "status": "error",
+        "classification": openrouter.classification,
+        "retryable": openrouter.retryable,
+        "network_attempted": openrouter.network_attempted,
+    }]) is True
+    assert evaluate_request_group_retryability([{
+        "status": "error",
+        "classification": perplexity.classification,
+        "retryable": perplexity.retryable,
+        "network_attempted": perplexity.network_attempted,
+    }]) is False
 
 
 @pytest.mark.parametrize("code,expected", [(401, "auth"), (402, "insufficient_balance_quota"), (422, "invalid_request"), (429, "rate_limit"), (500, "provider_5xx")])

@@ -118,6 +118,20 @@ _CODE_GROUPS = {
 }
 CODE_CLASSES = {code: cls for cls, codes in _CODE_GROUPS.items() for code in codes.split()}
 OPENROUTER_TYPES = frozenset("context_length_exceeded max_tokens_exceeded token_limit_exceeded string_too_long authentication permission_denied payment_required rate_limit_exceeded provider_overloaded provider_unavailable invalid_request invalid_prompt not_found precondition_failed payload_too_large unprocessable content_policy_violation refusal invalid_image image_too_large image_too_small unsupported_image_format image_not_found image_download_failed server timeout unmapped".split())
+_OPENROUTER_HTTP_LIKE_CODES = frozenset({400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 501, 502, 503, 504})
+_BALANCE_QUOTA_MESSAGE_MARKERS = (
+    "credit balance",
+    "credits exhausted",
+    "exhausted your credits",
+    "insufficient credits",
+    "insufficient balance",
+    "billing",
+    "payment required",
+    "spend limit",
+    "quota exhausted",
+    "quota exceeded",
+    "insufficient quota",
+)
 
 
 def _sanitize_provider_metadata(value: Any, *, depth: int = 0) -> Any:
@@ -231,6 +245,15 @@ def parse_provider_failure(
         effective_status = int(code)
         classification = classification or _status_class(effective_status, name)
         signal = str(code)
+    if name == "openrouter" and classification in {None, "unknown"} and normalized_type != "unmapped":
+        try:
+            numeric_code = int(str(code).strip()) if code is not None else None
+        except (TypeError, ValueError):
+            numeric_code = None
+        if numeric_code in _OPENROUTER_HTTP_LIKE_CODES:
+            classification = _status_class(numeric_code, name)
+            signal = str(numeric_code)
+            source = "provider_structured"
     if classification is None:
         classification = "unknown" if kind and name == "openrouter" else _status_class(effective_status, name)
         source = "provider_structured" if kind and name == "openrouter" else "http_status_fallback"
@@ -270,6 +293,10 @@ def parse_provider_failure(
         )
     ):
         classification, signal, source = "configuration", "invalid_model_or_parameter", "message_fallback"
+    if name == "perplexity" and effective_status == 429 and any(
+        marker in lowered for marker in _BALANCE_QUOTA_MESSAGE_MARKERS
+    ):
+        classification, signal, source = "insufficient_balance_quota", "billing_or_credit_exhaustion", "message_fallback"
     if name == "perplexity" and effective_status == 404:
         classification, signal, source = "configuration", "not_found", "provider_structured"
     if name in {"claude", "anthropic"} and effective_status in {400, 429} and classification == "rate_limit" and any(

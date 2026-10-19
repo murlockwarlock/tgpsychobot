@@ -337,11 +337,17 @@ def _is_balance_quota_evidence(msg: str, err_type: str = "", code: Any = None) -
         "insufficient_quota",
         "insufficient_credits",
         "insufficient_balance",
+        "insufficient credits",
+        "insufficient balance",
         "out of credits",
         "credit balance",
+        "credits exhausted",
         "exhausted your credits",
         "balance too low",
         "quota exceeded",
+        "quota exhausted",
+        "spend limit",
+        "payment required",
         "billing",
     )
     if any(marker in combined for marker in balance_markers):
