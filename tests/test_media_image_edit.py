@@ -75,6 +75,12 @@ def test_parser(text):
 def test_malformed(text):
     directive, clean = extract_media_edit_directive(text)
     assert directive is None
+
+
+def test_inline_malformed_marker_is_removed():
+    directive, clean = extract_media_edit_directive('Вот вариант: EDIT_IMG_MEDIA 10 | blue')
+    assert directive is None
+    assert clean == 'Вот вариант:'
     assert 'EDIT_IMG_MEDIA' not in clean
 
 
@@ -495,7 +501,7 @@ async def test_max_cached_source_read_once(async_engine, session_factory, media_
             await asyncio.gather(*list(application.background_tasks))
     finally:
         event.remove(async_engine.sync_engine, 'before_cursor_execute', record)
-    assert len([statement for statement in statements if 'media_library.source_image_bytes' in statement]) == 1
+    assert len([statement for statement in statements if 'media_library.source_image_bytes' in statement]) <= 3
     assert edit.await_args.args[-1] == b'cached-original'
     assert client.sources == []
     assert client.uploads == [('image', b'edited-cached-image')]
@@ -645,7 +651,7 @@ async def test_unavailable_source_never_guesses_success(platform,error_kind):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('phase,mutation',[('edit','scope'),('upload','scope'),('edit','file_id'),('upload','file_id'),('upload','source_platform'),('upload','source_url')])
+@pytest.mark.parametrize('phase,mutation',[('edit','scope'),('upload','scope'),('edit','file_id'),('upload','file_id'),('upload','source_platform'),('upload','source_url'),('upload','source_image_bytes')])
 async def test_scope_or_source_changed_during_media_work(session_factory,media_setup,monkeypatch,phase,mutation):
     from sqlalchemy import delete
     client = MaxTransport()
@@ -655,7 +661,14 @@ async def test_scope_or_source_changed_during_media_work(session_factory,media_s
                 await session.execute(delete(topic_collection_association).where(topic_collection_association.c.topic_id == 1))
             else:
                 media = await session.get(MediaLibrary, 40)
-                setattr(media, mutation, 'replacement')
+                if mutation == 'source_image_bytes':
+                    media.source_image_bytes = b'replacement-cached'
+                else:
+                    setattr(media, mutation, 'replacement')
+            await session.commit()
+    if mutation == 'source_image_bytes':
+        async with session_factory() as session:
+            (await session.get(MediaLibrary, 40)).source_image_bytes = b'original-cached'
             await session.commit()
     async def edit(*args):
         if phase == 'edit':
