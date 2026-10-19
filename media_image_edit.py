@@ -11,6 +11,7 @@ from sqlalchemy.orm import undefer
 
 from database import AIConfig, MediaLibrary, User
 from media_scope import PHOTO_MEDIA_TYPES, load_media_scope
+from response_buttons import extract_test_start_directive
 
 
 class MediaSourceError(ValueError):
@@ -36,6 +37,16 @@ def extract_media_edit_directive(text: str) -> tuple[MediaEditDirective | None, 
             directive = MediaEditDirective(int(match[1]), match[2].strip())
     clean = pattern.sub("", text)
     clean = re.sub(r"(?im)^\s*EDIT_IMG_MEDIA\s*:.*$", "", clean)
+    if matches:
+        starts_test, without_test = extract_test_start_directive(clean)
+        other_commands = re.compile(
+            r"\[(?:SHOW_IMG|RANDOM_IMG|CHOICE_IMG(?:_HIDDEN)?|SEND_AUDIO|GEN_IMG|IMG|EDIT_IMG)\s*:[^\]]*(?:\]|$)"
+            r"|\b(?:GEN_IMG|EDIT_IMG)\s*:[^\n]*",
+            re.IGNORECASE,
+        )
+        if starts_test or other_commands.search(without_test):
+            directive = None
+            clean = other_commands.sub('', without_test)
     return directive, clean.strip()
 
 

@@ -293,6 +293,60 @@ async def test_max_handle_update_journey(session_factory, media_setup, monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('platform', ['telegram', 'max'])
+@pytest.mark.parametrize('other', ['[START_TEST]', 'RUN_TEST', '[SHOW_IMG: portrait]', '[SEND_AUDIO: audio]', '[RANDOM_IMG: cards]', '[CHOICE_IMG: cards | 2]', '[CHOICE_IMG_HIDDEN: cards | 2]', 'GEN_IMG: [blue sky]', 'EDIT_IMG: change uploaded image'])
+async def test_mixed_directives_fail_closed(session_factory, media_setup, monkeypatch, platform, other):
+    import media_image_edit
+    assert extract_media_edit_directive(other) == (None, other)
+    response = 'Вот вариант:\n[EDIT_IMG_MEDIA: 10 | make the sky blue]\n' + other
+    directive, clean = extract_media_edit_directive(response)
+    assert directive is None
+    assert clean.rstrip(':') == 'Вот вариант'
+    download = AsyncMock()
+    monkeypatch.setattr(media_image_edit, 'load_media_image_bytes', download)
+    edit = AsyncMock()
+    if platform == 'telegram':
+        monkeypatch.setattr(ai_integration, '_call_gemini_api', AsyncMock(return_value=response))
+        monkeypatch.setattr(ai_integration, '_call_kie_image_edit', edit)
+        transport = TelegramTransport()
+        bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+        handlers.router._parent_router = None
+        dispatcher = Dispatcher()
+        dispatcher.include_router(handlers.router)
+        try:
+            await dispatcher.feed_update(bot, Update(update_id=7, message=Message(message_id=7, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'), text='Измени портрет')))
+            if media_setup in handlers.user_processing_tasks:
+                await handlers.user_processing_tasks[media_setup]
+            assert not any(isinstance(call, SendPhoto) for call in transport.calls)
+            visible = [call.text for call in transport.calls if isinstance(call, SendMessage)]
+            assert await dispatcher.fsm.get_context(bot=bot, chat_id=media_setup, user_id=media_setup).get_state() is None
+        finally:
+            dispatcher.sub_routers.clear()
+            handlers.router._parent_router = None
+            await bot.session.close()
+        user_id = media_setup
+    else:
+        monkeypatch.setattr(max_ai, '_dispatch_provider', AsyncMock(return_value=response))
+        monkeypatch.setattr(max_ai, '_edit_kie', edit)
+        client = MaxTransport()
+        application = max_app.MaxBotApplication(client)
+        await application.handle_update({'update_type': 'message_created', 'update_id': 'mixed', 'message': {'sender': {'user_id': 7, 'name': 'Max'}, 'recipient': {'chat_id': 100}, 'body': {'mid': 'mixed-incoming', 'text': 'Измени портрет'}}})
+        if application.background_tasks:
+            await asyncio.gather(*list(application.background_tasks))
+        assert client.uploads == []
+        visible = [kwargs.get('json_data', {}).get('text') or '' for _, _, kwargs in client.wire]
+        user_id = 100000000007
+    download.assert_not_called()
+    edit.assert_not_called()
+    assert any('Не удалось распознать' in value for value in visible)
+    assert all(other not in value and 'EDIT_IMG_MEDIA' not in value for value in visible)
+    async with session_factory() as session:
+        history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == user_id, DBMessage.role == 'assistant'))).all()
+        assert len(history) == 1 and 'Не удалось распознать' in history[0].content
+        assert other not in history[0].content and 'EDIT_IMG_MEDIA' not in history[0].content
+
+
+@pytest.mark.asyncio
 async def test_max_token_is_never_sent_to_telegram():
     media = SimpleNamespace(source_platform='max', source_url=None, file_id='max-token')
     bot = SimpleNamespace(get_file=AsyncMock())
