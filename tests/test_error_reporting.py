@@ -180,6 +180,25 @@ class ErrorReportingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sk-secret12345678", text)  # Secret redacted in attempts
         self.assertNotIn("Traceback:", text)
 
+    async def test_successful_fallback_attempt_is_rendered_as_result(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        attempts = (
+            {"provider": "DeepSeek", "model": "deepseek-v4-flash", "status": "FAILED", "error": "empty response"},
+            {"provider": "DeepSeek", "model": "deepseek-flash", "status": "SUCCESS", "error": "Ответ получен"},
+        )
+
+        with patch.object(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[123])):
+            await error_reporting.notify_admins_about_error(
+                bot,
+                title="Основной AI-провайдер не сработал — использован резервный",
+                provider_attempts=attempts,
+                include_traceback=False,
+            )
+
+        text = bot.send_message.await_args.args[1]
+        self.assertIn("Результат: <code>Ответ получен</code>", text)
+        self.assertNotIn("Ошибка: <code>Ответ получен</code>", text)
+
     async def test_non_ai_error_includes_traceback_when_requested(self):
         bot = SimpleNamespace(send_message=AsyncMock())
         try:

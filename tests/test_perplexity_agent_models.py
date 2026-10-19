@@ -2655,3 +2655,43 @@ def test_direct_models_heading_and_10_per_page_pagination():
     assert [b["text"] for b in max_btns_p1[-2]] == ["⬅️ Назад"]
     assert max_btns_p1[-2][0]["payload"] == "admin_ai_ppx_models_0"
 
+
+@pytest.mark.asyncio
+async def test_perplexity_catalog_refresh_keeps_structured_failure_observable():
+    class Client:
+        async def get(self, endpoint, timeout):
+            return httpx.Response(
+                429,
+                headers={"x-request-id": "ppx-catalog-rate-1", "retry-after": "7"},
+                json={
+                    "error": {
+                        "type": "rate_limit_error",
+                        "code": "rate_limit_exceeded",
+                        "message": "catalog rate limited",
+                    }
+                },
+            )
+
+    state = await refresh_perplexity_catalog(force=True, http_client=Client())
+
+    assert state.source == "static_fallback"
+    assert state.last_failure["classification"] == "rate_limit"
+    assert state.last_failure["retryable"] is True
+    assert state.last_failure["retry_after_seconds"] == 7.0
+    assert state.last_failure["request_id"] == "ppx-catalog-rate-1"
+    assert state.last_failure["classification_source"] == "provider_structured"
+
+
+@pytest.mark.asyncio
+async def test_perplexity_catalog_refresh_keeps_transport_failure_observable():
+    class Client:
+        async def get(self, endpoint, timeout):
+            raise httpx.ReadTimeout("catalog read timeout")
+
+    state = await refresh_perplexity_catalog(force=True, http_client=Client())
+
+    assert state.source == "static_fallback"
+    assert state.last_failure["classification"] == "timeout"
+    assert state.last_failure["retryable"] is True
+    assert state.last_failure["classification_source"] == "transport"
+

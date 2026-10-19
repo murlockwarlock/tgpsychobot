@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import os
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 import httpx
 
 from provider_models import PROVIDER_GEMINI, ensure_model_available
+from provider_failures import ProviderFailure, attach_failure, normalize_exception, parse_provider_failure, safe_message
 
 
 GEMINI_INTERACTIONS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -29,6 +31,55 @@ class GeminiImageError(RuntimeError):
 
 class GeminiImageResponseError(GeminiImageError):
     """Gemini returned an invalid, empty, or otherwise unusable image response."""
+
+
+def _local_response_failure(
+    operation: str,
+    message: str,
+    *,
+    status: int = 200,
+    headers: Any = None,
+) -> ProviderFailure:
+    header_values = {str(key).lower(): value for key, value in (headers or {}).items()}
+    return ProviderFailure(
+        provider="Gemini",
+        operation=operation,
+        classification="invalid_response",
+        detail_code="invalid_response",
+        provider_error_message=safe_message(message),
+        http_status=status,
+        request_id=safe_message(
+            header_values.get("x-request-id")
+            or header_values.get("x-goog-request-id")
+            or header_values.get("request-id"),
+            200,
+        ) or None,
+        retryable=False,
+        transient=False,
+        classification_source="message_fallback",
+    )
+
+
+def _error_with_failure(
+    exception: Exception,
+    *,
+    operation: str,
+    response: httpx.Response | None = None,
+    payload: dict[str, Any] | None = None,
+) -> GeminiImageError:
+    headers = getattr(response, "headers", None) if response is not None else None
+    status = getattr(response, "status_code", None) if response is not None else None
+    failure = parse_provider_failure("Gemini", operation, status, payload, headers)
+    if failure is None:
+        failure = normalize_exception(exception, "Gemini", operation)
+    wrapped = exception if isinstance(exception, GeminiImageError) else GeminiImageError(str(exception))
+    attach_failure(wrapped, failure)
+    if payload is not None:
+        try:
+            wrapped.provider_response_payload = safe_message(json.dumps(payload, ensure_ascii=False, default=str), 4000)
+        except Exception:
+            wrapped.provider_response_payload = safe_message(payload, 4000)
+    return wrapped
 
 
 def _build_gemini_proxy_transport() -> httpx.AsyncHTTPTransport | None:
@@ -128,12 +179,18 @@ def _decode_image_data(data: object) -> bytes:
     return decoded
 
 
-def extract_image_bytes(payload: object) -> bytes:
+def extract_image_bytes(payload: object, *, operation: str = "image_generation") -> bytes:
     """Extract the first image block from a native Interactions response."""
     if not isinstance(payload, dict):
         raise GeminiImageResponseError("Gemini image response was not a JSON object")
-    if "error" in payload:
-        raise GeminiImageError(f"Gemini image provider error: {_safe_error_detail(payload)}")
+    failure = parse_provider_failure("Gemini", operation, 200, payload)
+    if failure is not None:
+        error = attach_failure(GeminiImageError(f"Gemini image provider error: {_safe_error_detail(payload)}"), failure)
+        try:
+            error.provider_response_payload = safe_message(json.dumps(payload, ensure_ascii=False, default=str), 4000)
+        except Exception:
+            pass
+        raise error
 
     steps = payload.get("steps")
     if not isinstance(steps, list):
@@ -153,26 +210,61 @@ def extract_image_bytes(payload: object) -> bytes:
             return _decode_image_data(block.get("data"))
 
     if not found_model_output:
-        raise GeminiImageResponseError("Gemini image response contained no model_output steps")
-    raise GeminiImageResponseError("Gemini image response contained no image block")
+        error = GeminiImageResponseError("Gemini image response contained no model_output steps")
+        raise attach_failure(error, _local_response_failure(operation, str(error)))
+    error = GeminiImageResponseError("Gemini image response contained no image block")
+    raise attach_failure(error, _local_response_failure(operation, str(error)))
 
 
-def _parse_json_response(response: httpx.Response) -> dict[str, Any]:
+def _parse_json_response(response: httpx.Response, *, operation: str) -> dict[str, Any]:
     try:
         payload = response.json()
     except (ValueError, TypeError) as exc:
-        raise GeminiImageResponseError(
+        error = GeminiImageResponseError(
             f"Gemini image provider returned invalid JSON (HTTP {response.status_code})"
+        )
+        failure = parse_provider_failure(
+            "Gemini",
+            operation,
+            response.status_code,
+            {"error": {"message": getattr(response, "text", "")[:4000]}},
+            getattr(response, "headers", None) or {},
+        ) or _local_response_failure(
+            operation,
+            str(error),
+            status=response.status_code,
+            headers=getattr(response, "headers", None),
+        )
+        raise attach_failure(
+            error,
+            failure,
         ) from exc
 
     if not isinstance(payload, dict):
-        raise GeminiImageResponseError("Gemini image provider returned a non-object JSON response")
+        error = GeminiImageResponseError("Gemini image provider returned a non-object JSON response")
+        failure = parse_provider_failure(
+            "Gemini",
+            operation,
+            response.status_code,
+            {"error": {"message": str(payload)[:4000]}},
+            getattr(response, "headers", None) or {},
+        ) or _local_response_failure(
+            operation,
+            str(error),
+            status=response.status_code,
+            headers=getattr(response, "headers", None),
+        )
+        raise attach_failure(
+            error,
+            failure,
+        )
     return payload
 
 
-async def _post_interaction(api_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def _post_interaction(api_key: str, payload: dict[str, Any], *, operation: str) -> dict[str, Any]:
     if not isinstance(api_key, str) or not api_key.strip():
-        raise GeminiImageError("Gemini image API key is not configured")
+        error = GeminiImageError("Gemini image API key is not configured")
+        raise attach_failure(error, normalize_exception(error, "Gemini", operation))
 
     headers = {
         "x-goog-api-key": api_key.strip(),
@@ -190,24 +282,52 @@ async def _post_interaction(api_key: str, payload: dict[str, Any]) -> dict[str, 
                 json=payload,
             )
     except httpx.TimeoutException as exc:
-        raise GeminiImageError("Gemini image request timed out") from exc
+        error = _error_with_failure(exc, operation=operation)
+        error.args = ("Gemini image request timed out",)
+        raise error from exc
     except httpx.RequestError as exc:
-        raise GeminiImageError("Gemini image request failed due to a network error") from exc
+        error = _error_with_failure(exc, operation=operation)
+        error.args = ("Gemini image request failed due to a network error",)
+        raise error from exc
     except Exception as exc:
         logging.warning("Gemini image request failed: %s", type(exc).__name__)
-        raise GeminiImageError("Gemini image request failed") from exc
+        error = _error_with_failure(exc, operation=operation)
+        raise error from exc
+
+    try:
+        response_payload = _parse_json_response(response, operation=operation)
+    except GeminiImageError:
+        raise
+
+    failure = parse_provider_failure(
+        "Gemini",
+        operation,
+        response.status_code,
+        response_payload,
+        getattr(response, "headers", None) or {},
+    )
+    if failure is not None:
+        error = attach_failure(
+            GeminiImageError(
+                f"Gemini image provider request failed (HTTP {response.status_code}): "
+                f"{failure.provider_error_message or failure.detail_code}"
+            ),
+            failure,
+        )
+        try:
+            error.provider_response_payload = safe_message(json.dumps(response_payload, ensure_ascii=False, default=str), 4000)
+        except Exception:
+            pass
+        raise error
 
     if not 200 <= response.status_code < 300:
-        try:
-            error_payload = response.json()
-        except (ValueError, TypeError):
-            error_payload = None
-        detail = _safe_error_detail(error_payload)
-        raise GeminiImageError(
-            f"Gemini image provider request failed (HTTP {response.status_code}): {detail}"
+        error = GeminiImageError(
+            f"Gemini image provider request failed (HTTP {response.status_code}): "
+            f"{_safe_error_detail(response_payload)}"
         )
+        raise attach_failure(error, _local_response_failure(operation, str(error), status=response.status_code))
 
-    return _parse_json_response(response)
+    return response_payload
 
 
 async def generate_image(api_key: str, model: str, prompt: str) -> bytes:
@@ -215,7 +335,10 @@ async def generate_image(api_key: str, model: str, prompt: str) -> bytes:
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_gen")
     payload = build_generation_payload(target_model, prompt)
-    return extract_image_bytes(await _post_interaction(api_key, payload))
+    return extract_image_bytes(
+        await _post_interaction(api_key, payload, operation="image_generation"),
+        operation="image_generation",
+    )
 
 
 async def edit_image(api_key: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
@@ -223,4 +346,7 @@ async def edit_image(api_key: str, model: str, prompt: str, image_bytes: bytes) 
     target_model = (model or "").strip()
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_edit")
     payload = build_edit_payload(target_model, prompt, image_bytes)
-    return extract_image_bytes(await _post_interaction(api_key, payload))
+    return extract_image_bytes(
+        await _post_interaction(api_key, payload, operation="image_edit"),
+        operation="image_edit",
+    )

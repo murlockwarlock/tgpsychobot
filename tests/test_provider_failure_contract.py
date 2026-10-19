@@ -1,4 +1,9 @@
 import asyncio
+import os
+from types import SimpleNamespace
+
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+os.environ.setdefault("BOT_TOKEN", "123456:TEST_BOT_TOKEN")
 
 import httpx
 import pytest
@@ -70,6 +75,7 @@ def test_anthropic_structured_types(code, expected, retryable):
         ("deadline_exceeded", "timeout", True),
         ("safety", "content_policy", False),
         ("no_image", "provider_rejection", False),
+        ("image_other", "content_policy", False),
     ],
 )
 def test_gemini_codes_are_explicit(code, expected, retryable):
@@ -198,3 +204,272 @@ def test_application_type_errors_and_unknown_provider_errors_fail_closed():
     unknown_failure = normalize_exception(RuntimeError("provider returned an undocumented envelope"), "OpenAI")
     assert unknown_failure.classification == "unknown"
     assert unknown_failure.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    (
+        ({"promptFeedback": {"blockReason": "SAFETY"}}, "content_policy"),
+        ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "output_budget_exhausted"),
+    ),
+)
+def test_gemini_generate_content_structured_http_200_semantics(payload, expected):
+    failure = parse_provider_failure("Gemini", "chat", 200, payload, {"x-goog-request-id": "gemini-chat-1"})
+    assert failure.classification == expected
+    assert failure.retryable is False
+    assert failure.request_id == "gemini-chat-1"
+    assert failure.classification_source == "provider_structured"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    (
+        ({"promptFeedback": {"blockReason": "SAFETY"}}, "content_policy"),
+        ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "output_budget_exhausted"),
+    ),
+)
+async def test_gemini_generate_content_real_runtime_uses_canonical_failure(monkeypatch, surface, payload, expected):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"x-goog-request-id": "gemini-runtime-1"}, json=payload)
+
+    if surface == "telegram":
+        import ai_integration as module
+
+        monkeypatch.setattr(module, "_build_async_transport_from_env", lambda *_args, **_kwargs: httpx.MockTransport(handler))
+        with pytest.raises((module.AIServiceError, module.AIResponseError)) as raised:
+            await module._call_gemini_api(
+                "key",
+                "gemini-3.7-flash",
+                [],
+                "",
+                "system",
+                request_layout=AIRequestLayout(current_user_content="hello"),
+            )
+    else:
+        from max_messenger_bot import ai as module
+
+        monkeypatch.setattr(module, "_build_gemini_proxy_transport", lambda: httpx.MockTransport(handler))
+        with pytest.raises((module.AIServiceError, module.AIResponseError)) as raised:
+            await module._call_gemini(
+                "key",
+                "gemini-3.7-flash",
+                [{"role": "user", "content": "hello"}],
+                "system",
+                0.7,
+            )
+
+    assert raised.value.failure.classification == expected
+    assert raised.value.failure.retryable is False
+    assert raised.value.failure.request_id == "gemini-runtime-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    (
+        ({"promptFeedback": {"blockReason": "SAFETY"}}, "content_policy"),
+        ({"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": []}}]}, "output_budget_exhausted"),
+    ),
+)
+async def test_gemini_vision_real_runtime_uses_same_canonical_failure(monkeypatch, surface, payload, expected):
+    real_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"x-goog-request-id": "gemini-vision-runtime-1"}, json=payload)
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"fixture"
+    if surface == "telegram":
+        import ai_integration as module
+
+        monkeypatch.setattr(module.httpx, "AsyncClient", client_factory)
+        with pytest.raises((module.AIServiceError, module.AIResponseError)) as raised:
+            await module._call_gemini_vision("key", "gemini-3.7-flash", image_bytes, "describe")
+    else:
+        from max_messenger_bot import ai as module
+
+        monkeypatch.setattr(module.httpx, "AsyncClient", client_factory)
+        with pytest.raises((module.AIServiceError, module.AIResponseError)) as raised:
+            await module._analyze_gemini(
+                "key",
+                "gemini-3.7-flash",
+                image_bytes,
+                "system",
+                "describe",
+                0.7,
+            )
+
+    assert raised.value.failure.classification == expected
+    assert raised.value.failure.retryable is False
+    assert raised.value.failure.request_id == "gemini-vision-runtime-1"
+
+
+class _ImageConfigSession:
+    def __init__(self, config):
+        self.config = config
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, model, key):
+        return self.config
+
+
+class _OpenAIImageSDKError(Exception):
+    def __init__(self, status: int, body: dict):
+        super().__init__(body.get("error", {}).get("message", "OpenAI image error"))
+        self.response = httpx.Response(status, json=body)
+        self.body = body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    (
+        (401, {"error": {"code": "invalid_api_key", "message": "invalid key"}}, "auth"),
+        (429, {"error": {"code": "credit_balance_exhausted", "message": "credits exhausted"}}, "insufficient_balance_quota"),
+        (500, {"error": {"type": "server_error", "message": "provider failed"}}, "provider_5xx"),
+    ),
+)
+async def test_openai_image_generation_deterministic_physical_call_count(monkeypatch, status, body, expected):
+    import ai_integration as module
+
+    calls = []
+    config = SimpleNamespace(openai_api_key="openai-key")
+    monkeypatch.setattr(module, "async_session_maker", lambda: _ImageConfigSession(config))
+
+    class Images:
+        async def generate(self, **kwargs):
+            calls.append(kwargs)
+            raise _OpenAIImageSDKError(status, body)
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.images = Images()
+
+    monkeypatch.setattr(module, "AsyncOpenAI", Client)
+
+    with pytest.raises((module.AIServiceError, module.InsufficientBalanceError)) as raised:
+        await module.generate_openai_image("portrait illustration")
+
+    assert len(calls) == 1
+    assert raised.value.failure.classification == expected
+    assert raised.value.failure.retryable is (expected == "provider_5xx")
+
+
+@pytest.mark.asyncio
+async def test_openai_image_generation_allows_only_documented_size_correction(monkeypatch):
+    import ai_integration as module
+
+    calls = []
+    config = SimpleNamespace(openai_api_key="openai-key")
+    monkeypatch.setattr(module, "async_session_maker", lambda: _ImageConfigSession(config))
+
+    class Images:
+        async def generate(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise _OpenAIImageSDKError(
+                    400,
+                    {"error": {"code": "invalid_request", "message": "size 1024x1536 is unsupported"}},
+                )
+            return SimpleNamespace(data=[SimpleNamespace(url="https://image.example/result.png", b64_json=None)])
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.images = Images()
+
+    monkeypatch.setattr(module, "AsyncOpenAI", Client)
+    monkeypatch.setattr(module, "_select_image_generation_shape", lambda prompt: ("portrait", "1024x1536"))
+
+    result = await module.generate_openai_image("portrait illustration")
+
+    assert result == "https://image.example/result.png"
+    assert [call["size"] for call in calls] == ["1024x1536", "1024x1024"]
+
+
+@pytest.mark.asyncio
+async def test_kie_image_generation_never_recreates_created_task(monkeypatch):
+    import ai_integration as module
+
+    real_client = httpx.AsyncClient
+    calls = {"create": 0, "poll": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/jobs/createTask"):
+            calls["create"] += 1
+            return httpx.Response(200, json={"data": {"taskId": "task-image-1"}})
+        if request.method == "GET" and request.url.path.endswith("/jobs/recordInfo"):
+            calls["poll"] += 1
+            return httpx.Response(200, json={"data": {"state": "fail", "failCode": 500, "failMsg": "internal error"}})
+        raise AssertionError(f"unexpected KIE request: {request.method} {request.url}")
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", client_factory)
+
+    with pytest.raises((module.AIServiceError, module.InsufficientBalanceError)) as raised:
+        await module._call_kie_image_generation(
+            "kie-key",
+            "https://kie.example",
+            "bytedance/seedream-v4-text-to-image",
+            "draw a forest",
+        )
+
+    assert calls == {"create": 1, "poll": 1}
+    assert raised.value.task_id == "task-image-1"
+    assert raised.value.failure.classification == "provider_5xx"
+    assert raised.value.diagnostics["task_id"] == "task-image-1"
+    assert raised.value.diagnostics["retryable"] is True
+    assert raised.value.diagnostics["classification_source"] == "provider_structured"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    (
+        (401, "invalid key", "auth"),
+        (402, "insufficient credits", "insufficient_balance_quota"),
+        (400, "content policy violation", "content_policy"),
+    ),
+)
+async def test_kie_image_creation_failures_have_no_duplicate_task(monkeypatch, code, message, expected):
+    import ai_integration as module
+
+    real_client = httpx.AsyncClient
+    create_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_calls
+        if request.method == "POST" and request.url.path.endswith("/jobs/createTask"):
+            create_calls += 1
+            return httpx.Response(200, json={"code": code, "msg": message})
+        raise AssertionError("poll/download must not run after task creation failure")
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", client_factory)
+
+    with pytest.raises((module.AIServiceError, module.InsufficientBalanceError)) as raised:
+        await module._call_kie_image_generation(
+            "kie-key",
+            "https://kie.example",
+            "bytedance/seedream-v4-text-to-image",
+            "draw a forest",
+        )
+
+    assert create_calls == 1
+    assert raised.value.failure.classification == expected

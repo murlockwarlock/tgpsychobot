@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import httpx
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -155,6 +156,108 @@ async def test_gemini_provider_errors_are_safe(monkeypatch, status_code, payload
 
     with pytest.raises(gemini_image.GeminiImageError):
         await gemini_image.generate_image(API_KEY, GEN_MODEL, "prompt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("generate", "edit"))
+@pytest.mark.parametrize(
+    ("status_code", "payload", "expected", "retryable"),
+    (
+        (403, {"error": {"code": "image_prohibited_content", "message": "blocked", "details": [{"policy": "safety"}]}}, "content_policy", False),
+        (400, {"error": {"code": "invalid_request", "message": "bad image request"}}, "invalid_request", False),
+    ),
+)
+async def test_gemini_interactions_mock_transport_preserves_provider_failure(
+    monkeypatch, operation, status_code, payload, expected, retryable
+):
+    request_ids = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_ids.append(request.headers.get("x-goog-api-key"))
+        return httpx.Response(status_code, headers={"x-goog-request-id": "gemini-image-request-1"}, json=payload)
+
+    monkeypatch.setattr(gemini_image, "_build_gemini_proxy_transport", lambda: httpx.MockTransport(handler))
+
+    with pytest.raises(gemini_image.GeminiImageError) as raised:
+        if operation == "generate":
+            await gemini_image.generate_image(API_KEY, GEN_MODEL, "prompt")
+        else:
+            await gemini_image.edit_image(API_KEY, EDIT_MODEL, "prompt", SOURCE_PNG)
+
+    failure = raised.value.failure
+    assert failure.classification == expected
+    assert failure.retryable is retryable
+    assert failure.http_status == status_code
+    assert failure.request_id == "gemini-image-request-1"
+    assert failure.classification_source == "provider_structured"
+    assert failure.provider_metadata["error"]["message"] in {"blocked", "bad image request"}
+    assert request_ids == [API_KEY]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("generate", "edit"))
+async def test_gemini_interactions_transport_failure_is_canonical(monkeypatch, operation):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("Gemini read timeout", request=request)
+
+    monkeypatch.setattr(gemini_image, "_build_gemini_proxy_transport", lambda: httpx.MockTransport(handler))
+
+    with pytest.raises(gemini_image.GeminiImageError) as raised:
+        if operation == "generate":
+            await gemini_image.generate_image(API_KEY, GEN_MODEL, "prompt")
+        else:
+            await gemini_image.edit_image(API_KEY, EDIT_MODEL, "prompt", SOURCE_PNG)
+
+    failure = raised.value.failure
+    assert failure.classification == "timeout"
+    assert failure.retryable is True
+    assert failure.classification_source == "transport"
+
+
+@pytest.mark.asyncio
+async def test_gemini_interactions_non_json_http_failure_keeps_status_classification(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, headers={"x-request-id": "gemini-image-auth-1"}, text="unauthorized")
+
+    monkeypatch.setattr(gemini_image, "_build_gemini_proxy_transport", lambda: httpx.MockTransport(handler))
+
+    with pytest.raises(gemini_image.GeminiImageError) as raised:
+        await gemini_image.generate_image(API_KEY, GEN_MODEL, "prompt")
+
+    failure = raised.value.failure
+    assert failure.classification == "auth"
+    assert failure.http_status == 401
+    assert failure.request_id == "gemini-image-auth-1"
+    assert failure.classification_source == "http_status_fallback"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("telegram", "max"))
+@pytest.mark.parametrize("operation", ("generation", "edit"))
+async def test_gemini_image_runtime_wrappers_keep_provider_failure(monkeypatch, surface, operation):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "gemini-image-runtime-1"},
+            json={"error": {"code": "image_safety", "message": "policy block"}},
+        )
+
+    monkeypatch.setattr(gemini_image, "_build_gemini_proxy_transport", lambda: httpx.MockTransport(handler))
+    if surface == "telegram":
+        import ai_integration as module
+        call = module._call_gemini_image_generation if operation == "generation" else module.edit_image_gemini_v3
+    else:
+        from max_messenger_bot import ai as module
+        call = module._generate_gemini if operation == "generation" else module._edit_gemini
+
+    with pytest.raises((module.AIServiceError, module.AIResponseError)) as raised:
+        if operation == "generation":
+            await call(API_KEY, GEN_MODEL, "prompt")
+        else:
+            await call(API_KEY, EDIT_MODEL, "prompt", SOURCE_PNG)
+
+    assert raised.value.failure.classification == "content_policy"
+    assert raised.value.failure.request_id == "gemini-image-runtime-1"
 
 
 @pytest.mark.asyncio

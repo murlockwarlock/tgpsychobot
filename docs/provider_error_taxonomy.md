@@ -10,14 +10,17 @@ examples and mappings are paraphrases, not copied documentation.
 |---|---|---|
 | OpenAI | chat/vision `/v1/chat/completions`, image generation `/v1/images/generations`, transcription `/v1/audio/transcriptions` | [Errors](https://developers.openai.com/api/docs/guides/error-codes), [Images](https://developers.openai.com/api/reference/resources/images), [Audio](https://developers.openai.com/api/reference/resources/audio) |
 | Claude | chat/vision `/v1/messages` | [Errors](https://platform.claude.com/docs/en/api/errors), [Spend/rate limits](https://platform.claude.com/docs/en/api/rate-limits) |
-| Gemini | chat, vision, image generation/editing, inline-audio transcription: `/v1beta/models/{model}:generateContent` | [Troubleshooting](https://ai.google.dev/gemini-api/docs/troubleshooting), [FinishReason](https://ai.google.dev/api/generate-content), [Limits](https://ai.google.dev/gemini-api/docs/rate-limits) |
+| Gemini | chat, vision, inline-audio transcription: `/v1beta/models/{model}:generateContent`; image generation/editing: `/v1beta/interactions` | [Troubleshooting](https://ai.google.dev/gemini-api/docs/troubleshooting), [FinishReason](https://ai.google.dev/api/generate-content), [Interactions image generation](https://ai.google.dev/gemini-api/docs/image-generation), [Interactions errors](https://ai.google.dev/gemini-api/docs/api-errors), [Limits](https://ai.google.dev/gemini-api/docs/rate-limits) |
 | DeepSeek | chat `/chat/completions` through OpenAI SDK | [Chat errors](https://api-docs.deepseek.com/quick_start/error_codes/); Search/Fetch codes are not imported |
 | OpenRouter | chat/vision `/api/v1/chat/completions`; catalog GET `/api/v1/models` | [Errors and typed vocabulary](https://openrouter.ai/docs/api_reference/errors-and-debugging), [Live catalog](https://openrouter.ai/api/v1/models) |
 | KIE | chat/vision `/{model}/v1/chat/completions`, `/claude/v1/messages`, `/codex/v1/responses`, `/grok/v1/responses`, `/gemini/v1/models/{model}:streamGenerateContent`; image and transcription jobs `/api/v1/jobs/createTask`, `/api/v1/jobs/recordInfo`; `/api/file-stream-upload`; `/api/v1/common/download-url`; `/api/v1/chat/credit` | [Transport/auth](https://docs.kie.ai/), [Task status](https://docs.kie.ai/market/common/get-task-detail), [Upload](https://docs.kie.ai/file-upload-api/quickstart), [Common API](https://docs.kie.ai/common-api/quickstart), [Codex](https://docs.kie.ai/market/codex/gpt-codex) |
 | Perplexity | chat `/v1/agent`, catalog GET `/v1/models` | [Agent schema](https://docs.perplexity.ai/api-reference/agent-post), [Models](https://docs.perplexity.ai/api-reference/models-get), [SDK error handling](https://docs.perplexity.ai/docs/sdk/error-handling), [Background status](https://docs.perplexity.ai/docs/agent-api/background-mode) |
 | Deepgram | prerecorded transcription `/v1/listen` | [Errors](https://developers.deepgram.com/docs/errors) |
 
-All sources accessed on the audit date. KIE protocol families are distinct: job
+All sources accessed on the audit date. Gemini Interactions errors use the
+structured `error.code`/`error.message` envelope even when transport status is
+successful; the image adapter preserves that envelope and its request ID.
+KIE protocol families are distinct: job
 codes are not upstream model error types. Gemini's [snake_case error table](https://ai.google.dev/gemini-api/docs/api-errors)
 expressly describes **Interactions**, not generateContent. Snake_case codes on
 generateContent are defensive compatibility inputs, not documented wire fixtures.
@@ -59,6 +62,9 @@ KIE body codes and OpenRouter embedded codes do not overwrite it.
 | Gemini / generateContent | CANCELLED; UNIMPLEMENTED; ALREADY_EXISTS; ABORTED | error.status | cancelled; invalid_request; invalid_request; provider_rejection | P | no/no | — | change/higher-level resolution |
 | Gemini / generation | SAFETY, RECITATION, LANGUAGE, PROHIBITED_CONTENT, SPII, BLOCKLIST, IMAGE_SAFETY, IMAGE_PROHIBITED_CONTENT, IMAGE_RECITATION | promptFeedback.blockReason, candidates[].finishReason | content_policy / original reason | P | no/no | — | change |
 | Gemini / generation | MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL, TOO_MANY_TOOL_CALLS, MISSING_THOUGHT_SIGNATURE, NO_IMAGE | candidates[].finishReason | provider_rejection / original reason | P | no/no | — | change |
+| Gemini / Interactions image | invalid_request, failed_precondition, out_of_range, parameter_unknown | error.code, error.message | invalid_request / original code | P | no/no | — | change/operator |
+| Gemini / Interactions image | image_safety, image_prohibited_content, image_recitation, image_other, content_blocked | error.code, error.message | content_policy / original code | P | no/no | — | change |
+| Gemini / Interactions image | malformed_function_call, malformed_tool_call, unexpected_tool_call, too_many_tool_calls, missing_thought_signature, no_image | error.code, error.message | provider_rejection / original code | P | no/no | — | change |
 | Gemini / defensive only | invalid_request, failed_precondition, authentication, payment_required, permission_denied, not_found, model_not_found, already_exists, aborted, rate_limit_exceeded, too_many_requests, quota_exceeded, cancelled, api_error, unimplemented, service_unavailable, deadline_exceeded | error.code | same semantic classes; rate codes transient, quota permanent | conditional | conditional | yes | see native equivalent |
 | DeepSeek / chat | 400, 422 | error.message/type/code when supplied | invalid_request | P | no/no | — | change |
 | DeepSeek / chat | 401; 402 | error fields | auth; insufficient_balance_quota | P | no/no | — | operator |
@@ -89,7 +95,7 @@ KIE body codes and OpenRouter embedded codes do not overwrite it.
 | Perplexity / agent | cancelled; queued; in_progress | status | cancelled; invalid_response in synchronous pipeline | P | no/no | — | no duplicate run |
 | All / transport | timeout, connection, TLS, proxy exceptions | typed exception chain | timeout, network_connection, network_ssl, proxy_error | T | stage-dependent/yes for chat | — | recover network |
 | All / application | TypeError, invariant failure | typed exception | application_internal | P | no/no | — | fix code |
-| Catalog GETs | structured error then status fallback | same provider envelope, request ID | read-only failure; never synthesize model availability | conditional | bounded/no chat button | yes | type-dependent |
+| Catalog GETs | structured error then status fallback | same provider envelope, request ID | read-only failure; never synthesize model availability; catalog state retains normalized last failure | conditional | bounded/no chat button | yes | type-dependent |
 
 ## Policy invariants
 
@@ -119,6 +125,11 @@ used by the Telegram/MAX AI paths now sets `max_retries=0`. Gemini, KIE,
 OpenRouter, Perplexity and Deepgram use HTTPX paths (no SDK retry layer).
 HTTP adapters own bounded retries: OpenRouter/Deepgram at most two physical
 calls, Perplexity at most two, and KIE transcription stages at most three.
+OpenAI image generation has a maximum of two physical calls, and the second is
+allowed only when the first failure is normalized as the documented
+`size_incompatible` request-parameter case and a corrected size is actually
+available. Auth, billing, rate-limit, network and provider failures are one-call
+terminal outcomes.
 
 ## Additional owner requirements
 

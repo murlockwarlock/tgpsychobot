@@ -171,6 +171,37 @@ async def test_openrouter_catalog_uses_configured_proxy(monkeypatch):
     assert route.proxy_source == "OPENROUTER_PROXY"
 
 
+@pytest.mark.asyncio
+async def test_openrouter_catalog_structured_error_uses_shared_failure_parser():
+    capture = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "or-catalog-200-error"},
+            json={
+                "error": {
+                    "code": "provider_overloaded",
+                    "message": "upstream provider is temporarily overloaded",
+                    "metadata": {"error_type": "provider_overloaded"},
+                }
+            },
+        )
+
+    with pytest.raises(ProviderAdapterError) as exc_info:
+        await verify_openrouter_catalog(transport=httpx.MockTransport(handler), request_capture=capture)
+
+    error = exc_info.value
+    assert error.failure.classification == "provider_overloaded"
+    assert error.failure.detail_code == "provider_overloaded"
+    assert error.failure.retryable is True
+    assert error.failure.http_status == 200
+    assert error.failure.request_id == "or-catalog-200-error"
+    assert error.failure.classification_source == "provider_structured"
+    assert error.failure.provider_error_message == "upstream provider is temporarily overloaded"
+    assert capture["request_id"] == "or-catalog-200-error"
+
+
 # ---------------------------------------------------------------------------
 # 5. Fail Closed on Proxy Connection Failure
 # ---------------------------------------------------------------------------

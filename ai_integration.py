@@ -165,6 +165,67 @@ def _provider_http_failure(provider: str, operation: str, status: int, payload: 
     return error
 
 
+def _gemini_payload_failure(
+    payload: Any,
+    *,
+    status: int,
+    operation: str,
+    request_capture: dict | None = None,
+    headers: Any = None,
+) -> Any:
+    from provider_failures import parse_provider_failure, safe_message
+
+    failure = parse_provider_failure("Gemini", operation, status, payload, headers or {})
+    if failure is None:
+        return None
+    if request_capture is not None:
+        request_capture.update(failure.diagnostics())
+        try:
+            request_capture["provider_response_payload"] = safe_message(
+                json.dumps(payload, ensure_ascii=False, default=str),
+                4000,
+            )
+        except Exception:
+            pass
+    return failure
+
+
+def _raise_gemini_payload_failure(
+    payload: Any,
+    *,
+    status: int,
+    operation: str,
+    prefix: str,
+    request_capture: dict | None = None,
+    headers: Any = None,
+) -> None:
+    from provider_failures import attach_failure
+
+    failure = _gemini_payload_failure(
+        payload,
+        status=status,
+        operation=operation,
+        request_capture=request_capture,
+        headers=headers,
+    )
+    if failure is None:
+        return
+    error_type = AIResponseError if failure.classification in {
+        "empty_response", "invalid_response", "output_budget_exhausted",
+    } else AIServiceError
+    error = error_type(f"{prefix}: {failure.provider_error_message or failure.detail_code}")
+    attach_failure(error, failure)
+    try:
+        from provider_failures import safe_message
+        error.provider_response_payload = safe_message(
+            json.dumps(payload, ensure_ascii=False, default=str),
+            4000,
+        )
+    except Exception:
+        pass
+    raise error
+
+
 def _normalize_provider_exception(exception: Exception, *, provider: str, operation: str, prefix: str) -> Exception:
     from provider_failures import attach_failure, normalize_exception
 
@@ -369,7 +430,6 @@ async def _notify_ai_fallback_used(
 
     try:
         classification, classified_error = classify_external_error(error, provider=primary_provider)
-        primary_root = root_cause_exception(error) or error
         await notify_admins_about_error(
             bot,
             title="Основной AI-провайдер не сработал — использован резервный",
@@ -381,20 +441,18 @@ async def _notify_ai_fallback_used(
             stage="ai_provider_fallback",
             details=classified_error,
             provider_attempts=(
-                {
-                    "provider": primary_provider,
-                    "model": primary_model,
-                    "status": "FAILED",
-                    "classification": classification,
-                    "exception_class": type(primary_root).__name__,
-                    "error": exception_summary(error),
-                },
+                _build_ai_attempt(
+                    primary_provider,
+                    primary_model,
+                    error,
+                    classification=classification,
+                ),
                 {
                     "provider": fallback_provider,
                     "model": fallback_model,
                     "status": "SUCCESS",
                     "classification": None,
-                    "error": "Ответ получен",
+                    "result": "Ответ получен",
                 },
             ),
             extra={
@@ -624,10 +682,12 @@ def _validate_kie_json_response(status_code: int, payload: dict, *, context: str
         error.provider_code = payload.get("code") if isinstance(payload, dict) else None
         error.provider_message = payload.get("msg") or payload.get("message") or failure.provider_error_message
         error.provider_response_payload = json.dumps(payload, ensure_ascii=False, default=str)[:4000]
-        error.diagnostics = {
+        diagnostics = dict(failure.diagnostics())
+        diagnostics.update({
             "provider_code": error.provider_code,
             "provider_message": error.provider_message,
-        }
+        })
+        error.diagnostics = diagnostics
         raise error
     if not isinstance(payload, dict):
         error = AIResponseError("KIE вернул некорректный JSON")
@@ -948,7 +1008,13 @@ async def _call_gemini_api(
                 logging.warning("Failed to mark activity before outbound call: %s", act_err)
         async with httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout) as client:
             response = await client.post(url, json=payload, headers={'Content-Type': 'application/json'})
-            if response.status_code != 200:
+            response_status = getattr(response, "status_code", 200)
+            if not isinstance(response_status, int):
+                try:
+                    response_status = int(response_status)
+                except (TypeError, ValueError):
+                    response_status = 200
+            if response_status != 200:
                 try:
                     error_data = response.json()
                 except (TypeError, ValueError):
@@ -958,20 +1024,50 @@ async def _call_gemini_api(
                     error_payload.get('message') if isinstance(error_payload, dict) else None,
                     _nonempty_provider_reason(
                         getattr(response, 'text', None),
-                        f"HTTP {response.status_code} без описания",
+                        f"HTTP {response_status} без описания",
                     ),
                 )
-                raise _provider_http_failure("Gemini", "chat", response.status_code, error_data, error_msg, getattr(response, "headers", None))
+                raise _provider_http_failure("Gemini", "chat", response_status, error_data, error_msg, getattr(response, "headers", None))
             data = response.json()
+            _raise_gemini_payload_failure(
+                data,
+                status=response_status,
+                operation="chat",
+                prefix="Ошибка при обращении к Gemini",
+                request_capture=request_capture,
+                headers=getattr(response, "headers", None),
+            )
             candidates = data.get('candidates', [])
             if not candidates:
-                error = AIResponseError("Gemini returned an empty response or blocked content")
-                error.classification = "empty_response"
-                raise error
-            return _validate_text_response(
-                candidates[0]['content']['parts'][0]['text'],
-                provider="Gemini",
-            )
+                _raise_gemini_payload_failure(
+                    {"error": {"code": "empty_response", "message": "Gemini returned no candidates"}},
+                    status=response_status,
+                    operation="chat",
+                    prefix="Ошибка при обращении к Gemini",
+                    request_capture=request_capture,
+                    headers=getattr(response, "headers", None),
+                )
+            try:
+                text = candidates[0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError, TypeError):
+                _raise_gemini_payload_failure(
+                    {"error": {"code": "invalid_response", "message": "Gemini candidate had no text"}},
+                    status=response_status,
+                    operation="chat",
+                    prefix="Ошибка при обращении к Gemini",
+                    request_capture=request_capture,
+                    headers=getattr(response, "headers", None),
+                )
+            if not isinstance(text, str) or not text.strip():
+                _raise_gemini_payload_failure(
+                    {"error": {"code": "empty_response", "message": "Gemini candidate text was empty"}},
+                    status=response_status,
+                    operation="chat",
+                    prefix="Ошибка при обращении к Gemini",
+                    request_capture=request_capture,
+                    headers=getattr(response, "headers", None),
+                )
+            return _validate_text_response(text, provider="Gemini")
     except (AIServiceError, InsufficientBalanceError):
         raise
     except Exception as e:
@@ -1209,7 +1305,7 @@ async def _create_kie_task(api_key: str, base_url: str, model: str, input_payloa
         if not task_id:
             raise AIResponseError(f"KIE task creation returned no taskId: {data}")
         return task_id
-    except (AIServiceError, AIResponseError):
+    except (InsufficientBalanceError, AIServiceError, AIResponseError):
         raise
     except Exception as e:
         logging.error("KIE create task error", exc_info=e)
@@ -1229,6 +1325,22 @@ def _extract_kie_task_result(task_payload: dict) -> dict:
     if isinstance(result_json, dict):
         return result_json
     return {}
+
+
+def _attach_kie_task_failure(exception: Exception, task_id: str, operation: str = "image_generation") -> Exception:
+    from provider_failures import attach_failure, normalize_exception
+
+    failure = getattr(exception, "failure", None)
+    if failure is None:
+        if isinstance(exception, AIResponseError) and not getattr(exception, "classification", None):
+            exception.classification = "invalid_response"
+        failure = normalize_exception(exception, "KIE", operation)
+        attach_failure(exception, failure)
+    exception.task_id = task_id
+    diagnostics = dict(getattr(exception, "diagnostics", {}) or {})
+    diagnostics["task_id"] = task_id
+    exception.diagnostics = diagnostics
+    return exception
 
 
 async def _poll_kie_task(api_key: str, base_url: str, task_id: str, *, timeout_sec: int = 180) -> dict:
@@ -1264,7 +1376,23 @@ async def _download_binary_file(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
         response = await client.get(url)
     if response.status_code != 200:
-        raise AIServiceError(f"Result download failed: status={response.status_code} url={url}")
+        from provider_failures import attach_failure, parse_provider_failure
+
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {"error": {"message": response.text[:4000]}}
+        failure = parse_provider_failure(
+            "KIE",
+            "image_download",
+            response.status_code,
+            payload,
+            getattr(response, "headers", None) or {},
+        )
+        error = AIServiceError(f"Result download failed: status={response.status_code}")
+        if failure is not None:
+            attach_failure(error, failure)
+        raise error
     return response.content
 
 
@@ -2674,14 +2802,44 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
                 raise _provider_http_failure("Gemini", "transcription", response.status_code, error_data, error_msg, getattr(response, "headers", None))
 
             data = response.json()
+            _raise_gemini_payload_failure(
+                data,
+                status=response.status_code,
+                operation="transcription",
+                prefix="Ошибка при транскрибации (Gemini API)",
+                headers=getattr(response, "headers", None),
+            )
             try:
                 candidates = data.get('candidates', [])
                 if not candidates:
-                    error = AIResponseError("Gemini returned an empty transcription response")
-                    error.classification = "empty_response"
-                    raise error
+                    _raise_gemini_payload_failure(
+                        {"error": {"code": "empty_response", "message": "Gemini returned no transcription candidates"}},
+                        status=response.status_code,
+                        operation="transcription",
+                        prefix="Ошибка при транскрибации (Gemini API)",
+                        headers=getattr(response, "headers", None),
+                    )
 
-                return candidates[0]['content']['parts'][0]['text']
+                try:
+                    text = candidates[0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError, TypeError) as exc:
+                    _raise_gemini_payload_failure(
+                        {"error": {"code": "invalid_response", "message": "Gemini transcription candidate had no text"}},
+                        status=response.status_code,
+                        operation="transcription",
+                        prefix="Ошибка при транскрибации (Gemini API)",
+                        headers=getattr(response, "headers", None),
+                    )
+                    raise AssertionError from exc
+                if not isinstance(text, str) or not text.strip():
+                    _raise_gemini_payload_failure(
+                        {"error": {"code": "empty_response", "message": "Gemini transcription text was empty"}},
+                        status=response.status_code,
+                        operation="transcription",
+                        prefix="Ошибка при транскрибации (Gemini API)",
+                        headers=getattr(response, "headers", None),
+                    )
+                return text
             except (KeyError, IndexError) as e:
                 logging.error(f"Gemini transcribe parsing error: {e}. Data: {data}")
                 error = AIResponseError("Gemini returned an invalid transcription response")
@@ -2764,10 +2922,13 @@ async def _call_gemini_image_generation(api_key: str, model: str, prompt: str) -
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_gen")
     try:
         return await gemini_image.generate_image(api_key, target_model, prompt)
-    except gemini_image.GeminiImageResponseError as exc:
-        raise AIResponseError(str(exc)) from exc
     except gemini_image.GeminiImageError as exc:
-        raise AIServiceError(str(exc)) from exc
+        raise _normalize_provider_exception(
+            exc,
+            provider=PROVIDER_GEMINI,
+            operation="image_generation",
+            prefix="Ошибка генерации изображения (Gemini)",
+        ) from exc
 
 
 async def edit_image_gemini_v3(api_key: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
@@ -2775,10 +2936,13 @@ async def edit_image_gemini_v3(api_key: str, model: str, prompt: str, image_byte
     ensure_model_available(PROVIDER_GEMINI, target_model, channel="image_edit")
     try:
         return await gemini_image.edit_image(api_key, target_model, prompt, image_bytes)
-    except gemini_image.GeminiImageResponseError as exc:
-        raise AIResponseError(str(exc)) from exc
     except gemini_image.GeminiImageError as exc:
-        raise AIServiceError(str(exc)) from exc
+        raise _normalize_provider_exception(
+            exc,
+            provider=PROVIDER_GEMINI,
+            operation="image_edit",
+            prefix="Ошибка редактирования изображения (Gemini)",
+        ) from exc
 
 
 def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
@@ -2880,29 +3044,22 @@ def _build_kie_image_edit_input(model: str, prompt: str, source_url: str) -> dic
 
 async def _call_kie_image_generation(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
     ensure_model_available(PROVIDER_KIE, model, channel="image_gen")
-    attempts = 2
-    last_exc = None
-    for _ in range(attempts):
-        try:
-            task_id = await _create_kie_task(
-                api_key,
-                base_url,
-                model,
-                _build_kie_image_generation_input(model, prompt),
-            )
-            task_payload = await _poll_kie_task(api_key, base_url, task_id)
-            result = _extract_kie_task_result(task_payload)
-            result_urls = result.get("resultUrls") or result.get("result_urls") or []
-            if not result_urls:
-                raise AIResponseError(f"KIE image generation returned no result URLs: task_id={task_id} payload={task_payload}")
-            download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
-            return await _download_binary_file(download_url)
-        except AIServiceError as exc:
-            last_exc = exc
-            if "internal error" not in str(exc).lower():
-                raise
-            await asyncio.sleep(2)
-    raise last_exc or AIServiceError("KIE image generation failed without detailed error")
+    task_id = await _create_kie_task(
+        api_key,
+        base_url,
+        model,
+        _build_kie_image_generation_input(model, prompt),
+    )
+    try:
+        task_payload = await _poll_kie_task(api_key, base_url, task_id)
+        result = _extract_kie_task_result(task_payload)
+        result_urls = result.get("resultUrls") or result.get("result_urls") or []
+        if not result_urls:
+            raise AIResponseError(f"KIE image generation returned no result URLs: task_id={task_id} payload={task_payload}")
+        download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
+        return await _download_binary_file(download_url)
+    except Exception as exc:
+        raise _attach_kie_task_failure(exc, task_id) from exc
 
 
 async def _call_kie_image_edit(api_key: str, base_url: str, upload_base_url: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
@@ -2920,13 +3077,16 @@ async def _call_kie_image_edit(api_key: str, base_url: str, upload_base_url: str
         model,
         _build_kie_image_edit_input(model, prompt, source_url),
     )
-    task_payload = await _poll_kie_task(api_key, base_url, task_id)
-    result = _extract_kie_task_result(task_payload)
-    result_urls = result.get("resultUrls") or result.get("result_urls") or []
-    if not result_urls:
-        raise AIResponseError(f"KIE image edit returned no result URLs: task_id={task_id} payload={task_payload}")
-    download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
-    return await _download_binary_file(download_url)
+    try:
+        task_payload = await _poll_kie_task(api_key, base_url, task_id)
+        result = _extract_kie_task_result(task_payload)
+        result_urls = result.get("resultUrls") or result.get("result_urls") or []
+        if not result_urls:
+            raise AIResponseError(f"KIE image edit returned no result URLs: task_id={task_id} payload={task_payload}")
+        download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
+        return await _download_binary_file(download_url)
+    except Exception as exc:
+        raise _attach_kie_task_failure(exc, task_id, "image_edit") from exc
 
 
 async def generate_image(prompt: str) -> any:
@@ -3024,8 +3184,7 @@ async def generate_openai_image(prompt: str) -> str:
             requested_sizes.append("1024x1024")
 
         response = None
-        last_error = None
-        for size in requested_sizes:
+        for size_index, size in enumerate(requested_sizes):
             try:
                 response = await client.images.generate(
                     model=model,
@@ -3036,11 +3195,24 @@ async def generate_openai_image(prompt: str) -> str:
                 logging.info("OpenAI image generation completed with size=%s", size)
                 break
             except Exception as exc:
-                last_error = exc
                 logging.warning("OpenAI image generation failed with size=%s: %s", size, exc)
+                from provider_failures import is_openai_image_size_incompatibility, normalize_exception
+                failure = normalize_exception(exc, PROVIDER_OPENAI, "image_generation")
+                if (
+                    size_index + 1 < len(requested_sizes)
+                    and is_openai_image_size_incompatibility(failure)
+                ):
+                    logging.info("Retrying OpenAI image generation with compatible size after size incompatibility")
+                    continue
+                raise _normalize_provider_exception(
+                    exc,
+                    provider=PROVIDER_OPENAI,
+                    operation="image_generation",
+                    prefix="Ошибка генерации изображения",
+                ) from exc
 
         if response is None:
-            raise last_error or AIServiceError("OpenAI image generation failed without response")
+            raise AIResponseError("OpenAI image generation returned no response")
 
         if not response.data:
             raise AIServiceError("API не вернул данных (empty data).")
@@ -3054,9 +3226,16 @@ async def generate_openai_image(prompt: str) -> str:
         else:
             raise AIServiceError("API не вернул ни URL, ни B64.")
 
+    except (AIServiceError, InsufficientBalanceError):
+        raise
     except Exception as e:
         logging.error(f"OpenAI Image Error ({model}): {e}")
-        raise AIServiceError(f"Ошибка генерации изображения: {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_OPENAI,
+            operation="image_generation",
+            prefix="Ошибка генерации изображения",
+        ) from e
 
 
 async def _call_openai_vision(
@@ -3352,8 +3531,6 @@ async def _call_gemini_vision(
 
         if response.status_code == 200:
             data = response.json()
-            prompt_feedback = data.get("promptFeedback") or {}
-            block_reason = prompt_feedback.get("blockReason")
             candidates = data.get('candidates') or []
             cand = candidates[0] if candidates else {}
             finish_reason = cand.get("finishReason")
@@ -3374,55 +3551,35 @@ async def _call_gemini_vision(
                 if safe_resp_payload is not None:
                     request_capture["provider_response_payload"] = safe_resp_payload
 
-            if block_reason:
-                raise attach_error_metadata(
-                    AIServiceError(f"Gemini Vision prompt blocked: {block_reason}"),
-                    classification="provider_rejection",
-                    finish_reason=block_reason,
-                    http_status=200,
-                    diagnostics={"usage": usage_meta} if usage_meta else None,
-                    provider_response_payload=safe_resp_payload,
-                )
+            _raise_gemini_payload_failure(
+                data,
+                status=response.status_code,
+                operation="vision",
+                prefix="Ошибка анализа изображения (Gemini)",
+                request_capture=request_capture,
+                headers=getattr(response, "headers", None),
+            )
 
             if not candidates:
-                raise attach_error_metadata(
-                    AIResponseError("Gemini Vision returned no candidates"),
-                    classification="empty_response",
-                    http_status=200,
-                    diagnostics={"usage": usage_meta} if usage_meta else None,
-                    provider_response_payload=safe_resp_payload,
-                )
-
-            if finish_reason in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"}:
-                raise attach_error_metadata(
-                    AIServiceError(f"Gemini Vision candidate blocked: {finish_reason}"),
-                    classification="provider_rejection",
-                    finish_reason=finish_reason,
-                    http_status=200,
-                    diagnostics={"usage": usage_meta} if usage_meta else None,
-                    provider_response_payload=safe_resp_payload,
-                )
-
-            if finish_reason == "MAX_TOKENS":
-                raise attach_error_metadata(
-                    AIResponseError("Gemini Vision output budget exhausted"),
-                    classification="output_budget_exhausted",
-                    finish_reason="MAX_TOKENS",
-                    http_status=200,
-                    diagnostics={"usage": usage_meta} if usage_meta else None,
-                    provider_response_payload=safe_resp_payload,
+                _raise_gemini_payload_failure(
+                    {"error": {"code": "empty_response", "message": "Gemini Vision returned no candidates"}},
+                    status=response.status_code,
+                    operation="vision",
+                    prefix="Ошибка анализа изображения (Gemini)",
+                    request_capture=request_capture,
+                    headers=getattr(response, "headers", None),
                 )
 
             parts = cand.get("content", {}).get("parts", [])
             text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
             if not text:
-                raise attach_error_metadata(
-                    AIResponseError("Gemini Vision returned empty content"),
-                    classification="empty_response",
-                    finish_reason=finish_reason,
-                    http_status=200,
-                    diagnostics={"usage": usage_meta} if usage_meta else None,
-                    provider_response_payload=safe_resp_payload,
+                _raise_gemini_payload_failure(
+                    {"error": {"code": "empty_response", "message": "Gemini Vision returned empty content"}},
+                    status=response.status_code,
+                    operation="vision",
+                    prefix="Ошибка анализа изображения (Gemini)",
+                    request_capture=request_capture,
+                    headers=getattr(response, "headers", None),
                 )
 
             return text

@@ -1439,13 +1439,61 @@ async def verify_openrouter_catalog(
     timeout: float = 20.0,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    request_capture: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    client, _ = build_provider_http_client("OpenRouter", timeout=timeout, transport=transport)
-    async with client:
-        response = await client.get("https://openrouter.ai/api/v1/models")
-    if response.status_code != 200:
-        raise ProviderAdapterError("OpenRouter catalog unavailable", status=response.status_code, category="provider")
-    payload = response.json()
+    from provider_failures import normalize_exception, parse_provider_failure, safe_message
+
+    try:
+        client, _ = build_provider_http_client("OpenRouter", timeout=timeout, transport=transport)
+        async with client:
+            response = await client.get("https://openrouter.ai/api/v1/models")
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {}
+        failure = parse_provider_failure(
+            "OpenRouter",
+            "catalog",
+            response.status_code,
+            payload,
+            getattr(response, "headers", None) or {},
+        )
+        if failure is None and response.status_code == 200 and (
+            not isinstance(payload, dict) or not isinstance(payload.get("data"), list)
+        ):
+            failure = parse_provider_failure(
+                "OpenRouter",
+                "catalog",
+                response.status_code,
+                {"error": {"code": "invalid_response", "message": "catalog response is not an object"}},
+                getattr(response, "headers", None) or {},
+            )
+        if failure is not None:
+            if request_capture is not None:
+                request_capture.update(failure.diagnostics())
+            raise ProviderAdapterError(
+                f"OpenRouter catalog unavailable: {failure.provider_error_message or failure.detail_code}",
+                status=response.status_code,
+                category=failure.classification,
+                provider_error_message=failure.provider_error_message or safe_message(payload),
+                request_id=failure.request_id,
+                failure=failure,
+            )
+    except ProviderAdapterError:
+        raise
+    except Exception as exc:
+        failure = normalize_exception(exc, "OpenRouter", "catalog")
+        if request_capture is not None:
+            request_capture.update(failure.diagnostics())
+        raise ProviderAdapterError(
+            f"OpenRouter catalog request failed: {failure.provider_error_message or failure.detail_code}",
+            status=failure.http_status,
+            category=failure.classification,
+            provider_error_message=failure.provider_error_message,
+            request_id=failure.request_id,
+            failure=failure,
+        ) from exc
+
     live = {str(item.get("id")): item for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
     result: dict[str, Any] = {}
     for model_id, spec in OPENROUTER_MODEL_SPECS.items():

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from hashlib import sha256
 from hmac import compare_digest
+import logging
 import re
 import time
 from typing import Any, Callable
@@ -180,6 +181,7 @@ class PerplexityCatalogState:
     is_fresh: bool
     is_authoritative: bool
     fetched_at: float
+    last_failure: dict[str, Any] | None = None
 
 
 _current_perplexity_catalog_state: PerplexityCatalogState | None = None
@@ -229,6 +231,7 @@ def get_perplexity_catalog_state() -> PerplexityCatalogState:
             is_fresh=is_fresh,
             is_authoritative=is_authoritative,
             fetched_at=state.fetched_at,
+            last_failure=state.last_failure,
         )
     return state
 
@@ -293,14 +296,26 @@ async def refresh_perplexity_catalog(
         return current
 
     endpoint = "https://api.perplexity.ai/v1/models"
+    failure = None
     try:
         if http_client is not None:
             resp = await http_client.get(endpoint, timeout=timeout)
         else:
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 resp = await client.get(endpoint)
-        if resp.status_code == 200:
+        try:
             data = resp.json()
+        except (TypeError, ValueError):
+            data = {}
+        from provider_failures import parse_provider_failure
+        failure = parse_provider_failure(
+            "Perplexity",
+            "catalog",
+            getattr(resp, "status_code", None),
+            data,
+            getattr(resp, "headers", None) or {},
+        )
+        if failure is None and getattr(resp, "status_code", None) == 200:
             raw_list: list[Any] = []
             if isinstance(data, list):
                 raw_list = data
@@ -329,10 +344,32 @@ async def refresh_perplexity_catalog(
                     is_fresh=True,
                     is_authoritative=True,
                     fetched_at=now,
+                    last_failure=None,
                 )
                 return _current_perplexity_catalog_state
-    except Exception:
-        pass
+        if failure is None:
+            from provider_failures import parse_provider_failure
+            failure = parse_provider_failure(
+                "Perplexity",
+                "catalog",
+                getattr(resp, "status_code", None),
+                {"error": {"code": "invalid_response", "message": "catalog contained no selectable models"}},
+                getattr(resp, "headers", None) or {},
+            )
+    except Exception as exc:
+        from provider_failures import normalize_exception
+        failure = normalize_exception(exc, "Perplexity", "catalog")
+
+    if failure is not None:
+        logging.warning(
+            "Perplexity catalog refresh failed classification=%s detail=%s request_id=%s",
+            failure.classification,
+            failure.detail_code,
+            failure.request_id,
+        )
+        failure_diagnostics = failure.diagnostics()
+    else:
+        failure_diagnostics = None
 
     # Fallback on network or status failure
     if current.source in {"live", "stale_live"} and current.models:
@@ -342,6 +379,7 @@ async def refresh_perplexity_catalog(
             is_fresh=False,
             is_authoritative=False,
             fetched_at=current.fetched_at,
+            last_failure=failure_diagnostics,
         )
     else:
         _current_perplexity_catalog_state = PerplexityCatalogState(
@@ -350,6 +388,7 @@ async def refresh_perplexity_catalog(
             is_fresh=False,
             is_authoritative=False,
             fetched_at=0.0,
+            last_failure=failure_diagnostics,
         )
     return _current_perplexity_catalog_state
 

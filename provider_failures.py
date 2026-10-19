@@ -4,7 +4,7 @@ import json
 import math
 import re
 import ssl
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Mapping
@@ -72,6 +72,7 @@ class ProviderFailure:
     transient: bool = False
     operator_action_required: bool = False
     classification_source: str = "provider_structured"
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
 
     def diagnostics(self) -> dict[str, Any]:
         return asdict(self)
@@ -103,18 +104,46 @@ _CODE_GROUPS = {
     "provider_unavailable": "provider_unavailable service_unavailable service_unavailable_error unavailable",
     "provider_5xx": "server server_error api_error internal",
     "timeout": "timeout timeout_error deadline_exceeded",
-    "invalid_request": "invalid_request invalid_request_error invalid_argument invalid_prompt precondition_failed payload_too_large unprocessable asr_unprocessable_entity unimplemented already_exists conflict_error invalid_image image_too_large image_too_small unsupported_image_format image_not_found image_download_failed",
+    "invalid_request": "invalid_request invalid_request_error invalid_argument invalid_prompt precondition_failed payload_too_large unprocessable asr_unprocessable_entity unimplemented already_exists conflict_error invalid_image image_too_large image_too_small unsupported_image_format image_not_found image_download_failed out_of_range parameter_unknown",
     "invalid_model_or_resource": "not_found not_found_error model_not_found",
     "configuration": "failed_precondition",
     "context_limit": "context_length_exceeded token_limit_exceeded string_too_long request_too_large",
-    "output_budget_exhausted": "max_tokens_exceeded max_output_tokens",
-    "content_policy": "content_policy_violation refusal safety recitation language prohibited_content spii blocklist image_safety image_prohibited_content image_recitation content_blocked",
-    "provider_rejection": "aborted malformed_function_call malformed_tool_call unexpected_tool_call too_many_tool_calls missing_thought_signature no_image image_other",
+    "output_budget_exhausted": "max_tokens max_tokens_exceeded max_output_tokens",
+    "content_policy": "content_policy_violation refusal safety recitation language prohibited_content spii blocklist image_safety image_prohibited_content image_recitation image_other content_blocked",
+    "provider_rejection": "aborted malformed_function_call malformed_tool_call unexpected_tool_call too_many_tool_calls missing_thought_signature no_image",
+    "empty_response": "empty_response",
+    "invalid_response": "invalid_response",
     "cancelled": "cancelled",
     "unknown": "unmapped",
 }
 CODE_CLASSES = {code: cls for cls, codes in _CODE_GROUPS.items() for code in codes.split()}
 OPENROUTER_TYPES = frozenset("context_length_exceeded max_tokens_exceeded token_limit_exceeded string_too_long authentication permission_denied payment_required rate_limit_exceeded provider_overloaded provider_unavailable invalid_request invalid_prompt not_found precondition_failed payload_too_large unprocessable content_policy_violation refusal invalid_image image_too_large image_too_small unsupported_image_format image_not_found image_download_failed server timeout unmapped".split())
+
+
+def _sanitize_provider_metadata(value: Any, *, depth: int = 0) -> Any:
+    if depth > 3:
+        return "[truncated]"
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_provider_metadata(item, depth=depth + 1)
+            for key, item in list(value.items())[:24]
+            if str(key).lower() not in {"authorization", "api_key", "apikey", "token", "password", "secret"}
+        }
+    if isinstance(value, list):
+        return [_sanitize_provider_metadata(item, depth=depth + 1) for item in value[:24]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return safe_message(value, 500) if isinstance(value, str) else value
+    return safe_message(value, 500)
+
+
+def _provider_metadata(data: dict[str, Any], error: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if error:
+        metadata["error"] = _sanitize_provider_metadata(error)
+    for key in ("status", "request_id", "requestId", "interaction_id", "id", "promptFeedback"):
+        if key in data:
+            metadata[key] = _sanitize_provider_metadata(data[key])
+    return metadata
 
 
 def _status_class(status: int | None, provider: str) -> str:
@@ -140,6 +169,11 @@ def parse_provider_failure(
         if body is not None and headers is None and isinstance(body, Mapping):
             headers = body
         operation, http_status, body = "chat", operation, http_status
+    if http_status is not None and not isinstance(http_status, int):
+        try:
+            http_status = int(http_status)
+        except (TypeError, ValueError):
+            http_status = None
     name = provider.lower()
     data = body if isinstance(body, dict) else {}
     error = data.get("error")
@@ -207,7 +241,12 @@ def parse_provider_failure(
     ):
         classification, signal, source = "insufficient_balance_quota", "spend_limit", "message_fallback"
     if name in {"kie", "openai"} and effective_status == 401:
-        if "access permissions" in lowered or "ip allowlist" in lowered or "ip not authorized" in lowered:
+        if (
+            "access permissions" in lowered
+            or "ip allowlist" in lowered
+            or "ip not authorized" in lowered
+            or ("ip" in lowered and "not authorized" in lowered)
+        ):
             classification = "permission" if name == "kie" else "forbidden_geo"
             signal, source = "access_policy", "message_fallback"
     if name == "openai" and effective_status == 403 and any(x in lowered for x in ("country", "region", "territory")):
@@ -219,6 +258,11 @@ def parse_provider_failure(
         )
     ):
         classification, signal, source = "insufficient_balance_quota", "billing_or_spend_limit", "message_fallback"
+    if name == "openai" and effective_status == 400 and classification == "invalid_request" and (
+        any(marker in lowered for marker in ("unsupported size", "invalid size", "image size", "resolution"))
+        or ("size" in lowered and any(marker in lowered for marker in ("unsupported", "not supported", "invalid")))
+    ):
+        signal, source = "size_incompatible", "message_fallback"
     if name == "perplexity" and effective_status in {400, 422} and any(
         marker in lowered for marker in (
             "model not found", "unknown model", "invalid model", "does not exist",
@@ -239,6 +283,11 @@ def parse_provider_failure(
         marker in lowered for marker in ("security policy", "cloudflare", "access denied", "blocked")
     ):
         classification, signal, source = "provider_rejection", "security_policy", "message_fallback"
+    if name == "kie" and any(
+        marker in lowered
+        for marker in ("content policy", "content_policy", "safety", "prohibited content", "moderation")
+    ):
+        classification, signal, source = "content_policy", "content_policy_violation", "message_fallback"
     if name == "gemini" and normalized_type == "resource_exhausted":
         details = err.get("details") or []
         quota_ids = [str(v.get("quotaId", "")).lower() for d in details if isinstance(d, dict)
@@ -269,9 +318,11 @@ def parse_provider_failure(
         data.get("request_id")
         or data.get("requestId")
         or data.get("id")
+        or data.get("interaction_id")
         or err.get("request_id")
         or metadata.get("request_id")
         or header_values.get("x-request-id")
+        or header_values.get("x-goog-request-id")
         or header_values.get("request-id")
         or header_values.get("cf-ray")
         or task_data.get("taskId")
@@ -284,6 +335,26 @@ def parse_provider_failure(
         request_id=safe_message(request_id, 200) if request_id else None,
         retryable=retryable, transient=retryable, retry_after_seconds=retry_after,
         operator_action_required=operator, classification_source=source,
+        provider_metadata=_provider_metadata(data, err),
+    )
+
+
+def is_openai_image_size_incompatibility(failure: ProviderFailure | None) -> bool:
+    if failure is None or failure.provider.lower() != "openai" or failure.classification != "invalid_request":
+        return False
+    if failure.detail_code == "size_incompatible":
+        return True
+    signal = " ".join(
+        value.lower()
+        for value in (
+            failure.provider_error_code or "",
+            failure.provider_error_type or "",
+            failure.provider_error_message or "",
+        )
+    )
+    return (
+        any(marker in signal for marker in ("unsupported size", "invalid size", "image size", "resolution"))
+        or ("size" in signal and any(marker in signal for marker in ("unsupported", "not supported", "invalid")))
     )
 
 
