@@ -1563,7 +1563,7 @@ async def get_ai_response(
 
         stable_system_prompt = _build_user_system_prompt(user, ai_config, active_topic)
         _, editable_media = await load_available_media(session, active_topic_id)
-        edit_sources = format_media_edit_sources(editable_media, capabilities=MAX_CAPABILITIES, allow_image_edit=bool(ai_config.allow_image_edit))
+        edit_sources = format_media_edit_sources(editable_media, capabilities=MAX_CAPABILITIES, allow_image_edit=bool(getattr(ai_config, 'allow_image_edit', False)))
 
         relevant_chunks = []
         if active_topic:

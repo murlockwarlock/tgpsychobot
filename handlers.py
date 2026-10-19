@@ -23790,7 +23790,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             )
 
             _, media_files = await load_available_media(session, current_topic_id)
-            available_media_text, media_instruction_block = format_available_media_text(media_files, current_topic_id, allow_image_edit=bool(ai_config.allow_image_edit))
+            available_media_text, media_instruction_block = format_available_media_text(media_files, current_topic_id, allow_image_edit=bool(getattr(ai_config, 'allow_image_edit', False)))
 
             memory_mode = get_memory_mode(ai_config)
             request_layout = await build_conversational_request_layout(

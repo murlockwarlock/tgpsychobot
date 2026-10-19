@@ -2050,7 +2050,7 @@ async def get_ai_response(
             return "❌ Ошибка: Конфигурация ИИ не найдена."
 
         _, media_files = await load_available_media(session, active_topic_id)
-        available_media_text, media_instruction_block = format_available_media_text(media_files, active_topic_id, allow_image_edit=bool(ai_config.allow_image_edit))
+        available_media_text, media_instruction_block = format_available_media_text(media_files, active_topic_id, allow_image_edit=bool(getattr(ai_config, 'allow_image_edit', False)))
 
         provider = ai_config.provider
         provider_key = provider.strip().lower() if provider else ""
