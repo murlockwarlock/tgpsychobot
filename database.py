@@ -3,8 +3,8 @@ import hashlib
 import re
 import textwrap
 from sqlalchemy import (create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, BigInteger, Table,
-                        Float, Interval, Index, UniqueConstraint, CheckConstraint, func, text)
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship, validates
+                        Float, Interval, Index, UniqueConstraint, CheckConstraint, LargeBinary, func, text)
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, validates, deferred
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession as SQLAlchemyAsyncSession
 from datetime import datetime, timedelta
@@ -1464,6 +1464,18 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
 
 
 
+def _migrate_media_edit_sources(sync_conn):
+    from sqlalchemy import inspect
+
+    media_columns = {column['name'] for column in inspect(sync_conn).get_columns('media_library')}
+    for column in ('source_platform', 'source_url'):
+        if column not in media_columns:
+            sync_conn.execute(text(f"ALTER TABLE media_library ADD COLUMN {column} VARCHAR"))
+    if 'source_image_bytes' not in media_columns:
+        binary_type = 'BYTEA' if sync_conn.dialect.name == 'postgresql' else 'BLOB'
+        sync_conn.execute(text(f"ALTER TABLE media_library ADD COLUMN source_image_bytes {binary_type}"))
+
+
 async def init_db():
     async with engine.begin() as conn:
         await _acquire_database_init_lock(conn)
@@ -1474,6 +1486,7 @@ async def init_db():
         def _check_and_migrate(sync_conn):
             insp = sa_inspect(sync_conn)
             dialect_name = getattr(sync_conn.dialect, "name", "")
+            _migrate_media_edit_sources(sync_conn)
             sync_conn.execute(text(
                 "UPDATE media_library SET media_type = 'photo' "
                 "WHERE LOWER(media_type) = 'image'"
@@ -2517,6 +2530,9 @@ class MediaLibrary(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     topic_id = Column(Integer, ForeignKey('topics.id'), nullable=True)
     file_id = Column(String, nullable=False)
+    source_platform = Column(String, nullable=True)
+    source_url = Column(String, nullable=True)
+    source_image_bytes = deferred(Column(LargeBinary, nullable=True))
     file_name = Column(String, nullable=True)
     category = Column(String, nullable=True)
     description = Column(Text, nullable=True)

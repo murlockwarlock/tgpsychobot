@@ -545,6 +545,7 @@ async def test_max_app_add_attachment_with_caption_keeps_attachment_token(monkey
         message.sender.user_id,
         media_token="attachment-token",
         media_type="photo",
+        source_url=None,
     )
 
 
@@ -571,6 +572,7 @@ async def test_max_app_edit_attachment_with_caption_keeps_attachment_token(monke
         message.sender.user_id,
         token="attachment-token",
         media_type="photo",
+        source_url=None,
     )
 
 

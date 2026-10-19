@@ -808,7 +808,7 @@ class MaxBotApplication:
             if state.state == "admin_media_edit_file":
                 token = message.media_token or text.strip()
                 mtype = canonical_media_type(message.media_type) if message.media_token else None
-                await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype)
+                await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype, source_url=message.media_url)
                 return
             if state.state == "admin_media_add_file":
                 if message.media_token:
@@ -819,6 +819,7 @@ class MaxBotApplication:
                         message.sender.user_id,
                         media_token=message.media_token,
                         media_type=canonical_media_type(message.media_type),
+                        source_url=message.media_url,
                     )
                 else:
                     await admin_topic_media_service.receive_add_file(
@@ -856,9 +857,9 @@ class MaxBotApplication:
                     token = message.media_token
                     mtype = canonical_media_type(message.media_type)
                     if state.state == "admin_media_add_file":
-                        await admin_topic_media_service.receive_add_file(self.client, self.states, message.chat_id, message.sender.user_id, media_token=token, media_type=mtype)
+                        await admin_topic_media_service.receive_add_file(self.client, self.states, message.chat_id, message.sender.user_id, media_token=token, media_type=mtype, source_url=message.media_url)
                     else:
-                        await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype)
+                        await admin_topic_media_service.save_edit_file(self.client, self.states, message.chat_id, message.sender.user_id, token=token, media_type=mtype, source_url=message.media_url)
                     return
 
             # Handle media attachments

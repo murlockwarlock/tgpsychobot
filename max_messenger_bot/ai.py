@@ -21,7 +21,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 import gemini_image
 
-from prompt_blocks import MAX_CAPABILITIES
+from prompt_blocks import MAX_CAPABILITIES, format_media_edit_sources
+from media_scope import load_available_media
 from ai_integration import _build_ai_attempt
 from ai_log_context import apply_ai_log_context, record_ai_attempt_log
 from ai_request_builder import (
@@ -1561,6 +1562,8 @@ async def get_ai_response(
         actual_model = _resolve_log_model(ai_config, actual_provider)
 
         stable_system_prompt = _build_user_system_prompt(user, ai_config, active_topic)
+        _, editable_media = await load_available_media(session, active_topic_id)
+        edit_sources = format_media_edit_sources(editable_media, capabilities=MAX_CAPABILITIES, allow_image_edit=bool(getattr(ai_config, 'allow_image_edit', False)))
 
         relevant_chunks = []
         if active_topic:
@@ -1618,6 +1621,7 @@ async def get_ai_response(
             minutes_since_last_message=minutes_since_last_message,
             knowledge_context=context,
             service_capabilities=MAX_CAPABILITIES,
+            media_edit_sources=edit_sources,
         )
         temperature = _resolve_temperature(ai_config)
         request_group_id = uuid.uuid4().hex[:12]
@@ -2942,6 +2946,8 @@ async def analyze_image(
         )
 
         stable_system_prompt = _build_user_system_prompt(user, config, user.current_topic)
+        _, editable_media = await load_available_media(session, active_topic_id)
+        edit_sources = format_media_edit_sources(editable_media, capabilities=MAX_CAPABILITIES, allow_image_edit=bool(getattr(config, 'allow_image_edit', False)))
 
         request_layout = await build_conversational_request_layout(
             session,
@@ -2955,6 +2961,7 @@ async def analyze_image(
             minutes_since_last_message=gap_msg,
             service_capabilities=MAX_CAPABILITIES,
             modality_instructions=(photo_instructions,),
+            media_edit_sources=edit_sources,
         )
 
     if execution_context is not None:

@@ -815,6 +815,7 @@ class MaxBotMediaTests(unittest.IsolatedAsyncioTestCase):
         
         with (
             patch.object(ai, "async_session_maker", return_value=session_context),
+            patch.object(ai, "load_available_media", AsyncMock(return_value=(None, []))),
             patch(
                 "automation_engine.build_runtime_automation_context",
                 AsyncMock(return_value="current_state=photo metadata=vision-meta"),

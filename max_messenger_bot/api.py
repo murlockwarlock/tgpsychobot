@@ -345,6 +345,26 @@ class MaxApiClient:
             if tmp_path:
                 Path(tmp_path).unlink(missing_ok=True)
 
+    async def download_attachment_url(self, url: str) -> bytes:
+        import aiohttp
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(url)
+        allowed_host = any(parsed.hostname == domain or (parsed.hostname or '').endswith('.' + domain)
+                           for domain in ('max.ru', 'oneme.ru', 'okcdn.ru'))
+        if parsed.scheme != "https" or not allowed_host or parsed.username or parsed.password or parsed.port not in (None, 443):
+            raise MaxApiError("Invalid attachment download URL")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as http:
+            async with http.get(url, allow_redirects=False) as response:
+                if response.status != 200:
+                    raise MaxApiError(f"Attachment download failed: HTTP {response.status}")
+                content = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    content.extend(chunk)
+                    if len(content) > 20 * 1024 * 1024:
+                        raise MaxApiError("Attachment exceeds image edit limit")
+                return bytes(content)
+
     async def download_attachment(self, token: str, url: str | None = None) -> bytes:
         """Download a user-sent attachment by URL (preferred) or via API token."""
         import aiohttp as _aiohttp
@@ -356,7 +376,8 @@ class MaxApiClient:
                         return await resp.read()
                     log.warning("MAX attachment direct download failed status=%s url=%s", resp.status, url)
 
-        result = await self._request("GET", f"/uploads/{token}")
+        from urllib.parse import quote
+        result = await self._request("GET", f"/uploads/{quote(token, safe='')}")
         download_url = result.get("url") or result.get("download_url")
         if download_url:
             async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=60)) as http:

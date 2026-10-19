@@ -251,6 +251,7 @@ from prompt_blocks import (
     render_prompt_block,
 )
 from media_scope import load_available_media
+from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, validate_edited_media_source, MediaSourceError
 from provider_models import (
     DEEPSEEK_DEFAULT_MODEL,
     DEEPSEEK_MODELS,
@@ -2110,6 +2111,63 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
     return clean_text
 
 
+@dataclass(frozen=True)
+class MediaEditDelivery:
+    content: str | None
+
+
+async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_config):
+    directive, clean_text = extract_media_edit_directive(response)
+    if clean_text == response.strip() and directive is None:
+        return None
+
+    async def current():
+        return await media_edit_context_is_current(async_session_maker, user_id, dialogue_id, topic_id)
+
+    if not await current():
+        return MediaEditDelivery(None)
+    clean_text, button_rows = extract_response_buttons(clean_text)
+    presentation = await _prepare_telegram_response_buttons(user_id, button_rows)
+    if directive is None:
+        error_text = "Не удалось распознать запрос на редактирование изображения."
+        await bot.send_message(chat_id=user_id, text=error_text)
+        return MediaEditDelivery(error_text)
+    try:
+        edited = await edit_media_image(
+            directive, session_factory=async_session_maker, user_id=user_id,
+            dialogue_id=dialogue_id, topic_id=topic_id, edit_image=ai_integration.edit_image,
+            telegram_bot=bot,
+        )
+        if not await current():
+            return MediaEditDelivery(None)
+        if not edited or not edited.image_bytes:
+            raise MediaSourceError("Не удалось отредактировать изображение.")
+        for chunk in split_html_text(markdown_to_html(clean_text)) if clean_text else []:
+            if not await current():
+                return MediaEditDelivery(None)
+            await _safe_send_html(lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm), chunk)
+        if not await current():
+            return MediaEditDelivery(None)
+        await validate_edited_media_source(async_session_maker, media_id=directive.media_id, topic_id=topic_id, source_identity=edited.source_identity)
+        if not await current():
+            return MediaEditDelivery(None)
+        await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(edited.image_bytes, filename="edited.png"),
+                             caption="✨ Результат редактирования:", reply_markup=_telegram_response_text_markup(presentation))
+    except Exception as exc:
+        if not await current():
+            return MediaEditDelivery(None)
+        if isinstance(exc, MediaSourceError):
+            error_text = str(exc)
+        else:
+            provider, model = _resolve_ai_provider_model(ai_config, "image_edit")
+            await _report_ai_failure(bot, title="Сбой редактирования изображения", user=SimpleNamespace(id=user_id),
+                                     provider=provider, model=model, stage="edit_image", details=str(exc), exception=exc)
+            error_text = "Не удалось отредактировать изображение. Попробуйте позже."
+        await bot.send_message(chat_id=user_id, text=error_text)
+        return MediaEditDelivery(error_text)
+    return MediaEditDelivery(clean_text or '[Изображение]')
+
+
 def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None, str]:
     pattern = rf"{directive}:\s*(.+?)(?=\n\s*\n|\n(?:[#>*-]|\d+\.)\s|\Z)"
     match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
@@ -2370,6 +2428,9 @@ async def process_buffered_messages(
     ai_config = None
     try:
         async with async_session_maker() as session:
+            request_user = await session.get(User, user_id)
+            request_dialogue_id = request_user.current_dialogue_id if request_user else None
+            request_topic_id = request_user.current_topic_id if request_user else None
             ai_config = await session.get(AIConfig, 1)
             general_config = await session.get(BotGeneralConfig, 1)
             locale = await resolve_user_effective_locale(session, user_id)
@@ -2390,6 +2451,20 @@ async def process_buffered_messages(
             exclude_message_id=exclude_message_id,
         )
         ai_context_content = response_capture.get("raw_response") or response_text
+        if not await _check_scope_guard():
+            return
+        media_delivery = await _deliver_media_edit(bot, user_id, response_text, request_dialogue_id, request_topic_id, ai_config)
+        if media_delivery is not None:
+            await _delete_ai_processing_message(processing_message)
+            if media_delivery.content is not None and await media_edit_context_is_current(async_session_maker, user_id, request_dialogue_id, request_topic_id):
+                async with async_session_maker() as session:
+                    if not (scoped_kickoff and scoped_kickoff.is_hidden):
+                        session.add(DBMessage(user_id=user_id, role='user', content=history_user_text, ai_context_content=user_ai_context_content,
+                                              dialogue_id=request_dialogue_id, topic_id=request_topic_id))
+                    session.add(DBMessage(user_id=user_id, role='assistant', content=media_delivery.content,
+                                          dialogue_id=request_dialogue_id, topic_id=request_topic_id))
+                    await session.commit()
+            return
 
         # Post-call validation for scoped hidden kickoff
         if not await _check_scope_guard():
@@ -8863,7 +8938,16 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             user_gender,
             bot=bot,
         )
-        
+        media_delivery = await _deliver_media_edit(bot, user_id, response_text, dialogue_id, topic_id, ai_config)
+        if media_delivery is not None:
+            await _delete_ai_processing_message(thinking_msg)
+            if media_delivery.content is not None and await media_edit_context_is_current(async_session_maker, user_id, dialogue_id, topic_id):
+                async with async_session_maker() as session:
+                    session.add(DBMessage(user_id=user_id, role='assistant', content=media_delivery.content,
+                                          dialogue_id=dialogue_id, topic_id=topic_id))
+                    await session.commit()
+            return
+
         should_start_test, response_without_test_directive = extract_test_start_directive(response_text)
         clean_text, audios, random_imgs, choices, choices_hidden, show_imgs = await handle_ai_media_content(bot, user_id, response_without_test_directive)
         clean_text, response_button_rows = extract_response_buttons(clean_text)
@@ -12493,6 +12577,7 @@ async def _finish_collection_upload(message: Message, state: FSMContext, descrip
         media = MediaLibrary(
             media_type=data['upload_media_type'],
             file_id=data['upload_file_id'],
+            source_platform='telegram',
             file_name=data['upload_file_name'],
             category=data.get('upload_category', ''),
             description=normalized_description,
@@ -23708,7 +23793,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             )
 
             _, media_files = await load_available_media(session, current_topic_id)
-            available_media_text, media_instruction_block = format_available_media_text(media_files, current_topic_id)
+            available_media_text, media_instruction_block = format_available_media_text(media_files, current_topic_id, allow_image_edit=bool(getattr(ai_config, 'allow_image_edit', False)))
 
             memory_mode = get_memory_mode(ai_config)
             request_layout = await build_conversational_request_layout(
@@ -23834,6 +23919,16 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         # =========================================================================
         # Outer Conversational Layer: Fresh scope checks, message sending, assistant DB persistence
         # =========================================================================
+        media_delivery = await _deliver_media_edit(bot, user_id, visible_text, current_dialogue_id, current_topic_id, ai_config)
+        if media_delivery is not None:
+            if processing_msg:
+                await _delete_ai_processing_message(processing_msg)
+            if media_delivery.content is not None and await media_edit_context_is_current(async_session_maker, user_id, current_dialogue_id, current_topic_id):
+                async with async_session_maker() as session:
+                    session.add(DBMessage(user_id=user_id, role='assistant', content=media_delivery.content,
+                                          dialogue_id=current_dialogue_id, topic_id=current_topic_id))
+                    await session.commit()
+            return
         edit_prompt, clean_text = _extract_ai_directive_payload(visible_text, "EDIT_IMG")
         gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
 
@@ -24242,6 +24337,9 @@ async def admin_media_edit_file_finish(message: Message, state: FSMContext):
                 await message.answer("Файл не найден в этой коллекции.")
                 return
             media.file_id = file_id
+            media.source_platform = 'telegram'
+            media.source_url = None
+            media.source_image_bytes = None
             media.media_type = m_type
             await session.commit()
         page = data.get('collection_page', 0)
