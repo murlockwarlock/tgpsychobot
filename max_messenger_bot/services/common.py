@@ -36,6 +36,7 @@ from .subscription_access import load_active_subscription
 from memory_mode import normalize_memory_mode
 from dialogue_reset_policy import configured_metadata_reset_mode, start_new_dialogue_scope
 from ai_retry_policy import is_retryable_ai_error
+from translation_service import resolve_user_effective_locale, translate
 from response_buttons import ResponseButton, build_action_callback_data, extract_response_buttons, extract_test_start_directive
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
@@ -46,6 +47,21 @@ log = get_bot_logger("common")
 
 
 MSK = timezone(timedelta(hours=3))
+
+
+async def _localized_ai_terminal_message(user_id: int, retryable: bool) -> str:
+    key = "ui.ai.overloaded.max" if retryable else "ui.ai.service_unavailable"
+    fallback = (
+        "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос."
+        if retryable
+        else "К сожалению, сервис временно недоступен из-за технической проблемы."
+    )
+    try:
+        async with async_session_maker() as session:
+            locale = await resolve_user_effective_locale(session, user_id, platform="max")
+    except Exception:
+        locale = "ru"
+    return translate(key, locale, fallback=fallback) or fallback
 
 
 async def _notify_referrer_about_registration(
@@ -838,8 +854,8 @@ async def save_user_message(user_id: int, prompt_text: str) -> DBMessage | None:
             topic_id=user.current_topic_id,
         )
         session.add(msg)
+        await session.flush()
         await session.commit()
-        await session.refresh(msg)
         return msg
 
 
@@ -1042,10 +1058,12 @@ async def _execute_ai_dialogue_turn(
         failed_log_id = getattr(exc, "ai_log_id", None)
         if not failed_log_id and getattr(exc, "ai_log_ids", None):
             failed_log_id = exc.ai_log_ids[-1]
-        if original_message_id and failed_log_id and is_retryable_ai_error(exc):
+        retryable_group = is_retryable_ai_error(exc)
+        retryable_terminal = bool(original_message_id and failed_log_id and retryable_group)
+        if retryable_terminal:
             from ..keyboards import ai_retry_keyboard_max
             attachments = ai_retry_keyboard_max(original_message_id, failed_log_id=failed_log_id)
-        text = "Сервис ИИ временно недоступен. Попробуйте позже."
+        text = await _localized_ai_terminal_message(user_id, retryable_group)
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text=text, attachments=attachments)
             thinking_message_id = None

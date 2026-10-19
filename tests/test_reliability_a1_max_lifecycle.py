@@ -112,7 +112,7 @@ class TestA1MaxTemporaryStatusLifecycle:
 
         assert len(client.events) == 2
         assert client.events[0] == ("send_message", "🤖 Думаю...", "mid.thinking.123")
-        assert client.events[1] == ("edit_message", "Сервис ИИ временно недоступен. Попробуйте позже.", "mid.thinking.123")
+        assert client.events[1] == ("edit_message", "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос.", "mid.thinking.123")
 
     async def test_07_chat_unexpected_exception(self):
         client = MockMaxClient()

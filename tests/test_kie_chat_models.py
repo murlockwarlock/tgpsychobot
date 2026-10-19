@@ -507,16 +507,19 @@ async def test_kie_http_200_channel_rejection_is_provider_error_with_full_metada
 
     error = raised.value
     assert not isinstance(error, module.InsufficientBalanceError)
-    assert error.classification == "provider_rejection"
+    assert error.classification == "invalid_request"
     assert error.provider == "KIE"
     assert error.model == "gemini-3-flash"
     assert error.provider_code == 422
     assert error.provider_message == "The channel is not supported"
     assert error.http_status == 200
-    assert error.diagnostics == {
-        "provider_code": 422,
-        "provider_message": "The channel is not supported",
-    }
+    assert error.diagnostics["provider_code"] == 422
+    assert error.diagnostics["provider_message"] == "The channel is not supported"
+    assert error.diagnostics["classification"] == "invalid_request"
+    assert error.diagnostics["detail_code"] == "422"
+    assert error.diagnostics["http_status"] == 200
+    assert error.diagnostics["retryable"] is False
+    assert error.diagnostics["classification_source"] == "provider_structured"
     assert json.loads(error.provider_response_payload) == error_payload
 
 

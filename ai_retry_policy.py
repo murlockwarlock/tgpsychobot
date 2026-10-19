@@ -4,23 +4,32 @@ from collections import OrderedDict
 from typing import Any
 
 from error_reporting import classify_external_error
+from provider_failures import evaluate_request_group_retryability
 
 RETRYABLE_ERROR_CLASSIFICATIONS = frozenset({
     "timeout",
     "network_ssl",
     "network_connection",
+    "proxy_error",
     "provider_5xx",
+    "provider_overloaded",
+    "provider_unavailable",
     "rate_limit",
     "empty_response",
     "invalid_response",
-    "unknown",
 })
 
 NON_RETRYABLE_ERROR_CLASSIFICATIONS = frozenset({
     "configuration",
     "auth",
+    "permission",
     "forbidden_geo",
     "insufficient_balance_quota",
+    "invalid_model_or_resource",
+    "invalid_request",
+    "context_limit",
+    "content_policy",
+    "cancelled",
     "provider_rejection",
     "output_budget_exhausted",
     "application_internal",
@@ -40,16 +49,17 @@ def is_retryable_classification(classification: str | None) -> bool:
 def is_retryable_ai_error(exception: Exception | None, provider: str | None = None) -> bool:
     if exception is None:
         return False
+    attempts = getattr(exception, "provider_attempts", None)
+    if attempts:
+        return evaluate_request_group_retryability(attempts)
+    effective_provider = provider or getattr(exception, "provider", None)
+    failure = getattr(exception, "failure", None)
+    if failure is not None:
+        return failure.network_attempted and failure.retryable
     explicit = getattr(exception, "classification", None)
     if explicit and isinstance(explicit, str):
         return is_retryable_classification(explicit)
-    attempts = getattr(exception, "provider_attempts", None)
-    if attempts:
-        for attempt in reversed(attempts):
-            attempt_cls = getattr(attempt, "classification", None)
-            if attempt_cls and isinstance(attempt_cls, str):
-                return is_retryable_classification(attempt_cls)
-    code, _ = classify_external_error(exception, provider=provider)
+    code, _ = classify_external_error(exception, provider=effective_provider)
     return is_retryable_classification(code)
 
 
@@ -124,6 +134,7 @@ async def validate_terminal_failure_retry_eligibility(
 
     # Determine effective terminal failure outcome across the entire request group
     terminal_row = failed_log
+    group_rows = [failed_log]
     if failed_log.request_group_id:
         stmt = (
             select(AILog)
@@ -138,7 +149,7 @@ async def validate_terminal_failure_retry_eligibility(
 
     # Effective terminal classification must be retryable
     term_classification = terminal_row.error_classification
-    if not is_retryable_classification(term_classification):
+    if not evaluate_request_group_retryability(group_rows):
         return False, f"non_retryable_classification:{term_classification}", terminal_row
 
     # Check if a later chat turn with the exact same prompt already succeeded in this dialogue/topic

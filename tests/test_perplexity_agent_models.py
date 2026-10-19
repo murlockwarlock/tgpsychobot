@@ -876,6 +876,46 @@ async def test_429_retry_policy_rate_limit_vs_quota():
     assert capture_i["will_retry"] is False
 
 
+@pytest.mark.asyncio
+async def test_429_credits_exhausted_without_typed_code_stops_after_one_physical_call():
+    url = "https://api.perplexity.ai/v1/agent"
+    payload = {"model": "sonar-pro", "input": "test"}
+    calls = 0
+    capture = {}
+
+    def mock_credits_exhausted(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429,
+            headers={"x-request-id": "ppx-credit-429", "retry-after": "0"},
+            json={"error": {"message": "credits exhausted"}},
+        )
+
+    with patch("httpx.AsyncClient", mock_httpx_async_client(httpx.MockTransport(mock_credits_exhausted))), \
+         patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(ProviderAdapterError) as exc_info:
+            await _post_perplexity_json(
+                url,
+                headers={"Authorization": "Bearer TEST_KEY"},
+                payload=payload,
+                timeout=5.0,
+                request_capture=capture,
+                max_attempts=2,
+            )
+
+    failure = exc_info.value.failure
+    assert calls == 1
+    assert exc_info.value.category == "insufficient_balance_quota"
+    assert failure.classification == "insufficient_balance_quota"
+    assert failure.retryable is False
+    assert failure.operator_action_required is True
+    assert failure.request_id == "ppx-credit-429"
+    assert capture["classification"] == "insufficient_balance_quota"
+    assert capture["is_retryable"] is False
+    assert capture["will_retry"] is False
+
+
 # ---------------------------------------------------------------------------
 # 7. Table-Driven Error Classification with Realistic Full Bodies
 # ---------------------------------------------------------------------------
@@ -2654,4 +2694,44 @@ def test_direct_models_heading_and_10_per_page_pagination():
     assert len(max_btns_p1) == 12
     assert [b["text"] for b in max_btns_p1[-2]] == ["⬅️ Назад"]
     assert max_btns_p1[-2][0]["payload"] == "admin_ai_ppx_models_0"
+
+
+@pytest.mark.asyncio
+async def test_perplexity_catalog_refresh_keeps_structured_failure_observable():
+    class Client:
+        async def get(self, endpoint, timeout):
+            return httpx.Response(
+                429,
+                headers={"x-request-id": "ppx-catalog-rate-1", "retry-after": "7"},
+                json={
+                    "error": {
+                        "type": "rate_limit_error",
+                        "code": "rate_limit_exceeded",
+                        "message": "catalog rate limited",
+                    }
+                },
+            )
+
+    state = await refresh_perplexity_catalog(force=True, http_client=Client())
+
+    assert state.source == "static_fallback"
+    assert state.last_failure["classification"] == "rate_limit"
+    assert state.last_failure["retryable"] is True
+    assert state.last_failure["retry_after_seconds"] == 7.0
+    assert state.last_failure["request_id"] == "ppx-catalog-rate-1"
+    assert state.last_failure["classification_source"] == "provider_structured"
+
+
+@pytest.mark.asyncio
+async def test_perplexity_catalog_refresh_keeps_transport_failure_observable():
+    class Client:
+        async def get(self, endpoint, timeout):
+            raise httpx.ReadTimeout("catalog read timeout")
+
+    state = await refresh_perplexity_catalog(force=True, http_client=Client())
+
+    assert state.source == "static_fallback"
+    assert state.last_failure["classification"] == "timeout"
+    assert state.last_failure["retryable"] is True
+    assert state.last_failure["classification_source"] == "transport"
 

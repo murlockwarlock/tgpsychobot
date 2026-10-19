@@ -35,52 +35,20 @@ def is_kie_error_payload(payload: Any) -> bool:
     """Return whether a JSON response is a KIE error envelope."""
     return (
         isinstance(payload, dict)
-        and payload.get("code") not in (None, 200, "200")
+        and (bool(payload.get("error")) or payload.get("code") not in (None, 200, "200"))
     )
 
 
 def is_kie_insufficient_balance(status_code: int, payload: Any) -> bool:
-    """Recognize KIE credit failures without deciding how callers handle them."""
-    if status_code == 402:
-        return True
-    if not isinstance(payload, dict):
-        return False
-
-    if str(payload.get("code", "")).strip() == "402":
-        return True
-
-    detail = payload.get("msg") or payload.get("message") or str(payload)
-    lowered = str(detail).lower()
-    return any(
-        marker in lowered
-        for marker in ("insufficient", "billing", "quota", "balance", "credit")
-    )
+    from provider_failures import parse_provider_failure
+    failure = parse_provider_failure("KIE", "chat", status_code, payload)
+    return failure is not None and failure.classification == "insufficient_balance_quota"
 
 
 def kie_error_classification(status_code: int, payload: Any) -> str | None:
-    if status_code != 200:
-        code = str(status_code)
-    elif isinstance(payload, dict):
-        code = str(payload.get("code", "")).strip()
-    else:
-        code = ""
-    classifications = {
-        "401": "auth",
-        "402": "insufficient_balance_quota",
-        "403": "forbidden_geo",
-        "429": "rate_limit",
-        "400": "provider_rejection",
-        "409": "provider_rejection",
-        "422": "provider_rejection",
-        "500": "provider_5xx",
-        "502": "provider_5xx",
-        "503": "provider_5xx",
-        "504": "provider_5xx",
-    }
-    classification = classifications.get(code)
-    if classification is not None:
-        return classification
-    return "provider_rejection" if status_code == 200 else None
+    from provider_failures import parse_provider_failure
+    failure = parse_provider_failure("KIE", "chat", status_code, payload)
+    return failure.classification if failure is not None else None
 
 
 def _value(message: Any, key: str, default: Any = None) -> Any:
