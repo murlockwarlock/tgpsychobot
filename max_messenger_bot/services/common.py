@@ -41,7 +41,7 @@ from response_buttons import ResponseButton, build_action_callback_data, extract
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
 from telegram_start_service import grant_subscription_days
-from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, resolve_editable_media_source, media_source_identity, MediaSourceError
+from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, validate_edited_media_source, MediaSourceError
 
 
 log = get_bot_logger("common")
@@ -953,16 +953,16 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
         token = result.get("token") or result.get("fileId")
         if not token:
             raise MediaSourceError("Не удалось отправить отредактированное изображение.")
-        async with async_session_maker() as session:
-            current_media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
-            if media_source_identity(current_media) != edited.source_identity:
-                raise MediaSourceError("Исходное изображение изменилось. Повторите запрос.")
+        await validate_edited_media_source(async_session_maker, media_id=directive.media_id, topic_id=topic_id, source_identity=edited.source_identity)
         if clean_text or buttons:
             chunks = split_text(markdown_to_html(clean_text or 'Выберите действие:'))
             for index, chunk in enumerate(chunks):
                 if not await current():
                     return True
                 await _send_ai_text(client, chat_id, None, [chunk], buttons if index == len(chunks) - 1 else [])
+        if not await current():
+            return True
+        await validate_edited_media_source(async_session_maker, media_id=directive.media_id, topic_id=topic_id, source_identity=edited.source_identity)
         if not await current():
             return True
         await client.send_media_attachment(chat_id=chat_id, media_type="image", token=token)

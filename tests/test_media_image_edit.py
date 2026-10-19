@@ -71,7 +71,7 @@ def test_parser(text):
     assert clean == 'Вот вариант:'
 
 
-@pytest.mark.parametrize('text', ['[EDIT_IMG_MEDIA:]', '[EDIT_IMG_MEDIA: abc | x]', '[EDIT_IMG_MEDIA: -1 | x]', '[EDIT_IMG_MEDIA: 1]', '[EDIT_IMG_MEDIA: 0 | x]', '[EDIT_IMG_MEDIA: 999999999999999999 | x]', '[EDIT_IMG_MEDIA: https://x | x]', '[EDIT_IMG_MEDIA: ../../../ | x]', '[EDIT_IMG_MEDIA: 1 | ]', '[EDIT_IMG_MEDIA: 1 | x', '[EDIT_IMG_MEDIA: 1 | x]\n[EDIT_IMG_MEDIA: 2 | y]'])
+@pytest.mark.parametrize('text', ['[EDIT_IMG_MEDIA:]', '[EDIT_IMG_MEDIA: abc | x]', '[EDIT_IMG_MEDIA: -1 | x]', '[EDIT_IMG_MEDIA: 1]', '[EDIT_IMG_MEDIA: 0 | x]', '[EDIT_IMG_MEDIA: 999999999999999999 | x]', '[EDIT_IMG_MEDIA: https://x | x]', '[EDIT_IMG_MEDIA: ../../../ | x]', '[EDIT_IMG_MEDIA: 1 | ]', '[EDIT_IMG_MEDIA: 1 | x', '[EDIT_IMG_MEDIA: 1 | x]\n[EDIT_IMG_MEDIA: 2 | y]', '[EDIT_IMG_MEDIA]', '[EDIT_IMG_MEDIA 1 | x]', '[EDIT_IMG_MEDIA', 'EDIT_IMG_MEDIA 1 | x'])
 def test_malformed(text):
     directive, clean = extract_media_edit_directive(text)
     assert directive is None
@@ -674,6 +674,67 @@ async def test_scope_or_source_changed_during_media_work(session_factory,media_s
         await asyncio.gather(*list(application.background_tasks))
     assert not any(item.get('type') == 'image' for _,_,kwargs in client.wire for item in kwargs.get('json_data',{}).get('attachments',[]))
     assert not any('Вот вариант' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('platform', ['telegram', 'max'])
+@pytest.mark.parametrize('mutation', ['file_id', 'scope'])
+async def test_source_changed_during_preamble_is_not_delivered(session_factory, media_setup, monkeypatch, platform, mutation):
+    from sqlalchemy import delete
+    media_id = 10 if platform == 'telegram' else 40
+    response = f'Вот вариант:\n[EDIT_IMG_MEDIA: {media_id} | make the sky blue]'
+    async def replace():
+        async with session_factory() as session:
+            if mutation == 'scope':
+                await session.execute(delete(topic_collection_association).where(topic_collection_association.c.topic_id == 1))
+            else:
+                (await session.get(MediaLibrary, media_id)).file_id = 'replacement'
+            await session.commit()
+    if platform == 'telegram':
+        transport = TelegramTransport()
+        original_request = transport.make_request
+        async def request(bot, method, timeout=None):
+            if isinstance(method, SendMessage) and 'Вот вариант' in method.text:
+                await replace()
+            return await original_request(bot, method, timeout)
+        monkeypatch.setattr(transport, 'make_request', request)
+        bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+        handlers.router._parent_router = None
+        dispatcher = Dispatcher()
+        dispatcher.include_router(handlers.router)
+        monkeypatch.setattr(ai_integration, '_call_gemini_api', AsyncMock(return_value=response))
+        monkeypatch.setattr(ai_integration, '_call_kie_image_edit', AsyncMock(return_value=b'edited'))
+        try:
+            await dispatcher.feed_update(bot, Update(update_id=81, message=Message(message_id=81, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'), text='Измени портрет')))
+            if media_setup in handlers.user_processing_tasks:
+                await handlers.user_processing_tasks[media_setup]
+            assert not any(isinstance(call, SendPhoto) for call in transport.calls)
+        finally:
+            dispatcher.sub_routers.clear()
+            handlers.router._parent_router = None
+            await bot.session.close()
+        user_id = media_setup
+    else:
+        client = MaxTransport()
+        original_request = client._request
+        async def request(method, path, **kwargs):
+            if 'Вот вариант' in (kwargs.get('json_data', {}).get('text') or ''):
+                await replace()
+            return await original_request(method, path, **kwargs)
+        monkeypatch.setattr(client, '_request', request)
+        monkeypatch.setattr(max_ai, '_dispatch_provider', AsyncMock(return_value=response))
+        monkeypatch.setattr(max_ai, '_edit_kie', AsyncMock(return_value=b'edited'))
+        application = max_app.MaxBotApplication(client)
+        await application.handle_update({'update_type': 'message_created', 'update_id': 'preamble-change', 'message': {'sender': {'user_id': 7, 'name': 'Max'}, 'recipient': {'chat_id': 100}, 'body': {'mid': 'preamble-incoming', 'text': 'Измени портрет'}}})
+        if application.background_tasks:
+            await asyncio.gather(*list(application.background_tasks))
+        assert client.uploads == [('image', b'edited')]
+        assert not any(item.get('type') == 'image' for _, _, kwargs in client.wire for item in kwargs.get('json_data', {}).get('attachments', []))
+        user_id = 100000000007
+    async with session_factory() as session:
+        history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == user_id, DBMessage.role == 'assistant'))).all()
+        assert len(history) == 1
+        assert 'изменилось' in history[0].content or 'недоступно' in history[0].content
 
 
 @pytest.mark.asyncio

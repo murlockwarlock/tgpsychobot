@@ -251,7 +251,7 @@ from prompt_blocks import (
     render_prompt_block,
 )
 from media_scope import load_available_media
-from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, MediaSourceError
+from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, validate_edited_media_source, MediaSourceError
 from provider_models import (
     DEEPSEEK_DEFAULT_MODEL,
     DEEPSEEK_MODELS,
@@ -2146,6 +2146,9 @@ async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_
             if not await current():
                 return MediaEditDelivery(None)
             await _safe_send_html(lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm), chunk)
+        if not await current():
+            return MediaEditDelivery(None)
+        await validate_edited_media_source(async_session_maker, media_id=directive.media_id, topic_id=topic_id, source_identity=edited.source_identity)
         if not await current():
             return MediaEditDelivery(None)
         await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(edited.image_bytes, filename="edited.png"),

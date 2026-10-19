@@ -35,7 +35,7 @@ def media_source_identity(media):
 
 
 def extract_media_edit_directive(text: str) -> tuple[MediaEditDirective | None, str]:
-    pattern = re.compile(r"\[EDIT_IMG_MEDIA\s*:[^\]]*(?:\]|$)", re.IGNORECASE)
+    pattern = re.compile(r"\[EDIT_IMG_MEDIA\b[^\]]*(?:\]|$)", re.IGNORECASE)
     matches = list(pattern.finditer(text))
     directive = None
     if len(matches) == 1:
@@ -46,7 +46,7 @@ def extract_media_edit_directive(text: str) -> tuple[MediaEditDirective | None, 
         if match and 0 < int(match[1]) <= 2147483647 and match[2].strip():
             directive = MediaEditDirective(int(match[1]), match[2].strip())
     clean = pattern.sub("", text)
-    clean = re.sub(r"(?im)^\s*EDIT_IMG_MEDIA\s*:.*$", "", clean)
+    clean = re.sub(r"(?im)^\s*EDIT_IMG_MEDIA\b.*$", "", clean)
     if matches:
         starts_test, without_test = extract_test_start_directive(clean)
         other_commands = re.compile(
@@ -81,6 +81,13 @@ async def media_edit_context_is_current(session_factory, user_id, dialogue_id, t
     async with session_factory() as session:
         user = await session.get(User, user_id)
         return bool(user and user.current_dialogue_id == dialogue_id and user.current_topic_id == topic_id)
+
+
+async def validate_edited_media_source(session_factory, *, media_id, topic_id, source_identity):
+    async with session_factory() as session:
+        media = await resolve_editable_media_source(session, media_id=media_id, topic_id=topic_id)
+        if media_source_identity(media) != source_identity:
+            raise MediaSourceError("Исходное изображение изменилось. Повторите запрос.")
 
 
 async def download_max_image_source(client, file_id, source_url=None):
