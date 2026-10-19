@@ -41,6 +41,7 @@ from response_buttons import ResponseButton, build_action_callback_data, extract
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
 from telegram_start_service import grant_subscription_days
+from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, MediaSourceError
 
 
 log = get_bot_logger("common")
@@ -916,6 +917,49 @@ async def _transition_image_progress_status(
     return progress_mid, None
 
 
+async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, topic_id):
+    directive, clean_text = extract_media_edit_directive(response)
+    if directive is None and clean_text == response.strip():
+        return False
+
+    async def current():
+        return await media_edit_context_is_current(async_session_maker, user_id, dialogue_id, topic_id)
+
+    if not await current():
+        return True
+    clean_text, buttons = extract_response_buttons(clean_text)
+    if clean_text:
+        await _send_ai_text(client, chat_id, None, split_text(markdown_to_html(clean_text)), buttons)
+    if directive is None:
+        await client.send_message(chat_id=chat_id, text="Не удалось распознать запрос на редактирование изображения.")
+        return True
+    try:
+        edited = await edit_media_image(
+            directive, session_factory=async_session_maker, user_id=user_id,
+            dialogue_id=dialogue_id, topic_id=topic_id, edit_image=edit_image, max_client=client,
+        )
+        if not await current():
+            return True
+        if not edited:
+            raise MediaSourceError("Не удалось отредактировать изображение.")
+        with tempfile.NamedTemporaryFile(suffix=".png") as temporary:
+            temporary.write(edited)
+            temporary.flush()
+            result = await client.upload_file("image", temporary.name)
+        if not await current():
+            return True
+        token = result.get("token") or result.get("fileId")
+        if not token:
+            raise MediaSourceError("Не удалось отправить отредактированное изображение.")
+        await client.send_media_attachment(chat_id=chat_id, media_type="image", token=token)
+        await save_ai_message(user_id, clean_text or '[Изображение]', dialogue_id=dialogue_id, topic_id=topic_id)
+    except Exception as exc:
+        if await current():
+            text = str(exc) if isinstance(exc, MediaSourceError) else "Не удалось отредактировать изображение. Попробуйте позже."
+            await client.send_message(chat_id=chat_id, text=text)
+    return True
+
+
 async def _execute_ai_dialogue_turn(
     client: MaxApiClient,
     chat_id: int,
@@ -932,6 +976,8 @@ async def _execute_ai_dialogue_turn(
     topic_phrase = None
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        request_dialogue_id = user.current_dialogue_id if user else None
+        request_topic_id = user.current_topic_id if user else None
         if user and user.current_topic_id:
             topic_phrase = await get_random_message_by_topic(user.current_topic_id)
     final_prompt = prompt_text
@@ -942,6 +988,11 @@ async def _execute_ai_dialogue_turn(
         response_text = await get_ai_response(user_id, final_prompt, exclude_message_id=exclude_message_id)
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ")
+
+        if await _deliver_media_edit(client, chat_id, user_id, response_text, request_dialogue_id, request_topic_id):
+            if thinking_message_id:
+                await client.delete_message(thinking_message_id)
+            return
 
         should_start_test, response_without_test_directive = extract_test_start_directive(response_text)
         await save_ai_message(user_id, response_without_test_directive)
@@ -1204,6 +1255,10 @@ async def run_hidden_ai_kickoff(
                 return
 
         should_start_test, response_without_test_directive = extract_test_start_directive(response_text)
+        if await _deliver_media_edit(client, chat_id, user_id, response_without_test_directive, expected_dialogue_id, expected_topic_id):
+            if thinking_message_id:
+                await client.delete_message(thinking_message_id)
+            return
         await save_ai_message(user_id, response_without_test_directive, dialogue_id=expected_dialogue_id, topic_id=expected_topic_id)
 
         if should_start_test:
@@ -1348,6 +1403,8 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
     prompt = caption or "Опиши это изображение подробно."
     user_msg = await save_user_message(user_id, f"[Изображение] {prompt}")
     user_msg_id = getattr(user_msg, "id", None) if user_msg else None
+    request_dialogue_id = getattr(user_msg, 'dialogue_id', None)
+    request_topic_id = getattr(user_msg, 'topic_id', None)
     thinking = await client.send_message(chat_id=chat_id, text="🤖 Анализирую изображение...")
     thinking_message_id = extract_sent_message_id(thinking)
 
@@ -1370,6 +1427,10 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
         if not response_text or not response_text.strip():
             raise AIServiceError("ИИ вернул пустой ответ при анализе изображения")
 
+        if await _deliver_media_edit(client, chat_id, user_id, response_text, request_dialogue_id, request_topic_id):
+            if thinking_message_id:
+                await client.delete_message(thinking_message_id)
+            return
         edit_prompt, clean_text = _extract_ai_directive_payload(response_text, "EDIT_IMG")
         gen_prompt, clean_text = _extract_ai_directive_payload(clean_text, "GEN_IMG")
 

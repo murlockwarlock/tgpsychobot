@@ -401,12 +401,20 @@ async def save_edit_file(
     user_id: int,
     token: str | None,
     media_type: str | None,
+    source_url: str | None = None,
 ) -> None:
     media_type = canonical_media_type(media_type)
     if not token:
         await client.send_message(chat_id=chat_id, text="Отправь файл или вставь его токен.")
         return
-    updates = {"file_id": token}
+    source_bytes = None
+    if media_type == 'photo' and source_url:
+        try:
+            source_bytes = await client.download_attachment_url(source_url)
+        except Exception:
+            await client.send_message(chat_id=chat_id, text="Не удалось сохранить исходное изображение. Отправьте файл ещё раз.")
+            return
+    updates = {"file_id": token, "source_platform": "max", "source_url": source_url, "source_image_bytes": source_bytes}
     if media_type:
         updates["media_type"] = media_type
     await _save_edit(
@@ -508,6 +516,7 @@ async def receive_add_file(
     text: str | None = None,
     media_token: str | None = None,
     media_type: str | None = None,
+    source_url: str | None = None,
 ) -> None:
     media_type = canonical_media_type(media_type)
     snapshot = await states.get(user_id)
@@ -537,7 +546,7 @@ async def receive_add_file(
         user_id,
         chat_id,
         "admin_media_add_name",
-        {**data, "topic_id": topic_id, "token": token, "media_type": m_type},
+        {**data, "topic_id": topic_id, "token": token, "media_type": m_type, "source_url": source_url},
     )
     await client.send_message(
         chat_id=chat_id,
@@ -650,6 +659,14 @@ async def save_add_description(
         await client.send_message(chat_id=chat_id, text="Состояние добавления потеряно.")
         return
 
+    source_bytes = None
+    if m_type == 'photo' and data.get('source_url'):
+        try:
+            source_bytes = await client.download_attachment_url(data['source_url'])
+        except Exception:
+            await client.send_message(chat_id=chat_id, text="Не удалось сохранить исходное изображение. Попробуйте ещё раз.")
+            return
+
     async with async_session_maker() as session:
         scope = await load_media_scope(session, topic_id, include_media_ids=False)
         if collection_id not in scope.collection_ids:
@@ -659,6 +676,9 @@ async def save_add_description(
         new_media = MediaLibrary(
             media_type=m_type,
             file_id=token,
+            source_platform="max",
+            source_url=data.get("source_url"),
+            source_image_bytes=source_bytes,
             file_name=m_name,
             category=category,
             description=text.strip() or None,

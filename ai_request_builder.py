@@ -351,6 +351,7 @@ async def build_conversational_request_layout(
     knowledge_context: str = "",
     available_media_text: str = "",
     media_instruction_block: str = "",
+    media_edit_sources: str = "",
     subscription_config: SubscriptionConfig | None = None,
     load_subscription_config: bool = True,
     include_subscription_status: bool = True,
@@ -386,6 +387,7 @@ async def build_conversational_request_layout(
             capabilities=service_capabilities,
             available_media_text=available_media_text,
             media_instruction_block=media_instruction_block,
+            media_edit_sources=media_edit_sources,
             test_context_injection="",
             short_response_instruction="",
         )

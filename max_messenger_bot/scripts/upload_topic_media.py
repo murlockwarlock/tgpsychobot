@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -78,6 +79,8 @@ async def main_async() -> None:
         media = MediaLibrary(
             media_type=media_type,
             file_id=token,
+            source_platform="max",
+            source_image_bytes=Path(args.file).read_bytes() if media_type == 'photo' else None,
             file_name=args.file_name,
             category=args.category,
             description=args.description,
