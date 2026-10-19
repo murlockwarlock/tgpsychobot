@@ -39,15 +39,18 @@ def extract_media_edit_directive(text: str) -> tuple[MediaEditDirective | None, 
     return directive, clean.strip()
 
 
-async def resolve_editable_media_source(session, *, media_id: int, topic_id: int | None):
+async def resolve_editable_media_source(session, *, media_id: int, topic_id: int | None, include_source_bytes: bool = False):
     if type(media_id) is not int or not 0 < media_id <= 2147483647:
         raise MediaSourceError("Изображение недоступно в текущей теме.")
     scope = await load_media_scope(session, topic_id, include_media_ids=False)
-    media = await session.scalar(select(MediaLibrary).options(undefer(MediaLibrary.source_image_bytes)).where(
+    query = select(MediaLibrary).where(
         MediaLibrary.id == media_id,
         scope.predicate(),
         MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
-    ))
+    )
+    if include_source_bytes:
+        query = query.options(undefer(MediaLibrary.source_image_bytes))
+    media = await session.scalar(query)
     if media is None:
         raise MediaSourceError("Изображение недоступно в текущей теме.")
     return media
@@ -128,7 +131,7 @@ async def edit_media_image(directive, *, session_factory, user_id, dialogue_id, 
         return None
     async with session_factory() as session:
         await ensure_enabled(session)
-        media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
+        media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id, include_source_bytes=True)
     image_bytes = await load_media_image_bytes(media, telegram_bot=telegram_bot, max_client=max_client)
     if not await current():
         return None

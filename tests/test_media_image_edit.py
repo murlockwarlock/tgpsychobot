@@ -377,10 +377,39 @@ async def test_cached_max_source_survives_url_expiry(session_factory, media_setu
         media.source_image_bytes = b'persistent-original'
         await session.commit()
     async with session_factory() as session:
-        media = await resolve_editable_media_source(session,media_id=40,topic_id=1)
+        media = await resolve_editable_media_source(session,media_id=40,topic_id=1,include_source_bytes=True)
     client = SimpleNamespace(download_attachment_url=AsyncMock(side_effect=RuntimeError('expired')))
     assert await load_media_image_bytes(media,max_client=client) == b'persistent-original'
     client.download_attachment_url.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_max_cached_source_read_once(async_engine, session_factory, media_setup, monkeypatch):
+    from sqlalchemy import event
+    async with session_factory() as session:
+        (await session.get(MediaLibrary, 40)).source_image_bytes = b'cached-original'
+        await session.commit()
+    statements = []
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith('SELECT'):
+            statements.append(statement)
+    event.listen(async_engine.sync_engine, 'before_cursor_execute', record)
+    client = MaxTransport()
+    application = max_app.MaxBotApplication(client)
+    monkeypatch.setattr(max_ai, '_dispatch_provider', AsyncMock(return_value='[EDIT_IMG_MEDIA: 40 | make the sky blue]'))
+    edit = AsyncMock(return_value=b'edited-cached-image')
+    monkeypatch.setattr(max_ai, '_edit_kie', edit)
+    try:
+        await application.handle_update({'update_type': 'message_created', 'update_id': 'cached-edit', 'message': {'sender': {'user_id': 7, 'name': 'Max'}, 'recipient': {'chat_id': 100}, 'body': {'mid': 'cached-incoming', 'text': 'Измени портрет'}}})
+        if application.background_tasks:
+            await asyncio.gather(*list(application.background_tasks))
+    finally:
+        event.remove(async_engine.sync_engine, 'before_cursor_execute', record)
+    assert len([statement for statement in statements if 'media_library.source_image_bytes' in statement]) == 1
+    assert edit.await_args.args[-1] == b'cached-original'
+    assert client.sources == []
+    assert client.uploads == [('image', b'edited-cached-image')]
+    assert any({'type': 'image', 'payload': {'token': 'edited-token'}} in kwargs.get('json_data', {}).get('attachments', []) for _, _, kwargs in client.wire)
 
 
 @pytest.mark.asyncio
@@ -453,7 +482,7 @@ async def test_max_admin_preserves_source_bytes(session_factory,media_setup):
         await admin_topic_media.save_add_description(client,state,100,100000000007,'Portrait')
     async with session_factory() as session:
         media_id = await session.scalar(select(MediaLibrary.id).where(MediaLibrary.file_name == 'new'))
-        media = await resolve_editable_media_source(session,media_id=media_id,topic_id=1)
+        media = await resolve_editable_media_source(session,media_id=media_id,topic_id=1,include_source_bytes=True)
         assert media.source_platform == 'max'
         assert media.source_image_bytes == b'original-max-image'
         assert media.file_id == 'new-token'
