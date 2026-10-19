@@ -860,13 +860,15 @@ async def save_user_message(user_id: int, prompt_text: str) -> DBMessage | None:
         return msg
 
 
-async def save_ai_message(user_id: int, response_text: str, dialogue_id: int | None = None, topic_id: int | None = None) -> None:
+async def save_ai_message(user_id: int, response_text: str, dialogue_id: int | None = None, topic_id: int | None = None, *, require_current_scope: bool = False) -> None:
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
             return
+        if require_current_scope and (user.current_dialogue_id != dialogue_id or user.current_topic_id != topic_id):
+            return
         target_dialogue_id = dialogue_id if dialogue_id is not None else user.current_dialogue_id
-        target_topic_id = topic_id if topic_id is not None else user.current_topic_id
+        target_topic_id = topic_id if require_current_scope or topic_id is not None else user.current_topic_id
         session.add(
             DBMessage(
                 user_id=user_id,
@@ -929,7 +931,9 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
         return True
     clean_text, buttons = extract_response_buttons(clean_text)
     if directive is None:
-        await client.send_message(chat_id=chat_id, text="Не удалось распознать запрос на редактирование изображения.")
+        error_text = "Не удалось распознать запрос на редактирование изображения."
+        await client.send_message(chat_id=chat_id, text=error_text)
+        await save_ai_message(user_id, error_text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
         return True
     try:
         edited = await edit_media_image(
@@ -960,11 +964,12 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
         if not await current():
             return True
         await client.send_media_attachment(chat_id=chat_id, media_type="image", token=token)
-        await save_ai_message(user_id, clean_text or '[Изображение]', dialogue_id=dialogue_id, topic_id=topic_id)
+        await save_ai_message(user_id, clean_text or '[Изображение]', dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
     except Exception as exc:
         if await current():
             text = str(exc) if isinstance(exc, MediaSourceError) else "Не удалось отредактировать изображение. Попробуйте позже."
             await client.send_message(chat_id=chat_id, text=text)
+            await save_ai_message(user_id, text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
     return True
 
 

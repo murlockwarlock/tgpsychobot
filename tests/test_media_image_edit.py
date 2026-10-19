@@ -272,7 +272,9 @@ async def test_max_handle_update_journey(session_factory, media_setup, monkeypat
     assert all('EDIT_IMG_MEDIA' not in (kwargs.get('json_data', {}).get('text') or '') for _,_,kwargs in client.wire)
     async with session_factory() as session:
         history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == 100000000007, DBMessage.role == 'assistant'))).all()
-        assert bool(history) is (media_id in (10,40,41,42) and not stale)
+        assert bool(history) is (not stale)
+        if history and media_id not in (10,40,41,42):
+            assert 'недоступно' in history[0].content
     if stale:
         assert not any('Вот вариант' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)
 
@@ -399,6 +401,11 @@ async def test_max_failures_no_output(session_factory,media_setup,monkeypatch,fa
     assert edit.await_count == int(failure == 'provider')
     assert not client.uploads
     assert any('Не удалось' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)
+    async with session_factory() as session:
+        history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == 100000000007,DBMessage.role == 'assistant'))).all()
+        assert len(history) == 1
+        assert history[0].topic_id == 1 and history[0].dialogue_id == 1
+        assert history[0].content == next(kwargs['json_data']['text'] for _,_,kwargs in client.wire if 'Не удалось' in (kwargs.get('json_data',{}).get('text') or ''))
 
 
 @pytest.mark.asyncio
@@ -491,3 +498,26 @@ async def test_scope_revoked_during_media_work(session_factory,media_setup,monke
     await common.run_ai_dialogue(client,100,100000000007,'Измени портрет')
     assert not any(item.get('type') == 'image' for _,_,kwargs in client.wire for item in kwargs.get('json_data',{}).get('attachments',[]))
     assert not any('Вот вариант' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)
+
+
+@pytest.mark.asyncio
+async def test_max_error_history_does_not_move_to_new_topic(session_factory,media_setup,monkeypatch):
+    client = MaxTransport()
+    original_request = client._request
+    async def request(method,path,**kwargs):
+        if 'Не удалось' in (kwargs.get('json_data',{}).get('text') or ''):
+            async with session_factory() as session:
+                user = await session.get(User,100000000007)
+                user.current_topic_id = 2
+                await session.commit()
+        return await original_request(method,path,**kwargs)
+    monkeypatch.setattr(client,'_request',request)
+    monkeypatch.setattr(max_ai,'_dispatch_provider',AsyncMock(return_value='[EDIT_IMG_MEDIA: 40 | blue sky]'))
+    monkeypatch.setattr(client,'download_attachment_url',AsyncMock(side_effect=RuntimeError('unavailable')))
+    async with session_factory() as session:
+        user = await session.get(User,100000000007)
+        user.current_topic_id = None
+        await session.commit()
+    await common.run_ai_dialogue(client,100,100000000007,'Измени портрет')
+    async with session_factory() as session:
+        assert not (await session.scalars(select(DBMessage).where(DBMessage.user_id == 100000000007,DBMessage.role == 'assistant'))).all()
