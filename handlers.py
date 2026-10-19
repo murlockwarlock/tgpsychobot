@@ -2140,7 +2140,7 @@ async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_
         )
         if not await current():
             return MediaEditDelivery(None)
-        if not edited:
+        if not edited or not edited.image_bytes:
             raise MediaSourceError("Не удалось отредактировать изображение.")
         for chunk in split_html_text(markdown_to_html(clean_text)) if clean_text else []:
             if not await current():
@@ -2148,7 +2148,7 @@ async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_
             await _safe_send_html(lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm), chunk)
         if not await current():
             return MediaEditDelivery(None)
-        await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(edited, filename="edited.png"),
+        await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(edited.image_bytes, filename="edited.png"),
                              caption="✨ Результат редактирования:", reply_markup=_telegram_response_text_markup(presentation))
     except Exception as exc:
         if not await current():
@@ -2456,7 +2456,7 @@ async def process_buffered_messages(
             if media_delivery.content is not None and await media_edit_context_is_current(async_session_maker, user_id, request_dialogue_id, request_topic_id):
                 async with async_session_maker() as session:
                     if not (scoped_kickoff and scoped_kickoff.is_hidden):
-                        session.add(DBMessage(user_id=user_id, role='user', content=history_user_text,
+                        session.add(DBMessage(user_id=user_id, role='user', content=history_user_text, ai_context_content=user_ai_context_content,
                                               dialogue_id=request_dialogue_id, topic_id=request_topic_id))
                     session.add(DBMessage(user_id=user_id, role='assistant', content=media_delivery.content,
                                           dialogue_id=request_dialogue_id, topic_id=request_topic_id))

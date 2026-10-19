@@ -24,6 +24,16 @@ class MediaEditDirective:
     prompt: str
 
 
+@dataclass(frozen=True)
+class EditedMediaImage:
+    image_bytes: bytes
+    source_identity: tuple[str, str | None, str | None]
+
+
+def media_source_identity(media):
+    return media.file_id, media.source_platform, media.source_url
+
+
 def extract_media_edit_directive(text: str) -> tuple[MediaEditDirective | None, str]:
     pattern = re.compile(r"\[EDIT_IMG_MEDIA\s*:[^\]]*(?:\]|$)", re.IGNORECASE)
     matches = list(pattern.finditer(text))
@@ -73,12 +83,24 @@ async def media_edit_context_is_current(session_factory, user_id, dialogue_id, t
         return bool(user and user.current_dialogue_id == dialogue_id and user.current_topic_id == topic_id)
 
 
+async def download_max_image_source(client, file_id, source_url=None):
+    def validate(content):
+        if not isinstance(content, bytes) or not content or len(content) > 20 * 1024 * 1024:
+            raise MediaSourceError("Не удалось загрузить исходное изображение.")
+        return content
+
+    if source_url:
+        try:
+            return validate(await client.download_attachment_url(source_url))
+        except Exception:
+            pass
+    return validate(await client.download_attachment(file_id))
+
+
 async def load_media_image_bytes(media, *, telegram_bot=None, max_client=None) -> bytes:
     async def load_max():
         async def download(client):
-            if media.source_url:
-                return await client.download_attachment_url(media.source_url)
-            return await client.download_attachment(media.file_id)
+            return await download_max_image_source(client, media.file_id, media.source_url)
 
         if max_client is not None:
             return await download(max_client)
@@ -143,19 +165,20 @@ async def edit_media_image(directive, *, session_factory, user_id, dialogue_id, 
     async with session_factory() as session:
         await ensure_enabled(session)
         media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id, include_source_bytes=True)
+    source_identity = media_source_identity(media)
     image_bytes = await load_media_image_bytes(media, telegram_bot=telegram_bot, max_client=max_client)
     if not await current():
         return None
     async with session_factory() as session:
         await ensure_enabled(session)
         current_media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
-        if current_media.file_id != media.file_id:
+        if media_source_identity(current_media) != source_identity:
             raise MediaSourceError("Исходное изображение изменилось. Повторите запрос.")
     edited = await edit_image(directive.prompt, image_bytes)
     if not await current():
         return None
     async with session_factory() as session:
         current_media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
-        if current_media.file_id != media.file_id:
+        if media_source_identity(current_media) != source_identity:
             raise MediaSourceError("Исходное изображение изменилось. Повторите запрос.")
-    return edited
+    return EditedMediaImage(edited, source_identity)

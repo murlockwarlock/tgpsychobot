@@ -41,7 +41,7 @@ from response_buttons import ResponseButton, build_action_callback_data, extract
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
 from telegram_start_service import grant_subscription_days
-from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, resolve_editable_media_source, MediaSourceError
+from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, resolve_editable_media_source, media_source_identity, MediaSourceError
 
 
 log = get_bot_logger("common")
@@ -942,10 +942,10 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
         )
         if not await current():
             return True
-        if not edited:
+        if not edited or not edited.image_bytes:
             raise MediaSourceError("Не удалось отредактировать изображение.")
         with tempfile.NamedTemporaryFile(suffix=".png") as temporary:
-            temporary.write(edited)
+            temporary.write(edited.image_bytes)
             temporary.flush()
             result = await client.upload_file("image", temporary.name)
         if not await current():
@@ -954,7 +954,9 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
         if not token:
             raise MediaSourceError("Не удалось отправить отредактированное изображение.")
         async with async_session_maker() as session:
-            await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
+            current_media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
+            if media_source_identity(current_media) != edited.source_identity:
+                raise MediaSourceError("Исходное изображение изменилось. Повторите запрос.")
         if clean_text or buttons:
             chunks = split_text(markdown_to_html(clean_text or 'Выберите действие:'))
             for index, chunk in enumerate(chunks):

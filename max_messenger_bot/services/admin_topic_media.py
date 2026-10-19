@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import case, func, select
 
 from media_scope import ensure_topic_collection, load_media_scope, media_scope_predicate
+from media_image_edit import download_max_image_source
 
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard
@@ -410,7 +411,7 @@ async def save_edit_file(
     source_bytes = None
     if media_type == 'photo' and source_url:
         try:
-            source_bytes = await client.download_attachment_url(source_url)
+            source_bytes = await download_max_image_source(client, token, source_url)
         except Exception:
             await client.send_message(chat_id=chat_id, text="Не удалось сохранить исходное изображение. Отправьте файл ещё раз.")
             return
@@ -662,9 +663,10 @@ async def save_add_description(
     source_bytes = None
     if m_type == 'photo' and data.get('source_url'):
         try:
-            source_bytes = await client.download_attachment_url(data['source_url'])
+            source_bytes = await download_max_image_source(client, token, data['source_url'])
         except Exception:
-            await client.send_message(chat_id=chat_id, text="Не удалось сохранить исходное изображение. Попробуйте ещё раз.")
+            await states.set(user_id, chat_id, 'admin_media_add_file', {key: value for key, value in data.items() if key not in ('token', 'source_url')})
+            await client.send_message(chat_id=chat_id, text="Не удалось сохранить исходное изображение. Отправьте файл ещё раз.")
             return
 
     async with async_session_maker() as session:

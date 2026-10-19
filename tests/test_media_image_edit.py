@@ -15,7 +15,7 @@ import pytest_asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.methods import GetFile, SendPhoto, SendMessage
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Chat, File, Message, PhotoSize, Update, User as TelegramUser
+from aiogram.types import CallbackQuery, Chat, File, InlineKeyboardButton, InlineKeyboardMarkup, Message, PhotoSize, Update, User as TelegramUser
 from sqlalchemy import select
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -208,6 +208,39 @@ async def test_telegram_dispatcher_journey(session_factory, media_setup, monkeyp
             if history and (media_id != 10 or download_failure or not enabled):
                 assert '[Изображение]' not in history[0].content
                 assert any(text in history[0].content for text in ('недоступно', 'Не удалось', 'отключено'))
+    finally:
+        dispatcher.sub_routers.clear()
+        handlers.router._parent_router = None
+        await bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_button_edit_preserves_action_context(session_factory, media_setup, monkeypatch):
+    transport = TelegramTransport()
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+    chat = AsyncMock(return_value='[EDIT_IMG_MEDIA: 10 | make the sky blue]')
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', chat)
+    monkeypatch.setattr(ai_integration, '_call_kie_image_edit', AsyncMock(return_value=b'edited-output'))
+    try:
+        message = Message(message_id=71, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='Изменить портрет?', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Да', callback_data='ai_btn:edit_portrait')]]))
+        await dispatcher.feed_update(bot, Update(update_id=71, callback_query=CallbackQuery(id='edit-button', from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'), chat_instance='ci', message=message, data='ai_btn:edit_portrait')))
+        if media_setup in handlers.user_processing_tasks:
+            await handlers.user_processing_tasks[media_setup]
+        assert any(isinstance(call, SendPhoto) and call.photo.data == b'edited-output' for call in transport.calls)
+        async with session_factory() as session:
+            history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == media_setup, DBMessage.role == 'user'))).all()
+            assert len(history) == 1 and history[0].content == 'Да'
+            assert '(edit_portrait)' in history[0].ai_context_content
+            assert 'Да' in history[0].ai_context_content
+        chat.return_value = 'Продолжим.'
+        await dispatcher.feed_update(bot, Update(update_id=72, message=Message(message_id=72, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'), text='Продолжи')))
+        if media_setup in handlers.user_processing_tasks:
+            await handlers.user_processing_tasks[media_setup]
+        assert chat.await_count == 2
+        assert 'edit_portrait' in str(chat.await_args)
     finally:
         dispatcher.sub_routers.clear()
         handlers.router._parent_router = None
@@ -527,7 +560,8 @@ async def test_max_failures_no_output(session_factory,media_setup,monkeypatch,fa
 
 
 @pytest.mark.asyncio
-async def test_max_admin_preserves_source_bytes(session_factory,media_setup):
+@pytest.mark.parametrize('source_status', ['available', 'expired', 'retry'])
+async def test_max_admin_preserves_source_bytes(session_factory,media_setup,monkeypatch,source_status):
     from max_messenger_bot.services import admin_topic_media
     from tests.test_max_media_admin import FakeState
     from unittest.mock import patch
@@ -535,8 +569,25 @@ async def test_max_admin_preserves_source_bytes(session_factory,media_setup):
     state.state = 'admin_media_add_desc'
     state.data = {'topic_id':1,'collection_id':1,'token':'new-token','file_name':'new','media_type':'photo','source_url':'https://img.oneme.ru/source.jpg'}
     client = MaxTransport()
+    token_download = AsyncMock(return_value=b'original-max-image')
+    if source_status != 'available':
+        monkeypatch.setattr(client, 'download_attachment_url', AsyncMock(side_effect=RuntimeError('expired URL')))
+        if source_status == 'retry':
+            token_download.side_effect = RuntimeError('unavailable token')
+        monkeypatch.setattr(client, 'download_attachment', token_download)
     with patch.object(admin_topic_media,'async_session_maker',session_factory):
         await admin_topic_media.save_add_description(client,state,100,100000000007,'Portrait')
+        if source_status == 'retry':
+            assert state.state == 'admin_media_add_file'
+            async with session_factory() as session:
+                assert await session.scalar(select(MediaLibrary.id).where(MediaLibrary.file_name == 'new')) is None
+            monkeypatch.setattr(client, 'download_attachment_url', AsyncMock(return_value=b'original-max-image'))
+            await admin_topic_media.receive_add_file(client, state, 100, 100000000007, media_token='new-token', media_type='image', source_url='https://img.oneme.ru/fresh.jpg')
+            await admin_topic_media.save_add_name(client, state, 100, 100000000007, 'new')
+            await admin_topic_media.save_add_category(client, state, 100, 100000000007, 'portraits')
+            await admin_topic_media.save_add_description(client, state, 100, 100000000007, 'Portrait')
+    if source_status != 'available':
+        token_download.assert_awaited_once_with('new-token')
     async with session_factory() as session:
         media_id = await session.scalar(select(MediaLibrary.id).where(MediaLibrary.file_name == 'new'))
         media = await resolve_editable_media_source(session,media_id=media_id,topic_id=1,include_source_bytes=True)
@@ -594,13 +645,17 @@ async def test_unavailable_source_never_guesses_success(platform,error_kind):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('phase',['edit','upload'])
-async def test_scope_revoked_during_media_work(session_factory,media_setup,monkeypatch,phase):
+@pytest.mark.parametrize('phase,mutation',[('edit','scope'),('upload','scope'),('edit','file_id'),('upload','file_id'),('upload','source_platform'),('upload','source_url')])
+async def test_scope_or_source_changed_during_media_work(session_factory,media_setup,monkeypatch,phase,mutation):
     from sqlalchemy import delete
     client = MaxTransport()
     async def revoke():
         async with session_factory() as session:
-            await session.execute(delete(topic_collection_association).where(topic_collection_association.c.topic_id == 1))
+            if mutation == 'scope':
+                await session.execute(delete(topic_collection_association).where(topic_collection_association.c.topic_id == 1))
+            else:
+                media = await session.get(MediaLibrary, 40)
+                setattr(media, mutation, 'replacement')
             await session.commit()
     async def edit(*args):
         if phase == 'edit':
@@ -613,7 +668,10 @@ async def test_scope_revoked_during_media_work(session_factory,media_setup,monke
     monkeypatch.setattr(max_ai,'_dispatch_provider',AsyncMock(return_value='Вот вариант:\n[EDIT_IMG_MEDIA: 40 | blue sky]'))
     monkeypatch.setattr(max_ai,'_edit_kie',edit)
     monkeypatch.setattr(client,'upload_file',upload)
-    await common.run_ai_dialogue(client,100,100000000007,'Измени портрет')
+    application = max_app.MaxBotApplication(client)
+    await application.handle_update({'update_type': 'message_created', 'update_id': 'changed-source', 'message': {'sender': {'user_id': 7, 'name': 'Max'}, 'recipient': {'chat_id': 100}, 'body': {'mid': 'changed-source-incoming', 'text': 'Измени портрет'}}})
+    if application.background_tasks:
+        await asyncio.gather(*list(application.background_tasks))
     assert not any(item.get('type') == 'image' for _,_,kwargs in client.wire for item in kwargs.get('json_data',{}).get('attachments',[]))
     assert not any('Вот вариант' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)
 
