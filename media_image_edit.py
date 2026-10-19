@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select
 from sqlalchemy.orm import undefer
 
-from database import MediaLibrary, User
+from database import AIConfig, MediaLibrary, User
 from media_scope import PHOTO_MEDIA_TYPES, load_media_scope
 
 
@@ -119,14 +119,21 @@ async def edit_media_image(directive, *, session_factory, user_id, dialogue_id, 
     async def current():
         return await media_edit_context_is_current(session_factory, user_id, dialogue_id, topic_id)
 
+    async def ensure_enabled(session):
+        config = await session.get(AIConfig, 1)
+        if not config or not config.allow_image_edit:
+            raise MediaSourceError("Редактирование изображений отключено.")
+
     if not await current():
         return None
     async with session_factory() as session:
+        await ensure_enabled(session)
         media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
     image_bytes = await load_media_image_bytes(media, telegram_bot=telegram_bot, max_client=max_client)
     if not await current():
         return None
     async with session_factory() as session:
+        await ensure_enabled(session)
         current_media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
         if current_media.file_id != media.file_id:
             raise MediaSourceError("Исходное изображение изменилось. Повторите запрос.")

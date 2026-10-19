@@ -158,8 +158,11 @@ class TelegramTransport(ValidatingTelegramSession):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('media_id,stale,download_failure', [(10,False,False),(20,False,False),(30,False,False),(999,False,False),(10,True,False),(10,False,True)])
-async def test_telegram_dispatcher_journey(session_factory, media_setup, monkeypatch, media_id, stale, download_failure):
+@pytest.mark.parametrize('media_id,stale,download_failure,enabled', [(10,False,False,True),(20,False,False,True),(30,False,False,True),(999,False,False,True),(10,True,False,True),(10,False,True,True),(10,False,False,False)])
+async def test_telegram_dispatcher_journey(session_factory, media_setup, monkeypatch, media_id, stale, download_failure, enabled):
+    async with session_factory() as session:
+        (await session.get(AIConfig, 1)).allow_image_edit = enabled
+        await session.commit()
     transport = TelegramTransport()
     bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
     handlers.router._parent_router = None
@@ -188,10 +191,13 @@ async def test_telegram_dispatcher_journey(session_factory, media_setup, monkeyp
             await handlers.user_processing_tasks[media_setup]
         assert chat_calls
         photos = [call for call in transport.calls if isinstance(call, SendPhoto)]
-        assert len(photos) == int(media_id == 10 and not stale and not download_failure)
+        assert len(photos) == int(media_id == 10 and not stale and not download_failure and enabled)
         if photos:
             assert photos[0].photo.data == b'edited-output'
-        assert edits == ([('seedream/4.5-edit', 'make the sky blue', b'original-telegram-image')] if media_id == 10 and not download_failure else [])
+        assert edits == ([('seedream/4.5-edit', 'make the sky blue', b'original-telegram-image')] if media_id == 10 and not download_failure and enabled else [])
+        if not enabled:
+            assert not any(isinstance(call, GetFile) for call in transport.calls)
+            assert 'EDIT_IMG_MEDIA' not in str(chat_calls)
         assert all('EDIT_IMG_MEDIA' not in (getattr(call, 'text', '') or '') for call in transport.calls)
         if stale:
             assert not any('Вот вариант' in (getattr(call,'text','') or '') for call in transport.calls)
@@ -199,9 +205,9 @@ async def test_telegram_dispatcher_journey(session_factory, media_setup, monkeyp
         async with session_factory() as session:
             history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == media_setup, DBMessage.role == 'assistant'))).all()
             assert bool(history) is (not stale)
-            if history and (media_id != 10 or download_failure):
+            if history and (media_id != 10 or download_failure or not enabled):
                 assert '[Изображение]' not in history[0].content
-                assert 'недоступно' in history[0].content or 'Не удалось' in history[0].content
+                assert any(text in history[0].content for text in ('недоступно', 'Не удалось', 'отключено'))
     finally:
         dispatcher.sub_routers.clear()
         handlers.router._parent_router = None
@@ -234,8 +240,11 @@ class MaxTransport(MaxApiClient):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('media_id,stale', [(10,False),(40,False),(41,False),(42,False),(20,False),(30,False),(999,False),(40,True)])
-async def test_max_handle_update_journey(session_factory, media_setup, monkeypatch, media_id, stale):
+@pytest.mark.parametrize('media_id,stale,enabled', [(10,False,True),(40,False,True),(41,False,True),(42,False,True),(20,False,True),(30,False,True),(999,False,True),(40,True,True),(40,False,False)])
+async def test_max_handle_update_journey(session_factory, media_setup, monkeypatch, media_id, stale, enabled):
+    async with session_factory() as session:
+        (await session.get(AIConfig, 1)).allow_image_edit = enabled
+        await session.commit()
     import telegram_client
     monkeypatch.setattr(telegram_client,'create_telegram_bot',lambda token: Bot('123456:TEST_BOT_TOKEN',session=TelegramTransport()))
     client = MaxTransport()
@@ -260,21 +269,25 @@ async def test_max_handle_update_journey(session_factory, media_setup, monkeypat
         await asyncio.gather(*list(application.background_tasks))
     assert layouts
     prompt = '\n'.join(layouts[0].shared_instructions)
-    assert '[PHOTO id=40]' in prompt and '[PHOTO id=20]' not in prompt
-    assert 'EDIT_IMG_MEDIA' in prompt
+    assert ('[PHOTO id=40]' in prompt) is enabled and '[PHOTO id=20]' not in prompt
+    assert ('EDIT_IMG_MEDIA' in prompt) is enabled
     assert all(command not in prompt for command in ('SEND_AUDIO','RANDOM_IMG','CHOICE_IMG','SHOW_IMG'))
     attachments = [kwargs['json_data']['attachments'] for method,path,kwargs in client.wire if method == 'POST' and kwargs.get('json_data', {}).get('attachments')]
     image_payloads = [item for group in attachments for item in group if item['type'] == 'image']
-    assert image_payloads == ([{'type':'image','payload':{'token':'edited-token'}}] if media_id in (10,40,41,42) and not stale else [])
+    assert image_payloads == ([{'type':'image','payload':{'token':'edited-token'}}] if media_id in (10,40,41,42) and not stale and enabled else [])
     expected_source = b'original-telegram-image' if media_id == 10 else b'original-max-image'
-    assert edits == ([('seedream/4.5-edit','make the sky blue',expected_source)] if media_id in (10,40,41,42) else [])
-    assert client.uploads == ([('image',b'edited-output')] if media_id in (10,40,41,42) and not stale else [])
+    assert edits == ([('seedream/4.5-edit','make the sky blue',expected_source)] if media_id in (10,40,41,42) and enabled else [])
+    assert client.uploads == ([('image',b'edited-output')] if media_id in (10,40,41,42) and not stale and enabled else [])
+    if not enabled:
+        assert client.sources == []
     assert all('EDIT_IMG_MEDIA' not in (kwargs.get('json_data', {}).get('text') or '') for _,_,kwargs in client.wire)
     async with session_factory() as session:
         history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == 100000000007, DBMessage.role == 'assistant'))).all()
         assert bool(history) is (not stale)
         if history and media_id not in (10,40,41,42):
             assert 'недоступно' in history[0].content
+        if not enabled:
+            assert 'отключено' in history[0].content
     if stale:
         assert not any('Вот вариант' in (kwargs.get('json_data',{}).get('text') or '') for _,_,kwargs in client.wire)
 
@@ -286,6 +299,25 @@ async def test_max_token_is_never_sent_to_telegram():
     with pytest.raises(MediaSourceError):
         await load_media_image_bytes(media, telegram_bot=bot)
     bot.get_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disable_during_download_prevents_provider(session_factory, media_setup, monkeypatch):
+    import media_image_edit
+    async def download(*args, **kwargs):
+        async with session_factory() as session:
+            (await session.get(AIConfig, 1)).allow_image_edit = False
+            await session.commit()
+        return b'original-image'
+    monkeypatch.setattr(media_image_edit, 'load_media_image_bytes', download)
+    edit = AsyncMock()
+    with pytest.raises(MediaSourceError, match='отключено'):
+        await media_image_edit.edit_media_image(
+            media_image_edit.MediaEditDirective(10, 'make the sky blue'),
+            session_factory=session_factory, user_id=media_setup,
+            dialogue_id=1, topic_id=1, edit_image=edit,
+        )
+    edit.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -1563,7 +1563,7 @@ async def get_ai_response(
 
         stable_system_prompt = _build_user_system_prompt(user, ai_config, active_topic)
         _, editable_media = await load_available_media(session, active_topic_id)
-        edit_sources = format_media_edit_sources(editable_media, capabilities=MAX_CAPABILITIES)
+        edit_sources = format_media_edit_sources(editable_media, capabilities=MAX_CAPABILITIES, allow_image_edit=bool(ai_config.allow_image_edit))
 
         relevant_chunks = []
         if active_topic:
@@ -2947,7 +2947,7 @@ async def analyze_image(
 
         stable_system_prompt = _build_user_system_prompt(user, config, user.current_topic)
         _, editable_media = await load_available_media(session, active_topic_id)
-        edit_sources = format_media_edit_sources(editable_media, capabilities=MAX_CAPABILITIES)
+        edit_sources = format_media_edit_sources(editable_media, capabilities=MAX_CAPABILITIES, allow_image_edit=bool(getattr(config, 'allow_image_edit', False)))
 
         request_layout = await build_conversational_request_layout(
             session,
