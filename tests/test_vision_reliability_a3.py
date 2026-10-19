@@ -141,8 +141,8 @@ class KIEStructuredBodyCodeParserTests(unittest.IsolatedAsyncioTestCase):
             (402, "A", "insufficient_balance_quota"),
             (429, "B", "rate_limit"),
             (500, "C", "provider_5xx"),
-            (400, "D", "provider_rejection"),
-            (422, "E", "provider_rejection"),
+            (400, "D", "invalid_request"),
+            (422, "E", "invalid_request"),
         ]
         from ai_integration import _call_kie_vision_inference as tg_call_kie
         from max_messenger_bot.ai import _call_kie_vision_inference as max_call_kie

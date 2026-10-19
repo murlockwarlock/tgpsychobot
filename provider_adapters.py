@@ -113,6 +113,7 @@ class ProviderAdapterError(RuntimeError):
         request_id: str | None = None,
         proxy_used: bool | None = None,
         proxy_source: str | None = None,
+        failure=None,
     ):
         super().__init__(message)
         self.http_status = status
@@ -122,6 +123,11 @@ class ProviderAdapterError(RuntimeError):
         self.request_id = request_id
         self.proxy_used = proxy_used
         self.proxy_source = proxy_source
+        if failure is not None:
+            from provider_failures import attach_failure
+            attach_failure(self, failure)
+            self.classification = category
+            self.normalized_classification = failure.classification
 
 
 _ADAPTER_CLASSIFICATION_MAP = {
@@ -148,7 +154,11 @@ _ADAPTER_CLASSIFICATION_MAP = {
 
 
 def normalize_provider_error_classification(category: str | None) -> str:
-    return _ADAPTER_CLASSIFICATION_MAP.get(str(category or "provider"), "unknown")
+    from provider_failures import canonical_classification
+    legacy = str(category or "provider").strip().lower()
+    if legacy == "invalid_model":
+        return "configuration"
+    return canonical_classification(legacy)
 
 
 async def _mark_activity(activity_tracker: Any | None) -> None:
@@ -468,6 +478,12 @@ def _populate_perplexity_diagnostics(
             request_capture["provider_error_message"] = err["message"]
 
 
+def _perplexity_error(message: str, category: str, payload: dict[str, Any], *, status: int = 200) -> ProviderAdapterError:
+    from provider_failures import parse_provider_failure
+    failure = parse_provider_failure("Perplexity", "agent", status, payload)
+    return ProviderAdapterError(message, status=status, category=category, failure=failure) if failure else ProviderAdapterError(message, status=status, category=category)
+
+
 def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str, Any] | None = None) -> str:
     status = payload.get("status")
     if not status or not isinstance(status, str):
@@ -479,7 +495,7 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
             is_retryable=False,
             will_retry=False,
         )
-        raise ProviderAdapterError("Отсутствует обязательный статус ответа Perplexity", category="invalid_response")
+        raise _perplexity_error("Отсутствует обязательный статус ответа Perplexity", "invalid_response", payload)
 
     normalized_status = status.strip().lower()
     if normalized_status == "failed":
@@ -495,7 +511,7 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
             is_retryable=False,
             will_retry=False,
         )
-        raise ProviderAdapterError(f"Perplexity статус failed: {msg}", category=cat)
+        raise _perplexity_error(f"Perplexity статус failed: {msg}", cat, payload)
     if normalized_status == "incomplete":
         incomplete_details = payload.get("incomplete_details") if isinstance(payload.get("incomplete_details"), dict) else {}
         reason = incomplete_details.get("reason")
@@ -515,7 +531,7 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
         )
         if request_capture is not None and reason:
             request_capture["incomplete_reason"] = str(reason)
-        raise ProviderAdapterError(err_msg, category=cat)
+        raise _perplexity_error(err_msg, cat, payload)
     if normalized_status == "cancelled":
         _populate_perplexity_diagnostics(
             request_capture,
@@ -525,7 +541,7 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
             is_retryable=False,
             will_retry=False,
         )
-        raise ProviderAdapterError("Запрос к Perplexity был отменён (cancelled)", category="provider_rejection")
+        raise _perplexity_error("Запрос к Perplexity был отменён (cancelled)", "provider_rejection", payload)
     if normalized_status in {"queued", "in_progress"}:
         _populate_perplexity_diagnostics(
             request_capture,
@@ -535,7 +551,7 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
             is_retryable=False,
             will_retry=False,
         )
-        raise ProviderAdapterError(f"Неожиданный промежуточный статус Perplexity: {normalized_status}", category="invalid_response")
+        raise _perplexity_error(f"Неожиданный промежуточный статус Perplexity: {normalized_status}", "invalid_response", payload)
     if normalized_status != "completed":
         _populate_perplexity_diagnostics(
             request_capture,
@@ -545,7 +561,7 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
             is_retryable=False,
             will_retry=False,
         )
-        raise ProviderAdapterError(f"Неизвестный статус ответа Perplexity: {normalized_status}", category="invalid_response")
+        raise _perplexity_error(f"Неизвестный статус ответа Perplexity: {normalized_status}", "invalid_response", payload)
 
     if payload.get("error"):
         err = payload["error"]
@@ -560,7 +576,7 @@ def _extract_perplexity_text(payload: dict[str, Any], request_capture: dict[str,
             is_retryable=False,
             will_retry=False,
         )
-        raise ProviderAdapterError(f"Ошибка Perplexity в ответе: {msg}", category=cat)
+        raise _perplexity_error(f"Ошибка Perplexity в ответе: {msg}", cat, payload)
 
     output = payload.get("output")
     if isinstance(output, list):
@@ -897,6 +913,7 @@ async def _post_json(
     payload: dict[str, Any],
     timeout: float,
     provider: str,
+    operation: str = "chat",
     request_capture: dict | None,
     activity_tracker: Any | None = None,
     retries: int = 1,
@@ -943,7 +960,10 @@ async def _post_json(
             resp_headers = getattr(response, "headers", None) or {}
             req_id = resp_headers.get("x-request-id") or resp_headers.get("cf-ray")
 
-            if response.status_code >= 400:
+            from provider_failures import parse_provider_failure
+            failure = parse_provider_failure(provider, operation, response.status_code, data, resp_headers)
+            if failure is not None:
+                error_msg = failure.provider_error_message
                 if error_msg:
                     err_text = f"{provider} API вернул HTTP {response.status_code}: {error_msg}"
                 else:
@@ -956,16 +976,19 @@ async def _post_json(
                     request_id=req_id,
                     proxy_used=route.is_proxied,
                     proxy_source=route.proxy_source,
+                    failure=failure,
                 )
                 if request_capture is not None:
+                    request_capture.update(failure.diagnostics())
                     request_capture["http_status"] = response.status_code
-                    request_capture["classification"] = normalize_provider_error_classification(category)
+                    request_capture["classification"] = failure.classification
                     if error_msg:
                         request_capture["provider_error_message"] = error_msg
                     if req_id:
                         request_capture["request_id"] = req_id
-                if _retryable_status(response.status_code) and attempt < retries:
-                    await asyncio.sleep(0)
+                delay = failure.retry_after_seconds if failure.retry_after_seconds is not None else 0.5 * (2 ** attempt)
+                if failure.retryable and attempt < retries and delay <= 5.0 and time.monotonic() + delay < deadline:
+                    await asyncio.sleep(delay)
                     continue
                 raise error
 
@@ -1044,6 +1067,7 @@ async def call_openrouter(
     temperature: float | None = None,
     max_output_tokens: int | None = None,
     timeout: float = 60.0,
+    operation: str = "chat",
     request_capture: dict | None = None,
     activity_tracker: Any | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
@@ -1057,6 +1081,7 @@ async def call_openrouter(
         payload=payload,
         timeout=timeout,
         provider="OpenRouter",
+        operation=operation,
         request_capture=request_capture,
         activity_tracker=activity_tracker,
         transport=transport,
@@ -1139,7 +1164,10 @@ async def _post_perplexity_json(
             duration_ms = round((time.monotonic() - start_time) * 1000, 2)
 
             if response.status_code >= 400:
+                from provider_failures import parse_provider_failure
                 category = _classify_perplexity_http_error(response.status_code, data, raw_text)
+                failure = parse_provider_failure("Perplexity", "agent", response.status_code, data, response.headers)
+                effective_category = failure.classification if failure else category
                 err_msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else ""
                 if not err_msg:
                     err_msg = raw_text[:200]
@@ -1147,22 +1175,17 @@ async def _post_perplexity_json(
                     f"Perplexity API вернул HTTP {response.status_code}: {err_msg}",
                     status=response.status_code,
                     category=category,
+                    request_id=failure.request_id if failure else None,
+                    failure=failure,
                 )
-                # Only true rate limits and 5xx server errors are retryable by policy.
-                # Quota/credit exhaustion, auth errors, and configuration failures MUST NOT be retried.
-                is_retryable = (category in {"rate_limit", "provider_5xx"}) and (response.status_code in {429, 500, 502, 503, 504})
+                is_retryable = failure.retryable if failure else False
                 attempts_remain = (attempt + 1) < max_attempts
                 delay = 0.0
                 will_retry = False
                 if is_retryable and attempts_remain:
-                    retry_after_str = response.headers.get("retry-after")
-                    if retry_after_str:
-                        try:
-                            delay = max(0.0, float(retry_after_str))
-                        except (ValueError, TypeError):
-                            delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
-                    else:
-                        delay = 0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
+                    delay = failure.retry_after_seconds if failure and failure.retry_after_seconds is not None else (
+                        0.5 * (2 ** attempt) + _get_perplexity_jitter(0.0, 0.25)
+                    )
 
                     if time.monotonic() + delay <= deadline:
                         will_retry = True
@@ -1174,7 +1197,7 @@ async def _post_perplexity_json(
                     data=data if isinstance(data, dict) else {},
                     attempt_count=attempt + 1,
                     duration_ms=duration_ms,
-                    classification=category,
+                    classification=effective_category,
                     is_retryable=is_retryable,
                     will_retry=will_retry,
                 )
@@ -1371,14 +1394,20 @@ async def call_deepgram(
                     headers={"Authorization": f"Token {api_key}", "Content-Type": mime_type},
                     content=file_bytes,
                 )
-            if response.status_code >= 400:
-                error = ProviderAdapterError(
-                    f"Deepgram API вернул HTTP {response.status_code}",
-                    status=response.status_code,
-                    category=_status_category(response.status_code),
-                )
-                if _retryable_status(response.status_code) and attempt == 0:
-                    await asyncio.sleep(0)
+            from provider_failures import parse_provider_failure
+            try:
+                data = response.json()
+            except (ValueError, TypeError):
+                data = {}
+            failure = parse_provider_failure("Deepgram", "transcription", response.status_code, data, getattr(response, "headers", None) or {})
+            if failure is not None:
+                legacy_category = "server_error" if failure.classification == "provider_5xx" else failure.classification
+                error = ProviderAdapterError(f"Deepgram: {failure.provider_error_message or failure.detail_code}", category=legacy_category, failure=failure)
+                if request_capture is not None:
+                    request_capture.update(failure.diagnostics())
+                delay = failure.retry_after_seconds if failure.retry_after_seconds is not None else 0.5
+                if failure.retryable and attempt == 0 and delay <= 5.0 and time.monotonic() + delay < deadline:
+                    await asyncio.sleep(delay)
                     continue
                 raise error
             data = response.json()

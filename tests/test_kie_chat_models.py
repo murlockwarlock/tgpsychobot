@@ -507,7 +507,7 @@ async def test_kie_http_200_channel_rejection_is_provider_error_with_full_metada
 
     error = raised.value
     assert not isinstance(error, module.InsufficientBalanceError)
-    assert error.classification == "provider_rejection"
+    assert error.classification == "invalid_request"
     assert error.provider == "KIE"
     assert error.model == "gemini-3-flash"
     assert error.provider_code == 422

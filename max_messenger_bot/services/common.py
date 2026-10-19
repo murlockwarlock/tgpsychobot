@@ -1042,10 +1042,16 @@ async def _execute_ai_dialogue_turn(
         failed_log_id = getattr(exc, "ai_log_id", None)
         if not failed_log_id and getattr(exc, "ai_log_ids", None):
             failed_log_id = exc.ai_log_ids[-1]
-        if original_message_id and failed_log_id and is_retryable_ai_error(exc):
+        retryable_group = is_retryable_ai_error(exc)
+        retryable_terminal = bool(original_message_id and failed_log_id and retryable_group)
+        if retryable_terminal:
             from ..keyboards import ai_retry_keyboard_max
             attachments = ai_retry_keyboard_max(original_message_id, failed_log_id=failed_log_id)
-        text = "Сервис ИИ временно недоступен. Попробуйте позже."
+        text = (
+            "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос."
+            if retryable_group
+            else "К сожалению, сервис временно недоступен из-за технической проблемы."
+        )
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text=text, attachments=attachments)
             thinking_message_id = None

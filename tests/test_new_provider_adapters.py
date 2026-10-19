@@ -41,12 +41,19 @@ def layout() -> AIRequestLayout:
 
 
 def test_openrouter_catalog_is_curated_and_capability_driven():
-    assert len(OPENROUTER_MODELS) == 15
+    assert len(OPENROUTER_MODELS) == 20
     assert set(get_selectable_models(PROVIDER_OPENROUTER)) == set(OPENROUTER_MODEL_SPECS)
     assert set(get_selectable_models(PROVIDER_OPENROUTER, "vision")) == set(OPENROUTER_VISION_MODELS)
     assert "deepseek/deepseek-v4.1-flash" in OPENROUTER_VISION_MODELS
     assert all(spec.text for spec in OPENROUTER_MODEL_SPECS.values())
     assert OPENROUTER_MODEL_SPECS["google/gemini-3.7-flash"].audio_input is True
+    assert {
+        "google/gemini-2.5-flash",
+        "google/gemini-3-flash-preview",
+        "openai/gpt-5.6-luna",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+    }.issubset(OPENROUTER_MODEL_SPECS)
     assert validate_model_selection(PROVIDER_OPENROUTER, "openai/gpt-5.6-terra") == "openai/gpt-5.6-terra"
     assert validate_model_selection(PROVIDER_PERPLEXITY, "medium") == "medium"
     assert get_selectable_models(PROVIDER_DEEPGRAM, "transcription") == ("nova-3", "nova-2")

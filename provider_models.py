@@ -117,6 +117,11 @@ class OpenRouterModelSpec:
 
 
 OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
+    "google/gemini-2.5-flash": OpenRouterModelSpec("google/gemini-2.5-flash", "Google Gemini 2.5 Flash", True, True, True, 1048576, 65535),
+    "google/gemini-3-flash-preview": OpenRouterModelSpec("google/gemini-3-flash-preview", "Google Gemini 3 Flash Preview", True, True, True, 1048576, 65536),
+    "openai/gpt-5.6-luna": OpenRouterModelSpec("openai/gpt-5.6-luna", "OpenAI GPT-5.6 Luna", True, True, False, 1050000, 128000),
+    "deepseek/deepseek-v4-flash": OpenRouterModelSpec("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", True, False, False, 1048576, 943717),
+    "deepseek/deepseek-v4-pro": OpenRouterModelSpec("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", True, False, False, 1048576, 384000),
     "openai/gpt-5.6-terra": OpenRouterModelSpec("openai/gpt-5.6-terra", "OpenAI GPT-5.6 Terra", True, True, False, 1050000, 128000),
     "openai/gpt-5.6-sol": OpenRouterModelSpec("openai/gpt-5.6-sol", "OpenAI GPT-5.6 Sol", True, True, False, 1050000, 128000),
     "openai/gpt-5.6-luna-pro": OpenRouterModelSpec("openai/gpt-5.6-luna-pro", "OpenAI GPT-5.6 Luna Pro", True, True, False, 1050000, 128000),

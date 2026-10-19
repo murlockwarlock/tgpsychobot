@@ -2798,14 +2798,16 @@ async def process_buffered_messages(
         reply_markup = None
         failed_log_id = getattr(e, "ai_log_id", None) or (e.ai_log_ids[-1] if getattr(e, "ai_log_ids", None) else None)
         is_hidden_job = bool(scoped_kickoff and scoped_kickoff.is_hidden)
-        if failed_log_id and is_retryable_ai_error(e) and not is_hidden_job:
+        retryable_group = is_retryable_ai_error(e)
+        retryable_terminal = bool(failed_log_id and retryable_group)
+        if retryable_terminal and not is_hidden_job:
             reply_markup = kb.ai_retry_keyboard(failed_log_id, locale=locale)
         await bot.send_message(
             chat_id=user_id,
             text=translate(
-                "ui.ai.overloaded",
+                "ui.ai.overloaded" if retryable_group else "ui.ai.service_unavailable",
                 locale,
-                fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+                fallback=("Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!" if retryable_group else "К сожалению, сервис временно недоступен из-за технической проблемы."),
             ),
             reply_markup=reply_markup,
         )
@@ -9268,9 +9270,9 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         )
         await _send_processing_error(
             translate(
-                "ui.ai.overloaded",
+                "ui.ai.overloaded" if is_retryable_ai_error(e) else "ui.ai.service_unavailable",
                 locale,
-                fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+                fallback=("Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!" if is_retryable_ai_error(e) else "К сожалению, сервис временно недоступен из-за технической проблемы."),
             )
         )
     except Exception as e:
@@ -18771,9 +18773,9 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
             )
             await thinking_msg.edit_text(
                 translate(
-                    "ui.voice.overloaded",
+                    "ui.ai.service_unavailable",
                     locale,
-                    fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+                    fallback="К сожалению, сервис временно недоступен из-за технической проблемы.",
                 )
             )
             return
@@ -24011,9 +24013,9 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 pass
         await message.answer(
             translate(
-                "ui.ai.overloaded",
+                "ui.ai.service_unavailable",
                 locale,
-                fallback="Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!",
+                fallback="К сожалению, сервис временно недоступен из-за технической проблемы.",
             )
         )
         if not getattr(e, "admin_alert_handled", False):

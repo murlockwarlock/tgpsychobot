@@ -103,7 +103,7 @@ async def record_ai_attempt_log(
                 diag_data = diagnostics
             else:
                 diag_data = {"repr": str(diagnostics)}
-            diag_str = json.dumps(diag_data, ensure_ascii=False, default=str)
+            diag_str = sanitize_secret_values(json.dumps(diag_data, ensure_ascii=False, default=str))
         except Exception:
             diag_str = str(diagnostics)
 

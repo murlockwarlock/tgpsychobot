@@ -46,6 +46,12 @@ from ai_retry_policy import (
 )
 
 
+def transient_provider_error(message: str = "Fail") -> AIServiceError:
+    error = AIServiceError(message)
+    error.classification = "provider_5xx"
+    return error
+
+
 class ValidatingTelegramSession(BaseSession):
     def __init__(self):
         super().__init__()
@@ -499,8 +505,8 @@ async def test_telegram_retry_fails_again_journey(session_factory, setup_tg_user
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(handlers.router)
 
-    primary_mock = AsyncMock(side_effect=AIServiceError("Fail"))
-    fallback_mock = AsyncMock(side_effect=AIServiceError("Fail"))
+    primary_mock = AsyncMock(side_effect=transient_provider_error())
+    fallback_mock = AsyncMock(side_effect=transient_provider_error())
     monkeypatch.setattr(ai_integration, "_call_gemini_api", primary_mock)
     monkeypatch.setattr(ai_integration, "_call_openai_api", fallback_mock)
 
@@ -598,9 +604,9 @@ async def test_telegram_stale_scope_journey(session_factory, setup_tg_user, monk
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(handlers.router)
 
-    primary_mock = AsyncMock(side_effect=AIServiceError("Fail"))
+    primary_mock = AsyncMock(side_effect=transient_provider_error())
     monkeypatch.setattr(ai_integration, "_call_gemini_api", primary_mock)
-    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(side_effect=AIServiceError("Fail")))
+    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(side_effect=transient_provider_error()))
 
     msg_update = Update(
         update_id=1,
@@ -674,9 +680,9 @@ async def test_telegram_forged_ownership_journey(session_factory, setup_tg_user,
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(handlers.router)
 
-    primary_mock = AsyncMock(side_effect=AIServiceError("Fail"))
+    primary_mock = AsyncMock(side_effect=transient_provider_error())
     monkeypatch.setattr(ai_integration, "_call_gemini_api", primary_mock)
-    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(side_effect=AIServiceError("Fail")))
+    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(side_effect=transient_provider_error()))
 
     # User A triggers failure
     msg_update = Update(
@@ -834,8 +840,8 @@ async def test_telegram_double_click_journey(session_factory, setup_tg_user, mon
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(handlers.router)
 
-    monkeypatch.setattr(ai_integration, "_call_gemini_api", AsyncMock(side_effect=AIServiceError("Fail")))
-    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(side_effect=AIServiceError("Fail")))
+    monkeypatch.setattr(ai_integration, "_call_gemini_api", AsyncMock(side_effect=transient_provider_error()))
+    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(side_effect=transient_provider_error()))
 
     msg_update = Update(
         update_id=1,
@@ -1103,7 +1109,7 @@ async def test_deterministic_errors_do_not_show_retry_button(session_factory, se
 
     send_messages = [c for c in session.calls if isinstance(c, SendMessage)]
     failure_msg = send_messages[-1]
-    assert "перегружена" in failure_msg.text
+    assert "технической проблемы" in failure_msg.text
     # No reply_markup rendered!
     assert failure_msg.reply_markup is None
 
@@ -1112,8 +1118,8 @@ async def test_deterministic_errors_do_not_show_retry_button(session_factory, se
 async def test_request_group_terminal_outcome_eligibility(session_factory):
     """Test effective terminal failure classification policy on request groups:
     - primary provider_5xx + fallback timeout => retry allowed
-    - primary timeout + fallback auth => retry NOT allowed
-    - primary provider_5xx + fallback configuration => retry NOT allowed
+    - primary timeout + fallback auth => retry allowed
+    - primary provider_5xx + fallback configuration => retry allowed
     - primary auth + fallback provider_5xx => retry allowed
     - any attempt success => retry NOT allowed
     - non-retryable isolated errors => retry NOT allowed
@@ -1132,7 +1138,7 @@ async def test_request_group_terminal_outcome_eligibility(session_factory):
                      error_classification="timeout", prompt_summary="Q1", dialogue_id=1,
                      request_group_id="grp_1", attempt_no=2, provider="p", model="m", raw_response="")
 
-        # 2. timeout (attempt 1) -> auth (attempt 2): terminal is auth (deterministic non-retryable)
+        # 2. timeout (attempt 1) -> auth (attempt 2): transient primary keeps group retryable
         g2_1 = AILog(id=201, user_id=user_id, platform="telegram", request_type="chat", status="error",
                      error_classification="timeout", prompt_summary="Q2", dialogue_id=1,
                      request_group_id="grp_2", attempt_no=1, provider="p", model="m", raw_response="")
@@ -1140,7 +1146,7 @@ async def test_request_group_terminal_outcome_eligibility(session_factory):
                      error_classification="auth", prompt_summary="Q2", dialogue_id=1,
                      request_group_id="grp_2", attempt_no=2, provider="p", model="m", raw_response="")
 
-        # 3. provider_5xx (attempt 1) -> configuration (attempt 2): terminal is configuration (non-retryable)
+        # 3. provider_5xx (attempt 1) -> configuration (attempt 2): executed transient primary keeps group retryable
         g3_1 = AILog(id=301, user_id=user_id, platform="telegram", request_type="chat", status="error",
                      error_classification="provider_5xx", prompt_summary="Q3", dialogue_id=1,
                      request_group_id="grp_3", attempt_no=1, provider="p", model="m", raw_response="")
@@ -1172,15 +1178,15 @@ async def test_request_group_terminal_outcome_eligibility(session_factory):
         assert ok is True
         assert term.id == 102
 
-        # Test group 2: terminal auth -> rejected
+        # Test group 2: transient primary -> retry remains allowed
         ok, reason, term = await validate_terminal_failure_retry_eligibility(s, "telegram", user_id, 201, expected_dialogue_id=1)
-        assert ok is False
-        assert "auth" in reason
+        assert ok is True
+        assert term.id == 202
 
-        # Test group 3: terminal configuration -> rejected
+        # Test group 3: executed transient primary -> retry remains allowed
         ok, reason, term = await validate_terminal_failure_retry_eligibility(s, "telegram", user_id, 301, expected_dialogue_id=1)
-        assert ok is False
-        assert "configuration" in reason
+        assert ok is True
+        assert term.id == 302
 
         # Test group 4: terminal provider_5xx -> retry allowed
         ok, reason, term = await validate_terminal_failure_retry_eligibility(s, "telegram", user_id, 401, expected_dialogue_id=1)
@@ -1352,7 +1358,7 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
 
     # Verify MAX API calls at wire boundary
     failure_api_call = next(
-        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        (c for c in reversed(api_calls) if "перегружена" in c["body"].get("text", "")),
         None,
     )
     assert failure_api_call is not None
@@ -2129,7 +2135,7 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
     assert len(fallback_calls) == 1
 
     failure_call = next(
-        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        (c for c in reversed(api_calls) if "перегружена" in c["body"].get("text", "")),
         None,
     )
     assert failure_call is not None
@@ -2615,14 +2621,14 @@ async def test_max_fallback_missing_api_key_configuration_outcome(session_factor
     assert len(primary_calls) == 1
     assert len(fallback_calls) == 0
 
-    # Wire check: failure message emitted, attachments MUST NOT contain ai_retry
+    # A transient primary attempt keeps the group retryable despite missing fallback credentials.
     failure_api_call = next(
-        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        (c for c in reversed(api_calls) if "перегружена" in c["body"].get("text", "")),
         None,
     )
     assert failure_api_call is not None
     attachments = failure_api_call["body"].get("attachments", [])
-    assert not any("ai_retry" in json.dumps(att) for att in attachments)
+    assert any("ai_retry" in json.dumps(att) for att in attachments)
 
     # DB AILog verification
     async with session_factory() as s:
@@ -2776,12 +2782,12 @@ async def test_max_fallback_incomplete_provider_model_configuration_outcome(sess
     assert len(fallback_calls) == 0
 
     failure_api_call = next(
-        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        (c for c in reversed(api_calls) if "перегружена" in c["body"].get("text", "")),
         None,
     )
     assert failure_api_call is not None
     attachments = failure_api_call["body"].get("attachments", [])
-    assert not any("ai_retry" in json.dumps(att) for att in attachments)
+    assert any("ai_retry" in json.dumps(att) for att in attachments)
 
     async with session_factory() as s:
         logs = (await s.scalars(
@@ -2928,7 +2934,7 @@ async def test_max_fallback_transient_both_fail_still_retryable(session_factory,
 
     # Wire check: Retry button IS present
     failure_api_call = next(
-        (c for c in reversed(api_calls) if "Сервис ИИ временно недоступен" in c["body"].get("text", "")),
+        (c for c in reversed(api_calls) if "перегружена" in c["body"].get("text", "")),
         None,
     )
     assert failure_api_call is not None

@@ -154,9 +154,42 @@ class AIResponseError(AIServiceError):
     pass
 
 
+def _provider_http_failure(provider: str, operation: str, status: int, payload: Any, raw_text: str = "", headers: Any = None) -> AIServiceError:
+    from provider_failures import attach_failure, parse_provider_failure, safe_message
+    failure = parse_provider_failure(provider, operation, status, payload, headers or {})
+    message = failure.provider_error_message if failure else safe_message(raw_text) or f"HTTP {status}"
+    error = attach_failure(AIServiceError(f"{provider} API error: {message}"), failure) if failure else AIServiceError(f"{provider} API error: {message}")
+    error.http_status = status
+    if raw_text:
+        error.provider_response_payload = safe_message(raw_text, 4000)
+    return error
+
+
+def _normalize_provider_exception(exception: Exception, *, provider: str, operation: str, prefix: str) -> Exception:
+    from provider_failures import attach_failure, normalize_exception
+
+    failure = normalize_exception(exception, provider, operation)
+    message = failure.provider_error_message or exception_summary(exception)
+    error_type = AIResponseError if failure.classification in {
+        "empty_response", "invalid_response", "output_budget_exhausted",
+    } else AIServiceError
+    if failure.classification == "insufficient_balance_quota":
+        error_type = InsufficientBalanceError
+    error = error_type(f"{prefix}: {message}")
+    attach_failure(error, failure)
+    error.provider = provider
+    error.operation = operation
+    return error
+
+
 def _wrap_provider_adapter_error(exc: ProviderAdapterError) -> AIServiceError:
     error = AIServiceError(str(exc))
-    error.classification = normalize_provider_error_classification(getattr(exc, "classification", "provider"))
+    if getattr(exc, "failure", None) is not None:
+        from provider_failures import attach_failure
+        attach_failure(error, exc.failure)
+        error.classification = exc.failure.classification
+    else:
+        error.classification = normalize_provider_error_classification(getattr(exc, "classification", "provider"))
     error.http_status = getattr(exc, "http_status", None)
     if getattr(exc, "provider_response_payload", None) is not None:
         error.provider_response_payload = exc.provider_response_payload
@@ -413,11 +446,16 @@ def _build_ai_attempt(
         include_context=include_context,
     )
     root = root_cause_exception(error, include_context=include_context) or error
+    from provider_failures import normalize_exception
+    failure = normalize_exception(error, provider or "")
     return {
         "provider": provider,
         "model": model,
         "status": status,
         "classification": classification or error_classification,
+        "retryable": failure.retryable,
+        "network_attempted": failure.network_attempted,
+        "diagnostics": failure.diagnostics(),
         "exception_class": type(root).__name__,
         "error": exception_summary(error, include_context=include_context),
     }
@@ -576,62 +614,37 @@ async def _retry_kie_transcription_step(step: str, operation, attempts: int = 3)
 
 
 def _validate_kie_json_response(status_code: int, payload: dict, *, context: str) -> dict:
-    raw_detail = (
-        payload.get("msg") or payload.get("message") or str(payload)
-        if isinstance(payload, dict)
-        else str(payload)
-    )
-    detail = _nonempty_provider_reason(raw_detail, f"HTTP {status_code} без описания")
-    if status_code != 200:
-        if is_kie_insufficient_balance(status_code, payload):
-            err = InsufficientBalanceError(f"KIE API Error: {detail}")
-        else:
-            err = AIServiceError(f"{context}: status={status_code} message={detail}")
-        err.http_status = status_code
-        err.provider = "KIE"
-        err.provider_message = detail
-        err.provider_code = payload.get("code") if isinstance(payload, dict) else None
-        err.diagnostics = {
-            "provider_code": err.provider_code,
-            "provider_message": detail,
+    import json
+    from provider_failures import attach_failure, parse_provider_failure
+    failure = parse_provider_failure("KIE", context, status_code, payload)
+    if failure is not None:
+        error_type = InsufficientBalanceError if failure.classification == "insufficient_balance_quota" else AIServiceError
+        error = attach_failure(error_type(f"{context}: {failure.provider_error_message or failure.detail_code}"), failure)
+        error.provider = "KIE"
+        error.provider_code = payload.get("code") if isinstance(payload, dict) else None
+        error.provider_message = payload.get("msg") or payload.get("message") or failure.provider_error_message
+        error.provider_response_payload = json.dumps(payload, ensure_ascii=False, default=str)[:4000]
+        error.diagnostics = {
+            "provider_code": error.provider_code,
+            "provider_message": error.provider_message,
         }
-        try:
-            import json
-            err.provider_response_payload = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
-        except Exception:
-            err.provider_response_payload = str(payload)
-        if not isinstance(err, InsufficientBalanceError):
-            classification = kie_error_classification(status_code, payload)
-            if classification:
-                err.classification = classification
-        raise err
-
-    code = payload.get("code")
-    if code not in (None, 200, "200"):
-        if is_kie_insufficient_balance(status_code, payload):
-            err = InsufficientBalanceError(f"KIE API Error: {detail}")
-        else:
-            err = AIServiceError(f"{context}: {detail}")
-        err.http_status = status_code
-        err.provider = "KIE"
-        err.provider_message = detail
-        err.provider_code = code
-        err.diagnostics = {
-            "provider_code": code,
-            "provider_message": detail,
-        }
-        if not isinstance(err, InsufficientBalanceError):
-            classification = kie_error_classification(status_code, payload)
-            if classification:
-                err.classification = classification
-        try:
-            import json
-            err.provider_response_payload = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
-        except Exception:
-            err.provider_response_payload = str(payload)
-        raise err
-
+        raise error
+    if not isinstance(payload, dict):
+        error = AIResponseError("KIE вернул некорректный JSON")
+        error.classification = "invalid_response"
+        raise error
     return payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+
+def _kie_payload_from_response(response: Any) -> dict:
+    try:
+        payload = response.json()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    if isinstance(payload, dict) and payload:
+        return payload
+    raw_text = getattr(response, "text", "") or ""
+    return {"message": str(raw_text)[:4000]}
 
 
 def _extract_text_from_openai_message(message) -> str:
@@ -936,7 +949,10 @@ async def _call_gemini_api(
         async with httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout) as client:
             response = await client.post(url, json=payload, headers={'Content-Type': 'application/json'})
             if response.status_code != 200:
-                error_data = response.json()
+                try:
+                    error_data = response.json()
+                except (TypeError, ValueError):
+                    error_data = {}
                 error_payload = error_data.get('error', {}) if isinstance(error_data, dict) else {}
                 error_msg = _nonempty_provider_reason(
                     error_payload.get('message') if isinstance(error_payload, dict) else None,
@@ -945,21 +961,26 @@ async def _call_gemini_api(
                         f"HTTP {response.status_code} без описания",
                     ),
                 )
-                if "location" in error_msg.lower():
-                    raise InsufficientBalanceError(f"Geo-Block: {error_msg}")
-                raise AIServiceError(f"Ошибка API Gemini: {error_msg}")
+                raise _provider_http_failure("Gemini", "chat", response.status_code, error_data, error_msg, getattr(response, "headers", None))
             data = response.json()
             candidates = data.get('candidates', [])
             if not candidates:
-                raise AIResponseError("Gemini returned an empty response or blocked content")
+                error = AIResponseError("Gemini returned an empty response or blocked content")
+                error.classification = "empty_response"
+                raise error
             return _validate_text_response(
                 candidates[0]['content']['parts'][0]['text'],
                 provider="Gemini",
             )
+    except (AIServiceError, InsufficientBalanceError):
+        raise
     except Exception as e:
-        if any(word in str(e).lower() for word in ["billing", "quota", "location", "geo-block"]):
-            raise InsufficientBalanceError(f"Gemini API Error: {exception_summary(e)}") from e
-        raise AIServiceError(f"Ошибка при обращении к Gemini: {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_GEMINI,
+            operation="chat",
+            prefix="Ошибка при обращении к Gemini",
+        ) from e
 
 
 async def _call_kie_chat(
@@ -1085,18 +1106,13 @@ async def _upload_file_to_kie(
     try:
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(url, headers=headers, data=data, files=files)
-        try:
-            payload = response.json()
-        except Exception:
-            payload = {}
-
+        payload = _kie_payload_from_response(response)
         if response.status_code >= 400:
-            err = AIServiceError(f"Ошибка загрузки файла в KIE (HTTP {response.status_code}): {response.text}")
-            err.http_status = response.status_code
-            if isinstance(payload, dict) and "code" in payload:
-                err.provider_code = payload.get("code")
-            err.provider_response_payload = response.text
-            raise err
+            _validate_kie_json_response(
+                response.status_code,
+                payload,
+                context="Ошибка загрузки файла в KIE",
+            )
 
         data_payload = _validate_kie_json_response(
             response.status_code,
@@ -1161,7 +1177,7 @@ async def _call_kie_multimodal(
             )
         response_payload = _validate_kie_json_response(
             response.status_code,
-            response.json(),
+            _kie_payload_from_response(response),
             context="Ошибка обращения к KIE multimodal API",
         )
         text = _extract_kie_chat_text(response_payload)
@@ -1183,7 +1199,7 @@ async def _create_kie_task(api_key: str, base_url: str, model: str, input_payloa
     try:
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
             response = await client.post(url, headers=headers, json=payload)
-        data = response.json()
+        data = _kie_payload_from_response(response)
         data_payload = _validate_kie_json_response(
             response.status_code,
             data,
@@ -1226,7 +1242,7 @@ async def _poll_kie_task(api_key: str, base_url: str, task_id: str, *, timeout_s
             response = await client.get(url, headers=headers, params={"taskId": task_id})
             payload = _validate_kie_json_response(
                 response.status_code,
-                response.json(),
+                _kie_payload_from_response(response),
                 context=f"KIE task polling failed: task_id={task_id}",
             )
             state = (payload.get("state") or payload.get("status") or "").lower()
@@ -1279,11 +1295,13 @@ async def get_kie_remaining_credits(api_key: str, base_url: str) -> float:
             try:
                 response = await client.get(endpoint, headers=headers)
                 if response.status_code != 200:
-                    raise AIServiceError(
-                        f"KIE credits check failed: status={response.status_code} body={response.text}"
+                    _validate_kie_json_response(
+                        response.status_code,
+                        _kie_payload_from_response(response),
+                        context="KIE credits check failed",
                     )
 
-                payload = response.json()
+                payload = _kie_payload_from_response(response)
                 data = payload.get("data")
                 if isinstance(data, (int, float, str)):
                     return float(data)
@@ -1335,7 +1353,7 @@ async def _call_claude_api(
             raise AIServiceError("API key for Claude is not configured.")
         target_model = model if model else "claude-sonnet-5"
         ensure_model_available(PROVIDER_CLAUDE, target_model)
-        client = anthropic.AsyncAnthropic(api_key=api_key, timeout=timeout)
+        client = anthropic.AsyncAnthropic(api_key=api_key, timeout=timeout, max_retries=0)
 
         layout = _coerce_request_layout(
             request_layout,
@@ -1375,14 +1393,16 @@ async def _call_claude_api(
             **payload,
         )
         return message.content[0].text
-    except anthropic.AuthenticationError as e:
-        raise InsufficientBalanceError(f"Claude API Error: {exception_summary(e)}") from e
+    except (AIServiceError, InsufficientBalanceError):
+        raise
     except Exception as e:
-        error_text = str(e).lower()
-        if any(marker in error_text for marker in ["credit balance", "billing", "quota", "purchase credits", "insufficient"]):
-            raise InsufficientBalanceError(f"Claude API Error: {exception_summary(e)}") from e
         logging.error(f"Claude API error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к Claude API: {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_CLAUDE,
+            operation="chat",
+            prefix="Ошибка при обращении к Claude API",
+        ) from e
 
 
 async def _call_claude_vision(
@@ -1519,16 +1539,16 @@ async def _call_claude_vision(
             )
 
         return result
-    except anthropic.AuthenticationError as e:
-        raise InsufficientBalanceError(f"Claude Vision API Error: {exception_summary(e)}") from e
     except (AIServiceError, AIResponseError):
         raise
     except Exception as e:
-        error_text = str(e).lower()
-        if any(marker in error_text for marker in ["credit balance", "billing", "quota", "purchase credits", "insufficient"]):
-            raise InsufficientBalanceError(f"Claude Vision API Error: {exception_summary(e)}") from e
         logging.error("Claude vision error", exc_info=e)
-        raise AIServiceError(f"Ошибка анализа изображения (Claude): {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_CLAUDE,
+            operation="vision",
+            prefix="Ошибка анализа изображения (Claude)",
+        ) from e
 
 
 
@@ -1567,7 +1587,7 @@ async def _call_deepseek_api(
         timeout_sec = timeout
         http_client = httpx.AsyncClient(transport=transport, trust_env=False, timeout=timeout_sec)
 
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http_client, max_retries=0)
 
         layout = _coerce_request_layout(
             request_layout,
@@ -1663,18 +1683,16 @@ async def _call_deepseek_api(
         err.provider_response_payload = raw_payload_str
         err.classification = "empty_response"
         raise err
+    except (AIServiceError, InsufficientBalanceError):
+        raise
     except Exception as e:
-        if isinstance(e, AIServiceError):
-            raise
-        if hasattr(e, 'code') and e.code == 'insufficient_quota':
-            raise InsufficientBalanceError(f"Deepseek API Error: {exception_summary(e)}") from e
         logging.error(f"Deepseek API error: {e}")
-        service_err = AIServiceError(f"Ошибка при обращении к Deepseek API: {exception_summary(e)}")
-        if hasattr(e, 'status_code'):
-            service_err.http_status = e.status_code
-        elif hasattr(e, 'status'):
-            service_err.http_status = e.status
-        raise service_err from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_DEEPSEEK,
+            operation="chat",
+            prefix="Ошибка при обращении к Deepseek API",
+        ) from e
     finally:
         if client is not None:
             await client.close()
@@ -1685,25 +1703,23 @@ async def _call_deepseek_api(
 async def _call_openai_transcribe(api_key: str, file_bytes: bytes, filename: str) -> str:
     try:
         ensure_model_available(PROVIDER_OPENAI, "whisper-1", channel="transcription")
-        client = AsyncOpenAI(api_key=api_key)
+        client = AsyncOpenAI(api_key=api_key, max_retries=0)
 
         transcription = await client.audio.transcriptions.create(
             model="whisper-1",
             file=(filename, file_bytes)
         )
         return transcription.text
-    except AuthenticationError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {exception_summary(e)}") from e
-    except RateLimitError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Rate limit or quota exceeded. {exception_summary(e)}") from e
-    except BadRequestError as e:
-        if "billing" in str(e) or "quota" in str(e).lower():
-            raise InsufficientBalanceError(f"OpenAI API Error: Billing issue or insufficient quota. {exception_summary(e)}") from e
-        logging.error(f"OpenAI API error: {e}")
-        raise AIServiceError(f"Ошибка при транскрибации (OpenAI API): {exception_summary(e)}") from e
+    except (AIServiceError, InsufficientBalanceError):
+        raise
     except Exception as e:
         logging.error(f"OpenAI API transcription error: {e}")
-        raise AIServiceError(f"Ошибка при транскрибации: {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_OPENAI,
+            operation="transcription",
+            prefix="Ошибка при транскрибации (OpenAI API)",
+        ) from e
 
 
 async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
@@ -1803,7 +1819,7 @@ async def _call_openai_api(
             raise AIServiceError("API key for OpenAI is not configured.")
         target_model = model if model else "gpt-5.6-terra"
         ensure_model_available(PROVIDER_OPENAI, target_model)
-        client = AsyncOpenAI(api_key=api_key, timeout=timeout)
+        client = AsyncOpenAI(api_key=api_key, timeout=timeout, max_retries=0)
 
         layout = _coerce_request_layout(
             request_layout,
@@ -1837,18 +1853,16 @@ async def _call_openai_api(
             **payload,
         )
         return _extract_openai_chat_text(chat_completion, provider="OpenAI")
-    except AuthenticationError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Invalid API Key. {exception_summary(e)}") from e
-    except RateLimitError as e:
-        raise InsufficientBalanceError(f"OpenAI API Error: Rate limit or quota exceeded. {exception_summary(e)}") from e
-    except BadRequestError as e:
-        if "billing" in str(e) or "quota" in str(e).lower():
-            raise InsufficientBalanceError(f"OpenAI API Error: Billing issue or insufficient quota. {exception_summary(e)}") from e
-        logging.error(f"OpenAI API error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к OpenAI API: {exception_summary(e)}") from e
+    except (AIServiceError, InsufficientBalanceError):
+        raise
     except Exception as e:
         logging.error(f"OpenAI API error: {e}")
-        raise AIServiceError(f"Ошибка при обращении к OpenAI API: {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_OPENAI,
+            operation="chat",
+            prefix="Ошибка при обращении к OpenAI API",
+        ) from e
 
 
 async def get_ai_response(
@@ -2275,19 +2289,48 @@ async def get_ai_response(
             fb_provider = getattr(ai_config, 'fallback_provider', None)
             fb_model = getattr(ai_config, 'fallback_model', None)
             if not allow_fallback or not fb_provider or not fb_model:
-                await send_terminal_ai_failure_alert(
-                    bot=bot,
-                    platform="telegram",
-                    user_id=user_id,
-                    primary_provider=primary_prov,
-                    primary_model=primary_mod,
-                    exception=primary_err,
-                    classification=err_meta["error_classification"],
-                    ai_log_ids=[primary_log_id] if primary_log_id else None,
-                )
                 if allow_fallback:
                     fallback_config_error = AIServiceError(
                         "Fallback AI provider configuration is incomplete: provider and model are required"
+                    )
+                    fallback_config_error.classification = "configuration"
+                    fb_meta = extract_error_metadata(fallback_config_error, provider=fb_provider or "")
+                    fb_log_id = await record_ai_attempt_log(
+                        session,
+                        user_id=user_id,
+                        platform="telegram",
+                        dialogue_id=active_dialogue_id,
+                        topic_id=active_topic_id,
+                        topic_name=active_topic.name if active_topic else None,
+                        request_type=request_type or "chat",
+                        provider=fb_provider or "unconfigured",
+                        model=fb_model or "unconfigured",
+                        prompt_summary=user_prompt if user_prompt else None,
+                        request_capture=None,
+                        raw_response="",
+                        latency_ms=0,
+                        status="error",
+                        request_group_id=request_group_id,
+                        attempt_no=2,
+                        attempt_role="fallback",
+                        error_type=fb_meta["error_type"],
+                        error_message=fb_meta["error_message"],
+                        error_classification=fb_meta["error_classification"],
+                        http_status=fb_meta["http_status"],
+                        diagnostics=fb_meta["diagnostics"],
+                        provider_response_payload=fb_meta["provider_response_payload"],
+                    )
+                    await send_terminal_ai_failure_alert(
+                        bot=bot,
+                        platform="telegram",
+                        user_id=user_id,
+                        primary_provider=primary_prov,
+                        primary_model=primary_mod,
+                        fallback_provider=fb_provider,
+                        fallback_model=fb_model,
+                        exception=primary_err,
+                        classification=err_meta["error_classification"],
+                        ai_log_ids=[i for i in (primary_log_id, fb_log_id) if i is not None] or None,
                     )
                     service_err = AIServiceError(
                         "Основной AI-провайдер не сработал, резервный провайдер не настроен"
@@ -2304,10 +2347,20 @@ async def get_ai_response(
                         ),
                     )
                     service_err.classification = "configuration"
-                    service_err.ai_log_ids = [primary_log_id] if primary_log_id else None
-                    service_err.ai_log_id = primary_log_id
+                    service_err.ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None] or None
+                    service_err.ai_log_id = fb_log_id or primary_log_id
                     service_err.request_group_id = request_group_id
                     raise service_err from primary_err
+                await send_terminal_ai_failure_alert(
+                    bot=bot,
+                    platform="telegram",
+                    user_id=user_id,
+                    primary_provider=primary_prov,
+                    primary_model=primary_mod,
+                    exception=primary_err,
+                    classification=err_meta["error_classification"],
+                    ai_log_ids=[primary_log_id] if primary_log_id else None,
+                )
                 if isinstance(primary_err, AIServiceError):
                     primary_err.ai_log_ids = [primary_log_id] if primary_log_id else None
                     primary_err.ai_log_id = primary_log_id
@@ -2324,6 +2377,36 @@ async def get_ai_response(
             if fb_key in ['anthropic', 'claude'] and not fb_api_key:
                 fb_api_key = _normalize_config_value(ai_config.claude_api_key)
             if not fb_api_key:
+                fallback_config_error = AIServiceError(
+                    f"API key for fallback AI provider '{fb_provider}' is not configured"
+                )
+                fallback_config_error.classification = "configuration"
+                fb_meta = extract_error_metadata(fallback_config_error, provider=fb_provider)
+                fb_log_id = await record_ai_attempt_log(
+                    session,
+                    user_id=user_id,
+                    platform="telegram",
+                    dialogue_id=active_dialogue_id,
+                    topic_id=active_topic_id,
+                    topic_name=active_topic.name if active_topic else None,
+                    request_type=request_type or "chat",
+                    provider=fb_provider,
+                    model=fb_model,
+                    prompt_summary=user_prompt if user_prompt else None,
+                    request_capture=None,
+                    raw_response="",
+                    latency_ms=0,
+                    status="error",
+                    request_group_id=request_group_id,
+                    attempt_no=2,
+                    attempt_role="fallback",
+                    error_type=fb_meta["error_type"],
+                    error_message=fb_meta["error_message"],
+                    error_classification=fb_meta["error_classification"],
+                    http_status=fb_meta["http_status"],
+                    diagnostics=fb_meta["diagnostics"],
+                    provider_response_payload=fb_meta["provider_response_payload"],
+                )
                 await send_terminal_ai_failure_alert(
                     bot=bot,
                     platform="telegram",
@@ -2334,10 +2417,7 @@ async def get_ai_response(
                     fallback_model=fb_model,
                     exception=primary_err,
                     classification="configuration",
-                    ai_log_ids=[primary_log_id] if primary_log_id else None,
-                )
-                fallback_config_error = AIServiceError(
-                    f"API key for fallback AI provider '{fb_provider}' is not configured"
+                    ai_log_ids=[i for i in (primary_log_id, fb_log_id) if i is not None] or None,
                 )
                 logging.error(
                     "Fallback provider '%s' has no API key configured",
@@ -2358,8 +2438,8 @@ async def get_ai_response(
                     ),
                 )
                 service_err.classification = "configuration"
-                service_err.ai_log_ids = [primary_log_id] if primary_log_id else None
-                service_err.ai_log_id = primary_log_id
+                service_err.ai_log_ids = [i for i in (primary_log_id, fb_log_id) if i is not None] or None
+                service_err.ai_log_id = fb_log_id or primary_log_id
                 service_err.request_group_id = request_group_id
                 raise service_err from primary_err
 
@@ -2577,7 +2657,10 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
             response = await client.post(url, json=payload, headers=headers)
 
             if response.status_code != 200:
-                error_data = response.json()
+                try:
+                    error_data = response.json()
+                except (TypeError, ValueError):
+                    error_data = {}
                 error_payload = error_data.get('error', {}) if isinstance(error_data, dict) else {}
                 error_msg = _nonempty_provider_reason(
                     error_payload.get('message') if isinstance(error_payload, dict) else None,
@@ -2587,28 +2670,34 @@ async def _call_gemini_transcribe(api_key: str, model: str, file_bytes: bytes, f
                     ),
                 )
 
-                if "User location" in error_msg:
-                    raise InsufficientBalanceError(f"Gemini Geo-Block (Transcription): {error_msg}")
-
                 logging.error(f"Gemini Transcribe REST Error: {response.status_code} - {error_msg}")
-                raise AIServiceError(f"Ошибка транскрибации Gemini: {error_msg}")
+                raise _provider_http_failure("Gemini", "transcription", response.status_code, error_data, error_msg, getattr(response, "headers", None))
 
             data = response.json()
             try:
                 candidates = data.get('candidates', [])
                 if not candidates:
-                    return "Не удалось извлечь текст (пустой ответ от Gemini)."
+                    error = AIResponseError("Gemini returned an empty transcription response")
+                    error.classification = "empty_response"
+                    raise error
 
                 return candidates[0]['content']['parts'][0]['text']
             except (KeyError, IndexError) as e:
                 logging.error(f"Gemini transcribe parsing error: {e}. Data: {data}")
-                return "Не удалось извлечь текст транскрипции."
+                error = AIResponseError("Gemini returned an invalid transcription response")
+                error.classification = "invalid_response"
+                raise error from e
 
+    except (AIServiceError, InsufficientBalanceError):
+        raise
     except Exception as e:
         logging.error(f"Gemini API transcription error: {e}")
-        if "billing" in str(e).lower() or "geo-block" in str(e).lower():
-            raise InsufficientBalanceError(f"Gemini Error: {exception_summary(e)}") from e
-        raise AIServiceError(f"Ошибка при транскрибации (Gemini API): {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_GEMINI,
+            operation="transcription",
+            prefix="Ошибка при транскрибации (Gemini API)",
+        ) from e
 
 
 async def _call_kie_transcribe(api_key: str, base_url: str, upload_base_url: str, model: str, file_bytes: bytes, filename: str) -> str:
@@ -2922,7 +3011,7 @@ async def generate_openai_image(prompt: str) -> str:
 
     base_url = os.getenv("BASE_URL_OPENAI", "https://api.openai.com/v1")
     timeout = 60.0
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
 
     try:
         model = get_default_model(PROVIDER_OPENAI, channel="image_gen")
@@ -3113,7 +3202,12 @@ async def _call_openai_vision(
         raise
     except Exception as e:
         logging.error(f"OpenAI Vision Error: {e}")
-        raise AIServiceError(f"Ошибка анализа изображения (OpenAI): {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_OPENAI,
+            operation="vision",
+            prefix="Ошибка анализа изображения (OpenAI)",
+        ) from e
 
 
 async def _call_deepseek_vision(
@@ -3168,14 +3262,23 @@ async def _call_deepseek_vision(
             request_capture["http_status"] = 200
             request_capture["finish_reason"] = finish_reason
         if finish_reason == "length":
-            raise AIResponseError("DeepSeek Vision output budget exhausted")
+            error = AIResponseError("DeepSeek Vision output budget exhausted")
+            error.classification = "output_budget_exhausted"
+            raise error
         if not isinstance(content, str) or not content.strip():
-            raise AIResponseError("DeepSeek Vision returned empty content")
+            error = AIResponseError("DeepSeek Vision returned empty content")
+            error.classification = "empty_response"
+            raise error
         return content.strip()
     except (AIServiceError, AIResponseError):
         raise
     except Exception as exc:
-        raise AIServiceError(f"Ошибка анализа изображения (DeepSeek): {exception_summary(exc)}") from exc
+        raise _normalize_provider_exception(
+            exc,
+            provider=PROVIDER_DEEPSEEK,
+            operation="vision",
+            prefix="Ошибка анализа изображения (DeepSeek)",
+        ) from exc
 
 
 async def _call_gemini_vision(
@@ -3326,15 +3429,21 @@ async def _call_gemini_vision(
 
         error_detail = response.text
         logging.error(f"Gemini Vision API Error ({response.status_code}): {error_detail}")
-        err = AIServiceError(f"Ошибка API Gemini Vision: {response.status_code}")
-        err.http_status = response.status_code
-        err.provider_response_payload = error_detail
-        raise err
+        try:
+            error_data = response.json()
+        except (TypeError, ValueError):
+            error_data = {}
+        raise _provider_http_failure("Gemini", "vision", response.status_code, error_data, error_detail, getattr(response, "headers", None))
     except (AIServiceError, InsufficientBalanceError, AIResponseError):
         raise
     except Exception as e:
         logging.error(f"Ошибка вызова Gemini Vision: {e}")
-        raise AIServiceError(f"Ошибка анализа изображения (Gemini): {exception_summary(e)}") from e
+        raise _normalize_provider_exception(
+            e,
+            provider=PROVIDER_GEMINI,
+            operation="vision",
+            prefix="Ошибка анализа изображения (Gemini)",
+        ) from e
 
 
 async def _call_kie_vision_inference(
@@ -3392,18 +3501,7 @@ async def _call_kie_vision_inference(
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(endpoint, headers=headers, json=payload)
 
-        try:
-            raw_payload = response.json()
-        except Exception:
-            raw_payload = {}
-
-        if response.status_code >= 400:
-            err = AIServiceError(f"KIE multimodal API error (HTTP {response.status_code}): {response.text}")
-            err.http_status = response.status_code
-            if isinstance(raw_payload, dict) and "code" in raw_payload:
-                err.provider_code = raw_payload.get("code")
-            err.provider_response_payload = response.text
-            raise err
+        raw_payload = _kie_payload_from_response(response)
 
         response_payload = _validate_kie_json_response(
             response.status_code,
@@ -3952,6 +4050,7 @@ async def analyze_image_content(
                             temperature=temperature,
                             max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, primary_target_model),
                             timeout=prim_budget,
+                            operation="vision",
                             request_capture=prim_capture,
                             activity_tracker=activity_tracker,
                         ),
@@ -4212,6 +4311,7 @@ async def analyze_image_content(
                             temperature=temperature,
                             max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, eff_fallback_model),
                             timeout=fb_stage_budget,
+                            operation="vision",
                             request_capture=fb_capture,
                             activity_tracker=activity_tracker,
                         ),

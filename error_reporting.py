@@ -96,6 +96,15 @@ def exception_summary(exception: Exception, *, include_context: bool = True) -> 
 
 
 _ERROR_CLASS_DESCRIPTIONS = {
+    "permission": "Нет разрешения на ресурс провайдера",
+    "proxy_error": "Ошибка соединения через прокси",
+    "provider_overloaded": "Провайдер временно перегружен",
+    "provider_unavailable": "Провайдер временно недоступен",
+    "invalid_request": "Некорректные параметры запроса",
+    "invalid_model_or_resource": "Модель или ресурс недоступны",
+    "context_limit": "Превышен допустимый размер запроса",
+    "content_policy": "Запрос отклонён правилами обработки содержимого",
+    "cancelled": "Запрос отменён",
     "network_ssl": "Ошибка SSL/TLS при обращении к провайдеру",
     "network_connection": "Ошибка сетевого соединения с провайдером",
     "timeout": "Провайдер не ответил вовремя",
@@ -168,6 +177,11 @@ def classify_external_error(
     """Classify an external-call failure using the complete exception chain with deterministic precedence."""
     if exception is None:
         return "unknown", _ERROR_CLASS_DESCRIPTIONS["unknown"]
+
+    from provider_failures import normalize_exception
+    failure = normalize_exception(exception, provider or "")
+    if failure.classification_source != "message_fallback" or failure.classification == "application_internal":
+        return failure.classification, _ERROR_CLASS_DESCRIPTIONS[failure.classification]
 
     chain = exception_chain(exception, include_context=include_context)
     type_text = " ".join(type(item).__name__ for item in chain).lower()
@@ -398,53 +412,46 @@ def classify_ai_error(exception: Exception | None, provider: str | None = None) 
     if "отключена провайдером" in text or "modelunavailableerror" in exc_type.lower():
         return "retired_model_unsupported", "Модель отключена провайдером и не поддерживается"
 
-    if any(m in text for m in ("не указан api ключ", "api ключ openai не установлен", "api ключ не настроен")):
-        return "missing_config", "API-ключ или конфигурация провайдера не настроены"
-
-    if any(m in text for m in ("invalid api key", "invalid_api_key", "authenticationerror", "unauthorized", "status code 401")):
-        return "auth_invalid_key", "Неверный или неактивный API-ключ (401 Unauthorized)"
-
-    if any(m in text for m in ("user location is not supported", "location not supported", "geoblock", "geo-block", "country, region, or territory", "status code 403")):
-        if "location" in text or "country" in text or "region" in text or "territory" in text:
-            return "geo_blocked", "Блокировка доступа по региону (Geo-Block / 403 Forbidden)"
-        return "auth_forbidden", "Доступ запрещен провайдером (403 Forbidden)"
-
-    if any(m in text for m in ("insufficientbalanceerror", "insufficient credits", "credit balance", "billing", "quota", "purchase credits", "code\": 402", "status code 402")):
-        return "insufficient_balance", "Недостаточно средств, кредитов или квоты на балансе (402)"
-
-    if any(m in text for m in ("ratelimiterror", "rate limit", "too many requests", "status code 429", "code\": 429")):
-        return "rate_limited", "Превышен лимит запросов к API (429 Rate Limit)"
-
-    if any(m in text for m in ("timeouterror", "timeout", "timed out", "apitimeouterror")):
-        return "timeout", "Превышено время ожидания ответа от API (Timeout)"
-
-    if any(m in text for m in ("500", "502", "503", "504", "internalservererror", "service unavailable", "overloaded", "server error")):
-        return "provider_5xx", "Внутренняя ошибка или перегрузка сервиса провайдера (5xx)"
-
-    if any(m in text for m in ("sslerror", "unexpected_eof", "tls", "certificate verify failed")):
-        return "network_ssl", _ERROR_CLASS_DESCRIPTIONS["network_ssl"]
-
-    if any(m in text for m in ("connecterror", "connection error", "readerror", "network", "api connection", "remotedisconnected")):
-        return "network_error", "Ошибка сетевого соединения с API"
-
-    if any(m in text for m in ("пустой ответ", "empty", "no response data")):
-        return "empty_response", "Провайдер вернул пустой ответ"
-
+    from provider_failures import normalize_exception
+    failure = normalize_exception(exception, provider or "")
     generic_code, generic_description = classify_external_error(exception, provider=provider)
+    canonical_code = failure.classification if failure.classification != "unknown" else generic_code
     legacy_code = {
         "auth": "auth_invalid_key",
         "forbidden_geo": "geo_blocked" if any(marker in text for marker in ("location", "country", "region", "territory")) else "auth_forbidden",
+        "permission": "auth_forbidden",
         "rate_limit": "rate_limited",
         "insufficient_balance_quota": "insufficient_balance",
         "timeout": "timeout",
+        "network_ssl": "network_ssl",
         "provider_5xx": "provider_5xx",
+        "provider_overloaded": "provider_5xx",
+        "provider_unavailable": "provider_5xx",
+        "proxy_error": "network_error",
         "network_connection": "network_error",
         "empty_response": "empty_response",
         "invalid_response": "invalid_response",
         "configuration": "missing_config",
-    }.get(generic_code, "general_error")
+        "invalid_request": "provider_rejection",
+        "context_limit": "provider_rejection",
+        "content_policy": "provider_rejection",
+        "provider_rejection": "provider_rejection",
+    }.get(canonical_code, "general_error")
     if legacy_code != "general_error":
-        return legacy_code, generic_description
+        legacy_descriptions = {
+            "auth_invalid_key": "Неверный или неактивный API-ключ (401 Unauthorized)",
+            "auth_forbidden": "Доступ запрещен провайдером (403 Forbidden)",
+            "geo_blocked": "Блокировка доступа по региону (Geo-Block / 403 Forbidden)",
+            "insufficient_balance": "Недостаточно средств, кредитов или квоты на балансе (402)",
+            "rate_limited": "Превышен лимит запросов к API (429 Rate Limit)",
+            "timeout": "Превышено время ожидания ответа от API (Timeout)",
+            "provider_5xx": "Внутренняя ошибка или перегрузка сервиса провайдера (5xx)",
+            "network_error": "Ошибка сетевого соединения с API",
+            "empty_response": "Провайдер вернул пустой ответ",
+            "invalid_response": "Провайдер вернул пустой или некорректный ответ",
+            "missing_config": "API-ключ или конфигурация провайдера не настроены",
+        }
+        return legacy_code, legacy_descriptions.get(legacy_code, _ERROR_CLASS_DESCRIPTIONS.get(canonical_code, generic_description))
     clean_summary = exception_summary(exception)
     return "general_error", clean_summary
 
@@ -583,12 +590,14 @@ async def notify_admins_about_error(
                 if attempt_exception_class
                 else ""
             )
-            raw_err = attempt.get("error") or "неизвестная ошибка"
+            succeeded = str(attempt.get("status", "")).lower() == "success"
+            raw_err = (attempt.get("result") or "Ответ получен") if succeeded else (attempt.get("error") or "неизвестная ошибка")
+            result_label = "Результат" if succeeded else "Ошибка"
             attempt_error = html.escape(_shorten(sanitize_secret_values(raw_err), 900))
             message_lines.append(
                 f"{index}. <b>{attempt_provider}</b>{model_suffix} · статус: <code>{attempt_status}</code>"
                 f"{classification_suffix}{exception_suffix}\n"
-                f"Ошибка: <code>{attempt_error}</code>"
+                f"{result_label}: <code>{attempt_error}</code>"
             )
     if extra:
         safe_extra = _shorten(_safe_extra_text(extra), 1200)
@@ -659,9 +668,16 @@ def extract_error_metadata(
             if hasattr(resp, "text"):
                 provider_response_payload = getattr(resp, "text")
 
-    classification = getattr(exception, "classification", None)
-    if not classification:
-        classification, _ = classify_external_error(exception, provider=provider)
+    from provider_failures import normalize_exception, safe_message
+    failure = normalize_exception(exception, provider or "")
+    classification = failure.classification
+    previous = diagnostics if isinstance(diagnostics, dict) else vars(diagnostics) if hasattr(diagnostics, "__dict__") else {}
+    diagnostics = {**previous, **failure.diagnostics()}
+    provider_code = failure.provider_error_code or provider_code
+    provider_message = failure.provider_error_message or safe_message(provider_message)
+    if provider_response_payload is None:
+        provider_response_payload = None
+    error_message = safe_message(error_message)
 
     return {
         "error_type": error_type,
