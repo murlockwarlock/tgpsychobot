@@ -1,6 +1,9 @@
 import io
 import math
 import re
+from dataclasses import dataclass
+from fractions import Fraction
+from typing import Literal
 
 from PIL import Image
 
@@ -19,6 +22,28 @@ SEEDREAM_SIZES = {
     '21:9': 'landscape_21_9',
 }
 QUOTED_TEXT = re.compile(r'''"(?:\\.|[^"\\])*"|“[^”]*”|«[^»]*»|(?<!\w)'(?:\\.|[^'\\])*'(?!\w)|`[^`]*`''')
+
+
+class ImageGeometryError(ValueError):
+    pass
+
+
+class ModelGeometryLimitation(ImageGeometryError):
+    pass
+
+
+@dataclass(frozen=True)
+class EditGeometry:
+    mode: Literal['preserve', 'resize']
+    source_size: tuple[int, int]
+    target_ratio: Fraction
+    target_size: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class EditRequest:
+    payload: dict
+    geometry: EditGeometry
 
 
 def shape_prompt(prompt):
@@ -53,11 +78,19 @@ def has_geometry_request(prefix):
     ))
 
 
-def explicit_ratio(prompt, *, editing=False):
+def preservation_context(prefix):
+    clause = re.split(r'[.!?;\n]', without_literals(prefix))[-1]
+    actions = list(re.finditer(r'\b(keep|preserve|retain|maintain|остав\w*|сохран\w*|resize|crop|change|convert|make|сделай|измени|обрежь)\b', clause, re.I))
+    if actions:
+        return bool(re.fullmatch(r'keep|preserve|retain|maintain|остав\w*|сохран\w*', actions[-1][0], re.I))
+    return bool(re.search(r'\b(?:same|original|source|current|исходн\w*|текущ\w*)\b', clause, re.I))
+
+
+def explicit_geometry(prompt, *, editing=False):
     requested = None
     literals = list(QUOTED_TEXT.finditer(prompt))
-    for match in re.finditer(r'(?<![\d.])([1-9]\d{0,3})\s*([:x×])\s*([1-9]\d{0,3})(?![\d.])', prompt, re.I):
-        width, _, height = match.groups()
+    for match in re.finditer(r'(?<![\d.])([1-9]\d{0,3})\s*([:x×])\s*([1-9]\d{0,3})(?!\d|\.\d)', prompt, re.I):
+        width, separator, height = match.groups()
         literal = next((item for item in literals if item.start() < match.start() and match.end() < item.end()), None)
         prefix = prompt[:literal.start() if literal else match.start()]
         geometry_request = has_geometry_request(prefix)
@@ -67,10 +100,15 @@ def explicit_ratio(prompt, *, editing=False):
             continue
         if re.search(r'\b(?:at|time|starts|в|время)\s*$', prefix, re.I) and not geometry_request:
             continue
-        if editing and not geometry_request and prompt.strip() != match[0]:
+        if editing and (preservation_context(prefix) or not geometry_request) and prompt.strip() != match[0]:
             continue
-        requested = int(width) / int(height)
+        requested = (int(width), int(height), separator.lower())
     return requested
+
+
+def explicit_ratio(prompt, *, editing=False):
+    geometry = explicit_geometry(prompt, editing=editing)
+    return geometry[0] / geometry[1] if geometry else None
 
 
 def generation_ratio(prompt):
@@ -105,18 +143,22 @@ def generation_shape(prompt):
     return ratio, size
 
 
-def source_ratio(image_bytes):
+def source_size(image_bytes):
     with Image.open(io.BytesIO(image_bytes)) as image:
         image.verify()
     with Image.open(io.BytesIO(image_bytes)) as image:
         width, height = image.size
         if image.getexif().get(274) in (5, 6, 7, 8):
             width, height = height, width
+    return width, height
+
+
+def source_ratio(image_bytes):
+    width, height = source_size(image_bytes)
     return width / height
 
 
-def edit_ratio(prompt, image_bytes):
-    source = source_ratio(image_bytes)
+def requested_edit_ratio(prompt):
     prompt = shape_prompt(prompt)
     requested = explicit_ratio(prompt, editing=True)
     if requested is None:
@@ -132,9 +174,20 @@ def edit_ratio(prompt, image_bytes):
         )
         matches = sorted((match for pattern in patterns for match in re.finditer(pattern, prompt)), key=lambda match: match.start())
         for match in matches:
-            if not is_negated(prompt, match.start()):
+            if not is_negated(prompt, match.start()) and not preservation_context(prompt[:match.start()]):
                 requested = generation_ratio(match[1])
-    return source if requested is None else requested
+    return requested
+
+
+def edit_geometry(prompt, image_bytes):
+    original_size = source_size(image_bytes)
+    numeric = explicit_geometry(shape_prompt(prompt), editing=True)
+    requested = requested_edit_ratio(prompt)
+    if requested is None:
+        return EditGeometry('preserve', original_size, Fraction(*original_size), original_size)
+    target_ratio = Fraction(numeric[0], numeric[1]) if numeric else Fraction(requested).limit_denominator(10000)
+    target_size = (numeric[0], numeric[1]) if numeric and numeric[2] != ':' else None
+    return EditGeometry('resize', original_size, target_ratio, target_size)
 
 
 def generation_input(model, prompt):
@@ -152,21 +205,49 @@ def generation_input(model, prompt):
     raise ValueError(f'Неподдерживаемая KIE image generation model: {model}')
 
 
-def edit_input(model, prompt, source_url, image_bytes):
-    value = edit_ratio(prompt, image_bytes)
+def prepare_edit(model, prompt, source_url, image_bytes):
+    geometry = edit_geometry(prompt, image_bytes)
+    supported = NANO_BANANA_RATIOS if model == 'google/nano-banana-edit' else SEEDREAM_RATIOS
+    ratio = next((ratio for ratio in supported if Fraction(ratio.replace(':', '/')) == geometry.target_ratio), None)
+    if ratio is None:
+        width, height = geometry.source_size
+        if geometry.mode == 'preserve':
+            raise ModelGeometryLimitation(f'Модель {model} не поддерживает точное сохранение исходного формата {width}×{height} в этом API. Редактирование не запущено.')
+        raise ModelGeometryLimitation(f'Модель {model} не поддерживает запрошенное соотношение сторон {geometry.target_ratio.numerator}:{geometry.target_ratio.denominator}. Редактирование не запущено.')
+    if geometry.mode == 'resize' and geometry.target_size is not None:
+        width, height = geometry.target_size
+        raise ModelGeometryLimitation(f'API модели {model} не позволяет задать точные размеры {width}×{height}. Редактирование не запущено.')
     result = {'prompt': prompt, 'image_urls': [source_url]}
     if model == 'google/nano-banana-edit':
-        result.update(output_format='png', aspect_ratio=closest_ratio(value, NANO_BANANA_RATIOS))
+        result.update(output_format='png', aspect_ratio=ratio)
     elif model == 'bytedance/seedream-v4-edit':
-        result.update(image_size=SEEDREAM_SIZES[closest_ratio(value, SEEDREAM_RATIOS)], image_resolution='1K', max_images=1)
+        result.update(image_size=SEEDREAM_SIZES[ratio], image_resolution='1K', max_images=1)
     elif model == 'seedream/4.5-edit':
-        result.update(aspect_ratio=closest_ratio(value, SEEDREAM_RATIOS), quality='basic')
+        result.update(aspect_ratio=ratio, quality='basic')
     else:
         raise ValueError(f'Неподдерживаемая KIE image edit model: {model}')
-    return result
+    return EditRequest(result, geometry)
 
 
-def validate_result(image_bytes, payload):
+def edit_input(model, prompt, source_url, image_bytes):
+    return prepare_edit(model, prompt, source_url, image_bytes).payload
+
+
+def validate_result(image_bytes, *, geometry: EditGeometry):
+    result_size = source_size(image_bytes)
+    if geometry.mode == 'preserve':
+        if result_size != geometry.source_size:
+            width, height = geometry.source_size
+            raise ImageGeometryError(f'Модель не сохранила исходные размеры {width}×{height}. Результат не отправлен.')
+    elif geometry.target_size is not None:
+        if result_size != geometry.target_size:
+            raise ImageGeometryError('Модель не выполнила запрошенное изменение размеров. Результат не отправлен.')
+    elif Fraction(*result_size) != geometry.target_ratio:
+        raise ImageGeometryError('Модель не выполнила запрошенное изменение пропорций. Результат не отправлен.')
+    return image_bytes
+
+
+def validate_generation_result(image_bytes, payload):
     requested = payload.get('aspect_ratio')
     if requested is None:
         requested = next(ratio for ratio, size in SEEDREAM_SIZES.items() if size == payload['image_size'])

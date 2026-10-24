@@ -2957,9 +2957,11 @@ def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
         raise AIServiceError(str(exc)) from exc
 
 
-def _build_kie_image_edit_input(model: str, prompt: str, source_url: str, image_bytes: bytes) -> dict:
+def _prepare_kie_image_edit(model: str, prompt: str, source_url: str, image_bytes: bytes) -> kie_image_inputs.EditRequest:
     try:
-        return kie_image_inputs.edit_input(model, prompt, source_url, image_bytes)
+        return kie_image_inputs.prepare_edit(model, prompt, source_url, image_bytes)
+    except kie_image_inputs.ImageGeometryError:
+        raise
     except (ValueError, OSError) as exc:
         raise AIServiceError("Не удалось подготовить исходное изображение для редактирования.") from exc
 
@@ -2982,7 +2984,7 @@ async def _call_kie_image_generation(api_key: str, base_url: str, model: str, pr
         download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
         image_result = await _download_binary_file(download_url)
         try:
-            return kie_image_inputs.validate_result(image_result, image_input)
+            return kie_image_inputs.validate_generation_result(image_result, image_input)
         except (ValueError, OSError) as exc:
             raise AIServiceError("Сервис вернул изображение неверного формата или пропорций.") from exc
     except Exception as exc:
@@ -2991,7 +2993,8 @@ async def _call_kie_image_generation(api_key: str, base_url: str, model: str, pr
 
 async def _call_kie_image_edit(api_key: str, base_url: str, upload_base_url: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
     ensure_model_available(PROVIDER_KIE, model, channel="image_edit")
-    image_input = _build_kie_image_edit_input(model, prompt, "", image_bytes)
+    edit_request = _prepare_kie_image_edit(model, prompt, "", image_bytes)
+    image_input = edit_request.payload
     source_url = await _upload_file_to_kie(
         api_key,
         upload_base_url,
@@ -3014,7 +3017,9 @@ async def _call_kie_image_edit(api_key: str, base_url: str, upload_base_url: str
         download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
         image_result = await _download_binary_file(download_url)
         try:
-            return kie_image_inputs.validate_result(image_result, image_input)
+            return kie_image_inputs.validate_result(image_result, geometry=edit_request.geometry)
+        except kie_image_inputs.ImageGeometryError:
+            raise
         except (ValueError, OSError) as exc:
             raise AIServiceError("Сервис вернул изображение неверного формата или пропорций.") from exc
     except Exception as exc:

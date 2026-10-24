@@ -27,9 +27,9 @@ from tests.test_hide_empty_media_prompt import LEGACY_SERVICE_PROMPT_TEMPLATE
 from tests.test_media_image_edit import async_engine, session_factory, clean_runtime, setup_tg_user, media_setup, TelegramTransport, MaxTransport
 
 
-def png(width, height, *, orientation=None):
+def png(width, height, *, orientation=None, color='magenta'):
     stream = io.BytesIO()
-    image = Image.new('RGB', (width, height), 'magenta')
+    image = Image.new('RGB', (width, height), color)
     if orientation:
         exif = Image.Exif()
         exif[274] = orientation
@@ -74,7 +74,7 @@ def test_generation_model_geometry(model, prompt, ratio, size):
 
 
 @pytest.mark.parametrize('model', EDIT_MODELS)
-@pytest.mark.parametrize('width,height,ratio,size', [(600, 900, '2:3', 'portrait_3_2'), (1600, 900, '16:9', 'landscape_16_9'), (800, 800, '1:1', 'square_hd'), (904, 1280, '2:3', 'portrait_3_2')])
+@pytest.mark.parametrize('width,height,ratio,size', [(600, 900, '2:3', 'portrait_3_2'), (1600, 900, '16:9', 'landscape_16_9'), (800, 800, '1:1', 'square_hd')])
 def test_edit_geometry_comes_from_source(model, width, height, ratio, size):
     prompt = 'Insert "ИВАН СОЛДАТОВ" and "24.10.2026". Preserve everything else, including the vertical certificate label.'
     payload = kie_image_inputs.edit_input(model, prompt, 'https://images.test/source.png', png(width, height))
@@ -150,7 +150,7 @@ def mock_kie(monkeypatch, source, result):
 @pytest.mark.parametrize('model', EDIT_MODELS)
 async def test_actual_edit_adapter_upload_task_poll_download(monkeypatch, surface, model):
     module = ai_integration if surface == 'telegram' else max_ai
-    source, result = png(904, 1280), png(1024, 1536)
+    source, result = png(600, 900), png(600, 900, color='blue')
     wire = mock_kie(monkeypatch, source, result)
     call = module._call_kie_image_edit if surface == 'telegram' else module._edit_kie
     prompt = 'Insert "ИВАН СОЛДАТОВ" and "24.10.2026". Preserve everything else.'
@@ -176,12 +176,16 @@ async def test_invalid_source_fails_before_upload_or_paid_task(monkeypatch, surf
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('surface', ['telegram', 'max'])
-@pytest.mark.parametrize('operation', ['edit', 'generate'])
-async def test_real_runtime_through_actual_kie_adapter(session_factory, media_setup, monkeypatch, surface, operation):
-    source = png(904, 1280)
-    result = png(1024, 1536) if operation == 'edit' else png(576, 1024)
+@pytest.mark.parametrize('operation,scenario', [('edit', 'preserve'), ('edit', 'resize'), ('edit', 'unsupported_source'), ('edit', 'changed_result'), ('generate', 'generate')])
+async def test_real_runtime_through_actual_kie_adapter(session_factory, media_setup, monkeypatch, surface, operation, scenario):
+    source = png(904, 1280) if scenario in ('unsupported_source', 'resize') else png(600, 900)
+    result_size = (1024, 1536) if scenario == 'changed_result' else (1600, 900) if scenario == 'resize' else (600, 900) if operation == 'edit' else (576, 1024)
+    result = png(*result_size, color='blue')
+    should_deliver = scenario not in ('unsupported_source', 'changed_result')
     wire = mock_kie(monkeypatch, source, result)
     prompt = 'Insert "ИВАН СОЛДАТОВ" and "24.10.2026". Preserve everything else.' if operation == 'edit' else 'A vertical poster in 9:16 format'
+    if scenario == 'resize':
+        prompt += ' Crop the image to 16:9.'
     response = f'Готово:\n[EDIT_IMG_MEDIA: panda_certificate | {prompt}]' if operation == 'edit' else f'Готово:\nGEN_IMG: [{prompt}]'
     async with session_factory() as session:
         config = await session.get(AIConfig, 1)
@@ -211,9 +215,12 @@ async def test_real_runtime_through_actual_kie_adapter(session_factory, media_se
             if media_setup in handlers.user_processing_tasks:
                 await handlers.user_processing_tasks[media_setup]
             photos = [item for item in transport.calls if isinstance(item, SendPhoto)]
-            assert len(photos) == 1
-            outgoing = SendPhoto.model_validate(photos[0].model_dump())
-            assert outgoing.photo.data == result
+            assert len(photos) == int(should_deliver)
+            if photos:
+                outgoing = SendPhoto.model_validate(photos[0].model_dump())
+                assert outgoing.photo.data == result
+                assert outgoing.photo.data != source
+            visible = [getattr(item, 'text', '') or '' for item in transport.calls]
             assert all('GEN_IMG' not in (getattr(item, 'text', '') or '') and 'EDIT_IMG_MEDIA' not in (getattr(item, 'text', '') or '') for item in transport.calls)
             if operation == 'edit':
                 assert MEDIA_EDIT_INSTRUCTION in '\n'.join(model.await_args.kwargs['request_layout'].shared_instructions)
@@ -230,13 +237,23 @@ async def test_real_runtime_through_actual_kie_adapter(session_factory, media_se
         await application.handle_update({'update_type': 'message_created', 'update_id': 'geometry', 'message': {'sender': {'user_id': 7, 'name': 'Denis'}, 'recipient': {'chat_id': 100}, 'body': {'mid': 'geometry-input', 'text': 'ИВАН СОЛДАТОВ, 24.10.2026' if operation == 'edit' else 'Сделай вертикальный постер 9:16'}}})
         if application.background_tasks:
             await asyncio.gather(*list(application.background_tasks))
-        assert client.uploads == [('image', result)]
+        assert client.uploads == ([('image', result)] if should_deliver else [])
         images = [item for _, _, kwargs in client.wire for item in kwargs.get('json_data', {}).get('attachments', []) if item.get('type') == 'image']
-        assert images == [{'type': 'image', 'payload': {'token': 'edited-token'}}]
+        assert images == ([{'type': 'image', 'payload': {'token': 'edited-token'}}] if should_deliver else [])
+        visible = [kwargs.get('json_data', {}).get('text') or '' for _, _, kwargs in client.wire]
         assert all('GEN_IMG' not in (kwargs.get('json_data', {}).get('text') or '') and 'EDIT_IMG_MEDIA' not in (kwargs.get('json_data', {}).get('text') or '') for _, _, kwargs in client.wire)
         user_id = 100000000007
-    assert len(wire.tasks) == 1
-    assert wire.tasks[0]['input']['image_size'] == ('portrait_3_2' if operation == 'edit' else 'portrait_16_9')
+    assert len(wire.tasks) == int(scenario != 'unsupported_source')
+    if scenario == 'unsupported_source':
+        assert wire.requests == []
+        assert any('904×1280' in text and 'не поддерживает' in text for text in visible)
+    else:
+        expected_size = 'landscape_16_9' if scenario == 'resize' else 'portrait_3_2' if operation == 'edit' else 'portrait_16_9'
+        assert wire.tasks[0]['input']['image_size'] == expected_size
+    if scenario == 'changed_result':
+        assert any('исходные размеры 600×900' in text for text in visible)
+    if not should_deliver:
+        assert 'Готово:' not in visible
     async with session_factory() as session:
         user = await session.get(User, user_id)
         assert user.current_topic_id == 1 and user.current_dialogue_id == 1
@@ -244,6 +261,8 @@ async def test_real_runtime_through_actual_kie_adapter(session_factory, media_se
         assert history and all(row.topic_id == 1 and row.dialogue_id == 1 for row in history)
         if operation == 'edit':
             assert all('EDIT_IMG_MEDIA' not in row.content for row in history)
+        if not should_deliver:
+            assert history[-1].content != 'Готово:'
 
 
 @pytest.mark.asyncio
@@ -278,9 +297,10 @@ async def test_telegram_settings_display_capability_status(session_factory, medi
 @pytest.mark.parametrize('operation', ['edit', 'generate'])
 async def test_wrong_provider_geometry_is_rejected_without_paid_retry(monkeypatch, surface, operation):
     module = ai_integration if surface == 'telegram' else max_ai
-    source, result = png(904, 1280), png(1024, 1024)
+    source, result = png(600, 900), png(1024, 1024)
     wire = mock_kie(monkeypatch, source, result)
-    with pytest.raises(module.AIServiceError, match='пропорций'):
+    error = kie_image_inputs.ImageGeometryError if operation == 'edit' else module.AIServiceError
+    with pytest.raises(error):
         if operation == 'edit':
             call = module._call_kie_image_edit if surface == 'telegram' else module._edit_kie
             await call('test-key', 'https://kie.test', 'https://uploads.test', EDIT_MODELS[0], 'Insert the name. Preserve everything else.', source)
@@ -298,9 +318,13 @@ def test_negated_resize_does_not_override_source(prompt):
 
 @pytest.mark.parametrize('reference', ['6:8', '5:7'])
 @pytest.mark.parametrize('model', EDIT_MODELS)
-def test_arbitrary_explicit_ratio_overrides_landscape_source(model, reference):
-    payload = kie_image_inputs.edit_input(model, f'Resize to {reference}', 'https://images.test/source.png', png(1600, 900))
-    assert payload.get('aspect_ratio') == '3:4' or payload.get('image_size') == 'portrait_4_3'
+def test_edit_ratio_normalization_or_explicit_model_limitation(model, reference):
+    if reference == '5:7':
+        with pytest.raises(kie_image_inputs.ModelGeometryLimitation, match='5:7'):
+            kie_image_inputs.edit_input(model, f'Resize to {reference}', 'https://images.test/source.png', png(1600, 900))
+    else:
+        payload = kie_image_inputs.edit_input(model, f'Resize to {reference}', 'https://images.test/source.png', png(1600, 900))
+        assert payload.get('aspect_ratio') == '3:4' or payload.get('image_size') == 'portrait_4_3'
 
 
 @pytest.mark.parametrize('model', EDIT_MODELS)
@@ -376,3 +400,77 @@ def test_generation_literal_orientation_is_caption_content(model):
 def test_wrapped_generation_prompt_still_honors_ratio(model):
     payload = kie_image_inputs.generation_input(model, '"A vertical poster in 9:16"')
     assert payload.get('aspect_ratio') == '9:16' or payload.get('image_size') == 'portrait_16_9'
+
+
+@pytest.mark.parametrize('width,height', [(1024, 1536), (1808, 2560), (904, 1279)])
+def test_ordinary_edit_rejects_any_change_to_original_904x1280_geometry(width, height):
+    source = png(904, 1280)
+    geometry = kie_image_inputs.edit_geometry('Insert name and date. Preserve everything else.', source)
+    assert geometry.mode == 'preserve'
+    assert geometry.source_size == (904, 1280)
+    with pytest.raises(kie_image_inputs.ImageGeometryError, match='904×1280'):
+        kie_image_inputs.validate_result(png(width, height), geometry=geometry)
+
+
+def test_ordinary_edit_validator_uses_source_not_provider_preset():
+    geometry = kie_image_inputs.edit_geometry('Insert name and date. Preserve everything else.', png(904, 1280))
+    result = png(904, 1280, color='blue')
+    assert kie_image_inputs.validate_result(result, geometry=geometry) == result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('model', EDIT_MODELS)
+@pytest.mark.parametrize('surface', ['telegram', 'max'])
+async def test_unsupported_source_geometry_is_a_model_limitation_before_any_http(monkeypatch, model, surface):
+    module = ai_integration if surface == 'telegram' else max_ai
+    source = png(904, 1280)
+    wire = mock_kie(monkeypatch, source, png(1024, 1536))
+    call = module._call_kie_image_edit if surface == 'telegram' else module._edit_kie
+    with pytest.raises(kie_image_inputs.ModelGeometryLimitation, match='904×1280'):
+        await call('test-key', 'https://kie.test', 'https://uploads.test', model, 'Insert name and date. Preserve everything else.', source)
+    assert wire.requests == [] and wire.tasks == [] and wire.uploads == 0
+
+
+def test_explicit_resize_validator_uses_requested_target_not_source_or_preset():
+    geometry = kie_image_inputs.edit_geometry('Crop the image to 16:9', png(904, 1280))
+    assert geometry.mode == 'resize'
+    result = png(1600, 900)
+    assert kie_image_inputs.validate_result(result, geometry=geometry) == result
+    for width, height in ((904, 1280), (1024, 1536), (1600, 899)):
+        with pytest.raises(kie_image_inputs.ImageGeometryError, match='пропорций'):
+            kie_image_inputs.validate_result(png(width, height), geometry=geometry)
+
+
+def test_explicit_pixel_target_validation_is_exact():
+    geometry = kie_image_inputs.edit_geometry('Resize to 1920x1080', png(904, 1280))
+    assert geometry.mode == 'resize' and geometry.target_size == (1920, 1080)
+    result = png(1920, 1080)
+    assert kie_image_inputs.validate_result(result, geometry=geometry) == result
+    with pytest.raises(kie_image_inputs.ImageGeometryError, match='размеров'):
+        kie_image_inputs.validate_result(png(1600, 900), geometry=geometry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('model', EDIT_MODELS)
+@pytest.mark.parametrize('prompt', ['Resize to 5:7', 'Resize to 1920x1080'])
+@pytest.mark.parametrize('surface', ['telegram', 'max'])
+async def test_unsupported_explicit_targets_do_not_spend_a_paid_task(monkeypatch, surface, model, prompt):
+    module = ai_integration if surface == 'telegram' else max_ai
+    source = png(904, 1280)
+    wire = mock_kie(monkeypatch, source, png(1600, 900))
+    call = module._call_kie_image_edit if surface == 'telegram' else module._edit_kie
+    with pytest.raises(kie_image_inputs.ModelGeometryLimitation):
+        await call('test-key', 'https://kie.test', 'https://uploads.test', model, prompt, source)
+    assert wire.requests == []
+
+
+@pytest.mark.parametrize('prompt', [
+    'Insert name. Preserve original size 904x1280.',
+    'Keep the original aspect ratio 113:160.',
+    'Maintain dimensions 904x1280.',
+    'Original dimensions: 904x1280. Make the portrait brighter.',
+    'Keep the portrait orientation. Preserve everything else.',
+])
+def test_source_geometry_mentions_are_not_resize_permission(prompt):
+    geometry = kie_image_inputs.edit_geometry(prompt, png(904, 1280))
+    assert geometry.mode == 'preserve' and geometry.source_size == (904, 1280)
