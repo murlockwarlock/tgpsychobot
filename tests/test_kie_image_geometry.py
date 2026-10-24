@@ -61,6 +61,8 @@ EDIT_MODELS = ('bytedance/seedream-v4-edit', 'seedream/4.5-edit', 'google/nano-b
     ('A square image containing vertical stripes', '1:1', 'square_hd'),
     ('Generate an image in 6:8', '3:4', 'portrait_4_3'),
     ('Generate an image in 5:7', '3:4', 'portrait_4_3'),
+    ('A landscape banner with vertical stripes', '4:3', 'landscape_4_3'),
+    ('A portrait poster with horizontal lines', '3:4', 'portrait_4_3'),
 ])
 def test_generation_model_geometry(model, prompt, ratio, size):
     payload = kie_image_inputs.generation_input(model, prompt)
@@ -299,3 +301,29 @@ def test_negated_resize_does_not_override_source(prompt):
 def test_arbitrary_explicit_ratio_overrides_landscape_source(model, reference):
     payload = kie_image_inputs.edit_input(model, f'Resize to {reference}', 'https://images.test/source.png', png(1600, 900))
     assert payload.get('aspect_ratio') == '3:4' or payload.get('image_size') == 'portrait_4_3'
+
+
+@pytest.mark.parametrize('model', EDIT_MODELS)
+@pytest.mark.parametrize('prompt', [
+    'Replace the caption with "Starts at 12:30". Preserve everything else.',
+    "Replace the caption with 'Starts at 12:30'. Preserve everything else.",
+    'Впиши «Начало в 12:30». Остальное без изменений.',
+    'Print “Set aspect ratio 12:30” in the caption. Preserve everything else.',
+    'Replace the label with `904x1280`. Preserve everything else.',
+    'Write the time 12:30 in the caption. Preserve everything else.',
+])
+def test_caption_literals_do_not_change_canvas_geometry(model, prompt):
+    payload = kie_image_inputs.edit_input(model, prompt, 'https://images.test/source.png', png(1600, 900))
+    assert payload.get('aspect_ratio') == '16:9' or payload.get('image_size') == 'landscape_16_9'
+
+
+@pytest.mark.parametrize('prompt', ['Resize to "6:8"', "Resize to '6:8'", 'Сделай формат «6:8»', 'Make it 6:8', '6:8'])
+def test_explicit_resize_supports_quoted_ratios(prompt):
+    payload = kie_image_inputs.edit_input(EDIT_MODELS[0], prompt, 'https://images.test/source.png', png(1600, 900))
+    assert payload['image_size'] == 'portrait_4_3'
+
+
+@pytest.mark.parametrize('model', GENERATION_MODELS)
+def test_generation_caption_time_does_not_override_orientation(model):
+    payload = kie_image_inputs.generation_input(model, 'Horizontal poster with caption "Starts at 12:30"')
+    assert payload.get('aspect_ratio') == '4:3' or payload.get('image_size') == 'landscape_4_3'

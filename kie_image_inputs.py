@@ -34,12 +34,32 @@ def is_negated(prompt, position):
     return bool(match and not re.search(r'\b(?:but|instead|но|а)\b', match[0], re.I))
 
 
-def explicit_ratio(prompt):
+def has_geometry_request(prefix):
+    return bool(re.search(
+        r'\b(?:aspect[ -]?ratio|ratio|format|canvas|dimensions?|resolution|size|resize|crop|формат\w*|соотношен\w*|размер\w*|обреж\w*|холст\w*)\b[^.;!?\n]{0,40}$'
+        r'|\b(?:make|convert|change|сделай|сделать|измени|изменить)(?:\s+(?:the|this|image|canvas|photo|it|to|a|an|изображение|фото|в|формат)){0,5}\s*$',
+        prefix,
+        re.I,
+    ))
+
+
+def explicit_ratio(prompt, *, editing=False):
     requested = None
+    literals = list(re.finditer(r'''"(?:\\.|[^"\\])*"|“[^”]*”|«[^»]*»|(?<!\w)'(?:\\.|[^'\\])*'(?!\w)|`[^`]*`''', prompt))
     for match in re.finditer(r'(?<![\d.])([1-9]\d{0,3})\s*([:x×])\s*([1-9]\d{0,3})(?![\d.])', prompt, re.I):
         width, _, height = match.groups()
-        if not is_negated(prompt, match.start()):
-            requested = int(width) / int(height)
+        literal = next((item for item in literals if item.start() < match.start() and match.end() < item.end()), None)
+        prefix = prompt[:literal.start() if literal else match.start()]
+        geometry_request = has_geometry_request(prefix)
+        if literal and (literal[0][1:-1].strip() != match[0] or not geometry_request):
+            continue
+        if is_negated(prompt, match.start()):
+            continue
+        if re.search(r'\b(?:at|time|starts|в|время)\s*$', prefix, re.I) and not geometry_request:
+            continue
+        if editing and not geometry_request and prompt.strip() != match[0]:
+            continue
+        requested = int(width) / int(height)
     return requested
 
 
@@ -48,13 +68,10 @@ def generation_ratio(prompt):
     ratio = explicit_ratio(prompt)
     if ratio is not None:
         return ratio
-    orientations = re.finditer(
-        r'\b(?:vertical|horizontal|вертикаль\w*|горизонталь\w*|квадрат\w*)\b'
-        r'|\bsquare\s+(?:image|format|canvas|poster|composition)\b'
-        r'|\b(?:image|canvas|photo|poster)\s+square\b'
-        r'|\b(?:landscape|portrait)\s+(?:orientation|format|canvas|poster)\b',
-        prompt,
-    )
+    direction = r'(?:vertical|horizontal|square|landscape|portrait|вертикаль\w*|горизонталь\w*|квадрат\w*)'
+    canvas = r'(?:image|format|canvas|poster|composition|orientation|banner|photo|view|frame|illustration|wallpaper|certificate|изображен\w*|формат\w*|плакат\w*|постер\w*|баннер\w*|холст\w*|фото|сертификат\w*)'
+    adjectives = r'(?:(?!(?:of|on|with|and|featuring|containing|depicting|с|на|в|и|для|из)\b)\w+\s+){0,2}'
+    orientations = re.finditer(rf'\b{direction}\s+{adjectives}{canvas}\b|\b{canvas}\s+(?:is\s+)?{direction}\b', prompt)
     for match in orientations:
         if is_negated(prompt, match.start()):
             continue
@@ -90,7 +107,7 @@ def source_ratio(image_bytes):
 def edit_ratio(prompt, image_bytes):
     source = source_ratio(image_bytes)
     prompt = (prompt or '').lower()
-    requested = explicit_ratio(prompt)
+    requested = explicit_ratio(prompt, editing=True)
     if requested is None:
         match = re.search(
             r'\b(?:make|convert|crop|resize|сделай|сделать|измени|изменить|обрежь)\s+'
