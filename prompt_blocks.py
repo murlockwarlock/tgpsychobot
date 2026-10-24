@@ -76,8 +76,8 @@ _LEGACY_MEDIA_BLOCK_REGEX = re.compile(
 
 
 MEDIA_EDIT_INSTRUCTION = (
-    "Для изменения доступного PHOTO: [EDIT_IMG_MEDIA: media_id | detailed edit instruction in English]. "
-    "Используй только ID перечисленного PHOTO. Не придумывай ID. EDIT_IMG относится только к фото текущего сообщения."
+    "Для изменения доступного PHOTO: [EDIT_IMG_MEDIA: exact_file_name | detailed edit instruction in English]. "
+    "Используй точное имя PHOTO из списка доступной медиатеки. Также допустим numeric media_id для backward compatibility. Не придумывай имя или ID и не используй URL/file_id. EDIT_IMG относится только к фото текущего сообщения."
     " EDIT_IMG_MEDIA не совмещай с другими исполняемыми командами в одном ответе; обычный текст и кнопки допустимы."
 )
 

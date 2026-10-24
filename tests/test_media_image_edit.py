@@ -29,7 +29,7 @@ import max_messenger_bot.storage as max_storage
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.services import common
 from database import AIConfig, BotGeneralConfig, SubscriptionConfig, MediaLibrary, MediaCollection, Topic, User, Message as DBMessage, media_collection_items, topic_collection_association, main_dialogue_collection_association
-from media_image_edit import extract_media_edit_directive, resolve_editable_media_source, MediaSourceError, load_media_image_bytes
+from media_image_edit import extract_media_edit_directive, resolve_editable_media_source, resolve_editable_media_reference, MediaSourceError, load_media_image_bytes
 from prompt_blocks import format_media_edit_sources, MAX_CAPABILITIES
 from tests.test_ai_terminal_failure_retry import session_factory, clean_runtime, ValidatingTelegramSession
 
@@ -66,12 +66,12 @@ async def async_engine():
 @pytest.mark.parametrize('text', ['[EDIT_IMG_MEDIA: 153 | make the sky blue]', '[EDIT_IMG_MEDIA : 153| make the sky blue ]', '[EDIT_IMG_MEDIA: 153 | make\nthe sky blue]'])
 def test_parser(text):
     directive, clean = extract_media_edit_directive('Вот вариант:\n' + text)
-    assert directive.media_id == 153
+    assert directive.media_ref == 153
     assert directive.prompt == ('make\nthe sky blue' if '\n' in text else 'make the sky blue')
     assert clean == 'Вот вариант:'
 
 
-@pytest.mark.parametrize('text', ['[EDIT_IMG_MEDIA:]', '[EDIT_IMG_MEDIA: abc | x]', '[EDIT_IMG_MEDIA: -1 | x]', '[EDIT_IMG_MEDIA: 1]', '[EDIT_IMG_MEDIA: 0 | x]', '[EDIT_IMG_MEDIA: 999999999999999999 | x]', '[EDIT_IMG_MEDIA: https://x | x]', '[EDIT_IMG_MEDIA: ../../../ | x]', '[EDIT_IMG_MEDIA: 1 | ]', '[EDIT_IMG_MEDIA: 1 | x', '[EDIT_IMG_MEDIA: 1 | x]\n[EDIT_IMG_MEDIA: 2 | y]', '[EDIT_IMG_MEDIA]', '[EDIT_IMG_MEDIA 1 | x]', '[EDIT_IMG_MEDIA', 'EDIT_IMG_MEDIA 1 | x'])
+@pytest.mark.parametrize('text', ['[EDIT_IMG_MEDIA:]', '[EDIT_IMG_MEDIA: | x]', '[EDIT_IMG_MEDIA: -1 | x]', '[EDIT_IMG_MEDIA: 1]', '[EDIT_IMG_MEDIA: 0 | x]', '[EDIT_IMG_MEDIA: 999999999999999999 | x]', '[EDIT_IMG_MEDIA: https://x | x]', '[EDIT_IMG_MEDIA: ../../../ | x]', '[EDIT_IMG_MEDIA: 1 | ]', '[EDIT_IMG_MEDIA: 1 | x', '[EDIT_IMG_MEDIA: 1 | x]\n[EDIT_IMG_MEDIA: 2 | y]', '[EDIT_IMG_MEDIA]', '[EDIT_IMG_MEDIA 1 | x]', '[EDIT_IMG_MEDIA', 'EDIT_IMG_MEDIA 1 | x'])
 def test_malformed(text):
     directive, clean = extract_media_edit_directive(text)
     assert directive is None
@@ -546,7 +546,7 @@ async def test_max_stale_dialogue(session_factory, media_setup, monkeypatch, pha
 @pytest.mark.parametrize('failure',['download','provider','malformed'])
 async def test_max_failures_no_output(session_factory,media_setup,monkeypatch,failure):
     client = MaxTransport()
-    response = '[EDIT_IMG_MEDIA: abc | x]' if failure == 'malformed' else '[EDIT_IMG_MEDIA: 40 | blue sky]'
+    response = '[EDIT_IMG_MEDIA: | x]' if failure == 'malformed' else '[EDIT_IMG_MEDIA: 40 | blue sky]'
     monkeypatch.setattr(max_ai,'_dispatch_provider',AsyncMock(return_value=response))
     provider_error = ai_integration.AIServiceError('provider unavailable')
     provider_error.classification = 'provider_unavailable'
@@ -771,3 +771,172 @@ async def test_max_error_history_does_not_move_to_new_topic(session_factory,medi
     await common.run_ai_dialogue(client,100,100000000007,'Измени портрет')
     async with session_factory() as session:
         assert not (await session.scalars(select(DBMessage).where(DBMessage.user_id == 100000000007,DBMessage.role == 'assistant'))).all()
+
+
+@pytest.mark.parametrize('reference', ['panda_certificate', 'certificate', 'certificate.jpg', 'Сертификат', 'сертификат_детский', '  panda_certificate  '])
+def test_symbolic_parser(reference):
+    directive, clean = extract_media_edit_directive(f'Готово:\n[EDIT_IMG_MEDIA: {reference} | Insert text.]')
+    assert directive.media_ref == reference.strip()
+    assert directive.prompt == 'Insert text.'
+    assert clean == 'Готово:'
+
+
+@pytest.mark.parametrize('reference', ['', ' ', 'http://example.com/x', 'https://example.com/x', 'file:///etc/passwd', '/etc/passwd', '../x', 'a/b', r'C:\images\x', r'folder\x', 'a\x00b', 'a\nb', 'a\tb', 'a\x7fb', 'a\u200bb', 'a' * 256, 'a|b', '[name]', '..', '.'])
+def test_malformed_symbolic_reference(reference):
+    assert extract_media_edit_directive(f'[EDIT_IMG_MEDIA: {reference} | Insert text.]')[0] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('topic,reference,expected', [(1, 'portrait', 10), (None, 'portrait', 10), (2, 'foreign', 20), (1, 'foreign', None), (2, 'portrait', None), (None, 'foreign', None), (1, 'portr', None), (1, 'Portrait', None), (1, 'Portrait description', None), (1, 'telegram-source', None), (1, 'audio', None), (1, 10, 10)])
+async def test_exact_scoped_reference(session_factory, media_setup, topic, reference, expected):
+    async with session_factory() as session:
+        if expected:
+            media = await resolve_editable_media_reference(session, media_ref=reference, topic_id=topic)
+            assert type(media.id) is int and media.id == expected
+        else:
+            with pytest.raises(MediaSourceError, match='недоступно'):
+                await resolve_editable_media_reference(session, media_ref=reference, topic_id=topic)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_scope_counts_media_not_collection_memberships(session_factory, media_setup):
+    async with session_factory() as session:
+        await session.execute(topic_collection_association.insert().values(topic_id=1, collection_id=2))
+        await session.execute(media_collection_items.insert().values(collection_id=2, media_id=10))
+        await session.commit()
+        assert (await resolve_editable_media_reference(session, media_ref='portrait', topic_id=1)).id == 10
+        (await session.get(MediaLibrary, 20)).file_name = 'portrait'
+        await session.commit()
+        with pytest.raises(MediaSourceError, match='несколько'):
+            await resolve_editable_media_reference(session, media_ref='portrait', topic_id=1)
+        assert (await resolve_editable_media_source(session, media_id=10, topic_id=1)).id == 10
+
+
+DENIS_EDIT_PROMPT = 'Insert "ИВАН СОЛДАТОВ" in the recipient field and "24.10.2026" in the issue date field. Preserve everything else.'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('platform', ['telegram', 'max'])
+@pytest.mark.parametrize('scenario', ['name', 'numeric', 'main', 'wrong_topic', 'wrong_collection', 'duplicate', 'nonexistent', 'audio', 'video', 'document', 'disabled', 'stale_topic', 'stale_dialogue', 'replaced'])
+async def test_denis_certificate_real_runtime(session_factory, media_setup, monkeypatch, platform, scenario):
+    import media_image_edit
+    from sqlalchemy import delete
+    user_id = media_setup if platform == 'telegram' else 100000000007
+    reference = '3' if scenario == 'numeric' else 'panda_certificate'
+    if scenario == 'nonexistent':
+        reference = 'missing_certificate'
+    async with session_factory() as session:
+        session.add(MediaLibrary(id=3, file_id='telegram-source' if platform == 'telegram' else 'max-source', file_name='panda_certificate', media_type=scenario if scenario in ('audio', 'video', 'document') else 'photo', source_platform=platform, source_url='https://img.oneme.ru/source.jpg' if platform == 'max' else None))
+        await session.flush()
+        await session.execute(media_collection_items.insert().values(collection_id=2 if scenario in ('wrong_topic', 'wrong_collection') else 1, media_id=3))
+        if scenario == 'wrong_collection':
+            await session.execute(delete(topic_collection_association).where(topic_collection_association.c.collection_id == 2))
+        if scenario == 'duplicate':
+            session.add(MediaLibrary(id=4, file_id='duplicate-source', file_name='panda_certificate', media_type='image'))
+            await session.flush()
+            await session.execute(media_collection_items.insert().values(collection_id=1, media_id=4))
+        config = await session.get(AIConfig, 1)
+        config.provider = 'DeepSeek'
+        config.deepseek_api_key = 'test-key'
+        config.deepseek_model = 'deepseek-chat'
+        config.allow_image_edit = scenario != 'disabled'
+        config.system_prompt = 'Используй файл panda_certificate из доступной медиатеки. Используй EDIT_IMG_MEDIA.'
+        topic = await session.get(Topic, 1)
+        topic.system_prompt = 'Используй файл panda_certificate из доступной медиатеки. Используй EDIT_IMG_MEDIA.'
+        user = await session.get(User, user_id)
+        user.current_topic_id = None if scenario == 'main' else 1
+        await session.commit()
+    response = f'Готово, вот сертификат:\n\n[EDIT_IMG_MEDIA: {reference} | {DENIS_EDIT_PROMPT}]'
+    model = AsyncMock(return_value=response)
+    async def edit(*args):
+        if scenario in ('stale_topic', 'stale_dialogue', 'replaced'):
+            async with session_factory() as session:
+                user = await session.get(User, user_id)
+                if scenario == 'stale_topic':
+                    user.current_topic_id = 2
+                elif scenario == 'stale_dialogue':
+                    user.current_dialogue_id = 2
+                else:
+                    (await session.get(MediaLibrary, 3)).file_id = 'replacement'
+                await session.commit()
+        return b'edited-certificate'
+    provider = AsyncMock(side_effect=edit)
+    source_loader = AsyncMock(wraps=media_image_edit.load_media_image_bytes)
+    monkeypatch.setattr(media_image_edit, 'load_media_image_bytes', source_loader)
+    should_edit = scenario in ('name', 'numeric', 'main', 'stale_topic', 'stale_dialogue', 'replaced')
+    should_deliver = scenario in ('name', 'numeric', 'main')
+    if platform == 'telegram':
+        transport = TelegramTransport()
+        bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+        handlers.router._parent_router = None
+        dispatcher = Dispatcher()
+        dispatcher.include_router(handlers.router)
+        monkeypatch.setattr(ai_integration, '_call_deepseek_api', model)
+        monkeypatch.setattr(ai_integration, '_call_kie_image_edit', provider)
+        try:
+            await dispatcher.feed_update(bot, Update(update_id=901, message=Message(message_id=901, date=datetime.now(timezone.utc), chat=Chat(id=user_id, type='private'), from_user=TelegramUser(id=user_id, is_bot=False, first_name='Denis'), text='ИВАН СОЛДАТОВ, 24.10.2026')))
+            if user_id in handlers.user_processing_tasks:
+                await handlers.user_processing_tasks[user_id]
+            photos = [call for call in transport.calls if isinstance(call, SendPhoto)]
+            assert len(photos) == int(should_deliver)
+            if photos:
+                validated = SendPhoto.model_validate(photos[0].model_dump())
+                assert validated.chat_id == user_id
+                assert validated.photo.data == b'edited-certificate'
+            assert sum(isinstance(call, GetFile) for call in transport.calls) == int(should_edit)
+            visible = [call.text for call in transport.calls if isinstance(call, SendMessage)]
+        finally:
+            dispatcher.sub_routers.clear()
+            handlers.router._parent_router = None
+            await bot.session.close()
+    else:
+        client = MaxTransport()
+        monkeypatch.setattr(max_ai, '_dispatch_provider', model)
+        monkeypatch.setattr(max_ai, '_edit_kie', provider)
+        application = max_app.MaxBotApplication(client)
+        await application.handle_update({'update_type': 'message_created', 'update_id': 'denis', 'message': {'sender': {'user_id': 7, 'name': 'Denis'}, 'recipient': {'chat_id': 100}, 'body': {'mid': 'denis-input', 'text': 'ИВАН СОЛДАТОВ, 24.10.2026'}}})
+        if application.background_tasks:
+            await asyncio.gather(*list(application.background_tasks))
+        payloads = [kwargs['json_data'] for method, path, kwargs in client.wire if method == 'POST' and path == '/messages']
+        images = [item for payload in payloads for item in payload.get('attachments', []) if item['type'] == 'image']
+        assert images == ([{'type': 'image', 'payload': {'token': 'edited-token'}}] if should_deliver else [])
+        assert client.uploads == ([('image', b'edited-certificate')] if should_deliver else [])
+        assert len(client.sources) == int(should_edit)
+        visible = [payload.get('text', '') for payload in payloads]
+        prompt = '\n'.join(model.await_args.args[1].shared_instructions)
+        assert all(command not in prompt for command in ('SHOW_IMG', 'RANDOM_IMG', 'CHOICE_IMG', 'SEND_AUDIO'))
+    model.assert_awaited_once()
+    layout = model.await_args.kwargs['request_layout'] if platform == 'telegram' else model.await_args.args[1]
+    assert 'Используй файл panda_certificate' in layout.stable_system_prompt
+    instructions = '\n'.join(layout.shared_instructions)
+    if scenario != 'disabled':
+        assert '[EDIT_IMG_MEDIA: exact_file_name |' in instructions
+        if scenario not in ('wrong_topic', 'wrong_collection', 'audio', 'video', 'document'):
+            assert '[PHOTO id=3] panda_certificate' in instructions
+    assert source_loader.await_count == int(should_edit)
+    assert provider.await_count == int(should_edit)
+    if should_edit:
+        assert source_loader.await_args.args[0].id == 3
+        assert provider.await_args.args[-3:] == ('seedream/4.5-edit', DENIS_EDIT_PROMPT, b'original-telegram-image' if platform == 'telegram' else b'original-max-image')
+    assert all('EDIT_IMG_MEDIA' not in text for text in visible)
+    if should_deliver:
+        assert 'Готово, вот сертификат:' in visible
+    elif scenario not in ('stale_topic', 'stale_dialogue'):
+        expected = 'отключено' if scenario == 'disabled' else 'несколько' if scenario == 'duplicate' else 'изменилось' if scenario == 'replaced' else 'недоступно'
+        assert any(expected in text for text in visible)
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        assert user.current_topic_id == (2 if scenario == 'stale_topic' else None if scenario == 'main' else 1)
+        assert user.current_dialogue_id == (2 if scenario == 'stale_dialogue' else 1)
+        history = (await session.scalars(select(DBMessage).where(DBMessage.user_id == user_id, DBMessage.role == 'assistant'))).all()
+        assert len(history) == int(scenario not in ('stale_topic', 'stale_dialogue'))
+        if should_deliver:
+            assert history[0].topic_id == user.current_topic_id and history[0].dialogue_id == 1
+            assert history[0].content == 'Готово, вот сертификат:'
+
+
+def test_numeric_parser_preserves_whitespace_and_prompt_pipes():
+    directive, clean = extract_media_edit_directive('[EDIT_IMG_MEDIA: \n3\t | add A | B]')
+    assert directive.media_ref == 3
+    assert directive.prompt == 'add A | B'
+    assert clean == ''

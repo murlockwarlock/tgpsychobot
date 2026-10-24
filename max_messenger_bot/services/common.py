@@ -953,7 +953,7 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
         token = result.get("token") or result.get("fileId")
         if not token:
             raise MediaSourceError("Не удалось отправить отредактированное изображение.")
-        await validate_edited_media_source(async_session_maker, media_id=directive.media_id, topic_id=topic_id, source_identity=edited.source_identity)
+        await validate_edited_media_source(async_session_maker, media_id=edited.media_id, topic_id=topic_id, source_identity=edited.source_identity)
         if clean_text or buttons:
             chunks = split_text(markdown_to_html(clean_text or 'Выберите действие:'))
             for index, chunk in enumerate(chunks):
@@ -962,7 +962,7 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
                 await _send_ai_text(client, chat_id, None, [chunk], buttons if index == len(chunks) - 1 else [])
         if not await current():
             return True
-        await validate_edited_media_source(async_session_maker, media_id=directive.media_id, topic_id=topic_id, source_identity=edited.source_identity)
+        await validate_edited_media_source(async_session_maker, media_id=edited.media_id, topic_id=topic_id, source_identity=edited.source_identity)
         if not await current():
             return True
         await client.send_media_attachment(chat_id=chat_id, media_type="image", token=token)
