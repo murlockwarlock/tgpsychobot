@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from aiogram.exceptions import TelegramBadRequest
@@ -21,12 +22,13 @@ class MediaSourceError(ValueError):
 
 @dataclass(frozen=True)
 class MediaEditDirective:
-    media_id: int
+    media_ref: int | str
     prompt: str
 
 
 @dataclass(frozen=True)
 class EditedMediaImage:
+    media_id: int
     image_bytes: bytes
     source_identity: tuple[str, str | None, str | None, str]
 
@@ -46,17 +48,33 @@ def source_identity_matches(media, source_identity):
     return media_source_identity(media) == source_identity[:3]
 
 
+def parse_media_reference(value: str) -> int | str | None:
+    raw_value = value
+    value = value.strip()
+    if re.fullmatch(r"[+-]?[0-9]+", value):
+        if len(value) <= 18 and value.isdecimal() and 0 < int(value) <= 2147483647:
+            return int(value)
+        return None
+    if len(raw_value) > 255 or any(unicodedata.category(char).startswith("C") for char in raw_value):
+        return None
+    if not value or any(char in value for char in "/\\:|[]") or value in (".", ".."):
+        return None
+    return value
+
+
 def extract_media_edit_directive(text: str) -> tuple[MediaEditDirective | None, str]:
     pattern = re.compile(r"\[EDIT_IMG_MEDIA\b[^\]]*(?:\]|$)", re.IGNORECASE)
     matches = list(pattern.finditer(text))
     directive = None
     if len(matches) == 1:
         match = re.fullmatch(
-            r"\[EDIT_IMG_MEDIA\s*:\s*([0-9]{1,18})\s*\|\s*([^\[\]]+?)\s*\]",
+            r"\[EDIT_IMG_MEDIA\s*:([^|\[\]]*)\|\s*([^\[\]]+?)\s*\]",
             matches[0].group(), re.IGNORECASE | re.DOTALL,
         )
-        if match and 0 < int(match[1]) <= 2147483647 and match[2].strip():
-            directive = MediaEditDirective(int(match[1]), match[2].strip())
+        if match and match[2].strip():
+            media_ref = parse_media_reference(match[1])
+            if media_ref is not None and (type(media_ref) is int or "|" not in match[2]):
+                directive = MediaEditDirective(media_ref, match[2].strip())
     clean = pattern.sub("", text)
     clean = re.sub(r"(?im)^\s*EDIT_IMG_MEDIA\b.*$", "", clean)
     inline_marker = re.search(r"\bEDIT_IMG_MEDIA\b", clean, re.IGNORECASE)
@@ -79,15 +97,28 @@ def extract_media_edit_directive(text: str) -> tuple[MediaEditDirective | None, 
 async def resolve_editable_media_source(session, *, media_id: int, topic_id: int | None, include_source_bytes: bool = False):
     if type(media_id) is not int or not 0 < media_id <= 2147483647:
         raise MediaSourceError("Изображение недоступно в текущей теме.")
+    return await resolve_editable_media_reference(session, media_ref=media_id, topic_id=topic_id, include_source_bytes=include_source_bytes)
+
+
+async def resolve_editable_media_reference(session, *, media_ref: int | str, topic_id: int | None, include_source_bytes: bool = False):
+    if type(media_ref) is int:
+        valid = 0 < media_ref <= 2147483647
+    else:
+        valid = isinstance(media_ref, str) and parse_media_reference(media_ref) == media_ref
+    if not valid:
+        raise MediaSourceError("Изображение недоступно в текущей теме.")
     scope = await load_media_scope(session, topic_id, include_media_ids=False)
     query = select(MediaLibrary).where(
-        MediaLibrary.id == media_id,
+        MediaLibrary.id == media_ref if type(media_ref) is int else MediaLibrary.file_name == media_ref,
         scope.predicate(),
         MediaLibrary.media_type.in_(PHOTO_MEDIA_TYPES),
     )
     if include_source_bytes:
         query = query.options(undefer(MediaLibrary.source_image_bytes))
-    media = await session.scalar(query)
+    matches = (await session.scalars(query.limit(2))).all()
+    if len(matches) > 1:
+        raise MediaSourceError("Найдено несколько изображений с таким именем. Уточните файл в медиатеке.")
+    media = matches[0] if matches else None
     if media is None:
         raise MediaSourceError("Изображение недоступно в текущей теме.")
     return media
@@ -188,21 +219,22 @@ async def edit_media_image(directive, *, session_factory, user_id, dialogue_id, 
         return None
     async with session_factory() as session:
         await ensure_enabled(session)
-        media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id, include_source_bytes=True)
+        media = await resolve_editable_media_reference(session, media_ref=directive.media_ref, topic_id=topic_id, include_source_bytes=True)
+    media_id = media.id
     source_identity = media_source_identity(media, include_content_digest=True)
     image_bytes = await load_media_image_bytes(media, telegram_bot=telegram_bot, max_client=max_client)
     if not await current():
         return None
     async with session_factory() as session:
         await ensure_enabled(session)
-        current_media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
+        current_media = await resolve_editable_media_source(session, media_id=media_id, topic_id=topic_id)
         if media_source_identity(current_media) != source_identity[:3]:
             raise MediaSourceError("Исходное изображение изменилось. Повторите запрос.")
     edited = await edit_image(directive.prompt, image_bytes)
     if not await current():
         return None
     async with session_factory() as session:
-        current_media = await resolve_editable_media_source(session, media_id=directive.media_id, topic_id=topic_id)
+        current_media = await resolve_editable_media_source(session, media_id=media_id, topic_id=topic_id)
         if media_source_identity(current_media) != source_identity[:3]:
             raise MediaSourceError("Исходное изображение изменилось. Повторите запрос.")
-    return EditedMediaImage(edited, source_identity)
+    return EditedMediaImage(media_id, edited, source_identity)

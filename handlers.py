@@ -2148,7 +2148,7 @@ async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_
             await _safe_send_html(lambda text, pm: bot.send_message(chat_id=user_id, text=text, parse_mode=pm), chunk)
         if not await current():
             return MediaEditDelivery(None)
-        await validate_edited_media_source(async_session_maker, media_id=directive.media_id, topic_id=topic_id, source_identity=edited.source_identity)
+        await validate_edited_media_source(async_session_maker, media_id=edited.media_id, topic_id=topic_id, source_identity=edited.source_identity)
         if not await current():
             return MediaEditDelivery(None)
         await bot.send_photo(chat_id=user_id, photo=BufferedInputFile(edited.image_bytes, filename="edited.png"),
