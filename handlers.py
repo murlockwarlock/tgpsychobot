@@ -5300,6 +5300,8 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             getattr(config, 'image_edit_model', None),
             "image_edit",
         )
+        image_gen_status = 'Включено' if getattr(config, 'allow_image_generation', False) else 'Выключено'
+        image_edit_status = 'Включено' if getattr(config, 'allow_image_edit', False) else 'Выключено'
         kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0)
         fb_provider = getattr(config, 'fallback_provider', None)
         fb_model = getattr(config, 'fallback_model', None)
@@ -5338,9 +5340,11 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             f"▫️ Провайдер: <b>{vis_provider}</b>\n"
             f"▫️ Модель: <code>{vis_model}</code>\n\n"
             f"🧪 <b>Генерация изображений:</b>\n"
+            f"▫️ Статус: <b>{image_gen_status}</b>\n"
             f"▫️ Провайдер: <b>{image_gen_provider}</b>\n"
             f"▫️ Модель: <code>{image_gen_model}</code>\n\n"
             f"🎨 <b>Редактирование изображений:</b>\n"
+            f"▫️ Статус: <b>{image_edit_status}</b>\n"
             f"▫️ Провайдер: <b>{image_edit_provider}</b>\n"
             f"▫️ Модель: <code>{image_edit_model}</code>\n\n"
             f"💳 <b>KIE кредиты:</b>\n"
