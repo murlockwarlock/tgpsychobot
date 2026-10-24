@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -332,12 +333,13 @@ async def test_max_handle_update_journey(session_factory, media_setup, monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('reference', [10, 'portrait'])
 @pytest.mark.parametrize('platform', ['telegram', 'max', 'max_hidden'])
 @pytest.mark.parametrize('other', ['[START_TEST]', 'RUN_TEST', '[SHOW_IMG: portrait]', '[SEND_AUDIO: audio]', '[RANDOM_IMG: cards]', '[CHOICE_IMG: cards | 2]', '[CHOICE_IMG_HIDDEN: cards | 2]', 'GEN_IMG: [blue sky]', 'EDIT_IMG: change uploaded image'])
-async def test_mixed_directives_fail_closed(session_factory, media_setup, monkeypatch, platform, other):
+async def test_mixed_directives_fail_closed(session_factory, media_setup, monkeypatch, platform, other, reference):
     import media_image_edit
     assert extract_media_edit_directive(other) == (None, other)
-    response = 'Вот вариант:\n[EDIT_IMG_MEDIA: 10 | make the sky blue]\n' + other
+    response = f'Вот вариант:\n[EDIT_IMG_MEDIA: {reference} | make the sky blue]\n' + other
     directive, clean = extract_media_edit_directive(response)
     assert directive is None
     assert clean.rstrip(':') == 'Вот вариант'
@@ -817,7 +819,7 @@ DENIS_EDIT_PROMPT = 'Insert "ИВАН СОЛДАТОВ" in the recipient field a
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('platform', ['telegram', 'max'])
-@pytest.mark.parametrize('scenario', ['name', 'numeric', 'main', 'wrong_topic', 'wrong_collection', 'duplicate', 'nonexistent', 'audio', 'video', 'document', 'disabled', 'stale_topic', 'stale_dialogue', 'replaced'])
+@pytest.mark.parametrize('scenario', ['name', 'numeric', 'main', 'wrong_topic', 'wrong_collection', 'duplicate', 'nonexistent', 'audio', 'video', 'document', 'disabled', 'stale_topic', 'stale_dialogue', 'replaced', 'renamed'])
 async def test_denis_certificate_real_runtime(session_factory, media_setup, monkeypatch, platform, scenario):
     import media_image_edit
     from sqlalchemy import delete
@@ -849,22 +851,27 @@ async def test_denis_certificate_real_runtime(session_factory, media_setup, monk
     response = f'Готово, вот сертификат:\n\n[EDIT_IMG_MEDIA: {reference} | {DENIS_EDIT_PROMPT}]'
     model = AsyncMock(return_value=response)
     async def edit(*args):
-        if scenario in ('stale_topic', 'stale_dialogue', 'replaced'):
+        if scenario in ('stale_topic', 'stale_dialogue', 'replaced', 'renamed'):
             async with session_factory() as session:
                 user = await session.get(User, user_id)
                 if scenario == 'stale_topic':
                     user.current_topic_id = 2
                 elif scenario == 'stale_dialogue':
                     user.current_dialogue_id = 2
-                else:
+                elif scenario == 'replaced':
                     (await session.get(MediaLibrary, 3)).file_id = 'replacement'
+                else:
+                    (await session.get(MediaLibrary, 3)).file_name = 'archived_certificate'
+                    replacement = await session.get(MediaLibrary, 10)
+                    replacement.file_name = 'panda_certificate'
+                    replacement.file_id = 'wrong-source'
                 await session.commit()
         return b'edited-certificate'
     provider = AsyncMock(side_effect=edit)
     source_loader = AsyncMock(wraps=media_image_edit.load_media_image_bytes)
     monkeypatch.setattr(media_image_edit, 'load_media_image_bytes', source_loader)
-    should_edit = scenario in ('name', 'numeric', 'main', 'stale_topic', 'stale_dialogue', 'replaced')
-    should_deliver = scenario in ('name', 'numeric', 'main')
+    should_edit = scenario in ('name', 'numeric', 'main', 'stale_topic', 'stale_dialogue', 'replaced', 'renamed')
+    should_deliver = scenario in ('name', 'numeric', 'main', 'renamed')
     if platform == 'telegram':
         transport = TelegramTransport()
         bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
@@ -912,7 +919,11 @@ async def test_denis_certificate_real_runtime(session_factory, media_setup, monk
     if scenario != 'disabled':
         assert '[EDIT_IMG_MEDIA: exact_file_name |' in instructions
         if scenario not in ('wrong_topic', 'wrong_collection', 'audio', 'video', 'document'):
-            assert '[PHOTO id=3] panda_certificate' in instructions
+            if platform == 'telegram':
+                assert '[PHOTO id=3] panda_certificate' in instructions
+            else:
+                source_line = next(line for line in instructions.splitlines() if line.startswith('[PHOTO id=3]'))
+                assert json.loads(source_line.partition('] ')[2])['name'] == 'panda_certificate'
     assert source_loader.await_count == int(should_edit)
     assert provider.await_count == int(should_edit)
     if should_edit:
@@ -940,3 +951,12 @@ def test_numeric_parser_preserves_whitespace_and_prompt_pipes():
     assert directive.media_ref == 3
     assert directive.prompt == 'add A | B'
     assert clean == ''
+
+
+@pytest.mark.parametrize('text', [
+    '[EDIT_IMG_MEDIA: panda_certificate | ]',
+    '[EDIT_IMG_MEDIA: panda_certificate]',
+    '[EDIT_IMG_MEDIA: panda_certificate | x]\n[EDIT_IMG_MEDIA: portrait | y]',
+])
+def test_symbolic_malformed_directives(text):
+    assert extract_media_edit_directive(text)[0] is None
