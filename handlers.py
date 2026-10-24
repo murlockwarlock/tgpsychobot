@@ -60,6 +60,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
                      AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH)
 from aiogram.types import LabeledPrice
 import keyboards as kb
+from kie_image_inputs import ImageGeometryError
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
 from ai_integration import (
     get_ai_response,
@@ -2156,7 +2157,7 @@ async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_
     except Exception as exc:
         if not await current():
             return MediaEditDelivery(None)
-        if isinstance(exc, MediaSourceError):
+        if isinstance(exc, (MediaSourceError, ImageGeometryError)):
             error_text = str(exc)
         else:
             provider, model = _resolve_ai_provider_model(ai_config, "image_edit")
@@ -5300,6 +5301,8 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             getattr(config, 'image_edit_model', None),
             "image_edit",
         )
+        image_gen_status = 'Включено' if getattr(config, 'allow_image_generation', False) else 'Выключено'
+        image_edit_status = 'Включено' if getattr(config, 'allow_image_edit', False) else 'Выключено'
         kie_credit_alert_threshold = getattr(config, 'kie_credit_alert_threshold', 0)
         fb_provider = getattr(config, 'fallback_provider', None)
         fb_model = getattr(config, 'fallback_model', None)
@@ -5338,9 +5341,11 @@ async def admin_ai_settings(message: Message | CallbackQuery):
             f"▫️ Провайдер: <b>{vis_provider}</b>\n"
             f"▫️ Модель: <code>{vis_model}</code>\n\n"
             f"🧪 <b>Генерация изображений:</b>\n"
+            f"▫️ Статус: <b>{image_gen_status}</b>\n"
             f"▫️ Провайдер: <b>{image_gen_provider}</b>\n"
             f"▫️ Модель: <code>{image_gen_model}</code>\n\n"
             f"🎨 <b>Редактирование изображений:</b>\n"
+            f"▫️ Статус: <b>{image_edit_status}</b>\n"
             f"▫️ Провайдер: <b>{image_edit_provider}</b>\n"
             f"▫️ Модель: <code>{image_edit_model}</code>\n\n"
             f"💳 <b>KIE кредиты:</b>\n"
@@ -24097,6 +24102,13 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             await session.commit()
 
 
+    except ImageGeometryError as exc:
+        if typing_task:
+            typing_task.cancel()
+        if processing_msg:
+            await _delete_ai_processing_message(processing_msg)
+        if await media_edit_context_is_current(async_session_maker, user_id, current_dialogue_id, current_topic_id):
+            await message.answer(str(exc))
     except AIServiceError as e:
         if typing_task:
             typing_task.cancel()
