@@ -37,9 +37,8 @@ def is_negated(prompt, position):
 def explicit_ratio(prompt):
     requested = None
     for match in re.finditer(r'(?<![\d.])([1-9]\d{0,3})\s*([:x×])\s*([1-9]\d{0,3})(?![\d.])', prompt, re.I):
-        width, separator, height = match.groups()
-        ratio = f'{width}:{height}'
-        if (separator.lower() != ':' or ratio in NANO_BANANA_RATIOS) and not is_negated(prompt, match.start()):
+        width, _, height = match.groups()
+        if not is_negated(prompt, match.start()):
             requested = int(width) / int(height)
     return requested
 
@@ -49,8 +48,19 @@ def generation_ratio(prompt):
     ratio = explicit_ratio(prompt)
     if ratio is not None:
         return ratio
-    if re.search(r'\bsquare\s+(?:image|format|canvas|poster|composition)\b|\b(?:image|canvas|photo|poster)\s+square\b|\bквадрат\w*\b', prompt):
-        return 1.0
+    orientations = re.finditer(
+        r'\b(?:vertical|horizontal|вертикаль\w*|горизонталь\w*|квадрат\w*)\b'
+        r'|\bsquare\s+(?:image|format|canvas|poster|composition)\b'
+        r'|\b(?:image|canvas|photo|poster)\s+square\b'
+        r'|\b(?:landscape|portrait)\s+(?:orientation|format|canvas|poster)\b',
+        prompt,
+    )
+    for match in orientations:
+        if is_negated(prompt, match.start()):
+            continue
+        if re.search(r'square|квадрат', match[0]):
+            return 1.0
+        return 4 / 3 if re.search(r'horizontal|landscape|горизонталь', match[0]) else 3 / 4
     if re.search(r'\b(?:horizontal|landscape|widescreen|panoramic|banner|горизонталь\w*|широкоформат\w*|баннер\w*)\b|wide shot|cinematic wide', prompt):
         return 4 / 3
     if re.search(r'\b(?:vertical|portrait|вертикаль\w*|портрет\w*)\b|phone wallpaper', prompt):

@@ -55,6 +55,12 @@ EDIT_MODELS = ('bytedance/seedream-v4-edit', 'seedream/4.5-edit', 'google/nano-b
     ('A horizontal view of a town square', '4:3', 'landscape_4_3'),
     ('Source 3:4, change to 16:9', '16:9', 'landscape_16_9'),
     ('A banner in 16:9, not 1:1', '16:9', 'landscape_16_9'),
+    ('A vertical poster featuring a landscape painting', '3:4', 'portrait_4_3'),
+    ('A horizontal poster featuring a portrait photograph', '4:3', 'landscape_4_3'),
+    ('A vertical poster containing a square image', '3:4', 'portrait_4_3'),
+    ('A square image containing vertical stripes', '1:1', 'square_hd'),
+    ('Generate an image in 6:8', '3:4', 'portrait_4_3'),
+    ('Generate an image in 5:7', '3:4', 'portrait_4_3'),
 ])
 def test_generation_model_geometry(model, prompt, ratio, size):
     payload = kie_image_inputs.generation_input(model, prompt)
@@ -286,3 +292,10 @@ async def test_wrong_provider_geometry_is_rejected_without_paid_retry(monkeypatc
 def test_negated_resize_does_not_override_source(prompt):
     payload = kie_image_inputs.edit_input(EDIT_MODELS[0], prompt, 'https://images.test/source.png', png(600, 900))
     assert payload['image_size'] == 'portrait_3_2'
+
+
+@pytest.mark.parametrize('reference', ['6:8', '5:7'])
+@pytest.mark.parametrize('model', EDIT_MODELS)
+def test_arbitrary_explicit_ratio_overrides_landscape_source(model, reference):
+    payload = kie_image_inputs.edit_input(model, f'Resize to {reference}', 'https://images.test/source.png', png(1600, 900))
+    assert payload.get('aspect_ratio') == '3:4' or payload.get('image_size') == 'portrait_4_3'
