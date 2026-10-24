@@ -18,6 +18,16 @@ SEEDREAM_SIZES = {
     '16:9': 'landscape_16_9',
     '21:9': 'landscape_21_9',
 }
+QUOTED_TEXT = re.compile(r'''"(?:\\.|[^"\\])*"|“[^”]*”|«[^»]*»|(?<!\w)'(?:\\.|[^'\\])*'(?!\w)|`[^`]*`''')
+
+
+def shape_prompt(prompt):
+    prompt = (prompt or '').lower().strip()
+    return prompt[1:-1] if QUOTED_TEXT.fullmatch(prompt) else prompt
+
+
+def without_literals(prompt):
+    return QUOTED_TEXT.sub(lambda match: ' ' * len(match[0]), prompt)
 
 
 def ratio_value(ratio):
@@ -45,7 +55,7 @@ def has_geometry_request(prefix):
 
 def explicit_ratio(prompt, *, editing=False):
     requested = None
-    literals = list(re.finditer(r'''"(?:\\.|[^"\\])*"|“[^”]*”|«[^»]*»|(?<!\w)'(?:\\.|[^'\\])*'(?!\w)|`[^`]*`''', prompt))
+    literals = list(QUOTED_TEXT.finditer(prompt))
     for match in re.finditer(r'(?<![\d.])([1-9]\d{0,3})\s*([:x×])\s*([1-9]\d{0,3})(?![\d.])', prompt, re.I):
         width, _, height = match.groups()
         literal = next((item for item in literals if item.start() < match.start() and match.end() < item.end()), None)
@@ -64,10 +74,11 @@ def explicit_ratio(prompt, *, editing=False):
 
 
 def generation_ratio(prompt):
-    prompt = (prompt or '').lower()
+    prompt = shape_prompt(prompt)
     ratio = explicit_ratio(prompt)
     if ratio is not None:
         return ratio
+    prompt = without_literals(prompt)
     direction = r'(?:vertical|horizontal|square|landscape|portrait|вертикаль\w*|горизонталь\w*|квадрат\w*)'
     canvas = r'(?:image|format|canvas|poster|composition|orientation|banner|photo|view|frame|illustration|wallpaper|certificate|изображен\w*|формат\w*|плакат\w*|постер\w*|баннер\w*|холст\w*|фото|сертификат\w*)'
     adjectives = r'(?:(?!(?:of|on|with|and|featuring|containing|depicting|с|на|в|и|для|из)\b)\w+\s+){0,2}'
@@ -106,17 +117,23 @@ def source_ratio(image_bytes):
 
 def edit_ratio(prompt, image_bytes):
     source = source_ratio(image_bytes)
-    prompt = (prompt or '').lower()
+    prompt = shape_prompt(prompt)
     requested = explicit_ratio(prompt, editing=True)
     if requested is None:
-        match = re.search(
-            r'\b(?:make|convert|crop|resize|сделай|сделать|измени|изменить|обрежь)\s+'
-            r'(?:(?:the|this|image|canvas|photo|it|to|a|an|изображение|фото|формат)\s+)*'
-            r'(horizontal|landscape|vertical|portrait|square|горизонталь\w*|вертикаль\w*|квадрат\w*)\b',
-            prompt,
+        prompt = without_literals(prompt)
+        direction = r'(horizontal|landscape|vertical|portrait|square|горизонталь\w*|вертикаль\w*|квадрат\w*)'
+        patterns = (
+            r'\b(?:make|convert|crop|resize|change|сделай|сделать|измени|изменить|обрежь)\s+'
+            r'(?:(?:the|this)\s+)?(?:image|canvas|photo|picture|frame|format|it|изображение|фото|холст|формат)\s+'
+            r'(?:(?:to|into|a|an|в)\s+)*' + direction + r'\b',
+            r'\b(?:orientation|format|ориентац\w*|формат\w*)\s*(?:(?:to|into|в|:|=)\s*)?' + direction + r'\b',
+            r'\b(?:crop|resize|convert|change|обрежь|измени)\s+(?:to|into|в)\s+(?:(?:a|an)\s+)?' + direction + r'\b',
+            r'\b' + direction + r'\s+(?:orientation|format)\b',
         )
-        if match and not is_negated(prompt, match.start()):
-            requested = generation_ratio(match[1])
+        matches = sorted((match for pattern in patterns for match in re.finditer(pattern, prompt)), key=lambda match: match.start())
+        for match in matches:
+            if not is_negated(prompt, match.start()):
+                requested = generation_ratio(match[1])
     return source if requested is None else requested
 
 

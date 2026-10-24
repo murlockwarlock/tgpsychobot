@@ -327,3 +327,52 @@ def test_explicit_resize_supports_quoted_ratios(prompt):
 def test_generation_caption_time_does_not_override_orientation(model):
     payload = kie_image_inputs.generation_input(model, 'Horizontal poster with caption "Starts at 12:30"')
     assert payload.get('aspect_ratio') == '4:3' or payload.get('image_size') == 'landscape_4_3'
+
+
+@pytest.mark.parametrize('model', EDIT_MODELS)
+@pytest.mark.parametrize('width,height,ratio,size', [(800, 800, '1:1', 'square_hd'), (600, 900, '2:3', 'portrait_3_2'), (1600, 900, '16:9', 'landscape_16_9')])
+@pytest.mark.parametrize('prompt', [
+    'Make the portrait brighter. Preserve everything else.',
+    'Make the landscape greener. Preserve everything else.',
+    'Make the text horizontal. Preserve the image dimensions.',
+    'Make horizontal text. Preserve everything else.',
+    'Make the logo square. Preserve everything else.',
+    'Сделай портрет ярче. Остальное без изменений.',
+])
+def test_subject_edits_do_not_override_canvas(model, width, height, ratio, size, prompt):
+    payload = kie_image_inputs.edit_input(model, prompt, 'https://images.test/source.png', png(width, height))
+    assert payload.get('aspect_ratio') == ratio or payload.get('image_size') == size
+
+
+@pytest.mark.parametrize('prompt,size', [
+    ('Make the image portrait', 'portrait_4_3'),
+    ('Convert it to landscape', 'landscape_4_3'),
+    ('Crop to square', 'square_hd'),
+    ('Change canvas orientation to landscape', 'landscape_4_3'),
+])
+def test_explicit_canvas_orientation_changes_are_supported(prompt, size):
+    payload = kie_image_inputs.edit_input(EDIT_MODELS[0], prompt, 'https://images.test/source.png', png(600, 900))
+    assert payload['image_size'] == size
+
+
+@pytest.mark.parametrize('model', EDIT_MODELS)
+@pytest.mark.parametrize('prompt', [
+    'Write "Make the image portrait" in the caption. Preserve everything else.',
+    'Replace the label with «landscape orientation». Preserve everything else.',
+    'Write “Resize the image to 6:8” in the caption. Preserve everything else.',
+])
+def test_literal_orientation_commands_do_not_resize_image(model, prompt):
+    payload = kie_image_inputs.edit_input(model, prompt, 'https://images.test/source.png', png(800, 800))
+    assert payload.get('aspect_ratio') == '1:1' or payload.get('image_size') == 'square_hd'
+
+
+@pytest.mark.parametrize('model', GENERATION_MODELS)
+def test_generation_literal_orientation_is_caption_content(model):
+    payload = kie_image_inputs.generation_input(model, 'A poster with caption "horizontal image"')
+    assert payload.get('aspect_ratio') == '3:4' or payload.get('image_size') == 'portrait_4_3'
+
+
+@pytest.mark.parametrize('model', GENERATION_MODELS)
+def test_wrapped_generation_prompt_still_honors_ratio(model):
+    payload = kie_image_inputs.generation_input(model, '"A vertical poster in 9:16"')
+    assert payload.get('aspect_ratio') == '9:16' or payload.get('image_size') == 'portrait_16_9'
