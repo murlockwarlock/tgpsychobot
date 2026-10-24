@@ -497,3 +497,38 @@ def test_preserving_content_does_not_cancel_explicit_resize(model, prompt, ratio
     request = kie_image_inputs.prepare_edit(model, prompt, 'https://images.test/source.png', png(600, 900))
     assert request.geometry.mode == 'resize'
     assert request.payload.get('aspect_ratio') == ratio or request.payload.get('image_size') == size
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('surface', ['telegram', 'max'])
+@pytest.mark.parametrize('model', EDIT_MODELS)
+@pytest.mark.parametrize('target', ['15360x8640', '100000x50000', '15360×8640', '9' * 200 + 'x1080'])
+async def test_large_pixel_targets_fail_before_kie_http(monkeypatch, surface, model, target):
+    module = ai_integration if surface == 'telegram' else max_ai
+    source = png(600, 900)
+    wire = mock_kie(monkeypatch, source, png(1600, 900))
+    call = module._call_kie_image_edit if surface == 'telegram' else module._edit_kie
+    with pytest.raises(kie_image_inputs.ModelGeometryLimitation):
+        await call('test-key', 'https://kie.test', 'https://uploads.test', model, f'Resize to {target}', source)
+    assert wire.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('surface', ['telegram', 'max'])
+@pytest.mark.parametrize('model', EDIT_MODELS)
+@pytest.mark.parametrize('target', ['0x1080', '-1920x1080'])
+async def test_invalid_pixel_targets_are_not_ordinary_edits(monkeypatch, surface, model, target):
+    module = ai_integration if surface == 'telegram' else max_ai
+    source = png(600, 900)
+    wire = mock_kie(monkeypatch, source, png(600, 900))
+    call = module._call_kie_image_edit if surface == 'telegram' else module._edit_kie
+    with pytest.raises(kie_image_inputs.ImageGeometryError):
+        await call('test-key', 'https://kie.test', 'https://uploads.test', model, f'Resize to {target}', source)
+    assert wire.requests == []
+
+
+@pytest.mark.parametrize('model', EDIT_MODELS)
+def test_large_equivalent_ratio_is_normalized_before_model_mapping(model):
+    request = kie_image_inputs.prepare_edit(model, 'Change aspect ratio to 15360:8640', 'https://images.test/source.png', png(600, 900))
+    assert request.geometry.mode == 'resize'
+    assert request.payload.get('aspect_ratio') == '16:9' or request.payload.get('image_size') == 'landscape_16_9'

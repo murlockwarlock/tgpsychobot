@@ -102,7 +102,7 @@ def has_edit_geometry_request(prefix):
 def explicit_geometry(prompt, *, editing=False):
     requested = None
     literals = list(QUOTED_TEXT.finditer(prompt))
-    for match in re.finditer(r'(?<![\d.])([1-9]\d{0,3})\s*([:x×])\s*([1-9]\d{0,3})(?!\d|\.\d)', prompt, re.I):
+    for match in re.finditer(r'(?<![\d.])([+-]?[0-9]+)\s*([:x×])\s*([+-]?[0-9]+)(?!\d|\.\d)', prompt, re.I):
         width, separator, height = match.groups()
         literal = next((item for item in literals if item.start() < match.start() and match.end() < item.end()), None)
         prefix = prompt[:literal.start() if literal else match.start()]
@@ -115,6 +115,10 @@ def explicit_geometry(prompt, *, editing=False):
             continue
         if editing and (preservation_context(prefix) or not has_edit_geometry_request(prefix)) and prompt.strip() != match[0]:
             continue
+        if len(width.lstrip('+-')) > 18 or len(height.lstrip('+-')) > 18:
+            raise ModelGeometryLimitation('Запрошенные размеры превышают возможности подключённых моделей. Операция не запущена.')
+        if int(width) <= 0 or int(height) <= 0:
+            raise ImageGeometryError('Ширина и высота должны быть положительными. Операция не запущена.')
         requested = (int(width), int(height), separator.lower())
     return requested
 
