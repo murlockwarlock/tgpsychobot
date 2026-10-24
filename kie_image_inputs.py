@@ -86,6 +86,19 @@ def preservation_context(prefix):
     return bool(re.search(r'\b(?:same|original|source|current|исходн\w*|текущ\w*)\b', clause, re.I))
 
 
+def has_edit_geometry_request(prefix):
+    field = r'(?:aspect[ _-]?ratio|ratio|format|dimensions?|size|соотношение\s+сторон|формат\w*|размер\w*|пропорц\w*)'
+    image = r'(?:image|canvas|photo|picture|frame|it|изображение|фото|холст)'
+    article = r'(?:(?:the|this|original|source)\s+)?'
+    target = r'\s*(?:(?:to|into|in|at|в|на|до)\s*)?(?:[:=]\s*)?$'
+    clause = re.split(r'[.!?;\n]', prefix)[-1].strip()
+    return bool(
+        re.search(rf'\b(?:resize|crop|обрежь)\s+{article}(?:{image}\s+)?(?:{field}\s*)?{target}', prefix, re.I)
+        or re.search(rf'\b(?:make|change|convert|set|use|сделай|сделать|измени|изменить)\s+{article}(?:{image}|{field})(?:\s+{field})?{target}', prefix, re.I)
+        or re.fullmatch(rf'(?:(?:target|output|requested|canvas)\s+)?{field}{target}', clause, re.I)
+    )
+
+
 def explicit_geometry(prompt, *, editing=False):
     requested = None
     literals = list(QUOTED_TEXT.finditer(prompt))
@@ -100,7 +113,7 @@ def explicit_geometry(prompt, *, editing=False):
             continue
         if re.search(r'\b(?:at|time|starts|в|время)\s*$', prefix, re.I) and not geometry_request:
             continue
-        if editing and (preservation_context(prefix) or not geometry_request) and prompt.strip() != match[0]:
+        if editing and (preservation_context(prefix) or not has_edit_geometry_request(prefix)) and prompt.strip() != match[0]:
             continue
         requested = (int(width), int(height), separator.lower())
     return requested
@@ -174,7 +187,7 @@ def requested_edit_ratio(prompt):
         )
         matches = sorted((match for pattern in patterns for match in re.finditer(pattern, prompt)), key=lambda match: match.start())
         for match in matches:
-            if not is_negated(prompt, match.start()) and not preservation_context(prompt[:match.start()]):
+            if not is_negated(prompt, match.start()) and not preservation_context(prompt[:match.end()]):
                 requested = generation_ratio(match[1])
     return requested
 

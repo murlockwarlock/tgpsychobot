@@ -474,3 +474,26 @@ async def test_unsupported_explicit_targets_do_not_spend_a_paid_task(monkeypatch
 def test_source_geometry_mentions_are_not_resize_permission(prompt):
     geometry = kie_image_inputs.edit_geometry(prompt, png(904, 1280))
     assert geometry.mode == 'preserve' and geometry.source_size == (904, 1280)
+
+
+@pytest.mark.parametrize('prompt', [
+    'Write ratio 4:3 in the caption. Preserve everything else.',
+    'Insert the label format 16:9. Preserve everything else.',
+    'Set font size 16x24. Preserve everything else.',
+    'Source aspect ratio 113:160. Insert name and date.',
+])
+def test_geometry_words_in_text_edits_do_not_authorize_resize(prompt):
+    geometry = kie_image_inputs.edit_geometry(prompt, png(904, 1280))
+    assert geometry.mode == 'preserve' and geometry.source_size == (904, 1280)
+
+
+@pytest.mark.parametrize('model', EDIT_MODELS)
+@pytest.mark.parametrize('prompt,ratio,size', [
+    ('Keep the logo unchanged, but make the image square', '1:1', 'square_hd'),
+    ('Preserve all text and crop to square', '1:1', 'square_hd'),
+    ('Keep all labels unchanged, but convert it to landscape', '4:3', 'landscape_4_3'),
+])
+def test_preserving_content_does_not_cancel_explicit_resize(model, prompt, ratio, size):
+    request = kie_image_inputs.prepare_edit(model, prompt, 'https://images.test/source.png', png(600, 900))
+    assert request.geometry.mode == 'resize'
+    assert request.payload.get('aspect_ratio') == ratio or request.payload.get('image_size') == size
