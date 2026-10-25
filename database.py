@@ -3,7 +3,7 @@ import hashlib
 import re
 import textwrap
 from sqlalchemy import (create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, BigInteger, Table,
-                        Float, Interval, Index, UniqueConstraint, CheckConstraint, LargeBinary, func, text)
+                        Float, Interval, Index, UniqueConstraint, CheckConstraint, LargeBinary, JSON, func, text)
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, validates, deferred
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession as SQLAlchemyAsyncSession
@@ -1476,6 +1476,16 @@ def _migrate_media_edit_sources(sync_conn):
         sync_conn.execute(text(f"ALTER TABLE media_library ADD COLUMN source_image_bytes {binary_type}"))
 
 
+def _migrate_media_templates(sync_conn):
+    from sqlalchemy import inspect
+
+    columns = {column['name'] for column in inspect(sync_conn).get_columns('media_library')}
+    if 'render_template_enabled' not in columns:
+        sync_conn.execute(text('ALTER TABLE media_library ADD COLUMN render_template_enabled BOOLEAN NOT NULL DEFAULT FALSE'))
+    if 'render_template_config' not in columns:
+        sync_conn.execute(text('ALTER TABLE media_library ADD COLUMN render_template_config JSON'))
+
+
 async def init_db():
     async with engine.begin() as conn:
         await _acquire_database_init_lock(conn)
@@ -1487,6 +1497,7 @@ async def init_db():
             insp = sa_inspect(sync_conn)
             dialect_name = getattr(sync_conn.dialect, "name", "")
             _migrate_media_edit_sources(sync_conn)
+            _migrate_media_templates(sync_conn)
             sync_conn.execute(text(
                 "UPDATE media_library SET media_type = 'photo' "
                 "WHERE LOWER(media_type) = 'image'"
@@ -2537,6 +2548,8 @@ class MediaLibrary(Base):
     category = Column(String, nullable=True)
     description = Column(Text, nullable=True)
     media_type = Column(String, nullable=False)
+    render_template_enabled = Column(Boolean, nullable=False, default=False, server_default=text('false'))
+    render_template_config = Column(JSON, nullable=True)
     collections = relationship("MediaCollection", secondary=media_collection_items, back_populates="media_files")
 
 

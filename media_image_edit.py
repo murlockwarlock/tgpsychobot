@@ -84,7 +84,7 @@ def extract_media_edit_directive(text: str) -> tuple[MediaEditDirective | None, 
     if matches or inline_marker:
         starts_test, without_test = extract_test_start_directive(clean)
         other_commands = re.compile(
-            r"\[(?:SHOW_IMG|RANDOM_IMG|CHOICE_IMG(?:_HIDDEN)?|SEND_AUDIO|GEN_IMG|IMG|EDIT_IMG)\s*:[^\]]*(?:\]|$)"
+            r"\[(?:RENDER_IMG_MEDIA|SHOW_IMG|RANDOM_IMG|CHOICE_IMG(?:_HIDDEN)?|SEND_AUDIO|GEN_IMG|IMG|EDIT_IMG)\s*:[^\]]*(?:\]|$)"
             r"|\b(?:GEN_IMG|EDIT_IMG)\s*:[^\n]*",
             re.IGNORECASE,
         )

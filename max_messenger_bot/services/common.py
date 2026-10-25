@@ -42,6 +42,8 @@ from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
 from telegram_start_service import grant_subscription_days
 from kie_image_inputs import ImageGeometryError
+from media_templates import extract_template_directive, render_media_template, validate_rendered_template
+from media_template_renderer import TemplateRenderError
 from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, validate_edited_media_source, MediaSourceError
 
 
@@ -920,7 +922,45 @@ async def _transition_image_progress_status(
     return progress_mid, None
 
 
+async def _deliver_media_template(client, chat_id, user_id, response, dialogue_id, topic_id):
+    async def current():
+        return await media_edit_context_is_current(async_session_maker, user_id, dialogue_id, topic_id)
+    if not await current():
+        return True
+    directive, clean = extract_template_directive(response)
+    try:
+        if directive is None:
+            raise TemplateRenderError('Не удалось распознать запрос на заполнение шаблона.')
+        rendered = await render_media_template(directive, session_factory=async_session_maker, user_id=user_id, dialogue_id=dialogue_id, topic_id=topic_id, max_client=client)
+        if not rendered or not await current():
+            return True
+        await validate_rendered_template(async_session_maker, rendered, topic_id)
+        with tempfile.NamedTemporaryFile(suffix='.png') as temporary:
+            temporary.write(rendered.image_bytes)
+            temporary.flush()
+            upload = await client.upload_file('file', temporary.name)
+        token = upload.get('token') or upload.get('fileId') or upload.get('id')
+        if not isinstance(token, str) or not token:
+            raise TemplateRenderError('Не удалось отправить заполненный шаблон.')
+        if not await current():
+            return True
+        await validate_rendered_template(async_session_maker, rendered, topic_id)
+        if not await current():
+            return True
+        clean, buttons = extract_response_buttons(clean)
+        await client.send_media_attachment(chat_id=chat_id, media_type='file', token=token, caption=html.escape(clean[:1024]) or 'certificate.png')
+        await save_ai_message(user_id, clean or '[Шаблон изображения]', dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
+    except Exception as exc:
+        if await current():
+            text = str(exc) if isinstance(exc, (TemplateRenderError, MediaSourceError)) else 'Не удалось заполнить шаблон изображения.'
+            await client.send_message(chat_id=chat_id, text=text)
+            await save_ai_message(user_id, text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
+    return True
+
+
 async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, topic_id):
+    if re.search(r'\bRENDER_IMG_MEDIA\b', response, re.I):
+        return await _deliver_media_template(client, chat_id, user_id, response, dialogue_id, topic_id)
     directive, clean_text = extract_media_edit_directive(response)
     if directive is None and clean_text == response.strip():
         return False

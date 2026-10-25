@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 import gemini_image
 import kie_image_inputs
+from media_templates import format_template_sources
 
 import time
 from datetime import datetime
@@ -2154,6 +2155,7 @@ async def get_ai_response(
             knowledge_context=context,
             available_media_text=available_media_text,
             media_instruction_block=media_instruction_block,
+            media_edit_sources=format_template_sources(media_files),
             subscription_config=subscription_config,
             memory_mode=get_memory_mode(ai_config),
             service_capabilities=TELEGRAM_CAPABILITIES,
