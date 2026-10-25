@@ -20,6 +20,7 @@ from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 import gemini_image
+import kie_image_inputs
 
 from prompt_blocks import MAX_CAPABILITIES, format_media_edit_sources
 from media_scope import load_available_media
@@ -1101,38 +1102,23 @@ async def _call_kie_multimodal(
 
 
 def _select_image_generation_shape(prompt: str) -> tuple[str, str]:
-    prompt_lc = (prompt or "").lower()
-    portrait_markers = ("tarot", "card", "oracle", "poster", "cover", "vertical", "portrait orientation", "full body", "full-body", "phone wallpaper")
-    landscape_markers = ("landscape orientation", "horizontal", "wide shot", "widescreen", "panoramic", "banner", "cinematic wide")
-    if any(m in prompt_lc for m in portrait_markers):
-        return "3:4", "1024x1536"
-    if any(m in prompt_lc for m in landscape_markers):
-        return "4:3", "1536x1024"
-    return "1:1", "1024x1024"
+    return kie_image_inputs.generation_shape(prompt)
 
 
 def _build_kie_image_generation_input(model: str, prompt: str) -> dict:
-    aspect_ratio, _ = _select_image_generation_shape(prompt)
-    if model == "google/imagen4-fast":
-        return {"prompt": prompt, "aspect_ratio": aspect_ratio, "num_images": "1"}
-    if model in {"google/imagen4-ultra", "google/imagen4"}:
-        return {"prompt": prompt, "aspect_ratio": aspect_ratio}
-    if model == "bytedance/seedream-v4-text-to-image":
-        return {"prompt": prompt, "image_size": "square_hd", "image_resolution": "1K", "max_images": 1}
-    if model == "seedream/4.5-text-to-image":
-        return {"prompt": prompt, "aspect_ratio": aspect_ratio, "quality": "basic"}
-    raise AIServiceError(f"Неподдерживаемая KIE image generation model: {model}")
+    try:
+        return kie_image_inputs.generation_input(model, prompt)
+    except ValueError as exc:
+        raise AIServiceError(str(exc)) from exc
 
 
-def _build_kie_image_edit_input(model: str, prompt: str, source_url: str) -> dict:
-    aspect_ratio, _ = _select_image_generation_shape(prompt)
-    if model == "google/nano-banana-edit":
-        return {"prompt": prompt, "image_urls": [source_url], "output_format": "png", "image_size": "1:1"}
-    if model == "bytedance/seedream-v4-edit":
-        return {"prompt": prompt, "image_urls": [source_url], "image_size": "square_hd", "image_resolution": "1K", "max_images": 1}
-    if model == "seedream/4.5-edit":
-        return {"prompt": prompt, "image_urls": [source_url], "aspect_ratio": aspect_ratio, "quality": "basic"}
-    raise AIServiceError(f"Неподдерживаемая KIE image edit model: {model}")
+def _prepare_kie_image_edit(model: str, prompt: str, source_url: str, image_bytes: bytes) -> kie_image_inputs.EditRequest:
+    try:
+        return kie_image_inputs.prepare_edit(model, prompt, source_url, image_bytes)
+    except kie_image_inputs.ImageGeometryError:
+        raise
+    except (ValueError, OSError) as exc:
+        raise AIServiceError("Не удалось подготовить исходное изображение для редактирования.") from exc
 
 
 async def _transcribe_kie(api_key: str, base_url: str, upload_base_url: str, model: str, file_bytes: bytes, filename: str) -> str:
@@ -1202,7 +1188,8 @@ async def _analyze_kie(api_key: str, base_url: str, upload_base_url: str, model:
 
 async def _generate_kie(api_key: str, base_url: str, model: str, prompt: str) -> bytes:
     ensure_model_available(PROVIDER_KIE, model, channel="image_gen")
-    task_id = await _create_kie_task(api_key, base_url, model, _build_kie_image_generation_input(model, prompt))
+    image_input = _build_kie_image_generation_input(model, prompt)
+    task_id = await _create_kie_task(api_key, base_url, model, image_input)
     try:
         task_payload = await _poll_kie_task(api_key, base_url, task_id)
         result = _extract_kie_task_result(task_payload)
@@ -1210,18 +1197,24 @@ async def _generate_kie(api_key: str, base_url: str, model: str, prompt: str) ->
         if not result_urls:
             raise AIServiceError(f"KIE image generation returned no result URLs: task_id={task_id}")
         download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
-        return await _download_binary_file(download_url)
+        image_result = await _download_binary_file(download_url)
+        try:
+            return kie_image_inputs.validate_generation_result(image_result, image_input)
+        except (ValueError, OSError) as exc:
+            raise AIServiceError("Сервис вернул изображение неверного формата или пропорций.") from exc
     except Exception as exc:
         raise _attach_kie_task_failure(exc, task_id) from exc
 
 
 async def _edit_kie(api_key: str, base_url: str, upload_base_url: str, model: str, prompt: str, image_bytes: bytes) -> bytes:
     ensure_model_available(PROVIDER_KIE, model, channel="image_edit")
+    edit_request = _prepare_kie_image_edit(model, prompt, "", image_bytes)
+    image_input = edit_request.payload
     source_url = await _upload_file_to_kie(
         api_key, upload_base_url, image_bytes,
         _guess_filename(image_bytes, "image_edit_source", "jpg"), "images",
     )
-    task_id = await _create_kie_task(api_key, base_url, model, _build_kie_image_edit_input(model, prompt, source_url))
+    task_id = await _create_kie_task(api_key, base_url, model, {**image_input, "image_urls": [source_url]})
     try:
         task_payload = await _poll_kie_task(api_key, base_url, task_id)
         result = _extract_kie_task_result(task_payload)
@@ -1229,7 +1222,13 @@ async def _edit_kie(api_key: str, base_url: str, upload_base_url: str, model: st
         if not result_urls:
             raise AIServiceError(f"KIE image edit returned no result URLs: task_id={task_id}")
         download_url = await _get_kie_download_url(api_key, base_url, result_urls[0])
-        return await _download_binary_file(download_url)
+        image_result = await _download_binary_file(download_url)
+        try:
+            return kie_image_inputs.validate_result(image_result, geometry=edit_request.geometry)
+        except kie_image_inputs.ImageGeometryError:
+            raise
+        except (ValueError, OSError) as exc:
+            raise AIServiceError("Сервис вернул изображение неверного формата или пропорций.") from exc
     except Exception as exc:
         raise _attach_kie_task_failure(exc, task_id, "image_edit") from exc
 

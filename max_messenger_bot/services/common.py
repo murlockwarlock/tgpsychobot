@@ -41,6 +41,7 @@ from response_buttons import ResponseButton, build_action_callback_data, extract
 from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
 from telegram_start_service import grant_subscription_days
+from kie_image_inputs import ImageGeometryError
 from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, validate_edited_media_source, MediaSourceError
 
 
@@ -969,7 +970,7 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
         await save_ai_message(user_id, clean_text or '[Изображение]', dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
     except Exception as exc:
         if await current():
-            text = str(exc) if isinstance(exc, MediaSourceError) else "Не удалось отредактировать изображение. Попробуйте позже."
+            text = str(exc) if isinstance(exc, (MediaSourceError, ImageGeometryError)) else "Не удалось отредактировать изображение. Попробуйте позже."
             await client.send_message(chat_id=chat_id, text=text)
             await save_ai_message(user_id, text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
     return True
@@ -1475,6 +1476,10 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
                         await client.send_message(chat_id=chat_id, text="⚠️ Фото отредактировано, но не удалось отправить.")
                 finally:
                     Path(tmp_path).unlink(missing_ok=True)
+            except ImageGeometryError as img_exc:
+                if await media_edit_context_is_current(async_session_maker, user_id, request_dialogue_id, request_topic_id):
+                    await client.send_message(chat_id=chat_id, text=str(img_exc))
+                    await save_ai_message(user_id, str(img_exc), dialogue_id=request_dialogue_id, topic_id=request_topic_id, require_current_scope=True)
             except Exception as img_exc:
                 log.exception("Image edit failed user_id=%s: %s", user_id, img_exc)
                 await client.send_message(chat_id=chat_id, text="⚠️ Не удалось изменить изображение.")

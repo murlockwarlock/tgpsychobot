@@ -322,6 +322,8 @@ def render_service_prompt(
         unsupported_patterns.append(re.compile(r"</?DATA>|\b<DATA>\b"))
 
     rendered = _sanitize_logical_units(rendered, unsupported_patterns)
+    if caps.supports_media_collections and MEDIA_EDIT_INSTRUCTION in media_instruction_block and MEDIA_EDIT_INSTRUCTION not in rendered:
+        rendered += "\n\n" + MEDIA_EDIT_INSTRUCTION
     if caps.supports_media_image_edit_sources and media_edit_sources:
         rendered += "\n\n" + media_edit_sources
     return rendered.strip()
