@@ -61,6 +61,8 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from kie_image_inputs import ImageGeometryError
+from media_templates import extract_template_directive, render_media_template, validate_rendered_template
+from media_template_renderer import TemplateRenderError
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
 from ai_integration import (
     get_ai_response,
@@ -2117,7 +2119,37 @@ class MediaEditDelivery:
     content: str | None
 
 
+async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id):
+    async def current():
+        return await media_edit_context_is_current(async_session_maker, user_id, dialogue_id, topic_id)
+    if not await current():
+        return MediaEditDelivery(None)
+    directive, clean = extract_template_directive(response)
+    try:
+        if directive is None:
+            raise TemplateRenderError('Не удалось распознать запрос на заполнение шаблона.')
+        rendered = await render_media_template(directive, session_factory=async_session_maker, user_id=user_id, dialogue_id=dialogue_id, topic_id=topic_id, telegram_bot=bot)
+        if not rendered or not await current():
+            return MediaEditDelivery(None)
+        await validate_rendered_template(async_session_maker, rendered, topic_id)
+        clean, rows = extract_response_buttons(clean)
+        presentation = await _prepare_telegram_response_buttons(user_id, rows)
+        await validate_rendered_template(async_session_maker, rendered, topic_id)
+        if not await current():
+            return MediaEditDelivery(None)
+        await bot.send_document(chat_id=user_id, document=BufferedInputFile(rendered.image_bytes, filename='certificate.png'), caption=clean[:1024] or None, parse_mode=None, reply_markup=_telegram_response_text_markup(presentation))
+        return MediaEditDelivery(clean or '[Шаблон изображения]')
+    except Exception as exc:
+        if not await current():
+            return MediaEditDelivery(None)
+        text = str(exc) if isinstance(exc, (TemplateRenderError, MediaSourceError)) else 'Не удалось заполнить шаблон изображения.'
+        await bot.send_message(chat_id=user_id, text=text)
+        return MediaEditDelivery(text)
+
+
 async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_config):
+    if re.search(r'\bRENDER_IMG_MEDIA\b', response, re.I):
+        return await _deliver_media_template(bot, user_id, response, dialogue_id, topic_id)
     directive, clean_text = extract_media_edit_directive(response)
     if clean_text == response.strip() and directive is None:
         return None
@@ -12670,7 +12702,7 @@ async def _send_collection_media_view(
         return
     media, _, collection_names = payload
     text = _collection_media_text(media, collection_names)
-    markup = kb.collection_media_edit_keyboard(media_id, coll_id, page, list_page)
+    markup = kb.collection_media_edit_keyboard(media_id, coll_id, page, list_page, is_image=media.media_type in PHOTO_MEDIA_TYPES)
     try:
         if media.media_type == 'audio':
             await bot.send_audio(chat_id=chat_id, audio=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
@@ -12703,7 +12735,7 @@ async def _answer_collection_media_view(message: Message, coll_id: int, media_id
         return
     media, _, collection_names = payload
     text = _collection_media_text(media, collection_names)
-    markup = kb.collection_media_edit_keyboard(media_id, coll_id, page, list_page)
+    markup = kb.collection_media_edit_keyboard(media_id, coll_id, page, list_page, is_image=media.media_type in PHOTO_MEDIA_TYPES)
     try:
         if media.media_type == 'audio':
             await message.answer_audio(audio=media.file_id, caption=text, reply_markup=markup, parse_mode='HTML')
@@ -12722,6 +12754,11 @@ async def _answer_collection_media_view(message: Message, coll_id: int, media_id
             sanitize_secret_values(exception_summary(exc))[:240],
         )
         await message.answer(text, reply_markup=markup, parse_mode='HTML')
+
+
+from media_template_admin import register_template_admin
+
+register_template_admin(router, session_factory=lambda: async_session_maker(), require_admin=_require_media_collection_admin, show_media=_send_collection_media_view)
 
 
 @router.callback_query(F.data.startswith("admin_coll_file_view_"), StateFilter('*'))

@@ -2119,8 +2119,10 @@ def admin_collection_attach_keyboard(
     return builder.as_markup()
 
 
-def collection_media_edit_keyboard(media_id: int, coll_id: int, page: int = 0, list_page: int = 0):
+def collection_media_edit_keyboard(media_id: int, coll_id: int, page: int = 0, list_page: int = 0, *, is_image: bool = False):
     builder = InlineKeyboardBuilder()
+    if is_image:
+        builder.button(text="🧩 Шаблон изображения", callback_data=f"mt:home:{media_id}:{coll_id}:{page}:{list_page}:-1")
     builder.button(text="✏️ Имя", callback_data=f"admin_coll_media_editname_{media_id}_{coll_id}_{page}_{list_page}")
     builder.button(text="📂 Категория", callback_data=f"admin_coll_media_editcat_{media_id}_{coll_id}_{page}_{list_page}")
     builder.button(text="📝 Описание", callback_data=f"admin_coll_media_editdesc_{media_id}_{coll_id}_{page}_{list_page}")
