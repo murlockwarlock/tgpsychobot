@@ -450,9 +450,14 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
             elif char == '"':
                 in_string = False
             continue
+        if not stack:
+            if char == "{" or (char == "[" and _is_line_start_tag(text, offset)):
+                stack.append(char)
+                stack_positions.append(offset)
+            continue
         if char == '"':
             in_string = True
-        elif char == "{" or (char == "[" and stack):
+        elif char in "{[":
             stack.append(char)
             stack_positions.append(offset)
         elif char in "}]" and stack and stack[-1] == pairs[char]:
@@ -461,7 +466,7 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
     if not stack:
         return False
     return any(
-        char == "{" and _is_line_start_tag(text, position)
+        char in "{[" and _is_line_start_tag(text, position)
         for char, position in zip(stack, stack_positions)
     )
 
@@ -529,12 +534,12 @@ def _find_unbalanced_service_tail(
     text: str,
     excluded_ranges: list[tuple[int, int]],
 ) -> tuple[int, int] | None:
-    roots = re.finditer(r"(?m)^[ \t]*\{", text)
+    roots = re.finditer(r"(?m)^[ \t]*[\{\[]", text)
     for root in roots:
         start = root.start()
         if any(begin <= start < end for begin, end in excluded_ranges):
             continue
-        if not _json_root_is_unclosed(text, start):
+        if not _json_root_is_unclosed(text, root.end() - 1):
             continue
         tail = text[start:]
         if re.search(
