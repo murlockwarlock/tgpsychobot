@@ -18,6 +18,7 @@ from ..legacy import AIConfig, AIModelSettings, async_session_maker
 from ..storage import StateStore
 from memory_mode import MEMORY_MODE_RESET, get_metadata_reset_mode, memory_mode_label, metadata_reset_mode_label, next_memory_mode, normalize_memory_mode
 from provider_models import (
+    build_reasoning_callback_token,
     PROVIDER_CLAUDE,
     PROVIDER_DEEPSEEK,
     PROVIDER_GEMINI,
@@ -44,7 +45,9 @@ from ai_model_settings import (
     validate_model_setting,
     REASONING_AUTO,
     REASONING_NONE,
+    REASONING_ENABLED,
     REASONING_LOW,
+    REASONING_MEDIUM,
     REASONING_HIGH,
     REASONING_MAX,
 )
@@ -599,7 +602,9 @@ def _reasoning_label(value: str) -> str:
     return {
         REASONING_AUTO: "Авто",
         REASONING_NONE: "Выкл",
+        REASONING_ENABLED: "Вкл",
         REASONING_LOW: "Low",
+        REASONING_MEDIUM: "Medium",
         REASONING_HIGH: "High",
         REASONING_MAX: "Max",
     }.get(value, "Авто")
@@ -640,7 +645,15 @@ async def show_provider_settings(client: MaxApiClient, chat_id: int, provider: s
         text += f"🌍 Proxy: <b>{'Включён' if getattr(config, 'use_proxy', True) else 'Выключен'}</b>\n"
     rows = [[callback_button("📏 Max tokens", f"admin_ai_model_max_tokens_{provider}")]]
     if caps.reasoning_effort:
-        rows.append([callback_button("🧠 Reasoning", f"admin_ai_model_reasoning_{provider}")])
+        reasoning_callback = f"admin_ai_model_reasoning_{provider}"
+        if provider == PROVIDER_OPENROUTER:
+            reasoning_callback = f"admin_ai_model_reasoning_{build_reasoning_callback_token(provider, model, 'auto')}"
+        rows.append([
+            callback_button(
+                "🧠 Reasoning",
+                reasoning_callback,
+            )
+        ])
     if caps.temperature and (provider != PROVIDER_DEEPSEEK or settings.reasoning_effort == REASONING_NONE):
         rows.append([callback_button("🌡 Temperature", f"admin_ai_model_temperature_{provider}")])
     if provider == PROVIDER_DEEPSEEK:
@@ -672,17 +685,62 @@ async def show_model_settings(client: MaxApiClient, chat_id: int) -> None:
     await show_provider_settings(client, chat_id, _active_chat_scope(config)[0])
 
 
-async def show_model_reasoning(client: MaxApiClient, chat_id: int, provider: str | None = None) -> None:
-    provider = canonical_provider_name(provider or (await _get_config()).provider)
-    rows = [[callback_button(label, f"admin_ai_reasoning_{provider}_{value}")] for value, label in (("auto", "Авто"), ("none", "Выкл"), ("low", "Low"), ("high", "High"), ("max", "Max"))]
+async def show_model_reasoning(
+    client: MaxApiClient,
+    chat_id: int,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
+    config = await _get_config()
+    provider, active_model = _provider_scope(config, provider or config.provider)
+    model = model or active_model
+    if model != active_model:
+        await client.send_message(chat_id=chat_id, text="Модель изменилась. Откройте настройки заново.")
+        return
+    capabilities = get_generation_capabilities(provider, model, "chat")
+    if not capabilities.reasoning_effort:
+        await client.send_message(chat_id=chat_id, text="Reasoning недоступен для выбранной модели.")
+        return
+    rows = [
+        [callback_button(
+            label,
+            f"admin_ai_reasoning_{build_reasoning_callback_token(provider, model, value)}"
+            if provider == PROVIDER_OPENROUTER
+            else f"admin_ai_reasoning_{provider}_{value}",
+        )]
+        for value, label in (
+            ("auto", "Авто"),
+            ("none", "Выкл"),
+            ("enabled", "Вкл"),
+            ("low", "Low"),
+            ("medium", "Medium"),
+            ("high", "High"),
+            ("max", "Max"),
+        )
+        if value in capabilities.reasoning_effort
+    ]
     rows.append([callback_button("⬅️ Назад", f"admin_ai_models_{provider}")])
-    await client.send_message(chat_id=chat_id, text="<b>Reasoning DeepSeek</b>", attachments=inline_keyboard(rows))
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"<b>🧠 Reasoning</b>\nМодель: <code>{html.escape(model)}</code>",
+        attachments=inline_keyboard(rows),
+    )
 
 
-async def save_model_reasoning(client: MaxApiClient, chat_id: int, value: str, provider: str | None = None) -> None:
+async def save_model_reasoning(
+    client: MaxApiClient,
+    chat_id: int,
+    value: str,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
     async with async_session_maker() as session:
         config = await _ensure_session_config(session)
-        provider, model = _provider_scope(config, provider or config.provider)
+        provider, active_model = _provider_scope(config, provider or config.provider)
+        if model and model != active_model:
+            await client.send_message(chat_id=chat_id, text="Модель изменилась. Настройки не изменены.")
+            return
+        model = model or active_model
         try:
             value = validate_model_setting(provider, model, "reasoning_effort", value)
         except ValueError as exc:

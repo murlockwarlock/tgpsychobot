@@ -12,7 +12,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import database
 from database import AIConfig, AIModelSettings, Base, BotGeneralConfig, BotTranslation, TelegramPendingAIReply, User
-from provider_models import PROVIDER_DEEPSEEK
+from provider_models import PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER
 
 
 class _FakeConnection:
@@ -500,5 +500,42 @@ async def test_init_db_seeds_menu_content_and_preserves_custom_text(tmp_path, mo
             reloaded_menu = await session.get(database.Content, "menu")
             assert reloaded_menu is not None
             assert reloaded_menu.text_content == "Пользовательское меню\n[Темы](btn:svc:topics)"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_normalizes_lowered_openrouter_output_override(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'model-settings-limit-normalization.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        await database.init_db()
+        async with sessions() as session:
+            session.add(
+                AIModelSettings(
+                    provider=PROVIDER_OPENROUTER,
+                    model="deepseek/deepseek-v4-pro",
+                    channel="chat",
+                    max_output_tokens=32768,
+                )
+            )
+            await session.commit()
+
+        await database.init_db()
+
+        async with sessions() as session:
+            row = await session.scalar(
+                select(AIModelSettings).where(
+                    AIModelSettings.provider == PROVIDER_OPENROUTER,
+                    AIModelSettings.model == "deepseek/deepseek-v4-pro",
+                    AIModelSettings.channel == "chat",
+                )
+            )
+            assert row.max_output_tokens == 16384
     finally:
         await engine.dispose()

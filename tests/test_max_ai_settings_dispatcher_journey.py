@@ -2,6 +2,7 @@ import os
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test")
@@ -79,7 +80,6 @@ def _classify_max_callback(payload):
         "admin_ai_choose_capability_",
         "admin_ai_set_channel_model_",
         "admin_ai_set_model_",
-        "admin_ai_reasoning_",
         "admin_ai_cancel_",
         "admin_ai_text_fallback",
         "admin_ai_fallback_provider",
@@ -97,7 +97,9 @@ def _classify_max_callback(payload):
         "admin_ai_fb_ppx_",
     )
     mutation = (
+        "admin_ai_provider_",
         "admin_ai_key_",
+        "admin_ai_reasoning_",
         "admin_ai_main_chat_set_model_",
         "admin_ai_model_max_tokens_",
         "admin_ai_model_reasoning_",
@@ -597,6 +599,568 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
         + journey_counts["deepseek_reasoning_back"]
         == 30
     )
+
+
+@pytest.mark.asyncio
+async def test_max_openrouter_qwen_reasoning_is_a_real_attachment_journey(max_settings_db, monkeypatch):
+    import httpx
+    from database import Topic, User
+    from max_messenger_bot import ai as max_ai
+    from provider_models import resolve_reasoning_callback_token
+
+    monkeypatch.setattr(max_admin_ai, "async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_ai, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+
+    async with max_settings_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "OpenRouter"
+        config.openrouter_api_key = "sk-or-test-key"
+        config.openrouter_model = "qwen/qwen3.8-27b"
+        config.system_prompt = "Система"
+        config.shared_prompt_block = ""
+        config.memory_mode = "global"
+        session.add(Topic(id=1, name="Тестовая тема", is_active=True, system_prompt="Система"))
+        session.add(User(id=1001, first_name="Admin", name="Admin", current_topic_id=1, current_dialogue_id=1))
+        await session.commit()
+
+    captured = []
+    wire_payloads = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    update_id = 100
+    classified_callbacks = {}
+    executed_callbacks = set()
+
+    def classify_visible(attachments):
+        for button in _max_buttons(attachments):
+            classified_callbacks[button["payload"]] = _classify_max_callback(button["payload"])
+
+    async def spy_post(self, url, *args, **kwargs):
+        wire_payloads.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", spy_post)
+
+    async def send_admin_command(command):
+        nonlocal update_id
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_created",
+            "update_id": update_id,
+            "message": {
+                "body": {"text": command},
+                "recipient": {"chat_id": 1001},
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+        })
+        return captured[-1]["body"]
+
+    async def press(payload, attachments):
+        nonlocal update_id
+        visible = {button["payload"] for button in _max_buttons(attachments)}
+        assert payload in visible
+        executed_callbacks.add(payload)
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": payload,
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+            "message": {
+                "mid": "admin-message",
+                "recipient": {"chat_id": 1001},
+                "body": {"attachments": attachments},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert messages, payload
+        return messages[-1]["body"]
+
+    root = await send_admin_command("/admin")
+    ai = await press("admin_ai_settings", root.get("attachments", []))
+    keys = await press("admin_ai_keys", ai.get("attachments", []))
+    detail = await press("admin_ai_models_OpenRouter", keys.get("attachments", []))
+    classify_visible(detail.get("attachments", []))
+    reasoning_entry = next(
+        button
+        for button in _max_buttons(detail.get("attachments", []))
+        if button["payload"].startswith("admin_ai_model_reasoning_r_")
+    )
+    picker = await press(reasoning_entry["payload"], detail.get("attachments", []))
+    classify_visible(picker.get("attachments", []))
+    choices = _max_buttons(picker.get("attachments", []))
+    assert [button["text"] for button in choices[:-1]] == ["Авто", "Выкл", "Low", "Medium", "Max"]
+    back_payload = choices[-1]["payload"]
+    visible_modes = [(button["text"], button["payload"]) for button in choices[:-1]]
+    assert resolve_reasoning_callback_token(dict(visible_modes)["Max"].replace("admin_ai_reasoning_", "", 1)) == (
+        "OpenRouter",
+        "qwen/qwen3.8-27b",
+        "max",
+    )
+    for index, (label, mode_payload) in enumerate(visible_modes):
+        if index:
+            picker = await press(reasoning_entry["payload"], detail.get("attachments", []))
+            classify_visible(picker.get("attachments", []))
+        picker_choices = _max_buttons(picker.get("attachments", []))
+        assert [button["text"] for button in picker_choices[:-1]] == ["Авто", "Выкл", "Low", "Medium", "Max"]
+        assert next(button for button in picker_choices if button["text"] == label)["payload"] == mode_payload
+        assert picker_choices[-1]["payload"] == back_payload
+        detail = await press(mode_payload, picker.get("attachments", []))
+        classify_visible(detail.get("attachments", []))
+        assert f"Reasoning: <b>{label}</b>" in detail["text"]
+        async with max_settings_db() as session:
+            settings = await max_admin_ai.resolve_model_settings(
+                session,
+                "OpenRouter",
+                "qwen/qwen3.8-27b",
+                "chat",
+            )
+            assert settings.reasoning_effort == {"Авто": "auto", "Выкл": "none", "Low": "low", "Medium": "medium", "Max": "max"}[label]
+        assert await max_ai.get_ai_response(
+            1001,
+            f"MAX {label}",
+            track_user_activity=False,
+            minutes_since_last_visit=1,
+            minutes_since_last_message=1,
+        ) == "ok"
+        payload = wire_payloads[-1]
+        assert payload["model"] == "qwen/qwen3.8-27b"
+        expected_reasoning = {
+            "Авто": None,
+            "Выкл": {"effort": "none", "exclude": True},
+            "Low": {"effort": "low", "exclude": True},
+            "Medium": {"effort": "medium", "exclude": True},
+            "Max": {"effort": "xhigh", "exclude": True},
+        }[label]
+        if expected_reasoning is None:
+            assert "reasoning" not in payload
+            assert "provider" not in payload
+        else:
+            assert payload["reasoning"] == expected_reasoning
+            assert payload["provider"] == {"require_parameters": True}
+        assert "extra_body" not in payload
+        assert "reasoning_effort" not in payload
+        picker = await press(reasoning_entry["payload"], detail.get("attachments", []))
+        classify_visible(picker.get("attachments", []))
+        back = next(button for button in _max_buttons(picker.get("attachments", [])) if button["text"] == "⬅️ Назад")
+        assert back["payload"] == back_payload
+        detail = await press(back["payload"], picker.get("attachments", []))
+        assert f"Reasoning: <b>{label}</b>" in detail["text"]
+
+    assert {payload for _, payload in visible_modes} <= executed_callbacks
+    assert reasoning_entry["payload"] in executed_callbacks
+    assert back_payload in executed_callbacks
+    assert classified_callbacks[reasoning_entry["payload"]] == "mutation"
+    assert all(classified_callbacks[payload] == "mutation" for _, payload in visible_modes)
+    assert classified_callbacks[back_payload] == "navigation"
+
+    model_picker = await press("admin_ai_provider_models_OpenRouter", detail.get("attachments", []))
+    classify_visible(model_picker.get("attachments", []))
+    non_reasoning = next(
+        button
+        for button in _max_buttons(model_picker.get("attachments", []))
+        if button["text"] == "Qwen3 VL 235B Instruct"
+    )
+    detail = await press(non_reasoning["payload"], model_picker.get("attachments", []))
+    classify_visible(detail.get("attachments", []))
+    assert "qwen/qwen3-vl-235b-a22b-instruct" in detail["text"]
+    assert "Reasoning:" not in detail["text"]
+    assert not any(
+        button["payload"].startswith("admin_ai_model_reasoning")
+        for button in _max_buttons(detail.get("attachments", []))
+    )
+    assert await max_ai.get_ai_response(
+        1001,
+        "MAX Qwen VL",
+        track_user_activity=False,
+        minutes_since_last_visit=1,
+        minutes_since_last_message=1,
+    ) == "ok"
+    assert wire_payloads[-1]["model"] == "qwen/qwen3-vl-235b-a22b-instruct"
+    assert "reasoning" not in wire_payloads[-1]
+    assert "provider" not in wire_payloads[-1]
+
+    model_picker = await press("admin_ai_provider_models_OpenRouter", detail.get("attachments", []))
+    classify_visible(model_picker.get("attachments", []))
+    qwen_reasoning = next(
+        button
+        for button in _max_buttons(model_picker.get("attachments", []))
+        if "Qwen3.8 27B" in button["text"]
+    )
+    detail = await press(qwen_reasoning["payload"], model_picker.get("attachments", []))
+    classify_visible(detail.get("attachments", []))
+    assert "Reasoning: <b>Max</b>" in detail["text"]
+    assert await max_ai.get_ai_response(
+        1001,
+        "MAX Qwen restored",
+        track_user_activity=False,
+        minutes_since_last_visit=1,
+        minutes_since_last_message=1,
+    ) == "ok"
+    assert wire_payloads[-1]["model"] == "qwen/qwen3.8-27b"
+    assert wire_payloads[-1]["reasoning"] == {"effort": "xhigh", "exclude": True}
+    assert wire_payloads[-1]["provider"] == {"require_parameters": True}
+
+
+@pytest.mark.parametrize(
+    ("model", "friendly_name", "modes"),
+    [
+        ("qwen/qwen3.7-plus", "Qwen3.7 Plus", [("Авто", "auto"), ("Выкл", "none"), ("Вкл", "enabled")]),
+        ("qwen/qwen3.8-27b", "Qwen3.8 27B", [("Авто", "auto"), ("Выкл", "none"), ("Low", "low"), ("Medium", "medium"), ("Max", "max")]),
+        ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", [("Авто", "auto"), ("Выкл", "none"), ("High", "high"), ("Max", "max")]),
+        ("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", [("Авто", "auto"), ("Выкл", "none"), ("High", "high"), ("Max", "max")]),
+        ("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", [("Авто", "auto"), ("Выкл", "none"), ("Low", "low"), ("High", "high"), ("Max", "max")]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_max_openrouter_reasoning_modes_have_real_scoped_wire_journeys(
+    max_settings_db,
+    monkeypatch,
+    model,
+    friendly_name,
+    modes,
+):
+    import httpx
+    from database import Topic, User
+    from max_messenger_bot import ai as max_ai
+    from provider_models import resolve_reasoning_callback_token
+
+    monkeypatch.setattr(max_admin_ai, "async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_ai, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+
+    async with max_settings_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "OpenRouter"
+        config.openrouter_api_key = "sk-or-test-key"
+        config.openrouter_model = model
+        config.system_prompt = "Система"
+        config.shared_prompt_block = ""
+        config.memory_mode = "global"
+        session.add(Topic(id=1, name="Тестовая тема", is_active=True, system_prompt="Система"))
+        session.add(User(id=1001, first_name="Admin", name="Admin", current_topic_id=1, current_dialogue_id=1))
+        await session.commit()
+
+    captured = []
+    wire_payloads = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    async def spy_post(self, url, *args, **kwargs):
+        wire_payloads.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", spy_post)
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    update_id = 8000
+    classified_callbacks = {}
+    executed_callbacks = set()
+
+    def classify_visible(attachments):
+        for button in _max_buttons(attachments):
+            classified_callbacks[button["payload"]] = _classify_max_callback(button["payload"])
+
+    async def press(payload, attachments):
+        nonlocal update_id
+        visible = {button["payload"] for button in _max_buttons(attachments)}
+        assert payload in visible
+        executed_callbacks.add(payload)
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": payload,
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+            "message": {
+                "mid": "admin-message",
+                "recipient": {"chat_id": 1001},
+                "body": {"attachments": attachments},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert messages, payload
+        return messages[-1]["body"]
+
+    update_id += 1
+    await app.handle_update({
+        "update_type": "message_created",
+        "update_id": update_id,
+        "message": {
+            "body": {"text": "/admin"},
+            "recipient": {"chat_id": 1001},
+            "sender": {"user_id": 1001, "name": "Admin"},
+        },
+    })
+    root = captured[-1]["body"]
+    ai = await press("admin_ai_settings", root.get("attachments", []))
+    keys = await press("admin_ai_keys", ai.get("attachments", []))
+    detail = await press("admin_ai_models_OpenRouter", keys.get("attachments", []))
+    model_picker = await press("admin_ai_provider_models_OpenRouter", detail.get("attachments", []))
+    model_picker_buttons = _max_buttons(model_picker.get("attachments", []))
+    classify_visible(model_picker.get("attachments", []))
+    model_button = next(button for button in model_picker_buttons if friendly_name in button["text"])
+    detail = await press(model_button["payload"], model_picker.get("attachments", []))
+    assert f"<code>{model}</code>" in detail["text"]
+    classify_visible(detail.get("attachments", []))
+    reasoning_entry = next(
+        button
+        for button in _max_buttons(detail.get("attachments", []))
+        if button["payload"].startswith("admin_ai_model_reasoning_r_")
+    )
+    picker = await press(reasoning_entry["payload"], detail.get("attachments", []))
+    classify_visible(picker.get("attachments", []))
+    picker_buttons = _max_buttons(picker.get("attachments", []))
+    assert [button["text"] for button in picker_buttons[:-1]] == [label for label, _ in modes]
+    back_payload = picker_buttons[-1]["payload"]
+    assert back_payload == "admin_ai_models_OpenRouter"
+    mode_callbacks = {button["text"]: button["payload"] for button in picker_buttons[:-1]}
+    for label, value in modes:
+        if value != modes[0][1]:
+            picker = await press(reasoning_entry["payload"], detail.get("attachments", []))
+            classify_visible(picker.get("attachments", []))
+        current_buttons = _max_buttons(picker.get("attachments", []))
+        assert [button["text"] for button in current_buttons[:-1]] == [label for label, _ in modes]
+        assert current_buttons[-1]["payload"] == back_payload
+        detail = await press(mode_callbacks[label], picker.get("attachments", []))
+        classify_visible(detail.get("attachments", []))
+        assert f"Reasoning: <b>{label}</b>" in detail["text"]
+        async with max_settings_db() as session:
+            settings = await max_admin_ai.resolve_model_settings(session, "OpenRouter", model, "chat")
+            assert settings.reasoning_effort == value
+        assert await max_ai.get_ai_response(
+            1001,
+            f"MAX {model} {value}",
+            track_user_activity=False,
+            minutes_since_last_visit=1,
+            minutes_since_last_message=1,
+        ) == "ok"
+        payload = wire_payloads[-1]
+        assert payload["model"] == model
+        if value == "auto":
+            assert "reasoning" not in payload
+            assert "provider" not in payload
+        elif model == "qwen/qwen3.7-plus" and value == "none":
+            assert payload["reasoning"] == {"enabled": False}
+            assert payload["provider"] == {"require_parameters": True}
+        elif model == "qwen/qwen3.7-plus" and value == "enabled":
+            assert payload["reasoning"] == {"enabled": True, "exclude": True}
+            assert payload["provider"] == {"require_parameters": True}
+        else:
+            assert payload["reasoning"] == {
+                "effort": (
+                    "xhigh"
+                    if value == "max" and model in {
+                        "qwen/qwen3.8-27b",
+                        "deepseek/deepseek-v4-flash",
+                        "deepseek/deepseek-v4-pro",
+                    }
+                    else value
+                ),
+                "exclude": True,
+            }
+            assert payload["provider"] == {"require_parameters": True}
+        assert "extra_body" not in payload
+        assert "reasoning_effort" not in payload
+        picker = await press(reasoning_entry["payload"], detail.get("attachments", []))
+        classify_visible(picker.get("attachments", []))
+        current_buttons = _max_buttons(picker.get("attachments", []))
+        assert current_buttons[-1]["payload"] == back_payload
+        detail = await press(back_payload, picker.get("attachments", []))
+        assert f"Reasoning: <b>{label}</b>" in detail["text"]
+
+    assert set(mode_callbacks.values()) <= executed_callbacks
+    assert reasoning_entry["payload"] in executed_callbacks
+    assert back_payload in executed_callbacks
+    assert classified_callbacks[reasoning_entry["payload"]] == "mutation"
+    assert all(classified_callbacks[payload] == "mutation" for payload in mode_callbacks.values())
+    assert classified_callbacks[back_payload] == "navigation"
+
+
+@pytest.mark.asyncio
+async def test_max_unresolved_reasoning_token_is_rejected_without_scope_mutation(max_settings_db, monkeypatch):
+    from database import AIModelSettings
+    from provider_models import build_reasoning_callback_token
+
+    monkeypatch.setattr(max_admin_ai, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+
+    async with max_settings_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "OpenRouter"
+        config.deepseek_model = "deepseek-v4-pro"
+        config.openrouter_model = "qwen/qwen3.8-27b"
+        session.add_all([
+            AIModelSettings(
+                provider="Deepseek",
+                model="deepseek-v4-pro",
+                channel="chat",
+                reasoning_effort="high",
+            ),
+            AIModelSettings(
+                provider="OpenRouter",
+                model="qwen/qwen3.8-27b",
+                channel="chat",
+                reasoning_effort="max",
+            ),
+        ])
+        await session.commit()
+
+    captured = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    valid_token = build_reasoning_callback_token("OpenRouter", "qwen/qwen3.8-27b", "max")
+    unresolved_token = "r_" + "0" * 32
+    assert valid_token != unresolved_token
+
+    await app.handle_update({
+        "update_type": "message_callback",
+        "update_id": 900,
+        "callback": {
+            "callback_id": "cb-900",
+            "payload": f"admin_ai_reasoning_{unresolved_token}",
+            "sender": {"user_id": 1001, "name": "Admin"},
+        },
+        "message": {
+            "mid": "admin-message",
+            "recipient": {"chat_id": 1001},
+            "body": {"attachments": []},
+        },
+    })
+
+    async with max_settings_db() as session_check:
+        deepseek = await session_check.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "Deepseek",
+                AIModelSettings.model == "deepseek-v4-pro",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        openrouter = await session_check.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "OpenRouter",
+                AIModelSettings.model == "qwen/qwen3.8-27b",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        config = await session_check.get(AIConfig, 1)
+        assert deepseek.reasoning_effort == "high"
+        assert openrouter.reasoning_effort == "max"
+        assert config.provider == "OpenRouter"
+        assert config.openrouter_model == "qwen/qwen3.8-27b"
+
+    answers = [item for item in captured if item["path"] == "/answers"]
+    assert answers, captured
+    assert answers[-1]["body"].get("notification") == "Кнопка устарела. Откройте настройки модели заново."
+
+    await app.handle_update({
+        "update_type": "message_callback",
+        "update_id": 901,
+        "callback": {
+            "callback_id": "cb-901",
+            "payload": "admin_ai_reasoning_NotAProvider_max",
+            "sender": {"user_id": 1001, "name": "Admin"},
+        },
+        "message": {
+            "mid": "admin-message",
+            "recipient": {"chat_id": 1001},
+            "body": {"attachments": []},
+        },
+    })
+    answers = [item for item in captured if item["path"] == "/answers"]
+    assert answers[-1]["body"].get("notification") == "Недействительная кнопка настройки reasoning."
+    async with max_settings_db() as session_check:
+        deepseek = await session_check.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "Deepseek",
+                AIModelSettings.model == "deepseek-v4-pro",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        openrouter = await session_check.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "OpenRouter",
+                AIModelSettings.model == "qwen/qwen3.8-27b",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        assert deepseek.reasoning_effort == "high"
+        assert openrouter.reasoning_effort == "max"
+
+    async with max_settings_db() as session_update:
+        config = await session_update.get(AIConfig, 1)
+        config.openrouter_model = "qwen/qwen3.7-plus"
+        await session_update.commit()
+    await app.handle_update({
+        "update_type": "message_callback",
+        "update_id": 902,
+        "callback": {
+            "callback_id": "cb-902",
+            "payload": f"admin_ai_reasoning_{valid_token}",
+            "sender": {"user_id": 1001, "name": "Admin"},
+        },
+        "message": {
+            "mid": "admin-message",
+            "recipient": {"chat_id": 1001},
+            "body": {"attachments": []},
+        },
+    })
+    messages = [item for item in captured if item["path"] == "/messages"]
+    assert messages[-1]["body"]["text"] == "Модель изменилась. Настройки не изменены."
+    async with max_settings_db() as session_check:
+        openrouter = await session_check.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "OpenRouter",
+                AIModelSettings.model == "qwen/qwen3.8-27b",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        config = await session_check.get(AIConfig, 1)
+        assert openrouter.reasoning_effort == "max"
+        assert config.openrouter_model == "qwen/qwen3.7-plus"
 
 
 async def _true_async():

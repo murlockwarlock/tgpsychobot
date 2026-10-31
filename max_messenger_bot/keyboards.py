@@ -11,6 +11,8 @@ from .time_utils import format_msk
 from provider_models import (
     PERPLEXITY_MODES,
     PERPLEXITY_MODE_INFO,
+    PROVIDER_OPENROUTER,
+    get_openrouter_model_spec,
     get_perplexity_model_label,
 )
 
@@ -958,7 +960,11 @@ def admin_ai_keys_keyboard(
 def admin_ai_model_selection_keyboard(provider: str, current_model: str, models: list[str], *, back_callback: str = "admin_ai_keys") -> list[dict]:
     rows: list[list[dict]] = []
     for model in models:
-        label = f"✅ {model}" if model == current_model else model
+        display_name = model
+        if provider == PROVIDER_OPENROUTER:
+            spec = get_openrouter_model_spec(model)
+            display_name = spec.friendly_name if spec else model
+        label = f"✅ {display_name}" if model == current_model else display_name
         rows.append([callback_button(label, f"admin_ai_set_model_{provider}_{model}")])
     rows.append([callback_button("⬅️ Назад", back_callback)])
     return inline_keyboard(rows)

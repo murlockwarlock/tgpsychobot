@@ -2071,6 +2071,10 @@ async def init_db():
                     )
                     session.add(settings)
 
+        from ai_model_settings import normalize_persisted_model_settings
+
+        await normalize_persisted_model_settings(session)
+
         sub_conf = await session.get(SubscriptionConfig, 1)
         if not sub_conf:
             session.add(SubscriptionConfig(id=1))

@@ -264,6 +264,8 @@ def _wrap_provider_adapter_error(exc: ProviderAdapterError) -> AIServiceError:
         error.proxy_used = exc.proxy_used
     if getattr(exc, "proxy_source", None) is not None:
         error.proxy_source = exc.proxy_source
+    if getattr(exc, "finish_reason", None) is not None:
+        error.finish_reason = exc.finish_reason
     return error
 
 
@@ -2257,6 +2259,7 @@ async def get_ai_response(
                             p_model,
                             temperature=request_temperature,
                             max_output_tokens=output_tokens,
+                            reasoning_effort=reasoning_effort,
                             timeout=timeout,
                             request_capture=capture_dict,
                             activity_tracker=activity_tracker,
@@ -4145,6 +4148,7 @@ async def analyze_image_content(
                             primary_target_model,
                             temperature=temperature,
                             max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, primary_target_model),
+                            reasoning_effort=None,
                             timeout=prim_budget,
                             operation="vision",
                             request_capture=prim_capture,
@@ -4406,6 +4410,7 @@ async def analyze_image_content(
                             eff_fallback_model,
                             temperature=temperature,
                             max_output_tokens=get_provider_vision_max_tokens(PROVIDER_OPENROUTER, eff_fallback_model),
+                            reasoning_effort=None,
                             timeout=fb_stage_budget,
                             operation="vision",
                             request_capture=fb_capture,

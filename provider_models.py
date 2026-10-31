@@ -106,6 +106,22 @@ PROVIDER_DEFAULT_MODELS = {
 
 
 @dataclass(frozen=True)
+class OpenRouterReasoningSpec:
+    modes: tuple[str, ...]
+    supported_efforts: tuple[str, ...] | None
+    mandatory: bool
+    default_enabled: bool | None
+    default_effort: str | None
+    supports_max_tokens: bool | None
+    can_disable: bool
+    temperature_supported_with_reasoning: bool
+    exclude_supported: bool
+    effort_map: tuple[tuple[str, str], ...] = ()
+    supported_efforts_present: bool = True
+    supports_max_tokens_present: bool = False
+
+
+@dataclass(frozen=True)
 class OpenRouterModelSpec:
     model_id: str
     friendly_name: str
@@ -115,17 +131,19 @@ class OpenRouterModelSpec:
     context_limit: int
     output_limit: int
     status: str = "active"
+    reasoning: OpenRouterReasoningSpec | None = None
+    temperature: bool = True
 
 
 OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
     "google/gemini-2.5-flash": OpenRouterModelSpec("google/gemini-2.5-flash", "Google Gemini 2.5 Flash", True, True, True, 1048576, 65535),
     "google/gemini-3-flash-preview": OpenRouterModelSpec("google/gemini-3-flash-preview", "Google Gemini 3 Flash Preview", True, True, True, 1048576, 65536),
-    "openai/gpt-5.6-luna": OpenRouterModelSpec("openai/gpt-5.6-luna", "OpenAI GPT-5.6 Luna", True, True, False, 1050000, 128000),
-    "deepseek/deepseek-v4-flash": OpenRouterModelSpec("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", True, False, False, 1048576, 943717),
-    "deepseek/deepseek-v4-pro": OpenRouterModelSpec("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", True, False, False, 1048576, 384000),
-    "openai/gpt-5.6-terra": OpenRouterModelSpec("openai/gpt-5.6-terra", "OpenAI GPT-5.6 Terra", True, True, False, 1050000, 128000),
-    "openai/gpt-5.6-sol": OpenRouterModelSpec("openai/gpt-5.6-sol", "OpenAI GPT-5.6 Sol", True, True, False, 1050000, 128000),
-    "openai/gpt-5.6-luna-pro": OpenRouterModelSpec("openai/gpt-5.6-luna-pro", "OpenAI GPT-5.6 Luna Pro", True, True, False, 1050000, 128000),
+    "openai/gpt-5.6-luna": OpenRouterModelSpec("openai/gpt-5.6-luna", "OpenAI GPT-5.6 Luna", True, True, False, 1050000, 128000, temperature=False),
+    "deepseek/deepseek-v4-flash": OpenRouterModelSpec("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", True, False, False, 1048576, 32768, reasoning=OpenRouterReasoningSpec(("auto", "none", "high", "max"), ("xhigh", "high", "none"), False, None, "high", None, True, True, True, (("max", "xhigh"),))),
+    "deepseek/deepseek-v4-pro": OpenRouterModelSpec("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", True, False, False, 1048576, 16384, reasoning=OpenRouterReasoningSpec(("auto", "none", "high", "max"), ("xhigh", "high", "none"), False, None, "high", None, True, True, True, (("max", "xhigh"),))),
+    "openai/gpt-5.6-terra": OpenRouterModelSpec("openai/gpt-5.6-terra", "OpenAI GPT-5.6 Terra", True, True, False, 1050000, 128000, temperature=False),
+    "openai/gpt-5.6-sol": OpenRouterModelSpec("openai/gpt-5.6-sol", "OpenAI GPT-5.6 Sol", True, True, False, 1050000, 128000, temperature=False),
+    "openai/gpt-5.6-luna-pro": OpenRouterModelSpec("openai/gpt-5.6-luna-pro", "OpenAI GPT-5.6 Luna Pro", True, True, False, 1050000, 128000, temperature=False),
     "google/gemini-3.7-flash": OpenRouterModelSpec("google/gemini-3.7-flash", "Google Gemini 3.7 Flash", True, True, True, 1048576, 65536),
     "google/gemini-3.8-flash": OpenRouterModelSpec("google/gemini-3.8-flash", "Google Gemini 3.8 Flash", True, True, True, 1048576, 65536),
     "google/gemini-3.1-pro-preview": OpenRouterModelSpec("google/gemini-3.1-pro-preview", "Google Gemini 3.1 Pro Preview", True, True, True, 1048576, 65536),
@@ -134,15 +152,151 @@ OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
     "anthropic/claude-haiku-4.5": OpenRouterModelSpec("anthropic/claude-haiku-4.5", "Anthropic Claude Haiku 4.5", True, True, False, 200000, 64000),
     "x-ai/grok-4.7": OpenRouterModelSpec("x-ai/grok-4.7", "xAI Grok 4.7", True, True, False, 500000, 450000),
     "x-ai/grok-4.6": OpenRouterModelSpec("x-ai/grok-4.6", "xAI Grok 4.6", True, True, False, 500000, 450000),
-    "deepseek/deepseek-v4.1-flash": OpenRouterModelSpec("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", True, True, False, 1048576, 393216),
-    "qwen/qwen3-vl-235b-a22b-instruct": OpenRouterModelSpec("qwen/qwen3-vl-235b-a22b-instruct", "Qwen3 VL 235B Instruct", True, True, False, 262144, 32768),
-    "moonshotai/kimi-k2.6": OpenRouterModelSpec("moonshotai/kimi-k2.6", "Kimi K2.6", True, True, False, 262144, 235929),
+    "deepseek/deepseek-v4.1-flash": OpenRouterModelSpec("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", True, True, False, 1048576, 131072, reasoning=OpenRouterReasoningSpec(("auto", "none", "low", "high", "max"), ("max", "high", "low", "none"), False, True, "high", None, True, True, True)),
+    "qwen/qwen3-vl-235b-a22b-instruct": OpenRouterModelSpec("qwen/qwen3-vl-235b-a22b-instruct", "Qwen3 VL 235B Instruct", True, True, False, 262144, 16384),
+    "qwen/qwen3.7-plus": OpenRouterModelSpec("qwen/qwen3.7-plus", "Qwen3.7 Plus", True, True, False, 1000000, 131072, reasoning=OpenRouterReasoningSpec(("auto", "none", "enabled"), None, False, True, None, None, True, True, True, supported_efforts_present=False)),
+    "qwen/qwen3.8-27b": OpenRouterModelSpec("qwen/qwen3.8-27b", "Qwen3.8 27B", True, True, False, 1000000, 32768, reasoning=OpenRouterReasoningSpec(("auto", "none", "low", "medium", "max"), ("xhigh", "medium", "low", "none"), False, True, "xhigh", None, True, True, True, (("max", "xhigh"),))),
+    "moonshotai/kimi-k2.6": OpenRouterModelSpec("moonshotai/kimi-k2.6", "Kimi K2.6", True, True, False, 262144, 16384),
     "mistralai/mistral-medium-3-5": OpenRouterModelSpec("mistralai/mistral-medium-3-5", "Mistral Medium 3.5", True, True, False, 262144, 209715),
 }
 
 OPENROUTER_MODELS = tuple(OPENROUTER_MODEL_SPECS)
 OPENROUTER_VISION_MODELS = tuple(spec.model_id for spec in OPENROUTER_MODEL_SPECS.values() if spec.vision)
 PERPLEXITY_MODES = ("fast", "low", "medium", "high", "xhigh")
+
+
+@dataclass(frozen=True)
+class OpenRouterRequestContract:
+    model_id: str
+    reasoning_mode: str
+    required_parameters: tuple[str, ...]
+    requires_parameter_routing: bool
+    temperature_present: bool
+    vision: bool
+    max_output_tokens_present: bool
+
+
+def openrouter_endpoint_is_active(endpoint: dict[str, Any]) -> bool:
+    status = endpoint.get("status")
+    return status in (0, "0", "active")
+
+
+def openrouter_endpoint_supports_contract(endpoint: dict[str, Any], contract: OpenRouterRequestContract) -> bool:
+    if not openrouter_endpoint_is_active(endpoint):
+        return False
+    if not contract.requires_parameter_routing:
+        return True
+    supported = {str(value) for value in endpoint.get("supported_parameters") or ()}
+    return set(contract.required_parameters).issubset(supported)
+
+
+def get_openrouter_model_spec(model: str | None) -> OpenRouterModelSpec | None:
+    return OPENROUTER_MODEL_SPECS.get(str(model or "").strip())
+
+
+def get_openrouter_reasoning_spec(model: str | None) -> OpenRouterReasoningSpec | None:
+    spec = get_openrouter_model_spec(model)
+    return spec.reasoning if spec else None
+
+
+def openrouter_reasoning_modes(model: str | None) -> tuple[str, ...]:
+    reasoning = get_openrouter_reasoning_spec(model)
+    return reasoning.modes if reasoning else ()
+
+
+def openrouter_required_parameters(
+    model: str | None,
+    reasoning_mode: str = "auto",
+    *,
+    temperature_present: bool = False,
+    vision: bool = False,
+    max_output_tokens_present: bool = True,
+) -> OpenRouterRequestContract:
+    model_id = str(model or "").strip()
+    spec = get_openrouter_model_spec(model_id)
+    if spec is None:
+        raise ModelUnavailableError(f"Недоступная модель OpenRouter: {model_id or 'не указана'}")
+    mode = str(reasoning_mode or "auto").strip().lower()
+    reasoning = spec.reasoning
+    if mode != "auto" and (reasoning is None or mode not in reasoning.modes):
+        raise ModelUnavailableError(f"Режим reasoning '{mode}' не поддерживается моделью OpenRouter '{model_id}'.")
+    if mode == "none" and reasoning.mandatory:
+        raise ModelUnavailableError(f"Reasoning нельзя отключить для модели OpenRouter '{model_id}'.")
+    required = []
+    if max_output_tokens_present:
+        required.append("max_tokens")
+    if temperature_present:
+        required.append("temperature")
+    if mode != "auto":
+        required.append("reasoning")
+        effort_map = dict(reasoning.effort_map) if reasoning else {}
+        if mode != "enabled" and (
+            mode in effort_map
+            or mode in (reasoning.supported_efforts or () if reasoning else ())
+        ):
+            required.append("reasoning_effort")
+    return OpenRouterRequestContract(
+        model_id=model_id,
+        reasoning_mode=mode,
+        required_parameters=tuple(sorted(set(required))),
+        requires_parameter_routing=mode != "auto",
+        temperature_present=temperature_present,
+        vision=vision,
+        max_output_tokens_present=max_output_tokens_present,
+    )
+
+
+def openrouter_request_contracts(model: str | None) -> tuple[OpenRouterRequestContract, ...]:
+    spec = get_openrouter_model_spec(model)
+    if spec is None:
+        return ()
+    modes = ("auto",) + tuple(mode for mode in (spec.reasoning.modes if spec.reasoning else ()) if mode != "auto")
+    temperatures = (False, True) if spec.temperature else (False,)
+    visions = (False, True) if spec.vision else (False,)
+    contracts = []
+    for mode in modes:
+        for temperature_present in temperatures:
+            for vision in visions:
+                for max_output_tokens_present in (False, True):
+                    contracts.append(
+                        openrouter_required_parameters(
+                            model,
+                            mode,
+                            temperature_present=temperature_present,
+                            vision=vision,
+                            max_output_tokens_present=max_output_tokens_present,
+                        )
+                    )
+    return tuple(contracts)
+
+
+def openrouter_reasoning_payload(model: str | None, reasoning_mode: str = "auto") -> dict[str, Any] | None:
+    spec = get_openrouter_model_spec(model)
+    reasoning = spec.reasoning if spec else None
+    mode = str(reasoning_mode or "auto").strip().lower()
+    if mode == "auto" or reasoning is None or mode not in reasoning.modes:
+        return None
+    if mode == "none" and reasoning.mandatory:
+        return None
+    if mode == "enabled":
+        payload: dict[str, Any] = {"enabled": True}
+    else:
+        effort_map = dict(reasoning.effort_map)
+        if mode in effort_map:
+            payload = {"effort": effort_map[mode]}
+        elif mode in (reasoning.supported_efforts or ()):
+            payload = {"effort": mode}
+        elif mode == "none" and "none" in (reasoning.supported_efforts or ()):
+            payload = {"effort": "none"}
+        elif mode == "none" and reasoning.can_disable:
+            payload = {"enabled": False}
+        else:
+            return None
+    if reasoning.exclude_supported and mode not in {"none"}:
+        payload["exclude"] = True
+    elif reasoning.exclude_supported and payload.get("effort") == "none":
+        payload["exclude"] = True
+    return payload
 
 PERPLEXITY_STATIC_DIRECT_MODELS: tuple[str, ...] = (
     # Anthropic
@@ -780,6 +934,86 @@ def resolve_telegram_model_callback(callback_data: str | None) -> tuple[str, str
             if compare_digest(digest, expected):
                 return provider, channel, model
     return None
+
+
+REASONING_CALLBACK_PREFIX = "r_"
+REASONING_CALLBACK_TOKEN_RE = re.compile(r"^r_([0-9a-f]{32})$")
+DIRECT_DEEPSEEK_REASONING_MODES = ("auto", "none", "low", "high", "max")
+LEGACY_REASONING_CALLBACK_VALUES = frozenset({
+    "auto",
+    "none",
+    "enabled",
+    "low",
+    "medium",
+    "high",
+    "max",
+})
+
+
+def _reasoning_callback_digest(provider: str, model: str, value: str) -> str:
+    return sha256(f"reasoning\0{provider}\0{model}\0{value}".encode("utf-8")).hexdigest()[:32]
+
+
+def reasoning_callback_modes(provider: str | None, model: str | None) -> tuple[str, ...]:
+    normalized_provider = canonical_provider_name(provider)
+    if normalized_provider == PROVIDER_OPENROUTER:
+        return openrouter_reasoning_modes(model)
+    if normalized_provider == PROVIDER_DEEPSEEK:
+        return DIRECT_DEEPSEEK_REASONING_MODES
+    return ()
+
+
+def build_reasoning_callback_token(provider: str, model: str, value: str) -> str:
+    normalized_provider = canonical_provider_name(provider)
+    normalized_model = validate_model_selection(normalized_provider, model, channel="chat")
+    normalized_value = str(value or "").strip().lower()
+    if normalized_value not in reasoning_callback_modes(normalized_provider, normalized_model):
+        raise ModelUnavailableError("Недопустимый режим reasoning для выбранной модели.")
+    token = f"{REASONING_CALLBACK_PREFIX}{_reasoning_callback_digest(normalized_provider, normalized_model, normalized_value)}"
+    if len(token.encode("utf-8")) > TELEGRAM_CALLBACK_DATA_LIMIT:
+        raise ModelUnavailableError("Сформирован слишком длинный callback reasoning.")
+    return token
+
+
+def resolve_reasoning_callback_token(token: str | None) -> tuple[str, str, str] | None:
+    match = REASONING_CALLBACK_TOKEN_RE.fullmatch(token or "")
+    if not match:
+        return None
+    digest = match.group(1)
+    for provider in (PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER):
+        for model in get_callback_resolution_models(provider, channel="chat"):
+            for value in reasoning_callback_modes(provider, model):
+                expected = _reasoning_callback_digest(provider, model, value)
+                if compare_digest(digest, expected):
+                    return provider, model, value
+    return None
+
+
+def is_reasoning_callback_payload(payload: str | None) -> bool:
+    return str(payload or "").startswith(REASONING_CALLBACK_PREFIX)
+
+
+def parse_legacy_reasoning_callback(payload: str | None) -> tuple[str, str] | None:
+    if is_reasoning_callback_payload(payload):
+        return None
+    provider_raw, separator, value = str(payload or "").rpartition("_")
+    if not separator or value not in LEGACY_REASONING_CALLBACK_VALUES:
+        return None
+    provider = canonical_provider_name(provider_raw)
+    if provider not in {PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER}:
+        return None
+    if provider == PROVIDER_DEEPSEEK and value not in DIRECT_DEEPSEEK_REASONING_MODES:
+        return None
+    return provider, value
+
+
+def parse_legacy_reasoning_provider_callback(payload: str | None) -> str | None:
+    if is_reasoning_callback_payload(payload):
+        return None
+    provider = canonical_provider_name(payload)
+    if provider not in {PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER}:
+        return None
+    return provider
 
 
 def ensure_model_available(provider: str | None, model: str | None, channel: str = "chat") -> None:
