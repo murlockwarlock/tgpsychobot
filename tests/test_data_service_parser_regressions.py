@@ -282,6 +282,69 @@ def test_malformed_fallback_payload_before_valid_payload_is_diagnosed():
     assert extraction.classification == "parse_error"
 
 
+def test_untagged_malformed_service_payload_before_valid_payload_is_hidden():
+    raw = (
+        'Ответ.\n{"metadata":{"private":"secret",}}\n'
+        '{"current_state":{"current_step":"good"}}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert [block.current_state for block in extraction.blocks] == [{"current_step": "good"}]
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
+def test_signed_non_json_fallback_is_hidden_as_parse_error():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```json\n"
+        "not json\n"
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
+def test_fallback_data_preserves_visible_braced_code_inside_signed_fence():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```python\n"
+        'print({"before": 1})\n'
+        '{"current_state":{"current_step":"ok"}}\n'
+        'print({"after": 2})\n'
+        "```\n"
+        "Конец."
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert 'print({"before": 1})' in extraction.visible_text
+    assert 'print({"after": 2})' in extraction.visible_text
+    assert "```python" in extraction.visible_text
+    assert extraction.blocks[0].current_state == {"current_step": "ok"}
+    assert extraction.invalid_count == 0
+
+
+def test_malformed_untagged_service_json_removes_explicit_heading():
+    raw = 'Ответ.\nСлужебный блок данных:\n{"current_state":{"current_step":"secret",}}'
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
 def test_unrelated_empty_code_fence_is_preserved():
     raw = "Обычный ответ.\n```python\n```\nПродолжение."
 

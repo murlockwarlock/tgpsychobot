@@ -686,13 +686,9 @@ def _find_invalid_signed_fence_tail(
         opening_start, opening_end, closing_start, closing_end = region
         content_end = closing_start if closing_start is not None else len(text)
         remainder = masked_text[opening_end:content_end]
-        if not re.search(r"[\{\[]", remainder):
-            continue
-        remainder_start = opening_end
-        while remainder_start < content_end and masked_text[remainder_start].isspace():
-            remainder_start += 1
-        if remainder_start < content_end:
-            return remainder_start, content_end
+        unbalanced_tail = _find_unbalanced_service_tail(remainder, [])
+        if unbalanced_tail is not None:
+            return opening_end + unbalanced_tail[0], content_end
     return None
 
 
@@ -711,6 +707,22 @@ def _find_fallback_service_tail(
             continue
         if re.match(r"\s*[\{\[]", masked_text[signature.end():]):
             return signature.start(), len(text)
+        for region in _fence_regions(text):
+            opening_start, opening_end, closing_start, closing_end = region
+            if opening_start < signature.end():
+                continue
+            if text[signature.end():opening_start].strip():
+                continue
+            content_end = closing_start if closing_start is not None else len(text)
+            content = masked_text[opening_end:content_end]
+            if not content.strip():
+                continue
+            if any(
+                start < content_end and end > opening_end
+                for start, end in excluded_ranges
+            ):
+                continue
+            return signature.start(), closing_end if closing_end is not None else len(text)
     return None
 
 
@@ -779,21 +791,43 @@ def _looks_like_malformed_service_payload(text: str) -> bool:
 
 
 def _find_invalid_fallback_spans(text: str) -> list[tuple[int, int]]:
+    container_spans = _find_balanced_container_spans(text)
+    valid_service_starts: set[int] = set()
+    for object_start, object_end in container_spans:
+        payload = _json_loads_dict_or_list(text[object_start:object_end])
+        if not isinstance(payload, dict):
+            continue
+        if _is_service_fallback_payload(
+            payload,
+            _has_explicit_service_signature(text, object_start),
+        ):
+            valid_service_starts.add(object_start)
+
     invalid_spans: list[tuple[int, int]] = []
-    for object_start, object_end in _find_balanced_container_spans(text):
+    for object_start, object_end in container_spans:
         candidate = text[object_start:object_end]
         if not candidate.lstrip().startswith("{"):
             continue
         if _json_loads_dict_or_list(candidate) is not None:
             continue
         explicit_signature = _has_explicit_service_signature(text, object_start)
+        has_later_service_payload = any(
+            service_start > object_start
+            for service_start in valid_service_starts
+        )
         if not explicit_signature and not _is_fallback_tail(
             text,
             object_end,
             fenced=_fence_context(text, object_start) is not None,
-        ):
+        ) and not has_later_service_payload:
             continue
-        if not explicit_signature and not _looks_like_malformed_service_payload(candidate):
+        if not explicit_signature and not (
+            _looks_like_malformed_service_payload(candidate)
+            or (
+                has_later_service_payload
+                and re.search(r'"metadata"\s*:', candidate)
+            )
+        ):
             continue
         invalid_spans.append((object_start, object_end))
     return invalid_spans
@@ -912,8 +946,17 @@ def _extract_fallback_data(
     visible_text: str,
 ) -> tuple[str, list[tuple[int, ServiceDataBlock]], int, bool, list[tuple[int, int]]]:
     invalid_spans = _find_invalid_fallback_spans(visible_text)
-    spans = _find_balanced_json_spans(_mask_spans(visible_text, invalid_spans))
-    removals: list[tuple[int, int]] = list(invalid_spans)
+    invalid_removals: list[tuple[int, int]] = []
+    for object_start, object_end in invalid_spans:
+        start, fenced = _fallback_removal_start(
+            visible_text,
+            object_start,
+            invalid_removals,
+        )
+        end = _fence_end(visible_text, object_end) if fenced else object_end
+        invalid_removals.append((start, end))
+    spans = _find_balanced_json_spans(_mask_spans(visible_text, invalid_removals))
+    removals: list[tuple[int, int]] = list(invalid_removals)
     located_blocks: list[tuple[int, ServiceDataBlock]] = []
     invalid_count = len(invalid_spans)
     for object_start, object_end in spans:
