@@ -939,6 +939,15 @@ def resolve_telegram_model_callback(callback_data: str | None) -> tuple[str, str
 REASONING_CALLBACK_PREFIX = "r_"
 REASONING_CALLBACK_TOKEN_RE = re.compile(r"^r_([0-9a-f]{32})$")
 DIRECT_DEEPSEEK_REASONING_MODES = ("auto", "none", "low", "high", "max")
+LEGACY_REASONING_CALLBACK_VALUES = frozenset({
+    "auto",
+    "none",
+    "enabled",
+    "low",
+    "medium",
+    "high",
+    "max",
+})
 
 
 def _reasoning_callback_digest(provider: str, model: str, value: str) -> str:
@@ -978,6 +987,33 @@ def resolve_reasoning_callback_token(token: str | None) -> tuple[str, str, str] 
                 if compare_digest(digest, expected):
                     return provider, model, value
     return None
+
+
+def is_reasoning_callback_payload(payload: str | None) -> bool:
+    return str(payload or "").startswith(REASONING_CALLBACK_PREFIX)
+
+
+def parse_legacy_reasoning_callback(payload: str | None) -> tuple[str, str] | None:
+    if is_reasoning_callback_payload(payload):
+        return None
+    provider_raw, separator, value = str(payload or "").rpartition("_")
+    if not separator or value not in LEGACY_REASONING_CALLBACK_VALUES:
+        return None
+    provider = canonical_provider_name(provider_raw)
+    if provider not in {PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER}:
+        return None
+    if provider == PROVIDER_DEEPSEEK and value not in DIRECT_DEEPSEEK_REASONING_MODES:
+        return None
+    return provider, value
+
+
+def parse_legacy_reasoning_provider_callback(payload: str | None) -> str | None:
+    if is_reasoning_callback_payload(payload):
+        return None
+    provider = canonical_provider_name(payload)
+    if provider not in {PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER}:
+        return None
+    return provider
 
 
 def ensure_model_available(provider: str | None, model: str | None, channel: str = "chat") -> None:

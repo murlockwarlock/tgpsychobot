@@ -116,6 +116,9 @@ from provider_models import (
     refresh_perplexity_catalog,
     resolve_telegram_model_callback,
     resolve_reasoning_callback_token,
+    is_reasoning_callback_payload,
+    parse_legacy_reasoning_callback,
+    parse_legacy_reasoning_provider_callback,
     validate_model_selection,
 )
 from knowledge_base_admin import (
@@ -5723,7 +5726,13 @@ async def model_setting_reasoning_for_provider(callback: CallbackQuery):
         provider, model, _ = resolved
         await _show_model_reasoning(callback, provider, model)
         return
-    provider = canonical_provider_name(payload)
+    if is_reasoning_callback_payload(payload):
+        await callback.answer("Кнопка устарела. Откройте настройки модели заново.", show_alert=True)
+        return
+    provider = parse_legacy_reasoning_provider_callback(payload)
+    if provider is None:
+        await callback.answer("Недействительная кнопка настройки reasoning.", show_alert=True)
+        return
     await _show_model_reasoning(callback, provider)
 
 
@@ -5733,12 +5742,15 @@ async def save_model_reasoning(callback: CallbackQuery):
     resolved = resolve_reasoning_callback_token(payload)
     if resolved:
         provider, model, value = resolved
+    elif is_reasoning_callback_payload(payload):
+        await callback.answer("Кнопка устарела. Откройте настройки модели заново.", show_alert=True)
+        return
     else:
-        provider, separator, value = payload.rpartition("_")
-        if not separator or canonical_provider_name(provider) not in {PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER}:
-            provider = PROVIDER_DEEPSEEK
-            value = payload
-        provider = canonical_provider_name(provider)
+        legacy = parse_legacy_reasoning_callback(payload)
+        if legacy is None:
+            await callback.answer("Недействительная кнопка настройки reasoning.", show_alert=True)
+            return
+        provider, value = legacy
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
@@ -5746,11 +5758,11 @@ async def save_model_reasoning(callback: CallbackQuery):
             return
         provider = canonical_provider_name(provider)
         active_provider, active_model = _provider_model_scope(config, provider)
-        if resolved is None:
-            provider, model = active_provider, active_model
-        elif active_provider != provider or active_model != model:
+        if resolved is not None and active_model != model:
             await callback.answer("Провайдер модели изменился. Откройте настройки заново.", show_alert=True)
             return
+        if resolved is None:
+            provider, model = active_provider, active_model
         try:
             normalized = validate_model_setting(provider, model, "reasoning_effort", value)
         except ValueError as exc:

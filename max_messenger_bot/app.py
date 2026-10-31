@@ -39,7 +39,12 @@ from .services import common, settings as settings_service, subscriptions as sub
 from .settings import get_settings, validate_webhook_runtime_settings
 from .keyboards import callback_button, inline_keyboard, main_menu_row
 from .identity import is_max_user_id
-from provider_models import resolve_reasoning_callback_token
+from provider_models import (
+    is_reasoning_callback_payload,
+    parse_legacy_reasoning_callback,
+    parse_legacy_reasoning_provider_callback,
+    resolve_reasoning_callback_token,
+)
 from response_buttons import MAIN_TOPIC_ACTIONS, build_ai_button_system_message, split_action_callback_data
 from .storage import StateStore, init_storage
 from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
@@ -1847,8 +1852,20 @@ class MaxBotApplication:
                 if resolved:
                     provider, model, _ = resolved
                     await admin_ai_service.show_model_reasoning(self.client, chat_id, provider, model)
+                elif is_reasoning_callback_payload(payload):
+                    await self.client.answer_callback(
+                        callback.callback_id,
+                        notification="Кнопка устарела. Откройте настройки модели заново.",
+                    )
                 else:
-                    await admin_ai_service.show_model_reasoning(self.client, chat_id, payload)
+                    provider = parse_legacy_reasoning_provider_callback(payload)
+                    if provider is None:
+                        await self.client.answer_callback(
+                            callback.callback_id,
+                            notification="Недействительная кнопка настройки reasoning.",
+                        )
+                        return
+                    await admin_ai_service.show_model_reasoning(self.client, chat_id, provider)
                 return
             if data == "admin_ai_model_choices":
                 config = await admin_ai_service._get_config()
@@ -1889,10 +1906,20 @@ class MaxBotApplication:
                         provider=provider,
                         model=model,
                     )
+                elif is_reasoning_callback_payload(payload):
+                    await self.client.answer_callback(
+                        callback.callback_id,
+                        notification="Кнопка устарела. Откройте настройки модели заново.",
+                    )
                 else:
-                    provider, separator, value = payload.rpartition("_")
-                    if not separator:
-                        provider, value = None, payload
+                    legacy = parse_legacy_reasoning_callback(payload)
+                    if legacy is None:
+                        await self.client.answer_callback(
+                            callback.callback_id,
+                            notification="Недействительная кнопка настройки reasoning.",
+                        )
+                        return
+                    provider, value = legacy
                     await admin_ai_service.save_model_reasoning(self.client, chat_id, value, provider=provider)
                 return
             if data == "admin_ai_model_max_tokens":
