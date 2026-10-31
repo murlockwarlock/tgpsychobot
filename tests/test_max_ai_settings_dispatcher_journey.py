@@ -1130,6 +1130,38 @@ async def test_max_unresolved_reasoning_token_is_rejected_without_scope_mutation
         assert deepseek.reasoning_effort == "high"
         assert openrouter.reasoning_effort == "max"
 
+    async with max_settings_db() as session_update:
+        config = await session_update.get(AIConfig, 1)
+        config.openrouter_model = "qwen/qwen3.7-plus"
+        await session_update.commit()
+    await app.handle_update({
+        "update_type": "message_callback",
+        "update_id": 902,
+        "callback": {
+            "callback_id": "cb-902",
+            "payload": f"admin_ai_reasoning_{valid_token}",
+            "sender": {"user_id": 1001, "name": "Admin"},
+        },
+        "message": {
+            "mid": "admin-message",
+            "recipient": {"chat_id": 1001},
+            "body": {"attachments": []},
+        },
+    })
+    messages = [item for item in captured if item["path"] == "/messages"]
+    assert messages[-1]["body"]["text"] == "Модель изменилась. Настройки не изменены."
+    async with max_settings_db() as session_check:
+        openrouter = await session_check.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "OpenRouter",
+                AIModelSettings.model == "qwen/qwen3.8-27b",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        config = await session_check.get(AIConfig, 1)
+        assert openrouter.reasoning_effort == "max"
+        assert config.openrouter_model == "qwen/qwen3.7-plus"
+
 
 async def _true_async():
     return True

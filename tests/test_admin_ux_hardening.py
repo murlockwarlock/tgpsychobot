@@ -1596,6 +1596,32 @@ async def test_telegram_unresolved_reasoning_token_does_not_mutate_scoped_settin
     answer = next(method for method in session.calls if method.__class__.__name__ == "AnswerCallbackQuery")
     assert answer.show_alert is True
 
+    async with factory() as session_update:
+        config = await session_update.get(AIConfig, 1)
+        config.openrouter_model = "qwen/qwen3.7-plus"
+        await session_update.commit()
+    session.calls.clear()
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        message,
+        f"model_reasoning_{valid_token}",
+        5302,
+    )
+    async with factory() as session_check:
+        openrouter = await session_check.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "OpenRouter",
+                AIModelSettings.model == "qwen/qwen3.8-27b",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        config = await session_check.get(AIConfig, 1)
+        assert openrouter.reasoning_effort == "max"
+        assert config.openrouter_model == "qwen/qwen3.7-plus"
+    answer = next(method for method in session.calls if method.__class__.__name__ == "AnswerCallbackQuery")
+    assert answer.show_alert is True
+
     session.calls.clear()
     await _feed_callback(
         admin_dispatcher,
