@@ -686,6 +686,41 @@ def _is_service_fallback_payload(payload: dict[str, Any], explicit_signature: bo
     )
 
 
+def _is_service_fallback_candidate(
+    payload: dict[str, Any],
+    text: str,
+    object_start: int,
+    explicit_signature: bool,
+) -> bool:
+    if not _is_service_fallback_payload(payload, explicit_signature):
+        return False
+    context = _fence_context(text, object_start)
+    if context is None or _fence_language(text, context) == "json":
+        return True
+    return _is_service_fallback_payload(payload, False)
+
+
+def _fence_residual_only_nonservice_json(
+    text: str,
+    content_start: int,
+    content_end: int,
+) -> bool:
+    residual = text[content_start:content_end]
+    spans = _find_balanced_json_spans(residual)
+    if not spans:
+        return False
+    for object_start, object_end in spans:
+        payload = _json_loads_dict_or_list(residual[object_start:object_end])
+        if isinstance(payload, dict) and _is_service_fallback_candidate(
+            payload,
+            text,
+            content_start + object_start,
+            True,
+        ):
+            return False
+    return True
+
+
 def _fence_has_service_signature(
     text: str,
     region: tuple[int, int, int | None, int | None],
@@ -744,16 +779,40 @@ def _find_fallback_service_tail(
             content = masked_text[opening_end:content_end]
             if not content.strip():
                 continue
+            language = _fence_language(text, region)
             has_content_removal = any(
                 start < content_end and end > opening_end
                 for start, end in excluded_ranges
             )
             if not has_content_removal:
+                if (
+                    language == ""
+                    and _fence_residual_only_nonservice_json(
+                        masked_text,
+                        opening_end,
+                        content_end,
+                    )
+                ):
+                    continue
                 return signature.start(), closing_end if closing_end is not None else len(text)
             residual_start = opening_end
             while residual_start < content_end and masked_text[residual_start].isspace():
                 residual_start += 1
             if residual_start < content_end:
+                if (
+                    language == ""
+                    and (
+                        _fence_residual_only_nonservice_json(
+                            masked_text,
+                            opening_end,
+                            content_end,
+                        )
+                        or not _looks_like_malformed_service_payload(
+                            masked_text[residual_start:content_end],
+                        )
+                    )
+                ):
+                    continue
                 return residual_start, closing_end if closing_end is not None else len(text)
     return None
 
@@ -823,11 +882,22 @@ def _looks_like_malformed_service_payload(text: str) -> bool:
 
 
 def _has_user_facing_json_example_marker(text: str, object_start: int) -> bool:
-    line_prefix = text[_line_start(text, object_start):object_start]
-    return bool(re.search(
-        r"(?i)(?:пример|example|json\s*:|json\s+для)",
-        line_prefix,
-    ))
+    line_start = _line_start(text, object_start)
+    line_prefix = text[line_start:object_start]
+    marker_re = re.compile(r"(?i)(?:пример|example|json\s*:|json\s+для)")
+    if marker_re.search(line_prefix):
+        return True
+    cursor = line_start
+    while cursor > 0:
+        previous_end = cursor
+        previous_start = text.rfind("\n", 0, previous_end - 1) + 1
+        previous_line = text[previous_start:previous_end].strip()
+        if not previous_line:
+            break
+        if marker_re.search(previous_line):
+            return True
+        cursor = previous_start
+    return False
 
 
 def _find_invalid_fallback_spans(
@@ -842,8 +912,10 @@ def _find_invalid_fallback_spans(
         payload = _json_loads_dict_or_list(text[object_start:object_end])
         if not isinstance(payload, dict):
             continue
-        if _is_service_fallback_payload(
+        if _is_service_fallback_candidate(
             payload,
+            text,
+            object_start,
             _has_explicit_service_signature(text, object_start),
         ):
             valid_service_starts.add(object_start)
@@ -879,6 +951,14 @@ def _find_invalid_fallback_spans(
         if not explicit_signature and _has_user_facing_json_example_marker(
             text,
             object_start,
+        ):
+            continue
+        context = _fence_context(text, object_start)
+        if (
+            explicit_signature
+            and context is not None
+            and _fence_language(text, context) != "json"
+            and not _looks_like_malformed_service_payload(candidate)
         ):
             continue
         invalid_spans.append((object_start, object_end))
@@ -1038,7 +1118,12 @@ def _extract_fallback_data(
                 removals.append((start, end))
                 invalid_count += 1
             continue
-        if not isinstance(payload, dict) or not _is_service_fallback_payload(payload, explicit_signature):
+        if not isinstance(payload, dict) or not _is_service_fallback_candidate(
+            payload,
+            visible_text,
+            object_start,
+            explicit_signature,
+        ):
             continue
         end = _fence_end(visible_text, object_end) if fenced else object_end
         located_blocks.append(
