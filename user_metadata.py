@@ -838,15 +838,16 @@ def _has_user_facing_json_example_marker(text: str, object_start: int) -> bool:
     if marker_re.search(line_prefix):
         return True
     cursor = line_start
-    while cursor > 0:
+    inspected_lines = 0
+    while cursor > 0 and inspected_lines < 3:
         previous_end = cursor
         previous_start = text.rfind("\n", 0, previous_end - 1) + 1
         previous_line = text[previous_start:previous_end].strip()
-        if not previous_line:
-            break
-        if marker_re.search(previous_line):
-            return True
         cursor = previous_start
+        if previous_line and marker_re.search(previous_line):
+            return True
+        if previous_line:
+            inspected_lines += 1
     return False
 
 

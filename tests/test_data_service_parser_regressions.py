@@ -422,6 +422,24 @@ def test_multiline_malformed_user_json_example_before_service_payload_is_preserv
     assert extraction.classification == "fallback"
 
 
+def test_blank_line_after_json_example_marker_preserves_malformed_example():
+    raw = (
+        "Ответ.\n"
+        "Пример JSON:\n"
+        "\n"
+        '{"metadata":{"name":"Alice",}}\n'
+        '{"current_state":{"current_step":"good"}}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert "Пример JSON:" in extraction.visible_text
+    assert '{"metadata":{"name":"Alice",}}' in extraction.visible_text
+    assert extraction.blocks[0].current_state == {"current_step": "good"}
+    assert extraction.invalid_count == 0
+    assert extraction.classification == "fallback"
+
+
 @pytest.mark.parametrize("fence", ["```python", "```"])
 def test_metadata_only_literal_in_non_json_fence_is_not_service_data(fence):
     raw = (
