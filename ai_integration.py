@@ -59,7 +59,7 @@ from error_reporting import (
 )
 from ai_log_context import record_ai_attempt_log
 from vector_store import search_relevant_chunks
-from user_metadata import extract_service_data
+from user_metadata import extract_service_data, extract_service_data_details, service_data_diagnostics
 from provider_models import (
     CLAUDE_CHAT_MAX_TOKENS,
     DEEPGRAM_DEFAULT_MODEL,
@@ -2325,7 +2325,10 @@ async def get_ai_response(
                 default_provider=provider,
                 default_model=model,
             )
-            visible_text, service_blocks, invalid_data_blocks = extract_service_data(response_text)
+            extraction = extract_service_data_details(response_text)
+            visible_text = extraction.visible_text
+            service_blocks = extraction.blocks
+            invalid_data_blocks = extraction.invalid_count
             if response_capture is not None:
                 response_capture.clear()
                 response_capture.update({
@@ -2354,6 +2357,7 @@ async def get_ai_response(
                 request_group_id=request_group_id,
                 attempt_no=1,
                 attempt_role="primary",
+                diagnostics=service_data_diagnostics(extraction),
             )
             primary_succeeded = True
             successful_log_id = primary_log_id
@@ -2590,7 +2594,10 @@ async def get_ai_response(
                     default_provider=fb_provider,
                     default_model=fb_model,
                 )
-                visible_text, service_blocks, invalid_data_blocks = extract_service_data(response_text)
+                extraction = extract_service_data_details(response_text)
+                visible_text = extraction.visible_text
+                service_blocks = extraction.blocks
+                invalid_data_blocks = extraction.invalid_count
                 if response_capture is not None:
                     response_capture.clear()
                     response_capture.update({
@@ -2619,6 +2626,7 @@ async def get_ai_response(
                     request_group_id=request_group_id,
                     attempt_no=2,
                     attempt_role="fallback",
+                    diagnostics=service_data_diagnostics(extraction),
                 )
                 successful_log_id = fb_log_id
                 actual_provider = fb_prov
@@ -4029,7 +4037,8 @@ async def analyze_image_content(
                     cand_latency = int((time.monotonic() - cand_start) * 1000)
                     if request_capture is not None:
                         request_capture.update(cand_capture)
-                    clean_res, _, _ = extract_service_data(res)
+                    extraction = extract_service_data_details(res)
+                    clean_res = extraction.visible_text
                     await _audit_attempt(
                         "KIE",
                         cand_model,
@@ -4039,7 +4048,7 @@ async def analyze_image_content(
                         cand_capture,
                         res,
                         clean_res,
-                        diagnostics=cand_diag,
+                        diagnostics={**cand_diag, **service_data_diagnostics(extraction)},
                     )
                     success_result = res
                     break
@@ -4179,7 +4188,8 @@ async def analyze_image_content(
             prim_latency = int((time.monotonic() - prim_start) * 1000)
             if request_capture is not None:
                 request_capture.update(prim_capture)
-            clean_res, _, _ = extract_service_data(res)
+            extraction = extract_service_data_details(res)
+            clean_res = extraction.visible_text
             await _audit_attempt(
                 primary_provider,
                 primary_target_model,
@@ -4189,6 +4199,7 @@ async def analyze_image_content(
                 prim_capture,
                 res,
                 clean_res,
+                diagnostics=service_data_diagnostics(extraction),
             )
             success_result = res
         except Exception as prim_exc:
@@ -4442,8 +4453,13 @@ async def analyze_image_content(
             fb_latency = int((time.monotonic() - fb_start) * 1000)
             if request_capture is not None:
                 request_capture.update(fb_capture)
-            clean_fb_res, _, _ = extract_service_data(fb_res)
-            fb_diag = {"stage": "provider_fallback", "fallback_kind": "provider"}
+            extraction = extract_service_data_details(fb_res)
+            clean_fb_res = extraction.visible_text
+            fb_diag = {
+                "stage": "provider_fallback",
+                "fallback_kind": "provider",
+                **service_data_diagnostics(extraction),
+            }
             await _audit_attempt(
                 eff_fallback_provider,
                 eff_fallback_model or "",

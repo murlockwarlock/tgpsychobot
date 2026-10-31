@@ -354,6 +354,27 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.current_step, "CALCULATED")
         self.assertEqual(load_metadata(state.metadata_json), {"calc": {"result_val": 42}})
 
+    async def test_get_ai_response_direct_does_not_fallback_to_raw_data_only_response(self):
+        import handlers
+
+        provider_responses = [
+            '<DATA>{"metadata":{"private":"secret"}}</DATA>',
+            '<DATA>{"metadata":{"private":"secret"}',
+        ]
+
+        with patch.object(handlers, "async_session_maker", self.sessions):
+            for provider_response in provider_responses:
+                with patch.object(handlers, "_call_gemini_api", AsyncMock(return_value=provider_response)):
+                    visible = await handlers.get_ai_response_direct(
+                        42,
+                        "Системный промпт",
+                        "Ответы",
+                    )
+
+                self.assertEqual(visible, "")
+                self.assertNotIn("<DATA>", visible)
+                self.assertNotIn("private", visible)
+
     async def test_max_get_ai_response_direct_merges_data_blocks(self):
         from max_messenger_bot import ai as max_ai
 
