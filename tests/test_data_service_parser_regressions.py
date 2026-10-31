@@ -199,6 +199,70 @@ def test_multiple_signed_fallback_objects_in_one_fence_are_all_hidden():
     assert extraction.invalid_count == 0
 
 
+def test_mixed_tagged_and_fallback_blocks_in_one_fence_keep_source_order():
+    raw = (
+        "Служебный блок данных:\n"
+        "```json\n"
+        '<DATA>{"event":"FIRST"}</DATA>\n'
+        '{"event":"SECOND"}\n'
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert [block.events for block in extraction.blocks] == [["FIRST"], ["SECOND"]]
+    assert extraction.visible_text == ""
+    assert extraction.invalid_count == 0
+
+
+def test_visible_code_before_data_inside_fence_is_preserved():
+    raw = (
+        "Ответ.\n"
+        "```python\n"
+        'print("before")\n'
+        '<DATA>{"metadata":{"x":1}}</DATA>\n'
+        "```\n"
+        "Конец."
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text.startswith("Ответ.\n```python\n")
+    assert 'print("before")' in extraction.visible_text
+    assert extraction.visible_text.endswith("```\nКонец.")
+    assert extraction.blocks[0].metadata == {"x": 1}
+    assert extraction.invalid_count == 0
+
+
+def test_malformed_fallback_payload_after_valid_payload_is_hidden():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```json\n"
+        '{"current_state":{"current_step":"ok"}}\n'
+        '{"metadata":{"private":"secret",}}\n'
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert [block.current_state for block in extraction.blocks] == [{"current_step": "ok"}]
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+    assert "private" not in extraction.visible_text
+
+
+def test_unrelated_empty_code_fence_is_preserved():
+    raw = "Обычный ответ.\n```python\n```\nПродолжение."
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == raw
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 0
+
+
 @pytest.mark.parametrize(
     ("opening", "closing"),
     [("<DATA>", "</DATA>"), ("[DATA]", "[/DATA]")],

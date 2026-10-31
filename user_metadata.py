@@ -352,6 +352,18 @@ def _fence_end(text: str, position: int) -> int:
     return closing_end
 
 
+def _fence_prefix_is_service_only(
+    text: str,
+    position: int,
+    removals: list[tuple[int, int]],
+) -> bool:
+    context = _fence_context(text, position)
+    if context is None:
+        return True
+    masked_text = _mask_spans(text, removals)
+    return not masked_text[context[1]:position].strip()
+
+
 def _find_tag_close(text: str, start: int, kind: str) -> re.Match[str] | None:
     close_re = DATA_CLOSE_RE[kind]
     in_string = False
@@ -412,6 +424,8 @@ def _empty_fence_removals(
     text: str,
     removals: list[tuple[int, int]],
 ) -> list[tuple[int, int]]:
+    if not removals:
+        return []
     masked_text = _mask_spans(text, removals)
     empty_fences: list[tuple[int, int]] = []
     for opening_start, opening_end, closing_start, closing_end in _fence_regions(text):
@@ -620,6 +634,41 @@ def _is_service_fallback_payload(payload: dict[str, Any], explicit_signature: bo
     )
 
 
+def _fence_has_service_signature(
+    text: str,
+    region: tuple[int, int, int | None, int | None],
+) -> bool:
+    signature_start = _signature_line_start(text, region[1])
+    if signature_start is None:
+        return False
+    signature_text = text[signature_start:_line_start(text, region[0])]
+    return bool(re.search(
+        r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?$",
+        signature_text,
+    ))
+
+
+def _find_invalid_signed_fence_tail(
+    text: str,
+    removals: list[tuple[int, int]],
+) -> tuple[int, int] | None:
+    masked_text = _mask_spans(text, removals)
+    for region in _fence_regions(text):
+        if not _fence_has_service_signature(text, region):
+            continue
+        opening_start, opening_end, closing_start, closing_end = region
+        content_end = closing_start if closing_start is not None else len(text)
+        remainder = masked_text[opening_end:content_end]
+        if not re.search(r"[\{\[]", remainder):
+            continue
+        remainder_start = opening_end
+        while remainder_start < content_end and masked_text[remainder_start].isspace():
+            remainder_start += 1
+        if remainder_start < content_end:
+            return remainder_start, content_end
+    return None
+
+
 def _find_fallback_service_tail(
     text: str,
     excluded_ranges: list[tuple[int, int]] | None = None,
@@ -738,7 +787,11 @@ def _extract_tagged_data(
 
         start = _fence_start(raw_text, match.start())
         fence_end = _fence_end(raw_text, close.end())
-        has_wrapper_fence = start != match.start() and fence_end > close.end()
+        has_wrapper_fence = (
+            start != match.start()
+            and fence_end > close.end()
+            and _fence_prefix_is_service_only(raw_text, match.start(), removals)
+        )
         if has_wrapper_fence:
             end = fence_end
         else:
@@ -828,11 +881,16 @@ def _extract_fallback_data(
         end = _fence_end(visible_text, object_end) if fenced else object_end
         located_blocks.append(
             (
-                start,
+                object_start,
                 _normalize_service_payload(payload, candidate, xml_syntax=True),
             )
         )
         removals.append((start, end))
+
+    invalid_tail = _find_invalid_signed_fence_tail(visible_text, removals)
+    if invalid_tail:
+        removals.append(invalid_tail)
+        invalid_count += 1
 
     tail = _find_fallback_service_tail(visible_text, removals)
     if tail:
