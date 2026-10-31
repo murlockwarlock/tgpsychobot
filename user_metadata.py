@@ -33,6 +33,10 @@ FALLBACK_SIGNATURE_RE = re.compile(
     r"^[ \t]*(?:служебный блок данных|заполненный current_state|json|data:)[ \t]*:?$",
     re.IGNORECASE,
 )
+EXPLICIT_SERVICE_SIGNATURE_RE = re.compile(
+    r"^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?[ \t]*(?:\r?\n|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 MARKDOWN_FENCE_RE = re.compile(
     r"[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?:\r?\n)?$"
 )
@@ -432,17 +436,21 @@ def _has_explicit_service_signature(text: str, object_start: int) -> bool:
 
 
 def _has_unclosed_json_container(text: str, object_start: int) -> bool:
-    signature_start = _signature_line_start(text, object_start)
-    if signature_start is None:
-        context_start = _line_start(text, object_start)
-    else:
+    signatures = list(EXPLICIT_SERVICE_SIGNATURE_RE.finditer(text[:object_start]))
+    if signatures:
+        signature_start = signatures[-1].start()
         newline = text.find("\n", signature_start)
         context_start = len(text) if newline == -1 else newline + 1
+        explicit_context = True
+    else:
+        context_start = _line_start(text, object_start)
+        explicit_context = False
     stack: list[str] = []
+    stack_positions: list[int] = []
     in_string = False
     escaped = False
     pairs = {"}": "{", "]": "["}
-    for char in text[context_start:object_start]:
+    for offset, char in enumerate(text[context_start:object_start], context_start):
         if in_string:
             if escaped:
                 escaped = False
@@ -455,9 +463,18 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
             in_string = True
         elif char == "{" or (char == "[" and stack):
             stack.append(char)
+            stack_positions.append(offset)
         elif char in "}]" and stack and stack[-1] == pairs[char]:
             stack.pop()
-    return bool(stack)
+            stack_positions.pop()
+    if not stack:
+        return False
+    if explicit_context:
+        return True
+    return any(
+        char == "{" and _is_line_start_tag(text, position)
+        for char, position in zip(stack, stack_positions)
+    )
 
 
 def _is_service_fallback_payload(payload: dict[str, Any], explicit_signature: bool) -> bool:
@@ -481,7 +498,7 @@ def _find_fallback_service_tail(
 ) -> tuple[int, int] | None:
     excluded_ranges = excluded_ranges or []
     signatures = re.finditer(
-        r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?\s*(?:\r?\n|$)",
+        EXPLICIT_SERVICE_SIGNATURE_RE,
         text,
     )
     for signature in signatures:
