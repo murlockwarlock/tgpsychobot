@@ -801,7 +801,36 @@ def test_inline_data_does_not_remove_code_before_tag(opening, closing):
 
     extraction = extract_service_data_details(raw)
 
-    assert extraction.visible_text == 'Ответ.\n```python\nprint("hello")\n```'
+    assert extraction.visible_text.startswith("Ответ.\n```python\n")
+    assert extraction.visible_text.endswith('print("hello")\n```')
+    assert 'print("hello")' in extraction.visible_text
+    assert extraction.blocks[0].raw_json == '{"metadata":{"x":1}}'
+    assert extraction.invalid_count == 0
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing", "suffix"),
+    [
+        ("<DATA>", "</DATA>", ' print("hello")\n'),
+        ("<DATA>", "</DATA>", '\nprint("hello")\n'),
+        ("[DATA]", "[/DATA]", ' print("hello")\n'),
+        ("[DATA]", "[/DATA]", '\nprint("hello")\n'),
+    ],
+)
+def test_data_with_following_code_preserves_wrapper_fences(opening, closing, suffix):
+    raw = (
+        "Ответ.\n"
+        "```python\n"
+        f'{opening}{{"metadata":{{"x":1}}}}{closing}'
+        f"{suffix}"
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text.startswith("Ответ.\n```python\n")
+    assert extraction.visible_text.endswith('print("hello")\n```')
+    assert 'print("hello")' in extraction.visible_text
     assert extraction.blocks[0].raw_json == '{"metadata":{"x":1}}'
     assert extraction.invalid_count == 0
 

@@ -688,7 +688,13 @@ def _extract_tagged_data(
             break
 
         start = _fence_start(raw_text, match.start())
-        end = _fence_end(raw_text, close.end()) if start != match.start() else close.end()
+        fence_end = _fence_end(raw_text, close.end())
+        has_wrapper_fence = start != match.start() and fence_end > close.end()
+        if has_wrapper_fence:
+            end = fence_end
+        else:
+            start = match.start()
+            end = close.end()
         raw_json = body.strip()
         payload = _repair_json_payload(raw_json)
         if payload is None or not isinstance(payload, dict):
