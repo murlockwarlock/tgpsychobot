@@ -177,6 +177,71 @@ def test_signed_metadata_in_markdown_fence_is_service_data():
     assert invalid == 0
 
 
+def test_multiple_signed_fallback_objects_in_one_fence_are_all_hidden():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```json\n"
+        '{"current_state":{"current_step":"first"}}\n'
+        '{"current_state":{"current_step":"second"},"metadata":{"private":"secret"}}\n'
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert [block.current_state for block in extraction.blocks] == [
+        {"current_step": "first"},
+        {"current_step": "second"},
+    ]
+    assert extraction.blocks[1].metadata == {"private": "secret"}
+    assert "private" not in extraction.visible_text
+    assert extraction.invalid_count == 0
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [("<DATA>", "</DATA>"), ("[DATA]", "[/DATA]")],
+)
+def test_pure_service_fence_is_removed_when_closing_fence_is_missing(opening, closing):
+    raw = (
+        "Ответ.\n"
+        "```json\n"
+        f'{opening}{{"metadata":{{"private":"secret"}}}}{closing}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks
+    assert "```" not in extraction.visible_text
+    assert extraction.invalid_count == 0
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [("<DATA>", "</DATA>"), ("[DATA]", "[/DATA]")],
+)
+def test_multiple_tagged_service_blocks_remove_their_wrapper_fence(opening, closing):
+    raw = (
+        "Ответ.\n"
+        "```json\n"
+        f'{opening}{{"metadata":{{"first":1}}}}{closing}\n'
+        f'{opening}{{"metadata":{{"second":2}}}}{closing}\n'
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert [block.raw_json for block in extraction.blocks] == [
+        '{"metadata":{"first":1}}',
+        '{"metadata":{"second":2}}',
+    ]
+    assert "```" not in extraction.visible_text
+    assert extraction.invalid_count == 0
+
+
 def test_truncated_untagged_service_json_is_hidden_without_partial_state():
     raw = 'Ответ.\nСлужебный блок данных:\n{"current_step":"secret","metadata":{"private":'
 

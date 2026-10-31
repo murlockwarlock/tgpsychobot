@@ -40,6 +40,7 @@ EXPLICIT_SERVICE_SIGNATURE_RE = re.compile(
 MARKDOWN_FENCE_RE = re.compile(
     r"[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?:\r?\n)?$"
 )
+FENCE_LINE_RE = re.compile(r"[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*$")
 
 
 @dataclass(frozen=True)
@@ -293,32 +294,62 @@ def _is_opening_fence(text: str, line_start: int, line_end: int) -> bool:
     return len(previous_fences) % 2 == 0
 
 
+def _fence_regions(text: str) -> list[tuple[int, int, int | None, int | None]]:
+    regions: list[tuple[int, int, int | None, int | None]] = []
+    opening_start: int | None = None
+    opening_end: int | None = None
+    position = 0
+    while position < len(text):
+        line_end = text.find("\n", position)
+        if line_end == -1:
+            line_end = len(text)
+        else:
+            line_end += 1
+        line = text[position:line_end].rstrip("\r\n")
+        if FENCE_LINE_RE.fullmatch(line):
+            if opening_start is None:
+                opening_start = position
+                opening_end = line_end
+            else:
+                regions.append((opening_start, opening_end, position, line_end))
+                opening_start = None
+                opening_end = None
+        position = line_end
+    if opening_start is not None:
+        regions.append((opening_start, opening_end, None, None))
+    return regions
+
+
+def _fence_context(
+    text: str,
+    position: int,
+) -> tuple[int, int, int | None, int | None] | None:
+    for region in _fence_regions(text):
+        opening_start, opening_end, closing_start, closing_end = region
+        region_end = closing_start if closing_start is not None else len(text)
+        if opening_end <= position < region_end:
+            return region
+    return None
+
+
 def _fence_start(text: str, position: int) -> int:
     current_line_start = _line_start(text, position)
     if text[current_line_start:position].strip():
         return position
-    if current_line_start == 0:
-        return position
-    cursor = current_line_start
-    while cursor > 0:
-        previous_end = cursor
-        previous_start = text.rfind("\n", 0, previous_end - 1) + 1
-        previous_line = text[previous_start:previous_end].rstrip("\r\n")
-        if not previous_line.strip():
-            cursor = previous_start
-            continue
-        if _is_opening_fence(text, previous_start, previous_end):
-            return previous_start
-        break
+    context = _fence_context(text, position)
+    if context is not None:
+        return context[0]
     return position
 
 
 def _fence_end(text: str, position: int) -> int:
-    match = re.match(
-        r"(?:\r?\n[ \t]*)+[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?:\r?\n|$)",
-        text[position:],
-    )
-    return position + match.end() if match else position
+    context = _fence_context(text, position)
+    if context is None or context[2] is None or context[3] is None:
+        return position
+    closing_start, closing_end = context[2], context[3]
+    if text[position:closing_start].strip():
+        return position
+    return closing_end
 
 
 def _find_tag_close(text: str, start: int, kind: str) -> re.Match[str] | None:
@@ -375,6 +406,23 @@ def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
             if masked[position] not in "\r\n":
                 masked[position] = " "
     return "".join(masked)
+
+
+def _empty_fence_removals(
+    text: str,
+    removals: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    masked_text = _mask_spans(text, removals)
+    empty_fences: list[tuple[int, int]] = []
+    for opening_start, opening_end, closing_start, closing_end in _fence_regions(text):
+        content_end = closing_start if closing_start is not None else len(text)
+        if masked_text[opening_end:content_end].strip():
+            continue
+        empty_fences.append((
+            opening_start,
+            closing_end if closing_end is not None else len(text),
+        ))
+    return empty_fences
 
 
 def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
@@ -462,7 +510,8 @@ def _is_fallback_tail(text: str, end: int, *, fenced: bool) -> bool:
 
 def _signature_line_start(text: str, position: int) -> int | None:
     fence_start = _fence_start(text, position)
-    line_start = _line_start(text, fence_start)
+    context = _fence_context(text, position)
+    line_start = _line_start(text, context[0] if context is not None else fence_start)
     cursor = line_start
     found: int | None = None
     while cursor > 0:
@@ -702,7 +751,7 @@ def _extract_tagged_data(
         else:
             located_blocks.append(
                 (
-                    start,
+                    match.start(),
                     _normalize_service_payload(
                         payload,
                         raw_json,
@@ -812,11 +861,18 @@ def extract_service_data_details(text: str | None) -> ServiceDataExtraction:
         invalid_count += fallback_invalid
         classification = "fallback" if not invalid_count else "parse_error"
 
+    wrapper_removals = _empty_fence_removals(
+        raw_text,
+        tagged_removals + fallback_removals,
+    )
     located_blocks = sorted(
         tagged_blocks + fallback_blocks,
         key=lambda item: item[0],
     )
-    visible_text = _remove_spans(raw_text, tagged_removals + fallback_removals)
+    visible_text = _remove_spans(
+        raw_text,
+        tagged_removals + fallback_removals + wrapper_removals,
+    )
 
     return ServiceDataExtraction(
         visible_text=_normalize_visible_text(visible_text),
