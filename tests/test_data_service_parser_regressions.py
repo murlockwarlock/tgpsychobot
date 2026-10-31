@@ -207,7 +207,7 @@ def test_signed_service_json_can_be_followed_by_visible_explanation():
 def test_extraction_classification_is_safe_and_does_not_include_metadata():
     cases = [
         ('Ответ <DATA>{"metadata":{"private":"value"}}</DATA>', "tags"),
-        ('Ответ.\n{"current_step":"step"}', "fallback"),
+        ('Ответ.\n{"current_state":{"current_step":"step"}}', "fallback"),
         ("Обычный ответ.", "none"),
         ('Ответ.\n<DATA>{"metadata":', "parse_error"),
     ]
@@ -216,3 +216,86 @@ def test_extraction_classification_is_safe_and_does_not_include_metadata():
         extraction = extract_service_data_details(raw)
         assert extraction.classification == expected
         assert "private" not in str(service_data_diagnostics(extraction))
+
+
+def test_inline_truncated_xml_opener_hides_service_suffix_but_keeps_prefix():
+    raw = 'Ответ. <DATA version="1"\n{"metadata":{"private":"value"}}'
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+
+
+def test_multiple_signed_fallback_blocks_are_removed_and_preserved_in_order():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        '{"metadata":{"first":1}}\n'
+        "Заполненный current_state:\n"
+        '{"current_state":{"current_step":"second"}}'
+    )
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == "Ответ."
+    assert [block.metadata for block in blocks] == [{"first": 1}, {}]
+    assert [block.current_state for block in blocks] == [{}, {"current_step": "second"}]
+    assert invalid == 0
+
+
+def test_valid_fallback_is_still_extracted_after_invalid_tagged_block():
+    raw = (
+        "Ответ.\n"
+        "<DATA>{not-json}</DATA>\n"
+        "Служебный блок данных:\n"
+        '{"current_step":"safe"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks[0].current_state == {"current_step": "safe"}
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
+def test_malformed_tagged_event_does_not_execute_alias_or_create_block():
+    raw = '<DATA>{"event":"SHOULD_NOT_RUN"</DATA>'
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == ""
+    assert blocks == []
+    assert invalid == 1
+
+
+def test_ordinary_event_json_example_is_not_treated_as_service_data():
+    raw = 'Ответ.\n{"event":"MEETING","title":"Demo"}'
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == raw
+    assert blocks == []
+    assert invalid == 0
+
+
+def test_generic_json_heading_does_not_erase_ordinary_json():
+    raw = 'Ответ.\nJSON:\n{"name":"Alice"}\nПояснение.'
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == raw
+    assert blocks == []
+    assert invalid == 0
+
+
+def test_line_start_literal_data_without_json_is_not_hidden():
+    raw = "Начало.\n<DATA> это обычное упоминание и продолжение."
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == raw
+    assert blocks == []
+    assert invalid == 0

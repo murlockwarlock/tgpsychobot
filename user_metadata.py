@@ -29,13 +29,6 @@ SERVICE_DATA_KEYS = frozenset({
     "metadata",
     "save_mode",
 })
-SERVICE_DATA_STRONG_KEYS = frozenset({
-    "current_state",
-    "current_step",
-    "event",
-    "events",
-    "save_mode",
-})
 FALLBACK_SIGNATURE_RE = re.compile(
     r"^[ \t]*(?:служебный блок данных|заполненный current_state|json|data:)[ \t]*:?$",
     re.IGNORECASE,
@@ -186,7 +179,7 @@ def _repair_json_payload(raw_json: str) -> dict[str, Any] | None:
                 repaired_chars.append(ch)
 
         if open_count > close_count:
-            repaired_chars.append("}" * (open_count - close_count))
+            return None
 
         repaired_text = "".join(repaired_chars)
         repaired_text = re.sub(r",\s*([\}\]])", r"\1", repaired_text)
@@ -228,8 +221,16 @@ def _tag_kind(match: re.Match[str]) -> str:
     return "square" if match.group(0).startswith("[") else "xml"
 
 
-def _is_tag_candidate(text: str, match: re.Match[str], body: str = "") -> bool:
-    return _is_line_start_tag(text, match.start()) or _looks_like_json_payload(body)
+def _is_tag_candidate(
+    text: str,
+    match: re.Match[str],
+    body: str = "",
+    *,
+    has_close: bool,
+) -> bool:
+    return _looks_like_json_payload(body) or (
+        has_close and _is_line_start_tag(text, match.start())
+    )
 
 
 def _fence_start(text: str, position: int) -> int:
@@ -367,10 +368,6 @@ def _fallback_removal_start(text: str, object_start: int) -> tuple[int, bool]:
     return object_start, False
 
 
-def _has_service_signature(text: str, object_start: int) -> bool:
-    return _signature_line_start(text, object_start) is not None
-
-
 def _has_explicit_service_signature(text: str, object_start: int) -> bool:
     signature_start = _signature_line_start(text, object_start)
     if signature_start is None:
@@ -382,15 +379,24 @@ def _has_explicit_service_signature(text: str, object_start: int) -> bool:
     ))
 
 
-def _is_service_fallback_payload(payload: dict[str, Any], has_signature: bool) -> bool:
-    if SERVICE_DATA_STRONG_KEYS.intersection(payload):
+def _is_service_fallback_payload(payload: dict[str, Any], explicit_signature: bool) -> bool:
+    if explicit_signature:
+        return bool(SERVICE_DATA_KEYS.intersection(payload) or {
+            "ws",
+            "safety_flag",
+        }.intersection(payload))
+    if isinstance(payload.get("current_state"), dict):
         return True
-    return has_signature and bool({"metadata", "ws", "safety_flag"}.intersection(payload))
+    return (
+        isinstance(payload.get("current_step"), str)
+        and bool(payload.get("current_step", "").strip())
+        and bool({"event", "events", "metadata", "save_mode"}.intersection(payload))
+    )
 
 
 def _find_fallback_service_tail(text: str) -> tuple[int, int] | None:
     signature = re.search(
-        r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|json|data:)[ \t]*:?\s*(?:\r?\n|$)",
+        r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?\s*(?:\r?\n|$)",
         text,
     )
     if not signature:
@@ -425,7 +431,7 @@ def _extract_tagged_data(
         kind = _tag_kind(match)
         close = _find_tag_close(raw_text, match.end(), kind)
         body = raw_text[match.end():close.start()] if close else raw_text[match.end():]
-        if not _is_tag_candidate(raw_text, match, body):
+        if not _is_tag_candidate(raw_text, match, body, has_close=close is not None):
             search_position = match.end()
             continue
         if close and not _looks_like_json_payload(body):
@@ -464,7 +470,13 @@ def _extract_tagged_data(
         visible_text = SELF_CLOSING_DATA_RE.sub("", visible_text)
 
     truncated = TRUNCATED_XML_OPEN_RE.search(visible_text)
-    if truncated and _is_line_start_tag(visible_text, truncated.start()):
+    if truncated and (
+        bool(re.search(r"\s+[^>\r\n]*$", truncated.group(0)))
+        or _is_line_start_tag(visible_text, truncated.start())
+    ) and (
+        _looks_like_json_payload(visible_text[truncated.end():])
+        or not visible_text[truncated.end():].strip()
+    ):
         start = _fence_start(visible_text, truncated.start())
         visible_text = visible_text[:start]
         invalid_count += 1
@@ -476,23 +488,33 @@ def _extract_fallback_data(
     visible_text: str,
 ) -> tuple[str, list[ServiceDataBlock], int, bool]:
     spans = _find_balanced_json_spans(visible_text)
-    for object_start, object_end in reversed(spans):
+    removals: list[tuple[int, int]] = []
+    blocks: list[ServiceDataBlock] = []
+    invalid_count = 0
+    for object_start, object_end in spans:
         start, fenced = _fallback_removal_start(visible_text, object_start)
-        has_signature = _has_service_signature(visible_text, object_start)
+        explicit_signature = _has_explicit_service_signature(visible_text, object_start)
         tail_is_allowed = _is_fallback_tail(visible_text, object_end, fenced=fenced)
-        if not tail_is_allowed and not _has_explicit_service_signature(visible_text, object_start):
+        if not tail_is_allowed and not explicit_signature:
             continue
         candidate = visible_text[object_start:object_end]
         try:
             payload = json.loads(candidate)
         except (TypeError, json.JSONDecodeError):
+            if explicit_signature:
+                end = _fence_end(visible_text, object_end) if fenced else object_end
+                removals.append((start, end))
+                invalid_count += 1
             continue
-        if not isinstance(payload, dict) or not _is_service_fallback_payload(payload, has_signature):
+        if not isinstance(payload, dict) or not _is_service_fallback_payload(payload, explicit_signature):
             continue
         end = _fence_end(visible_text, object_end) if fenced else object_end
-        block = _normalize_service_payload(payload, candidate, xml_syntax=True)
-        cleaned = _normalize_visible_text(_remove_spans(visible_text, [(start, end)]))
-        return cleaned, [block], 0, True
+        blocks.append(_normalize_service_payload(payload, candidate, xml_syntax=True))
+        removals.append((start, end))
+
+    if removals:
+        cleaned = _normalize_visible_text(_remove_spans(visible_text, removals))
+        return cleaned, blocks, invalid_count, True
 
     tail = _find_fallback_service_tail(visible_text)
     if tail:
@@ -508,12 +530,11 @@ def extract_service_data_details(text: str | None) -> ServiceDataExtraction:
     if blocks or invalid_count:
         classification = "tags" if blocks and not invalid_count else "parse_error"
 
-    if not invalid_count:
-        visible_text, fallback_blocks, fallback_invalid, used_fallback = _extract_fallback_data(visible_text)
-        if used_fallback:
-            blocks.extend(fallback_blocks)
-            invalid_count += fallback_invalid
-            classification = "fallback" if not invalid_count else "parse_error"
+    visible_text, fallback_blocks, fallback_invalid, used_fallback = _extract_fallback_data(visible_text)
+    if used_fallback:
+        blocks.extend(fallback_blocks)
+        invalid_count += fallback_invalid
+        classification = "fallback" if not invalid_count else "parse_error"
 
     return ServiceDataExtraction(
         visible_text=_normalize_visible_text(visible_text),
