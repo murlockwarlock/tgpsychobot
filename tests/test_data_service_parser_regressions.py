@@ -415,3 +415,46 @@ def test_quote_in_visible_prose_does_not_hide_valid_fallback_json():
     assert extraction.blocks[0].current_state == {"current_step": "done"}
     assert extraction.blocks[0].events == ["DONE"]
     assert extraction.invalid_count == 0
+
+
+def test_overlapping_fallback_removals_hide_all_same_line_service_objects():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        '{"metadata":{"first":1}} {"metadata":{"private":"secret"}}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert [block.metadata for block in extraction.blocks] == [
+        {"first": 1},
+        {"private": "secret"},
+    ]
+    assert "secret" not in extraction.visible_text
+    assert extraction.invalid_count == 0
+
+
+def test_invalid_bracketed_prose_does_not_shield_tagged_service_block():
+    raw = 'Ответ [не JSON "\n<DATA>{"metadata":{"private":"secret"}}</DATA>\n"]'
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.blocks[0].metadata == {"private": "secret"}
+    assert "secret" not in extraction.visible_text
+    assert extraction.invalid_count == 0
+
+
+def test_unmatched_prose_bracket_does_not_shield_fallback_service_block():
+    raw = (
+        "Оцените тревогу в диапазоне [0, 10).\n"
+        "Служебный блок данных:\n"
+        '{"current_state":{"current_step":"done"},"event":"DONE"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Оцените тревогу в диапазоне [0, 10)."
+    assert extraction.blocks[0].current_state == {"current_step": "done"}
+    assert extraction.blocks[0].events == ["DONE"]
+    assert extraction.invalid_count == 0

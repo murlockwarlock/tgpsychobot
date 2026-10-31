@@ -285,9 +285,13 @@ def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
         return text
     result: list[str] = []
     cursor = 0
+    merged: list[list[int]] = []
     for start, end in sorted(spans):
-        if start < cursor:
-            continue
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    for start, end in merged:
         result.append(text[cursor:start])
         cursor = end
     result.append(text[cursor:])
@@ -307,41 +311,55 @@ def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
 
 def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
-    stack: list[str] = []
-    root_start: int | None = None
-    in_string = False
-    escaped = False
-    pairs = {"}": "{", "]": "["}
-    for position, char in enumerate(text):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
+    position = 0
+    while position < len(text):
+        if text[position] != "{":
+            position += 1
             continue
-        if not stack:
+        stack = ["{"]
+        in_string = False
+        escaped = False
+        end: int | None = None
+        cursor = position + 1
+        while cursor < len(text):
+            char = text[cursor]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                cursor += 1
+                continue
+            if char == '"':
+                in_string = True
+                cursor += 1
+                continue
             if char in "{[":
-                root_start = position
                 stack.append(char)
+            elif char in "}]":
+                pairs = {"}": "{", "]": "["}
+                if not stack or stack[-1] != pairs[char]:
+                    break
+                stack.pop()
+                if not stack:
+                    end = cursor + 1
+                    break
+            cursor += 1
+        if end is None:
+            position += 1
             continue
-        if char == '"':
-            in_string = True
+        try:
+            payload = json.loads(text[position:end])
+        except (TypeError, json.JSONDecodeError):
+            position += 1
             continue
-        if char in "{[":
-            stack.append(char)
-            continue
-        if char not in "}]":
-            continue
-        if stack[-1] != pairs[char]:
-            stack.clear()
-            root_start = None
-            continue
-        stack.pop()
-        if not stack and root_start is not None:
-            spans.append((root_start, position + 1))
-            root_start = None
+        if isinstance(payload, dict):
+            spans.append((position, end))
+            position = end
+        else:
+            position += 1
     return spans
 
 
