@@ -730,6 +730,35 @@ def test_decimal_and_semicolon_intervals_do_not_shield_service_data(interval):
     assert extraction.invalid_count == 0
 
 
+def test_scientific_interval_does_not_shield_following_service_data():
+    raw = (
+        "[0, 1e3) — допустимый диапазон.\n"
+        '{"current_state":{"current_step":"done"},"event":"DONE"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "[0, 1e3) — допустимый диапазон."
+    assert extraction.blocks[0].current_state == {"current_step": "done"}
+    assert extraction.blocks[0].events == ["DONE"]
+    assert extraction.invalid_count == 0
+
+
+def test_unfenced_data_does_not_remove_following_code_fence():
+    raw = (
+        '<DATA>{"current_state":{"current_step":"done"},"event":"DONE"}</DATA>\n'
+        '```python\n'
+        'print("ok")\n'
+        '```'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == '```python\nprint("ok")\n```'
+    assert extraction.blocks[0].events == ["DONE"]
+    assert extraction.invalid_count == 0
+
+
 @pytest.mark.parametrize(
     ("opening", "closing"),
     [

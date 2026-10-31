@@ -213,7 +213,7 @@ def _is_line_start_tag(text: str, position: int) -> bool:
 def _is_prose_interval_start(text: str, position: int) -> bool:
     line_end = text.find("\n", position)
     line = text[position:] if line_end == -1 else text[position:line_end]
-    number = r"(?:[-+]?(?:\d+(?:\.\d+)?|\.\d+)|[-+]?∞)"
+    number = r"(?:[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|∞))"
     return bool(re.match(rf"\[\s*{number}\s*(?:,|;)\s*{number}\s*\)", line))
 
 
@@ -680,7 +680,7 @@ def _extract_tagged_data(
             break
 
         start = _fence_start(raw_text, match.start())
-        end = _fence_end(raw_text, close.end())
+        end = _fence_end(raw_text, close.end()) if start != match.start() else close.end()
         raw_json = body.strip()
         payload = _repair_json_payload(raw_json)
         if payload is None or not isinstance(payload, dict):
