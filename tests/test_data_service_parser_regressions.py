@@ -345,6 +345,69 @@ def test_malformed_untagged_service_json_removes_explicit_heading():
     assert extraction.classification == "parse_error"
 
 
+def test_untagged_malformed_payload_before_tagged_service_is_hidden():
+    raw = 'Ответ.\n{"metadata":{"private":"secret",}}\n<DATA>{"event":"valid"}</DATA>'
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert [block.events for block in extraction.blocks] == [["valid"]]
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
+def test_signed_json_fence_hides_malformed_tail_after_valid_payload():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```json\n"
+        '{"current_state":{"current_step":"good"}}\n'
+        "not json\n"
+        "```\n"
+        "Конец."
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ.\nКонец."
+    assert [block.current_state for block in extraction.blocks] == [{"current_step": "good"}]
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
+def test_malformed_user_json_example_before_service_payload_is_preserved():
+    raw = (
+        'Ответ. Пример JSON: {"metadata":{"name":"Alice",}}\n'
+        '{"current_state":{"current_step":"good"}}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert 'Пример JSON: {"metadata":{"name":"Alice",}}' in extraction.visible_text
+    assert extraction.blocks[0].current_state == {"current_step": "good"}
+    assert extraction.invalid_count == 0
+    assert extraction.classification == "fallback"
+
+
+def test_service_metadata_literal_inside_visible_python_is_preserved():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```python\n"
+        'print({"metadata": {"name": "Alice"}})\n'
+        '{"current_state":{"current_step":"ok"}}\n'
+        'print("after")\n'
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert 'print({"metadata": {"name": "Alice"}})' in extraction.visible_text
+    assert 'print("after")' in extraction.visible_text
+    assert [block.current_state for block in extraction.blocks] == [{"current_step": "ok"}]
+    assert extraction.invalid_count == 0
+
+
 def test_unrelated_empty_code_fence_is_preserved():
     raw = "Обычный ответ.\n```python\n```\nПродолжение."
 

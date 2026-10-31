@@ -352,6 +352,31 @@ def _fence_end(text: str, position: int) -> int:
     return closing_end
 
 
+def _fence_language(
+    text: str,
+    region: tuple[int, int, int | None, int | None],
+) -> str:
+    line = text[region[0]:region[1]].strip()
+    match = re.match(r"`{3,}([a-zA-Z0-9_-]+)?", line)
+    return (match.group(1) or "").lower() if match else ""
+
+
+def _is_fallback_object_candidate(
+    text: str,
+    object_start: int,
+    object_end: int,
+) -> bool:
+    context = _fence_context(text, object_start)
+    if context is None or _fence_language(text, context) in {"", "json"}:
+        return True
+    line_end = text.find("\n", object_end)
+    if line_end == -1:
+        line_end = len(text)
+    return not text[_line_start(text, object_start):object_start].strip() and not text[
+        object_end:line_end
+    ].strip()
+
+
 def _fence_prefix_is_service_only(
     text: str,
     position: int,
@@ -713,16 +738,23 @@ def _find_fallback_service_tail(
                 continue
             if text[signature.end():opening_start].strip():
                 continue
+            if _fence_language(text, region) not in {"", "json"}:
+                continue
             content_end = closing_start if closing_start is not None else len(text)
             content = masked_text[opening_end:content_end]
             if not content.strip():
                 continue
-            if any(
+            has_content_removal = any(
                 start < content_end and end > opening_end
                 for start, end in excluded_ranges
-            ):
-                continue
-            return signature.start(), closing_end if closing_end is not None else len(text)
+            )
+            if not has_content_removal:
+                return signature.start(), closing_end if closing_end is not None else len(text)
+            residual_start = opening_end
+            while residual_start < content_end and masked_text[residual_start].isspace():
+                residual_start += 1
+            if residual_start < content_end:
+                return residual_start, closing_end if closing_end is not None else len(text)
     return None
 
 
@@ -790,10 +822,23 @@ def _looks_like_malformed_service_payload(text: str) -> bool:
     ))
 
 
-def _find_invalid_fallback_spans(text: str) -> list[tuple[int, int]]:
+def _has_user_facing_json_example_marker(text: str, object_start: int) -> bool:
+    line_prefix = text[_line_start(text, object_start):object_start]
+    return bool(re.search(
+        r"(?i)(?:пример|example|json\s*:|json\s+для)",
+        line_prefix,
+    ))
+
+
+def _find_invalid_fallback_spans(
+    text: str,
+    additional_service_starts: tuple[int, ...] = (),
+) -> list[tuple[int, int]]:
     container_spans = _find_balanced_container_spans(text)
-    valid_service_starts: set[int] = set()
+    valid_service_starts: set[int] = set(additional_service_starts)
     for object_start, object_end in container_spans:
+        if not _is_fallback_object_candidate(text, object_start, object_end):
+            continue
         payload = _json_loads_dict_or_list(text[object_start:object_end])
         if not isinstance(payload, dict):
             continue
@@ -805,6 +850,8 @@ def _find_invalid_fallback_spans(text: str) -> list[tuple[int, int]]:
 
     invalid_spans: list[tuple[int, int]] = []
     for object_start, object_end in container_spans:
+        if not _is_fallback_object_candidate(text, object_start, object_end):
+            continue
         candidate = text[object_start:object_end]
         if not candidate.lstrip().startswith("{"):
             continue
@@ -827,6 +874,11 @@ def _find_invalid_fallback_spans(text: str) -> list[tuple[int, int]]:
                 has_later_service_payload
                 and re.search(r'"metadata"\s*:', candidate)
             )
+        ):
+            continue
+        if not explicit_signature and _has_user_facing_json_example_marker(
+            text,
+            object_start,
         ):
             continue
         invalid_spans.append((object_start, object_end))
@@ -944,8 +996,12 @@ def _extract_tagged_data(
 
 def _extract_fallback_data(
     visible_text: str,
+    additional_service_starts: tuple[int, ...] = (),
 ) -> tuple[str, list[tuple[int, ServiceDataBlock]], int, bool, list[tuple[int, int]]]:
-    invalid_spans = _find_invalid_fallback_spans(visible_text)
+    invalid_spans = _find_invalid_fallback_spans(
+        visible_text,
+        additional_service_starts,
+    )
     invalid_removals: list[tuple[int, int]] = []
     for object_start, object_end in invalid_spans:
         start, fenced = _fallback_removal_start(
@@ -960,6 +1016,8 @@ def _extract_fallback_data(
     located_blocks: list[tuple[int, ServiceDataBlock]] = []
     invalid_count = len(invalid_spans)
     for object_start, object_end in spans:
+        if not _is_fallback_object_candidate(visible_text, object_start, object_end):
+            continue
         if _has_unclosed_json_container(visible_text, object_start):
             continue
         start, fenced = _fallback_removal_start(
@@ -1018,7 +1076,10 @@ def extract_service_data_details(text: str | None) -> ServiceDataExtraction:
     if tagged_blocks or invalid_count:
         classification = "tags" if tagged_blocks and not invalid_count else "parse_error"
 
-    _, fallback_blocks, fallback_invalid, used_fallback, fallback_removals = _extract_fallback_data(masked_text)
+    _, fallback_blocks, fallback_invalid, used_fallback, fallback_removals = _extract_fallback_data(
+        masked_text,
+        tuple(position for position, _ in tagged_blocks),
+    )
     if used_fallback:
         invalid_count += fallback_invalid
         classification = "fallback" if not invalid_count else "parse_error"
