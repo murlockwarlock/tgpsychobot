@@ -253,6 +253,35 @@ def test_malformed_fallback_payload_after_valid_payload_is_hidden():
     assert "private" not in extraction.visible_text
 
 
+def test_malformed_untagged_service_json_is_hidden_at_response_tail():
+    raw = 'Ответ.\n{"current_state":{"current_step":"secret",}}'
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
+def test_malformed_fallback_payload_before_valid_payload_is_diagnosed():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```json\n"
+        '{"metadata":{"private":"secret",}}\n'
+        '{"current_state":{"current_step":"good"}}\n'
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert [block.current_state for block in extraction.blocks] == [{"current_step": "good"}]
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
 def test_unrelated_empty_code_fence_is_preserved():
     raw = "Обычный ответ.\n```python\n```\nПродолжение."
 
@@ -260,6 +289,37 @@ def test_unrelated_empty_code_fence_is_preserved():
 
     assert extraction.visible_text == raw
     assert extraction.blocks == []
+    assert extraction.invalid_count == 0
+
+
+def test_unrelated_empty_fence_after_data_is_preserved():
+    raw = 'Ответ.\n<DATA>{"metadata":{"x":1}}</DATA>\n```python\n```\nПродолжение.'
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == 'Ответ.\n\n```python\n```\nПродолжение.'
+    assert extraction.blocks[0].metadata == {"x": 1}
+    assert extraction.invalid_count == 0
+
+
+def test_fallback_data_does_not_remove_visible_code_inside_signed_fence():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```python\n"
+        'print("before")\n'
+        '{"current_state":{"current_step":"ok"}}\n'
+        'print("after")\n'
+        "```\n"
+        "Конец."
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert 'print("before")' in extraction.visible_text
+    assert 'print("after")' in extraction.visible_text
+    assert "```python" in extraction.visible_text
+    assert extraction.blocks[0].current_state == {"current_step": "ok"}
     assert extraction.invalid_count == 0
 
 

@@ -430,16 +430,27 @@ def _empty_fence_removals(
     empty_fences: list[tuple[int, int]] = []
     for opening_start, opening_end, closing_start, closing_end in _fence_regions(text):
         content_end = closing_start if closing_start is not None else len(text)
+        if not any(
+            start < content_end and end > opening_end
+            for start, end in removals
+        ):
+            continue
         if masked_text[opening_end:content_end].strip():
             continue
+        cleanup_start = opening_start
+        region = (opening_start, opening_end, closing_start, closing_end)
+        if _fence_has_service_signature(text, region):
+            signature_start = _signature_line_start(text, opening_end)
+            if signature_start is not None:
+                cleanup_start = signature_start
         empty_fences.append((
-            opening_start,
+            cleanup_start,
             closing_end if closing_end is not None else len(text),
         ))
     return empty_fences
 
 
-def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
+def _find_balanced_container_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     position = 0
     while position < len(text):
@@ -480,17 +491,25 @@ def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
         if end is None:
             position += 1
             continue
-        try:
-            payload = json.loads(text[position:end])
-        except (TypeError, json.JSONDecodeError):
-            position += 1
-            continue
-        if isinstance(payload, (dict, list)):
-            spans.append((position, end))
-            position = end
-        else:
-            position += 1
+        spans.append((position, end))
+        position = end
     return spans
+
+
+def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
+    return [
+        (start, end)
+        for start, end in _find_balanced_container_spans(text)
+        if isinstance(_json_loads_dict_or_list(text[start:end]), (dict, list))
+    ]
+
+
+def _json_loads_dict_or_list(text: str) -> dict[str, Any] | list[Any] | None:
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, (dict, list)) else None
 
 
 def _is_inside_json_string(text: str, position: int) -> bool:
@@ -542,11 +561,19 @@ def _signature_line_start(text: str, position: int) -> int | None:
     return found
 
 
-def _fallback_removal_start(text: str, object_start: int) -> tuple[int, bool]:
-    fence_start = _fence_start(text, object_start)
-    if fence_start != object_start:
-        signature_start = _signature_line_start(text, fence_start)
-        return signature_start if signature_start is not None else fence_start, True
+def _fallback_removal_start(
+    text: str,
+    object_start: int,
+    removals: list[tuple[int, int]] | None = None,
+) -> tuple[int, bool]:
+    context = _fence_context(text, object_start)
+    if context is not None:
+        prefix_service_only = _fence_prefix_is_service_only(
+            text,
+            object_start,
+            removals or [],
+        )
+        return object_start, prefix_service_only
     signature_start = _signature_line_start(text, object_start)
     if signature_start is not None:
         return signature_start, False
@@ -674,6 +701,7 @@ def _find_fallback_service_tail(
     excluded_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[int, int] | None:
     excluded_ranges = excluded_ranges or []
+    masked_text = _mask_spans(text, excluded_ranges)
     signatures = re.finditer(
         EXPLICIT_SERVICE_SIGNATURE_RE,
         text,
@@ -681,7 +709,7 @@ def _find_fallback_service_tail(
     for signature in signatures:
         if any(start <= signature.start() < end for start, end in excluded_ranges):
             continue
-        if _looks_like_json_payload(text[signature.end():]):
+        if re.match(r"\s*[\{\[]", masked_text[signature.end():]):
             return signature.start(), len(text)
     return None
 
@@ -741,6 +769,34 @@ def _find_unbalanced_service_tail(
         ):
             return start, len(text)
     return None
+
+
+def _looks_like_malformed_service_payload(text: str) -> bool:
+    return bool(re.search(
+        r'"(?:current_state|current_step|event|events|save_mode)"\s*:',
+        text,
+    ))
+
+
+def _find_invalid_fallback_spans(text: str) -> list[tuple[int, int]]:
+    invalid_spans: list[tuple[int, int]] = []
+    for object_start, object_end in _find_balanced_container_spans(text):
+        candidate = text[object_start:object_end]
+        if not candidate.lstrip().startswith("{"):
+            continue
+        if _json_loads_dict_or_list(candidate) is not None:
+            continue
+        explicit_signature = _has_explicit_service_signature(text, object_start)
+        if not explicit_signature and not _is_fallback_tail(
+            text,
+            object_end,
+            fenced=_fence_context(text, object_start) is not None,
+        ):
+            continue
+        if not explicit_signature and not _looks_like_malformed_service_payload(candidate):
+            continue
+        invalid_spans.append((object_start, object_end))
+    return invalid_spans
 
 
 def _normalize_visible_text(text: str) -> str:
@@ -855,14 +911,19 @@ def _extract_tagged_data(
 def _extract_fallback_data(
     visible_text: str,
 ) -> tuple[str, list[tuple[int, ServiceDataBlock]], int, bool, list[tuple[int, int]]]:
-    spans = _find_balanced_json_spans(visible_text)
-    removals: list[tuple[int, int]] = []
+    invalid_spans = _find_invalid_fallback_spans(visible_text)
+    spans = _find_balanced_json_spans(_mask_spans(visible_text, invalid_spans))
+    removals: list[tuple[int, int]] = list(invalid_spans)
     located_blocks: list[tuple[int, ServiceDataBlock]] = []
-    invalid_count = 0
+    invalid_count = len(invalid_spans)
     for object_start, object_end in spans:
         if _has_unclosed_json_container(visible_text, object_start):
             continue
-        start, fenced = _fallback_removal_start(visible_text, object_start)
+        start, fenced = _fallback_removal_start(
+            visible_text,
+            object_start,
+            removals,
+        )
         explicit_signature = _has_explicit_service_signature(visible_text, object_start)
         tail_is_allowed = _is_fallback_tail(visible_text, object_end, fenced=fenced)
         if not tail_is_allowed and not explicit_signature:
