@@ -16,6 +16,7 @@ from mailing_utils import MAILING_AUDIENCE_LABELS, get_mailing_status_label, is_
 from memory_mode import memory_mode_label
 from time_helpers import format_msk, to_msk
 from provider_models import (
+    build_reasoning_callback_token,
     build_telegram_model_callback_data,
     canonical_provider_name,
     DEEPGRAM_DEFAULT_MODEL,
@@ -23,7 +24,9 @@ from provider_models import (
     PROVIDER_PERPLEXITY,
     PERPLEXITY_MODES,
     PERPLEXITY_MODE_INFO,
+    PROVIDER_OPENROUTER,
     get_perplexity_model_label,
+    reasoning_callback_modes,
 )
 from max_messenger_bot.identity import is_max_user_id, max_client_list_label
 from translation_service import (
@@ -665,6 +668,7 @@ def perplexity_models_keyboard(
 def provider_model_settings_keyboard(
     provider: str,
     *,
+    model: str | None = None,
     show_reasoning: bool,
     show_temperature: bool,
     transcription_only: bool = False,
@@ -679,7 +683,10 @@ def provider_model_settings_keyboard(
     if not transcription_only:
         builder.button(text="📏 Max tokens", callback_data=f"model_setting_max_tokens_{provider}")
         if show_reasoning:
-            builder.button(text="🧠 Reasoning", callback_data=f"model_setting_reasoning_{provider}")
+            reasoning_callback = f"model_setting_reasoning_{provider}"
+            if model and canonical_provider_name(provider) == PROVIDER_OPENROUTER:
+                reasoning_callback = f"model_setting_reasoning_{build_reasoning_callback_token(provider, model, 'auto')}"
+            builder.button(text="🧠 Reasoning", callback_data=reasoning_callback)
         if show_temperature:
             builder.button(text="🌡 Temperature", callback_data=f"model_setting_temperature_{provider}")
         if show_proxy:
@@ -698,11 +705,30 @@ def model_settings_keyboard(*, show_reasoning: bool, show_temperature: bool) -> 
     )
 
 
-def model_reasoning_keyboard(provider: str = "Deepseek") -> InlineKeyboardMarkup:
+def model_reasoning_keyboard(
+    provider: str = "Deepseek",
+    model: str | None = None,
+    modes: tuple[str, ...] | None = None,
+    back_callback: str | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for value, label in (("auto", "Авто"), ("none", "Выкл"), ("low", "Low"), ("high", "High"), ("max", "Max")):
-        builder.button(text=label, callback_data=f"model_reasoning_{provider}_{value}")
-    builder.button(text="⬅️ Назад", callback_data=f"view_models_{provider}")
+    values = tuple(modes) if modes is not None else reasoning_callback_modes(provider, model)
+    labels = {
+        "auto": "Авто",
+        "none": "Выкл",
+        "enabled": "Вкл",
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High",
+        "max": "Max",
+    }
+    for value in values:
+        if model and canonical_provider_name(provider) == PROVIDER_OPENROUTER:
+            callback_data = f"model_reasoning_{build_reasoning_callback_token(provider, model, value)}"
+        else:
+            callback_data = f"model_reasoning_{provider}_{value}"
+        builder.button(text=labels.get(value, value), callback_data=callback_data)
+    builder.button(text="⬅️ Назад", callback_data=back_callback or f"view_models_{provider}")
     builder.adjust(1)
     return builder.as_markup()
 

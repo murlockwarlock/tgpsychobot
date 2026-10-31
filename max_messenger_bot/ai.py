@@ -162,6 +162,8 @@ def _wrap_provider_adapter_error(exc: ProviderAdapterError) -> AIServiceError:
         error.proxy_used = exc.proxy_used
     if getattr(exc, "proxy_source", None) is not None:
         error.proxy_source = exc.proxy_source
+    if getattr(exc, "finish_reason", None) is not None:
+        error.finish_reason = exc.finish_reason
     return error
 
 
@@ -1458,6 +1460,7 @@ async def _dispatch_provider(
                     selected_model,
                     temperature=temperature,
                     max_output_tokens=output_tokens,
+                    reasoning_effort=reasoning_effort,
                     timeout=timeout,
                     request_capture=request_capture,
                     activity_tracker=activity_tracker,
@@ -1990,6 +1993,7 @@ async def get_ai_response(
                                 fb_model,
                                 temperature=fb_temperature,
                                 max_output_tokens=fb_tokens,
+                                reasoning_effort=fb_reasoning_effort,
                                 timeout=fb_timeout,
                                 request_capture=fallback_capture,
                                 activity_tracker=activity_tracker,

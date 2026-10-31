@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 import ai_integration
 import keyboards
-from database import AIConfig, Base, Topic, User
+from database import AIConfig, AIModelSettings, Base, Topic, User
 from max_messenger_bot import ai as max_ai
 from provider_models import (
     DEEPSEEK_CHAT_MAX_TOKENS,
@@ -238,6 +238,48 @@ async def test_openrouter_uses_shared_budget_without_thinking_control(generation
 
     assert call.await_args.kwargs["max_output_tokens"] == 7000
     assert "thinking_enabled" not in call.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_openrouter_fallback_resolves_reasoning_by_actual_model(generation_db):
+    sessions = generation_db
+    async with sessions() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "OpenRouter"
+        config.openrouter_api_key = "openrouter-key"
+        config.openrouter_model = "qwen/qwen3-vl-235b-a22b-instruct"
+        config.allow_fallback = True
+        config.fallback_provider = "OpenRouter"
+        config.fallback_model = "qwen/qwen3.8-27b"
+        session.add_all([
+            AIModelSettings(
+                provider="OpenRouter",
+                model="qwen/qwen3-vl-235b-a22b-instruct",
+                channel="chat",
+                reasoning_effort="max",
+            ),
+            AIModelSettings(
+                provider="OpenRouter",
+                model="qwen/qwen3.8-27b",
+                channel="chat",
+                reasoning_effort="max",
+            ),
+        ])
+        await session.commit()
+
+    calls = []
+
+    async def openrouter_call(*args, **kwargs):
+        calls.append(kwargs.copy())
+        if len(calls) == 1:
+            raise ai_integration.AIServiceError("primary failed")
+        return "fallback response"
+
+    with patch("ai_integration.call_openrouter", side_effect=openrouter_call):
+        assert await ai_integration.generate_response(101, "Проверка fallback") == "fallback response"
+
+    assert calls[0]["reasoning_effort"] is None
+    assert calls[1]["reasoning_effort"] == "max"
 
 
 @pytest.mark.asyncio

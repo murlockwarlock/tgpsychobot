@@ -1096,7 +1096,7 @@ async def test_admin_dispatcher_crawls_general_languages_and_ai_sections(factory
     assert "model_setting_reasoning_Deepseek" in card_callbacks
     assert "model_setting_api_key_Deepseek" in card_callbacks
     assert "admin_ai_deepseek_proxy" in card_callbacks
-    await screen("model_setting_reasoning_Deepseek", "Reasoning DeepSeek", 416)
+    await screen("model_setting_reasoning_Deepseek", "Reasoning", 416)
     await screen("model_reasoning_Deepseek_max", "Параметры модели", 417)
     await screen("model_setting_max_tokens_Deepseek", "Max tokens", 418)
     prompt = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
@@ -1114,6 +1114,136 @@ async def test_admin_dispatcher_crawls_general_languages_and_ai_sections(factory
     await screen("admin_ai_keys", "Провайдеры и модели", 420)
     await screen("admin_ai_settings", "Настройки ИИ", 421)
     await screen("admin_panel", "Добро пожаловать в админ-панель", 422)
+
+
+@pytest.mark.asyncio
+async def test_telegram_openrouter_qwen_reasoning_is_a_real_model_scoped_journey(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+    from database import AIModelSettings
+    from provider_models import resolve_reasoning_callback_token, resolve_telegram_model_callback
+
+    for module in (handlers, admin_content_authoring, automation_admin, keyboards):
+        monkeypatch.setattr(module, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            AIConfig(id=1, provider="OpenRouter", openrouter_model="qwen/qwen3.8-27b"),
+            SubscriptionConfig(id=1),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    message = _admin_message(bot, user_id=11, text="/admin")
+    update_id = 5000
+
+    async def press(current_message, callback_data):
+        nonlocal update_id
+        visible = {
+            button.callback_data
+            for button in _ai_callback_buttons(current_message.reply_markup)
+        }
+        assert callback_data in visible
+        session.calls.clear()
+        update_id += 1
+        await _feed_callback(admin_dispatcher, bot, current_message, callback_data, update_id)
+        rendered = next(
+            method
+            for method in reversed(session.calls)
+            if isinstance(method, (EditMessageText, SendMessage))
+        )
+        _classify_telegram_ai_markup(rendered.reply_markup, {})
+        return message.model_copy(update={
+            "text": rendered.text,
+            "reply_markup": rendered.reply_markup,
+        })
+
+    await admin_dispatcher.feed_update(bot, Update(update_id=update_id, message=message))
+    initial = next(
+        method
+        for method in reversed(session.calls)
+        if isinstance(method, (EditMessageText, SendMessage))
+    )
+    message = message.model_copy(update={
+        "text": initial.text,
+        "reply_markup": initial.reply_markup,
+    })
+    message = await press(message, "admin_ai_settings")
+    message = await press(message, "admin_ai_keys")
+    message = await press(message, "view_models_OpenRouter")
+    message = await press(message, "view_provider_models_OpenRouter")
+
+    qwen_button = next(
+        button
+        for button in _ai_callback_buttons(message.reply_markup)
+        if "Qwen3.8 27B" in button.text
+    )
+    assert len(qwen_button.callback_data.encode()) <= 64
+    resolved_model = resolve_telegram_model_callback(qwen_button.callback_data)
+    assert resolved_model == ("OpenRouter", "chat", "qwen/qwen3.8-27b")
+    message = await press(message, qwen_button.callback_data)
+    assert "Модель: <code>qwen/qwen3.8-27b</code>" in message.text
+
+    reasoning_entry = next(
+        button
+        for button in _ai_callback_buttons(message.reply_markup)
+        if button.callback_data.startswith("model_setting_reasoning_r_")
+    )
+    message = await press(message, reasoning_entry.callback_data)
+    assert "🧠 <b>Reasoning</b>" in message.text
+    mode_buttons = _ai_callback_buttons(message.reply_markup)
+    assert [button.text for button in mode_buttons[:-1]] == ["Авто", "Выкл", "Low", "Medium", "Max"]
+    assert all(len(button.callback_data.encode()) <= 64 for button in mode_buttons)
+    max_button = next(button for button in mode_buttons if button.text == "Max")
+    resolved_reasoning = resolve_reasoning_callback_token(max_button.callback_data.replace("model_reasoning_", "", 1))
+    assert resolved_reasoning == ("OpenRouter", "qwen/qwen3.8-27b", "max")
+    parent = mode_buttons[-1].callback_data
+    assert parent == "view_models_OpenRouter"
+    message = await press(message, max_button.callback_data)
+    assert "Reasoning: <b>Max</b>" in message.text
+    async with factory() as session_check:
+        stored = await session_check.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "OpenRouter",
+                AIModelSettings.model == "qwen/qwen3.8-27b",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        assert stored.reasoning_effort == "max"
+
+    message = await press(message, reasoning_entry.callback_data)
+    assert "Reasoning" in message.text
+    message = await press(message, next(button.callback_data for button in _ai_callback_buttons(message.reply_markup) if button.text == "⬅️ Назад"))
+    assert "Модель: <code>qwen/qwen3.8-27b</code>" in message.text
+
+    message = await press(message, "view_provider_models_OpenRouter")
+    qwen_vl_button = next(
+        button
+        for button in _ai_callback_buttons(message.reply_markup)
+        if "Qwen3 VL 235B Instruct" in button.text
+    )
+    message = await press(message, qwen_vl_button.callback_data)
+    assert "Модель: <code>qwen/qwen3-vl-235b-a22b-instruct</code>" in message.text
+    assert not any(
+        button.callback_data.startswith("model_setting_reasoning")
+        for button in _ai_callback_buttons(message.reply_markup)
+    )
+    assert "Reasoning:" not in message.text
+
+    message = await press(message, "view_provider_models_OpenRouter")
+    qwen_back_button = next(
+        button
+        for button in _ai_callback_buttons(message.reply_markup)
+        if "Qwen3.8 27B" in button.text
+    )
+    message = await press(message, qwen_back_button.callback_data)
+    assert "Reasoning: <b>Max</b>" in message.text
 
 
 @pytest.mark.asyncio
@@ -1406,11 +1536,11 @@ async def test_telegram_ai_visible_button_contracts_use_complete_dispatcher_jour
             await press(proxy_button.callback_data, "Proxy:")
             async with factory() as verify:
                 assert (await verify.get(AIConfig, 1)).use_proxy is proxy_before
-            detail = await press("model_setting_reasoning_Deepseek", "Reasoning DeepSeek")
+            detail = await press("model_setting_reasoning_Deepseek", "Reasoning")
             reasoning_back = next(button.callback_data for button in _ai_callback_buttons(detail.reply_markup) if button.text == "⬅️ Назад")
             detail = await press(reasoning_back, "Параметры модели")
             nested_back_contracts["deepseek_reasoning"][0] += 1
-            detail = await press("model_setting_reasoning_Deepseek", "Reasoning DeepSeek")
+            detail = await press("model_setting_reasoning_Deepseek", "Reasoning")
             reasoning_max = next(button.callback_data for button in _ai_callback_buttons(detail.reply_markup) if button.callback_data == "model_reasoning_Deepseek_max")
             detail = await press(reasoning_max, "Параметры модели")
             assert "Reasoning: <b>Max</b>" in detail.text

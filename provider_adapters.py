@@ -22,6 +22,11 @@ from provider_models import (
     DEEPGRAM_DEFAULT_MODEL,
     DEEPGRAM_TRANSCRIPTION_MODELS,
     OPENROUTER_MODEL_SPECS,
+    openrouter_endpoint_is_active,
+    openrouter_endpoint_supports_contract,
+    openrouter_reasoning_payload,
+    openrouter_request_contracts,
+    openrouter_required_parameters,
     PERPLEXITY_MODES,
     PERPLEXITY_STATIC_DIRECT_MODELS,
     is_perplexity_preset,
@@ -114,6 +119,8 @@ class ProviderAdapterError(RuntimeError):
         proxy_used: bool | None = None,
         proxy_source: str | None = None,
         failure=None,
+        finish_reason: str | None = None,
+        provider_response_payload: str | None = None,
     ):
         super().__init__(message)
         self.http_status = status
@@ -123,6 +130,8 @@ class ProviderAdapterError(RuntimeError):
         self.request_id = request_id
         self.proxy_used = proxy_used
         self.proxy_source = proxy_source
+        self.finish_reason = finish_reason
+        self.provider_response_payload = provider_response_payload
         if failure is not None:
             from provider_failures import attach_failure
             attach_failure(self, failure)
@@ -195,10 +204,36 @@ def _extract_message_text(content: Any) -> str:
         parts = [
             str(item.get("text", ""))
             for item in content
-            if isinstance(item, dict) and isinstance(item.get("text"), str)
+            if isinstance(item, dict)
+            and item.get("type") not in {"reasoning", "reasoning_text", "reasoning_details"}
+            and not {"reasoning", "reasoning_details", "thinking"}.intersection(item)
+            and isinstance(item.get("text"), str)
         ]
         return "\n".join(part for part in parts if part).strip()
     return ""
+
+
+def _openrouter_usage_summary(usage: Any) -> dict[str, Any] | None:
+    if not isinstance(usage, dict):
+        return None
+    summary: dict[str, Any] = {}
+    for key, value in usage.items():
+        normalized_key = str(key).casefold()
+        if normalized_key in {
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "thinking",
+            "thinking_content",
+        }:
+            continue
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            summary[str(key)] = value
+        elif isinstance(value, dict):
+            nested = _openrouter_usage_summary(value)
+            if nested:
+                summary[str(key)] = nested
+    return summary or None
 
 
 def build_openrouter_payload(
@@ -207,18 +242,44 @@ def build_openrouter_payload(
     *,
     temperature: float | None = None,
     max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     spec = OPENROUTER_MODEL_SPECS.get(model)
     if spec is None or not spec.text:
         raise ProviderAdapterError("Недоступная модель OpenRouter", category="invalid_model")
+    mode = str(reasoning_effort or "auto").strip().lower()
+    reasoning_spec = spec.reasoning
+    effective_temperature = temperature
+    if (
+        mode != "auto"
+        and reasoning_spec is not None
+        and not reasoning_spec.temperature_supported_with_reasoning
+    ):
+        effective_temperature = None
     payload: dict[str, Any] = {
         "model": model,
         "messages": build_openai_chat_messages(layout),
     }
     if max_output_tokens is not None:
         payload["max_tokens"] = max_output_tokens
-    if temperature is not None:
-        payload["temperature"] = temperature
+    if effective_temperature is not None:
+        payload["temperature"] = effective_temperature
+    reasoning_payload = openrouter_reasoning_payload(model, mode)
+    if reasoning_payload is not None:
+        payload["reasoning"] = reasoning_payload
+        contract = openrouter_required_parameters(
+            model,
+            mode,
+            temperature_present=effective_temperature is not None,
+            vision=any(
+                isinstance(item, dict) and item.get("role") == "user" and isinstance(item.get("content"), list)
+                and any(isinstance(part, dict) and part.get("type") == "image_url" for part in item["content"])
+                for item in payload["messages"]
+            ),
+            max_output_tokens_present=max_output_tokens is not None,
+        )
+        if contract.requires_parameter_routing:
+            payload["provider"] = {"require_parameters": True}
     return payload
 
 
@@ -1072,6 +1133,7 @@ async def call_openrouter(
     *,
     temperature: float | None = None,
     max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     timeout: float = 60.0,
     operation: str = "chat",
     request_capture: dict | None = None,
@@ -1080,7 +1142,13 @@ async def call_openrouter(
 ) -> str:
     if not api_key:
         raise ProviderAdapterError("API ключ OpenRouter не задан", category="auth")
-    payload = build_openrouter_payload(layout, model, temperature=temperature, max_output_tokens=max_output_tokens)
+    payload = build_openrouter_payload(
+        layout,
+        model,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
+    )
     data = await _post_json(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -1097,11 +1165,29 @@ async def call_openrouter(
         raise ProviderAdapterError("OpenRouter вернул пустой ответ", category="empty_response")
     message = choices[0].get("message") if isinstance(choices[0], dict) else None
     content = message.get("content") if isinstance(message, dict) else None
+    finish_reason = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
+    usage = _openrouter_usage_summary(data.get("usage"))
+    if request_capture is not None:
+        request_capture["finish_reason"] = finish_reason
+        if usage is not None:
+            request_capture["usage"] = usage
     text = _extract_message_text(content)
     if not text:
+        if finish_reason == "length":
+            safe_response = json.dumps(
+                {"finish_reason": finish_reason, "usage": usage},
+                ensure_ascii=False,
+            )
+            if request_capture is not None:
+                request_capture["classification"] = "output_budget_exhausted"
+                request_capture["provider_response_payload"] = safe_response
+            raise ProviderAdapterError(
+                "OpenRouter исчерпал бюджет output tokens",
+                category="output_budget_exhausted",
+                finish_reason=finish_reason,
+                provider_response_payload=safe_response,
+            )
         raise ProviderAdapterError("OpenRouter вернул пустой текст", category="empty_response")
-    if request_capture is not None and isinstance(data.get("usage"), dict):
-        request_capture["usage"] = data["usage"]
     return text
 
 
@@ -1453,38 +1539,65 @@ async def verify_openrouter_catalog(
         client, _ = build_provider_http_client("OpenRouter", timeout=timeout, transport=transport)
         async with client:
             response = await client.get("https://openrouter.ai/api/v1/models")
-        try:
-            payload = response.json()
-        except (TypeError, ValueError):
-            payload = {}
-        failure = parse_provider_failure(
-            "OpenRouter",
-            "catalog",
-            response.status_code,
-            payload,
-            getattr(response, "headers", None) or {},
-        )
-        if failure is None and response.status_code == 200 and (
-            not isinstance(payload, dict) or not isinstance(payload.get("data"), list)
-        ):
+            try:
+                payload = response.json()
+            except (TypeError, ValueError):
+                payload = {}
             failure = parse_provider_failure(
                 "OpenRouter",
                 "catalog",
                 response.status_code,
-                {"error": {"code": "invalid_response", "message": "catalog response is not an object"}},
+                payload,
                 getattr(response, "headers", None) or {},
             )
-        if failure is not None:
-            if request_capture is not None:
-                request_capture.update(failure.diagnostics())
-            raise ProviderAdapterError(
-                f"OpenRouter catalog unavailable: {failure.provider_error_message or failure.detail_code}",
-                status=response.status_code,
-                category=failure.classification,
-                provider_error_message=failure.provider_error_message or safe_message(payload),
-                request_id=failure.request_id,
-                failure=failure,
-            )
+            if failure is None and response.status_code == 200 and (
+                not isinstance(payload, dict) or not isinstance(payload.get("data"), list)
+            ):
+                failure = parse_provider_failure(
+                    "OpenRouter",
+                    "catalog",
+                    response.status_code,
+                    {"error": {"code": "invalid_response", "message": "catalog response is not an object"}},
+                    getattr(response, "headers", None) or {},
+                )
+            if failure is not None:
+                if request_capture is not None:
+                    request_capture.update(failure.diagnostics())
+                raise ProviderAdapterError(
+                    f"OpenRouter catalog unavailable: {failure.provider_error_message or failure.detail_code}",
+                    status=response.status_code,
+                    category=failure.classification,
+                    provider_error_message=failure.provider_error_message or safe_message(payload),
+                    request_id=failure.request_id,
+                    failure=failure,
+                )
+
+            live = {
+                str(item.get("id")): item
+                for item in payload.get("data", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            endpoint_payloads: dict[str, dict[str, Any]] = {}
+            for model_id in OPENROUTER_MODEL_SPECS:
+                if model_id not in live:
+                    continue
+                endpoint_url = f"https://openrouter.ai/api/v1/models/{model_id}/endpoints"
+                try:
+                    endpoint_response = await client.get(endpoint_url)
+                    try:
+                        endpoint_body = endpoint_response.json()
+                    except (TypeError, ValueError):
+                        endpoint_body = {}
+                    endpoint_payloads[model_id] = {
+                        "status": endpoint_response.status_code,
+                        "body": endpoint_body,
+                    }
+                except Exception as exc:
+                    endpoint_payloads[model_id] = {
+                        "status": None,
+                        "body": {},
+                        "error": str(exc),
+                    }
     except ProviderAdapterError:
         raise
     except Exception as exc:
@@ -1500,7 +1613,6 @@ async def verify_openrouter_catalog(
             failure=failure,
         ) from exc
 
-    live = {str(item.get("id")): item for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
     result: dict[str, Any] = {}
     for model_id, spec in OPENROUTER_MODEL_SPECS.items():
         item = live.get(model_id)
@@ -1510,10 +1622,13 @@ async def verify_openrouter_catalog(
         architecture = item.get("architecture") or {}
         modalities = set(architecture.get("input_modalities") or [])
         live_context = item.get("context_length")
-        live_output = (item.get("top_provider") or {}).get("max_completion_tokens")
+        live_top_provider_output = (item.get("top_provider") or {}).get("max_completion_tokens")
         live_status = str(item.get("status") or "active")
         expiration_date = item.get("expiration_date")
-        mismatches = []
+        supported_parameters = tuple(sorted(str(value) for value in item.get("supported_parameters") or ()))
+        live_reasoning = item.get("reasoning") if isinstance(item.get("reasoning"), dict) else None
+        live_reasoning_present = live_reasoning is not None or "reasoning" in supported_parameters
+        mismatches: list[str] = []
         if spec.text != ("text" in modalities):
             mismatches.append("text")
         if ("image" in modalities) != spec.vision:
@@ -1522,8 +1637,6 @@ async def verify_openrouter_catalog(
             mismatches.append("audio_input")
         if live_context != spec.context_limit:
             mismatches.append("context_limit")
-        if live_output != spec.output_limit:
-            mismatches.append("output_limit")
         if live_status.lower() in {"deprecated", "decommissioned", "disabled"}:
             mismatches.append("status")
         if expiration_date:
@@ -1532,14 +1645,112 @@ async def verify_openrouter_catalog(
                     mismatches.append("expiration_date")
             except ValueError:
                 mismatches.append("expiration_date")
+
+        endpoint_info = endpoint_payloads.get(model_id) or {}
+        endpoint_body = endpoint_info.get("body") if isinstance(endpoint_info.get("body"), dict) else {}
+        endpoint_data = endpoint_body.get("data")
+        if isinstance(endpoint_data, dict):
+            endpoints = endpoint_data.get("endpoints") or []
+        elif isinstance(endpoint_data, list):
+            endpoints = endpoint_data
+        else:
+            endpoints = endpoint_body.get("endpoints") or []
+        endpoints = [endpoint for endpoint in endpoints if isinstance(endpoint, dict)]
+        active_endpoints = [endpoint for endpoint in endpoints if openrouter_endpoint_is_active(endpoint)]
+        contracts = openrouter_request_contracts(model_id)
+        contract_limits: dict[str, list[int]] = {}
+        contract_counts: dict[str, int] = {}
+        contract_requirements: dict[str, list[list[str]]] = {}
+        all_limits: list[int] = []
+        incomplete_contracts = []
+        for contract in contracts:
+            compatible = [
+                endpoint
+                for endpoint in active_endpoints
+                if openrouter_endpoint_supports_contract(endpoint, contract)
+            ]
+            limits = [
+                int(endpoint["max_completion_tokens"])
+                for endpoint in compatible
+                if isinstance(endpoint.get("max_completion_tokens"), (int, float))
+                and int(endpoint["max_completion_tokens"]) > 0
+            ]
+            contract_key = contract.reasoning_mode
+            contract_limits.setdefault(contract_key, []).extend(limits)
+            contract_counts[contract_key] = max(contract_counts.get(contract_key, 0), len(compatible))
+            requirements = contract_requirements.setdefault(contract_key, [])
+            if list(contract.required_parameters) not in requirements:
+                requirements.append(list(contract.required_parameters))
+            all_limits.extend(limits)
+            if not limits:
+                incomplete_contracts.append(contract)
+        endpoint_safe_by_mode = {
+            mode: min(limits) if limits else None
+            for mode, limits in contract_limits.items()
+        }
+        endpoint_safe_limit = min(all_limits) if not incomplete_contracts and all_limits else None
+        if endpoint_safe_limit is None:
+            mismatches.append("endpoint_safe_output_limit")
+        elif spec.output_limit > endpoint_safe_limit:
+            mismatches.append("configured_output_limit")
+        for mode, mode_limit in endpoint_safe_by_mode.items():
+            if mode_limit is None or spec.output_limit > mode_limit:
+                mismatch = f"endpoint_safe_output_limit:{mode}"
+                if mismatch not in mismatches:
+                    mismatches.append(mismatch)
+
+        static_reasoning = spec.reasoning
+        if static_reasoning and not live_reasoning_present:
+            mismatches.append("reasoning/support")
+        elif static_reasoning and live_reasoning is None:
+            mismatches.append("reasoning/metadata")
+        elif static_reasoning and live_reasoning_present:
+            live_efforts = live_reasoning.get("supported_efforts") if live_reasoning else None
+            if static_reasoning.supported_efforts is None:
+                if live_efforts:
+                    mismatches.append("reasoning/supported_efforts")
+            elif set(static_reasoning.supported_efforts) != set(live_efforts or ()):
+                mismatches.append("reasoning/supported_efforts")
+            for field_name in ("mandatory", "default_enabled", "default_effort"):
+                expected = getattr(static_reasoning, field_name)
+                observed = live_reasoning.get(field_name) if live_reasoning else None
+                if expected is not None and observed != expected:
+                    mismatches.append(f"reasoning/{field_name}")
+            if static_reasoning.supports_max_tokens != ("max_tokens" in supported_parameters):
+                mismatches.append("reasoning/supports_max_tokens")
+            live_can_disable = not bool(live_reasoning.get("mandatory")) if live_reasoning else False
+            if static_reasoning.can_disable != live_can_disable:
+                mismatches.append("reasoning/can_disable")
+        if spec.temperature != ("temperature" in supported_parameters):
+            mismatches.append("temperature")
         result[model_id] = {
             "exists": True,
+            "request_model_id": model_id,
             "canonical_slug": item.get("canonical_slug"),
             "text": "text" in modalities,
             "vision": "image" in modalities,
             "audio_input": "audio" in modalities,
+            "input_modalities": sorted(modalities),
             "context_limit": live_context,
-            "output_limit": live_output,
+            "top_provider_output_limit": live_top_provider_output,
+            "observed_top_provider_output_limit": live_top_provider_output,
+            "output_limit": spec.output_limit,
+            "configured_output_limit": spec.output_limit,
+            "endpoint_safe_output_limit": endpoint_safe_limit,
+            "endpoint_safe_output_limits_by_mode": endpoint_safe_by_mode,
+            "active_endpoint_count": len(active_endpoints),
+            "compatible_endpoint_counts_by_mode": contract_counts,
+            "request_parameters_by_mode": contract_requirements,
+            "supported_parameters": list(supported_parameters),
+            "reasoning": live_reasoning,
+            "reasoning_present": live_reasoning_present,
+            "supported_efforts": live_reasoning.get("supported_efforts") if live_reasoning else None,
+            "mandatory": live_reasoning.get("mandatory") if live_reasoning else None,
+            "default_enabled": live_reasoning.get("default_enabled") if live_reasoning else None,
+            "default_effort": live_reasoning.get("default_effort") if live_reasoning else None,
+            "supports_max_tokens": "max_tokens" in supported_parameters,
+            "can_disable": not bool(live_reasoning.get("mandatory")) if live_reasoning else False,
+            "temperature_supported": "temperature" in supported_parameters,
             "status": live_status,
             "expiration_date": expiration_date,
             "matches_static": not mismatches,

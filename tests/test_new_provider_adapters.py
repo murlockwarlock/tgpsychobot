@@ -41,7 +41,7 @@ def layout() -> AIRequestLayout:
 
 
 def test_openrouter_catalog_is_curated_and_capability_driven():
-    assert len(OPENROUTER_MODELS) == 20
+    assert len(OPENROUTER_MODELS) == 22
     assert set(get_selectable_models(PROVIDER_OPENROUTER)) == set(OPENROUTER_MODEL_SPECS)
     assert set(get_selectable_models(PROVIDER_OPENROUTER, "vision")) == set(OPENROUTER_VISION_MODELS)
     assert "deepseek/deepseek-v4.1-flash" in OPENROUTER_VISION_MODELS
@@ -53,6 +53,8 @@ def test_openrouter_catalog_is_curated_and_capability_driven():
         "openai/gpt-5.6-luna",
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro",
+        "qwen/qwen3.7-plus",
+        "qwen/qwen3.8-27b",
     }.issubset(OPENROUTER_MODEL_SPECS)
     assert validate_model_selection(PROVIDER_OPENROUTER, "openai/gpt-5.6-terra") == "openai/gpt-5.6-terra"
     assert validate_model_selection(PROVIDER_PERPLEXITY, "medium") == "medium"
@@ -82,6 +84,49 @@ def test_openrouter_vision_uses_data_uri_and_rejects_unknown_model():
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
     with pytest.raises(ModelUnavailableError):
         validate_model_selection(PROVIDER_OPENROUTER, "unknown/model", channel="vision")
+
+
+def test_openrouter_reasoning_payloads_use_model_contract_and_routing_guarantee():
+    auto = build_openrouter_payload(
+        layout(),
+        "qwen/qwen3.8-27b",
+        temperature=0.7,
+        max_output_tokens=1024,
+    )
+    assert "reasoning" not in auto
+    assert "provider" not in auto
+
+    maximum = build_openrouter_payload(
+        layout(),
+        "qwen/qwen3.8-27b",
+        temperature=0.7,
+        max_output_tokens=1024,
+        reasoning_effort="max",
+    )
+    assert maximum["reasoning"] == {"effort": "xhigh", "exclude": True}
+    assert maximum["provider"] == {"require_parameters": True}
+    assert "extra_body" not in maximum
+    assert "reasoning_effort" not in maximum
+
+    qwen_toggle = build_openrouter_payload(
+        layout(),
+        "qwen/qwen3.7-plus",
+        reasoning_effort="enabled",
+    )
+    assert qwen_toggle["reasoning"] == {"enabled": True, "exclude": True}
+    assert qwen_toggle["provider"] == {"require_parameters": True}
+
+    qwen_disabled = build_openrouter_payload(
+        layout(),
+        "qwen/qwen3.7-plus",
+        reasoning_effort="none",
+    )
+    assert qwen_disabled["reasoning"] == {"enabled": False}
+    assert qwen_disabled["provider"] == {"require_parameters": True}
+
+    stale = build_openrouter_payload(layout(), "qwen/qwen3-vl-235b-a22b-instruct", reasoning_effort="max")
+    assert "reasoning" not in stale
+    assert "provider" not in stale
 
 
 class FakeResponse:
@@ -200,7 +245,8 @@ def test_deepgram_payload_and_transcript_support_multilingual_audio():
 
 def test_new_provider_output_budget_respects_model_capability_metadata():
     assert effective_chat_output_tokens(PROVIDER_OPENROUTER, "qwen/qwen3-vl-235b-a22b-instruct", 1000) == 1000
-    assert effective_chat_output_tokens(PROVIDER_OPENROUTER, "qwen/qwen3-vl-235b-a22b-instruct", 50000) == 32768
+    assert effective_chat_output_tokens(PROVIDER_OPENROUTER, "qwen/qwen3-vl-235b-a22b-instruct", 50000) == 16384
+    assert effective_chat_output_tokens(PROVIDER_OPENROUTER, "qwen/qwen3.8-27b", 50000) == 32768
     assert effective_chat_output_tokens(PROVIDER_PERPLEXITY, "fast", None) == 8192
     assert effective_chat_output_tokens(PROVIDER_PERPLEXITY, "low", None) == 32768
     assert effective_chat_output_tokens(PROVIDER_PERPLEXITY, "medium", None) == 128000
@@ -264,3 +310,83 @@ def test_provider_rejects_invalid_models_and_malformed_responses():
     with pytest.raises(ProviderAdapterError) as error:
         asyncio.run(call_deepgram("secret", b"audio", "voice.ogg", model="unsupported"))
     assert error.value.classification == "invalid_model"
+
+
+def test_openrouter_reasoning_response_does_not_expose_hidden_trace():
+    FakeClient.response = FakeResponse(
+        200,
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": [
+                        {"type": "reasoning", "text": "hidden content"},
+                        {"type": "text", "text": "Публичный ответ"},
+                        {"reasoning_details": [{"text": "hidden details"}], "text": "hidden details"},
+                    ],
+                    "reasoning": "hidden chain of thought",
+                    "reasoning_details": [{"text": "hidden details"}],
+                },
+            }],
+            "usage": {
+                "completion_tokens": 12,
+                "completion_tokens_details": {"reasoning_tokens": 8},
+                "reasoning": "hidden usage trace",
+                "reasoning_details": {"text": "hidden usage details"},
+            },
+        },
+    )
+    capture = {}
+    with patch("provider_adapters.httpx.AsyncClient", FakeClient):
+        result = asyncio.run(
+            call_openrouter(
+                "secret",
+                layout(),
+                "qwen/qwen3.8-27b",
+                reasoning_effort="max",
+                request_capture=capture,
+            )
+        )
+    assert result == "Публичный ответ"
+    assert "hidden" not in repr(capture)
+    assert capture["usage"]["completion_tokens_details"]["reasoning_tokens"] == 8
+    assert "reasoning" not in capture["usage"]
+    assert "reasoning_details" not in capture["usage"]
+
+
+def test_openrouter_output_budget_exhaustion_is_not_empty_response():
+    FakeClient.response = FakeResponse(
+        200,
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": None,
+                    "reasoning": "hidden chain of thought",
+                },
+            }],
+            "usage": {
+                "completion_tokens": 1024,
+                "completion_tokens_details": {"reasoning_tokens": 900},
+                "reasoning": "hidden usage trace",
+            },
+        },
+    )
+    capture = {}
+    with patch("provider_adapters.httpx.AsyncClient", FakeClient):
+        with pytest.raises(ProviderAdapterError) as error:
+            asyncio.run(
+                call_openrouter(
+                    "secret",
+                    layout(),
+                    "qwen/qwen3.8-27b",
+                    reasoning_effort="max",
+                    request_capture=capture,
+                )
+            )
+    assert error.value.classification == "output_budget_exhausted"
+    assert error.value.finish_reason == "length"
+    assert "hidden" not in (error.value.provider_response_payload or "")
+    assert capture["classification"] == "output_budget_exhausted"
+    assert capture["finish_reason"] == "length"
+    assert capture["usage"]["completion_tokens_details"]["reasoning_tokens"] == 900

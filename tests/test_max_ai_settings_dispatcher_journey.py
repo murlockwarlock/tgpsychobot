@@ -599,5 +599,129 @@ async def test_max_ai_settings_use_real_app_callback_journeys(max_settings_db, m
     )
 
 
+@pytest.mark.asyncio
+async def test_max_openrouter_qwen_reasoning_is_a_real_attachment_journey(max_settings_db, monkeypatch):
+    from provider_models import resolve_reasoning_callback_token
+
+    monkeypatch.setattr(max_admin_ai, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+
+    async with max_settings_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "OpenRouter"
+        config.openrouter_model = "qwen/qwen3.8-27b"
+        await session.commit()
+
+    captured = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    update_id = 100
+
+    async def send_admin_command(command):
+        nonlocal update_id
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_created",
+            "update_id": update_id,
+            "message": {
+                "body": {"text": command},
+                "recipient": {"chat_id": 1001},
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+        })
+        return captured[-1]["body"]
+
+    async def press(payload, attachments):
+        nonlocal update_id
+        visible = {button["payload"] for button in _max_buttons(attachments)}
+        assert payload in visible
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": payload,
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+            "message": {
+                "mid": "admin-message",
+                "recipient": {"chat_id": 1001},
+                "body": {"attachments": attachments},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert messages, payload
+        return messages[-1]["body"]
+
+    root = await send_admin_command("/admin")
+    ai = await press("admin_ai_settings", root.get("attachments", []))
+    keys = await press("admin_ai_keys", ai.get("attachments", []))
+    detail = await press("admin_ai_models_OpenRouter", keys.get("attachments", []))
+    reasoning_entry = next(
+        button
+        for button in _max_buttons(detail.get("attachments", []))
+        if button["payload"].startswith("admin_ai_model_reasoning_r_")
+    )
+    picker = await press(reasoning_entry["payload"], detail.get("attachments", []))
+    choices = _max_buttons(picker.get("attachments", []))
+    assert [button["text"] for button in choices[:-1]] == ["Авто", "Выкл", "Low", "Medium", "Max"]
+    max_button = next(button for button in choices if button["text"] == "Max")
+    assert resolve_reasoning_callback_token(max_button["payload"].replace("admin_ai_reasoning_", "", 1)) == (
+        "OpenRouter",
+        "qwen/qwen3.8-27b",
+        "max",
+    )
+    detail = await press(max_button["payload"], picker.get("attachments", []))
+    assert "Reasoning: <b>Max</b>" in detail["text"]
+    async with max_settings_db() as session:
+        settings = await max_admin_ai.resolve_model_settings(
+            session,
+            "OpenRouter",
+            "qwen/qwen3.8-27b",
+            "chat",
+        )
+        assert settings.reasoning_effort == "max"
+
+    picker = await press(reasoning_entry["payload"], detail.get("attachments", []))
+    back = next(button for button in _max_buttons(picker.get("attachments", [])) if button["text"] == "⬅️ Назад")
+    detail = await press(back["payload"], picker.get("attachments", []))
+    assert "Параметры модели" in detail["text"]
+
+    model_picker = await press("admin_ai_provider_models_OpenRouter", detail.get("attachments", []))
+    non_reasoning = next(
+        button
+        for button in _max_buttons(model_picker.get("attachments", []))
+        if button["text"] == "Qwen3 VL 235B Instruct"
+    )
+    detail = await press(non_reasoning["payload"], model_picker.get("attachments", []))
+    assert "qwen/qwen3-vl-235b-a22b-instruct" in detail["text"]
+    assert "Reasoning:" not in detail["text"]
+    assert not any(
+        button["payload"].startswith("admin_ai_model_reasoning")
+        for button in _max_buttons(detail.get("attachments", []))
+    )
+
+    model_picker = await press("admin_ai_provider_models_OpenRouter", detail.get("attachments", []))
+    qwen_reasoning = next(
+        button
+        for button in _max_buttons(model_picker.get("attachments", []))
+        if "Qwen3.8 27B" in button["text"]
+    )
+    detail = await press(qwen_reasoning["payload"], model_picker.get("attachments", []))
+    assert "Reasoning: <b>Max</b>" in detail["text"]
+
+
 async def _true_async():
     return True

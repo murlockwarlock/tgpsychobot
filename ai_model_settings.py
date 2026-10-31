@@ -18,6 +18,7 @@ from provider_models import (
     canonical_provider_name,
     get_chat_output_token_limit,
     get_default_model,
+    get_openrouter_model_spec,
     is_perplexity_preset,
     normalize_deepseek_model,
     should_omit_claude_sampling,
@@ -26,7 +27,9 @@ from provider_models import (
 
 REASONING_AUTO = "auto"
 REASONING_NONE = "none"
+REASONING_ENABLED = "enabled"
 REASONING_LOW = "low"
+REASONING_MEDIUM = "medium"
 REASONING_HIGH = "high"
 REASONING_MAX = "max"
 REASONING_VALUES = (REASONING_AUTO, REASONING_NONE, REASONING_LOW, REASONING_HIGH, REASONING_MAX)
@@ -116,12 +119,21 @@ def get_generation_capabilities(
             reasoning_effort=(),
         )
     if normalized_provider == PROVIDER_OPENROUTER:
+        spec = get_openrouter_model_spec(normalized_model)
+        reasoning_modes = tuple(
+            mode
+            for mode in (spec.reasoning.modes if spec and spec.reasoning else ())
+            if not (spec.reasoning.mandatory and mode == REASONING_NONE)
+        ) if spec and spec.reasoning else ()
         return GenerationCapabilities(
             max_output_tokens=True,
             max_output_tokens_required=False,
             output_limit=get_chat_output_token_limit(normalized_provider, normalized_model),
-            temperature=not normalized_model.startswith(("openai/gpt-5.6", "google/gemini-3.7", "google/gemini-3.8")),
-            reasoning_effort=(),
+            temperature=bool(spec.temperature) if spec else False,
+            reasoning_effort=reasoning_modes,
+            temperature_ignored_for_reasoning=bool(
+                spec and spec.reasoning and not spec.reasoning.temperature_supported_with_reasoning
+            ),
         )
     if normalized_provider == PROVIDER_PERPLEXITY:
         is_preset = is_perplexity_preset(normalized_model)
@@ -136,8 +148,16 @@ def get_generation_capabilities(
     return GenerationCapabilities(True, False, get_chat_output_token_limit(normalized_provider, normalized_model), True, ())
 
 
-def normalize_reasoning_effort(provider: str | None, value: Any) -> str:
-    if canonical_provider_name(provider) != PROVIDER_DEEPSEEK:
+def normalize_reasoning_effort(provider: str | None, model: str | None, value: Any) -> str:
+    normalized_provider = canonical_provider_name(provider)
+    normalized_model = str(model or "").strip()
+    if normalized_provider == PROVIDER_OPENROUTER:
+        capabilities = get_generation_capabilities(normalized_provider, normalized_model)
+        normalized = str(value or REASONING_AUTO).strip().lower()
+        aliases = {"default": REASONING_AUTO, "off": REASONING_NONE, "disabled": REASONING_NONE, "on": REASONING_ENABLED}
+        normalized = aliases.get(normalized, normalized)
+        return normalized if normalized in capabilities.reasoning_effort else REASONING_AUTO
+    if normalized_provider != PROVIDER_DEEPSEEK:
         return REASONING_AUTO
     normalized = str(value or REASONING_AUTO).strip().lower()
     aliases = {"default": REASONING_AUTO, "off": REASONING_NONE, "disabled": REASONING_NONE}
@@ -177,7 +197,7 @@ def validate_model_setting(
             limit = get_chat_output_token_limit(
                 normalized_provider,
                 normalized_model,
-                normalize_reasoning_effort(normalized_provider, reasoning_effort),
+                normalize_reasoning_effort(normalized_provider, normalized_model, reasoning_effort),
             )
         if limit is not None and parsed > limit:
             raise ValueError(f"Для выбранной модели максимальное значение — {limit} токенов.")
@@ -195,7 +215,7 @@ def validate_model_setting(
             raise ValueError("Введите число от 0.0 до 2.0.")
         return parsed
     if name == "reasoning_effort":
-        parsed = normalize_reasoning_effort(normalized_provider, value)
+        parsed = normalize_reasoning_effort(normalized_provider, normalized_model, value)
         if parsed not in capabilities.reasoning_effort:
             raise ValueError("Этот режим рассуждений для модели не поддерживается.")
         return parsed
@@ -271,7 +291,7 @@ async def resolve_model_settings(
             normalized_channel,
             row.max_output_tokens,
             row.temperature,
-            normalize_reasoning_effort(normalized_provider, row.reasoning_effort),
+            normalize_reasoning_effort(normalized_provider, normalized_model, row.reasoning_effort),
             "model",
         )
     if config is None:
@@ -307,7 +327,7 @@ async def get_or_create_model_settings(session, provider: str | None, model: str
         channel=normalized_channel,
         max_output_tokens=resolved.max_output_tokens,
         temperature=resolved.temperature,
-        reasoning_effort=resolved.reasoning_effort if normalized_provider == PROVIDER_DEEPSEEK else None,
+        reasoning_effort=resolved.reasoning_effort if get_generation_capabilities(normalized_provider, normalized_model).reasoning_effort else None,
     )
     session.add(row)
     await session.flush()
@@ -331,9 +351,16 @@ def wire_max_output_tokens(settings: ResolvedModelSettings) -> int | None:
 
 def wire_temperature(settings: ResolvedModelSettings) -> float | None:
     capabilities = get_generation_capabilities(settings.provider, settings.model, settings.channel)
+    normalized_reasoning = normalize_reasoning_effort(
+        settings.provider,
+        settings.model,
+        settings.reasoning_effort,
+    )
+    reasoning_override = settings.provider == PROVIDER_DEEPSEEK and normalized_reasoning != REASONING_NONE
+    if settings.provider == PROVIDER_OPENROUTER:
+        reasoning_override = normalized_reasoning != REASONING_AUTO
     if not capabilities.temperature or (
-        capabilities.temperature_ignored_for_reasoning
-        and settings.reasoning_effort != REASONING_NONE
+        capabilities.temperature_ignored_for_reasoning and reasoning_override
     ):
         return None
     if settings.temperature is None:
@@ -342,7 +369,7 @@ def wire_temperature(settings: ResolvedModelSettings) -> float | None:
 
 
 def wire_reasoning_effort(settings: ResolvedModelSettings) -> str | None:
-    if settings.provider != PROVIDER_DEEPSEEK:
+    if settings.provider not in (PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER):
         return None
-    effort = normalize_reasoning_effort(settings.provider, settings.reasoning_effort)
+    effort = normalize_reasoning_effort(settings.provider, settings.model, settings.reasoning_effort)
     return None if effort == REASONING_AUTO else effort

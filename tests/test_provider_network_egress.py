@@ -9,12 +9,17 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 import ai_integration
-from database import AIConfig, Base, Topic, User
+from database import AILog, AIConfig, AIModelSettings, Base, Message as DBMessage, Topic, User
 from max_messenger_bot import ai as max_ai
+from max_messenger_bot import app as max_app_module
+from max_messenger_bot.api import MaxApiClient
+from max_messenger_bot.app import MaxBotApplication
+from max_messenger_bot.models import MAX_ID_OFFSET
 from ai_request_context import AIRequestLayout
 from provider_adapters import (
     ProviderAdapterError,
@@ -461,4 +466,236 @@ async def test_max_openrouter_call_uses_proxy(egress_db, monkeypatch):
     assert "3128" in (call_info["proxy_url"] or "")
     assert "https://openrouter.ai/api/v1/chat/completions" in call_info["url"]
     assert call_info["auth"] == "Bearer sk-or-test-key"
+
+
+@pytest.mark.asyncio
+async def test_telegram_and_max_runtime_share_explicit_openrouter_reasoning_payload(egress_db, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    async with egress_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.openrouter_model = "qwen/qwen3.8-27b"
+        session.add(
+            AIModelSettings(
+                provider="OpenRouter",
+                model="qwen/qwen3.8-27b",
+                channel="chat",
+                reasoning_effort="max",
+            )
+        )
+        await session.commit()
+
+    payloads = []
+
+    async def spy_post(self, url, *args, **kwargs):
+        payloads.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
+        )
+
+    with patch.object(httpx.AsyncClient, "post", spy_post):
+        assert await ai_integration.generate_response(101, "Telegram Qwen") == "ok"
+        assert await max_ai.get_ai_response(101, "MAX Qwen") == "ok"
+
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert payload["model"] == "qwen/qwen3.8-27b"
+        assert payload["reasoning"] == {"effort": "xhigh", "exclude": True}
+        assert payload["provider"] == {"require_parameters": True}
+        assert "extra_body" not in payload
+        assert "reasoning_effort" not in payload
+
+
+@pytest.mark.asyncio
+async def test_max_handle_update_reaches_scoped_openrouter_runtime_and_history(egress_db, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    max_user_id = MAX_ID_OFFSET + 101
+    async with egress_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.openrouter_model = "qwen/qwen3.8-27b"
+        session.add(
+            User(
+                id=max_user_id,
+                first_name="Тест",
+                name="Тест",
+                accepted_disclaimer=True,
+                current_topic_id=1,
+                current_dialogue_id=1,
+            )
+        )
+        session.add(
+            AIModelSettings(
+                provider="OpenRouter",
+                model="qwen/qwen3.8-27b",
+                channel="chat",
+                reasoning_effort="max",
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(max_app_module, "async_session_maker", egress_db)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", egress_db)
+    monkeypatch.setattr(max_app_module.common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_app_module.common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+    monkeypatch.setattr(max_app_module, "_track_task", lambda tasks, task: tasks.add(task))
+
+    sent_messages = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        if path == "/messages":
+            sent_messages.append(json_data or {})
+            return {"message": {"body": {"mid": str(len(sent_messages))}}}
+        return {}
+
+    provider_payloads = []
+
+    async def spy_post(self, url, *args, **kwargs):
+        provider_payloads.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "MAX response"}}]},
+        )
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    async def no_followup(*args, **kwargs):
+        return None
+
+    app.states = type("EmptyStateStore", (), {"get": AsyncMock(return_value=None)})()
+    app._begin_max_followup_activity = no_followup
+    app._finalize_max_followup_activity = no_followup
+    with patch.object(httpx.AsyncClient, "post", spy_post):
+        await app.handle_update({
+            "update_type": "message_created",
+            "update_id": 7701,
+            "message": {
+                "body": {"text": "MAX user request"},
+                "recipient": {"chat_id": 101},
+                "sender": {"user_id": 101, "name": "Тест"},
+            },
+        })
+        task = app.user_tasks.get(max_user_id)
+        if task is not None:
+            await task
+        else:
+            await asyncio.gather(*tuple(app.background_tasks))
+
+    assert provider_payloads[0]["model"] == "qwen/qwen3.8-27b"
+    assert provider_payloads[0]["reasoning"] == {"effort": "xhigh", "exclude": True}
+    assert provider_payloads[0]["provider"] == {"require_parameters": True}
+    assert any(message.get("text") == "MAX response" for message in sent_messages)
+    async with egress_db() as session:
+        history = (
+            await session.execute(
+                select(DBMessage).where(DBMessage.user_id == max_user_id).order_by(DBMessage.id.asc())
+            )
+        ).scalars().all()
+    assert any(row.role == "assistant" and row.content == "MAX response" for row in history)
+
+
+@pytest.mark.asyncio
+async def test_telegram_openrouter_length_response_is_controlled_budget_failure(egress_db, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    async with egress_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.openrouter_model = "qwen/qwen3.8-27b"
+        session.add(
+            AIModelSettings(
+                provider="OpenRouter",
+                model="qwen/qwen3.8-27b",
+                channel="chat",
+                reasoning_effort="max",
+            )
+        )
+        await session.commit()
+
+    attempts = 0
+
+    async def exhausted_post(self, url, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": None, "reasoning": "hidden trace"},
+                }],
+                "usage": {"completion_tokens": 32768, "completion_tokens_details": {"reasoning_tokens": 30000}},
+            },
+        )
+
+    with patch.object(httpx.AsyncClient, "post", exhausted_post):
+        with pytest.raises(ai_integration.AIServiceError) as error:
+            await ai_integration.generate_response(101, "Budget test")
+
+    assert attempts == 1
+    assert error.value.classification == "output_budget_exhausted"
+    assert getattr(error.value, "finish_reason", None) == "length"
+    assert "hidden trace" not in str(error.value)
+    async with egress_db() as session:
+        audit = await session.scalar(select(AILog).order_by(AILog.id.desc()))
+        assert audit is not None
+        assert audit.error_classification == "output_budget_exhausted"
+        assert "hidden trace" not in repr(audit.diagnostics_json)
+        assert "hidden trace" not in repr(audit.provider_response_payload)
+
+
+@pytest.mark.asyncio
+async def test_max_openrouter_length_response_uses_controlled_budget_failure(egress_db, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    async with egress_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.openrouter_model = "qwen/qwen3.8-27b"
+        session.add(
+            AIModelSettings(
+                provider="OpenRouter",
+                model="qwen/qwen3.8-27b",
+                channel="chat",
+                reasoning_effort="max",
+            )
+        )
+        await session.commit()
+
+    attempts = 0
+
+    async def exhausted_post(self, url, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": None, "reasoning_details": [{"text": "hidden trace"}]},
+                }],
+                "usage": {"completion_tokens": 32768, "completion_tokens_details": {"reasoning_tokens": 30000}},
+            },
+        )
+
+    with patch.object(httpx.AsyncClient, "post", exhausted_post):
+        with pytest.raises(max_ai.AIServiceError) as error:
+            await max_ai.get_ai_response(101, "MAX budget test")
+
+    assert attempts == 1
+    assert error.value.classification == "output_budget_exhausted"
+    assert getattr(error.value, "finish_reason", None) == "length"
+    assert "hidden trace" not in str(error.value)
+    async with egress_db() as session:
+        audit = await session.scalar(
+            select(AILog).where(AILog.platform == "max").order_by(AILog.id.desc())
+        )
+        assert audit is not None
+        assert audit.error_classification == "output_budget_exhausted"
+        assert "hidden trace" not in repr(audit.diagnostics_json)
+        assert "hidden trace" not in repr(audit.provider_response_payload)
 

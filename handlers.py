@@ -115,6 +115,7 @@ from provider_models import (
     get_selectable_models,
     refresh_perplexity_catalog,
     resolve_telegram_model_callback,
+    resolve_reasoning_callback_token,
     validate_model_selection,
 )
 from knowledge_base_admin import (
@@ -145,7 +146,9 @@ from ai_model_settings import (
     wire_temperature,
     REASONING_AUTO,
     REASONING_NONE,
+    REASONING_ENABLED,
     REASONING_LOW,
+    REASONING_MEDIUM,
     REASONING_HIGH,
     REASONING_MAX,
 )
@@ -5541,7 +5544,9 @@ def _reasoning_label(value: str) -> str:
     return {
         REASONING_AUTO: "Авто",
         REASONING_NONE: "Выкл",
+        REASONING_ENABLED: "Вкл",
         REASONING_LOW: "Low",
+        REASONING_MEDIUM: "Medium",
         REASONING_HIGH: "High",
         REASONING_MAX: "Max",
     }.get(value, "Авто")
@@ -5565,6 +5570,7 @@ async def _provider_model_settings_render_data(provider: str, *, channel: str = 
         )
         return text, kb.provider_model_settings_keyboard(
             provider,
+            model=model,
             show_reasoning=False,
             show_temperature=False,
             transcription_only=True,
@@ -5592,6 +5598,7 @@ async def _provider_model_settings_render_data(provider: str, *, channel: str = 
         text += f"🌍 Proxy: <b>{'Включён' if use_proxy else 'Выключен'}</b>\n"
     return text, kb.provider_model_settings_keyboard(
         provider,
+        model=model,
         show_reasoning=bool(capabilities.reasoning_effort),
         show_temperature=capabilities.temperature and (
             provider != PROVIDER_DEEPSEEK or settings.reasoning_effort == REASONING_NONE
@@ -5675,16 +5682,34 @@ async def view_active_model_choices(callback: CallbackQuery):
 async def model_setting_reasoning(callback: CallbackQuery):
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
-    await _show_model_reasoning(callback, _active_chat_model_scope(config)[0] if config else PROVIDER_DEEPSEEK)
+    provider, model = _active_chat_model_scope(config) if config else (PROVIDER_DEEPSEEK, None)
+    await _show_model_reasoning(callback, provider, model)
 
 
-async def _show_model_reasoning(callback: CallbackQuery, provider: str):
-    if canonical_provider_name(provider) != PROVIDER_DEEPSEEK:
-        await callback.answer("Reasoning доступен только для DeepSeek.", show_alert=True)
+async def _show_model_reasoning(callback: CallbackQuery, provider: str, model: str | None = None):
+    provider = canonical_provider_name(provider)
+    async with async_session_maker() as session:
+        config = await session.get(AIConfig, 1)
+        if not config:
+            await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
+            return
+        provider, active_model = _provider_model_scope(config, provider)
+        if model and model != active_model:
+            await callback.answer("Модель изменилась. Откройте настройки заново.", show_alert=True)
+            return
+        model = active_model
+    capabilities = get_generation_capabilities(provider, model, "chat")
+    if not capabilities.reasoning_effort:
+        await callback.answer("Reasoning недоступен для выбранной модели.", show_alert=True)
         return
     await callback.message.edit_text(
-        "🧠 <b>Reasoning DeepSeek</b>\n\nВыберите режим:",
-        reply_markup=kb.model_reasoning_keyboard(provider),
+        f"🧠 <b>Reasoning</b>\nМодель: <code>{model}</code>\n\nВыберите режим:",
+        reply_markup=kb.model_reasoning_keyboard(
+            provider,
+            model=model,
+            modes=capabilities.reasoning_effort,
+            back_callback=f"view_models_{provider}",
+        ),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -5692,26 +5717,39 @@ async def _show_model_reasoning(callback: CallbackQuery, provider: str):
 
 @router.callback_query(F.data.startswith("model_setting_reasoning_"))
 async def model_setting_reasoning_for_provider(callback: CallbackQuery):
-    provider = canonical_provider_name(callback.data.replace("model_setting_reasoning_", "", 1))
+    payload = callback.data.replace("model_setting_reasoning_", "", 1)
+    resolved = resolve_reasoning_callback_token(payload)
+    if resolved:
+        provider, model, _ = resolved
+        await _show_model_reasoning(callback, provider, model)
+        return
+    provider = canonical_provider_name(payload)
     await _show_model_reasoning(callback, provider)
 
 
 @router.callback_query(F.data.startswith("model_reasoning_"))
 async def save_model_reasoning(callback: CallbackQuery):
     payload = callback.data.replace("model_reasoning_", "", 1)
-    provider, separator, value = payload.rpartition("_")
-    if not separator or canonical_provider_name(provider) != PROVIDER_DEEPSEEK:
-        provider = PROVIDER_DEEPSEEK
-        value = payload
-    provider = canonical_provider_name(provider)
+    resolved = resolve_reasoning_callback_token(payload)
+    if resolved:
+        provider, model, value = resolved
+    else:
+        provider, separator, value = payload.rpartition("_")
+        if not separator or canonical_provider_name(provider) not in {PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER}:
+            provider = PROVIDER_DEEPSEEK
+            value = payload
+        provider = canonical_provider_name(provider)
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
         if not config:
-            await callback.answer("Reasoning доступен только для DeepSeek.", show_alert=True)
+            await callback.answer("Ошибка: конфигурация ИИ не найдена.", show_alert=True)
             return
-        provider, model = _provider_model_scope(config, provider)
-        if provider != PROVIDER_DEEPSEEK:
-            await callback.answer("Reasoning доступен только для DeepSeek.", show_alert=True)
+        provider = canonical_provider_name(provider)
+        active_provider, active_model = _provider_model_scope(config, provider)
+        if resolved is None:
+            provider, model = active_provider, active_model
+        elif active_provider != provider or active_model != model:
+            await callback.answer("Провайдер модели изменился. Откройте настройки заново.", show_alert=True)
             return
         try:
             normalized = validate_model_setting(provider, model, "reasoning_effort", value)
@@ -21174,6 +21212,7 @@ async def get_ai_response_direct(
                     model,
                     temperature=request_temperature,
                     max_output_tokens=output_tokens,
+                    reasoning_effort=reasoning_effort,
                     activity_tracker=activity_tracker,
                 )
             except ai_integration.ProviderAdapterError as exc:
