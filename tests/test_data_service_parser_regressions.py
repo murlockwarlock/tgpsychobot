@@ -482,3 +482,51 @@ def test_json_array_literals_protect_embedded_data_tags():
     assert extraction.visible_text == raw
     assert extraction.blocks == []
     assert extraction.invalid_count == 0
+
+
+def test_multiline_malformed_service_envelope_does_not_recover_nested_event():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "{\n"
+        '  "metadata": {\n'
+        '    "current_state": {"current_step":"bad"},\n'
+        '    "event":"SHOULD_NOT_RUN"\n'
+        ""
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+
+
+def test_prose_bracket_does_not_shield_inline_fallback_service_json():
+    raw = (
+        'Ответ содержит символ [. {"current_state":{"current_step":"done"},'
+        '"metadata":{"private":"secret"}}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ содержит символ [."
+    assert extraction.blocks[0].current_state == {"current_step": "done"}
+    assert extraction.blocks[0].metadata == {"private": "secret"}
+    assert extraction.invalid_count == 0
+
+
+def test_multiple_service_headings_do_not_remove_following_explanation():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "Заполненный current_state:\n"
+        '{"metadata":{"ok":true}}\n'
+        "Пояснение для пользователя."
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert "Пояснение для пользователя." in extraction.visible_text
+    assert extraction.blocks[0].metadata == {"ok": True}
+    assert extraction.invalid_count == 0

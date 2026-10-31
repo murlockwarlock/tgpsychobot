@@ -453,7 +453,7 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
             continue
         if char == '"':
             in_string = True
-        elif char in "{[":
+        elif char == "{" or (char == "[" and stack):
             stack.append(char)
         elif char in "}]" and stack and stack[-1] == pairs[char]:
             stack.pop()
@@ -477,15 +477,15 @@ def _is_service_fallback_payload(payload: dict[str, Any], explicit_signature: bo
 
 def _find_fallback_service_tail(
     text: str,
-    excluded_starts: set[int] | None = None,
+    excluded_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[int, int] | None:
-    excluded_starts = excluded_starts or set()
+    excluded_ranges = excluded_ranges or []
     signatures = re.finditer(
         r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?\s*(?:\r?\n|$)",
         text,
     )
     for signature in signatures:
-        if signature.start() in excluded_starts:
+        if any(start <= signature.start() < end for start, end in excluded_ranges):
             continue
         if _looks_like_json_payload(text[signature.end():]):
             return signature.start(), len(text)
@@ -598,7 +598,6 @@ def _extract_fallback_data(
     removals: list[tuple[int, int]] = []
     located_blocks: list[tuple[int, ServiceDataBlock]] = []
     invalid_count = 0
-    excluded_signature_starts: set[int] = set()
     for object_start, object_end in spans:
         if _has_unclosed_json_container(visible_text, object_start):
             continue
@@ -614,7 +613,6 @@ def _extract_fallback_data(
             if explicit_signature:
                 end = _fence_end(visible_text, object_end) if fenced else object_end
                 removals.append((start, end))
-                excluded_signature_starts.add(start)
                 invalid_count += 1
             continue
         if not isinstance(payload, dict) or not _is_service_fallback_payload(payload, explicit_signature):
@@ -627,9 +625,8 @@ def _extract_fallback_data(
             )
         )
         removals.append((start, end))
-        excluded_signature_starts.add(start)
 
-    tail = _find_fallback_service_tail(visible_text, excluded_signature_starts)
+    tail = _find_fallback_service_tail(visible_text, removals)
     if tail:
         removals.append(tail)
         invalid_count += 1
