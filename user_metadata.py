@@ -436,21 +436,12 @@ def _has_explicit_service_signature(text: str, object_start: int) -> bool:
 
 
 def _has_unclosed_json_container(text: str, object_start: int) -> bool:
-    signatures = list(EXPLICIT_SERVICE_SIGNATURE_RE.finditer(text[:object_start]))
-    if signatures:
-        signature_start = signatures[-1].start()
-        newline = text.find("\n", signature_start)
-        context_start = len(text) if newline == -1 else newline + 1
-        explicit_context = True
-    else:
-        context_start = _line_start(text, object_start)
-        explicit_context = False
     stack: list[str] = []
     stack_positions: list[int] = []
     in_string = False
     escaped = False
     pairs = {"}": "{", "]": "["}
-    for offset, char in enumerate(text[context_start:object_start], context_start):
+    for offset, char in enumerate(text[:object_start]):
         if in_string:
             if escaped:
                 escaped = False
@@ -469,8 +460,6 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
             stack_positions.pop()
     if not stack:
         return False
-    if explicit_context:
-        return True
     return any(
         char == "{" and _is_line_start_tag(text, position)
         for char, position in zip(stack, stack_positions)
@@ -506,6 +495,53 @@ def _find_fallback_service_tail(
             continue
         if _looks_like_json_payload(text[signature.end():]):
             return signature.start(), len(text)
+    return None
+
+
+def _json_root_is_unclosed(text: str, start: int) -> bool:
+    stack = [text[start]]
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+    for char in text[start + 1:]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if not stack or stack[-1] != pairs[char]:
+                return True
+            stack.pop()
+            if not stack:
+                return False
+    return bool(stack)
+
+
+def _find_unbalanced_service_tail(
+    text: str,
+    excluded_ranges: list[tuple[int, int]],
+) -> tuple[int, int] | None:
+    roots = re.finditer(r"(?m)^[ \t]*\{", text)
+    for root in roots:
+        start = root.start()
+        if any(begin <= start < end for begin, end in excluded_ranges):
+            continue
+        if not _json_root_is_unclosed(text, start):
+            continue
+        tail = text[start:]
+        if re.search(
+            r'"(?:current_state|current_step|event|events|metadata|save_mode)"\s*:',
+            tail,
+        ):
+            return start, len(text)
     return None
 
 
@@ -647,6 +683,11 @@ def _extract_fallback_data(
     if tail:
         removals.append(tail)
         invalid_count += 1
+    else:
+        tail = _find_unbalanced_service_tail(visible_text, removals)
+        if tail:
+            removals.append(tail)
+            invalid_count += 1
 
     if removals:
         return visible_text, located_blocks, invalid_count, True, removals
