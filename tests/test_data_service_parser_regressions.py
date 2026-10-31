@@ -744,7 +744,17 @@ def test_scientific_interval_does_not_shield_following_service_data():
     assert extraction.invalid_count == 0
 
 
-@pytest.mark.parametrize("interval", ["[0,5; 1,5)", "[0; 1,5)", "[0,5; 1)"])
+@pytest.mark.parametrize(
+    "interval",
+    [
+        "[0,5; 1,5)",
+        "[0; 1,5)",
+        "[0,5; 1)",
+        "[0,5; +∞)",
+        "[-∞; 1,5)",
+        "[0,5; 1e3)",
+    ],
+)
 def test_decimal_comma_interval_does_not_shield_following_service_data(interval):
     raw = (
         f"{interval} — допустимый диапазон.\n"

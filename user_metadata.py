@@ -214,11 +214,12 @@ def _is_prose_interval_start(text: str, position: int) -> bool:
     line_end = text.find("\n", position)
     line = text[position:] if line_end == -1 else text[position:line_end]
     number = r"(?:[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|∞))"
-    if re.match(rf"\[\s*{number}\s*(?:,|;)\s*{number}\s*\)", line):
+    if re.match(rf"\[\s*{number}\s*,\s*{number}\s*\)", line):
         return True
     comma_number = r"(?:[-+]?(?:\d+(?:,\d+)?|,\d+))"
+    semicolon_number = rf"(?:{number}|{comma_number})"
     return bool(
-        re.match(rf"\[\s*{comma_number}\s*;\s*{comma_number}\s*\)", line)
+        re.match(rf"\[\s*{semicolon_number}\s*;\s*{semicolon_number}\s*\)", line)
     )
 
 
