@@ -715,7 +715,7 @@ def test_inline_truncated_array_does_not_recover_nested_service_object():
     assert extraction.invalid_count == 1
 
 
-@pytest.mark.parametrize("interval", ["[0.0, 10.0)", "[0; 10)"])
+@pytest.mark.parametrize("interval", ["[0.0, 10.0)", "[0; 10)", "[0, +∞)"])
 def test_decimal_and_semicolon_intervals_do_not_shield_service_data(interval):
     raw = (
         f"{interval} — допустимый диапазон.\n"
@@ -727,4 +727,28 @@ def test_decimal_and_semicolon_intervals_do_not_shield_service_data(interval):
     assert extraction.visible_text == f"{interval} — допустимый диапазон."
     assert extraction.blocks[0].current_state == {"current_step": "done"}
     assert extraction.blocks[0].events == ["DONE"]
+    assert extraction.invalid_count == 0
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [
+        ("```json\n\n", "\n```\n"),
+        ("````json\n\n", "\n````\n"),
+    ],
+)
+def test_signed_fallback_handles_fence_whitespace_and_lengths(opening, closing):
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        + opening
+        + '{"metadata":{"private":"secret"}}'
+        + closing
+        + "Пояснение для пользователя."
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert "Пояснение для пользователя." in extraction.visible_text
+    assert extraction.blocks[0].metadata == {"private": "secret"}
     assert extraction.invalid_count == 0

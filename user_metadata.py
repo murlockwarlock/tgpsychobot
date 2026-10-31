@@ -213,7 +213,7 @@ def _is_line_start_tag(text: str, position: int) -> bool:
 def _is_prose_interval_start(text: str, position: int) -> bool:
     line_end = text.find("\n", position)
     line = text[position:] if line_end == -1 else text[position:line_end]
-    number = r"-?(?:\d+(?:\.\d+)?|\.\d+)"
+    number = r"(?:[-+]?(?:\d+(?:\.\d+)?|\.\d+)|[-+]?∞)"
     return bool(re.match(rf"\[\s*{number}\s*(?:,|;)\s*{number}\s*\)", line))
 
 
@@ -274,21 +274,40 @@ def _is_tag_candidate(
     )
 
 
+def _is_opening_fence(text: str, line_start: int, line_end: int) -> bool:
+    line = text[line_start:line_end].rstrip("\r\n")
+    if re.fullmatch(r"[ \t]*`{3,}[a-zA-Z0-9_-]+[ \t]*", line):
+        return True
+    if not re.fullmatch(r"[ \t]*`{3,}[ \t]*", line):
+        return False
+    previous_fences = re.findall(
+        r"(?m)^[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?:\r?$)",
+        text[:line_start],
+    )
+    return len(previous_fences) % 2 == 0
+
+
 def _fence_start(text: str, position: int) -> int:
     current_line_start = _line_start(text, position)
     if current_line_start == 0:
         return position
-    previous_line_end = current_line_start
-    previous_line_start = text.rfind("\n", 0, previous_line_end - 1) + 1
-    previous_line = text[previous_line_start:previous_line_end]
-    if MARKDOWN_FENCE_RE.fullmatch(previous_line):
-        return previous_line_start
+    cursor = current_line_start
+    while cursor > 0:
+        previous_end = cursor
+        previous_start = text.rfind("\n", 0, previous_end - 1) + 1
+        previous_line = text[previous_start:previous_end].rstrip("\r\n")
+        if not previous_line.strip():
+            cursor = previous_start
+            continue
+        if _is_opening_fence(text, previous_start, previous_end):
+            return previous_start
+        break
     return position
 
 
 def _fence_end(text: str, position: int) -> int:
     match = re.match(
-        r"\r?\n[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?=\r?\n|$)",
+        r"\r?\n[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?:\r?\n|$)",
         text[position:],
     )
     return position + match.end() if match else position
@@ -428,7 +447,9 @@ def _is_fallback_tail(text: str, end: int, *, fenced: bool) -> bool:
     tail = text[end:]
     if not tail.strip():
         return True
-    return fenced and bool(re.fullmatch(r"\s*```[ \t]*", tail))
+    return fenced and bool(
+        re.fullmatch(r"\s*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*\r?\n?\s*", tail)
+    )
 
 
 def _signature_line_start(text: str, position: int) -> int | None:
