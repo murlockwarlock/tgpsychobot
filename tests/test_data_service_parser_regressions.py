@@ -299,3 +299,52 @@ def test_line_start_literal_data_without_json_is_not_hidden():
     assert visible == raw
     assert blocks == []
     assert invalid == 0
+
+
+def test_valid_fallback_does_not_expose_later_truncated_service_tail():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        '{"metadata":{"public":"value"}}\n'
+        "Служебный блок данных:\n"
+        '{"metadata":{"private":"secret"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert [block.metadata for block in extraction.blocks] == [{"public": "value"}]
+    assert extraction.invalid_count == 1
+
+
+def test_tagged_and_fallback_blocks_are_applied_in_source_order():
+    raw = (
+        "Служебный блок данных:\n"
+        '{"current_state":{"current_step":"first"}}\n'
+        '<DATA>{"current_state":{"current_step":"second"},"events":["SECOND"]}</DATA>'
+    )
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == ""
+    assert [block.current_state for block in blocks] == [
+        {"current_step": "first"},
+        {"current_step": "second"},
+    ]
+    assert [block.events for block in blocks] == [[], ["SECOND"]]
+    assert invalid == 0
+
+
+def test_rejected_literal_truncated_opener_does_not_mask_later_service_opener():
+    raw = (
+        "Упоминание <DATA как слово\n"
+        "Пояснение.\n"
+        '<DATA version="1"\n'
+        '{"metadata":{"private":"secret"}}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Упоминание <DATA как слово\nПояснение."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1

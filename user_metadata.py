@@ -294,6 +294,17 @@ def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
     return "".join(result)
 
 
+def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    masked = list(text)
+    for start, end in spans:
+        for position in range(start, end):
+            if masked[position] not in "\r\n":
+                masked[position] = " "
+    return "".join(masked)
+
+
 def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     stack: list[str] = []
@@ -394,17 +405,21 @@ def _is_service_fallback_payload(payload: dict[str, Any], explicit_signature: bo
     )
 
 
-def _find_fallback_service_tail(text: str) -> tuple[int, int] | None:
-    signature = re.search(
+def _find_fallback_service_tail(
+    text: str,
+    excluded_starts: set[int] | None = None,
+) -> tuple[int, int] | None:
+    excluded_starts = excluded_starts or set()
+    signatures = re.finditer(
         r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?\s*(?:\r?\n|$)",
         text,
     )
-    if not signature:
-        return None
-    tail = text[signature.end():]
-    if not _looks_like_json_payload(tail):
-        return None
-    return signature.start(), len(text)
+    for signature in reversed(list(signatures)):
+        if signature.start() in excluded_starts:
+            continue
+        if _looks_like_json_payload(text[signature.end():]):
+            return signature.start(), len(text)
+    return None
 
 
 def _normalize_visible_text(text: str) -> str:
@@ -415,8 +430,8 @@ def _normalize_visible_text(text: str) -> str:
 
 def _extract_tagged_data(
     raw_text: str,
-) -> tuple[str, list[ServiceDataBlock], int]:
-    blocks: list[ServiceDataBlock] = []
+) -> tuple[str, list[tuple[int, ServiceDataBlock]], int, list[tuple[int, int]]]:
+    located_blocks: list[tuple[int, ServiceDataBlock]] = []
     removals: list[tuple[int, int]] = []
     invalid_count = 0
     search_position = 0
@@ -453,44 +468,57 @@ def _extract_tagged_data(
         if payload is None or not isinstance(payload, dict):
             invalid_count += 1
         else:
-            blocks.append(
-                _normalize_service_payload(
-                    payload,
-                    raw_json,
-                    xml_syntax=kind == "xml",
+            located_blocks.append(
+                (
+                    start,
+                    _normalize_service_payload(
+                        payload,
+                        raw_json,
+                        xml_syntax=kind == "xml",
+                    ),
                 )
             )
         removals.append((start, end))
         search_position = end
 
-    visible_text = _remove_spans(raw_text, removals)
+    visible_text = _mask_spans(raw_text, removals)
     self_closing_matches = list(SELF_CLOSING_DATA_RE.finditer(visible_text))
     if self_closing_matches:
         invalid_count += len(self_closing_matches)
-        visible_text = SELF_CLOSING_DATA_RE.sub("", visible_text)
+        removals.extend((match.start(), match.end()) for match in self_closing_matches)
+        visible_text = _mask_spans(raw_text, removals)
 
-    truncated = TRUNCATED_XML_OPEN_RE.search(visible_text)
-    if truncated and (
-        bool(re.search(r"\s+[^>\r\n]*$", truncated.group(0)))
-        or _is_line_start_tag(visible_text, truncated.start())
-    ) and (
-        _looks_like_json_payload(visible_text[truncated.end():])
-        or not visible_text[truncated.end():].strip()
-    ):
-        start = _fence_start(visible_text, truncated.start())
-        visible_text = visible_text[:start]
-        invalid_count += 1
+    search_position = 0
+    while True:
+        truncated = TRUNCATED_XML_OPEN_RE.search(visible_text, search_position)
+        if truncated is None:
+            break
+        is_attr_opener = bool(re.search(r"\s+[^>\r\n]*$", truncated.group(0)))
+        is_candidate = (
+            is_attr_opener or _is_line_start_tag(visible_text, truncated.start())
+        ) and (
+            _looks_like_json_payload(visible_text[truncated.end():])
+            or not visible_text[truncated.end():].strip()
+        )
+        if is_candidate:
+            start = _fence_start(visible_text, truncated.start())
+            removals.append((start, len(raw_text)))
+            invalid_count += 1
+            visible_text = _mask_spans(raw_text, removals)
+            break
+        search_position = truncated.end()
 
-    return _normalize_visible_text(visible_text), blocks, invalid_count
+    return visible_text, located_blocks, invalid_count, removals
 
 
 def _extract_fallback_data(
     visible_text: str,
-) -> tuple[str, list[ServiceDataBlock], int, bool]:
+) -> tuple[str, list[tuple[int, ServiceDataBlock]], int, bool, list[tuple[int, int]]]:
     spans = _find_balanced_json_spans(visible_text)
     removals: list[tuple[int, int]] = []
-    blocks: list[ServiceDataBlock] = []
+    located_blocks: list[tuple[int, ServiceDataBlock]] = []
     invalid_count = 0
+    excluded_signature_starts: set[int] = set()
     for object_start, object_end in spans:
         start, fenced = _fallback_removal_start(visible_text, object_start)
         explicit_signature = _has_explicit_service_signature(visible_text, object_start)
@@ -504,41 +532,52 @@ def _extract_fallback_data(
             if explicit_signature:
                 end = _fence_end(visible_text, object_end) if fenced else object_end
                 removals.append((start, end))
+                excluded_signature_starts.add(start)
                 invalid_count += 1
             continue
         if not isinstance(payload, dict) or not _is_service_fallback_payload(payload, explicit_signature):
             continue
         end = _fence_end(visible_text, object_end) if fenced else object_end
-        blocks.append(_normalize_service_payload(payload, candidate, xml_syntax=True))
+        located_blocks.append(
+            (
+                start,
+                _normalize_service_payload(payload, candidate, xml_syntax=True),
+            )
+        )
         removals.append((start, end))
+        excluded_signature_starts.add(start)
+
+    tail = _find_fallback_service_tail(visible_text, excluded_signature_starts)
+    if tail:
+        removals.append(tail)
+        invalid_count += 1
 
     if removals:
-        cleaned = _normalize_visible_text(_remove_spans(visible_text, removals))
-        return cleaned, blocks, invalid_count, True
-
-    tail = _find_fallback_service_tail(visible_text)
-    if tail:
-        cleaned = _normalize_visible_text(_remove_spans(visible_text, [tail]))
-        return cleaned, [], 1, True
-    return visible_text, [], 0, False
+        return visible_text, located_blocks, invalid_count, True, removals
+    return visible_text, located_blocks, 0, False, removals
 
 
 def extract_service_data_details(text: str | None) -> ServiceDataExtraction:
     raw_text = text or ""
-    visible_text, blocks, invalid_count = _extract_tagged_data(raw_text)
+    masked_text, tagged_blocks, invalid_count, tagged_removals = _extract_tagged_data(raw_text)
     classification = "none"
-    if blocks or invalid_count:
-        classification = "tags" if blocks and not invalid_count else "parse_error"
+    if tagged_blocks or invalid_count:
+        classification = "tags" if tagged_blocks and not invalid_count else "parse_error"
 
-    visible_text, fallback_blocks, fallback_invalid, used_fallback = _extract_fallback_data(visible_text)
+    _, fallback_blocks, fallback_invalid, used_fallback, fallback_removals = _extract_fallback_data(masked_text)
     if used_fallback:
-        blocks.extend(fallback_blocks)
         invalid_count += fallback_invalid
         classification = "fallback" if not invalid_count else "parse_error"
 
+    located_blocks = sorted(
+        tagged_blocks + fallback_blocks,
+        key=lambda item: item[0],
+    )
+    visible_text = _remove_spans(raw_text, tagged_removals + fallback_removals)
+
     return ServiceDataExtraction(
         visible_text=_normalize_visible_text(visible_text),
-        blocks=blocks,
+        blocks=[block for _, block in located_blocks],
         invalid_count=invalid_count,
         classification=classification,
     )
