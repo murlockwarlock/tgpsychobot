@@ -338,7 +338,8 @@ def _is_fallback_tail(text: str, end: int, *, fenced: bool) -> bool:
 
 
 def _signature_line_start(text: str, position: int) -> int | None:
-    line_start = _line_start(text, position)
+    fence_start = _fence_start(text, position)
+    line_start = _line_start(text, fence_start)
     cursor = line_start
     found: int | None = None
     while cursor > 0:

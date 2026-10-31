@@ -161,6 +161,22 @@ def test_fallback_metadata_requires_service_signature():
     assert invalid == 0
 
 
+def test_signed_metadata_in_markdown_fence_is_service_data():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```json\n"
+        '{"metadata":{"ws":{"ok":true}}}\n'
+        "```"
+    )
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == "Ответ."
+    assert blocks[0].metadata == {"ws": {"ok": True}}
+    assert invalid == 0
+
+
 def test_truncated_untagged_service_json_is_hidden_without_partial_state():
     raw = 'Ответ.\nСлужебный блок данных:\n{"current_step":"secret","metadata":{"private":'
 
