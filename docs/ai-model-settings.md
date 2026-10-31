@@ -28,13 +28,15 @@
 - `FALSE` становится `Выкл`;
 - legacy поля не удаляются и не перезаписываются.
 
+При инициализации и при разрешении scoped-настройки числовой persisted override нормализуется к текущему лимиту модели. Например, старый `32768` для OpenRouter DeepSeek V4 Pro становится `16384`; это сохраняется application initialization path и не требует ручного сброса в Admin. Runtime дополнительно применяет тот же fail-safe clamp перед wire serialization.
+
 `Auto` не вычисляет внутренний лимит для отправки. Для провайдеров с обязательным output budget runtime использует их безопасный обязательный limit; для остальных поле не отправляется. Fallback-разговор разрешает настройки по фактической паре fallback provider/model.
 
 Для DeepSeek Chat Completions `Auto` не добавляет thinking-параметры, `Выкл` отправляет `extra_body.thinking.type=disabled`, а `Low`, `High` и `Max` отправляют `reasoning_effort` вместе с `extra_body.thinking.type=enabled`. Это direct DeepSeek contract и он не переносится в OpenRouter.
 
 ## OpenRouter Reasoning
 
-OpenRouter capability хранится в `OpenRouterModelSpec.reasoning`. В ней фиксируются документированные modes, `supported_efforts`, `mandatory`, default metadata, возможность отключения, поддержка temperature и `reasoning.exclude`. Model picker не проверяет имена с prefix heuristic.
+OpenRouter capability хранится в `OpenRouterModelSpec.reasoning`. В ней фиксируются документированные modes, наличие и значение `supported_efforts`, `mandatory`, default metadata, возможность отключения, поддержка temperature и `reasoning.exclude`. `supports_max_tokens` reasoning object не заявляется, если live metadata его не содержит; это отдельное поле от outer `max_tokens`. Model picker не проверяет имена с prefix heuristic.
 
 Для подтверждённых curated моделей текущий набор такой:
 
@@ -46,9 +48,13 @@ OpenRouter capability хранится в `OpenRouterModelSpec.reasoning`. В н
 | `deepseek/deepseek-v4-pro` | `Auto / Выкл / High / Max` | `High`, `Max → xhigh`, `Выкл → none` |
 | `deepseek/deepseek-v4.1-flash` | `Auto / Выкл / Low / High / Max` | documented effort values; `Max → max` |
 
+Для Qwen3.7 отсутствие ключа `supported_efforts` означает toggle-only contract. Это не эквивалентно JSON `supported_efforts: null`: verifier сохраняет presence и отмечает такой drift, не добавляя неподтверждённые effort-кнопки.
+
 `Auto` означает отсутствие `reasoning` override. Explicit mode отправляет документированный OpenRouter `reasoning` object и `exclude: true`, чтобы reasoning trace не возвращался в ответ. Для explicit override добавляется `provider.require_parameters=true`; это гарантирует маршрутизацию только на endpoints, поддерживающие фактический request contract. Auto не включает reasoning-specific routing restriction.
 
 `output_limit` curated-модели — portable safe floor для всех request contracts, которые приложение может отправить. Для `qwen/qwen3.8-27b` это `32768`: live `top_provider.max_completion_tokens` может быть `235929`, но endpoint matrix содержит активный совместимый endpoint с лимитом `32768`. Catalog verifier сравнивает отдельно top-provider limit, endpoint-safe floor и static application limit.
+
+`moonshotai/kimi-k2.6` также имеет `configured_output_limit=16384`: текущая live endpoint matrix содержит активный endpoint с минимумом `16384`, поэтому прежний `235929` не был routing-independent safe floor. Это не reasoning UI change, а обязательная защита общего endpoint-safe contract.
 
 Reasoning tokens входят в output budget. Ответ `finish_reason=length` с пустым content классифицируется как `output_budget_exhausted`, сохраняет только finish reason и безопасный usage summary и не запускает платный retry. `reasoning`, `reasoning_details` и аналогичные скрытые поля не попадают в user-facing text, историю, diagnostics или fallback prompt.
 

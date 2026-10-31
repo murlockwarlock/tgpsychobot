@@ -509,6 +509,52 @@ async def test_telegram_and_max_runtime_share_explicit_openrouter_reasoning_payl
 
 
 @pytest.mark.asyncio
+async def test_telegram_and_max_runtime_normalize_legacy_openrouter_output_limit(egress_db, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    async with egress_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.openrouter_model = "deepseek/deepseek-v4-pro"
+        session.add(
+            AIModelSettings(
+                provider="OpenRouter",
+                model="deepseek/deepseek-v4-pro",
+                channel="chat",
+                max_output_tokens=32768,
+                reasoning_effort="max",
+            )
+        )
+        await session.commit()
+
+    payloads = []
+
+    async def spy_post(self, url, *args, **kwargs):
+        payloads.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
+        )
+
+    with patch.object(httpx.AsyncClient, "post", spy_post):
+        assert await ai_integration.generate_response(101, "Legacy Telegram limit") == "ok"
+        assert await max_ai.get_ai_response(101, "Legacy MAX limit") == "ok"
+
+    assert len(payloads) == 2
+    assert all(payload["max_tokens"] == 16384 for payload in payloads)
+    assert all(payload["reasoning"] == {"effort": "xhigh", "exclude": True} for payload in payloads)
+    async with egress_db() as session:
+        row = await session.scalar(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "OpenRouter",
+                AIModelSettings.model == "deepseek/deepseek-v4-pro",
+                AIModelSettings.channel == "chat",
+            )
+        )
+        assert row.max_output_tokens == 16384
+
+
+@pytest.mark.asyncio
 async def test_max_handle_update_reaches_scoped_openrouter_runtime_and_history(egress_db, monkeypatch):
     monkeypatch.delenv("OPENROUTER_PROXY", raising=False)
     monkeypatch.delenv("HTTPS_PROXY", raising=False)

@@ -165,6 +165,44 @@ def normalize_reasoning_effort(provider: str | None, model: str | None, value: A
     return normalized if normalized in REASONING_VALUES else REASONING_AUTO
 
 
+def normalize_persisted_max_output_tokens(
+    provider: str | None,
+    model: str | None,
+    value: Any,
+    *,
+    reasoning_effort: str | None = None,
+) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 1:
+        return None
+    normalized_provider = canonical_provider_name(provider)
+    normalized_model = str(model or "").strip()
+    normalized_reasoning = normalize_reasoning_effort(normalized_provider, normalized_model, reasoning_effort)
+    limit = get_chat_output_token_limit(normalized_provider, normalized_model, normalized_reasoning)
+    return min(parsed, limit) if limit is not None else parsed
+
+
+async def normalize_persisted_model_settings(session) -> int:
+    rows = (await session.execute(select(AIModelSettings))).scalars().all()
+    changed = 0
+    for row in rows:
+        normalized = normalize_persisted_max_output_tokens(
+            row.provider,
+            row.model,
+            row.max_output_tokens,
+            reasoning_effort=row.reasoning_effort,
+        )
+        if row.max_output_tokens != normalized:
+            row.max_output_tokens = normalized
+            changed += 1
+    return changed
+
+
 def reasoning_from_legacy(value: bool | None) -> str:
     if value is True:
         return REASONING_HIGH
@@ -285,25 +323,39 @@ async def resolve_model_settings(
         hasattr(row, field)
         for field in ("max_output_tokens", "temperature", "reasoning_effort")
     ):
+        normalized_reasoning = normalize_reasoning_effort(normalized_provider, normalized_model, row.reasoning_effort)
+        normalized_max_output_tokens = normalize_persisted_max_output_tokens(
+            normalized_provider,
+            normalized_model,
+            row.max_output_tokens,
+            reasoning_effort=normalized_reasoning,
+        )
+        row.max_output_tokens = normalized_max_output_tokens
         return ResolvedModelSettings(
             normalized_provider,
             normalized_model,
             normalized_channel,
-            row.max_output_tokens,
+            normalized_max_output_tokens,
             row.temperature,
-            normalize_reasoning_effort(normalized_provider, normalized_model, row.reasoning_effort),
+            normalized_reasoning,
             "model",
         )
     if config is None:
         config = await session.get(AIConfig, 1)
     if normalized_channel == "chat" and not scoped_rows_exist and _legacy_scope(config, normalized_provider, normalized_model):
+        legacy_reasoning = reasoning_from_legacy(getattr(config, "deepseek_thinking_enabled", None)) if normalized_provider == PROVIDER_DEEPSEEK else REASONING_AUTO
         return ResolvedModelSettings(
             normalized_provider,
             normalized_model,
             normalized_channel,
-            getattr(config, "max_output_tokens", None),
+            normalize_persisted_max_output_tokens(
+                normalized_provider,
+                normalized_model,
+                getattr(config, "max_output_tokens", None),
+                reasoning_effort=legacy_reasoning,
+            ),
             getattr(config, "temperature", None),
-            reasoning_from_legacy(getattr(config, "deepseek_thinking_enabled", None)) if normalized_provider == PROVIDER_DEEPSEEK else REASONING_AUTO,
+            legacy_reasoning,
             "legacy",
         )
     return ResolvedModelSettings(normalized_provider, normalized_model, normalized_channel, None, None, REASONING_AUTO, "default")
@@ -319,6 +371,13 @@ async def get_or_create_model_settings(session, provider: str | None, model: str
         )
     )
     if row is not None:
+        normalized = normalize_persisted_max_output_tokens(
+            normalized_provider,
+            normalized_model,
+            row.max_output_tokens,
+            reasoning_effort=row.reasoning_effort,
+        )
+        row.max_output_tokens = normalized
         return row
     resolved = await resolve_model_settings(session, normalized_provider, normalized_model, normalized_channel, config=config)
     row = AIModelSettings(
@@ -337,11 +396,19 @@ async def get_or_create_model_settings(session, provider: str | None, model: str
 def wire_max_output_tokens(settings: ResolvedModelSettings) -> int | None:
     capabilities = get_generation_capabilities(settings.provider, settings.model, settings.channel)
     if settings.max_output_tokens is not None:
+        normalized = normalize_persisted_max_output_tokens(
+            settings.provider,
+            settings.model,
+            settings.max_output_tokens,
+            reasoning_effort=settings.reasoning_effort,
+        )
+        if normalized is None:
+            return capabilities.output_limit if capabilities.max_output_tokens_required else None
         return validate_model_setting(
             settings.provider,
             settings.model,
             "max_output_tokens",
-            settings.max_output_tokens,
+            normalized,
             reasoning_effort=settings.reasoning_effort,
         )
     if capabilities.max_output_tokens_required:

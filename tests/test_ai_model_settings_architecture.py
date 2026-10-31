@@ -8,6 +8,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 from unittest.mock import AsyncMock
@@ -28,6 +29,7 @@ from ai_model_settings import (
     get_generation_capabilities,
     get_or_create_model_settings,
     normalize_reasoning_effort,
+    normalize_persisted_model_settings,
     resolve_model_settings,
     validate_model_setting,
     wire_max_output_tokens,
@@ -35,7 +37,7 @@ from ai_model_settings import (
     wire_temperature,
 )
 from ai_request_context import AIRequestLayout
-from database import AIConfig, Base
+from database import AIConfig, AIModelSettings, Base
 from provider_models import (
     ModelUnavailableError,
     OPENROUTER_MODEL_SPECS,
@@ -129,6 +131,45 @@ async def test_model_scoped_settings_survive_switching(settings_db):
     assert deepseek_resolved.reasoning_effort == REASONING_MAX
     assert deepseek_resolved.max_output_tokens is None
     assert openai_resolved.max_output_tokens == 12000
+
+
+@pytest.mark.asyncio
+async def test_persisted_output_overrides_are_normalized_for_all_lowered_models(settings_db):
+    legacy_values = {
+        "deepseek/deepseek-v4-flash": 100000,
+        "deepseek/deepseek-v4-pro": 32768,
+        "deepseek/deepseek-v4.1-flash": 200000,
+        "qwen/qwen3-vl-235b-a22b-instruct": 32768,
+        "moonshotai/kimi-k2.6": 235929,
+    }
+    expected = {
+        "deepseek/deepseek-v4-flash": 32768,
+        "deepseek/deepseek-v4-pro": 16384,
+        "deepseek/deepseek-v4.1-flash": 131072,
+        "qwen/qwen3-vl-235b-a22b-instruct": 16384,
+        "moonshotai/kimi-k2.6": 16384,
+    }
+    async with settings_db() as session:
+        session.add_all(
+            AIModelSettings(
+                provider="OpenRouter",
+                model=model,
+                channel="chat",
+                max_output_tokens=value,
+            )
+            for model, value in legacy_values.items()
+        )
+        await session.commit()
+
+        assert await normalize_persisted_model_settings(session) == len(legacy_values)
+        await session.commit()
+
+    async with settings_db() as session:
+        rows = (await session.execute(select(AIModelSettings))).scalars().all()
+        assert {row.model: row.max_output_tokens for row in rows} == expected
+        resolved = await resolve_model_settings(session, "OpenRouter", "deepseek/deepseek-v4-pro")
+        assert resolved.max_output_tokens == 16384
+        assert wire_max_output_tokens(resolved) == 16384
 
 
 @pytest.mark.asyncio

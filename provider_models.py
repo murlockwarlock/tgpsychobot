@@ -112,11 +112,13 @@ class OpenRouterReasoningSpec:
     mandatory: bool
     default_enabled: bool | None
     default_effort: str | None
-    supports_max_tokens: bool
+    supports_max_tokens: bool | None
     can_disable: bool
     temperature_supported_with_reasoning: bool
     exclude_supported: bool
     effort_map: tuple[tuple[str, str], ...] = ()
+    supported_efforts_present: bool = True
+    supports_max_tokens_present: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,8 +139,8 @@ OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
     "google/gemini-2.5-flash": OpenRouterModelSpec("google/gemini-2.5-flash", "Google Gemini 2.5 Flash", True, True, True, 1048576, 65535),
     "google/gemini-3-flash-preview": OpenRouterModelSpec("google/gemini-3-flash-preview", "Google Gemini 3 Flash Preview", True, True, True, 1048576, 65536),
     "openai/gpt-5.6-luna": OpenRouterModelSpec("openai/gpt-5.6-luna", "OpenAI GPT-5.6 Luna", True, True, False, 1050000, 128000, temperature=False),
-    "deepseek/deepseek-v4-flash": OpenRouterModelSpec("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", True, False, False, 1048576, 32768, reasoning=OpenRouterReasoningSpec(("auto", "none", "high", "max"), ("xhigh", "high", "none"), False, None, "high", True, True, True, True, (("max", "xhigh"),))),
-    "deepseek/deepseek-v4-pro": OpenRouterModelSpec("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", True, False, False, 1048576, 16384, reasoning=OpenRouterReasoningSpec(("auto", "none", "high", "max"), ("xhigh", "high", "none"), False, None, "high", True, True, True, True, (("max", "xhigh"),))),
+    "deepseek/deepseek-v4-flash": OpenRouterModelSpec("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", True, False, False, 1048576, 32768, reasoning=OpenRouterReasoningSpec(("auto", "none", "high", "max"), ("xhigh", "high", "none"), False, None, "high", None, True, True, True, (("max", "xhigh"),))),
+    "deepseek/deepseek-v4-pro": OpenRouterModelSpec("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", True, False, False, 1048576, 16384, reasoning=OpenRouterReasoningSpec(("auto", "none", "high", "max"), ("xhigh", "high", "none"), False, None, "high", None, True, True, True, (("max", "xhigh"),))),
     "openai/gpt-5.6-terra": OpenRouterModelSpec("openai/gpt-5.6-terra", "OpenAI GPT-5.6 Terra", True, True, False, 1050000, 128000, temperature=False),
     "openai/gpt-5.6-sol": OpenRouterModelSpec("openai/gpt-5.6-sol", "OpenAI GPT-5.6 Sol", True, True, False, 1050000, 128000, temperature=False),
     "openai/gpt-5.6-luna-pro": OpenRouterModelSpec("openai/gpt-5.6-luna-pro", "OpenAI GPT-5.6 Luna Pro", True, True, False, 1050000, 128000, temperature=False),
@@ -150,10 +152,10 @@ OPENROUTER_MODEL_SPECS: dict[str, OpenRouterModelSpec] = {
     "anthropic/claude-haiku-4.5": OpenRouterModelSpec("anthropic/claude-haiku-4.5", "Anthropic Claude Haiku 4.5", True, True, False, 200000, 64000),
     "x-ai/grok-4.7": OpenRouterModelSpec("x-ai/grok-4.7", "xAI Grok 4.7", True, True, False, 500000, 450000),
     "x-ai/grok-4.6": OpenRouterModelSpec("x-ai/grok-4.6", "xAI Grok 4.6", True, True, False, 500000, 450000),
-    "deepseek/deepseek-v4.1-flash": OpenRouterModelSpec("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", True, True, False, 1048576, 131072, reasoning=OpenRouterReasoningSpec(("auto", "none", "low", "high", "max"), ("max", "high", "low", "none"), False, True, "high", True, True, True, True)),
+    "deepseek/deepseek-v4.1-flash": OpenRouterModelSpec("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", True, True, False, 1048576, 131072, reasoning=OpenRouterReasoningSpec(("auto", "none", "low", "high", "max"), ("max", "high", "low", "none"), False, True, "high", None, True, True, True)),
     "qwen/qwen3-vl-235b-a22b-instruct": OpenRouterModelSpec("qwen/qwen3-vl-235b-a22b-instruct", "Qwen3 VL 235B Instruct", True, True, False, 262144, 16384),
-    "qwen/qwen3.7-plus": OpenRouterModelSpec("qwen/qwen3.7-plus", "Qwen3.7 Plus", True, True, False, 1000000, 131072, reasoning=OpenRouterReasoningSpec(("auto", "none", "enabled"), None, False, True, None, True, True, True, True)),
-    "qwen/qwen3.8-27b": OpenRouterModelSpec("qwen/qwen3.8-27b", "Qwen3.8 27B", True, True, False, 1000000, 32768, reasoning=OpenRouterReasoningSpec(("auto", "none", "low", "medium", "max"), ("xhigh", "medium", "low", "none"), False, True, "xhigh", True, True, True, True, (("max", "xhigh"),))),
+    "qwen/qwen3.7-plus": OpenRouterModelSpec("qwen/qwen3.7-plus", "Qwen3.7 Plus", True, True, False, 1000000, 131072, reasoning=OpenRouterReasoningSpec(("auto", "none", "enabled"), None, False, True, None, None, True, True, True, supported_efforts_present=False)),
+    "qwen/qwen3.8-27b": OpenRouterModelSpec("qwen/qwen3.8-27b", "Qwen3.8 27B", True, True, False, 1000000, 32768, reasoning=OpenRouterReasoningSpec(("auto", "none", "low", "medium", "max"), ("xhigh", "medium", "low", "none"), False, True, "xhigh", None, True, True, True, (("max", "xhigh"),))),
     "moonshotai/kimi-k2.6": OpenRouterModelSpec("moonshotai/kimi-k2.6", "Kimi K2.6", True, True, False, 262144, 16384),
     "mistralai/mistral-medium-3-5": OpenRouterModelSpec("mistralai/mistral-medium-3-5", "Mistral Medium 3.5", True, True, False, 262144, 209715),
 }

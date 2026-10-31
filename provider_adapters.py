@@ -5,6 +5,7 @@ import base64
 import copy
 import json
 import logging
+import math
 import mimetypes
 import os
 import random
@@ -1628,6 +1629,13 @@ async def verify_openrouter_catalog(
         supported_parameters = tuple(sorted(str(value) for value in item.get("supported_parameters") or ()))
         live_reasoning = item.get("reasoning") if isinstance(item.get("reasoning"), dict) else None
         live_reasoning_present = live_reasoning is not None or "reasoning" in supported_parameters
+        live_supported_efforts_present = live_reasoning is not None and "supported_efforts" in live_reasoning
+        live_reasoning_supports_max_tokens_present = live_reasoning is not None and "supports_max_tokens" in live_reasoning
+        live_reasoning_supports_max_tokens = (
+            live_reasoning.get("supports_max_tokens")
+            if live_reasoning_supports_max_tokens_present
+            else None
+        )
         mismatches: list[str] = []
         if spec.text != ("text" in modalities):
             mismatches.append("text")
@@ -1661,31 +1669,41 @@ async def verify_openrouter_catalog(
         contract_limits: dict[str, list[int]] = {}
         contract_counts: dict[str, int] = {}
         contract_requirements: dict[str, list[list[str]]] = {}
+        contract_unknown_limits: dict[str, bool] = {}
         all_limits: list[int] = []
         incomplete_contracts = []
+
+        def endpoint_completion_limit(endpoint: dict[str, Any]) -> int | None:
+            value = endpoint.get("max_completion_tokens")
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return value if value > 0 else None
+            if isinstance(value, float) and math.isfinite(value) and value.is_integer() and value > 0:
+                return int(value)
+            return None
+
         for contract in contracts:
             compatible = [
                 endpoint
                 for endpoint in active_endpoints
                 if openrouter_endpoint_supports_contract(endpoint, contract)
             ]
-            limits = [
-                int(endpoint["max_completion_tokens"])
-                for endpoint in compatible
-                if isinstance(endpoint.get("max_completion_tokens"), (int, float))
-                and int(endpoint["max_completion_tokens"]) > 0
-            ]
+            endpoint_limits = [endpoint_completion_limit(endpoint) for endpoint in compatible]
+            invalid_limit = any(limit is None for limit in endpoint_limits)
+            limits = [limit for limit in endpoint_limits if limit is not None]
             contract_key = contract.reasoning_mode
             contract_limits.setdefault(contract_key, []).extend(limits)
             contract_counts[contract_key] = max(contract_counts.get(contract_key, 0), len(compatible))
+            contract_unknown_limits[contract_key] = contract_unknown_limits.get(contract_key, False) or invalid_limit
             requirements = contract_requirements.setdefault(contract_key, [])
             if list(contract.required_parameters) not in requirements:
                 requirements.append(list(contract.required_parameters))
             all_limits.extend(limits)
-            if not limits:
+            if invalid_limit or not limits:
                 incomplete_contracts.append(contract)
         endpoint_safe_by_mode = {
-            mode: min(limits) if limits else None
+            mode: None if contract_unknown_limits.get(mode) or not limits else min(limits)
             for mode, limits in contract_limits.items()
         }
         endpoint_safe_limit = min(all_limits) if not incomplete_contracts and all_limits else None
@@ -1706,17 +1724,18 @@ async def verify_openrouter_catalog(
             mismatches.append("reasoning/metadata")
         elif static_reasoning and live_reasoning_present:
             live_efforts = live_reasoning.get("supported_efforts") if live_reasoning else None
-            if static_reasoning.supported_efforts is None:
-                if live_efforts:
-                    mismatches.append("reasoning/supported_efforts")
-            elif set(static_reasoning.supported_efforts) != set(live_efforts or ()):
+            if static_reasoning.supported_efforts_present != live_supported_efforts_present:
+                mismatches.append("reasoning/supported_efforts")
+            elif static_reasoning.supported_efforts_present and set(static_reasoning.supported_efforts or ()) != set(live_efforts or ()):
                 mismatches.append("reasoning/supported_efforts")
             for field_name in ("mandatory", "default_enabled", "default_effort"):
                 expected = getattr(static_reasoning, field_name)
                 observed = live_reasoning.get(field_name) if live_reasoning else None
                 if expected is not None and observed != expected:
                     mismatches.append(f"reasoning/{field_name}")
-            if static_reasoning.supports_max_tokens != ("max_tokens" in supported_parameters):
+            if static_reasoning.supports_max_tokens_present != live_reasoning_supports_max_tokens_present:
+                mismatches.append("reasoning/supports_max_tokens")
+            elif static_reasoning.supports_max_tokens_present and static_reasoning.supports_max_tokens != live_reasoning_supports_max_tokens:
                 mismatches.append("reasoning/supports_max_tokens")
             live_can_disable = not bool(live_reasoning.get("mandatory")) if live_reasoning else False
             if static_reasoning.can_disable != live_can_disable:
@@ -1744,11 +1763,14 @@ async def verify_openrouter_catalog(
             "supported_parameters": list(supported_parameters),
             "reasoning": live_reasoning,
             "reasoning_present": live_reasoning_present,
-            "supported_efforts": live_reasoning.get("supported_efforts") if live_reasoning else None,
+            "supported_efforts_present": live_supported_efforts_present,
+            "supported_efforts": live_reasoning.get("supported_efforts") if live_supported_efforts_present else None,
             "mandatory": live_reasoning.get("mandatory") if live_reasoning else None,
             "default_enabled": live_reasoning.get("default_enabled") if live_reasoning else None,
             "default_effort": live_reasoning.get("default_effort") if live_reasoning else None,
-            "supports_max_tokens": "max_tokens" in supported_parameters,
+            "outer_max_tokens_supported": "max_tokens" in supported_parameters,
+            "reasoning_supports_max_tokens_present": live_reasoning_supports_max_tokens_present,
+            "reasoning_supports_max_tokens": live_reasoning_supports_max_tokens,
             "can_disable": not bool(live_reasoning.get("mandatory")) if live_reasoning else False,
             "temperature_supported": "temperature" in supported_parameters,
             "status": live_status,

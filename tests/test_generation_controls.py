@@ -256,12 +256,14 @@ async def test_openrouter_fallback_resolves_reasoning_by_actual_model(generation
                 provider="OpenRouter",
                 model="qwen/qwen3-vl-235b-a22b-instruct",
                 channel="chat",
+                max_output_tokens=50000,
                 reasoning_effort="max",
             ),
             AIModelSettings(
                 provider="OpenRouter",
                 model="qwen/qwen3.8-27b",
                 channel="chat",
+                max_output_tokens=50000,
                 reasoning_effort="max",
             ),
         ])
@@ -280,6 +282,8 @@ async def test_openrouter_fallback_resolves_reasoning_by_actual_model(generation
 
     assert calls[0]["reasoning_effort"] is None
     assert calls[1]["reasoning_effort"] == "max"
+    assert calls[0]["max_output_tokens"] == 16384
+    assert calls[1]["max_output_tokens"] == 32768
 
 
 @pytest.mark.asyncio

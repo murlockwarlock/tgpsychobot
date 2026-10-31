@@ -123,6 +123,11 @@ def test_catalog_verifier_uses_endpoint_safe_floor_not_top_provider_limit():
     assert evidence["configured_output_limit"] == 32768
     assert evidence["endpoint_safe_output_limits_by_mode"]["auto"] == 32768
     assert evidence["endpoint_safe_output_limits_by_mode"]["max"] == 32768
+    assert evidence["compatible_endpoint_counts_by_mode"]["auto"] == 2
+    assert evidence["compatible_endpoint_counts_by_mode"]["max"] == 1
+    assert evidence["supported_efforts_present"] is True
+    assert evidence["reasoning_supports_max_tokens_present"] is False
+    assert evidence["reasoning_supports_max_tokens"] is None
     assert evidence["matches_static"] is True
     assert "configured_output_limit" not in evidence["mismatches"]
 
@@ -182,7 +187,98 @@ def test_qwen37_endpoint_safe_floor_is_verified_separately_from_top_provider():
     assert evidence["endpoint_safe_output_limit"] == 131072
     assert evidence["configured_output_limit"] == 131072
     assert evidence["supported_efforts"] is None
+    assert evidence["supported_efforts_present"] is False
+    assert evidence["reasoning_supports_max_tokens_present"] is False
+    assert evidence["reasoning_supports_max_tokens"] is None
     assert evidence["mandatory"] is False
     assert evidence["default_enabled"] is True
     assert evidence["can_disable"] is True
+    assert evidence["matches_static"] is True
+
+
+def test_catalog_verifier_distinguishes_null_efforts_from_omitted_efforts():
+    item = _qwen38_catalog_item()
+    item["reasoning"]["supported_efforts"] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(200, json={"data": [item]})
+        if request.url.path.endswith("/endpoints"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "endpoints": [{
+                            "status": 0,
+                            "max_completion_tokens": 32768,
+                            "supported_parameters": [
+                                "max_tokens",
+                                "temperature",
+                                "reasoning",
+                                "reasoning_effort",
+                            ],
+                        }]
+                    }
+                },
+            )
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    result = asyncio.run(verify_openrouter_catalog(transport=httpx.MockTransport(handler)))
+    evidence = result["qwen/qwen3.8-27b"]
+    assert evidence["supported_efforts_present"] is True
+    assert evidence["supported_efforts"] is None
+    assert "reasoning/supported_efforts" in evidence["mismatches"]
+
+
+def test_catalog_verifier_fails_closed_when_compatible_endpoint_limit_is_unknown():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(200, json={"data": [_qwen38_catalog_item()]})
+        if request.url.path.endswith("/endpoints"):
+            params = ["max_tokens", "temperature", "reasoning", "reasoning_effort"]
+            return httpx.Response(
+                200,
+                json={"data": {"endpoints": [
+                    {"status": 0, "max_completion_tokens": 32768, "supported_parameters": params},
+                    {"status": 0, "supported_parameters": params},
+                ]}},
+            )
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    result = asyncio.run(verify_openrouter_catalog(transport=httpx.MockTransport(handler)))
+    evidence = result["qwen/qwen3.8-27b"]
+    assert evidence["endpoint_safe_output_limit"] is None
+    assert evidence["endpoint_safe_output_limits_by_mode"]["auto"] is None
+    assert evidence["endpoint_safe_output_limits_by_mode"]["max"] is None
+    assert "endpoint_safe_output_limit" in evidence["mismatches"]
+
+
+def test_kimi_portable_limit_matches_active_endpoint_floor():
+    item = {
+        "id": "moonshotai/kimi-k2.6",
+        "canonical_slug": "moonshotai/kimi-k2.6-20260420",
+        "architecture": {"input_modalities": ["text", "image"]},
+        "context_length": 262144,
+        "top_provider": {"max_completion_tokens": 235929},
+        "supported_parameters": ["max_tokens", "temperature", "tools"],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(200, json={"data": [item]})
+        if request.url.path.endswith("/endpoints"):
+            return httpx.Response(
+                200,
+                json={"data": {"endpoints": [
+                    {"status": 0, "max_completion_tokens": 16384, "supported_parameters": ["max_tokens", "temperature"]},
+                    {"status": 0, "max_completion_tokens": 235929, "supported_parameters": ["max_tokens", "temperature"]},
+                ]}},
+            )
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    result = asyncio.run(verify_openrouter_catalog(transport=httpx.MockTransport(handler)))
+    evidence = result["moonshotai/kimi-k2.6"]
+    assert evidence["configured_output_limit"] == 16384
+    assert evidence["endpoint_safe_output_limit"] == 16384
+    assert evidence["top_provider_output_limit"] == 235929
     assert evidence["matches_static"] is True
