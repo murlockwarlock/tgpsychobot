@@ -210,9 +210,40 @@ def _is_line_start_tag(text: str, position: int) -> bool:
     return not text[_line_start(text, position):position].strip()
 
 
+def _is_prose_interval_start(text: str, position: int) -> bool:
+    line_end = text.find("\n", position)
+    line = text[position:] if line_end == -1 else text[position:line_end]
+    return bool(re.match(r"\[\s*-?\d+(?:\s*,\s*-?\d+)?\s*\)", line))
+
+
 def _is_json_array_root_candidate(text: str, position: int) -> bool:
+    if _is_prose_interval_start(text, position):
+        return False
     next_position = _skip_whitespace(text, position + 1)
-    return text[next_position:next_position + 1] in {"{", "["}
+    return text[next_position:next_position + 1] in {
+        "{",
+        "[",
+        '"',
+        "-",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "t",
+        "f",
+        "n",
+    }
+
+
+def _is_json_object_root_candidate(text: str, position: int) -> bool:
+    next_position = _skip_whitespace(text, position + 1)
+    return bool(re.match(r'"(?:\\.|[^"\\])*"\s*:', text[next_position:]))
 
 
 def _skip_whitespace(text: str, position: int) -> int:
@@ -457,7 +488,11 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
             continue
         if not stack:
             if (
-                char == "{" and _is_line_start_tag(text, offset)
+                char == "{"
+                and (
+                    _is_line_start_tag(text, offset)
+                    or _is_json_object_root_candidate(text, offset)
+                )
             ) or (
                 char == "["
                 and _is_line_start_tag(text, offset)
@@ -477,7 +512,18 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
     if not stack:
         return False
     return any(
-        char in "{[" and _is_line_start_tag(text, position)
+        (
+            char == "{"
+            and (
+                _is_line_start_tag(text, position)
+                or _is_json_object_root_candidate(text, position)
+            )
+        )
+        or (
+            char == "["
+            and _is_line_start_tag(text, position)
+            and _is_json_array_root_candidate(text, position)
+        )
         for char, position in zip(stack, stack_positions)
     )
 
@@ -545,17 +591,22 @@ def _find_unbalanced_service_tail(
     text: str,
     excluded_ranges: list[tuple[int, int]],
 ) -> tuple[int, int] | None:
-    roots = re.finditer(r"(?m)^[ \t]*[\{\[]", text)
+    roots = re.finditer(r"[\{\[]", text)
     for root in roots:
         start = root.start()
-        if text[root.end() - 1] == "[" and not _is_json_array_root_candidate(
+        open_position = root.end() - 1
+        if text[open_position] == "[" and not _is_json_array_root_candidate(text, open_position):
+            continue
+        if text[open_position] == "{" and not _is_json_object_root_candidate(
             text,
-            root.end() - 1,
+            open_position,
         ):
+            continue
+        if _is_inside_json_string(text, open_position):
             continue
         if any(begin <= start < end for begin, end in excluded_ranges):
             continue
-        if not _json_root_is_unclosed(text, root.end() - 1):
+        if not _json_root_is_unclosed(text, open_position):
             continue
         tail = text[start:]
         if re.search(

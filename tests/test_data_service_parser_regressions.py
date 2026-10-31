@@ -666,3 +666,37 @@ def test_interval_prose_does_not_shield_or_delete_following_service_data():
     assert extraction.blocks[0].current_state == {"current_step": "done"}
     assert extraction.blocks[0].events == ["DONE"]
     assert extraction.invalid_count == 0
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "[0,\n",
+        '["ordinary",\n',
+    ],
+)
+def test_truncated_array_does_not_recover_nested_service_object(prefix):
+    raw = (
+        "Ответ.\n"
+        + prefix
+        + '{"current_state":{"current_step":"bad"},"event":"SHOULD_NOT_RUN"}\n'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+
+
+def test_inline_truncated_json_envelope_does_not_recover_nested_service_object():
+    raw = (
+        'Ответ. {"metadata":{"current_state":{"current_step":"bad"},'
+        '"event":"SHOULD_NOT_RUN"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
