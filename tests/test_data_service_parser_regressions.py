@@ -744,6 +744,20 @@ def test_scientific_interval_does_not_shield_following_service_data():
     assert extraction.invalid_count == 0
 
 
+def test_decimal_comma_interval_does_not_shield_following_service_data():
+    raw = (
+        "[0,5; 1,5) — допустимый диапазон.\n"
+        '{"current_state":{"current_step":"done"},"event":"DONE"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "[0,5; 1,5) — допустимый диапазон."
+    assert extraction.blocks[0].current_state == {"current_step": "done"}
+    assert extraction.blocks[0].events == ["DONE"]
+    assert extraction.invalid_count == 0
+
+
 def test_unfenced_data_does_not_remove_following_code_fence():
     raw = (
         '<DATA>{"current_state":{"current_step":"done"},"event":"DONE"}</DATA>\n'
@@ -756,6 +770,25 @@ def test_unfenced_data_does_not_remove_following_code_fence():
 
     assert extraction.visible_text == '```python\nprint("ok")\n```'
     assert extraction.blocks[0].events == ["DONE"]
+    assert extraction.invalid_count == 0
+
+
+def test_signed_fallback_removes_closing_fence_after_blank_line():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        "```json\n"
+        '{"metadata":{"private":"secret"}}\n'
+        "\n"
+        "```\n"
+        "Пояснение."
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ.\nПояснение."
+    assert extraction.blocks[0].metadata == {"private": "secret"}
+    assert "```" not in extraction.visible_text
     assert extraction.invalid_count == 0
 
 

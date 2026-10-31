@@ -214,7 +214,12 @@ def _is_prose_interval_start(text: str, position: int) -> bool:
     line_end = text.find("\n", position)
     line = text[position:] if line_end == -1 else text[position:line_end]
     number = r"(?:[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|∞))"
-    return bool(re.match(rf"\[\s*{number}\s*(?:,|;)\s*{number}\s*\)", line))
+    if re.match(rf"\[\s*{number}\s*(?:,|;)\s*{number}\s*\)", line):
+        return True
+    comma_number = r"(?:[-+]?(?:\d+,\d+|,\d+))"
+    return bool(
+        re.match(rf"\[\s*{comma_number}\s*;\s*{comma_number}\s*\)", line)
+    )
 
 
 def _is_json_array_root_candidate(text: str, position: int) -> bool:
@@ -307,7 +312,7 @@ def _fence_start(text: str, position: int) -> int:
 
 def _fence_end(text: str, position: int) -> int:
     match = re.match(
-        r"\r?\n[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?:\r?\n|$)",
+        r"(?:\r?\n[ \t]*)+[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?:\r?\n|$)",
         text[position:],
     )
     return position + match.end() if match else position
