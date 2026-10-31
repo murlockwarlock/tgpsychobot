@@ -327,10 +327,8 @@ def test_fallback_data_preserves_visible_braced_code_inside_signed_fence():
 
     extraction = extract_service_data_details(raw)
 
-    assert 'print({"before": 1})' in extraction.visible_text
-    assert 'print({"after": 2})' in extraction.visible_text
-    assert "```python" in extraction.visible_text
-    assert extraction.blocks[0].current_state == {"current_step": "ok"}
+    assert extraction.visible_text == raw
+    assert extraction.blocks == []
     assert extraction.invalid_count == 0
 
 
@@ -402,9 +400,8 @@ def test_service_metadata_literal_inside_visible_python_is_preserved():
 
     extraction = extract_service_data_details(raw)
 
-    assert 'print({"metadata": {"name": "Alice"}})' in extraction.visible_text
-    assert 'print("after")' in extraction.visible_text
-    assert [block.current_state for block in extraction.blocks] == [{"current_step": "ok"}]
+    assert extraction.visible_text == raw
+    assert extraction.blocks == []
     assert extraction.invalid_count == 0
 
 
@@ -438,9 +435,25 @@ def test_metadata_only_literal_in_non_json_fence_is_not_service_data(fence):
 
     extraction = extract_service_data_details(raw)
 
-    assert '{"metadata":{"name":"Alice"}}' in extraction.visible_text
-    assert extraction.blocks[0].current_state == {"current_step": "ok"}
-    assert extraction.blocks[0].metadata == {}
+    assert extraction.visible_text == raw
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 0
+
+
+@pytest.mark.parametrize("fence", ["```python", "```"])
+def test_service_shaped_literal_in_non_json_fence_is_not_service_data(fence):
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        f"{fence}\n"
+        '{"current_state":{"current_step":"example"}}\n'
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == raw
+    assert extraction.blocks == []
     assert extraction.invalid_count == 0
 
 
@@ -478,10 +491,8 @@ def test_fallback_data_does_not_remove_visible_code_inside_signed_fence():
 
     extraction = extract_service_data_details(raw)
 
-    assert 'print("before")' in extraction.visible_text
-    assert 'print("after")' in extraction.visible_text
-    assert "```python" in extraction.visible_text
-    assert extraction.blocks[0].current_state == {"current_step": "ok"}
+    assert extraction.visible_text == raw
+    assert extraction.blocks == []
     assert extraction.invalid_count == 0
 
 

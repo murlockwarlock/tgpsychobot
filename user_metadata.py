@@ -367,14 +367,9 @@ def _is_fallback_object_candidate(
     object_end: int,
 ) -> bool:
     context = _fence_context(text, object_start)
-    if context is None or _fence_language(text, context) in {"", "json"}:
+    if context is None:
         return True
-    line_end = text.find("\n", object_end)
-    if line_end == -1:
-        line_end = len(text)
-    return not text[_line_start(text, object_start):object_start].strip() and not text[
-        object_end:line_end
-    ].strip()
+    return _fence_language(text, context) == "json"
 
 
 def _fence_prefix_is_service_only(
@@ -700,27 +695,6 @@ def _is_service_fallback_candidate(
     return _is_service_fallback_payload(payload, False)
 
 
-def _fence_residual_only_nonservice_json(
-    text: str,
-    content_start: int,
-    content_end: int,
-) -> bool:
-    residual = text[content_start:content_end]
-    spans = _find_balanced_json_spans(residual)
-    if not spans:
-        return False
-    for object_start, object_end in spans:
-        payload = _json_loads_dict_or_list(residual[object_start:object_end])
-        if isinstance(payload, dict) and _is_service_fallback_candidate(
-            payload,
-            text,
-            content_start + object_start,
-            True,
-        ):
-            return False
-    return True
-
-
 def _fence_has_service_signature(
     text: str,
     region: tuple[int, int, int | None, int | None],
@@ -773,46 +747,22 @@ def _find_fallback_service_tail(
                 continue
             if text[signature.end():opening_start].strip():
                 continue
-            if _fence_language(text, region) not in {"", "json"}:
+            if _fence_language(text, region) != "json":
                 continue
             content_end = closing_start if closing_start is not None else len(text)
             content = masked_text[opening_end:content_end]
             if not content.strip():
                 continue
-            language = _fence_language(text, region)
             has_content_removal = any(
                 start < content_end and end > opening_end
                 for start, end in excluded_ranges
             )
             if not has_content_removal:
-                if (
-                    language == ""
-                    and _fence_residual_only_nonservice_json(
-                        masked_text,
-                        opening_end,
-                        content_end,
-                    )
-                ):
-                    continue
                 return signature.start(), closing_end if closing_end is not None else len(text)
             residual_start = opening_end
             while residual_start < content_end and masked_text[residual_start].isspace():
                 residual_start += 1
             if residual_start < content_end:
-                if (
-                    language == ""
-                    and (
-                        _fence_residual_only_nonservice_json(
-                            masked_text,
-                            opening_end,
-                            content_end,
-                        )
-                        or not _looks_like_malformed_service_payload(
-                            masked_text[residual_start:content_end],
-                        )
-                    )
-                ):
-                    continue
                 return residual_start, closing_end if closing_end is not None else len(text)
     return None
 
