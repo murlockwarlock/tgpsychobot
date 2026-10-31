@@ -216,7 +216,7 @@ def _is_prose_interval_start(text: str, position: int) -> bool:
     number = r"(?:[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|∞))"
     if re.match(rf"\[\s*{number}\s*(?:,|;)\s*{number}\s*\)", line):
         return True
-    comma_number = r"(?:[-+]?(?:\d+,\d+|,\d+))"
+    comma_number = r"(?:[-+]?(?:\d+(?:,\d+)?|,\d+))"
     return bool(
         re.match(rf"\[\s*{comma_number}\s*;\s*{comma_number}\s*\)", line)
     )

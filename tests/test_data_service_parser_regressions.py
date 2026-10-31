@@ -744,15 +744,16 @@ def test_scientific_interval_does_not_shield_following_service_data():
     assert extraction.invalid_count == 0
 
 
-def test_decimal_comma_interval_does_not_shield_following_service_data():
+@pytest.mark.parametrize("interval", ["[0,5; 1,5)", "[0; 1,5)", "[0,5; 1)"])
+def test_decimal_comma_interval_does_not_shield_following_service_data(interval):
     raw = (
-        "[0,5; 1,5) — допустимый диапазон.\n"
+        f"{interval} — допустимый диапазон.\n"
         '{"current_state":{"current_step":"done"},"event":"DONE"}'
     )
 
     extraction = extract_service_data_details(raw)
 
-    assert extraction.visible_text == "[0,5; 1,5) — допустимый диапазон."
+    assert extraction.visible_text == f"{interval} — допустимый диапазон."
     assert extraction.blocks[0].current_state == {"current_step": "done"}
     assert extraction.blocks[0].events == ["DONE"]
     assert extraction.invalid_count == 0
