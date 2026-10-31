@@ -295,6 +295,8 @@ def _is_opening_fence(text: str, line_start: int, line_end: int) -> bool:
 
 def _fence_start(text: str, position: int) -> int:
     current_line_start = _line_start(text, position)
+    if text[current_line_start:position].strip():
+        return position
     if current_line_start == 0:
         return position
     cursor = current_line_start

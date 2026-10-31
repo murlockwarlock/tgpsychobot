@@ -784,6 +784,28 @@ def test_unfenced_data_does_not_remove_following_code_fence():
     assert extraction.invalid_count == 0
 
 
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [
+        ("<DATA>", "</DATA>"),
+        ("[DATA]", "[/DATA]"),
+    ],
+)
+def test_inline_data_does_not_remove_code_before_tag(opening, closing):
+    raw = (
+        "Ответ.\n"
+        "```python\n"
+        f'print("hello") {opening}{{"metadata":{{"x":1}}}}{closing}\n'
+        "```"
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == 'Ответ.\n```python\nprint("hello")\n```'
+    assert extraction.blocks[0].raw_json == '{"metadata":{"x":1}}'
+    assert extraction.invalid_count == 0
+
+
 def test_signed_fallback_removes_closing_fence_after_blank_line():
     raw = (
         "Ответ.\n"
