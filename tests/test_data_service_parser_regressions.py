@@ -614,6 +614,21 @@ def test_prose_quote_does_not_enable_partial_recovery_from_truncated_envelope():
     assert extraction.invalid_count == 1
 
 
+def test_combined_prose_delimiters_do_not_enable_partial_recovery():
+    raw = (
+        'Ответ содержит символы { и ".\n'
+        "{\n"
+        '  "metadata": {"current_state":{"current_step":"bad"},'
+        '"event":"SHOULD_NOT_RUN"}\n'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == 'Ответ содержит символы { и ".'
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+
+
 def test_unclosed_array_does_not_recover_nested_service_object():
     raw = (
         "Ответ.\n"
@@ -635,4 +650,19 @@ def test_indented_ordinary_json_example_is_not_deleted_as_unbalanced_service_tai
 
     assert extraction.visible_text == raw
     assert extraction.blocks == []
+    assert extraction.invalid_count == 0
+
+
+def test_interval_prose_does_not_shield_or_delete_following_service_data():
+    raw = (
+        "[0, 10) — допустимый диапазон.\n"
+        "Служебный блок данных:\n"
+        '{"current_state":{"current_step":"done"},"event":"DONE"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "[0, 10) — допустимый диапазон."
+    assert extraction.blocks[0].current_state == {"current_step": "done"}
+    assert extraction.blocks[0].events == ["DONE"]
     assert extraction.invalid_count == 0

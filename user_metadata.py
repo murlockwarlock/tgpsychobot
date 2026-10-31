@@ -210,6 +210,11 @@ def _is_line_start_tag(text: str, position: int) -> bool:
     return not text[_line_start(text, position):position].strip()
 
 
+def _is_json_array_root_candidate(text: str, position: int) -> bool:
+    next_position = _skip_whitespace(text, position + 1)
+    return text[next_position:next_position + 1] in {"{", "["}
+
+
 def _skip_whitespace(text: str, position: int) -> int:
     while position < len(text) and text[position].isspace():
         position += 1
@@ -451,7 +456,13 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
                 in_string = False
             continue
         if not stack:
-            if char == "{" or (char == "[" and _is_line_start_tag(text, offset)):
+            if (
+                char == "{" and _is_line_start_tag(text, offset)
+            ) or (
+                char == "["
+                and _is_line_start_tag(text, offset)
+                and _is_json_array_root_candidate(text, offset)
+            ):
                 stack.append(char)
                 stack_positions.append(offset)
             continue
@@ -537,6 +548,11 @@ def _find_unbalanced_service_tail(
     roots = re.finditer(r"(?m)^[ \t]*[\{\[]", text)
     for root in roots:
         start = root.start()
+        if text[root.end() - 1] == "[" and not _is_json_array_root_candidate(
+            text,
+            root.end() - 1,
+        ):
+            continue
         if any(begin <= start < end for begin, end in excluded_ranges):
             continue
         if not _json_root_is_unclosed(text, root.end() - 1):
