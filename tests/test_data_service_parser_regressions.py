@@ -458,3 +458,27 @@ def test_unmatched_prose_bracket_does_not_shield_fallback_service_block():
     assert extraction.blocks[0].current_state == {"current_step": "done"}
     assert extraction.blocks[0].events == ["DONE"]
     assert extraction.invalid_count == 0
+
+
+def test_malformed_service_envelope_does_not_recover_nested_event_object():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        '{"metadata":{"event":"SHOULD_NOT_RUN"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+
+
+def test_json_array_literals_protect_embedded_data_tags():
+    raw = '["Keep <DATA>{}</DATA> literally", "Keep <DATA/> too"]'
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == raw
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 0

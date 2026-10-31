@@ -313,10 +313,10 @@ def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     position = 0
     while position < len(text):
-        if text[position] != "{":
+        if text[position] not in "{[":
             position += 1
             continue
-        stack = ["{"]
+        stack = [text[position]]
         in_string = False
         escaped = False
         end: int | None = None
@@ -355,7 +355,7 @@ def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
         except (TypeError, json.JSONDecodeError):
             position += 1
             continue
-        if isinstance(payload, dict):
+        if isinstance(payload, (dict, list)):
             spans.append((position, end))
             position = end
         else:
@@ -429,6 +429,35 @@ def _has_explicit_service_signature(text: str, object_start: int) -> bool:
         r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?$",
         signature_text,
     ))
+
+
+def _has_unclosed_json_container(text: str, object_start: int) -> bool:
+    signature_start = _signature_line_start(text, object_start)
+    if signature_start is None:
+        context_start = _line_start(text, object_start)
+    else:
+        newline = text.find("\n", signature_start)
+        context_start = len(text) if newline == -1 else newline + 1
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+    for char in text[context_start:object_start]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]" and stack and stack[-1] == pairs[char]:
+            stack.pop()
+    return bool(stack)
 
 
 def _is_service_fallback_payload(payload: dict[str, Any], explicit_signature: bool) -> bool:
@@ -571,6 +600,8 @@ def _extract_fallback_data(
     invalid_count = 0
     excluded_signature_starts: set[int] = set()
     for object_start, object_end in spans:
+        if _has_unclosed_json_container(visible_text, object_start):
+            continue
         start, fenced = _fallback_removal_start(visible_text, object_start)
         explicit_signature = _has_explicit_service_signature(visible_text, object_start)
         tail_is_allowed = _is_fallback_tail(visible_text, object_end, fenced=fenced)
