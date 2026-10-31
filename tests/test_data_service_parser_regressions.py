@@ -379,3 +379,39 @@ def test_data_tags_inside_fallback_json_strings_are_preserved():
     assert extraction.visible_text == "Ответ."
     assert extraction.blocks[0].metadata == {"note": note}
     assert extraction.invalid_count == 0
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Keep <DATA/> literally",
+        "Keep <DATA literally",
+    ],
+)
+def test_all_tag_cleanup_passes_ignore_tags_inside_fallback_json_strings(note):
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        + json.dumps({"metadata": {"note": note}})
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks[0].metadata == {"note": note}
+    assert extraction.invalid_count == 0
+
+
+def test_quote_in_visible_prose_does_not_hide_valid_fallback_json():
+    raw = (
+        'Ответ содержит символ ".\n'
+        "Служебный блок данных:\n"
+        '{"current_state":{"current_step":"done"},"event":"DONE"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == 'Ответ содержит символ ".'
+    assert extraction.blocks[0].current_state == {"current_step": "done"}
+    assert extraction.blocks[0].events == ["DONE"]
+    assert extraction.invalid_count == 0

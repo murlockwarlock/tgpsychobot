@@ -321,15 +321,18 @@ def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
             elif char == '"':
                 in_string = False
             continue
+        if not stack:
+            if char in "{[":
+                root_start = position
+                stack.append(char)
+            continue
         if char == '"':
             in_string = True
             continue
         if char in "{[":
-            if not stack:
-                root_start = position
             stack.append(char)
             continue
-        if char not in "}]" or not stack:
+        if char not in "}]":
             continue
         if stack[-1] != pairs[char]:
             stack.clear()
@@ -505,7 +508,11 @@ def _extract_tagged_data(
         search_position = end
 
     visible_text = _mask_spans(raw_text, removals)
-    self_closing_matches = list(SELF_CLOSING_DATA_RE.finditer(visible_text))
+    self_closing_matches = [
+        match
+        for match in SELF_CLOSING_DATA_RE.finditer(visible_text)
+        if not _is_inside_json_string(visible_text, match.start())
+    ]
     if self_closing_matches:
         invalid_count += len(self_closing_matches)
         removals.extend((match.start(), match.end()) for match in self_closing_matches)
@@ -516,6 +523,9 @@ def _extract_tagged_data(
         truncated = TRUNCATED_XML_OPEN_RE.search(visible_text, search_position)
         if truncated is None:
             break
+        if _is_inside_json_string(visible_text, truncated.start()):
+            search_position = truncated.end()
+            continue
         is_attr_opener = bool(re.search(r"\s+[^>\r\n]*$", truncated.group(0)))
         is_candidate = (
             is_attr_opener or _is_line_start_tag(visible_text, truncated.start())
