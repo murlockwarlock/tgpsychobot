@@ -700,3 +700,31 @@ def test_inline_truncated_json_envelope_does_not_recover_nested_service_object()
     assert extraction.visible_text == "Ответ."
     assert extraction.blocks == []
     assert extraction.invalid_count == 1
+
+
+def test_inline_truncated_array_does_not_recover_nested_service_object():
+    raw = (
+        'Ответ. [0, {"current_state":{"current_step":"bad"},'
+        '"event":"SHOULD_NOT_RUN"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+
+
+@pytest.mark.parametrize("interval", ["[0.0, 10.0)", "[0; 10)"])
+def test_decimal_and_semicolon_intervals_do_not_shield_service_data(interval):
+    raw = (
+        f"{interval} — допустимый диапазон.\n"
+        '{"current_state":{"current_step":"done"},"event":"DONE"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == f"{interval} — допустимый диапазон."
+    assert extraction.blocks[0].current_state == {"current_step": "done"}
+    assert extraction.blocks[0].events == ["DONE"]
+    assert extraction.invalid_count == 0

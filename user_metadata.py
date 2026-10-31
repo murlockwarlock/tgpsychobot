@@ -213,7 +213,8 @@ def _is_line_start_tag(text: str, position: int) -> bool:
 def _is_prose_interval_start(text: str, position: int) -> bool:
     line_end = text.find("\n", position)
     line = text[position:] if line_end == -1 else text[position:line_end]
-    return bool(re.match(r"\[\s*-?\d+(?:\s*,\s*-?\d+)?\s*\)", line))
+    number = r"-?(?:\d+(?:\.\d+)?|\.\d+)"
+    return bool(re.match(rf"\[\s*{number}\s*(?:,|;)\s*{number}\s*\)", line))
 
 
 def _is_json_array_root_candidate(text: str, position: int) -> bool:
@@ -495,7 +496,6 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
                 )
             ) or (
                 char == "["
-                and _is_line_start_tag(text, offset)
                 and _is_json_array_root_candidate(text, offset)
             ):
                 stack.append(char)
@@ -521,7 +521,6 @@ def _has_unclosed_json_container(text: str, object_start: int) -> bool:
         )
         or (
             char == "["
-            and _is_line_start_tag(text, position)
             and _is_json_array_root_candidate(text, position)
         )
         for char, position in zip(stack, stack_positions)
