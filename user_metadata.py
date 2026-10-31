@@ -342,6 +342,26 @@ def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _is_inside_json_string(text: str, position: int) -> bool:
+    for root_start, root_end in _find_balanced_json_spans(text):
+        if not root_start <= position < root_end:
+            continue
+        in_string = False
+        escaped = False
+        for char in text[root_start:position]:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+        return in_string
+    return False
+
+
 def _is_fallback_tail(text: str, end: int, *, fenced: bool) -> bool:
     tail = text[end:]
     if not tail.strip():
@@ -414,7 +434,7 @@ def _find_fallback_service_tail(
         r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?\s*(?:\r?\n|$)",
         text,
     )
-    for signature in reversed(list(signatures)):
+    for signature in signatures:
         if signature.start() in excluded_starts:
             continue
         if _looks_like_json_payload(text[signature.end():]):
@@ -440,6 +460,9 @@ def _extract_tagged_data(
         match = DATA_BLOCK_RE.search(raw_text, search_position)
         if match is None:
             break
+        if _is_inside_json_string(raw_text, match.start()):
+            search_position = match.end()
+            continue
         if re.search(r"/\s*>$", match.group(0)):
             search_position = match.end()
             continue

@@ -348,3 +348,34 @@ def test_rejected_literal_truncated_opener_does_not_mask_later_service_opener():
     assert extraction.visible_text == "Упоминание <DATA как слово\nПояснение."
     assert extraction.blocks == []
     assert extraction.invalid_count == 1
+
+
+def test_multiple_truncated_fallback_sections_are_all_hidden():
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        '{"metadata":{"private":"secret_one"}\n'
+        "Служебный блок данных:\n"
+        '{"metadata":{"private":"secret_two"}'
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count >= 1
+
+
+def test_data_tags_inside_fallback_json_strings_are_preserved():
+    note = "Keep <DATA>{}</DATA> literally"
+    raw = (
+        "Ответ.\n"
+        "Служебный блок данных:\n"
+        + json.dumps({"metadata": {"note": note}})
+    )
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks[0].metadata == {"note": note}
+    assert extraction.invalid_count == 0
