@@ -10,13 +10,39 @@ from typing import Any
 
 
 DATA_BLOCK_RE = re.compile(
-    r"(?:^[ \t]*```(?:json)?[ \t]*\r?\n)?"
-    r"(?:<DATA(?:\s[^>]*)?>\s*(?P<xml>.*?)\s*</DATA>|"
-    r"\[DATA\]\s*(?P<square>.*?)\s*\[/DATA\])"
-    r"(?:\r?\n[ \t]*```[ \t]*(?=\r?\n|$))?",
-    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    r"<DATA(?:\s+[^>\r\n]*)?>|\[DATA\]",
+    re.IGNORECASE,
 )
-SERVICE_DATA_KEYS = frozenset({"current_state", "events", "metadata", "save_mode"})
+DATA_CLOSE_RE = {
+    "xml": re.compile(r"</DATA>", re.IGNORECASE),
+    "square": re.compile(r"\[/DATA\]", re.IGNORECASE),
+}
+TRUNCATED_XML_OPEN_RE = re.compile(
+    r"<DATA(?:\s+[^>\r\n]*)?(?=\r?\n|$)",
+    re.IGNORECASE,
+)
+SERVICE_DATA_KEYS = frozenset({
+    "current_state",
+    "current_step",
+    "event",
+    "events",
+    "metadata",
+    "save_mode",
+})
+SERVICE_DATA_STRONG_KEYS = frozenset({
+    "current_state",
+    "current_step",
+    "event",
+    "events",
+    "save_mode",
+})
+FALLBACK_SIGNATURE_RE = re.compile(
+    r"^[ \t]*(?:служебный блок данных|заполненный current_state|json|data:)[ \t]*:?$",
+    re.IGNORECASE,
+)
+MARKDOWN_FENCE_RE = re.compile(
+    r"[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?:\r?\n)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +55,14 @@ class ServiceDataBlock:
     save_mode: str
     raw_json: str
     legacy: bool = False
+
+
+@dataclass(frozen=True)
+class ServiceDataExtraction:
+    visible_text: str
+    blocks: list[ServiceDataBlock]
+    invalid_count: int
+    classification: str
 
 
 def _normalize_service_payload(
@@ -45,8 +79,20 @@ def _normalize_service_payload(
         return ServiceDataBlock({}, [], payload, "merge", raw_json, legacy=True)
 
     current_state = payload.get("current_state")
+    if not isinstance(current_state, dict):
+        current_state = {}
+    current_state = dict(current_state)
+    current_step = payload.get("current_step")
+    if (
+        isinstance(current_step, str)
+        and current_step.strip()
+        and not current_state.get("current_step")
+    ):
+        current_state["current_step"] = current_step.strip()
     metadata = payload.get("metadata")
     raw_events = payload.get("events")
+    if not raw_events and payload.get("event"):
+        raw_events = payload.get("event")
     save_mode = str(payload.get("save_mode") or "merge").strip().lower()
     if save_mode not in {"merge", "snapshot"}:
         save_mode = "merge"
@@ -64,7 +110,7 @@ def _normalize_service_payload(
                     events.append(name.strip())
 
     return ServiceDataBlock(
-        current_state=current_state if isinstance(current_state, dict) else {},
+        current_state=current_state,
         events=events,
         metadata=metadata if isinstance(metadata, dict) else {},
         save_mode=save_mode,
@@ -159,56 +205,334 @@ SELF_CLOSING_DATA_RE = re.compile(
     re.IGNORECASE,
 )
 
-UNMATCHED_DATA_OPENER_RE = re.compile(
-    r"(?P<fence>^[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*\r?\n\s*)?"
-    r"(?P<tag><DATA(?:\s*>|\s+[^>\r\n]*(?:>|\r?\n|$)|[ \t]*(?:\r?\n|$))|\[DATA\])",
-    re.IGNORECASE | re.MULTILINE,
-)
+def _line_start(text: str, position: int) -> int:
+    return text.rfind("\n", 0, position) + 1
 
 
-def extract_service_data(text: str | None) -> tuple[str, list[ServiceDataBlock], int]:
-    """Extract legacy ``[DATA]`` and the unified ``<DATA>`` JSON envelope."""
-    raw_text = text or ""
+def _is_line_start_tag(text: str, position: int) -> bool:
+    return not text[_line_start(text, position):position].strip()
+
+
+def _skip_whitespace(text: str, position: int) -> int:
+    while position < len(text) and text[position].isspace():
+        position += 1
+    return position
+
+
+def _looks_like_json_payload(text: str) -> bool:
+    position = _skip_whitespace(text, 0)
+    return text[position:position + 1] in {"{", "["} or text[position:].startswith("```")
+
+
+def _tag_kind(match: re.Match[str]) -> str:
+    return "square" if match.group(0).startswith("[") else "xml"
+
+
+def _is_tag_candidate(text: str, match: re.Match[str], body: str = "") -> bool:
+    return _is_line_start_tag(text, match.start()) or _looks_like_json_payload(body)
+
+
+def _fence_start(text: str, position: int) -> int:
+    current_line_start = _line_start(text, position)
+    if current_line_start == 0:
+        return position
+    previous_line_end = current_line_start
+    previous_line_start = text.rfind("\n", 0, previous_line_end - 1) + 1
+    previous_line = text[previous_line_start:previous_line_end]
+    if MARKDOWN_FENCE_RE.fullmatch(previous_line):
+        return previous_line_start
+    return position
+
+
+def _fence_end(text: str, position: int) -> int:
+    match = re.match(
+        r"\r?\n[ \t]*`{3,}(?:[a-zA-Z0-9_-]+)?[ \t]*(?=\r?\n|$)",
+        text[position:],
+    )
+    return position + match.end() if match else position
+
+
+def _find_tag_close(text: str, start: int, kind: str) -> re.Match[str] | None:
+    close_re = DATA_CLOSE_RE[kind]
+    in_string = False
+    escaped = False
+    position = start
+    while position < len(text):
+        char = text[position]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            position += 1
+            continue
+        if char == '"':
+            in_string = True
+            position += 1
+            continue
+        match = close_re.match(text, position)
+        if match:
+            return match
+        position += 1
+    return None
+
+
+def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    result: list[str] = []
+    cursor = 0
+    for start, end in sorted(spans):
+        if start < cursor:
+            continue
+        result.append(text[cursor:start])
+        cursor = end
+    result.append(text[cursor:])
+    return "".join(result)
+
+
+def _find_balanced_json_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    stack: list[str] = []
+    root_start: int | None = None
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+    for position, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char in "{[":
+            if not stack:
+                root_start = position
+            stack.append(char)
+            continue
+        if char not in "}]" or not stack:
+            continue
+        if stack[-1] != pairs[char]:
+            stack.clear()
+            root_start = None
+            continue
+        stack.pop()
+        if not stack and root_start is not None:
+            spans.append((root_start, position + 1))
+            root_start = None
+    return spans
+
+
+def _is_fallback_tail(text: str, end: int, *, fenced: bool) -> bool:
+    tail = text[end:]
+    if not tail.strip():
+        return True
+    return fenced and bool(re.fullmatch(r"\s*```[ \t]*", tail))
+
+
+def _signature_line_start(text: str, position: int) -> int | None:
+    line_start = _line_start(text, position)
+    cursor = line_start
+    found: int | None = None
+    while cursor > 0:
+        previous_end = cursor
+        previous_start = text.rfind("\n", 0, previous_end - 1) + 1
+        line = text[previous_start:previous_end].rstrip("\r\n")
+        if not line.strip():
+            cursor = previous_start
+            continue
+        if not FALLBACK_SIGNATURE_RE.fullmatch(line):
+            break
+        found = previous_start
+        cursor = previous_start
+    return found
+
+
+def _fallback_removal_start(text: str, object_start: int) -> tuple[int, bool]:
+    fence_start = _fence_start(text, object_start)
+    if fence_start != object_start:
+        signature_start = _signature_line_start(text, fence_start)
+        return signature_start if signature_start is not None else fence_start, True
+    signature_start = _signature_line_start(text, object_start)
+    if signature_start is not None:
+        return signature_start, False
+    return object_start, False
+
+
+def _has_service_signature(text: str, object_start: int) -> bool:
+    return _signature_line_start(text, object_start) is not None
+
+
+def _has_explicit_service_signature(text: str, object_start: int) -> bool:
+    signature_start = _signature_line_start(text, object_start)
+    if signature_start is None:
+        return False
+    signature_text = text[signature_start:_line_start(text, object_start)]
+    return bool(re.search(
+        r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|data:)[ \t]*:?$",
+        signature_text,
+    ))
+
+
+def _is_service_fallback_payload(payload: dict[str, Any], has_signature: bool) -> bool:
+    if SERVICE_DATA_STRONG_KEYS.intersection(payload):
+        return True
+    return has_signature and bool({"metadata", "ws", "safety_flag"}.intersection(payload))
+
+
+def _find_fallback_service_tail(text: str) -> tuple[int, int] | None:
+    signature = re.search(
+        r"(?im)^[ \t]*(?:служебный блок данных|заполненный current_state|json|data:)[ \t]*:?\s*(?:\r?\n|$)",
+        text,
+    )
+    if not signature:
+        return None
+    tail = text[signature.end():]
+    if not _looks_like_json_payload(tail):
+        return None
+    return signature.start(), len(text)
+
+
+def _normalize_visible_text(text: str) -> str:
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _extract_tagged_data(
+    raw_text: str,
+) -> tuple[str, list[ServiceDataBlock], int]:
     blocks: list[ServiceDataBlock] = []
+    removals: list[tuple[int, int]] = []
     invalid_count = 0
+    search_position = 0
 
-    for match in DATA_BLOCK_RE.finditer(raw_text):
-        raw_json = (match.group("xml") or match.group("square") or "").strip()
+    while search_position < len(raw_text):
+        match = DATA_BLOCK_RE.search(raw_text, search_position)
+        if match is None:
+            break
+        if re.search(r"/\s*>$", match.group(0)):
+            search_position = match.end()
+            continue
+        kind = _tag_kind(match)
+        close = _find_tag_close(raw_text, match.end(), kind)
+        body = raw_text[match.end():close.start()] if close else raw_text[match.end():]
+        if not _is_tag_candidate(raw_text, match, body):
+            search_position = match.end()
+            continue
+        if close and not _looks_like_json_payload(body):
+            nested = DATA_BLOCK_RE.search(raw_text, match.end(), close.start())
+            if nested is not None and not re.search(r"/\s*>$", nested.group(0)):
+                search_position = match.end()
+                continue
+
+        if close is None:
+            start = _fence_start(raw_text, match.start())
+            removals.append((start, len(raw_text)))
+            invalid_count += 1
+            break
+
+        start = _fence_start(raw_text, match.start())
+        end = _fence_end(raw_text, close.end())
+        raw_json = body.strip()
         payload = _repair_json_payload(raw_json)
         if payload is None or not isinstance(payload, dict):
             invalid_count += 1
-            continue
-        blocks.append(
-            _normalize_service_payload(
-                payload,
-                raw_json,
-                xml_syntax=match.group("xml") is not None,
+        else:
+            blocks.append(
+                _normalize_service_payload(
+                    payload,
+                    raw_json,
+                    xml_syntax=kind == "xml",
+                )
             )
-        )
+        removals.append((start, end))
+        search_position = end
 
-    visible_text = DATA_BLOCK_RE.sub("", raw_text)
-
+    visible_text = _remove_spans(raw_text, removals)
     self_closing_matches = list(SELF_CLOSING_DATA_RE.finditer(visible_text))
     if self_closing_matches:
         invalid_count += len(self_closing_matches)
         visible_text = SELF_CLOSING_DATA_RE.sub("", visible_text)
 
-    unmatched_match = UNMATCHED_DATA_OPENER_RE.search(visible_text)
-    if unmatched_match:
-        start_pos = unmatched_match.start()
-        fence_part = unmatched_match.group("fence")
-        if fence_part:
-            prefix = visible_text[:unmatched_match.start()]
-            fence_count = len(re.findall(r"^[ \t]*`{3,}", prefix, re.MULTILINE))
-            if fence_count % 2 == 1 and not re.search(r"`{3,}[a-zA-Z0-9_-]+", fence_part):
-                start_pos = unmatched_match.start("tag")
-        visible_text = visible_text[:start_pos]
+    truncated = TRUNCATED_XML_OPEN_RE.search(visible_text)
+    if truncated and _is_line_start_tag(visible_text, truncated.start()):
+        start = _fence_start(visible_text, truncated.start())
+        visible_text = visible_text[:start]
         invalid_count += 1
 
-    visible_text = re.sub(r"</?DATA(?:\s[^>]*)?>|\[/?DATA\]", "", visible_text, flags=re.IGNORECASE)
-    visible_text = re.sub(r"[ \t]+\n", "\n", visible_text)
-    visible_text = re.sub(r"\n{3,}", "\n\n", visible_text).strip()
-    return visible_text, blocks, invalid_count
+    return _normalize_visible_text(visible_text), blocks, invalid_count
+
+
+def _extract_fallback_data(
+    visible_text: str,
+) -> tuple[str, list[ServiceDataBlock], int, bool]:
+    spans = _find_balanced_json_spans(visible_text)
+    for object_start, object_end in reversed(spans):
+        start, fenced = _fallback_removal_start(visible_text, object_start)
+        has_signature = _has_service_signature(visible_text, object_start)
+        tail_is_allowed = _is_fallback_tail(visible_text, object_end, fenced=fenced)
+        if not tail_is_allowed and not _has_explicit_service_signature(visible_text, object_start):
+            continue
+        candidate = visible_text[object_start:object_end]
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or not _is_service_fallback_payload(payload, has_signature):
+            continue
+        end = _fence_end(visible_text, object_end) if fenced else object_end
+        block = _normalize_service_payload(payload, candidate, xml_syntax=True)
+        cleaned = _normalize_visible_text(_remove_spans(visible_text, [(start, end)]))
+        return cleaned, [block], 0, True
+
+    tail = _find_fallback_service_tail(visible_text)
+    if tail:
+        cleaned = _normalize_visible_text(_remove_spans(visible_text, [tail]))
+        return cleaned, [], 1, True
+    return visible_text, [], 0, False
+
+
+def extract_service_data_details(text: str | None) -> ServiceDataExtraction:
+    raw_text = text or ""
+    visible_text, blocks, invalid_count = _extract_tagged_data(raw_text)
+    classification = "none"
+    if blocks or invalid_count:
+        classification = "tags" if blocks and not invalid_count else "parse_error"
+
+    if not invalid_count:
+        visible_text, fallback_blocks, fallback_invalid, used_fallback = _extract_fallback_data(visible_text)
+        if used_fallback:
+            blocks.extend(fallback_blocks)
+            invalid_count += fallback_invalid
+            classification = "fallback" if not invalid_count else "parse_error"
+
+    return ServiceDataExtraction(
+        visible_text=_normalize_visible_text(visible_text),
+        blocks=blocks,
+        invalid_count=invalid_count,
+        classification=classification,
+    )
+
+
+def service_data_diagnostics(extraction: ServiceDataExtraction) -> dict[str, Any]:
+    return {
+        "data_extraction": extraction.classification,
+        "data_block_count": len(extraction.blocks),
+        "invalid_data_blocks": extraction.invalid_count,
+    }
+
+
+def extract_service_data(text: str | None) -> tuple[str, list[ServiceDataBlock], int]:
+    extraction = extract_service_data_details(text)
+    return extraction.visible_text, extraction.blocks, extraction.invalid_count
 
 
 def merge_metadata(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:

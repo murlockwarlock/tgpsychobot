@@ -22,7 +22,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from database import AIConfig, AILog, Base, BotGeneralConfig, Message as DBMessage, SubscriptionConfig, Topic, User
+from automation_engine import get_conversation_automation_state, build_runtime_automation_context
+from database import AIConfig, AILog, AutomationEvent, Base, BotGeneralConfig, Message as DBMessage, SubscriptionConfig, Topic, User
 import handlers
 import keyboards as kb
 from max_messenger_bot.api import MaxApiClient
@@ -455,7 +456,13 @@ async def test_telegram_fallback_on_retry_journey(session_factory, setup_tg_user
 
     # On retry: primary fails, fallback succeeds
     monkeypatch.setattr(ai_integration, "_call_gemini_api", AsyncMock(side_effect=AIServiceError("P1 500")))
-    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(return_value="Успешный ответ от запасного провайдера!"))
+    fallback_response = (
+        "Успешный ответ от запасного провайдера!\n"
+        "Служебный блок данных:\n"
+        '{"current_step":"FALLBACK_RETRY","event":"FALLBACK_EVENT",'
+        '"metadata":{"ws":{"retry":true}}}'
+    )
+    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(return_value=fallback_response))
 
     cb_update = Update(
         update_id=2,
@@ -479,6 +486,8 @@ async def test_telegram_fallback_on_retry_journey(session_factory, setup_tg_user
 
     final_msgs = [c for c in session.calls if isinstance(c, SendMessage) and "запасного провайдера" in (c.text or "")]
     assert len(final_msgs) == 1
+    assert "<DATA>" not in final_msgs[0].text
+    assert '"metadata"' not in final_msgs[0].text
 
     async with session_factory() as s:
         history = (await s.scalars(select(DBMessage).where(DBMessage.user_id == user_id))).all()
@@ -486,6 +495,29 @@ async def test_telegram_fallback_on_retry_journey(session_factory, setup_tg_user
         assert history[0].role == "user"
         assert history[1].role == "assistant"
         assert "запасного провайдера" in history[1].content
+        state = await get_conversation_automation_state(
+            s,
+            user_id=user_id,
+            dialogue_id=1,
+            topic_id=None,
+        )
+        assert state.current_step == "FALLBACK_RETRY"
+        assert json.loads(state.metadata_json) == {"ws": {"retry": True}}
+        events = (await s.scalars(select(AutomationEvent).where(AutomationEvent.user_id == user_id))).all()
+        assert [event.name for event in events] == ["FALLBACK_EVENT"]
+        success_logs = (await s.scalars(select(AILog).where(AILog.user_id == user_id, AILog.status == "success"))).all()
+        assert len(success_logs) == 1
+        diagnostics = json.loads(success_logs[0].diagnostics_json)
+        assert diagnostics["data_extraction"] == "fallback"
+        assert "FALLBACK_EVENT" not in success_logs[0].diagnostics_json
+        context = await build_runtime_automation_context(
+            s,
+            user_id=user_id,
+            dialogue_id=1,
+            topic_id=None,
+        )
+        assert '"current_step":"FALLBACK_RETRY"' in context
+        assert '"retry":true' in context
 
 
 # ---------------------------------------------------------------------------
@@ -1377,12 +1409,25 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
         original_msg_id = db_msgs[0].id
 
     # Phase 2: User clicks visible Retry button
-    async def mock_primary_success(*args, **kwargs):
+    async def mock_primary_retry_fail(*args, **kwargs):
         prompt = _extract_prompt_from_call(*args, **kwargs)
         primary_calls.append(prompt)
-        return "Границы — это забота о себе."
+        err = AIServiceError("P1 still unavailable")
+        err.classification = "provider_5xx"
+        raise err
 
-    monkeypatch.setattr(max_ai, "_call_gemini", mock_primary_success)
+    monkeypatch.setattr(max_ai, "_call_gemini", mock_primary_retry_fail)
+    fallback_response = (
+        "Границы — это забота о себе.\n"
+        '<DATA>{"current_step":"MAX_FALLBACK_RETRY","event":"MAX_FALLBACK_EVENT",'
+        '"metadata":{"ws":{"retry":true}}}</DATA>'
+    )
+    async def mock_fallback_retry_success(*args, **kwargs):
+        prompt = _extract_prompt_from_call(*args, **kwargs)
+        fallback_calls.append(prompt)
+        return fallback_response
+
+    monkeypatch.setattr(max_ai, "_call_openai", mock_fallback_retry_success)
 
     retry_update = {
         "update_id": "max_up_2",
@@ -1426,6 +1471,8 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
     assert delivery_call["method"] in {"PUT", "POST"}
     assert delivery_call["body"]["format"] == "html"
     assert "Границы — это забота о себе." in delivery_call["body"]["text"]
+    assert "<DATA>" not in delivery_call["body"]["text"]
+    assert '"metadata"' not in delivery_call["body"]["text"]
 
     # Verify DB state after retry: original user message NOT DUPLICATED!
     async with session_factory() as s:
@@ -1435,6 +1482,29 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
         assert history[0].role == "user"
         assert history[1].role == "assistant"
         assert "Границы" in history[1].content
+        state = await get_conversation_automation_state(
+            s,
+            user_id=max_user_id,
+            dialogue_id=1,
+            topic_id=None,
+        )
+        assert state.current_step == "MAX_FALLBACK_RETRY"
+        assert json.loads(state.metadata_json) == {"ws": {"retry": True}}
+        events = (await s.scalars(select(AutomationEvent).where(AutomationEvent.user_id == max_user_id))).all()
+        assert [event.name for event in events] == ["MAX_FALLBACK_EVENT"]
+        success_logs = (await s.scalars(select(AILog).where(AILog.user_id == max_user_id, AILog.status == "success"))).all()
+        assert len(success_logs) == 1
+        diagnostics = json.loads(success_logs[0].diagnostics_json)
+        assert diagnostics["data_extraction"] == "tags"
+        assert "MAX_FALLBACK_EVENT" not in success_logs[0].diagnostics_json
+        context = await build_runtime_automation_context(
+            s,
+            user_id=max_user_id,
+            dialogue_id=1,
+            topic_id=None,
+        )
+        assert '"current_step":"MAX_FALLBACK_RETRY"' in context
+        assert '"retry":true' in context
 
     # Resend old retry callback: prove zero new provider calls and zero duplicate assistant responses!
     await app.handle_update(retry_update)

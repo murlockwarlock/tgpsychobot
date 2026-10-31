@@ -36,7 +36,7 @@ from .legacy import AIConfig, KnowledgeBase, Message as DBMessage, Topic, User, 
 from .legacy import AILog
 from .logging_utils import configure_logging, get_ai_logger
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, persist_service_data_blocks
-from user_metadata import extract_service_data
+from user_metadata import extract_service_data_details, service_data_diagnostics
 from memory_mode import MEMORY_MODE_TOPIC, build_history_scope, get_memory_mode, normalize_memory_mode
 from result_history import ai_history_role_filter, select_ai_history_messages
 from error_reporting import (
@@ -1647,7 +1647,10 @@ async def get_ai_response(
                 default_provider=actual_provider,
                 default_model=actual_model,
             )
-            visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+            extraction = extract_service_data_details(result)
+            visible_text = extraction.visible_text
+            service_blocks = extraction.blocks
+            invalid_data_blocks = extraction.invalid_count
             if invalid_data_blocks:
                 log.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
 
@@ -1670,6 +1673,7 @@ async def get_ai_response(
                 request_group_id=request_group_id,
                 attempt_no=1,
                 attempt_role="primary",
+                diagnostics=service_data_diagnostics(extraction),
             )
             primary_succeeded = True
             log.info("AI response generated user_id=%s provider=%s topic_id=%s", user_id, actual_provider, active_topic_id)
@@ -2034,7 +2038,10 @@ async def get_ai_response(
                         default_provider=str(fb_provider),
                         default_model=str(fb_model),
                     )
-                    visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+                    extraction = extract_service_data_details(result)
+                    visible_text = extraction.visible_text
+                    service_blocks = extraction.blocks
+                    invalid_data_blocks = extraction.invalid_count
                     if invalid_data_blocks:
                         log.warning("AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
 
@@ -2057,6 +2064,7 @@ async def get_ai_response(
                         request_group_id=request_group_id,
                         attempt_no=2,
                         attempt_role="fallback",
+                        diagnostics=service_data_diagnostics(extraction),
                     )
                     fallback_succeeded = True
                     log.info("Fallback response generated user_id=%s provider=%s", user_id, actual_provider)
@@ -2239,7 +2247,10 @@ async def get_ai_response_direct(
         log.exception("Unexpected AI direct request failure user_id=%s provider=%s", user_id, ai_config.provider)
         raise AIServiceError(f"Ошибка при прямом обращении к AI-провайдеру: {exc}") from exc
 
-    visible_text, service_blocks, invalid_data_blocks = extract_service_data(result)
+    extraction = extract_service_data_details(result)
+    visible_text = extraction.visible_text
+    service_blocks = extraction.blocks
+    invalid_data_blocks = extraction.invalid_count
     if invalid_data_blocks:
         log.warning("Direct AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
     if service_blocks:
@@ -3794,7 +3805,10 @@ async def analyze_image(
             final_exc.admin_alert_handled = True
         raise final_exc
 
-    visible_text, service_blocks, invalid_data_blocks = extract_service_data(raw_result)
+    extraction = extract_service_data_details(raw_result)
+    visible_text = extraction.visible_text
+    service_blocks = extraction.blocks
+    invalid_data_blocks = extraction.invalid_count
     if invalid_data_blocks:
         log.warning("Vision AI returned %s invalid DATA block(s) for user %s", invalid_data_blocks, user_id)
     if service_blocks:

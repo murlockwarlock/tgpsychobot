@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from user_metadata import extract_service_data
+from user_metadata import extract_service_data, extract_service_data_details, service_data_diagnostics
 
 
 def _compact(text: str) -> str:
@@ -140,3 +140,63 @@ def test_legacy_square_block_remains_supported():
     assert blocks[0].legacy is True
     assert blocks[0].metadata == {"legacy": True}
     assert invalid == 0
+
+
+def test_line_start_literal_does_not_join_with_later_block():
+    raw = "Начало.\n<DATA> как слово.\n<DATA>{\"current_step\":\"ok\"}</DATA>\nКонец"
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert "<DATA> как слово." in visible
+    assert blocks[0].current_state == {"current_step": "ok"}
+    assert invalid == 0
+
+
+def test_fallback_metadata_requires_service_signature():
+    ordinary = '```json\n{"metadata":{"name":"Alice"}}\n```'
+    visible, blocks, invalid = extract_service_data(ordinary)
+
+    assert visible == ordinary
+    assert blocks == []
+    assert invalid == 0
+
+
+def test_truncated_untagged_service_json_is_hidden_without_partial_state():
+    raw = 'Ответ.\nСлужебный блок данных:\n{"current_step":"secret","metadata":{"private":'
+
+    extraction = extract_service_data_details(raw)
+
+    assert extraction.visible_text == "Ответ."
+    assert extraction.blocks == []
+    assert extraction.invalid_count == 1
+    assert extraction.classification == "parse_error"
+
+
+def test_signed_service_json_can_be_followed_by_visible_explanation():
+    raw = (
+        "Текст.\n"
+        "Заполненный current_state:\n"
+        "JSON\n"
+        '{"current_state":{"current_step":"done"}}\n'
+        "Пояснение для пользователя."
+    )
+
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == "Текст.\n\nПояснение для пользователя."
+    assert blocks[0].current_state == {"current_step": "done"}
+    assert invalid == 0
+
+
+def test_extraction_classification_is_safe_and_does_not_include_metadata():
+    cases = [
+        ('Ответ <DATA>{"metadata":{"private":"value"}}</DATA>', "tags"),
+        ('Ответ.\n{"current_step":"step"}', "fallback"),
+        ("Обычный ответ.", "none"),
+        ('Ответ.\n<DATA>{"metadata":', "parse_error"),
+    ]
+
+    for raw, expected in cases:
+        extraction = extract_service_data_details(raw)
+        assert extraction.classification == expected
+        assert "private" not in str(service_data_diagnostics(extraction))
