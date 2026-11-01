@@ -948,6 +948,39 @@ async def test_max_transport_error_status_none_transitions_to_uncertain(sqlite_s
 
 
 @pytest.mark.asyncio
+async def test_max_suspended_recipient_is_terminal_failed_delivery(sqlite_session_factory):
+    user_id = await _create_test_user(sqlite_session_factory, MAX_ID_OFFSET + 802)
+    await _create_test_scenario(sqlite_session_factory, "max_suspended_ev")
+    await register_user_for_event(
+        sqlite_session_factory, user_id, "max_suspended_ev", platform="max"
+    )
+
+    claimed = await claim_pending_deliveries(sqlite_session_factory, batch_size=10)
+    assert len(claimed) == 1
+    delivery_id, claim_token = claimed[0]
+
+    mock_max = MagicMock()
+    mock_max.send_message = AsyncMock(
+        side_effect=MaxApiError(
+            "POST /messages failed: HTTP 403",
+            status=403,
+            error_code="chat.denied",
+            payload={"code": "chat.denied", "message": "Key: error.dialog.suspended"},
+        )
+    )
+
+    outcome = await process_single_delivery(
+        sqlite_session_factory, delivery_id, claim_token, max_client=mock_max
+    )
+
+    assert outcome == "failed"
+    async with sqlite_session_factory() as session:
+        delivery = await session.get(EventDelivery, delivery_id)
+        assert delivery.status == "failed"
+        assert delivery.finished_at is not None
+
+
+@pytest.mark.asyncio
 async def test_dynamic_now_clock_rejects_expired_delivery_during_cycle(sqlite_session_factory):
     """Item 4: In production runtime (now=None), time is evaluated dynamically right before
     pre-send checks, rejecting delivery if expires_at or lease passed rather than using worker start time."""

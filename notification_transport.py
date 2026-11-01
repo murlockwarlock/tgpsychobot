@@ -7,6 +7,7 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from max_messenger_bot.api import MaxApiError
 from translation_service import translate
 
 log = logging.getLogger(__name__)
@@ -88,6 +89,17 @@ async def send_notification_transport(
                 clean_text = clean_html_for_max(text)
                 await client.send_message(user_id=max_api_user_id, text=clean_text, attachments=attachments)
                 return True
+        except MaxApiError as e:
+            if e.is_suspended_recipient:
+                log.warning(
+                    "MAX notification delivery terminal for suspended recipient recipient_id=%s status=%s code=%s",
+                    recipient_id,
+                    e.status,
+                    e.error_code,
+                )
+            else:
+                log.error("Failed to send MAX notification to %s: %s", recipient_id, e, exc_info=e)
+            return False
         except Exception as e:
             log.error("Failed to send MAX notification to %s: %s", recipient_id, e, exc_info=e)
             return False

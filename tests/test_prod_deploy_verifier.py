@@ -243,6 +243,96 @@ def test_forward_baseline_tolerates_new_chat_not_found(tmp_path):
     assert verifier.classify_log_window(content.decode()).status == LOG_CLEAN
 
 
+def test_forward_baseline_tolerates_suspended_max_recipient_delivery(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"historical text\n")
+    process = _process(log_path=log_path)
+    baseline = verifier.capture_forward_log_baseline(
+        {process["name"]: process},
+        [process["name"]],
+    )[process["name"]]
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"ERROR:scheduler:Failed to send MAX message: POST /messages failed: "
+            b"HTTP 403: {\"code\":\"chat.denied\",\"message\":\"Key: error.dialog.suspended\"}\n"
+            b"Traceback (most recent call last):\n"
+            b"MaxApiError: POST /messages failed: HTTP 403: chat.denied error.dialog.suspended\n"
+        )
+
+    content, error = verifier.read_forward_log_bytes(baseline, log_path.stat().st_size)
+    result = verifier.classify_log_window(content.decode())
+
+    assert error is None
+    assert result.status == LOG_CLEAN
+
+
+def test_forward_baseline_keeps_other_max_forbidden_response_fatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"historical text\n")
+    process = _process(log_path=log_path)
+    baseline = verifier.capture_forward_log_baseline(
+        {process["name"]: process},
+        [process["name"]],
+    )[process["name"]]
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"ERROR:scheduler:Failed to send MAX message: POST /messages failed: "
+            b"HTTP 403: {\"code\":\"auth.forbidden\",\"message\":\"forbidden\"}\n"
+            b"Traceback (most recent call last):\n"
+            b"MaxApiError: POST /messages failed: HTTP 403: auth.forbidden\n"
+        )
+
+    content, error = verifier.read_forward_log_bytes(baseline, log_path.stat().st_size)
+    result = verifier.classify_log_window(content.decode())
+
+    assert error is None
+    assert result.status == LOG_ERROR
+
+
+def test_forward_baseline_keeps_database_migration_traceback_fatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"historical text\n")
+    process = _process(log_path=log_path)
+    baseline = verifier.capture_forward_log_baseline(
+        {process["name"]: process},
+        [process["name"]],
+    )[process["name"]]
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"ERROR:database:Migration failed\n"
+            b"Traceback (most recent call last):\n"
+            b"sqlalchemy.exc.OperationalError: database unavailable\n"
+        )
+
+    content, error = verifier.read_forward_log_bytes(baseline, log_path.stat().st_size)
+    result = verifier.classify_log_window(content.decode())
+
+    assert error is None
+    assert result.status == LOG_ERROR
+
+
+def test_forward_baseline_keeps_unknown_max_exception_fatal(tmp_path):
+    log_path = tmp_path / "bot-error.log"
+    log_path.write_bytes(b"historical text\n")
+    process = _process(log_path=log_path)
+    baseline = verifier.capture_forward_log_baseline(
+        {process["name"]: process},
+        [process["name"]],
+    )[process["name"]]
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"ERROR:scheduler:Failed to send MAX message\n"
+            b"Traceback (most recent call last):\n"
+            b"MaxApiError: POST /messages failed: HTTP 500: unexpected\n"
+        )
+
+    content, error = verifier.read_forward_log_bytes(baseline, log_path.stat().st_size)
+    result = verifier.classify_log_window(content.decode())
+
+    assert error is None
+    assert result.status == LOG_ERROR
+
+
 def test_forward_observation_fails_on_pid_or_restart_change(tmp_path):
     log_path = tmp_path / "bot-error.log"
     log_path.write_bytes(b"")
