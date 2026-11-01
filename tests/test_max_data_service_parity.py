@@ -108,6 +108,9 @@ class MaxDataServiceParityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(ai_logs), 1)
             self.assertEqual(ai_logs[0].raw_response, mock_response)
             self.assertEqual(ai_logs[0].clean_text, "Здравствуйте!")
+            diagnostics = json.loads(ai_logs[0].diagnostics_json)
+            self.assertEqual(diagnostics["data_extraction"], "tags")
+            self.assertNotIn("step", ai_logs[0].diagnostics_json)
 
             state = await get_conversation_automation_state(session, user_id=self.user_id, dialogue_id=1, topic_id=None)
             self.assertIsNotNone(state)
@@ -149,9 +152,13 @@ class MaxDataServiceParityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(ai_logs), 1)
             self.assertEqual(ai_logs[0].raw_response, mock_response)
             self.assertEqual(ai_logs[0].clean_text, "Текст ответа.")
+            diagnostics = json.loads(ai_logs[0].diagnostics_json)
+            self.assertEqual(diagnostics["data_extraction"], "parse_error")
 
             state = await get_conversation_automation_state(session, user_id=self.user_id, dialogue_id=1, topic_id=None)
             self.assertTrue(state is None or load_metadata(state.current_state_json) == {})
+            events = (await session.execute(select(AutomationEvent).where(AutomationEvent.user_id == self.user_id))).scalars().all()
+            self.assertEqual(events, [])
 
     # -----------------------------------------------------------------------
     # 4. DATA-only response
@@ -452,6 +459,8 @@ class MaxDataServiceParityTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(ai_logs), 1)
             self.assertEqual(ai_logs[0].raw_response, broken_provider_response)
             self.assertEqual(ai_logs[0].clean_text, "Нормальный ответ MAX.")
+            diagnostics = json.loads(ai_logs[0].diagnostics_json)
+            self.assertEqual(diagnostics["data_extraction"], "parse_error")
 
         # 3. Drive real common.run_ai_dialogue() with the same broken-provider response.
         client = _MockMaxApiClient()

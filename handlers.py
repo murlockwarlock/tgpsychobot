@@ -21259,7 +21259,7 @@ async def get_ai_response_direct(
         except Exception as exc:
             logging.exception("Could not save direct AI service data for user %s: %s", user_id, exc)
             raise
-    return visible_text or response_text
+    return visible_text
 
 
 @router.message(Command("test"))

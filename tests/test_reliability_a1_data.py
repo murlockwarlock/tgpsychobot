@@ -458,6 +458,8 @@ class TestA1ResultHistoryAndIntegration:
                 assert len(ai_logs) >= 1
                 assert ai_logs[0].raw_response == broken_response
                 assert ai_logs[0].clean_text == "Нормальный ответ TG."
+                diagnostics = json.loads(ai_logs[0].diagnostics_json)
+                assert diagnostics["data_extraction"] == "parse_error"
 
             # 3. Drive actual Telegram assistant persistence path via handlers.process_buffered_messages
             mock_bot = AsyncMock()
@@ -571,6 +573,8 @@ class TestA1ResultHistoryAndIntegration:
                 assert len(ai_logs) >= 1
                 assert ai_logs[0].raw_response == broken_data_only
                 assert ai_logs[0].clean_text == ""
+                diagnostics = json.loads(ai_logs[0].diagnostics_json)
+                assert diagnostics["data_extraction"] == "parse_error"
 
             # 3. Drive Telegram conversational flow with broken data-only response
             mock_bot = AsyncMock()
