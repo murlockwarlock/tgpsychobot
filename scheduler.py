@@ -59,6 +59,7 @@ from subscription_renewal import (
 )
 from time_helpers import format_msk, to_msk
 from notification_transport import build_subscribe_keyboard, send_notification_transport
+from max_messenger_bot.api import MaxApiError
 from notification_outbox import (
     NotificationPolicy,
     dispatch_outbox_by_key,
@@ -338,6 +339,23 @@ def patch_bot_send_message(bot: Bot):
                     clean_text = re.sub(r'<[^>]+>', '', text)
                     await client.send_message(user_id=max_api_user_id, text=clean_text, attachments=attachments)
                     return None
+            except MaxApiError as e:
+                scheduler_log = logging.getLogger("scheduler")
+                if e.is_suspended_recipient:
+                    scheduler_log.warning(
+                        "MAX message delivery terminal for suspended recipient chat_id=%s status=%s code=%s",
+                        chat_id_int,
+                        e.status,
+                        e.error_code,
+                    )
+                else:
+                    scheduler_log.error(
+                        "Failed to send MAX message to %s: %s",
+                        chat_id_int,
+                        e,
+                        exc_info=e,
+                    )
+                return None
             except Exception as e:
                 logging.getLogger("scheduler").error(f"Failed to send MAX message to {chat_id_int}: {e}", exc_info=e)
                 return None

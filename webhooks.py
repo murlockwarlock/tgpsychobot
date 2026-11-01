@@ -40,6 +40,7 @@ from notification_outbox import (
     get_canonical_key_for_yookassa_cancellation,
 )
 from telegram_start_service import grant_subscription_days
+from max_messenger_bot.api import MaxApiError
 
 import os
 import re
@@ -94,6 +95,17 @@ async def send_msg_universal(bot: Bot, user_id: int, text: str, parse_mode: str 
                 clean_text = clean_html_for_max(text)
                 await client.send_message(user_id=max_api_user_id, text=clean_text, attachments=attachments)
                 return True
+        except MaxApiError as e:
+            if e.is_suspended_recipient:
+                log.warning(
+                    "MAX message delivery terminal for suspended recipient user_id=%s status=%s code=%s",
+                    user_id,
+                    e.status,
+                    e.error_code,
+                )
+            else:
+                log.error(f"Failed to send MAX message to {user_id}: {e}", exc_info=e)
+            return False
         except Exception as e:
             log.error(f"Failed to send MAX message to {user_id}: {e}", exc_info=e)
             return False

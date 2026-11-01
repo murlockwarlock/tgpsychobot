@@ -29,6 +29,15 @@ class MaxApiError(RuntimeError):
         self.payload = payload or {}
 
     @property
+    def is_suspended_recipient(self) -> bool:
+        message = self.payload.get("message", "") if isinstance(self.payload, dict) else ""
+        return (
+            self.status == 403
+            and self.error_code == "chat.denied"
+            and "error.dialog.suspended" in f"{message} {self}"
+        )
+
+    @property
     def is_attachment_not_ready(self) -> bool:
         if self.error_code == "attachment.not.ready":
             return True

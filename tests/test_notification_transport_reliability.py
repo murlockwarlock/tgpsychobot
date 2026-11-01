@@ -2,6 +2,7 @@ import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from max_messenger_bot.api import MaxApiError
 from notification_transport import send_notification_transport, clean_html_for_max, build_subscribe_keyboard
 
 
@@ -61,6 +62,24 @@ class NotificationTransportReliabilityTests(unittest.IsolatedAsyncioTestCase):
              patch("max_messenger_bot.api.MaxApiClient", return_value=mock_client_instance):
             res = await send_notification_transport(bot, max_user_id, "Hello MAX")
             self.assertFalse(res)
+
+    async def test_suspended_max_recipient_is_terminal_delivery_failure(self):
+        error = MaxApiError(
+            "POST /messages failed: HTTP 403",
+            status=403,
+            error_code="chat.denied",
+            payload={"code": "chat.denied", "message": "Key: error.dialog.suspended"},
+        )
+        self.assertTrue(error.is_suspended_recipient)
+
+    async def test_other_max_forbidden_response_is_not_suspended_recipient(self):
+        error = MaxApiError(
+            "POST /messages failed: HTTP 403",
+            status=403,
+            error_code="auth.forbidden",
+            payload={"code": "auth.forbidden", "message": "forbidden"},
+        )
+        self.assertFalse(error.is_suspended_recipient)
 
     async def test_false_notify_sent_regression_in_scheduler(self):
         """On transport failure, _send_deduplicated_notification does not log NOTIFY_SENT and returns False."""

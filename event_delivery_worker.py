@@ -571,6 +571,24 @@ async def process_single_delivery(
         status_code = getattr(exc, "status", None)
         err_msg = str(exc)
 
+        if exc.is_suspended_recipient:
+            log.warning(
+                "MAX delivery %s terminal for suspended recipient %s: %s",
+                delivery_id,
+                user_id,
+                exc,
+            )
+            await finalize_delivery_outcome(
+                session_maker,
+                delivery_id,
+                claim_token,
+                status="failed",
+                finished_at=err_now,
+                last_error=err_msg,
+                now=now,
+            )
+            return "failed"
+
         if error_code in ("user.blocked", "blocked") or "blocked" in err_msg.lower():
             log.warning("MAX delivery %s blocked by user %s: %s", delivery_id, user_id, exc)
             await finalize_delivery_outcome(

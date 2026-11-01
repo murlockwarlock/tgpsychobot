@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -7,6 +8,7 @@ os.environ.setdefault("BOT_TOKEN", "test_bot_token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import pytest
+from max_messenger_bot.api import MaxApiError
 
 
 def test_ecosystem_config_max_bot_token_wiring():
@@ -58,6 +60,84 @@ async def test_scheduler_patch_bot_send_message_missing_max_token_fails_closed()
         res = await bot.send_message(max_user_id, "Hello MAX")
         # Returns None, did not crash, did not send to wrong bot
         assert res is None
+
+
+def _max_error_client(error):
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = None
+    client.send_message.side_effect = error
+    return client
+
+
+@pytest.mark.asyncio
+async def test_scheduler_treats_suspended_max_recipient_as_terminal_without_traceback(caplog):
+    import scheduler
+
+    class DummyBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            return "tg_sent"
+
+    bot = DummyBot()
+    scheduler.patch_bot_send_message(bot)
+    error = MaxApiError(
+        "POST /messages failed: HTTP 403",
+        status=403,
+        error_code="chat.denied",
+        payload={"code": "chat.denied", "message": "Key: error.dialog.suspended"},
+    )
+    with patch.dict(os.environ, {"MAX_BOT_TOKEN": "test-token"}, clear=False), \
+         patch("max_messenger_bot.api.MaxApiClient", return_value=_max_error_client(error)), \
+         caplog.at_level(logging.WARNING, logger="scheduler"):
+        result = await bot.send_message(100_000_000_001, "Hello MAX")
+
+    assert result is None
+    assert any("terminal" in record.message.lower() for record in caplog.records)
+    assert not any(record.exc_info for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_does_not_suppress_other_max_forbidden_response(caplog):
+    import scheduler
+
+    class DummyBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            return "tg_sent"
+
+    bot = DummyBot()
+    scheduler.patch_bot_send_message(bot)
+    error = MaxApiError(
+        "POST /messages failed: HTTP 403",
+        status=403,
+        error_code="auth.forbidden",
+        payload={"code": "auth.forbidden", "message": "forbidden"},
+    )
+    with patch.dict(os.environ, {"MAX_BOT_TOKEN": "test-token"}, clear=False), \
+         patch("max_messenger_bot.api.MaxApiClient", return_value=_max_error_client(error)), \
+         caplog.at_level(logging.ERROR, logger="scheduler"):
+        result = await bot.send_message(100_000_000_002, "Hello MAX")
+
+    assert result is None
+    assert any(record.exc_info for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_does_not_suppress_unknown_max_exception(caplog):
+    import scheduler
+
+    class DummyBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            return "tg_sent"
+
+    bot = DummyBot()
+    scheduler.patch_bot_send_message(bot)
+    with patch.dict(os.environ, {"MAX_BOT_TOKEN": "test-token"}, clear=False), \
+         patch("max_messenger_bot.api.MaxApiClient", return_value=_max_error_client(RuntimeError("unexpected"))), \
+         caplog.at_level(logging.ERROR, logger="scheduler"):
+        result = await bot.send_message(100_000_000_003, "Hello MAX")
+
+    assert result is None
+    assert any(record.exc_info for record in caplog.records)
 
 
 @pytest.mark.asyncio

@@ -162,7 +162,20 @@ def _is_chat_not_found_log(block: str) -> bool:
     return any(CHAT_NOT_FOUND_RE.search(line) for line in lines)
 
 
+def _is_suspended_max_recipient_log(block: str) -> bool:
+    lowered = block.casefold()
+    return (
+        "post /messages" in lowered
+        and "http 403" in lowered
+        and "chat.denied" in lowered
+        and "error.dialog.suspended" in lowered
+        and "max" in lowered
+    )
+
+
 def _is_allowed_delivery_block(block: str) -> bool:
+    if _is_suspended_max_recipient_log(block):
+        return True
     if STARTUP_ERROR_RE.search(block):
         return False
     context_match = STARTUP_CONTEXT_FAILURE_RE.search(block)
@@ -184,9 +197,12 @@ def _remove_allowed_delivery_context(
             lines.pop()
         if lines:
             context_line = lines[-1]
-            context_match = STARTUP_CONTEXT_FAILURE_RE.search(context_line)
-            if context_match and not FATAL_CONTEXT_MARKER_RE.search(context_match.group()):
+            if _is_suspended_max_recipient_log(context + residual[index]):
                 residual[context_index] = "".join(lines[:-1])
+            else:
+                context_match = STARTUP_CONTEXT_FAILURE_RE.search(context_line)
+                if context_match and not FATAL_CONTEXT_MARKER_RE.search(context_match.group()):
+                    residual[context_index] = "".join(lines[:-1])
         residual[index] = ""
     return "".join(residual)
 
