@@ -14,7 +14,6 @@ import re
 from typing import Any, Iterable
 from types import SimpleNamespace
 from sqlalchemy import select
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 from openai import AsyncOpenAI, AuthenticationError, RateLimitError, BadRequestError
 import gemini_image
@@ -24,7 +23,7 @@ from media_templates import format_template_sources
 import time
 from datetime import datetime
 
-from database import (async_session_maker, AIConfig, BotGeneralConfig, Message as DBMessage, User, Topic,
+from database import (async_session_maker, AIConfig, Message as DBMessage, User, Topic,
                      UserSubscription, KnowledgeBase, SubscriptionConfig, AILog)
 from ai_request_builder import (
     ActivityTracker,
@@ -43,7 +42,7 @@ from prompt_blocks import (
     render_prompt_block,
 )
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, persist_service_data_blocks
-from system_messages import addressing_style_instruction, normalize_addressing_style
+from system_messages import addressing_style_instruction, resolve_addressing_style
 from result_history import (
     TEST_RESULT_ROLE,
     ai_history_role_filter,
@@ -822,20 +821,14 @@ async def _build_request_context_blocks(
         )
 
     runtime_parts = ["\n".join(client_lines)]
-    try:
-        general_config = await session.get(BotGeneralConfig, 1)
-    except OperationalError:
-        general_config = None
-    if general_config is not None:
-        runtime_parts.append(
-            addressing_style_instruction(
-                normalize_addressing_style(getattr(general_config, "addressing_style", "informal")),
-            )
-        )
     if short_response_instruction and short_response_instruction.strip():
         runtime_parts.append(short_response_instruction.strip())
 
-    request_parts = []
+    request_parts = [
+        addressing_style_instruction(
+            await resolve_addressing_style(session, "telegram"),
+        )
+    ]
     if test_context and test_context.strip():
         request_parts.append(test_context.strip())
     if knowledge_context and knowledge_context.strip():

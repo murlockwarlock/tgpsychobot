@@ -666,6 +666,8 @@ AI_PROCESSING_MESSAGE_MAX_LENGTH = 4096
 AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH = 16000
 DEFAULT_ADDRESSING_STYLE = "informal"
 ADDRESSING_STYLES = ("informal", "formal")
+DEFAULT_BOT_SCOPE = "telegram"
+BOT_SCOPES = ("telegram", "max")
 
 
 class BotGeneralConfig(Base):
@@ -690,16 +692,24 @@ class BotGeneralConfig(Base):
     translations_revision = Column(Integer, default=0, nullable=False)
 
 
+class BotAddressingConfig(Base):
+    __tablename__ = 'bot_addressing_config'
+
+    bot_scope = Column(String(32), primary_key=True)
+    addressing_style = Column(String(16), default=DEFAULT_ADDRESSING_STYLE, nullable=False)
+
+
 class BotSystemMessage(Base):
     __tablename__ = 'bot_system_messages'
     __table_args__ = (
         UniqueConstraint(
+            'bot_scope',
             'translation_key',
             'locale',
             'addressing_style',
-            name='uq_bot_system_message_key_locale_style',
+            name='uq_bot_system_message_scope_key_locale_style',
         ),
-        Index('idx_bot_system_message_key_locale', 'translation_key', 'locale'),
+        Index('idx_bot_system_message_scope_key_locale', 'bot_scope', 'translation_key', 'locale'),
         CheckConstraint(
             "addressing_style IN ('informal', 'formal')",
             name='ck_bot_system_message_addressing_style',
@@ -707,6 +717,7 @@ class BotSystemMessage(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    bot_scope = Column(String(32), default=DEFAULT_BOT_SCOPE, nullable=False)
     translation_key = Column(String(255), nullable=False)
     locale = Column(String(8), nullable=False)
     addressing_style = Column(String(16), nullable=False)
@@ -1513,6 +1524,60 @@ def _migrate_media_templates(sync_conn):
         sync_conn.execute(text('ALTER TABLE media_library ADD COLUMN render_template_config JSON'))
 
 
+def _migrate_bot_system_messages(sync_conn):
+    from sqlalchemy import inspect
+
+    table_name = 'bot_system_messages'
+    inspector = inspect(sync_conn)
+    if not inspector.has_table(table_name):
+        return
+    columns = {column['name'] for column in inspector.get_columns(table_name)}
+    if 'bot_scope' not in columns:
+        if sync_conn.dialect.name == 'sqlite':
+            sync_conn.execute(text('ALTER TABLE bot_system_messages RENAME TO bot_system_messages_legacy'))
+            sync_conn.execute(text(
+                "CREATE TABLE bot_system_messages ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                "bot_scope VARCHAR(32) DEFAULT 'telegram' NOT NULL, "
+                "translation_key VARCHAR(255) NOT NULL, "
+                "locale VARCHAR(8) NOT NULL, "
+                "addressing_style VARCHAR(16) NOT NULL, "
+                "text TEXT NOT NULL, "
+                "updated_at DATETIME NOT NULL, "
+                "CONSTRAINT uq_bot_system_message_scope_key_locale_style "
+                "UNIQUE (bot_scope, translation_key, locale, addressing_style), "
+                "CONSTRAINT ck_bot_system_message_addressing_style "
+                "CHECK (addressing_style IN ('informal', 'formal'))"
+                ")"
+            ))
+            sync_conn.execute(text(
+                "INSERT INTO bot_system_messages "
+                "(id, bot_scope, translation_key, locale, addressing_style, text, updated_at) "
+                "SELECT id, 'telegram', translation_key, locale, addressing_style, text, updated_at "
+                "FROM bot_system_messages_legacy"
+            ))
+            sync_conn.execute(text('DROP TABLE bot_system_messages_legacy'))
+        else:
+            sync_conn.execute(text(
+                "ALTER TABLE bot_system_messages "
+                "ADD COLUMN bot_scope VARCHAR(32) DEFAULT 'telegram' NOT NULL"
+            ))
+            if sync_conn.dialect.name == 'postgresql':
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_system_messages "
+                    "DROP CONSTRAINT IF EXISTS uq_bot_system_message_key_locale_style"
+                ))
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_system_messages "
+                    "ADD CONSTRAINT uq_bot_system_message_scope_key_locale_style "
+                    "UNIQUE (bot_scope, translation_key, locale, addressing_style)"
+                ))
+    sync_conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_bot_system_message_scope_key_locale "
+        "ON bot_system_messages (bot_scope, translation_key, locale)"
+    ))
+
+
 async def init_db():
     async with engine.begin() as conn:
         await _acquire_database_init_lock(conn)
@@ -1525,6 +1590,7 @@ async def init_db():
             dialect_name = getattr(sync_conn.dialect, "name", "")
             _migrate_media_edit_sources(sync_conn)
             _migrate_media_templates(sync_conn)
+            _migrate_bot_system_messages(sync_conn)
             sync_conn.execute(text(
                 "UPDATE media_library SET media_type = 'photo' "
                 "WHERE LOWER(media_type) = 'image'"
@@ -2175,6 +2241,42 @@ async def init_db():
                 general_conf.telegram_enabled_languages = '["ru"]'
             if getattr(general_conf, 'translations_revision', None) is None:
                 general_conf.translations_revision = 0
+
+        from sqlalchemy import select
+
+        for bot_scope in BOT_SCOPES:
+            addressing_config = await session.get(BotAddressingConfig, bot_scope)
+            if addressing_config is None:
+                session.add(BotAddressingConfig(
+                    bot_scope=bot_scope,
+                    addressing_style=getattr(general_conf, 'addressing_style', DEFAULT_ADDRESSING_STYLE),
+                ))
+            elif addressing_config.addressing_style not in ADDRESSING_STYLES:
+                addressing_config.addressing_style = DEFAULT_ADDRESSING_STYLE
+
+        telegram_system_messages = (
+            await session.execute(
+                select(BotSystemMessage).where(BotSystemMessage.bot_scope == DEFAULT_BOT_SCOPE)
+            )
+        ).scalars().all()
+        for telegram_message in telegram_system_messages:
+            max_message = await session.scalar(
+                select(BotSystemMessage).where(
+                    BotSystemMessage.bot_scope == "max",
+                    BotSystemMessage.translation_key == telegram_message.translation_key,
+                    BotSystemMessage.locale == telegram_message.locale,
+                    BotSystemMessage.addressing_style == telegram_message.addressing_style,
+                )
+            )
+            if max_message is None:
+                session.add(BotSystemMessage(
+                    bot_scope="max",
+                    translation_key=telegram_message.translation_key,
+                    locale=telegram_message.locale,
+                    addressing_style=telegram_message.addressing_style,
+                    text=telegram_message.text,
+                    updated_at=telegram_message.updated_at,
+                ))
 
         # Seed default content sections for new bots (won't overwrite existing)
         default_content = [

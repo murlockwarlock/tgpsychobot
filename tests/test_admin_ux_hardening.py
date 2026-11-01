@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import EditMessageText, GetChat, GetMe, SendMessage
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetChat, GetMe, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User
 from aiogram.client.session.base import BaseSession
 from aiogram import Bot
@@ -37,6 +37,12 @@ from database import (
     UserSubscription,
 )
 from translation_service import source_hash
+from system_messages import (
+    SYSTEM_MESSAGE_CATALOG,
+    SYSTEM_MESSAGE_PAGE_SIZE,
+    parse_system_message_callback,
+    system_message_callback_data,
+)
 
 
 @pytest_asyncio.fixture
@@ -849,19 +855,27 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
     assert "Обращение: <b>Вы</b>" in general.text
     async with factory() as db_session:
         assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
+    general = await press("admin_general_set_addressing_informal", 502)
+    assert "Обращение: <b>Ты</b>" in general.text
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "informal"
+    general = await press("admin_general_set_addressing_formal", 503)
+    assert "Обращение: <b>Вы</b>" in general.text
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
 
-    system_list = await press("admin_system_messages", 502)
+    system_list = await press("admin_system_messages", 504)
     assert "Системные сообщения" in system_list.text
-    system_list = await press("admin_system_messages_page:2:ru", 503)
+    system_list = await press("admin_system_messages_page:2:ru", 505)
     assert any(
-        button.callback_data == "admin_system_message:ui.ai.busy:ru:2"
+        button.callback_data == system_message_callback_data("d", "ui.ai.busy", "ru", page=2)
         for row in system_list.reply_markup.inline_keyboard
         for button in row
     )
 
-    detail = await press("admin_system_message:ui.ai.busy:ru:2", 504)
+    detail = await press("admin_system_message:ui.ai.busy:ru:2", 506)
     assert "ui.ai.busy" in detail.text
-    await press("admin_system_edit:ui.ai.busy:ru:formal:2", 505)
+    await press("admin_system_edit:ui.ai.busy:ru:formal:2", 507)
 
     draft_message = _admin_message(
         bot,
@@ -870,14 +884,14 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
     )
     await admin_dispatcher.feed_update(
         bot,
-        Update(update_id=506, message=draft_message),
+        Update(update_id=508, message=draft_message),
     )
     assert any(
         isinstance(method, SendMessage) and "Черновик сохранён" in method.text
         for method in session.calls
     )
 
-    saved = await press("admin_system_save:ui.ai.busy:ru:formal:2", 507)
+    saved = await press("admin_system_save:ui.ai.busy:ru:formal:2", 509)
     assert "Ваш предыдущий запрос" in saved.text
     async with factory() as db_session:
         formal_row = await db_session.scalar(
@@ -888,13 +902,13 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
         )
         assert formal_row.text == "Пожалуйста, подождите — Ваш предыдущий запрос ещё выполняется."
 
-    reopened = await press("admin_system_message:ui.ai.busy:ru:2", 508)
+    reopened = await press("admin_system_message:ui.ai.busy:ru:2", 510)
     assert "Ваш предыдущий запрос" in reopened.text
-    await press("admin_system_edit:ui.ai.busy:ru:formal:2", 509)
+    await press("admin_system_edit:ui.ai.busy:ru:formal:2", 511)
     await admin_dispatcher.feed_update(
         bot,
         Update(
-            update_id=510,
+            update_id=512,
             message=_admin_message(
                 bot,
                 message_id=3,
@@ -902,16 +916,16 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
             ),
         ),
     )
-    cancelled = await press("admin_system_cancel:ui.ai.busy:ru:2", 511)
+    cancelled = await press("admin_system_cancel:ui.ai.busy:ru:2", 513)
     assert "Ваш предыдущий запрос" in cancelled.text
-    await press("admin_system_reset:ui.ai.busy:ru:formal:2", 512)
-    reset_detail = await press("admin_system_message:ui.ai.busy:ru:2", 513)
+    await press("admin_system_reset:ui.ai.busy:ru:formal:2", 514)
+    reset_detail = await press("admin_system_message:ui.ai.busy:ru:2", 515)
     assert "Пожалуйста, не так быстро" in reset_detail.text
 
-    await press("admin_system_messages_page:2:ru", 514)
-    english_list = await press("admin_system_messages_locale:en:2", 515)
+    await press("admin_system_messages_page:2:ru", 516)
+    english_list = await press("admin_system_messages_locale:en:2", 517)
     assert "Язык: <b>English</b>" in english_list.text
-    returned = await press("admin_general_settings", 516)
+    returned = await press("admin_general_settings", 518)
     assert "Общие настройки" in returned.text
 
     async with factory() as db_session:
@@ -969,6 +983,373 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
     assert any(method.text == "Ответ пользователю" for method in outgoing)
     assert provider_payloads
     assert "ОБРАЩЕНИЕ: обращайся к пользователю на «Вы»" in str(provider_payloads[-1])
+
+
+@pytest.mark.asyncio
+async def test_system_message_catalog_uses_valid_callback_data_on_every_detail_page(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add(DBUser(id=13, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=13, text="/admin")
+    update_id = 600
+    categories = {}
+
+    def classify(callback_data):
+        if callback_data in {"admin_general_settings", "admin_system_messages", "admin_panel", "admin_language_settings", "noop"}:
+            return "navigation"
+        if callback_data.startswith(("admin_general_toggle_", "admin_general_edit_", "admin_general_set_")):
+            return "mutation"
+        if callback_data.startswith("admin_main_collections_page_"):
+            return "navigation"
+        parsed = parse_system_message_callback(callback_data)
+        assert parsed is not None, callback_data
+        action = parsed["action"]
+        if action == "r":
+            return "destructive"
+        if action in {"e", "s"}:
+            return "mutation"
+        if action in {"c", "d", "l", "p", "v"}:
+            return "navigation"
+        raise AssertionError(f"unclassified system-message callback: {callback_data}")
+
+    def inspect_markup(markup):
+        buttons = [
+            button
+            for row in (markup.inline_keyboard if markup else [])
+            for button in row
+            if button.callback_data
+        ]
+        assert buttons
+        for button in buttons:
+            assert len(button.callback_data.encode("utf-8")) <= 64
+            categories[button.callback_data] = classify(button.callback_data)
+        return buttons
+
+    async def press(callback_data, *, expect_render=True):
+        nonlocal update_id
+        update_id += 1
+        session.calls.clear()
+        await _feed_callback(admin_dispatcher, bot, root_message, callback_data, update_id)
+        for method in session.calls:
+            if isinstance(method, AnswerCallbackQuery):
+                assert len((method.text or "").encode("utf-8")) <= 200
+        if not expect_render:
+            return None
+        rendered = [method for method in session.calls if isinstance(method, (EditMessageText, SendMessage))]
+        assert rendered, f"{callback_data}: {[(type(method).__name__, getattr(method, 'text', None)) for method in session.calls]}"
+        return rendered[-1]
+
+    await press("admin_general_settings")
+    system_list = await press("admin_system_messages")
+    total_pages = (len(SYSTEM_MESSAGE_CATALOG) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE
+
+    async def restore_page(target_page, current_list):
+        current_page = 0
+        while current_page < target_page:
+            next_button = next(
+                button
+                for button in inspect_markup(current_list.reply_markup)
+                if parse_system_message_callback(button.callback_data) is not None
+                and parse_system_message_callback(button.callback_data)["action"] == "p"
+                and int(parse_system_message_callback(button.callback_data)["page"]) == current_page + 1
+            )
+            current_list = await press(next_button.callback_data)
+            current_page += 1
+        return current_list
+
+    for page in range(total_pages):
+        if page:
+            system_list = await restore_page(page, system_list)
+        list_buttons = inspect_markup(system_list.reply_markup)
+        locale_buttons = [
+            button
+            for button in list_buttons
+            if parse_system_message_callback(button.callback_data)
+            and parse_system_message_callback(button.callback_data)["action"] == "l"
+        ]
+        for locale_button in locale_buttons:
+            system_list = await press(locale_button.callback_data)
+        ru_button = next(
+            button
+            for button in inspect_markup(system_list.reply_markup)
+            if parse_system_message_callback(button.callback_data)
+            and parse_system_message_callback(button.callback_data)["action"] == "l"
+            and parse_system_message_callback(button.callback_data)["locale"] == "ru"
+        )
+        system_list = await press(ru_button.callback_data)
+        list_buttons = inspect_markup(system_list.reply_markup)
+
+        await press("noop", expect_render=False)
+        item_buttons = [
+            button
+            for button in list_buttons
+            if parse_system_message_callback(button.callback_data)
+            and parse_system_message_callback(button.callback_data)["action"] == "d"
+        ]
+        for item_index, item_button in enumerate(item_buttons):
+            detail = await press(item_button.callback_data)
+            detail_buttons = inspect_markup(detail.reply_markup)
+            for detail_button in detail_buttons:
+                parsed = parse_system_message_callback(detail_button.callback_data)
+                if not parsed or parsed["action"] != "v":
+                    continue
+                preview = await press(detail_button.callback_data)
+                back_button = next(
+                    button
+                    for button in inspect_markup(preview.reply_markup)
+                    if parse_system_message_callback(button.callback_data)
+                    and parse_system_message_callback(button.callback_data)["action"] == "d"
+                )
+                detail = await press(back_button.callback_data)
+            detail_buttons = inspect_markup(detail.reply_markup)
+            for detail_button in detail_buttons:
+                parsed = parse_system_message_callback(detail_button.callback_data)
+                if not parsed or parsed["action"] != "e":
+                    continue
+                await press(detail_button.callback_data)
+                update_id += 1
+                await admin_dispatcher.feed_update(
+                    bot,
+                    Update(
+                        update_id=update_id,
+                        message=_admin_message(
+                            bot,
+                            user_id=13,
+                            message_id=update_id,
+                            text=f"CATALOG DRAFT {page} {item_index} {parsed['style']}",
+                        ),
+                    ),
+                )
+                draft_rendered = [
+                    method for method in session.calls if isinstance(method, SendMessage)
+                ]
+                assert draft_rendered
+                draft_method = next(
+                    method for method in reversed(draft_rendered) if method.reply_markup
+                )
+                draft_buttons = inspect_markup(draft_method.reply_markup)
+                draft_action = "c" if parsed["style"] == "informal" else "s"
+                draft_button = next(
+                    button
+                    for button in draft_buttons
+                    if parse_system_message_callback(button.callback_data)
+                    and parse_system_message_callback(button.callback_data)["action"] == draft_action
+                )
+                detail = await press(draft_button.callback_data)
+            detail_buttons = inspect_markup(detail.reply_markup)
+            for detail_button in detail_buttons:
+                parsed = parse_system_message_callback(detail_button.callback_data)
+                if not parsed or parsed["action"] != "r":
+                    continue
+                detail = await press(detail_button.callback_data)
+            back_button = next(
+                button
+                for button in inspect_markup(detail.reply_markup)
+                if parse_system_message_callback(button.callback_data)
+                and parse_system_message_callback(button.callback_data)["action"] == "p"
+            )
+            system_list = await press(back_button.callback_data)
+
+        list_buttons = inspect_markup(system_list.reply_markup)
+        page_buttons = [
+            button
+            for button in list_buttons
+            if parse_system_message_callback(button.callback_data)
+            and parse_system_message_callback(button.callback_data)["action"] == "p"
+        ]
+        for page_button in page_buttons:
+            target = int(parse_system_message_callback(page_button.callback_data)["page"])
+            if target == page:
+                continue
+            target_list = await press(page_button.callback_data)
+            return_button = next(
+                button
+                for button in inspect_markup(target_list.reply_markup)
+                if parse_system_message_callback(button.callback_data)
+                and parse_system_message_callback(button.callback_data)["action"] == "p"
+                and int(parse_system_message_callback(button.callback_data)["page"]) == page
+            )
+            system_list = await press(return_button.callback_data)
+        general_button = next(
+            button for button in inspect_markup(system_list.reply_markup)
+            if button.callback_data == "admin_general_settings"
+        )
+        general = await press(general_button.callback_data)
+        system_button = next(
+            button for button in inspect_markup(general.reply_markup)
+            if button.callback_data == "admin_system_messages"
+        )
+        system_list = await press(system_button.callback_data)
+
+    assert set(categories.values()) == {"navigation", "mutation", "destructive"}
+
+
+@pytest.mark.asyncio
+async def test_system_message_save_rejects_stale_telegram_edit_context(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add(DBUser(id=14, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, text="/admin")
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_system_message:ui.ai.busy:ru:2", 700)
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_system_edit:ui.ai.busy:ru:formal:2", 701)
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=702,
+            message=_admin_message(bot, message_id=10, text="STALE DRAFT"),
+        ),
+    )
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_system_edit:ui.ai.thinking:ru:informal:0", 703)
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_system_save:ui.ai.busy:ru:formal:2", 704)
+
+    async with factory() as db_session:
+        assert await db_session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        ) is None
+
+
+@pytest.mark.asyncio
+async def test_system_message_telegram_stale_save_after_cancel_locale_and_back(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add(DBUser(id=16, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=16, text="/admin")
+    update_id = 750
+
+    async def feed(data):
+        nonlocal update_id
+        update_id += 1
+        session.calls.clear()
+        await _feed_callback(admin_dispatcher, bot, root_message, data, update_id)
+        for method in session.calls:
+            if isinstance(method, AnswerCallbackQuery):
+                assert len((method.text or "").encode("utf-8")) <= 200
+
+    async def draft(text_value):
+        nonlocal update_id
+        update_id += 1
+        await admin_dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=update_id,
+                message=_admin_message(bot, user_id=16, message_id=update_id, text=text_value),
+            ),
+        )
+
+    key = "ui.ai.thinking"
+    edit = system_message_callback_data("e", key, "ru", "formal", 0)
+    save = system_message_callback_data("s", key, "ru", "formal", 0)
+    cancel = system_message_callback_data("c", key, "ru", "formal", 0)
+
+    await feed(edit)
+    await draft("CANCELLED DRAFT")
+    await feed(cancel)
+    await feed(save)
+
+    await feed(edit)
+    await draft("LOCALE DRAFT")
+    await feed(system_message_callback_data("l", locale="en", page=0))
+    await feed(save)
+
+    await feed(edit)
+    await draft("BACK DRAFT")
+    await feed("admin_general_settings")
+    await feed(save)
+
+    async with factory() as db_session:
+        assert await db_session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.translation_key == key,
+                BotSystemMessage.addressing_style == "formal",
+            )
+        ) is None
+
+
+@pytest.mark.asyncio
+async def test_system_message_detail_and_preview_fit_telegram_text_limit(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add_all([
+            DBUser(id=15, is_admin=True, first_name="Admin"),
+            BotSystemMessage(
+                translation_key="ui.access.subscription_required",
+                locale="ru",
+                addressing_style="informal",
+                text="<b>" + "A" * 4092 + "</b>",
+            ),
+            BotSystemMessage(
+                translation_key="ui.access.subscription_required",
+                locale="ru",
+                addressing_style="formal",
+                text="<b>" + "B" * 4092 + "</b>",
+            ),
+        ])
+        await db_session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, text="/admin")
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        root_message,
+        "admin_system_message:ui.access.subscription_required:ru:4",
+        705,
+    )
+    detail = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert len(detail.text) <= 4096
+    assert "&lt;b&gt;" in detail.text
+
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        root_message,
+        "admin_system_edit:ui.access.subscription_required:ru:formal:4",
+        7051,
+    )
+    editor = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert len(editor.text) <= 4096
+
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        root_message,
+        "admin_system_preview:ui.access.subscription_required:ru:formal:4",
+        706,
+    )
+    preview = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert len(preview.text) <= 4096
 
 
 @pytest.mark.asyncio

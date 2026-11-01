@@ -1626,6 +1626,7 @@ async def get_ai_response(
             service_capabilities=MAX_CAPABILITIES,
             media_edit_sources=edit_sources,
             preferred_response_locale=await resolve_user_effective_locale(session, user, platform="max"),
+            bot_scope="max",
         )
         temperature = _resolve_temperature(ai_config)
         request_group_id = uuid.uuid4().hex[:12]
@@ -2227,6 +2228,7 @@ async def get_ai_response_direct(
             minutes_since_last_visit=minutes_since_last_visit,
             minutes_since_last_message=minutes_since_last_message,
             service_capabilities=MAX_CAPABILITIES,
+            bot_scope="max",
         )
 
     # Session closed BEFORE external provider call
@@ -2979,6 +2981,7 @@ async def analyze_image(
             modality_instructions=(photo_instructions,),
             media_edit_sources=edit_sources,
             preferred_response_locale=await resolve_user_effective_locale(session, user, platform="max"),
+            bot_scope="max",
         )
 
     if execution_context is not None:

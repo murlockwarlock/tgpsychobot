@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-from database import AIConfig, Base, BotGeneralConfig
+from database import AIConfig, Base, BotAddressingConfig, BotGeneralConfig, BotSystemMessage
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.app import MaxBotApplication
 from max_messenger_bot import app as max_app_module
@@ -16,6 +16,12 @@ from max_messenger_bot.services import admin_ai as max_admin_ai
 from max_messenger_bot.services import admin_system_messages as max_system_messages
 from max_messenger_bot.storage import StorageBase
 from provider_models import get_capability_providers
+from system_messages import (
+    SYSTEM_MESSAGE_CATALOG,
+    SYSTEM_MESSAGE_PAGE_SIZE,
+    parse_system_message_callback,
+    system_message_callback_data,
+)
 
 
 @pytest_asyncio.fixture
@@ -1240,7 +1246,7 @@ async def test_max_addressing_style_system_message_journey_uses_real_app_callbac
     formal = await press("admin_general_set_addressing_formal")
     assert "Обращение: <b>Вы</b>" in formal["text"]
     async with max_settings_db() as session:
-        assert (await session.get(BotGeneralConfig, 1)).addressing_style == "formal"
+        assert (await session.get(BotAddressingConfig, "max")).addressing_style == "formal"
 
     await press("admin_system_messages")
     await press("admin_system_messages_page:2:ru")
@@ -1252,6 +1258,49 @@ async def test_max_addressing_style_system_message_journey_uses_real_app_callbac
     reopened = await press("admin_system_message:ui.ai.busy:ru:2")
     assert "Ваш предыдущий запрос" in reopened["text"]
     await press("admin_general_settings")
+
+    await press("admin_system_messages_page:4:ru")
+    await press("admin_system_message:ui.navigation.continue_prompt:ru:4")
+    await press("admin_system_edit:ui.navigation.continue_prompt:ru:formal:4")
+    await send_message("MAX CONTINUE CUSTOM")
+    saved_continue = await press("admin_system_save:ui.navigation.continue_prompt:ru:formal:4")
+    assert "MAX CONTINUE CUSTOM" in saved_continue["text"]
+    await press("admin_general_settings")
+    continue_message = await press("svc:continue")
+    assert continue_message["text"] == "MAX CONTINUE CUSTOM"
+    direct_continue_message = await send_message("💬 Начать/продолжить диалог")
+    assert direct_continue_message["text"] == "MAX CONTINUE CUSTOM"
+
+    stale_key = "ui.ai.thinking"
+    stale_edit = system_message_callback_data("e", stale_key, "ru", "formal", 0)
+    stale_save = system_message_callback_data("s", stale_key, "ru", "formal", 0)
+    stale_cancel = system_message_callback_data("c", stale_key, "ru", "formal", 0)
+    await press(stale_edit)
+    await send_message("MAX CANCELLED DRAFT")
+    await press(stale_cancel)
+    stale_result = await press(stale_save)
+    assert "устарело" in stale_result["text"]
+
+    await press(stale_edit)
+    await send_message("MAX LOCALE DRAFT")
+    await press(system_message_callback_data("l", locale="en", page=0))
+    stale_result = await press(stale_save)
+    assert "устарело" in stale_result["text"]
+
+    await press(stale_edit)
+    await send_message("MAX BACK DRAFT")
+    await press("admin_general_settings")
+    stale_result = await press(stale_save)
+    assert "устарело" in stale_result["text"]
+
+    async with max_settings_db() as session:
+        assert await session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "max",
+                BotSystemMessage.translation_key == stale_key,
+                BotSystemMessage.addressing_style == "formal",
+            )
+        ) is None
 
     async with max_settings_db() as session:
         config = await session.get(AIConfig, 1)
@@ -1287,3 +1336,244 @@ async def test_max_addressing_style_system_message_journey_uses_real_app_callbac
     assert any(item.get("text") == "Ответ MAX пользователю" for item in runtime_messages)
     assert captured_layouts
     assert "ОБРАЩЕНИЕ: обращайся к пользователю на «Вы»" in "\n".join(captured_layouts[-1].runtime_context)
+
+
+@pytest.mark.asyncio
+async def test_max_system_message_catalog_walks_every_real_editor_button(max_settings_db, monkeypatch):
+    from max_messenger_bot.services import common as max_common
+
+    monkeypatch.setattr(max_system_messages, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_common, "async_session_maker", max_settings_db)
+
+    captured = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    update_id = 3000
+    categories = {}
+
+    def classify(payload):
+        if payload in {
+            "admin_general_settings",
+            "admin_system_messages",
+            "admin_panel",
+            "admin_language_settings",
+            "noop",
+        }:
+            return "navigation"
+        if payload.startswith(("admin_general_toggle_", "admin_general_edit_", "admin_general_set_")):
+            return "mutation"
+        if payload.startswith("admin_main_collections_page_"):
+            return "navigation"
+        if payload.startswith("admin_"):
+            if any(token in payload for token in ("delete", "reset", "remove")):
+                return "destructive"
+            if any(token in payload for token in ("set", "save", "toggle", "edit", "confirm")):
+                return "mutation"
+            return "navigation"
+        parsed = parse_system_message_callback(payload)
+        assert parsed is not None, payload
+        if parsed["action"] == "r":
+            return "destructive"
+        if parsed["action"] in {"e", "s"}:
+            return "mutation"
+        if parsed["action"] in {"c", "d", "l", "p", "v"}:
+            return "navigation"
+        raise AssertionError(f"unclassified system-message callback: {payload}")
+
+    def inspect_body(body):
+        buttons = []
+        for attachment in body.get("attachments", []):
+            if attachment.get("type") != "inline_keyboard":
+                continue
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    if button.get("type") == "link":
+                        categories[button.get("url", "")] = "external"
+                        continue
+                    if button.get("type") != "callback":
+                        continue
+                    payload = button["payload"]
+                    assert len(payload.encode("utf-8")) <= 64
+                    categories[payload] = classify(payload)
+                    buttons.append(button)
+        assert buttons
+        return buttons
+
+    async def send_message(text):
+        nonlocal update_id
+        before = len([item for item in captured if item["path"] == "/messages"])
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_created",
+            "update_id": update_id,
+            "message": {
+                "body": {"text": text},
+                "recipient": {"chat_id": 1002},
+                "sender": {"user_id": 1002, "name": "Admin"},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert len(messages) > before, text
+        return messages[-1]["body"]
+
+    async def press(payload, *, expect_message=True):
+        nonlocal update_id
+        before_messages = len([item for item in captured if item["path"] == "/messages"])
+        before_answers = len([item for item in captured if item["path"] == "/answers"])
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": payload,
+                "sender": {"user_id": 1002, "name": "Admin"},
+            },
+            "message": {
+                "mid": "system-message-editor",
+                "recipient": {"chat_id": 1002},
+                "body": {"attachments": []},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        if not expect_message:
+            assert len([item for item in captured if item["path"] == "/answers"]) > before_answers
+            return None
+        assert len(messages) > before_messages, payload
+        body = messages[-1]["body"]
+        inspect_body(body)
+        return body
+
+    root = await send_message("/admin")
+    general_button = next(button for button in inspect_body(root) if button["payload"] == "admin_general_settings")
+    general = await press(general_button["payload"])
+    system_button = next(button for button in inspect_body(general) if button["payload"] == "admin_system_messages")
+    system_list = await press(system_button["payload"])
+    total_pages = (len(SYSTEM_MESSAGE_CATALOG) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE
+
+    async def restore_page(target_page, current_list):
+        current_page = 0
+        while current_page < target_page:
+            next_button = next(
+                button
+                for button in inspect_body(current_list)
+                if parse_system_message_callback(button["payload"])
+                and parse_system_message_callback(button["payload"])["action"] == "p"
+                and int(parse_system_message_callback(button["payload"])["page"]) == current_page + 1
+            )
+            current_list = await press(next_button["payload"])
+            current_page += 1
+        return current_list
+
+    for page in range(total_pages):
+        if page:
+            system_list = await restore_page(page, system_list)
+        list_buttons = inspect_body(system_list)
+        locale_buttons = [
+            button
+            for button in list_buttons
+            if parse_system_message_callback(button["payload"])
+            and parse_system_message_callback(button["payload"])["action"] == "l"
+        ]
+        for locale_button in locale_buttons:
+            system_list = await press(locale_button["payload"])
+        ru_button = next(
+            button
+            for button in inspect_body(system_list)
+            if parse_system_message_callback(button["payload"])
+            and parse_system_message_callback(button["payload"])["action"] == "l"
+            and parse_system_message_callback(button["payload"])["locale"] == "ru"
+        )
+        system_list = await press(ru_button["payload"])
+        list_buttons = inspect_body(system_list)
+        await press("noop", expect_message=False)
+
+        item_buttons = [
+            button
+            for button in list_buttons
+            if parse_system_message_callback(button["payload"])
+            and parse_system_message_callback(button["payload"])["action"] == "d"
+        ]
+        for item_index, item_button in enumerate(item_buttons):
+            detail = await press(item_button["payload"])
+            detail_buttons = inspect_body(detail)
+            for detail_button in detail_buttons:
+                parsed = parse_system_message_callback(detail_button["payload"])
+                if not parsed or parsed["action"] != "v":
+                    continue
+                preview = await press(detail_button["payload"])
+                back_button = next(
+                    button
+                    for button in inspect_body(preview)
+                    if parse_system_message_callback(button["payload"])
+                    and parse_system_message_callback(button["payload"])["action"] == "d"
+                )
+                detail = await press(back_button["payload"])
+            detail_buttons = inspect_body(detail)
+            for detail_button in detail_buttons:
+                parsed = parse_system_message_callback(detail_button["payload"])
+                if not parsed or parsed["action"] != "e":
+                    continue
+                await press(detail_button["payload"])
+                draft = await send_message(f"MAX CATALOG DRAFT {page} {item_index} {parsed['style']}")
+                draft_buttons = inspect_body(draft)
+                draft_action = "c" if parsed["style"] == "informal" else "s"
+                draft_button = next(
+                    button
+                    for button in draft_buttons
+                    if parse_system_message_callback(button["payload"])
+                    and parse_system_message_callback(button["payload"])["action"] == draft_action
+                )
+                detail = await press(draft_button["payload"])
+            detail_buttons = inspect_body(detail)
+            for detail_button in detail_buttons:
+                parsed = parse_system_message_callback(detail_button["payload"])
+                if not parsed or parsed["action"] != "r":
+                    continue
+                detail = await press(detail_button["payload"])
+            back_button = next(
+                button
+                for button in inspect_body(detail)
+                if parse_system_message_callback(button["payload"])
+                and parse_system_message_callback(button["payload"])["action"] == "p"
+            )
+            system_list = await press(back_button["payload"])
+
+        list_buttons = inspect_body(system_list)
+        page_buttons = [
+            button
+            for button in list_buttons
+            if parse_system_message_callback(button["payload"])
+            and parse_system_message_callback(button["payload"])["action"] == "p"
+        ]
+        for page_button in page_buttons:
+            target = int(parse_system_message_callback(page_button["payload"])["page"])
+            if target == page:
+                continue
+            target_list = await press(page_button["payload"])
+            return_button = next(
+                button
+                for button in inspect_body(target_list)
+                if parse_system_message_callback(button["payload"])
+                and parse_system_message_callback(button["payload"])["action"] == "p"
+                and int(parse_system_message_callback(button["payload"])["page"]) == page
+            )
+            system_list = await press(return_button["payload"])
+        general_button = next(button for button in inspect_body(system_list) if button["payload"] == "admin_general_settings")
+        general = await press(general_button["payload"])
+        system_button = next(button for button in inspect_body(general) if button["payload"] == "admin_system_messages")
+        system_list = await press(system_button["payload"])
+
+    assert {category for category in categories.values()} >= {"navigation", "mutation", "destructive"}

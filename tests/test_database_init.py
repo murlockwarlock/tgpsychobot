@@ -11,7 +11,17 @@ os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import database
-from database import AIConfig, AIModelSettings, Base, BotGeneralConfig, BotTranslation, TelegramPendingAIReply, User
+from database import (
+    AIConfig,
+    AIModelSettings,
+    Base,
+    BotAddressingConfig,
+    BotGeneralConfig,
+    BotSystemMessage,
+    BotTranslation,
+    TelegramPendingAIReply,
+    User,
+)
 from provider_models import PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER
 
 
@@ -257,6 +267,62 @@ async def test_init_db_adds_informal_addressing_style_to_legacy_config(tmp_path,
         assert "addressing_style" in general_columns
         assert has_system_messages_table is True
         assert config.addressing_style == "informal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_scopes_legacy_system_messages_for_telegram_and_max(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-system-message-scope.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.execute(text("DROP TABLE bot_system_messages"))
+            await connection.execute(text(
+                "CREATE TABLE bot_system_messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "translation_key VARCHAR(255) NOT NULL, "
+                "locale VARCHAR(8) NOT NULL, "
+                "addressing_style VARCHAR(16) NOT NULL, "
+                "text TEXT NOT NULL, "
+                "updated_at DATETIME NOT NULL, "
+                "CONSTRAINT uq_bot_system_message_key_locale_style "
+                "UNIQUE (translation_key, locale, addressing_style)"
+                ")"
+            ))
+            await connection.execute(text(
+                "INSERT INTO bot_system_messages "
+                "(translation_key, locale, addressing_style, text, updated_at) "
+                "VALUES ('ui.ai.busy', 'ru', 'formal', 'LEGACY', CURRENT_TIMESTAMP)"
+            ))
+
+        await database.init_db()
+
+        async with sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(BotSystemMessage).where(
+                        BotSystemMessage.translation_key == "ui.ai.busy",
+                        BotSystemMessage.locale == "ru",
+                        BotSystemMessage.addressing_style == "formal",
+                    )
+                )
+            ).all()
+            scopes = (
+                await session.scalars(select(BotAddressingConfig))
+            ).all()
+
+        assert {(row.bot_scope, row.text) for row in rows} == {
+            ("telegram", "LEGACY"),
+            ("max", "LEGACY"),
+        }
+        assert {row.bot_scope for row in scopes} == {"telegram", "max"}
     finally:
         await engine.dispose()
 

@@ -7,8 +7,14 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ai_request_builder import build_conversational_request_layout, build_isolated_request_layout
-from database import AIConfig, Base, BotGeneralConfig, BotTranslation, User
-from system_messages import reset_system_message, resolve_system_text, save_system_message
+from database import AIConfig, Base, BotGeneralConfig, BotTranslation, Content, User
+from system_messages import (
+    reset_system_message,
+    resolve_addressing_style,
+    resolve_system_text,
+    save_addressing_style,
+    save_system_message,
+)
 from translation_registry import STATIC_TRANSLATION_SOURCES
 from translation_service import source_hash
 
@@ -54,6 +60,97 @@ async def test_system_message_variants_locale_and_database_are_independent(tmp_p
     finally:
         await formal_engine.dispose()
         await informal_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_telegram_and_max_system_message_scopes_are_independent(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'scoped-bots.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(BotGeneralConfig(
+                id=1,
+                addressing_style="informal",
+                ai_processing_message_text="SHARED PROCESSING TEXT",
+            ))
+            session.add(Content(key="shared_content", text_content="SHARED CONTENT"))
+            await save_addressing_style(session, "formal", bot_scope="telegram")
+            await save_addressing_style(session, "informal", bot_scope="max")
+            await save_system_message(
+                session,
+                "ui.ai.busy",
+                "ru",
+                "formal",
+                "TELEGRAM TEXT",
+                bot_scope="telegram",
+            )
+            await save_system_message(
+                session,
+                "ui.ai.busy",
+                "ru",
+                "informal",
+                "MAX TEXT",
+                bot_scope="max",
+            )
+            await session.commit()
+            assert await resolve_addressing_style(session, "telegram") == "formal"
+            assert await resolve_addressing_style(session, "max") == "informal"
+            assert await resolve_system_text(session, "ui.ai.busy", "ru", bot_scope="telegram") == "TELEGRAM TEXT"
+            assert await resolve_system_text(session, "ui.ai.busy", "ru", bot_scope="max") == "MAX TEXT"
+            general = await session.get(BotGeneralConfig, 1)
+            shared_content = await session.get(Content, "shared_content")
+            assert general.addressing_style == "formal"
+            assert general.ai_processing_message_text == "SHARED PROCESSING TEXT"
+            assert shared_content.text_content == "SHARED CONTENT"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_system_message_runtime_preserves_html_and_unknown_placeholders(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'custom-text.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            await save_system_message(
+                session,
+                "ui.ai.button_accepted",
+                "ru",
+                "formal",
+                "<b>Ваш выбор</b>: {unknown_placeholder}",
+                bot_scope="max",
+            )
+            await session.commit()
+            assert await resolve_system_text(
+                session,
+                "ui.ai.button_accepted",
+                "ru",
+                "formal",
+                bot_scope="max",
+            ) == "<b>Ваш выбор</b>: {unknown_placeholder}"
+            assert await resolve_system_text(
+                session,
+                "ui.ai.button_accepted",
+                "ru",
+                "formal",
+                bot_scope="max",
+                button_text="готово",
+            ) == "<b>Ваш выбор</b>: {unknown_placeholder}"
+            with pytest.raises(ValueError):
+                await save_system_message(
+                    session,
+                    "ui.ai.button_accepted",
+                    "ru",
+                    "formal",
+                    "x" * 4097,
+                    bot_scope="max",
+                )
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

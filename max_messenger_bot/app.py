@@ -49,6 +49,7 @@ from provider_models import (
 from response_buttons import MAIN_TOPIC_ACTIONS, build_ai_button_system_message, split_action_callback_data
 from .storage import StateStore, init_storage
 from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
+from system_messages import parse_system_message_callback
 
 
 configure_logging()
@@ -952,7 +953,11 @@ class MaxBotApplication:
         if text == "💬 Начать/продолжить диалог":
             await self.client.send_message(
                 chat_id=message.chat_id,
-                text="Введите ваше сообщение для начала/продолжения диалога:",
+                text=await common.localized_system_text(
+                    message.sender.user_id,
+                    "ui.navigation.continue_prompt",
+                    "Введите ваше сообщение для начала/продолжения диалога:",
+                ),
             )
             return
 
@@ -1127,6 +1132,79 @@ class MaxBotApplication:
         if data == "noop":
             await self.client.answer_callback(callback.callback_id)
             return
+        compact_system_message = parse_system_message_callback(data)
+        if compact_system_message is not None:
+            if not await common.is_admin(user_id):
+                await self.client.answer_callback(callback.callback_id, notification="Недостаточно прав администратора.")
+                return
+            action = compact_system_message["action"]
+            locale = compact_system_message.get("locale", "ru")
+            page = compact_system_message.get("page", 0)
+            key = compact_system_message.get("key")
+            style = compact_system_message.get("style")
+            try:
+                if action == "l":
+                    await self.states.clear(user_id)
+                    await admin_system_messages_service.show_system_messages(self.client, chat_id, locale, page)
+                elif action == "p":
+                    await self.states.clear(user_id)
+                    await admin_system_messages_service.show_system_messages(self.client, chat_id, locale, page)
+                elif action == "d":
+                    await self.states.clear(user_id)
+                    await admin_system_messages_service.show_system_message(self.client, chat_id, key, locale, page)
+                elif action == "v":
+                    await self.states.clear(user_id)
+                    await admin_system_messages_service.preview_system_message(self.client, chat_id, key, locale, style, page)
+                elif action == "e":
+                    await admin_system_messages_service.start_edit_system_message(
+                        self.client,
+                        self.states,
+                        chat_id,
+                        user_id,
+                        key,
+                        locale,
+                        style,
+                        page,
+                    )
+                elif action == "s":
+                    await admin_system_messages_service.save_system_message_draft(
+                        self.client,
+                        self.states,
+                        chat_id,
+                        user_id,
+                        key,
+                        locale,
+                        style,
+                        page,
+                    )
+                elif action == "c":
+                    await admin_system_messages_service.cancel_system_message_edit(
+                        self.client,
+                        self.states,
+                        chat_id,
+                        user_id,
+                        key,
+                        locale,
+                        style,
+                        page,
+                    )
+                elif action == "r":
+                    await self.states.clear(user_id)
+                    await admin_system_messages_service.reset_system_message_text(
+                        self.client,
+                        chat_id,
+                        key,
+                        locale,
+                        style,
+                        page,
+                    )
+                else:
+                    raise ValueError
+            except ValueError:
+                await self.client.answer_callback(callback.callback_id, notification="Некорректная кнопка системного сообщения.")
+                return
+            await self.client.answer_callback(callback.callback_id)
+            return
         is_system_message_admin_callback = (
             data in {
                 "admin_general_settings",
@@ -1148,10 +1226,13 @@ class MaxBotApplication:
                 return
             try:
                 if data == "admin_general_settings":
+                    await self.states.clear(user_id)
                     await admin_system_messages_service.show_general_settings(self.client, chat_id)
                 elif data == "admin_general_set_addressing_informal":
+                    await self.states.clear(user_id)
                     await admin_system_messages_service.set_addressing_style(self.client, chat_id, "informal")
                 elif data == "admin_general_set_addressing_formal":
+                    await self.states.clear(user_id)
                     await admin_system_messages_service.set_addressing_style(self.client, chat_id, "formal")
                 elif data == "admin_system_messages":
                     await self.states.clear(user_id)
@@ -1170,6 +1251,7 @@ class MaxBotApplication:
                     await admin_system_messages_service.show_system_message(self.client, chat_id, key, locale, page)
                 elif data.startswith("admin_system_preview:"):
                     _, key, locale, style, page = data.split(":", 4)
+                    await self.states.clear(user_id)
                     await admin_system_messages_service.preview_system_message(self.client, chat_id, key, locale, style, page)
                 elif data.startswith("admin_system_edit:"):
                     _, key, locale, style, page = data.split(":", 4)
@@ -1204,10 +1286,12 @@ class MaxBotApplication:
                         user_id,
                         key,
                         locale,
+                        style,
                         page,
                     )
                 elif data.startswith("admin_system_reset:"):
                     _, key, locale, style, page = data.split(":", 4)
+                    await self.states.clear(user_id)
                     await admin_system_messages_service.reset_system_message_text(
                         self.client,
                         chat_id,
@@ -1436,7 +1520,14 @@ class MaxBotApplication:
                 await common.request_reset_dialogue(self.client, self.states, chat_id, user_id)
                 return
             if action == "svc:continue":
-                await self.client.send_message(chat_id=chat_id, text="Введите ваше сообщение для начала/продолжения диалога:")
+                await self.client.send_message(
+                    chat_id=chat_id,
+                    text=await common.localized_system_text(
+                        user_id,
+                        "ui.navigation.continue_prompt",
+                        "Введите ваше сообщение для начала/продолжения диалога:",
+                    ),
+                )
                 return
             if action.startswith("svc:content:"):
                 content_key = action[12:]

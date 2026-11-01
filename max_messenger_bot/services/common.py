@@ -67,6 +67,7 @@ async def localized_system_text(
                 session,
                 key,
                 locale,
+                bot_scope="max",
                 fallback=fallback,
                 **variables,
             )

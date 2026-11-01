@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import html
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -8,7 +10,10 @@ from sqlalchemy.exc import OperationalError
 
 from database import (
     ADDRESSING_STYLES,
+    BOT_SCOPES,
+    DEFAULT_BOT_SCOPE,
     DEFAULT_ADDRESSING_STYLE,
+    BotAddressingConfig,
     BotGeneralConfig,
     BotSystemMessage,
 )
@@ -107,11 +112,153 @@ SYSTEM_MESSAGE_CATALOG = (
 
 SYSTEM_MESSAGE_DEFINITIONS = {item.key: item for item in SYSTEM_MESSAGE_CATALOG}
 SYSTEM_MESSAGE_PAGE_SIZE = 8
+TELEGRAM_TEXT_LIMIT = 4096
+CALLBACK_ANSWER_LIMIT = 200
+SYSTEM_MESSAGE_CALLBACK_TOKENS = {
+    key: hashlib.sha1(key.encode("utf-8")).hexdigest()[:6]
+    for key in SYSTEM_MESSAGE_DEFINITIONS
+}
+SYSTEM_MESSAGE_KEYS_BY_CALLBACK_TOKEN = {
+    token: key for key, token in SYSTEM_MESSAGE_CALLBACK_TOKENS.items()
+}
+
+
+def system_message_callback_data(
+    action: str,
+    key: str | None = None,
+    locale: str = "ru",
+    style: str | None = None,
+    page: int = 0,
+) -> str:
+    if action in {"d"}:
+        parts = ("sm", action, system_message_callback_token(key or ""), locale, str(page))
+    elif action in {"v", "e", "r", "s", "c"}:
+        parts = (
+            "sm",
+            action,
+            system_message_callback_token(key or ""),
+            locale,
+            style or "informal",
+            str(page),
+        )
+    elif action == "l":
+        parts = ("sm", action, locale, str(page))
+    elif action == "p":
+        parts = ("sm", action, str(page), locale)
+    else:
+        raise ValueError("Неизвестное действие системного сообщения.")
+    return ":".join(parts)
+
+
+def system_message_callback_token(key: str) -> str:
+    try:
+        return SYSTEM_MESSAGE_CALLBACK_TOKENS[key]
+    except KeyError as exc:
+        raise ValueError("Неизвестный ключ системного сообщения.") from exc
+
+
+def parse_system_message_callback(data: str) -> dict[str, Any] | None:
+    parts = (data or "").split(":")
+    if len(parts) < 3 or parts[0] != "sm":
+        return None
+    action = parts[1]
+    if action == "l" and len(parts) == 4:
+        return {"action": action, "locale": parts[2], "page": parts[3]}
+    if action == "p" and len(parts) == 4:
+        return {"action": action, "page": parts[2], "locale": parts[3]}
+    if action == "d" and len(parts) == 5:
+        key = SYSTEM_MESSAGE_KEYS_BY_CALLBACK_TOKEN.get(parts[2])
+        return {"action": action, "key": key, "locale": parts[3], "page": parts[4]} if key else None
+    if action in {"v", "e", "r", "s", "c"} and len(parts) == 6:
+        key = SYSTEM_MESSAGE_KEYS_BY_CALLBACK_TOKEN.get(parts[2])
+        return (
+            {"action": action, "key": key, "locale": parts[3], "style": parts[4], "page": parts[5]}
+            if key
+            else None
+        )
+    return None
+
+
+def limit_callback_answer(value: Any) -> str:
+    text = str(value or "")
+    return text[:CALLBACK_ANSWER_LIMIT]
+
+
+def escape_text_with_limit(value: Any, limit: int) -> str:
+    source = str(value or "")
+    escaped = []
+    used = 0
+    truncated = False
+    for character in source:
+        escaped_character = html.escape(character)
+        if used + len(escaped_character) > limit:
+            truncated = True
+            break
+        escaped.append(escaped_character)
+        used += len(escaped_character)
+    if truncated and used < limit:
+        escaped.append("…")
+    return "".join(escaped)
+
+
+def render_system_message_detail(
+    definition: SystemMessageDefinition,
+    key: str,
+    locale: str,
+    variants: dict[str, str],
+) -> str:
+    header = (
+        "💬 <b>Системное сообщение</b>\n\n"
+        f"<b>{html.escape(definition.title)}</b>\n"
+        f"Ключ: <code>{html.escape(key)}</code>\n"
+        f"Язык: <b>{html.escape(locale)}</b>"
+    )
+    informal_prefix = f"{header}\n\n<b>Ты:</b>\n"
+    formal_prefix = "\n\n<b>Вы:</b>\n"
+    available = max(0, TELEGRAM_TEXT_LIMIT - len(informal_prefix) - len(formal_prefix))
+    informal_limit = available // 2
+    formal_limit = available - informal_limit
+    return (
+        informal_prefix
+        + escape_text_with_limit(variants.get("informal", ""), informal_limit)
+        + formal_prefix
+        + escape_text_with_limit(variants.get("formal", ""), formal_limit)
+    )
+
+
+def render_system_message_preview(
+    key: str,
+    style: Any,
+    text: str,
+) -> str:
+    style_label = "Вы" if normalize_addressing_style(style) == "formal" else "Ты"
+    header = f"👁 <b>Предпросмотр · {style_label}</b>\n\n<code>{html.escape(key)}</code>\n\n"
+    return header + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(header)))
+
+
+def render_system_message_editor(key: str, style: Any, text: str) -> str:
+    prefix = (
+        f"✏️ <b>Редактирование «{addressing_style_label(style)}»</b>\n\n"
+        f"Ключ: <code>{html.escape(key)}</code>\n"
+        "Текущее значение:\n"
+    )
+    suffix = "\n\nОтправьте новый текст одним сообщением. Затем нажмите «Сохранить» или «Отмена»."
+    return prefix + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(prefix) - len(suffix))) + suffix
+
+
+def render_system_message_draft(text: str) -> str:
+    prefix = "Черновик сохранён в форме. Проверьте текст и нажмите «Сохранить» или «Отмена».\n\n"
+    return prefix + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(prefix)))
 
 
 def normalize_addressing_style(value: Any) -> str:
     normalized = str(value or "").strip().lower()
     return normalized if normalized in ADDRESSING_STYLES else DEFAULT_ADDRESSING_STYLE
+
+
+def normalize_bot_scope(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in BOT_SCOPES else DEFAULT_BOT_SCOPE
 
 
 def addressing_style_label(style: Any) -> str:
@@ -136,6 +283,41 @@ def addressing_style_instruction(style: Any, locale: Any = "ru") -> str:
         },
     }
     return instructions[normalized_locale][normalized_style]
+
+
+async def resolve_addressing_style(session, bot_scope: Any = DEFAULT_BOT_SCOPE) -> str:
+    normalized_scope = normalize_bot_scope(bot_scope)
+    try:
+        scoped_config = await session.get(BotAddressingConfig, normalized_scope)
+    except (AttributeError, OperationalError):
+        scoped_config = None
+    if scoped_config is not None:
+        return normalize_addressing_style(getattr(scoped_config, "addressing_style", DEFAULT_ADDRESSING_STYLE))
+    try:
+        general_config = await session.get(BotGeneralConfig, 1)
+    except (AttributeError, OperationalError):
+        general_config = None
+    return normalize_addressing_style(
+        getattr(general_config, "addressing_style", DEFAULT_ADDRESSING_STYLE)
+    )
+
+
+async def save_addressing_style(session, style: Any, bot_scope: Any = DEFAULT_BOT_SCOPE) -> str:
+    normalized_scope = normalize_bot_scope(bot_scope)
+    normalized_style = normalize_addressing_style(style)
+    scoped_config = await session.get(BotAddressingConfig, normalized_scope)
+    if scoped_config is None:
+        session.add(BotAddressingConfig(
+            bot_scope=normalized_scope,
+            addressing_style=normalized_style,
+        ))
+    else:
+        scoped_config.addressing_style = normalized_style
+    if normalized_scope == DEFAULT_BOT_SCOPE:
+        general_config = await session.get(BotGeneralConfig, 1)
+        if general_config is not None:
+            general_config.addressing_style = normalized_style
+    return normalized_style
 
 
 def system_message_definition(key: str) -> SystemMessageDefinition:
@@ -185,21 +367,20 @@ async def resolve_system_text(
     locale: Any = "ru",
     addressing_style: Any = None,
     *,
+    bot_scope: Any = DEFAULT_BOT_SCOPE,
     fallback: str | None = None,
     **variables: Any,
 ) -> str:
     definition = system_message_definition(key)
     normalized_locale = normalize_locale(locale) or "ru"
+    normalized_scope = normalize_bot_scope(bot_scope)
     if addressing_style is None:
-        try:
-            config = await session.get(BotGeneralConfig, 1)
-        except (AttributeError, OperationalError):
-            config = None
-        addressing_style = getattr(config, "addressing_style", DEFAULT_ADDRESSING_STYLE)
+        addressing_style = await resolve_addressing_style(session, normalized_scope)
     normalized_style = normalize_addressing_style(addressing_style)
     try:
         row = await session.scalar(
             select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == normalized_scope,
                 BotSystemMessage.translation_key == definition.key,
                 BotSystemMessage.locale == normalized_locale,
                 BotSystemMessage.addressing_style == normalized_style,
@@ -224,10 +405,19 @@ async def resolve_system_text(
     return text
 
 
-async def save_system_message(session, key: str, locale: Any, addressing_style: Any, text: str) -> None:
+async def save_system_message(
+    session,
+    key: str,
+    locale: Any,
+    addressing_style: Any,
+    text: str,
+    *,
+    bot_scope: Any = DEFAULT_BOT_SCOPE,
+) -> None:
     definition = system_message_definition(key)
     normalized_locale = normalize_locale(locale) or "ru"
     normalized_style = normalize_addressing_style(addressing_style)
+    normalized_scope = normalize_bot_scope(bot_scope)
     value = str(text or "").strip()
     if not value:
         raise ValueError("Текст не может быть пустым.")
@@ -235,6 +425,7 @@ async def save_system_message(session, key: str, locale: Any, addressing_style: 
         raise ValueError("Текст не должен превышать 4096 символов.")
     row = await session.scalar(
         select(BotSystemMessage).where(
+            BotSystemMessage.bot_scope == normalized_scope,
             BotSystemMessage.translation_key == definition.key,
             BotSystemMessage.locale == normalized_locale,
             BotSystemMessage.addressing_style == normalized_style,
@@ -242,6 +433,7 @@ async def save_system_message(session, key: str, locale: Any, addressing_style: 
     )
     if row is None:
         session.add(BotSystemMessage(
+            bot_scope=normalized_scope,
             translation_key=definition.key,
             locale=normalized_locale,
             addressing_style=normalized_style,
@@ -251,12 +443,21 @@ async def save_system_message(session, key: str, locale: Any, addressing_style: 
         row.text = value
 
 
-async def reset_system_message(session, key: str, locale: Any, addressing_style: Any) -> None:
+async def reset_system_message(
+    session,
+    key: str,
+    locale: Any,
+    addressing_style: Any,
+    *,
+    bot_scope: Any = DEFAULT_BOT_SCOPE,
+) -> None:
     definition = system_message_definition(key)
     normalized_locale = normalize_locale(locale) or "ru"
     normalized_style = normalize_addressing_style(addressing_style)
+    normalized_scope = normalize_bot_scope(bot_scope)
     await session.execute(
         delete(BotSystemMessage).where(
+            BotSystemMessage.bot_scope == normalized_scope,
             BotSystemMessage.translation_key == definition.key,
             BotSystemMessage.locale == normalized_locale,
             BotSystemMessage.addressing_style == normalized_style,
@@ -264,9 +465,21 @@ async def reset_system_message(session, key: str, locale: Any, addressing_style:
     )
 
 
-async def get_system_message_variants(session, key: str, locale: Any) -> dict[str, str]:
+async def get_system_message_variants(
+    session,
+    key: str,
+    locale: Any,
+    *,
+    bot_scope: Any = DEFAULT_BOT_SCOPE,
+) -> dict[str, str]:
     normalized_locale = normalize_locale(locale) or "ru"
     return {
-        style: await resolve_system_text(session, key, normalized_locale, style)
+        style: await resolve_system_text(
+            session,
+            key,
+            normalized_locale,
+            style,
+            bot_scope=bot_scope,
+        )
         for style in ADDRESSING_STYLES
     }

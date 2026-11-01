@@ -407,9 +407,16 @@ from system_messages import (
     SYSTEM_MESSAGE_CATALOG,
     addressing_style_label,
     get_system_message_variants,
-    normalize_addressing_style,
+    limit_callback_answer,
+    parse_system_message_callback,
+    render_system_message_detail,
+    render_system_message_draft,
+    render_system_message_editor,
+    render_system_message_preview,
+    resolve_addressing_style,
     resolve_system_text,
     reset_system_message,
+    save_addressing_style,
     save_system_message,
 )
 from ai_retry_policy import (
@@ -17041,7 +17048,14 @@ async def _get_user_locale(user_id: int) -> str:
 async def _resolve_user_system_text(user_id: int, key: str, locale: str, *, fallback: str | None = None, **variables):
     try:
         async with async_session_maker() as session:
-            return await resolve_system_text(session, key, locale, fallback=fallback, **variables)
+            return await resolve_system_text(
+                session,
+                key,
+                locale,
+                bot_scope="telegram",
+                fallback=fallback,
+                **variables,
+            )
     except Exception:
         text = fallback or ""
         try:
@@ -21573,15 +21587,8 @@ async def _render_admin_system_message_detail(callback: CallbackQuery, key: str,
         await callback.answer("Системное сообщение не найдено.", show_alert=True)
         return
     async with async_session_maker() as session:
-        variants = await get_system_message_variants(session, key, locale)
-    text = (
-        "💬 <b>Системное сообщение</b>\n\n"
-        f"<b>{html.escape(definition.title)}</b>\n"
-        f"Ключ: <code>{html.escape(key)}</code>\n"
-        f"Язык: <b>{_system_messages_locale_label(locale)}</b>\n\n"
-        f"<b>Ты:</b>\n{html.escape(variants['informal'])}\n\n"
-        f"<b>Вы:</b>\n{html.escape(variants['formal'])}"
-    )
+        variants = await get_system_message_variants(session, key, locale, bot_scope="telegram")
+    text = render_system_message_detail(definition, key, _system_messages_locale_label(locale), variants)
     await callback.message.edit_text(
         text,
         parse_mode="HTML",
@@ -21589,20 +21596,140 @@ async def _render_admin_system_message_detail(callback: CallbackQuery, key: str,
     )
 
 
+def _system_message_edit_context_matches(data, key: str, locale: str, style: str, page: int) -> bool:
+    try:
+        stored_page = int(data.get("system_message_page", -1))
+    except (TypeError, ValueError):
+        return False
+    return (
+        data.get("system_message_key") == key
+        and data.get("system_message_locale") == locale
+        and data.get("system_message_style") == style
+        and stored_page == page
+    )
+
+
+@router.callback_query(F.data.startswith("sm:"))
+async def admin_system_message_compact_callback(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(limit_callback_answer("Недостаточно прав."), show_alert=True)
+        return
+    parsed = parse_system_message_callback(callback.data or "")
+    if parsed is None:
+        await callback.answer(limit_callback_answer("Некорректная кнопка системного сообщения."), show_alert=True)
+        return
+    action = parsed["action"]
+    locale = parsed.get("locale", "ru")
+    page = int(parsed.get("page", 0)) if str(parsed.get("page", "0")).isdigit() else 0
+    key = parsed.get("key")
+    style = parsed.get("style")
+    if action in {"d", "v", "e", "r", "s", "c"} and (
+        key not in SYSTEM_MESSAGE_DEFINITIONS
+        or locale not in {"ru", "en", "pt"}
+        or (action != "d" and style not in {"informal", "formal"})
+    ):
+        await callback.answer(limit_callback_answer("Некорректный вариант сообщения."), show_alert=True)
+        return
+    if action in {"l", "p"}:
+        await state.clear()
+        if action == "l":
+            await _render_admin_system_messages(callback, locale, page)
+        else:
+            await _render_admin_system_messages(callback, locale, page)
+        await callback.answer()
+        return
+    if action == "d":
+        await state.clear()
+        await _render_admin_system_message_detail(callback, key, locale, page)
+        await callback.answer()
+        return
+    if action == "v":
+        await state.clear()
+        async with async_session_maker() as session:
+            text_value = await resolve_system_text(
+                session,
+                key,
+                locale,
+                style,
+                bot_scope="telegram",
+            )
+        await callback.message.edit_text(
+            render_system_message_preview(key, style, text_value),
+            parse_mode="HTML",
+            reply_markup=kb.admin_system_message_preview_keyboard(key, locale, style, page),
+        )
+        await callback.answer()
+        return
+    if action == "e":
+        async with async_session_maker() as session:
+            current_text = await resolve_system_text(
+                session,
+                key,
+                locale,
+                style,
+                bot_scope="telegram",
+            )
+        await state.set_state(AdminStates.set_system_message_text)
+        await state.update_data(
+            system_message_key=key,
+            system_message_locale=locale,
+            system_message_style=style,
+            system_message_page=page,
+            system_message_draft=None,
+        )
+        await callback.message.edit_text(
+            render_system_message_editor(key, style, current_text),
+            parse_mode="HTML",
+            reply_markup=kb.admin_system_message_draft_keyboard(key, locale, style, page),
+        )
+        await callback.answer()
+        return
+    if action in {"s", "c"}:
+        data = await state.get_data()
+        if not _system_message_edit_context_matches(data, key, locale, style, page):
+            await callback.answer(limit_callback_answer("Изменение устарело. Откройте сообщение заново."), show_alert=True)
+            return
+        if action == "c":
+            await state.clear()
+            await _render_admin_system_message_detail(callback, key, locale, page)
+            await callback.answer(limit_callback_answer("Изменения отменены."))
+            return
+        draft = data.get("system_message_draft")
+        if not isinstance(draft, str) or not draft.strip():
+            await callback.answer(limit_callback_answer("Сначала отправьте новый текст."), show_alert=True)
+            return
+        async with async_session_maker() as session:
+            await save_system_message(
+                session,
+                key,
+                locale,
+                style,
+                draft,
+                bot_scope="telegram",
+            )
+            await session.commit()
+        await state.clear()
+        await _render_admin_system_message_detail(callback, key, locale, page)
+        await callback.answer(limit_callback_answer("Системное сообщение сохранено."))
+        return
+    async with async_session_maker() as session:
+        await state.clear()
+        await reset_system_message(session, key, locale, style, bot_scope="telegram")
+        await session.commit()
+    await _render_admin_system_message_detail(callback, key, locale, page)
+    await callback.answer(limit_callback_answer("Восстановлен текст по умолчанию."))
+
+
 @router.callback_query(F.data.in_({"admin_general_set_addressing_informal", "admin_general_set_addressing_formal"}))
-async def admin_general_set_addressing_style(callback: CallbackQuery):
+async def admin_general_set_addressing_style(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    style = "formal" if callback.data.endswith("formal") else "informal"
+    style = "formal" if callback.data == "admin_general_set_addressing_formal" else "informal"
     async with async_session_maker() as session:
-        config = await session.get(BotGeneralConfig, 1)
-        if config is None:
-            config = BotGeneralConfig(id=1)
-            session.add(config)
-        config.addressing_style = style
+        await save_addressing_style(session, style, bot_scope="telegram")
         await session.commit()
-    await admin_general_settings(callback)
+    await admin_general_settings(callback, state)
     await callback.answer(f"Обращение: {addressing_style_label(style)}")
 
 
@@ -21662,7 +21789,7 @@ async def admin_system_message_detail(callback: CallbackQuery, state: FSMContext
 
 
 @router.callback_query(F.data.startswith("admin_system_preview:"))
-async def admin_system_message_preview(callback: CallbackQuery):
+async def admin_system_message_preview(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
@@ -21676,13 +21803,18 @@ async def admin_system_message_preview(callback: CallbackQuery):
         await callback.answer("Некорректный вариант сообщения.", show_alert=True)
         return
     key, locale, style = parts[1], parts[2], parts[3]
+    await state.clear()
     async with async_session_maker() as session:
-        text_value = await resolve_system_text(session, key, locale, style)
-    style_label = addressing_style_label(style)
+        text_value = await resolve_system_text(session, key, locale, style, bot_scope="telegram")
     await callback.message.edit_text(
-        f"👁 <b>Предпросмотр · {style_label}</b>\n\n<code>{html.escape(key)}</code>\n\n{html.escape(text_value)}",
+        render_system_message_preview(key, style, text_value),
         parse_mode="HTML",
-        reply_markup=kb.admin_system_message_detail_keyboard(key, locale, int(parts[4]) if parts[4].isdigit() else 0),
+        reply_markup=kb.admin_system_message_preview_keyboard(
+            key,
+            locale,
+            style,
+            int(parts[4]) if parts[4].isdigit() else 0,
+        ),
     )
     await callback.answer()
 
@@ -21703,19 +21835,17 @@ async def admin_system_message_edit(callback: CallbackQuery, state: FSMContext):
         return
     key, locale, style = parts[1], parts[2], parts[3]
     async with async_session_maker() as session:
-        current_text = await resolve_system_text(session, key, locale, style)
+        current_text = await resolve_system_text(session, key, locale, style, bot_scope="telegram")
     await state.set_state(AdminStates.set_system_message_text)
     await state.update_data(
         system_message_key=key,
         system_message_locale=locale,
         system_message_style=style,
         system_message_page=int(parts[4]) if parts[4].isdigit() else 0,
+        system_message_draft=None,
     )
     await callback.message.edit_text(
-        f"✏️ <b>Редактирование «{addressing_style_label(style)}»</b>\n\n"
-        f"Ключ: <code>{html.escape(key)}</code>\n"
-        f"Текущее значение:\n{html.escape(current_text)}\n\n"
-        "Отправьте новый текст одним сообщением. Затем нажмите «Сохранить» или «Отмена».",
+        render_system_message_editor(key, style, current_text),
         parse_mode="HTML",
         reply_markup=kb.admin_system_message_draft_keyboard(key, locale, style, int(parts[4]) if parts[4].isdigit() else 0),
     )
@@ -21734,7 +21864,7 @@ async def admin_system_message_draft_received(message: Message, state: FSMContex
     data = await state.get_data()
     await state.update_data(system_message_draft=value)
     await message.answer(
-        "Черновик сохранён в форме. Проверьте текст и нажмите «Сохранить» или «Отмена».",
+        render_system_message_draft(value),
         reply_markup=kb.admin_system_message_draft_keyboard(
             data.get("system_message_key", ""),
             data.get("system_message_locale", "ru"),
@@ -21756,12 +21886,28 @@ async def admin_system_message_save(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     parts = (callback.data or "").split(":")
     draft = data.get("system_message_draft")
-    if len(parts) != 5 or not isinstance(draft, str) or not draft.strip():
+    page = int(parts[4]) if len(parts) == 5 and parts[4].isdigit() else -1
+    if (
+        len(parts) != 5
+        or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
+        or parts[2] not in {"ru", "en", "pt"}
+        or parts[3] not in {"informal", "formal"}
+        or not _system_message_edit_context_matches(data, parts[1], parts[2], parts[3], page)
+        or not isinstance(draft, str)
+        or not draft.strip()
+    ):
         await callback.answer("Сначала отправьте новый текст.", show_alert=True)
         return
     try:
         async with async_session_maker() as session:
-            await save_system_message(session, parts[1], parts[2], parts[3], draft)
+            await save_system_message(
+                session,
+                parts[1],
+                parts[2],
+                parts[3],
+                draft,
+                bot_scope="telegram",
+            )
             await session.commit()
     except ValueError as exc:
         await callback.answer(str(exc), show_alert=True)
@@ -21780,13 +21926,21 @@ async def admin_system_message_cancel(callback: CallbackQuery, state: FSMContext
     if len(parts) != 4:
         await callback.answer("Некорректное состояние редактирования.", show_alert=True)
         return
+    data = await state.get_data()
+    style = data.get("system_message_style")
+    if (
+        style not in {"informal", "formal"}
+        or not _system_message_edit_context_matches(data, parts[1], parts[2], style, int(parts[3]) if parts[3].isdigit() else -1)
+    ):
+        await callback.answer(limit_callback_answer("Изменение устарело. Откройте сообщение заново."), show_alert=True)
+        return
     await state.clear()
     await _render_admin_system_message_detail(callback, parts[1], parts[2], int(parts[3]) if parts[3].isdigit() else 0)
     await callback.answer("Изменения отменены.")
 
 
 @router.callback_query(F.data.startswith("admin_system_reset:"))
-async def admin_system_message_reset(callback: CallbackQuery):
+async def admin_system_message_reset(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
@@ -21799,8 +21953,9 @@ async def admin_system_message_reset(callback: CallbackQuery):
     ):
         await callback.answer("Некорректный вариант сообщения.", show_alert=True)
         return
+    await state.clear()
     async with async_session_maker() as session:
-        await reset_system_message(session, parts[1], parts[2], parts[3])
+        await reset_system_message(session, parts[1], parts[2], parts[3], bot_scope="telegram")
         await session.commit()
     await _render_admin_system_message_detail(callback, parts[1], parts[2], int(parts[4]) if parts[4].isdigit() else 0)
     await callback.answer("Восстановлен текст по умолчанию.")
@@ -21826,9 +21981,9 @@ async def admin_general_settings(
             )
             session.add(config)
             await session.commit()
+        addressing_style = await resolve_addressing_style(session, bot_scope="telegram")
 
     processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
-    addressing_style = normalize_addressing_style(getattr(config, "addressing_style", "informal"))
     from content_authoring import admin_value
     async with async_session_maker() as session:
         processing_text_display = html.escape(await admin_value(session, "bot_general_config", config, "ai_processing_message_text", label=True))
@@ -21847,7 +22002,7 @@ async def admin_general_settings(
     await callback.message.edit_text(
         _assert_admin_render_text(text),
         parse_mode="HTML",
-        reply_markup=kb.admin_general_settings_keyboard(config),
+        reply_markup=kb.admin_general_settings_keyboard(config, addressing_style),
     )
 
 

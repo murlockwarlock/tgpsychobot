@@ -44,6 +44,7 @@ from system_messages import (
     SYSTEM_MESSAGE_CATALOG,
     SYSTEM_MESSAGE_PAGE_SIZE,
     normalize_addressing_style,
+    system_message_callback_data,
 )
 
 
@@ -264,7 +265,7 @@ def admin_test_menu_keyboard(config_or_enabled):
     return builder.as_markup()
 
 
-def admin_general_settings_keyboard(config):
+def admin_general_settings_keyboard(config, addressing_style=None):
     builder = InlineKeyboardBuilder()
     fields = (
         ("name", "Имя", bool(getattr(config, "profile_collect_name", True))),
@@ -293,7 +294,9 @@ def admin_general_settings_keyboard(config):
         text="✏️ Текст сообщения ожидания",
         callback_data="admin_general_edit_ai_processing_message_text",
     )
-    addressing_style = normalize_addressing_style(getattr(config, "addressing_style", "informal"))
+    addressing_style = normalize_addressing_style(
+        addressing_style if addressing_style is not None else getattr(config, "addressing_style", "informal")
+    )
     builder.button(
         text=f"Обращение: {'✅ Ты' if addressing_style == 'informal' else 'Ты'}",
         callback_data="admin_general_set_addressing_informal",
@@ -326,12 +329,12 @@ def admin_system_messages_keyboard(locale: str = "ru", page: int = 0):
     ]:
         builder.button(
             text=f"{definition.title} · {definition.key}",
-            callback_data=f"admin_system_message:{definition.key}:{normalized_locale}:{current_page}",
+            callback_data=system_message_callback_data("d", definition.key, normalized_locale, page=current_page),
         )
     builder.row(*[
         InlineKeyboardButton(
             text=f"{'✅ ' if item == normalized_locale else ''}{item.upper()}",
-            callback_data=f"admin_system_messages_locale:{item}:{current_page}",
+            callback_data=system_message_callback_data("l", locale=item, page=current_page),
         )
         for item in ("ru", "en", "pt")
     ])
@@ -339,13 +342,13 @@ def admin_system_messages_keyboard(locale: str = "ru", page: int = 0):
     if current_page > 0:
         navigation.append(InlineKeyboardButton(
             text="⬅️",
-            callback_data=f"admin_system_messages_page:{current_page - 1}:{normalized_locale}",
+                callback_data=system_message_callback_data("p", locale=normalized_locale, page=current_page - 1),
         ))
     navigation.append(InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data="noop"))
     if current_page < total_pages - 1:
         navigation.append(InlineKeyboardButton(
             text="➡️",
-            callback_data=f"admin_system_messages_page:{current_page + 1}:{normalized_locale}",
+            callback_data=system_message_callback_data("p", locale=normalized_locale, page=current_page + 1),
         ))
     builder.row(*navigation)
     builder.button(text="⬅️ Назад к общим настройкам", callback_data="admin_general_settings")
@@ -360,20 +363,30 @@ def admin_system_message_detail_keyboard(key: str, locale: str, page: int = 0):
         builder.row(
             InlineKeyboardButton(
                 text=f"👁 Просмотр «{style_label}»",
-                callback_data=f"admin_system_preview:{key}:{locale}:{style}:{page}",
+                callback_data=system_message_callback_data("v", key, locale, style, page),
             ),
             InlineKeyboardButton(
                 text=f"✏️ Изменить «{style_label}»",
-                callback_data=f"admin_system_edit:{key}:{locale}:{style}:{page}",
+                callback_data=system_message_callback_data("e", key, locale, style, page),
             ),
         )
         builder.row(InlineKeyboardButton(
             text=f"↩️ Восстановить «{style_label}» по умолчанию",
-            callback_data=f"admin_system_reset:{key}:{locale}:{style}:{page}",
+            callback_data=system_message_callback_data("r", key, locale, style, page),
         ))
     builder.button(
         text="⬅️ К списку системных сообщений",
-        callback_data=f"admin_system_messages_page:{page}:{locale}",
+        callback_data=system_message_callback_data("p", locale=locale, page=page),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_system_message_preview_keyboard(key: str, locale: str, style: str, page: int = 0):
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="◀️ К сообщению",
+        callback_data=system_message_callback_data("d", key, locale, page=page),
     )
     builder.adjust(1)
     return builder.as_markup()
@@ -381,8 +394,8 @@ def admin_system_message_detail_keyboard(key: str, locale: str, page: int = 0):
 
 def admin_system_message_draft_keyboard(key: str, locale: str, style: str, page: int = 0):
     builder = InlineKeyboardBuilder()
-    builder.button(text="💾 Сохранить", callback_data=f"admin_system_save:{key}:{locale}:{style}:{page}")
-    builder.button(text="Отмена", callback_data=f"admin_system_cancel:{key}:{locale}:{page}")
+    builder.button(text="💾 Сохранить", callback_data=system_message_callback_data("s", key, locale, style, page))
+    builder.button(text="Отмена", callback_data=system_message_callback_data("c", key, locale, style, page))
     builder.adjust(1)
     return builder.as_markup()
 
