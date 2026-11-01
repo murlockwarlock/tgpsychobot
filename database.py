@@ -1530,9 +1530,11 @@ def _migrate_bot_system_messages(sync_conn):
     table_name = 'bot_system_messages'
     inspector = inspect(sync_conn)
     if not inspector.has_table(table_name):
-        return
+        return False
     columns = {column['name'] for column in inspector.get_columns(table_name)}
+    legacy_migrated = False
     if 'bot_scope' not in columns:
+        legacy_migrated = True
         if sync_conn.dialect.name == 'sqlite':
             sync_conn.execute(text('ALTER TABLE bot_system_messages RENAME TO bot_system_messages_legacy'))
             sync_conn.execute(text(
@@ -1576,6 +1578,7 @@ def _migrate_bot_system_messages(sync_conn):
         "CREATE INDEX IF NOT EXISTS idx_bot_system_message_scope_key_locale "
         "ON bot_system_messages (bot_scope, translation_key, locale)"
     ))
+    return legacy_migrated
 
 
 async def init_db():
@@ -1590,7 +1593,7 @@ async def init_db():
             dialect_name = getattr(sync_conn.dialect, "name", "")
             _migrate_media_edit_sources(sync_conn)
             _migrate_media_templates(sync_conn)
-            _migrate_bot_system_messages(sync_conn)
+            legacy_system_messages_migrated = _migrate_bot_system_messages(sync_conn)
             sync_conn.execute(text(
                 "UPDATE media_library SET media_type = 'photo' "
                 "WHERE LOWER(media_type) = 'image'"
@@ -2087,8 +2090,9 @@ async def init_db():
                 pass
 
             verify_event_reminder_chains_schema(sync_conn)
+            return legacy_system_messages_migrated
 
-        await conn.run_sync(_check_and_migrate)
+        legacy_system_messages_migrated = await conn.run_sync(_check_and_migrate)
 
     async with async_session_maker() as session:
         ai_conf = await session.get(AIConfig, 1)
@@ -2254,29 +2258,30 @@ async def init_db():
             elif addressing_config.addressing_style not in ADDRESSING_STYLES:
                 addressing_config.addressing_style = DEFAULT_ADDRESSING_STYLE
 
-        telegram_system_messages = (
-            await session.execute(
-                select(BotSystemMessage).where(BotSystemMessage.bot_scope == DEFAULT_BOT_SCOPE)
-            )
-        ).scalars().all()
-        for telegram_message in telegram_system_messages:
-            max_message = await session.scalar(
-                select(BotSystemMessage).where(
-                    BotSystemMessage.bot_scope == "max",
-                    BotSystemMessage.translation_key == telegram_message.translation_key,
-                    BotSystemMessage.locale == telegram_message.locale,
-                    BotSystemMessage.addressing_style == telegram_message.addressing_style,
+        if legacy_system_messages_migrated:
+            telegram_system_messages = (
+                await session.execute(
+                    select(BotSystemMessage).where(BotSystemMessage.bot_scope == DEFAULT_BOT_SCOPE)
                 )
-            )
-            if max_message is None:
-                session.add(BotSystemMessage(
-                    bot_scope="max",
-                    translation_key=telegram_message.translation_key,
-                    locale=telegram_message.locale,
-                    addressing_style=telegram_message.addressing_style,
-                    text=telegram_message.text,
-                    updated_at=telegram_message.updated_at,
-                ))
+            ).scalars().all()
+            for telegram_message in telegram_system_messages:
+                max_message = await session.scalar(
+                    select(BotSystemMessage).where(
+                        BotSystemMessage.bot_scope == "max",
+                        BotSystemMessage.translation_key == telegram_message.translation_key,
+                        BotSystemMessage.locale == telegram_message.locale,
+                        BotSystemMessage.addressing_style == telegram_message.addressing_style,
+                    )
+                )
+                if max_message is None:
+                    session.add(BotSystemMessage(
+                        bot_scope="max",
+                        translation_key=telegram_message.translation_key,
+                        locale=telegram_message.locale,
+                        addressing_style=telegram_message.addressing_style,
+                        text=telegram_message.text,
+                        updated_at=telegram_message.updated_at,
+                    ))
 
         # Seed default content sections for new bots (won't overwrite existing)
         default_content = [

@@ -866,16 +866,17 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
 
     system_list = await press("admin_system_messages", 504)
     assert "Системные сообщения" in system_list.text
-    system_list = await press("admin_system_messages_page:2:ru", 505)
+    system_list = await press(system_message_callback_data("p", locale="ru", page=1), 505)
+    system_list = await press(system_message_callback_data("p", locale="ru", page=2), 506)
     assert any(
         button.callback_data == system_message_callback_data("d", "ui.ai.busy", "ru", page=2)
         for row in system_list.reply_markup.inline_keyboard
         for button in row
     )
 
-    detail = await press("admin_system_message:ui.ai.busy:ru:2", 506)
+    detail = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=2), 507)
     assert "ui.ai.busy" in detail.text
-    await press("admin_system_edit:ui.ai.busy:ru:formal:2", 507)
+    await press(system_message_callback_data("e", "ui.ai.busy", "ru", "formal", 2), 508)
 
     draft_message = _admin_message(
         bot,
@@ -884,14 +885,14 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
     )
     await admin_dispatcher.feed_update(
         bot,
-        Update(update_id=508, message=draft_message),
+        Update(update_id=509, message=draft_message),
     )
     assert any(
         isinstance(method, SendMessage) and "Черновик сохранён" in method.text
         for method in session.calls
     )
 
-    saved = await press("admin_system_save:ui.ai.busy:ru:formal:2", 509)
+    saved = await press(system_message_callback_data("s", "ui.ai.busy", "ru", "formal", 2), 510)
     assert "Ваш предыдущий запрос" in saved.text
     async with factory() as db_session:
         formal_row = await db_session.scalar(
@@ -902,13 +903,13 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
         )
         assert formal_row.text == "Пожалуйста, подождите — Ваш предыдущий запрос ещё выполняется."
 
-    reopened = await press("admin_system_message:ui.ai.busy:ru:2", 510)
+    reopened = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=2), 511)
     assert "Ваш предыдущий запрос" in reopened.text
-    await press("admin_system_edit:ui.ai.busy:ru:formal:2", 511)
+    await press(system_message_callback_data("e", "ui.ai.busy", "ru", "formal", 2), 512)
     await admin_dispatcher.feed_update(
         bot,
         Update(
-            update_id=512,
+            update_id=513,
             message=_admin_message(
                 bot,
                 message_id=3,
@@ -916,16 +917,16 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
             ),
         ),
     )
-    cancelled = await press("admin_system_cancel:ui.ai.busy:ru:2", 513)
+    cancelled = await press(system_message_callback_data("c", "ui.ai.busy", "ru", "formal", 2), 514)
     assert "Ваш предыдущий запрос" in cancelled.text
-    await press("admin_system_reset:ui.ai.busy:ru:formal:2", 514)
-    reset_detail = await press("admin_system_message:ui.ai.busy:ru:2", 515)
+    await press(system_message_callback_data("r", "ui.ai.busy", "ru", "formal", 2), 515)
+    reset_detail = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=2), 516)
     assert "Пожалуйста, не так быстро" in reset_detail.text
 
-    await press("admin_system_messages_page:2:ru", 516)
-    english_list = await press("admin_system_messages_locale:en:2", 517)
+    await press(system_message_callback_data("p", locale="ru", page=2), 517)
+    english_list = await press(system_message_callback_data("l", locale="en", page=2), 518)
     assert "Язык: <b>English</b>" in english_list.text
-    returned = await press("admin_general_settings", 518)
+    returned = await press("admin_general_settings", 519)
     assert "Общие настройки" in returned.text
 
     async with factory() as db_session:
@@ -1225,6 +1226,81 @@ async def test_system_message_save_rejects_stale_telegram_edit_context(factory, 
                 BotSystemMessage.addressing_style == "formal",
             )
         ) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_telegram_system_message_mutations_are_non_mutating(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add_all([
+            DBUser(id=17, is_admin=True, first_name="Admin"),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.busy",
+                locale="ru",
+                addressing_style="formal",
+                text="ORIGINAL TELEGRAM TEXT",
+            ),
+        ])
+        await db_session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=17, text="/admin")
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        root_message,
+        "admin_system_edit:ui.ai.busy:ru:formal:0",
+        710,
+    )
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=711,
+            message=_admin_message(bot, user_id=17, message_id=11, text="LEGACY SAVE MUST NOT APPLY"),
+        ),
+    )
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        root_message,
+        "admin_system_save:ui.ai.busy:ru:formal:0",
+        712,
+    )
+
+    async with factory() as db_session:
+        row = await db_session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "telegram",
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.locale == "ru",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        assert row.text == "ORIGINAL TELEGRAM TEXT"
+
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        root_message,
+        "admin_system_reset:ui.ai.busy:ru:formal:0",
+        713,
+    )
+    async with factory() as db_session:
+        row = await db_session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "telegram",
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.locale == "ru",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        assert row.text == "ORIGINAL TELEGRAM TEXT"
 
 
 @pytest.mark.asyncio

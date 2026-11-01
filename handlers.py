@@ -3547,7 +3547,7 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
     if lease is None:
         current_locale = await _get_user_locale(user_id)
         await callback.answer(
-            await _resolve_user_system_text(user_id, "ui.ai.busy", current_locale, fallback=AI_BUSY_MESSAGE),
+            await _resolve_user_callback_text(user_id, "ui.ai.busy", current_locale, fallback=AI_BUSY_MESSAGE),
             show_alert=True,
         )
         return
@@ -3602,7 +3602,7 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
             await _disable_ai_button_keyboard(callback)
             locale = await _get_user_locale(user_id)
             await callback.answer(
-                await _resolve_user_system_text(
+                await _resolve_user_callback_text(
                     user_id,
                     "ui.ai.retry_stale",
                     locale,
@@ -3620,7 +3620,7 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
         await _disable_ai_button_keyboard(callback)
         locale = await _get_user_locale(user_id)
         await callback.answer(
-            await _resolve_user_system_text(
+            await _resolve_user_callback_text(
                 user_id,
                 "ui.ai.retry_already_used",
                 locale,
@@ -3637,7 +3637,7 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
             await _disable_ai_button_keyboard(callback)
             locale = await _get_user_locale(user_id)
             await callback.answer(
-                await _resolve_user_system_text(
+                await _resolve_user_callback_text(
                     user_id,
                     "ui.ai.retry_already_used",
                     locale,
@@ -3657,7 +3657,7 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
                 await _disable_ai_button_keyboard(callback)
                 locale = await _get_user_locale(user_id)
                 await callback.answer(
-                    await _resolve_user_system_text(
+                    await _resolve_user_callback_text(
                         user_id,
                         "ui.ai.retry_already_used",
                         locale,
@@ -3686,7 +3686,7 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
     if busy:
         locale = await _get_user_locale(user_id)
         await callback.answer(
-            await _resolve_user_system_text(user_id, "ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE),
+            await _resolve_user_callback_text(user_id, "ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE),
             show_alert=True,
         )
         return
@@ -3705,7 +3705,7 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
     if pending_card_ids and card_id not in pending_card_ids:
         locale = await _get_user_locale(user_id)
         await callback.answer(
-            await _resolve_user_system_text(
+            await _resolve_user_callback_text(
                 user_id,
                 "ui.card.stale_choice",
                 locale,
@@ -17064,6 +17064,12 @@ async def _resolve_user_system_text(user_id: int, key: str, locale: str, *, fall
             return text
 
 
+async def _resolve_user_callback_text(user_id: int, key: str, locale: str, *, fallback: str | None = None, **variables):
+    return limit_callback_answer(
+        await _resolve_user_system_text(user_id, key, locale, fallback=fallback, **variables)
+    )
+
+
 async def _user_settings_keyboard(user, locale: str, *, language_available: bool | None = None):
     if language_available is None:
         async with async_session_maker() as session:
@@ -21883,38 +21889,23 @@ async def admin_system_message_save(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    data = await state.get_data()
     parts = (callback.data or "").split(":")
-    draft = data.get("system_message_draft")
-    page = int(parts[4]) if len(parts) == 5 and parts[4].isdigit() else -1
     if (
         len(parts) != 5
         or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
         or parts[2] not in {"ru", "en", "pt"}
         or parts[3] not in {"informal", "formal"}
-        or not _system_message_edit_context_matches(data, parts[1], parts[2], parts[3], page)
-        or not isinstance(draft, str)
-        or not draft.strip()
     ):
-        await callback.answer("Сначала отправьте новый текст.", show_alert=True)
-        return
-    try:
-        async with async_session_maker() as session:
-            await save_system_message(
-                session,
-                parts[1],
-                parts[2],
-                parts[3],
-                draft,
-                bot_scope="telegram",
-            )
-            await session.commit()
-    except ValueError as exc:
-        await callback.answer(str(exc), show_alert=True)
+        await callback.answer(limit_callback_answer("Некорректная кнопка системного сообщения."), show_alert=True)
         return
     await state.clear()
-    await _render_admin_system_message_detail(callback, parts[1], parts[2], int(parts[4]) if parts[4].isdigit() else 0)
-    await callback.answer("Системное сообщение сохранено.")
+    await _render_admin_system_message_detail(
+        callback,
+        parts[1],
+        parts[2],
+        int(parts[4]) if parts[4].isdigit() else 0,
+    )
+    await callback.answer(limit_callback_answer("Кнопка устарела. Откройте сообщение заново."), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_system_cancel:"))
@@ -21954,11 +21945,8 @@ async def admin_system_message_reset(callback: CallbackQuery, state: FSMContext)
         await callback.answer("Некорректный вариант сообщения.", show_alert=True)
         return
     await state.clear()
-    async with async_session_maker() as session:
-        await reset_system_message(session, parts[1], parts[2], parts[3], bot_scope="telegram")
-        await session.commit()
     await _render_admin_system_message_detail(callback, parts[1], parts[2], int(parts[4]) if parts[4].isdigit() else 0)
-    await callback.answer("Восстановлен текст по умолчанию.")
+    await callback.answer(limit_callback_answer("Кнопка устарела. Откройте сообщение заново."), show_alert=True)
 
 
 @router.callback_query(F.data == "admin_general_settings")
@@ -23585,11 +23573,13 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
         if not user:
             locale = await resolve_user_effective_locale(session, user_id)
             await callback.answer(
-                await resolve_system_text(
-                    session,
-                    "ui.navigation.user_error",
-                    locale,
-                    fallback="Ошибка пользователя.",
+                limit_callback_answer(
+                    await resolve_system_text(
+                        session,
+                        "ui.navigation.user_error",
+                        locale,
+                        fallback="Ошибка пользователя.",
+                    )
                 )
             )
             return
@@ -23612,7 +23602,7 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
         lease = single_flight.try_claim("telegram", user_id)
         if lease is None:
             await callback.answer(
-                await _resolve_user_system_text(
+                await _resolve_user_callback_text(
                     user_id,
                     "ui.ai.busy",
                     await _get_user_locale(user_id),

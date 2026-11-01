@@ -1267,16 +1267,19 @@ class MaxBotApplication:
                     )
                 elif data.startswith("admin_system_save:"):
                     _, key, locale, style, page = data.split(":", 4)
-                    await admin_system_messages_service.save_system_message_draft(
+                    await self.states.clear(user_id)
+                    await admin_system_messages_service.show_system_message(
                         self.client,
-                        self.states,
                         chat_id,
-                        user_id,
                         key,
                         locale,
-                        style,
                         page,
                     )
+                    await self.client.answer_callback(
+                        callback.callback_id,
+                        notification="Кнопка устарела. Откройте сообщение заново.",
+                    )
+                    return
                 elif data.startswith("admin_system_cancel:"):
                     _, key, locale, style, page = data.split(":", 4)
                     await admin_system_messages_service.cancel_system_message_edit(
@@ -1292,14 +1295,18 @@ class MaxBotApplication:
                 elif data.startswith("admin_system_reset:"):
                     _, key, locale, style, page = data.split(":", 4)
                     await self.states.clear(user_id)
-                    await admin_system_messages_service.reset_system_message_text(
+                    await admin_system_messages_service.show_system_message(
                         self.client,
                         chat_id,
                         key,
                         locale,
-                        style,
                         page,
                     )
+                    await self.client.answer_callback(
+                        callback.callback_id,
+                        notification="Кнопка устарела. Откройте сообщение заново.",
+                    )
+                    return
                 else:
                     raise ValueError
             except ValueError:
@@ -1332,7 +1339,7 @@ class MaxBotApplication:
                             pass
                     await self.client.answer_callback(
                         callback.callback_id,
-                        notification=await common.localized_system_text(
+                        notification=await common.localized_callback_text(
                             user_id,
                             "ui.ai.retry_stale",
                             fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
@@ -1358,7 +1365,7 @@ class MaxBotApplication:
                     if reason in {"stale_dialogue", "stale_topic"}:
                         await self.client.answer_callback(
                             callback.callback_id,
-                            notification=await common.localized_system_text(
+                            notification=await common.localized_callback_text(
                                 user_id,
                                 "ui.ai.retry_stale",
                                 fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
@@ -1450,7 +1457,7 @@ class MaxBotApplication:
                         pass
                 await self.client.answer_callback(
                     callback.callback_id,
-                    notification=await common.localized_system_text(
+                    notification=await common.localized_callback_text(
                         user_id,
                         "ui.ai.retry_already_used",
                         fallback="Этот запрос уже был отправлен на повторную обработку.",

@@ -23,11 +23,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from automation_engine import get_conversation_automation_state, build_runtime_automation_context
-from database import AIConfig, AILog, AutomationEvent, Base, BotGeneralConfig, Message as DBMessage, SubscriptionConfig, Topic, User
+from database import AIConfig, AILog, AutomationEvent, Base, BotGeneralConfig, BotSystemMessage, Message as DBMessage, SubscriptionConfig, Topic, User
 import handlers
 import keyboards as kb
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.app import MaxBotApplication
+import max_messenger_bot.app as max_app_module
 import max_messenger_bot.ai as max_ai
 from max_messenger_bot.models import MAX_ID_OFFSET
 from max_messenger_bot.services import common as max_common
@@ -208,6 +209,180 @@ def _extract_prompt_from_call(*args, **kwargs) -> str:
     if len(args) > 4 and isinstance(args[4], str):
         return args[4]
     return ""
+
+
+@pytest.mark.asyncio
+async def test_telegram_system_callback_answers_are_limited_for_long_custom_text(
+    session_factory,
+    setup_tg_user,
+    monkeypatch,
+):
+    user_id = setup_tg_user
+    long_text = "X" * 320
+    async with session_factory() as session:
+        session.add_all([
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.busy",
+                locale="ru",
+                addressing_style="informal",
+                text=long_text,
+            ),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.retry_stale",
+                locale="ru",
+                addressing_style="informal",
+                text=long_text,
+            ),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.retry_already_used",
+                locale="ru",
+                addressing_style="informal",
+                text=long_text,
+            ),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.card.stale_choice",
+                locale="ru",
+                addressing_style="informal",
+                text=long_text,
+            ),
+        ])
+        await session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot(token="123456:TEST_BOT_TOKEN", session=session)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(handlers.router)
+
+    def callback_update(update_id, data):
+        return Update(
+            update_id=update_id,
+            callback_query=CallbackQuery(
+                id=f"callback-{update_id}",
+                from_user=TgUser(id=user_id, is_bot=False, first_name="Alice"),
+                chat_instance="callback-limit",
+                message=Message(
+                    message_id=update_id,
+                    date=datetime.now(timezone.utc),
+                    chat=Chat(id=user_id, type=ChatType.PRIVATE),
+                    from_user=TgUser(id=user_id, is_bot=False, first_name="Alice"),
+                    text="callback",
+                ).as_(bot),
+                data=data,
+            ),
+        )
+
+    async def press(update_id, data):
+        session.calls.clear()
+        await dispatcher.feed_update(bot, callback_update(update_id, data))
+        answers = [method for method in session.calls if isinstance(method, AnswerCallbackQuery)]
+        assert answers
+        answer = answers[-1]
+        type(answer).model_validate(answer.model_dump())
+        assert len(answer.text or "") <= 200
+        return answer
+
+    busy_lease = single_flight.try_claim("telegram", user_id)
+    assert busy_lease is not None
+    try:
+        await press(1, "ai_btn:busy-test")
+    finally:
+        single_flight.release(busy_lease)
+
+    async def fake_retry_eligibility(_session, *, failed_log_id, **_kwargs):
+        if failed_log_id == 1:
+            return False, "stale_dialogue", None
+        return True, "", SimpleNamespace(prompt_summary="retry prompt")
+
+    monkeypatch.setattr(handlers, "validate_terminal_failure_retry_eligibility", fake_retry_eligibility)
+    await press(2, "ai_retry:1")
+
+    monkeypatch.setattr(handlers, "is_retry_token_claimed", lambda *_args: True)
+    await press(3, "ai_retry:2")
+
+    monkeypatch.setattr(handlers, "_get_card_spread_state", AsyncMock(return_value={"pending_card_ids": [123]}))
+    await press(4, "card_select_456")
+
+
+@pytest.mark.asyncio
+async def test_max_retry_already_used_callback_answer_is_limited_for_long_custom_text(
+    session_factory,
+    monkeypatch,
+):
+    user_id = 902 + MAX_ID_OFFSET
+    original_message_id = 7001
+    monkeypatch.setattr(max_app_module, "async_session_maker", session_factory)
+    monkeypatch.setattr(max_common, "async_session_maker", session_factory)
+
+    async with session_factory() as session:
+        session.add_all([
+            User(
+                id=user_id,
+                first_name="Max Alice",
+                name="Max Alice",
+                accepted_disclaimer=True,
+                current_dialogue_id=1,
+            ),
+            DBMessage(
+                id=original_message_id,
+                user_id=user_id,
+                dialogue_id=1,
+                topic_id=None,
+                role="user",
+                content="retry prompt",
+            ),
+            BotSystemMessage(
+                bot_scope="max",
+                translation_key="ui.ai.retry_already_used",
+                locale="ru",
+                addressing_style="informal",
+                text="X" * 320,
+            ),
+        ])
+        await session.commit()
+
+    async def fake_eligibility(*_args, **_kwargs):
+        return True, "", SimpleNamespace(
+            diagnostics_json=json.dumps({"user_message_id": original_message_id}),
+            prompt_summary="retry prompt",
+        )
+
+    monkeypatch.setattr(max_app_module, "validate_terminal_failure_retry_eligibility", fake_eligibility)
+    monkeypatch.setattr(max_app_module, "claim_retry_token", lambda *_args: False)
+
+    api_calls = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        body = json_data or {}
+        if path == "/answers":
+            assert len(body.get("notification", "")) <= 200
+        api_calls.append({"method": method, "path": path, "body": body})
+        return {"message": {"body": {"mid": "mid-7001"}}} if path == "/messages" else {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    await app.handle_update({
+        "update_type": "message_callback",
+        "update_id": "max-long-retry-used",
+        "callback": {
+            "callback_id": "cb-max-long-retry-used",
+            "payload": f"ai_retry:{original_message_id}:99",
+            "sender": {"user_id": 902, "name": "Max Alice"},
+        },
+        "message": {
+            "mid": "mid-7001",
+            "chat_id": 902,
+        },
+    })
+
+    answers = [call for call in api_calls if call["path"] == "/answers"]
+    assert answers
+    assert len(answers[-1]["body"]["notification"]) <= 200
 
 
 # ---------------------------------------------------------------------------
@@ -2129,6 +2304,14 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
         else:
             sub_cfg.subscriptions_enabled = False
 
+        s.add(BotSystemMessage(
+            bot_scope="max",
+            translation_key="ui.ai.retry_stale",
+            locale="ru",
+            addressing_style="informal",
+            text="X" * 320,
+        ))
+
         topic123 = await s.get(Topic, 123)
         if not topic123:
             s.add(Topic(id=123, name="Тема 123", is_active=True))
@@ -2154,6 +2337,8 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
 
     async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
         call_entry = {"method": method, "path": path, "params": params or {}, "body": json_data or {}}
+        if path == "/answers":
+            assert len((json_data or {}).get("notification", "")) <= 200
         api_calls.append(call_entry)
         if path == "/messages":
             return {"message": {"body": {"mid": f"mid_{len(api_calls)}"}}}
@@ -2247,10 +2432,11 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
 
     # Assert: answer_callback called with notification ui.ai.retry_stale
     ans_call = next(
-        (c for c in reversed(api_calls) if "/answers" in c["path"] and "предыдущему диалогу" in c["body"].get("notification", "")),
+        (c for c in reversed(api_calls) if "/answers" in c["path"] and c["body"].get("notification")),
         None,
     )
     assert ans_call is not None
+    assert len(ans_call["body"]["notification"]) <= 200
 
     # Assert: no assistant DB row
     async with session_factory() as s:

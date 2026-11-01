@@ -45,7 +45,7 @@ from kie_image_inputs import ImageGeometryError
 from media_templates import extract_template_directive, render_media_template, validate_rendered_template
 from media_template_renderer import TemplateRenderError
 from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, validate_edited_media_source, MediaSourceError
-from system_messages import resolve_system_text
+from system_messages import limit_callback_answer, resolve_system_text
 
 
 log = get_bot_logger("common")
@@ -74,6 +74,15 @@ async def localized_system_text(
             return text if isinstance(text, str) else (fallback or "")
     except Exception:
         return fallback or ""
+
+
+async def localized_callback_text(
+    user_id: int,
+    key: str,
+    fallback: str | None = None,
+    **variables,
+) -> str:
+    return limit_callback_answer(await localized_system_text(user_id, key, fallback, **variables))
 
 
 async def _localized_ai_terminal_message(user_id: int, retryable: bool) -> str:

@@ -1175,6 +1175,99 @@ async def _true_async():
 
 
 @pytest.mark.asyncio
+async def test_max_legacy_system_message_mutations_are_non_mutating(max_settings_db, monkeypatch):
+    from max_messenger_bot.services import common as max_common
+
+    monkeypatch.setattr(max_system_messages, "async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_common, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+
+    async with max_settings_db() as session:
+        session.add(BotSystemMessage(
+            bot_scope="max",
+            translation_key="ui.ai.busy",
+            locale="ru",
+            addressing_style="formal",
+            text="ORIGINAL MAX TEXT",
+        ))
+        await session.commit()
+
+    captured = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    update_id = 2000
+
+    async def send_message(text):
+        nonlocal update_id
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_created",
+            "update_id": update_id,
+            "message": {
+                "body": {"text": text},
+                "recipient": {"chat_id": 1001},
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+        })
+
+    async def press(payload):
+        nonlocal update_id
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": payload,
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+            "message": {
+                "mid": "admin-message",
+                "recipient": {"chat_id": 1001},
+                "body": {"attachments": []},
+            },
+        })
+
+    await press("admin_system_edit:ui.ai.busy:ru:formal:0")
+    await send_message("LEGACY MAX SAVE MUST NOT APPLY")
+    await press("admin_system_save:ui.ai.busy:ru:formal:0")
+
+    async with max_settings_db() as session:
+        row = await session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "max",
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.locale == "ru",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        assert row.text == "ORIGINAL MAX TEXT"
+
+    await press("admin_system_reset:ui.ai.busy:ru:formal:0")
+    async with max_settings_db() as session:
+        row = await session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "max",
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.locale == "ru",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        assert row.text == "ORIGINAL MAX TEXT"
+
+
+@pytest.mark.asyncio
 async def test_max_addressing_style_system_message_journey_uses_real_app_callbacks(max_settings_db, monkeypatch):
     from database import SubscriptionConfig, User
     from max_messenger_bot import ai as max_ai
@@ -1249,21 +1342,23 @@ async def test_max_addressing_style_system_message_journey_uses_real_app_callbac
         assert (await session.get(BotAddressingConfig, "max")).addressing_style == "formal"
 
     await press("admin_system_messages")
-    await press("admin_system_messages_page:2:ru")
-    await press("admin_system_message:ui.ai.busy:ru:2")
-    await press("admin_system_edit:ui.ai.busy:ru:formal:2")
+    await press(system_message_callback_data("p", locale="ru", page=1))
+    await press(system_message_callback_data("p", locale="ru", page=2))
+    await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=2))
+    await press(system_message_callback_data("e", "ui.ai.busy", "ru", "formal", 2))
     await send_message("Пожалуйста, подождите — Ваш предыдущий запрос ещё выполняется.")
-    saved = await press("admin_system_save:ui.ai.busy:ru:formal:2")
+    saved = await press(system_message_callback_data("s", "ui.ai.busy", "ru", "formal", 2))
     assert "Ваш предыдущий запрос" in saved["text"]
-    reopened = await press("admin_system_message:ui.ai.busy:ru:2")
+    reopened = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=2))
     assert "Ваш предыдущий запрос" in reopened["text"]
     await press("admin_general_settings")
 
-    await press("admin_system_messages_page:4:ru")
-    await press("admin_system_message:ui.navigation.continue_prompt:ru:4")
-    await press("admin_system_edit:ui.navigation.continue_prompt:ru:formal:4")
+    await press(system_message_callback_data("p", locale="ru", page=3))
+    await press(system_message_callback_data("p", locale="ru", page=4))
+    await press(system_message_callback_data("d", "ui.navigation.continue_prompt", "ru", page=4))
+    await press(system_message_callback_data("e", "ui.navigation.continue_prompt", "ru", "formal", 4))
     await send_message("MAX CONTINUE CUSTOM")
-    saved_continue = await press("admin_system_save:ui.navigation.continue_prompt:ru:formal:4")
+    saved_continue = await press(system_message_callback_data("s", "ui.navigation.continue_prompt", "ru", "formal", 4))
     assert "MAX CONTINUE CUSTOM" in saved_continue["text"]
     await press("admin_general_settings")
     continue_message = await press("svc:continue")
