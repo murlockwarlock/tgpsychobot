@@ -460,7 +460,7 @@ async def test_telegram_fallback_on_retry_journey(session_factory, setup_tg_user
         "Успешный ответ от запасного провайдера!\n"
         "Служебный блок данных:\n"
         '{"current_step":"FALLBACK_RETRY","event":"FALLBACK_EVENT",'
-        '"metadata":{"ws":{"retry":true}}}'
+        '"ws":{"retry":true}}'
     )
     monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(return_value=fallback_response))
 
@@ -1420,7 +1420,7 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
     fallback_response = (
         "Границы — это забота о себе.\n"
         '<DATA>{"current_step":"MAX_FALLBACK_RETRY","event":"MAX_FALLBACK_EVENT",'
-        '"metadata":{"ws":{"retry":true}}}</DATA>'
+        '"ws":{"retry":true}}</DATA>'
     )
     async def mock_fallback_retry_success(*args, **kwargs):
         prompt = _extract_prompt_from_call(*args, **kwargs)
