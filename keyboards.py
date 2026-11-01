@@ -39,6 +39,13 @@ from translation_service import (
     translate,
 )
 from content_locales import admin_label
+from system_messages import (
+    ADDRESSING_STYLES,
+    SYSTEM_MESSAGE_CATALOG,
+    SYSTEM_MESSAGE_PAGE_SIZE,
+    normalize_addressing_style,
+    system_message_callback_data,
+)
 
 
 def should_show_test_button(test_config) -> bool:
@@ -258,7 +265,7 @@ def admin_test_menu_keyboard(config_or_enabled):
     return builder.as_markup()
 
 
-def admin_general_settings_keyboard(config):
+def admin_general_settings_keyboard(config, addressing_style=None):
     builder = InlineKeyboardBuilder()
     fields = (
         ("name", "Имя", bool(getattr(config, "profile_collect_name", True))),
@@ -287,12 +294,108 @@ def admin_general_settings_keyboard(config):
         text="✏️ Текст сообщения ожидания",
         callback_data="admin_general_edit_ai_processing_message_text",
     )
+    addressing_style = normalize_addressing_style(
+        addressing_style if addressing_style is not None else getattr(config, "addressing_style", "informal")
+    )
+    builder.button(
+        text=f"Обращение: {'✅ Ты' if addressing_style == 'informal' else 'Ты'}",
+        callback_data="admin_general_set_addressing_informal",
+    )
+    builder.button(
+        text=f"Обращение: {'✅ Вы' if addressing_style == 'formal' else 'Вы'}",
+        callback_data="admin_general_set_addressing_formal",
+    )
+    builder.button(
+        text="💬 Системные сообщения",
+        callback_data="admin_system_messages",
+    )
     builder.button(
         text="🎨 Медиаколлекции основного диалога",
         callback_data="admin_main_collections_page_0",
     )
     builder.button(text="🌐 Языки", callback_data="admin_language_settings")
     builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_system_messages_keyboard(locale: str = "ru", page: int = 0):
+    builder = InlineKeyboardBuilder()
+    normalized_locale = locale if locale in {"ru", "en", "pt"} else "ru"
+    total_pages = max(1, (len(SYSTEM_MESSAGE_CATALOG) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE)
+    current_page = max(0, min(page, total_pages - 1))
+    for definition in SYSTEM_MESSAGE_CATALOG[
+        current_page * SYSTEM_MESSAGE_PAGE_SIZE:(current_page + 1) * SYSTEM_MESSAGE_PAGE_SIZE
+    ]:
+        builder.button(
+            text=f"{definition.title} · {definition.key}",
+            callback_data=system_message_callback_data("d", definition.key, normalized_locale, page=current_page),
+        )
+    builder.row(*[
+        InlineKeyboardButton(
+            text=f"{'✅ ' if item == normalized_locale else ''}{item.upper()}",
+            callback_data=system_message_callback_data("l", locale=item, page=current_page),
+        )
+        for item in ("ru", "en", "pt")
+    ])
+    navigation = []
+    if current_page > 0:
+        navigation.append(InlineKeyboardButton(
+            text="⬅️",
+                callback_data=system_message_callback_data("p", locale=normalized_locale, page=current_page - 1),
+        ))
+    navigation.append(InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data="noop"))
+    if current_page < total_pages - 1:
+        navigation.append(InlineKeyboardButton(
+            text="➡️",
+            callback_data=system_message_callback_data("p", locale=normalized_locale, page=current_page + 1),
+        ))
+    builder.row(*navigation)
+    builder.button(text="⬅️ Назад к общим настройкам", callback_data="admin_general_settings")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_system_message_detail_keyboard(key: str, locale: str, page: int = 0):
+    builder = InlineKeyboardBuilder()
+    for style in ADDRESSING_STYLES:
+        style_label = "Ты" if style == "informal" else "Вы"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"👁 Просмотр «{style_label}»",
+                callback_data=system_message_callback_data("v", key, locale, style, page),
+            ),
+            InlineKeyboardButton(
+                text=f"✏️ Изменить «{style_label}»",
+                callback_data=system_message_callback_data("e", key, locale, style, page),
+            ),
+        )
+        builder.row(InlineKeyboardButton(
+            text=f"↩️ Восстановить «{style_label}» по умолчанию",
+            callback_data=system_message_callback_data("r", key, locale, style, page),
+        ))
+    builder.button(
+        text="⬅️ К списку системных сообщений",
+        callback_data=system_message_callback_data("p", locale=locale, page=page),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_system_message_preview_keyboard(key: str, locale: str, style: str, page: int = 0):
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="◀️ К сообщению",
+        callback_data=system_message_callback_data("d", key, locale, page=page),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_system_message_draft_keyboard(key: str, locale: str, style: str, page: int = 0):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💾 Сохранить", callback_data=system_message_callback_data("s", key, locale, style, page))
+    builder.button(text="Отмена", callback_data=system_message_callback_data("c", key, locale, style, page))
     builder.adjust(1)
     return builder.as_markup()
 
@@ -2486,8 +2589,13 @@ def admin_ai_log_detail_keyboard(
     return builder.as_markup()
 
 
-def ai_retry_keyboard(log_id: int, *, locale: str = "ru") -> InlineKeyboardMarkup:
+def ai_retry_keyboard(
+    log_id: int,
+    *,
+    locale: str = "ru",
+    text: str | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    text = translate("ui.ai.retry_request", locale, fallback="🔄 Повторить запрос")
-    builder.button(text=text, callback_data=f"ai_retry:{log_id}")
+    button_text = text or translate("ui.ai.retry_request", locale, fallback="🔄 Повторить запрос")
+    builder.button(text=button_text, callback_data=f"ai_retry:{log_id}")
     return builder.as_markup()

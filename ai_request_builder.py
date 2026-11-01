@@ -39,6 +39,7 @@ from prompt_blocks import (
 )
 from result_history import ai_history_role_filter, select_ai_history_messages
 from subscription_context import active_subscription_flag
+from system_messages import addressing_style_instruction, resolve_addressing_style
 
 log = logging.getLogger(__name__)
 
@@ -363,6 +364,7 @@ async def build_conversational_request_layout(
     modality_instructions: Iterable[str] | None = None,
     service_capabilities: ServiceCapabilities | None = None,
     preferred_response_locale: str | None = None,
+    bot_scope: str = "telegram",
 ) -> AIRequestLayout:
     """Build the single canonical AIRequestLayout for conversational turns (TG & MAX)."""
     effective_memory_mode = memory_mode or get_memory_mode(ai_config)
@@ -410,6 +412,12 @@ async def build_conversational_request_layout(
         minutes_since_last_message=minutes_since_last_message,
     )
     runtime_parts = [client_context, temporal_context]
+    runtime_parts.append(
+        addressing_style_instruction(
+            await resolve_addressing_style(session, bot_scope),
+            preferred_response_locale,
+        )
+    )
     language_directive = build_response_language_directive(preferred_response_locale)
     if language_directive:
         runtime_parts.append(language_directive)
@@ -487,6 +495,7 @@ async def build_isolated_request_layout(
     memory_mode: str | None = None,
     service_capabilities: ServiceCapabilities | None = None,
     preferred_response_locale: str | None = None,
+    bot_scope: str = "telegram",
 ) -> AIRequestLayout:
     """Build canonical AIRequestLayout for isolated direct calls (tests, single prompts, etc.)."""
     effective_memory_mode = memory_mode or get_memory_mode(ai_config)
@@ -509,6 +518,12 @@ async def build_isolated_request_layout(
         minutes_since_last_message=minutes_since_last_message,
     )
     runtime_parts = [client_context, temporal_context]
+    runtime_parts.append(
+        addressing_style_instruction(
+            await resolve_addressing_style(session, bot_scope),
+            preferred_response_locale,
+        )
+    )
     language_directive = build_response_language_directive(preferred_response_locale)
     if language_directive:
         runtime_parts.append(language_directive)

@@ -42,6 +42,7 @@ from prompt_blocks import (
     render_prompt_block,
 )
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, persist_service_data_blocks
+from system_messages import addressing_style_instruction, resolve_addressing_style
 from result_history import (
     TEST_RESULT_ROLE,
     ai_history_role_filter,
@@ -823,7 +824,11 @@ async def _build_request_context_blocks(
     if short_response_instruction and short_response_instruction.strip():
         runtime_parts.append(short_response_instruction.strip())
 
-    request_parts = []
+    request_parts = [
+        addressing_style_instruction(
+            await resolve_addressing_style(session, "telegram"),
+        )
+    ]
     if test_context and test_context.strip():
         request_parts.append(test_context.strip())
     if knowledge_context and knowledge_context.strip():

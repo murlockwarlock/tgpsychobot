@@ -11,7 +11,17 @@ os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import database
-from database import AIConfig, AIModelSettings, Base, BotGeneralConfig, BotTranslation, TelegramPendingAIReply, User
+from database import (
+    AIConfig,
+    AIModelSettings,
+    Base,
+    BotAddressingConfig,
+    BotGeneralConfig,
+    BotSystemMessage,
+    BotTranslation,
+    TelegramPendingAIReply,
+    User,
+)
 from provider_models import PROVIDER_DEEPSEEK, PROVIDER_OPENROUTER
 
 
@@ -216,6 +226,205 @@ async def test_init_db_adds_multilingual_authoring_flag_to_legacy_config(tmp_pat
         async with sessions() as session:
             config = await session.get(BotGeneralConfig, 1)
             assert config.multilingual_authoring_enabled is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_adds_informal_addressing_style_to_legacy_config(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-addressing-style.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(BotGeneralConfig(id=1, ai_processing_message_text="Думаю..."))
+            await session.commit()
+        async with engine.begin() as connection:
+            await connection.execute(text(
+                "ALTER TABLE bot_general_config DROP COLUMN addressing_style"
+            ))
+
+        await database.init_db()
+
+        async with engine.connect() as connection:
+            general_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    column["name"] for column in inspect(sync_connection).get_columns("bot_general_config")
+                }
+            )
+            has_system_messages_table = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).has_table("bot_system_messages")
+            )
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+
+        assert "addressing_style" in general_columns
+        assert has_system_messages_table is True
+        assert config.addressing_style == "informal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_scopes_legacy_system_messages_for_telegram_and_max(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-system-message-scope.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.execute(text("DROP TABLE bot_system_messages"))
+            await connection.execute(text(
+                "CREATE TABLE bot_system_messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "translation_key VARCHAR(255) NOT NULL, "
+                "locale VARCHAR(8) NOT NULL, "
+                "addressing_style VARCHAR(16) NOT NULL, "
+                "text TEXT NOT NULL, "
+                "updated_at DATETIME NOT NULL, "
+                "CONSTRAINT uq_bot_system_message_key_locale_style "
+                "UNIQUE (translation_key, locale, addressing_style)"
+                ")"
+            ))
+            await connection.execute(text(
+                "INSERT INTO bot_system_messages "
+                "(translation_key, locale, addressing_style, text, updated_at) "
+                "VALUES ('ui.ai.busy', 'ru', 'formal', 'LEGACY', CURRENT_TIMESTAMP)"
+            ))
+
+        await database.init_db()
+
+        async with sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(BotSystemMessage).where(
+                        BotSystemMessage.translation_key == "ui.ai.busy",
+                        BotSystemMessage.locale == "ru",
+                        BotSystemMessage.addressing_style == "formal",
+                    )
+                )
+            ).all()
+            scopes = (
+                await session.scalars(select(BotAddressingConfig))
+            ).all()
+
+        assert {(row.bot_scope, row.text) for row in rows} == {
+            ("telegram", "LEGACY"),
+            ("max", "LEGACY"),
+        }
+        assert {row.bot_scope for row in scopes} == {"telegram", "max"}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_repeated_init_db_does_not_resync_system_messages_between_scopes(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'repeated-system-message-init.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        await database.init_db()
+        async with sessions() as session:
+            session.add_all([
+                BotSystemMessage(
+                    bot_scope="telegram",
+                    translation_key="ui.ai.busy",
+                    locale="ru",
+                    addressing_style="informal",
+                    text="TELEGRAM EDIT",
+                ),
+                BotSystemMessage(
+                    bot_scope="telegram",
+                    translation_key="ui.ai.retry_stale",
+                    locale="ru",
+                    addressing_style="informal",
+                    text="TELEGRAM RESET SOURCE",
+                ),
+                BotSystemMessage(
+                    bot_scope="max",
+                    translation_key="ui.ai.retry_already_used",
+                    locale="ru",
+                    addressing_style="informal",
+                    text="MAX EDIT",
+                ),
+                BotSystemMessage(
+                    bot_scope="max",
+                    translation_key="ui.ai.retry_stale",
+                    locale="ru",
+                    addressing_style="informal",
+                    text="MAX RESET",
+                ),
+            ])
+            await session.commit()
+
+        await database.init_db()
+
+        async with sessions() as session:
+            assert await session.scalar(
+                select(BotSystemMessage).where(
+                    BotSystemMessage.bot_scope == "max",
+                    BotSystemMessage.translation_key == "ui.ai.busy",
+                )
+            ) is None
+            assert await session.scalar(
+                select(BotSystemMessage).where(
+                    BotSystemMessage.bot_scope == "max",
+                    BotSystemMessage.translation_key == "ui.ai.retry_request",
+                )
+            ) is None
+            max_edit = await session.scalar(
+                select(BotSystemMessage).where(
+                    BotSystemMessage.bot_scope == "max",
+                    BotSystemMessage.translation_key == "ui.ai.retry_already_used",
+                )
+            )
+            telegram_edit = await session.scalar(
+                select(BotSystemMessage).where(
+                    BotSystemMessage.bot_scope == "telegram",
+                    BotSystemMessage.translation_key == "ui.ai.busy",
+                )
+            )
+            assert max_edit.text == "MAX EDIT"
+            assert telegram_edit.text == "TELEGRAM EDIT"
+            max_reset = await session.scalar(
+                select(BotSystemMessage).where(
+                    BotSystemMessage.bot_scope == "max",
+                    BotSystemMessage.translation_key == "ui.ai.retry_stale",
+                )
+            )
+            await session.delete(max_reset)
+            await session.commit()
+
+        await database.init_db()
+
+        async with sessions() as session:
+            assert await session.scalar(
+                select(BotSystemMessage).where(
+                    BotSystemMessage.bot_scope == "max",
+                    BotSystemMessage.translation_key == "ui.ai.retry_stale",
+                )
+            ) is None
+            telegram_reset_source = await session.scalar(
+                select(BotSystemMessage).where(
+                    BotSystemMessage.bot_scope == "telegram",
+                    BotSystemMessage.translation_key == "ui.ai.retry_stale",
+                )
+            )
+            assert telegram_reset_source.text == "TELEGRAM RESET SOURCE"
     finally:
         await engine.dispose()
 

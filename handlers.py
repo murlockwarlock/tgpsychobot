@@ -401,6 +401,24 @@ from universal_tests import (
 )
 
 from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
+from system_messages import (
+    SYSTEM_MESSAGE_DEFINITIONS,
+    SYSTEM_MESSAGE_PAGE_SIZE,
+    SYSTEM_MESSAGE_CATALOG,
+    addressing_style_label,
+    get_system_message_variants,
+    limit_callback_answer,
+    parse_system_message_callback,
+    render_system_message_detail,
+    render_system_message_draft,
+    render_system_message_editor,
+    render_system_message_preview,
+    resolve_addressing_style,
+    resolve_system_text,
+    reset_system_message,
+    save_addressing_style,
+    save_system_message,
+)
 from ai_retry_policy import (
     is_retryable_ai_error,
     claim_retry_token,
@@ -793,11 +811,13 @@ async def _echo_ai_button_label(
     if not isinstance(button_text, str) or not button_text:
         return
     locale = await _get_user_locale(callback.from_user.id)
-    acknowledgement = translate(
+    acknowledgement = await _resolve_user_system_text(
+        callback.from_user.id,
         "ui.ai.button_accepted",
         locale,
         fallback="Ответ принят: {button_text}",
-    ).format(button_text=button_text)
+        button_text=button_text,
+    )
     message = getattr(callback, "message", None)
     answer = getattr(message, "answer", None)
     try:
@@ -1282,6 +1302,7 @@ class AdminStates(StatesGroup):
     set_temperature = State()
     set_kie_credit_threshold = State()
     set_ai_processing_message_text = State()
+    set_system_message_text = State()
     upload_test_questions_file = State()
     upload_test_formulas_file = State()
     set_test_system_prompt = State()
@@ -1656,14 +1677,21 @@ async def _send_ai_processing_message(
         text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
         entities = None
     source_text = text
-    localized_text = translate(
-        f"bot_general_config.{getattr(config, 'id', 1)}.ai_processing_message_text",
-        locale,
-        fallback=source_text,
-        source=source_text,
-    ) or source_text
-    if localized_text == source_text and source_text == DEFAULT_AI_PROCESSING_MESSAGE_TEXT:
-        localized_text = translate("ui.ai.processing_default", locale, fallback=source_text)
+    if source_text == DEFAULT_AI_PROCESSING_MESSAGE_TEXT:
+        async with async_session_maker() as session:
+            localized_text = await resolve_system_text(
+                session,
+                "ui.ai.processing_default",
+                locale,
+                fallback=source_text,
+            )
+    else:
+        localized_text = translate(
+            f"bot_general_config.{getattr(config, 'id', 1)}.ai_processing_message_text",
+            locale,
+            fallback=source_text,
+            source=source_text,
+        ) or source_text
     if localized_text != source_text:
         entities = None
     text = localized_text
@@ -2051,7 +2079,12 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                 card_ids = [c.id for c in cards]
                 kb_markup = keyboards.card_selection_keyboard(category, card_ids)
                 await message.answer(
-                    translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                    await _resolve_user_system_text(
+                        user_id,
+                        "ui.card.selection_prompt",
+                        locale,
+                        fallback="Выбери карту, которая тебе откликается:",
+                    ),
                     reply_markup=kb_markup,
                 )
 
@@ -2095,7 +2128,12 @@ async def execute_media_commands(message: Message, response_text: str, user_id: 
                 card_ids = [c.id for c in cards]
                 kb_markup = keyboards.card_selection_keyboard(cat_stripped, card_ids)
                 await message.answer(
-                    translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                    await _resolve_user_system_text(
+                        user_id,
+                        "ui.card.selection_prompt",
+                        locale,
+                        fallback="Выбери карту, которая тебе откликается:",
+                    ),
                     reply_markup=kb_markup,
                 )
 
@@ -2264,7 +2302,12 @@ async def _send_generated_response(bot: Bot, user_id: int, text: str) -> None:
         locale = await _get_user_locale(user_id)
         await bot.send_message(
             chat_id=user_id,
-            text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+            text=await _resolve_user_system_text(
+                user_id,
+                "ui.ai.choose_action",
+                locale,
+                fallback="Выберите действие:",
+            ),
             reply_markup=text_markup,
         )
         return
@@ -2620,7 +2663,12 @@ async def process_buffered_messages(
                         await bot.send_photo(
                             chat_id=user_id,
                             photo=BufferedInputFile(image_data, filename="gen.png"),
-                            caption=translate("ui.ai.image_ready", locale, fallback="✨ Готово!"),
+                            caption=await _resolve_user_system_text(
+                                user_id,
+                                "ui.ai.image_ready",
+                                locale,
+                                fallback="✨ Готово!",
+                            ),
                         )
                     except Exception as e:
                         if not await _check_scope_guard():
@@ -2640,7 +2688,12 @@ async def process_buffered_messages(
                         if await _check_scope_guard():
                             await bot.send_message(
                                 chat_id=user_id,
-                                text=translate("ui.ai.image_failed", locale, fallback="😔 Не удалось сгенерировать изображение."),
+                                text=await _resolve_user_system_text(
+                                    user_id,
+                                    "ui.ai.image_failed",
+                                    locale,
+                                    fallback="😔 Не удалось сгенерировать изображение.",
+                                ),
                             )
                     finally:
                         upload_task.cancel()
@@ -2649,7 +2702,12 @@ async def process_buffered_messages(
                         return
                     await bot.send_message(
                         chat_id=user_id,
-                        text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        text=await _resolve_user_system_text(
+                            user_id,
+                            "ui.ai.choose_action",
+                            locale,
+                            fallback="Выберите действие:",
+                        ),
                         reply_markup=response_text_markup,
                     )
             else:
@@ -2671,7 +2729,12 @@ async def process_buffered_messages(
                         return
                     await bot.send_message(
                         chat_id=user_id,
-                        text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        text=await _resolve_user_system_text(
+                            user_id,
+                            "ui.ai.choose_action",
+                            locale,
+                            fallback="Выберите действие:",
+                        ),
                         reply_markup=response_text_markup,
                     )
 
@@ -2769,7 +2832,12 @@ async def process_buffered_messages(
                         return
                     await bot.send_message(
                         chat_id=user_id,
-                        text=translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                        text=await _resolve_user_system_text(
+                            user_id,
+                            "ui.card.selection_prompt",
+                            locale,
+                            fallback="Выбери карту, которая тебе откликается:",
+                        ),
                         reply_markup=keyboards.card_selection_keyboard(cat, [c.id for c in cards]),
                     )
 
@@ -2815,7 +2883,12 @@ async def process_buffered_messages(
                         return
                     await bot.send_message(
                         chat_id=user_id,
-                        text=translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                        text=await _resolve_user_system_text(
+                            user_id,
+                            "ui.card.selection_prompt",
+                            locale,
+                            fallback="Выбери карту, которая тебе откликается:",
+                        ),
                         reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]),
                     )
             if not await _check_scope_guard():
@@ -2915,14 +2988,22 @@ async def process_buffered_messages(
         retryable_group = is_retryable_ai_error(e)
         retryable_terminal = bool(failed_log_id and retryable_group)
         if retryable_terminal and not is_hidden_job:
-            reply_markup = kb.ai_retry_keyboard(failed_log_id, locale=locale)
+            retry_text = await _resolve_user_system_text(
+                user_id,
+                "ui.ai.retry_request",
+                locale,
+                fallback="🔄 Повторить запрос",
+            )
+            reply_markup = kb.ai_retry_keyboard(failed_log_id, locale=locale, text=retry_text)
+        message_key = "ui.ai.overloaded" if retryable_group else "ui.ai.service_unavailable"
+        message_fallback = (
+            "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
+            if retryable_group
+            else "К сожалению, сервис временно недоступен из-за технической проблемы."
+        )
         await bot.send_message(
             chat_id=user_id,
-            text=translate(
-                "ui.ai.overloaded" if retryable_group else "ui.ai.service_unavailable",
-                locale,
-                fallback=("Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!" if retryable_group else "К сожалению, сервис временно недоступен из-за технической проблемы."),
-            ),
+            text=await _resolve_user_system_text(user_id, message_key, locale, fallback=message_fallback),
             reply_markup=reply_markup,
         )
     except Exception as e:
@@ -2943,7 +3024,8 @@ async def process_buffered_messages(
             return
         await bot.send_message(
             chat_id=user_id,
-            text=translate(
+            text=await _resolve_user_system_text(
+                user_id,
                 "ui.ai.processing_failed",
                 locale,
                 fallback="Произошла ошибка при обработке сообщения.",
@@ -3444,7 +3526,8 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
         if action == "svc:continue":
             locale = await _get_user_locale(user_id)
             await callback.message.answer(
-                translate(
+                await _resolve_user_system_text(
+                    user_id,
                     "ui.navigation.continue_prompt",
                     locale,
                     fallback="Введите ваше сообщение для начала/продолжения диалога:",
@@ -3462,8 +3545,9 @@ async def process_response_button(callback: CallbackQuery, state: FSMContext, bo
     # Generic AI path — check single-flight BEFORE button consumption
     lease = single_flight.try_claim("telegram", user_id)
     if lease is None:
+        current_locale = await _get_user_locale(user_id)
         await callback.answer(
-            translate("ui.ai.busy", await _get_user_locale(user_id), fallback=AI_BUSY_MESSAGE),
+            await _resolve_user_callback_text(user_id, "ui.ai.busy", current_locale, fallback=AI_BUSY_MESSAGE),
             show_alert=True,
         )
         return
@@ -3518,7 +3602,8 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
             await _disable_ai_button_keyboard(callback)
             locale = await _get_user_locale(user_id)
             await callback.answer(
-                translate(
+                await _resolve_user_callback_text(
+                    user_id,
                     "ui.ai.retry_stale",
                     locale,
                     fallback="Этот запрос уже относится к предыдущему диалогу. Отправьте сообщение заново.",
@@ -3535,7 +3620,8 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
         await _disable_ai_button_keyboard(callback)
         locale = await _get_user_locale(user_id)
         await callback.answer(
-            translate(
+            await _resolve_user_callback_text(
+                user_id,
                 "ui.ai.retry_already_used",
                 locale,
                 fallback="Этот запрос уже был отправлен на повторную обработку.",
@@ -3551,7 +3637,8 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
             await _disable_ai_button_keyboard(callback)
             locale = await _get_user_locale(user_id)
             await callback.answer(
-                translate(
+                await _resolve_user_callback_text(
+                    user_id,
                     "ui.ai.retry_already_used",
                     locale,
                     fallback="Этот запрос уже был отправлен на повторную обработку.",
@@ -3570,7 +3657,8 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
                 await _disable_ai_button_keyboard(callback)
                 locale = await _get_user_locale(user_id)
                 await callback.answer(
-                    translate(
+                    await _resolve_user_callback_text(
+                        user_id,
                         "ui.ai.retry_already_used",
                         locale,
                         fallback="Этот запрос уже был отправлен на повторную обработку.",
@@ -3598,7 +3686,7 @@ async def process_ai_retry(callback: CallbackQuery, state: FSMContext, bot: Bot)
     if busy:
         locale = await _get_user_locale(user_id)
         await callback.answer(
-            translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE),
+            await _resolve_user_callback_text(user_id, "ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE),
             show_alert=True,
         )
         return
@@ -3617,7 +3705,8 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
     if pending_card_ids and card_id not in pending_card_ids:
         locale = await _get_user_locale(user_id)
         await callback.answer(
-            translate(
+            await _resolve_user_callback_text(
+                user_id,
                 "ui.card.stale_choice",
                 locale,
                 fallback="Эта карта уже не участвует в текущем выборе.",
@@ -3652,11 +3741,22 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
         if media:
             if media.file_name == '_back':
                 await callback.message.answer(
-                    translate("ui.card.invalid_back", locale, fallback="Эта техническая рубашка не должна выбираться.")
+                    await resolve_system_text(
+                        session,
+                        "ui.card.invalid_back",
+                        locale,
+                        fallback="Эта техническая рубашка не должна выбираться.",
+                    )
                 )
                 return
 
-            caption = f"<b>{translate('ui.card.selected', locale, fallback='Твой выбор подтвержден.')}</b>\n\n{translate(f'media_library.{media.id}.description', locale, fallback=media.description or '', source=media.description or '') or ''}"
+            selected_text = await resolve_system_text(
+                session,
+                "ui.card.selected",
+                locale,
+                fallback="Твой выбор подтвержден.",
+            )
+            caption = f"<b>{selected_text}</b>\n\n{translate(f'media_library.{media.id}.description', locale, fallback=media.description or '', source=media.description or '') or ''}"
             await callback.message.answer_photo(
                 photo=media.file_id,
                 caption=caption,
@@ -3715,7 +3815,8 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
                 )
                 await bot.send_message(
                     chat_id=user_id,
-                    text=translate(
+                    text=await resolve_system_text(
+                        session,
                         "ui.card.interpretation_failed",
                         locale,
                         fallback="Не удалось получить интерпретацию карты. Попробуйте выбрать карту ещё раз через несколько минут.",
@@ -3729,7 +3830,8 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
             )
         else:
             await callback.message.answer(
-                translate(
+                await resolve_system_text(
+                    session,
                     "ui.card.not_found",
                     locale,
                     fallback="Ошибка: карта не найдена. Попробуйте начать выбор заново.",
@@ -3737,9 +3839,15 @@ async def process_card_selection(callback: CallbackQuery, bot: Bot):
             )
 
     if len(final_spread_file_ids) > 1:
+        spread_heading = await _resolve_user_system_text(
+            user_id,
+            "ui.card.spread_heading",
+            locale,
+            fallback="Твой расклад целиком:",
+        )
         await bot.send_message(
             chat_id=user_id,
-            text=translate("ui.card.spread_heading", locale, fallback="Твой расклад целиком:"),
+            text=spread_heading,
         )
         await send_card_album(
             bot,
@@ -3835,7 +3943,12 @@ async def _advance_card_spread_after_selection(
             locale = await _get_user_locale(user_id)
             await bot.send_message(
                 chat_id=user_id,
-                text=translate("ui.card.next_selection_prompt", locale, fallback="Выбери следующую карту:"),
+                text=await _resolve_user_system_text(
+                    user_id,
+                    "ui.card.next_selection_prompt",
+                    locale,
+                    fallback="Выбери следующую карту:",
+                ),
                 reply_markup=keyboards.card_selection_keyboard(spread['category'], [card.id for card in next_cards]),
             )
             return []
@@ -3844,7 +3957,8 @@ async def _advance_card_spread_after_selection(
         locale = await _get_user_locale(user_id)
         await bot.send_message(
             chat_id=user_id,
-            text=translate(
+            text=await _resolve_user_system_text(
+                user_id,
                 "ui.card.next_failed",
                 locale,
                 fallback="Не удалось показать следующие карты. Попробуй выбрать карту ещё раз или начни расклад заново.",
@@ -3894,13 +4008,17 @@ async def _resend_active_spread_choice(bot: Bot, user_id: int) -> bool:
 
     _, current_round, total_rounds = _card_spread_progress(spread)
     await send_card_album(bot, user_id, file_ids, context=context)
+    round_prompt = await _resolve_user_system_text(
+        user_id,
+        "ui.card.round_prompt",
+        locale,
+        fallback="Сейчас раунд {current_round} из {total_rounds}. Выбери одну из карт кнопкой ниже:",
+        current_round=current_round,
+        total_rounds=total_rounds,
+    )
     await bot.send_message(
         chat_id=user_id,
-        text=translate(
-            "ui.card.round_prompt",
-            locale,
-            fallback="Сейчас раунд {current_round} из {total_rounds}. Выбери одну из карт кнопкой ниже:",
-        ).format(current_round=current_round, total_rounds=total_rounds),
+        text=round_prompt,
         reply_markup=keyboards.card_selection_keyboard(spread['category'], [card.id for card in cards]),
     )
     return True
@@ -8998,7 +9116,9 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
         await session.commit()
 
     locale = await _get_user_locale(user_id)
-    thinking_msg = await message.answer(translate("ui.ai.thinking", locale, fallback="🤖 Думаю..."))
+    thinking_msg = await message.answer(
+        await _resolve_user_system_text(user_id, "ui.ai.thinking", locale, fallback="🤖 Думаю...")
+    )
     thinking_msg_can_be_edited = True
 
     async def _send_processing_error(text: str):
@@ -9128,13 +9248,13 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             elif response_text_markup:
                 if thinking_msg_can_be_edited:
                     await thinking_msg.edit_text(
-                        translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        await _resolve_user_system_text(user_id, "ui.ai.choose_action", locale, fallback="Выберите действие:"),
                         reply_markup=response_text_markup,
                     )
                 else:
                     await bot.send_message(
                         chat_id=user_id,
-                        text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        text=await _resolve_user_system_text(user_id, "ui.ai.choose_action", locale, fallback="Выберите действие:"),
                         reply_markup=response_text_markup,
                     )
             elif thinking_msg_can_be_edited:
@@ -9146,7 +9266,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 await bot.send_photo(
                     chat_id=user_id,
                     photo=BufferedInputFile(image_data, filename="gen.png"),
-                    caption=translate("ui.ai.image_ready", locale, fallback="✨ Готово!"),
+                    caption=await _resolve_user_system_text(user_id, "ui.ai.image_ready", locale, fallback="✨ Готово!"),
                 )
             except Exception as e:
                 gen_provider, gen_model = _resolve_ai_provider_model(ai_config, "image_generation")
@@ -9163,7 +9283,7 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 )
                 await bot.send_message(
                     chat_id=user_id,
-                    text=translate("ui.ai.image_failed", locale, fallback="😔 Не удалось сгенерировать изображение."),
+                    text=await _resolve_user_system_text(user_id, "ui.ai.image_failed", locale, fallback="😔 Не удалось сгенерировать изображение."),
                 )
             finally:
                 upload_task.cancel()
@@ -9204,13 +9324,13 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             elif response_text_markup:
                 if thinking_msg_can_be_edited:
                     await thinking_msg.edit_text(
-                        translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        await _resolve_user_system_text(user_id, "ui.ai.choose_action", locale, fallback="Выберите действие:"),
                         reply_markup=response_text_markup,
                     )
                 else:
                     await bot.send_message(
                         chat_id=user_id,
-                        text=translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                        text=await _resolve_user_system_text(user_id, "ui.ai.choose_action", locale, fallback="Выберите действие:"),
                         reply_markup=response_text_markup,
                     )
             elif thinking_msg_can_be_edited:
@@ -9304,7 +9424,12 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                     )
                     await bot.send_message(
                         chat_id=user_id,
-                        text=translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                        text=await _resolve_user_system_text(
+                            user_id,
+                            "ui.card.selection_prompt",
+                            locale,
+                            fallback="Выбери карту, которая тебе откликается:",
+                        ),
                         reply_markup=keyboards.card_selection_keyboard(cat, [c.id for c in cards]),
                     )
 
@@ -9346,7 +9471,12 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                         )
                     await bot.send_message(
                         chat_id=user_id,
-                        text=translate("ui.card.selection_prompt", locale, fallback="Выбери карту, которая тебе откликается:"),
+                        text=await _resolve_user_system_text(
+                            user_id,
+                            "ui.card.selection_prompt",
+                            locale,
+                            fallback="Выбери карту, которая тебе откликается:",
+                        ),
                         reply_markup=keyboards.card_selection_keyboard(cat_stripped, [c.id for c in cards]),
                     )
 
@@ -9440,10 +9570,15 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             exception=e,
         )
         await _send_processing_error(
-            translate(
+            await _resolve_user_system_text(
+                user_id,
                 "ui.ai.overloaded" if is_retryable_ai_error(e) else "ui.ai.service_unavailable",
                 locale,
-                fallback=("Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!" if is_retryable_ai_error(e) else "К сожалению, сервис временно недоступен из-за технической проблемы."),
+                fallback=(
+                    "Ой. Нейросеть сейчас перегружена и не отвечает. Загляни через несколько минут и повтори запрос. Я буду ждать!"
+                    if is_retryable_ai_error(e)
+                    else "К сожалению, сервис временно недоступен из-за технической проблемы."
+                ),
             )
         )
     except Exception as e:
@@ -9460,7 +9595,8 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
             exception=e,
         )
         await _send_processing_error(
-            translate(
+            await _resolve_user_system_text(
+                user_id,
                 "ui.ai.unexpected_failed",
                 locale,
                 fallback="Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.",
@@ -9583,7 +9719,12 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
         lease = single_flight.try_claim("telegram", user_id)
         if lease is None:
             await callback.message.answer(
-                translate("ui.ai.busy", await _get_user_locale(user_id), fallback=AI_BUSY_MESSAGE)
+                await _resolve_user_system_text(
+                    user_id,
+                    "ui.ai.busy",
+                    await _get_user_locale(user_id),
+                    fallback=AI_BUSY_MESSAGE,
+                )
             )
             return
         try:
@@ -9593,7 +9734,8 @@ async def disclaimer_accepted_handler(callback: CallbackQuery, state: FSMContext
     else:
         locale = await _get_user_locale(user_id)
         await callback.message.answer(
-            translate(
+            await _resolve_user_system_text(
+                user_id,
                 "ui.navigation.continue_ready",
                 locale,
                 fallback="Спасибо! Теперь вы можете задать свой вопрос.",
@@ -10708,7 +10850,8 @@ async def _check_telegram_chat_access(session, user_id: int, bot: Bot, chat_id: 
             locale = await resolve_user_effective_locale(session, user or user_id)
             await bot.send_message(
                 chat_id,
-                translate(
+                await resolve_system_text(
+                    session,
                     "ui.access.subscription_required",
                     locale,
                     fallback="Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
@@ -11289,7 +11432,12 @@ async def _resume_after_profile_onboarding(
         lease = single_flight.try_claim("telegram", user_id)
         if lease is None:
             await message.answer(
-                translate("ui.ai.busy", await _get_user_locale(user_id), fallback=AI_BUSY_MESSAGE)
+                await _resolve_user_system_text(
+                    user_id,
+                    "ui.ai.busy",
+                    await _get_user_locale(user_id),
+                    fallback=AI_BUSY_MESSAGE,
+                )
             )
             return
         try:
@@ -11560,7 +11708,12 @@ async def _complete_telegram_main_continuation(
     locale = await _get_user_locale(user_id)
     await bot.send_message(
         user_id,
-        translate("ui.navigation.main_resume", locale, fallback="✅ Мы вернулись в основной диалог."),
+        await _resolve_user_system_text(
+            user_id,
+            "ui.navigation.main_resume",
+            locale,
+            fallback="✅ Мы вернулись в основной диалог.",
+        ),
     )
 
     if not accepted_disclaimer:
@@ -16892,6 +17045,31 @@ async def _get_user_locale(user_id: int) -> str:
         return await resolve_user_effective_locale(session, user_id)
 
 
+async def _resolve_user_system_text(user_id: int, key: str, locale: str, *, fallback: str | None = None, **variables):
+    try:
+        async with async_session_maker() as session:
+            return await resolve_system_text(
+                session,
+                key,
+                locale,
+                bot_scope="telegram",
+                fallback=fallback,
+                **variables,
+            )
+    except Exception:
+        text = fallback or ""
+        try:
+            return text.format(**variables) if variables else text
+        except (KeyError, IndexError, ValueError):
+            return text
+
+
+async def _resolve_user_callback_text(user_id: int, key: str, locale: str, *, fallback: str | None = None, **variables):
+    return limit_callback_answer(
+        await _resolve_user_system_text(user_id, key, locale, fallback=fallback, **variables)
+    )
+
+
 async def _user_settings_keyboard(user, locale: str, *, language_available: bool | None = None):
     if language_available is None:
         async with async_session_maker() as session:
@@ -18823,7 +19001,7 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
     lease = single_flight.try_claim("telegram", user_id)
     if lease is None:
         await message.answer(
-            translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE)
+            await _resolve_user_system_text(user_id, "ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE)
         )
         return
 
@@ -18949,7 +19127,8 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 include_traceback=False,
             )
             await thinking_msg.edit_text(
-                translate(
+                await _resolve_user_system_text(
+                    user_id,
                     "ui.ai.service_unavailable",
                     locale,
                     fallback="К сожалению, сервис временно недоступен из-за технической проблемы.",
@@ -19003,7 +19182,8 @@ async def handle_voice_message(message: Message, state: FSMContext, bot: Bot):
                 if not user.subscription or user.subscription.end_date < datetime.utcnow():
                     await thinking_msg.delete()
                     await message.answer(
-                        translate(
+                        await resolve_system_text(
+                            session,
                             "ui.access.subscription_required",
                             locale,
                             fallback="Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
@@ -20007,7 +20187,9 @@ async def process_test_gender(callback: CallbackQuery, state: FSMContext, bot: B
         if prompt_text:
             lease = single_flight.try_claim("telegram", user_id)
             if lease is None:
-                await callback.message.answer(translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE))
+                await callback.message.answer(
+                    await _resolve_user_system_text(user_id, "ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE)
+                )
                 return
             try:
                 await process_user_prompt(callback.message, user_id, prompt_text, bot, state)
@@ -21384,6 +21566,389 @@ async def admin_test_toggle_profile_field(callback: CallbackQuery):
     await callback.answer()
 
 
+def _system_messages_locale_label(locale: str) -> str:
+    return {"ru": "Русский", "en": "English", "pt": "Português"}.get(locale, "Русский")
+
+
+async def _render_admin_system_messages(callback: CallbackQuery, locale: str = "ru", page: int = 0):
+    normalized_locale = locale if locale in {"ru", "en", "pt"} else "ru"
+    total_pages = max(1, (len(SYSTEM_MESSAGE_CATALOG) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE)
+    current_page = max(0, min(page, total_pages - 1))
+    text = (
+        "💬 <b>Системные сообщения</b>\n\n"
+        f"Язык: <b>{_system_messages_locale_label(normalized_locale)}</b>\n"
+        "Ключи стабильны. Варианты «Ты» и «Вы» редактируются независимо.\n"
+        "Автоматическая замена слов не используется."
+    )
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=kb.admin_system_messages_keyboard(normalized_locale, current_page),
+    )
+
+
+async def _render_admin_system_message_detail(callback: CallbackQuery, key: str, locale: str, page: int = 0):
+    definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
+    if definition is None or locale not in {"ru", "en", "pt"}:
+        await callback.answer("Системное сообщение не найдено.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        variants = await get_system_message_variants(session, key, locale, bot_scope="telegram")
+    text = render_system_message_detail(definition, key, _system_messages_locale_label(locale), variants)
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=kb.admin_system_message_detail_keyboard(key, locale, page),
+    )
+
+
+def _system_message_edit_context_matches(data, key: str, locale: str, style: str, page: int) -> bool:
+    try:
+        stored_page = int(data.get("system_message_page", -1))
+    except (TypeError, ValueError):
+        return False
+    return (
+        data.get("system_message_key") == key
+        and data.get("system_message_locale") == locale
+        and data.get("system_message_style") == style
+        and stored_page == page
+    )
+
+
+@router.callback_query(F.data.startswith("sm:"))
+async def admin_system_message_compact_callback(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(limit_callback_answer("Недостаточно прав."), show_alert=True)
+        return
+    parsed = parse_system_message_callback(callback.data or "")
+    if parsed is None:
+        await callback.answer(limit_callback_answer("Некорректная кнопка системного сообщения."), show_alert=True)
+        return
+    action = parsed["action"]
+    locale = parsed.get("locale", "ru")
+    page = int(parsed.get("page", 0)) if str(parsed.get("page", "0")).isdigit() else 0
+    key = parsed.get("key")
+    style = parsed.get("style")
+    if action in {"d", "v", "e", "r", "s", "c"} and (
+        key not in SYSTEM_MESSAGE_DEFINITIONS
+        or locale not in {"ru", "en", "pt"}
+        or (action != "d" and style not in {"informal", "formal"})
+    ):
+        await callback.answer(limit_callback_answer("Некорректный вариант сообщения."), show_alert=True)
+        return
+    if action in {"l", "p"}:
+        await state.clear()
+        if action == "l":
+            await _render_admin_system_messages(callback, locale, page)
+        else:
+            await _render_admin_system_messages(callback, locale, page)
+        await callback.answer()
+        return
+    if action == "d":
+        await state.clear()
+        await _render_admin_system_message_detail(callback, key, locale, page)
+        await callback.answer()
+        return
+    if action == "v":
+        await state.clear()
+        async with async_session_maker() as session:
+            text_value = await resolve_system_text(
+                session,
+                key,
+                locale,
+                style,
+                bot_scope="telegram",
+            )
+        await callback.message.edit_text(
+            render_system_message_preview(key, style, text_value),
+            parse_mode="HTML",
+            reply_markup=kb.admin_system_message_preview_keyboard(key, locale, style, page),
+        )
+        await callback.answer()
+        return
+    if action == "e":
+        async with async_session_maker() as session:
+            current_text = await resolve_system_text(
+                session,
+                key,
+                locale,
+                style,
+                bot_scope="telegram",
+            )
+        await state.set_state(AdminStates.set_system_message_text)
+        await state.update_data(
+            system_message_key=key,
+            system_message_locale=locale,
+            system_message_style=style,
+            system_message_page=page,
+            system_message_draft=None,
+        )
+        await callback.message.edit_text(
+            render_system_message_editor(key, style, current_text),
+            parse_mode="HTML",
+            reply_markup=kb.admin_system_message_draft_keyboard(key, locale, style, page),
+        )
+        await callback.answer()
+        return
+    if action in {"s", "c"}:
+        data = await state.get_data()
+        if not _system_message_edit_context_matches(data, key, locale, style, page):
+            await callback.answer(limit_callback_answer("Изменение устарело. Откройте сообщение заново."), show_alert=True)
+            return
+        if action == "c":
+            await state.clear()
+            await _render_admin_system_message_detail(callback, key, locale, page)
+            await callback.answer(limit_callback_answer("Изменения отменены."))
+            return
+        draft = data.get("system_message_draft")
+        if not isinstance(draft, str) or not draft.strip():
+            await callback.answer(limit_callback_answer("Сначала отправьте новый текст."), show_alert=True)
+            return
+        async with async_session_maker() as session:
+            await save_system_message(
+                session,
+                key,
+                locale,
+                style,
+                draft,
+                bot_scope="telegram",
+            )
+            await session.commit()
+        await state.clear()
+        await _render_admin_system_message_detail(callback, key, locale, page)
+        await callback.answer(limit_callback_answer("Системное сообщение сохранено."))
+        return
+    async with async_session_maker() as session:
+        await state.clear()
+        await reset_system_message(session, key, locale, style, bot_scope="telegram")
+        await session.commit()
+    await _render_admin_system_message_detail(callback, key, locale, page)
+    await callback.answer(limit_callback_answer("Восстановлен текст по умолчанию."))
+
+
+@router.callback_query(F.data.in_({"admin_general_set_addressing_informal", "admin_general_set_addressing_formal"}))
+async def admin_general_set_addressing_style(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    style = "formal" if callback.data == "admin_general_set_addressing_formal" else "informal"
+    async with async_session_maker() as session:
+        await save_addressing_style(session, style, bot_scope="telegram")
+        await session.commit()
+    await admin_general_settings(callback, state)
+    await callback.answer(f"Обращение: {addressing_style_label(style)}")
+
+
+@router.callback_query(F.data == "admin_system_messages")
+async def admin_system_messages(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.clear()
+    await _render_admin_system_messages(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_system_messages_locale:"))
+async def admin_system_messages_locale(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    locale = parts[1] if len(parts) > 1 else "ru"
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    await state.clear()
+    await _render_admin_system_messages(callback, locale, page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_system_messages_page:"))
+async def admin_system_messages_page(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    locale = parts[2] if len(parts) > 2 else "ru"
+    await state.clear()
+    await _render_admin_system_messages(callback, locale, page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_system_message:"))
+async def admin_system_message_detail(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 4:
+        await callback.answer("Некорректный ключ сообщения.", show_alert=True)
+        return
+    await state.clear()
+    await _render_admin_system_message_detail(
+        callback,
+        parts[1],
+        parts[2],
+        int(parts[3]) if parts[3].isdigit() else 0,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_system_preview:"))
+async def admin_system_message_preview(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 5
+        or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
+        or parts[2] not in {"ru", "en", "pt"}
+        or parts[3] not in {"informal", "formal"}
+    ):
+        await callback.answer("Некорректный вариант сообщения.", show_alert=True)
+        return
+    key, locale, style = parts[1], parts[2], parts[3]
+    await state.clear()
+    async with async_session_maker() as session:
+        text_value = await resolve_system_text(session, key, locale, style, bot_scope="telegram")
+    await callback.message.edit_text(
+        render_system_message_preview(key, style, text_value),
+        parse_mode="HTML",
+        reply_markup=kb.admin_system_message_preview_keyboard(
+            key,
+            locale,
+            style,
+            int(parts[4]) if parts[4].isdigit() else 0,
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_system_edit:"))
+async def admin_system_message_edit(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 5
+        or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
+        or parts[2] not in {"ru", "en", "pt"}
+        or parts[3] not in {"informal", "formal"}
+    ):
+        await callback.answer("Некорректный вариант сообщения.", show_alert=True)
+        return
+    key, locale, style = parts[1], parts[2], parts[3]
+    async with async_session_maker() as session:
+        current_text = await resolve_system_text(session, key, locale, style, bot_scope="telegram")
+    await state.set_state(AdminStates.set_system_message_text)
+    await state.update_data(
+        system_message_key=key,
+        system_message_locale=locale,
+        system_message_style=style,
+        system_message_page=int(parts[4]) if parts[4].isdigit() else 0,
+        system_message_draft=None,
+    )
+    await callback.message.edit_text(
+        render_system_message_editor(key, style, current_text),
+        parse_mode="HTML",
+        reply_markup=kb.admin_system_message_draft_keyboard(key, locale, style, int(parts[4]) if parts[4].isdigit() else 0),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.set_system_message_text, F.text)
+async def admin_system_message_draft_received(message: Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("Текст не может быть пустым.")
+        return
+    if len(value) > 4096:
+        await message.answer("Текст не должен превышать 4096 символов.")
+        return
+    data = await state.get_data()
+    await state.update_data(system_message_draft=value)
+    await message.answer(
+        render_system_message_draft(value),
+        reply_markup=kb.admin_system_message_draft_keyboard(
+            data.get("system_message_key", ""),
+            data.get("system_message_locale", "ru"),
+            data.get("system_message_style", "informal"),
+            int(data.get("system_message_page", 0) or 0),
+        ),
+    )
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("admin_system_save:"))
+async def admin_system_message_save(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 5
+        or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
+        or parts[2] not in {"ru", "en", "pt"}
+        or parts[3] not in {"informal", "formal"}
+    ):
+        await callback.answer(limit_callback_answer("Некорректная кнопка системного сообщения."), show_alert=True)
+        return
+    await state.clear()
+    await _render_admin_system_message_detail(
+        callback,
+        parts[1],
+        parts[2],
+        int(parts[4]) if parts[4].isdigit() else 0,
+    )
+    await callback.answer(limit_callback_answer("Кнопка устарела. Откройте сообщение заново."), show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_system_cancel:"))
+async def admin_system_message_cancel(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 4:
+        await callback.answer("Некорректное состояние редактирования.", show_alert=True)
+        return
+    data = await state.get_data()
+    style = data.get("system_message_style")
+    if (
+        style not in {"informal", "formal"}
+        or not _system_message_edit_context_matches(data, parts[1], parts[2], style, int(parts[3]) if parts[3].isdigit() else -1)
+    ):
+        await callback.answer(limit_callback_answer("Изменение устарело. Откройте сообщение заново."), show_alert=True)
+        return
+    await state.clear()
+    await _render_admin_system_message_detail(callback, parts[1], parts[2], int(parts[3]) if parts[3].isdigit() else 0)
+    await callback.answer("Изменения отменены.")
+
+
+@router.callback_query(F.data.startswith("admin_system_reset:"))
+async def admin_system_message_reset(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 5
+        or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
+        or parts[2] not in {"ru", "en", "pt"}
+        or parts[3] not in {"informal", "formal"}
+    ):
+        await callback.answer("Некорректный вариант сообщения.", show_alert=True)
+        return
+    await state.clear()
+    await _render_admin_system_message_detail(callback, parts[1], parts[2], int(parts[4]) if parts[4].isdigit() else 0)
+    await callback.answer(limit_callback_answer("Кнопка устарела. Откройте сообщение заново."), show_alert=True)
+
+
 @router.callback_query(F.data == "admin_general_settings")
 async def admin_general_settings(
     callback: CallbackQuery,
@@ -21404,6 +21969,7 @@ async def admin_general_settings(
             )
             session.add(config)
             await session.commit()
+        addressing_style = await resolve_addressing_style(session, bot_scope="telegram")
 
     processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
     from content_authoring import admin_value
@@ -21418,12 +21984,13 @@ async def admin_general_settings(
         "Если поле уже заполнено в профиле, бот повторно его не спрашивает. "
         "Отключённое поле можно заполнить позже через настройки пользователя.\n\n"
         f"Сообщение ожидания ИИ: {'включено' if processing_enabled else 'выключено'}\n"
-        f"Текущий текст: {processing_text_display}"
+        f"Текущий текст: {processing_text_display}\n"
+        f"Обращение: <b>{addressing_style_label(addressing_style)}</b>"
     )
     await callback.message.edit_text(
         _assert_admin_render_text(text),
         parse_mode="HTML",
-        reply_markup=kb.admin_general_settings_keyboard(config),
+        reply_markup=kb.admin_general_settings_keyboard(config, addressing_style),
     )
 
 
@@ -23006,7 +23573,14 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
         if not user:
             locale = await resolve_user_effective_locale(session, user_id)
             await callback.answer(
-                translate("ui.navigation.user_error", locale, fallback="Ошибка пользователя.")
+                limit_callback_answer(
+                    await resolve_system_text(
+                        session,
+                        "ui.navigation.user_error",
+                        locale,
+                        fallback="Ошибка пользователя.",
+                    )
+                )
             )
             return
 
@@ -23028,7 +23602,12 @@ async def handle_action_button_click(callback: CallbackQuery, state: FSMContext,
         lease = single_flight.try_claim("telegram", user_id)
         if lease is None:
             await callback.answer(
-                translate("ui.ai.busy", await _get_user_locale(user_id), fallback=AI_BUSY_MESSAGE),
+                await _resolve_user_callback_text(
+                    user_id,
+                    "ui.ai.busy",
+                    await _get_user_locale(user_id),
+                    fallback=AI_BUSY_MESSAGE,
+                ),
                 show_alert=True,
             )
             return
@@ -23740,7 +24319,9 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
     lease = single_flight.try_claim("telegram", user_id)
     if lease is None:
         locale = await _get_user_locale(user_id)
-        await message.answer(translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE))
+        await message.answer(
+            await _resolve_user_system_text(user_id, "ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE)
+        )
         return
 
     locale = "ru"
@@ -23784,7 +24365,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             if not is_user_admin and subscriptions_active:
                 if not user.subscription or user.subscription.end_date < datetime.utcnow():
                     await message.answer(
-                        translate(
+                        await resolve_system_text(
+                            session,
                             "ui.access.photo_subscription_required",
                             locale,
                             fallback="Чтобы отправлять фото и получать разборы, активируйте подписку.",
@@ -23824,7 +24406,12 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         # =========================================================================
         typing_task = asyncio.create_task(keep_typing())
         processing_msg = await message.answer(
-            translate("ui.ai.image_inspecting", locale, fallback="👀 Тщательно изучаю изображение...")
+            await _resolve_user_system_text(
+                user_id,
+                "ui.ai.image_inspecting",
+                locale,
+                fallback="👀 Тщательно изучаю изображение...",
+            )
         )
 
         photo = message.photo[-1]
@@ -24063,7 +24650,12 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 )
         elif response_text_markup:
             await message.answer(
-                translate("ui.ai.choose_action", locale, fallback="Выберите действие:"),
+                await _resolve_user_system_text(
+                    user_id,
+                    "ui.ai.choose_action",
+                    locale,
+                    fallback="Выберите действие:",
+                ),
                 reply_markup=response_text_markup,
             )
 
@@ -24072,7 +24664,12 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             m_gen_status = None
             try:
                 m_gen_status = await message.answer(
-                    translate("ui.ai.editing_image", locale, fallback="🎨 Редактирую ваше фото...")
+                    await _resolve_user_system_text(
+                        user_id,
+                        "ui.ai.editing_image",
+                        locale,
+                        fallback="🎨 Редактирую ваше фото...",
+                    )
                 )
             except Exception:
                 pass
@@ -24126,7 +24723,12 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             m_gen_status = None
             try:
                 m_gen_status = await message.answer(
-                    translate("ui.ai.generating_image", locale, fallback="🖼 Генерирую новое изображение...")
+                    await _resolve_user_system_text(
+                        user_id,
+                        "ui.ai.generating_image",
+                        locale,
+                        fallback="🖼 Генерирую новое изображение...",
+                    )
                 )
             except Exception:
                 pass
@@ -24207,7 +24809,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             except Exception:
                 pass
         await message.answer(
-            translate(
+            await _resolve_user_system_text(
+                user_id,
                 "ui.ai.service_unavailable",
                 locale,
                 fallback="К сожалению, сервис временно недоступен из-за технической проблемы.",
@@ -24244,7 +24847,12 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
             exception=e,
         )
         await message.answer(
-            translate("ui.ai.photo_failed", locale, fallback="Произошла ошибка при обработке фото.")
+            await _resolve_user_system_text(
+                user_id,
+                "ui.ai.photo_failed",
+                locale,
+                fallback="Произошла ошибка при обработке фото.",
+            )
         )
     finally:
         single_flight.release(lease)
@@ -24562,7 +25170,8 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
         if not is_user_admin and subscriptions_active:
             if not user.subscription or user.subscription.end_date < datetime.utcnow():
                 await message.answer(
-                    translate(
+                    await resolve_system_text(
+                        session,
                         "ui.access.subscription_required",
                         locale,
                         fallback="Чтобы продолжить диалог, активируйте подписку / бонусные дни.",
@@ -24621,7 +25230,9 @@ async def handle_ai_chat(message: Message, state: FSMContext, bot: Bot):
                 raise
 
     if busy:
-        await message.answer(translate("ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE))
+        await message.answer(
+            await _resolve_user_system_text(user_id, "ui.ai.busy", locale, fallback=AI_BUSY_MESSAGE)
+        )
         return
 
 

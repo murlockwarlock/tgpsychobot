@@ -308,9 +308,22 @@ class AIRequestLayout:
         )
         if stable_parts:
             blocks.append("\n\n".join(stable_parts))
-        dynamic_parts = self.runtime_context + self.scenario_context
+        addressing_parts = []
+        runtime_parts = []
+        addressing_prefixes = (
+            "ОБРАЩЕНИЕ:",
+            "ADDRESSING STYLE:",
+            "FORMA DE TRATAMENTO:",
+        )
+        for block in self.runtime_context:
+            if block.startswith(addressing_prefixes):
+                addressing_parts.append(block)
+            else:
+                runtime_parts.append(block)
+        dynamic_parts = tuple(runtime_parts) + self.scenario_context
         if dynamic_parts:
             blocks.append("\n\n".join(dynamic_parts))
+        blocks.extend(addressing_parts)
         blocks.extend(self.request_context)
         return tuple(blocks)
 
