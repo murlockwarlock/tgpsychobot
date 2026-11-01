@@ -122,6 +122,43 @@ def test_user_facing_json_example_with_metadata_key_is_not_removed():
     assert invalid == 0
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        (
+            'Вот пример структуры:\n'
+            '```json\n'
+            '{"current_state":{"current_step":"DEMO"}}\n'
+            '```'
+        ),
+        'Вот пример структуры:\n{"current_state":{"current_step":"DEMO"}}',
+    ],
+)
+def test_user_facing_current_state_json_example_is_not_removed(raw):
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == raw
+    assert blocks == []
+    assert invalid == 0
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        'Текст.\n```json\n{"current_step":"b"}\n```',
+        'Текст.\nJSON\n{"current_step":"b"}',
+    ],
+)
+def test_current_step_only_service_json_is_removed_and_normalized(raw):
+    visible, blocks, invalid = extract_service_data(raw)
+
+    assert visible == "Текст."
+    assert len(blocks) == 1
+    assert blocks[0].current_state == {"current_step": "b"}
+    assert blocks[0].metadata == {}
+    assert invalid == 0
+
+
 def test_user_facing_ws_example_without_service_signature_is_not_removed():
     raw = 'Пример структуры рабочего листа: {"ws":{"title":"Demo"}}.'
 

@@ -28,6 +28,8 @@ SERVICE_DATA_KEYS = frozenset({
     "events",
     "metadata",
     "save_mode",
+    "safety_flag",
+    "ws",
 })
 FALLBACK_SIGNATURE_RE = re.compile(
     r"^[ \t]*(?:служебный блок данных|заполненный current_state|json|data:)[ \t]*:?$",
@@ -88,6 +90,10 @@ def _normalize_service_payload(
     ):
         current_state["current_step"] = current_step.strip()
     metadata = payload.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    for extension_key in ("ws", "safety_flag"):
+        if extension_key in payload:
+            metadata[extension_key] = payload[extension_key]
     raw_events = payload.get("events")
     if not raw_events and payload.get("event"):
         raw_events = payload.get("event")
@@ -110,7 +116,7 @@ def _normalize_service_payload(
     return ServiceDataBlock(
         current_state=current_state,
         events=events,
-        metadata=metadata if isinstance(metadata, dict) else {},
+        metadata=metadata,
         save_mode=save_mode,
         raw_json=raw_json,
     )
@@ -611,6 +617,23 @@ def _has_explicit_service_signature(text: str, object_start: int) -> bool:
     ))
 
 
+def _has_json_signature(text: str, object_start: int) -> bool:
+    signature_start = _signature_line_start(text, object_start)
+    if signature_start is None:
+        return False
+    signature_text = text[signature_start:_line_start(text, object_start)]
+    return bool(re.search(r"(?im)^[ \t]*json[ \t]*:?$", signature_text))
+
+
+def _is_current_step_only_payload(payload: dict[str, Any]) -> bool:
+    current_step = payload.get("current_step")
+    return (
+        set(payload) == {"current_step"}
+        and isinstance(current_step, str)
+        and bool(current_step.strip())
+    )
+
+
 def _has_unclosed_json_container(text: str, object_start: int) -> bool:
     stack: list[str] = []
     stack_positions: list[int] = []
@@ -844,10 +867,15 @@ def _has_user_facing_json_example_marker(text: str, object_start: int) -> bool:
         previous_start = text.rfind("\n", 0, previous_end - 1) + 1
         previous_line = text[previous_start:previous_end].strip()
         cursor = previous_start
-        if previous_line and marker_re.search(previous_line):
+        if not previous_line:
+            continue
+        if FENCE_LINE_RE.fullmatch(previous_line):
+            continue
+        if previous_line.startswith(("{", "[")) or previous_line.endswith(("}", "]")):
+            return False
+        if marker_re.search(previous_line):
             return True
-        if previous_line:
-            inspected_lines += 1
+        inspected_lines += 1
     return False
 
 
@@ -1057,8 +1085,9 @@ def _extract_fallback_data(
             removals,
         )
         explicit_signature = _has_explicit_service_signature(visible_text, object_start)
+        json_signature = _has_json_signature(visible_text, object_start)
         tail_is_allowed = _is_fallback_tail(visible_text, object_end, fenced=fenced)
-        if not tail_is_allowed and not explicit_signature:
+        if not tail_is_allowed and not explicit_signature and not json_signature:
             continue
         candidate = visible_text[object_start:object_end]
         try:
@@ -1069,12 +1098,28 @@ def _extract_fallback_data(
                 removals.append((start, end))
                 invalid_count += 1
             continue
-        if not isinstance(payload, dict) or not _is_service_fallback_candidate(
+        if not isinstance(payload, dict):
+            continue
+        if not explicit_signature and _has_user_facing_json_example_marker(
+            visible_text,
+            object_start,
+        ):
+            continue
+        is_service_payload = _is_service_fallback_candidate(
             payload,
             visible_text,
             object_start,
             explicit_signature,
-        ):
+        )
+        context = _fence_context(visible_text, object_start)
+        is_json_context_step = (
+            _is_current_step_only_payload(payload)
+            and (
+                json_signature
+                or (context is not None and _fence_language(visible_text, context) == "json")
+            )
+        )
+        if not is_service_payload and not is_json_context_step:
             continue
         end = _fence_end(visible_text, object_end) if fenced else object_end
         located_blocks.append(

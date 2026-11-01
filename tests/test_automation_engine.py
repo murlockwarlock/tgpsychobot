@@ -165,6 +165,45 @@ class AutomationEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[0]["data"]["events"], ["READY_EVENT"])
         self.assertEqual(records[0]["data"]["save_mode"], "merge")
 
+    async def test_explicit_service_extensions_are_persisted_in_scoped_metadata(self):
+        expected_metadata = {}
+        for key, value in (("ws", {"answer": 42}), ("safety_flag", {"blocked": True})):
+            expected_metadata[key] = value
+            async with self.sessions() as session:
+                user = await session.get(User, 42)
+                visible, blocks, invalid = extract_service_data(
+                    f'Ответ.\nСлужебный блок данных:\n{json.dumps({key: value})}'
+                )
+                result = await apply_service_data_blocks(
+                    session,
+                    user=user,
+                    dialogue_id=1,
+                    topic_id=23,
+                    blocks=blocks,
+                )
+                await session.commit()
+                state = await get_conversation_automation_state(
+                    session,
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=23,
+                )
+                context = await build_runtime_automation_context(
+                    session,
+                    user_id=42,
+                    dialogue_id=1,
+                    topic_id=23,
+                )
+
+            self.assertEqual(visible, "Ответ.")
+            self.assertEqual(invalid, 0)
+            self.assertEqual(len(blocks), 1)
+            self.assertFalse(blocks[0].legacy)
+            self.assertFalse(result.state_changed)
+            self.assertEqual(load_metadata(state.metadata_json), expected_metadata)
+            self.assertIn(f'"{key}":', context)
+            self.assertIn(json.dumps(value, ensure_ascii=False, separators=(",", ":")), context)
+
     async def test_legacy_data_history_remains_metadata_only(self):
         _, blocks, invalid = extract_service_data(
             '[DATA]{"events":["ordinary metadata"],"score":5}[/DATA]'
