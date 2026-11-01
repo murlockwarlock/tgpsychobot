@@ -221,6 +221,47 @@ async def test_init_db_adds_multilingual_authoring_flag_to_legacy_config(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_init_db_adds_informal_addressing_style_to_legacy_config(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-addressing-style.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(BotGeneralConfig(id=1, ai_processing_message_text="Думаю..."))
+            await session.commit()
+        async with engine.begin() as connection:
+            await connection.execute(text(
+                "ALTER TABLE bot_general_config DROP COLUMN addressing_style"
+            ))
+
+        await database.init_db()
+
+        async with engine.connect() as connection:
+            general_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    column["name"] for column in inspect(sync_connection).get_columns("bot_general_config")
+                }
+            )
+            has_system_messages_table = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).has_table("bot_system_messages")
+            )
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+
+        assert "addressing_style" in general_columns
+        assert has_system_messages_table is True
+        assert config.addressing_style == "informal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_init_db_maps_legacy_generation_settings_to_active_model_scope(tmp_path, monkeypatch):
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'model-settings-migration.db'}"

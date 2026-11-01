@@ -23,6 +23,7 @@ from database import (
     AIConfig,
     Base,
     BotGeneralConfig,
+    BotSystemMessage,
     BotTranslation,
     Content,
     ContentMedia,
@@ -814,6 +815,160 @@ async def test_admin_dispatcher_general_settings_journey_uses_validated_methods(
     await _feed_callback(dispatcher, bot, root_message, "admin_panel", 102)
     back = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
     assert back.text == "Добро пожаловать в админ-панель!"
+
+
+@pytest.mark.asyncio
+async def test_addressing_style_system_message_journey_uses_real_dispatcher(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers.ai_integration, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add(DBUser(id=11, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession()
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, text="/admin")
+
+    async def press(callback_data, update_id):
+        session.calls.clear()
+        await _feed_callback(admin_dispatcher, bot, root_message, callback_data, update_id)
+        rendered = [
+            method
+            for method in session.calls
+            if isinstance(method, (EditMessageText, SendMessage))
+        ]
+        assert rendered, callback_data
+        return rendered[-1]
+
+    await press("admin_general_settings", 500)
+    general = await press("admin_general_set_addressing_formal", 501)
+    assert "Обращение: <b>Вы</b>" in general.text
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
+
+    system_list = await press("admin_system_messages", 502)
+    assert "Системные сообщения" in system_list.text
+    system_list = await press("admin_system_messages_page:2:ru", 503)
+    assert any(
+        button.callback_data == "admin_system_message:ui.ai.busy:ru:2"
+        for row in system_list.reply_markup.inline_keyboard
+        for button in row
+    )
+
+    detail = await press("admin_system_message:ui.ai.busy:ru:2", 504)
+    assert "ui.ai.busy" in detail.text
+    await press("admin_system_edit:ui.ai.busy:ru:formal:2", 505)
+
+    draft_message = _admin_message(
+        bot,
+        message_id=2,
+        text="Пожалуйста, подождите — Ваш предыдущий запрос ещё выполняется.",
+    )
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(update_id=506, message=draft_message),
+    )
+    assert any(
+        isinstance(method, SendMessage) and "Черновик сохранён" in method.text
+        for method in session.calls
+    )
+
+    saved = await press("admin_system_save:ui.ai.busy:ru:formal:2", 507)
+    assert "Ваш предыдущий запрос" in saved.text
+    async with factory() as db_session:
+        formal_row = await db_session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        assert formal_row.text == "Пожалуйста, подождите — Ваш предыдущий запрос ещё выполняется."
+
+    reopened = await press("admin_system_message:ui.ai.busy:ru:2", 508)
+    assert "Ваш предыдущий запрос" in reopened.text
+    await press("admin_system_edit:ui.ai.busy:ru:formal:2", 509)
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=510,
+            message=_admin_message(
+                bot,
+                message_id=3,
+                text="Этот текст должен быть отменён.",
+            ),
+        ),
+    )
+    cancelled = await press("admin_system_cancel:ui.ai.busy:ru:2", 511)
+    assert "Ваш предыдущий запрос" in cancelled.text
+    await press("admin_system_reset:ui.ai.busy:ru:formal:2", 512)
+    reset_detail = await press("admin_system_message:ui.ai.busy:ru:2", 513)
+    assert "Пожалуйста, не так быстро" in reset_detail.text
+
+    await press("admin_system_messages_page:2:ru", 514)
+    english_list = await press("admin_system_messages_locale:en:2", 515)
+    assert "Язык: <b>English</b>" in english_list.text
+    returned = await press("admin_general_settings", 516)
+    assert "Общие настройки" in returned.text
+
+    async with factory() as db_session:
+        formal_row = await db_session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        informal_row = await db_session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.addressing_style == "informal",
+            )
+        )
+        assert formal_row is None
+        assert informal_row is None
+
+    import httpx
+
+    async with factory() as db_session:
+        db_session.add(DBUser(
+            id=12,
+            first_name="Иван",
+            name="Иван",
+            gender="male",
+            accepted_disclaimer=True,
+            current_dialogue_id=1,
+        ))
+        db_session.add(AIConfig(
+            id=1,
+            provider="OpenRouter",
+            openrouter_api_key="sk-test-key",
+            openrouter_model="qwen/qwen3.7-plus",
+            system_prompt="Система администратора",
+            memory_mode="global",
+        ))
+        db_session.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        await db_session.commit()
+
+    provider_payloads = []
+
+    async def fake_provider_post(self, url, *args, **kwargs):
+        provider_payloads.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "Ответ пользователю"}}]},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_provider_post)
+    handlers.user_message_buffers[12] = ["Привет"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(12, bot)
+    outgoing = [method for method in session.calls if isinstance(method, SendMessage) and method.chat_id == 12]
+    assert any(method.text == "Ответ пользователю" for method in outgoing)
+    assert provider_payloads
+    assert "ОБРАЩЕНИЕ: обращайся к пользователю на «Вы»" in str(provider_payloads[-1])
 
 
 @pytest.mark.asyncio

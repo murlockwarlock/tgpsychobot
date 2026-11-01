@@ -49,6 +49,7 @@ from error_reporting import (
     send_terminal_ai_failure_alert,
 )
 from vector_store import search_relevant_chunks
+from translation_service import resolve_user_effective_locale
 from provider_models import (
     CLAUDE_CHAT_MAX_TOKENS,
     DEEPGRAM_DEFAULT_MODEL,
@@ -1624,6 +1625,7 @@ async def get_ai_response(
             knowledge_context=context,
             service_capabilities=MAX_CAPABILITIES,
             media_edit_sources=edit_sources,
+            preferred_response_locale=await resolve_user_effective_locale(session, user, platform="max"),
         )
         temperature = _resolve_temperature(ai_config)
         request_group_id = uuid.uuid4().hex[:12]
@@ -2976,6 +2978,7 @@ async def analyze_image(
             service_capabilities=MAX_CAPABILITIES,
             modality_instructions=(photo_instructions,),
             media_edit_sources=edit_sources,
+            preferred_response_locale=await resolve_user_effective_locale(session, user, platform="max"),
         )
 
     if execution_context is not None:

@@ -664,6 +664,8 @@ class TestConfig(Base):
 DEFAULT_AI_PROCESSING_MESSAGE_TEXT = "Думаю..."
 AI_PROCESSING_MESSAGE_MAX_LENGTH = 4096
 AI_PROCESSING_MESSAGE_STORAGE_MAX_LENGTH = 16000
+DEFAULT_ADDRESSING_STYLE = "informal"
+ADDRESSING_STYLES = ("informal", "formal")
 
 
 class BotGeneralConfig(Base):
@@ -680,11 +682,36 @@ class BotGeneralConfig(Base):
         default=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
         nullable=False,
     )
+    addressing_style = Column(String(16), default=DEFAULT_ADDRESSING_STYLE, nullable=False)
     telegram_default_language = Column(String(8), default="ru", nullable=False)
     telegram_language_selection_enabled = Column(Boolean, default=False, nullable=False)
     telegram_enabled_languages = Column(Text, default='["ru"]', nullable=False)
     multilingual_authoring_enabled = Column(Boolean, default=False, nullable=False)
     translations_revision = Column(Integer, default=0, nullable=False)
+
+
+class BotSystemMessage(Base):
+    __tablename__ = 'bot_system_messages'
+    __table_args__ = (
+        UniqueConstraint(
+            'translation_key',
+            'locale',
+            'addressing_style',
+            name='uq_bot_system_message_key_locale_style',
+        ),
+        Index('idx_bot_system_message_key_locale', 'translation_key', 'locale'),
+        CheckConstraint(
+            "addressing_style IN ('informal', 'formal')",
+            name='ck_bot_system_message_addressing_style',
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    translation_key = Column(String(255), nullable=False)
+    locale = Column(String(8), nullable=False)
+    addressing_style = Column(String(16), nullable=False)
+    text = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class BotTranslation(Base):
@@ -1606,6 +1633,15 @@ async def init_db():
                     "ALTER TABLE bot_general_config "
                     "ADD COLUMN ai_processing_message_enabled BOOLEAN DEFAULT FALSE NOT NULL"
                 ))
+            if 'addressing_style' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN addressing_style VARCHAR(16) DEFAULT 'informal' NOT NULL"
+                ))
+            sync_conn.execute(text(
+                "UPDATE bot_general_config SET addressing_style = 'informal' "
+                "WHERE addressing_style IS NULL OR addressing_style NOT IN ('informal', 'formal')"
+            ))
             ai_text_col = next((c for c in general_columns_raw if c.get('name') == 'ai_processing_message_text'), None)
             if ai_text_col is None:
                 sync_conn.execute(text(
@@ -2117,6 +2153,7 @@ async def init_db():
                 profile_collect_age=bool(getattr(test_conf, 'profile_collect_age', False)),
                 ai_processing_message_enabled=False,
                 ai_processing_message_text=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
+                addressing_style=DEFAULT_ADDRESSING_STYLE,
                 telegram_default_language='ru',
                 telegram_language_selection_enabled=False,
                 telegram_enabled_languages='["ru"]',
@@ -2128,6 +2165,8 @@ async def init_db():
                 general_conf.ai_processing_message_enabled = False
             if getattr(general_conf, 'ai_processing_message_text', None) is None:
                 general_conf.ai_processing_message_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+            if getattr(general_conf, 'addressing_style', None) not in ADDRESSING_STYLES:
+                general_conf.addressing_style = DEFAULT_ADDRESSING_STYLE
             if getattr(general_conf, 'telegram_default_language', None) is None:
                 general_conf.telegram_default_language = 'ru'
             if getattr(general_conf, 'telegram_language_selection_enabled', None) is None:

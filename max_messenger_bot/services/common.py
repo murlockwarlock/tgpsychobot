@@ -45,12 +45,34 @@ from kie_image_inputs import ImageGeometryError
 from media_templates import extract_template_directive, render_media_template, validate_rendered_template
 from media_template_renderer import TemplateRenderError
 from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, validate_edited_media_source, MediaSourceError
+from system_messages import resolve_system_text
 
 
 log = get_bot_logger("common")
 
 
 MSK = timezone(timedelta(hours=3))
+
+
+async def localized_system_text(
+    user_id: int,
+    key: str,
+    fallback: str | None = None,
+    **variables,
+) -> str:
+    try:
+        async with async_session_maker() as session:
+            locale = await resolve_user_effective_locale(session, user_id, platform="max")
+            text = await resolve_system_text(
+                session,
+                key,
+                locale,
+                fallback=fallback,
+                **variables,
+            )
+            return text if isinstance(text, str) else (fallback or "")
+    except Exception:
+        return fallback or ""
 
 
 async def _localized_ai_terminal_message(user_id: int, retryable: bool) -> str:
@@ -60,12 +82,7 @@ async def _localized_ai_terminal_message(user_id: int, retryable: bool) -> str:
         if retryable
         else "К сожалению, сервис временно недоступен из-за технической проблемы."
     )
-    try:
-        async with async_session_maker() as session:
-            locale = await resolve_user_effective_locale(session, user_id, platform="max")
-    except Exception:
-        locale = "ru"
-    return translate(key, locale, fallback=fallback) or fallback
+    return await localized_system_text(user_id, key, fallback)
 
 
 async def _notify_referrer_about_registration(
@@ -922,6 +939,18 @@ async def _transition_image_progress_status(
     return progress_mid, None
 
 
+async def _transition_localized_image_progress_status(
+    client: MaxApiClient,
+    chat_id: int,
+    user_id: int,
+    key: str,
+    fallback: str,
+    reusable_mid: str | None = None,
+) -> tuple[str | None, str | None]:
+    status_text = await localized_system_text(user_id, key, fallback)
+    return await _transition_image_progress_status(client, chat_id, status_text, reusable_mid=reusable_mid)
+
+
 async def _deliver_media_template(client, chat_id, user_id, response, dialogue_id, topic_id):
     async def current():
         return await media_edit_context_is_current(async_session_maker, user_id, dialogue_id, topic_id)
@@ -996,7 +1025,8 @@ async def _deliver_media_edit(client, chat_id, user_id, response, dialogue_id, t
             raise MediaSourceError("Не удалось отправить отредактированное изображение.")
         await validate_edited_media_source(async_session_maker, media_id=edited.media_id, topic_id=topic_id, source_identity=edited.source_identity)
         if clean_text or buttons:
-            chunks = split_text(markdown_to_html(clean_text or 'Выберите действие:'))
+            choice_text = clean_text or await localized_system_text(user_id, "ui.ai.choose_action", "Выберите действие:")
+            chunks = split_text(markdown_to_html(choice_text))
             for index, chunk in enumerate(chunks):
                 if not await current():
                     return True
@@ -1026,7 +1056,10 @@ async def _execute_ai_dialogue_turn(
     original_message_id: int | None = None,
     states: StateStore | None = None,
 ) -> None:
-    thinking = await client.send_message(chat_id=chat_id, text="🤖 Думаю...")
+    thinking = await client.send_message(
+        chat_id=chat_id,
+        text=await localized_system_text(user_id, "ui.ai.thinking", "🤖 Думаю..."),
+    )
     thinking_message_id = extract_sent_message_id(thinking)
 
     topic_phrase = None
@@ -1085,13 +1118,22 @@ async def _execute_ai_dialogue_turn(
                         )
                         thinking_message_id = None
                         buttons_sent = bool(response_buttons)
-                        gen_status_id, _ = await _transition_image_progress_status(
-                            client, chat_id, "🖼 Генерирую новое изображение..."
+                        gen_status_id, _ = await _transition_localized_image_progress_status(
+                            client,
+                            chat_id,
+                            user_id,
+                            "ui.ai.generating_image",
+                            "🖼 Генерирую новое изображение...",
                         )
                     except Exception as exc:
                         log.warning("Failed to deliver visible text before image generation: %s", exc)
-                        gen_status_id, thinking_message_id = await _transition_image_progress_status(
-                            client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+                        gen_status_id, thinking_message_id = await _transition_localized_image_progress_status(
+                            client,
+                            chat_id,
+                            user_id,
+                            "ui.ai.generating_image",
+                            "🖼 Генерирую новое изображение...",
+                            reusable_mid=thinking_message_id,
                         )
                 else:
                     try:
@@ -1103,12 +1145,21 @@ async def _execute_ai_dialogue_turn(
                         buttons_sent = bool(response_buttons)
                     except Exception as exc:
                         log.warning("Failed to deliver visible text before image generation: %s", exc)
-                    gen_status_id, _ = await _transition_image_progress_status(
-                        client, chat_id, "🖼 Генерирую новое изображение..."
+                    gen_status_id, _ = await _transition_localized_image_progress_status(
+                        client,
+                        chat_id,
+                        user_id,
+                        "ui.ai.generating_image",
+                        "🖼 Генерирую новое изображение...",
                     )
             else:
-                gen_status_id, thinking_message_id = await _transition_image_progress_status(
-                    client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+                gen_status_id, thinking_message_id = await _transition_localized_image_progress_status(
+                    client,
+                    chat_id,
+                    user_id,
+                    "ui.ai.generating_image",
+                    "🖼 Генерирую новое изображение...",
+                    reusable_mid=thinking_message_id,
                 )
 
             try:
@@ -1140,7 +1191,7 @@ async def _execute_ai_dialogue_turn(
                 try:
                     await client.send_message(
                         chat_id=chat_id,
-                        text="Выберите действие:",
+                        text=await localized_system_text(user_id, "ui.ai.choose_action", "Выберите действие:"),
                         attachments=_response_buttons_keyboard(response_buttons),
                     )
                 except Exception as exc:
@@ -1148,7 +1199,7 @@ async def _execute_ai_dialogue_turn(
             return
 
         if not clean_response_text and response_buttons:
-            clean_response_text = "Выберите действие:"
+            clean_response_text = await localized_system_text(user_id, "ui.ai.choose_action", "Выберите действие:")
         html_text = markdown_to_html(clean_response_text)
         chunks = split_text(html_text)
         thinking_message_id, _ = await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
@@ -1169,7 +1220,16 @@ async def _execute_ai_dialogue_turn(
         retryable_terminal = bool(original_message_id and failed_log_id and retryable_group)
         if retryable_terminal:
             from ..keyboards import ai_retry_keyboard_max
-            attachments = ai_retry_keyboard_max(original_message_id, failed_log_id=failed_log_id)
+            retry_text = await localized_system_text(
+                user_id,
+                "ui.ai.retry_request",
+                "🔄 Повторить запрос",
+            )
+            attachments = ai_retry_keyboard_max(
+                original_message_id,
+                failed_log_id=failed_log_id,
+                text=retry_text,
+            )
         text = await _localized_ai_terminal_message(user_id, retryable_group)
         if thinking_message_id:
             await client.edit_message(thinking_message_id, text=text, attachments=attachments)
@@ -1178,11 +1238,16 @@ async def _execute_ai_dialogue_turn(
             await client.send_message(chat_id=chat_id, text=text, attachments=attachments)
     except Exception:
         log.exception("Unexpected bot dialogue failure user_id=%s chat_id=%s", user_id, chat_id)
+        error_text = await localized_system_text(
+            user_id,
+            "ui.ai.internal_failed",
+            "Произошла внутренняя ошибка. Попробуйте позже.",
+        )
         if thinking_message_id:
-            await client.edit_message(thinking_message_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+            await client.edit_message(thinking_message_id, text=error_text)
             thinking_message_id = None
         else:
-            await client.send_message(chat_id=chat_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+            await client.send_message(chat_id=chat_id, text=error_text)
 
 
 async def run_ai_dialogue(client: MaxApiClient, chat_id: int, user_id: int, prompt_text: str, states: StateStore | None = None) -> None:
@@ -1265,7 +1330,10 @@ async def run_hidden_ai_kickoff(
             log.info("Pre-call drop: expected main (None) but user.current_topic_id=%s", user.current_topic_id)
             return
 
-    thinking = await client.send_message(chat_id=chat_id, text="🤖 Думаю...")
+    thinking = await client.send_message(
+        chat_id=chat_id,
+        text=await localized_system_text(user_id, "ui.ai.thinking", "🤖 Думаю..."),
+    )
     thinking_message_id = extract_sent_message_id(thinking)
 
     topic_phrase = None
@@ -1349,13 +1417,22 @@ async def run_hidden_ai_kickoff(
                         )
                         thinking_message_id = None
                         buttons_sent = bool(response_buttons)
-                        gen_status_id, _ = await _transition_image_progress_status(
-                            client, chat_id, "🖼 Генерирую новое изображение..."
+                        gen_status_id, _ = await _transition_localized_image_progress_status(
+                            client,
+                            chat_id,
+                            user_id,
+                            "ui.ai.generating_image",
+                            "🖼 Генерирую новое изображение...",
                         )
                     except Exception as exc:
                         log.warning("Failed to deliver visible text before kickoff image generation: %s", exc)
-                        gen_status_id, thinking_message_id = await _transition_image_progress_status(
-                            client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+                        gen_status_id, thinking_message_id = await _transition_localized_image_progress_status(
+                            client,
+                            chat_id,
+                            user_id,
+                            "ui.ai.generating_image",
+                            "🖼 Генерирую новое изображение...",
+                            reusable_mid=thinking_message_id,
                         )
                 else:
                     try:
@@ -1367,12 +1444,21 @@ async def run_hidden_ai_kickoff(
                         buttons_sent = bool(response_buttons)
                     except Exception as exc:
                         log.warning("Failed to deliver visible text before kickoff image generation: %s", exc)
-                    gen_status_id, _ = await _transition_image_progress_status(
-                        client, chat_id, "🖼 Генерирую новое изображение..."
+                    gen_status_id, _ = await _transition_localized_image_progress_status(
+                        client,
+                        chat_id,
+                        user_id,
+                        "ui.ai.generating_image",
+                        "🖼 Генерирую новое изображение...",
                     )
             else:
-                gen_status_id, thinking_message_id = await _transition_image_progress_status(
-                    client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+                gen_status_id, thinking_message_id = await _transition_localized_image_progress_status(
+                    client,
+                    chat_id,
+                    user_id,
+                    "ui.ai.generating_image",
+                    "🖼 Генерирую новое изображение...",
+                    reusable_mid=thinking_message_id,
                 )
 
             try:
@@ -1404,7 +1490,7 @@ async def run_hidden_ai_kickoff(
                 try:
                     await client.send_message(
                         chat_id=chat_id,
-                        text="Выберите действие:",
+                        text=await localized_system_text(user_id, "ui.ai.choose_action", "Выберите действие:"),
                         attachments=_response_buttons_keyboard(response_buttons),
                     )
                 except Exception as exc:
@@ -1412,7 +1498,7 @@ async def run_hidden_ai_kickoff(
             return
 
         if not clean_response_text and response_buttons:
-            clean_response_text = "Выберите действие:"
+            clean_response_text = await localized_system_text(user_id, "ui.ai.choose_action", "Выберите действие:")
         html_text = markdown_to_html(clean_response_text)
         chunks = split_text(html_text)
         thinking_message_id, _ = await _send_ai_text(client, chat_id, thinking_message_id, chunks, response_buttons)
@@ -1425,18 +1511,28 @@ async def run_hidden_ai_kickoff(
         log.info("Hidden AI kickoff completed user_id=%s chat_id=%s chunks=%s", user_id, chat_id, len(chunks))
     except AIServiceError as exc:
         log.exception("AIServiceError: %s", exc)
+        error_text = await localized_system_text(
+            user_id,
+            "ui.ai.service_unavailable.max",
+            "Сервис ИИ временно недоступен. Попробуйте позже.",
+        )
         if thinking_message_id:
-            await client.edit_message(thinking_message_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
+            await client.edit_message(thinking_message_id, text=error_text)
             thinking_message_id = None
         else:
-            await client.send_message(chat_id=chat_id, text="Сервис ИИ временно недоступен. Попробуйте позже.")
+            await client.send_message(chat_id=chat_id, text=error_text)
     except Exception:
         log.exception("Unexpected bot dialogue failure user_id=%s chat_id=%s", user_id, chat_id)
+        error_text = await localized_system_text(
+            user_id,
+            "ui.ai.internal_failed",
+            "Произошла внутренняя ошибка. Попробуйте позже.",
+        )
         if thinking_message_id:
-            await client.edit_message(thinking_message_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+            await client.edit_message(thinking_message_id, text=error_text)
             thinking_message_id = None
         else:
-            await client.send_message(chat_id=chat_id, text="Произошла внутренняя ошибка. Попробуйте позже.")
+            await client.send_message(chat_id=chat_id, text=error_text)
 
 
 def _extract_ai_directive_payload(text: str, directive: str) -> tuple[str | None, str]:
@@ -1461,7 +1557,10 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
     user_msg_id = getattr(user_msg, "id", None) if user_msg else None
     request_dialogue_id = getattr(user_msg, 'dialogue_id', None)
     request_topic_id = getattr(user_msg, 'topic_id', None)
-    thinking = await client.send_message(chat_id=chat_id, text="🤖 Анализирую изображение...")
+    thinking = await client.send_message(
+        chat_id=chat_id,
+        text=await localized_system_text(user_id, "ui.ai.image_analyzing", "🤖 Анализирую изображение..."),
+    )
     thinking_message_id = extract_sent_message_id(thinking)
 
     execution_context = VisionExecutionContext(
@@ -1498,8 +1597,13 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
             thinking_message_id, _ = await _send_ai_text(client, chat_id, thinking_message_id, chunks)
 
         if edit_prompt:
-            edit_status_id, thinking_message_id = await _transition_image_progress_status(
-                client, chat_id, "🎨 Редактирую ваше фото...", reusable_mid=thinking_message_id
+            edit_status_id, thinking_message_id = await _transition_localized_image_progress_status(
+                client,
+                chat_id,
+                user_id,
+                "ui.ai.editing_image",
+                "🎨 Редактирую ваше фото...",
+                reusable_mid=thinking_message_id,
             )
 
             try:
@@ -1532,8 +1636,13 @@ async def run_ai_dialogue_with_image(client: MaxApiClient, chat_id: int, user_id
                     edit_status_id = None
 
         elif gen_prompt:
-            gen_status_id, thinking_message_id = await _transition_image_progress_status(
-                client, chat_id, "🖼 Генерирую новое изображение...", reusable_mid=thinking_message_id
+            gen_status_id, thinking_message_id = await _transition_localized_image_progress_status(
+                client,
+                chat_id,
+                user_id,
+                "ui.ai.generating_image",
+                "🖼 Генерирую новое изображение...",
+                reusable_mid=thinking_message_id,
             )
 
             try:

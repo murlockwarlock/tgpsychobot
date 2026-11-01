@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Iterable
 
 from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -21,6 +21,7 @@ from ai_request_context import (
 import automation_engine
 from database import (
     AIConfig,
+    BotGeneralConfig,
     Message,
     SubscriptionConfig,
     Topic,
@@ -39,6 +40,7 @@ from prompt_blocks import (
 )
 from result_history import ai_history_role_filter, select_ai_history_messages
 from subscription_context import active_subscription_flag
+from system_messages import addressing_style_instruction, normalize_addressing_style
 
 log = logging.getLogger(__name__)
 
@@ -409,7 +411,18 @@ async def build_conversational_request_layout(
         minutes_since_last_visit=minutes_since_last_visit,
         minutes_since_last_message=minutes_since_last_message,
     )
+    try:
+        general_config = await session.get(BotGeneralConfig, 1)
+    except OperationalError:
+        general_config = None
     runtime_parts = [client_context, temporal_context]
+    if general_config is not None:
+        runtime_parts.append(
+            addressing_style_instruction(
+                normalize_addressing_style(getattr(general_config, "addressing_style", "informal")),
+                preferred_response_locale,
+            )
+        )
     language_directive = build_response_language_directive(preferred_response_locale)
     if language_directive:
         runtime_parts.append(language_directive)
@@ -508,7 +521,18 @@ async def build_isolated_request_layout(
         minutes_since_last_visit=minutes_since_last_visit,
         minutes_since_last_message=minutes_since_last_message,
     )
+    try:
+        general_config = await session.get(BotGeneralConfig, 1)
+    except OperationalError:
+        general_config = None
     runtime_parts = [client_context, temporal_context]
+    if general_config is not None:
+        runtime_parts.append(
+            addressing_style_instruction(
+                normalize_addressing_style(getattr(general_config, "addressing_style", "informal")),
+                preferred_response_locale,
+            )
+        )
     language_directive = build_response_language_directive(preferred_response_locale)
     if language_directive:
         runtime_parts.append(language_directive)

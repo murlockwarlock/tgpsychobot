@@ -8,11 +8,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-from database import AIConfig, Base
+from database import AIConfig, Base, BotGeneralConfig
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.app import MaxBotApplication
 from max_messenger_bot import app as max_app_module
 from max_messenger_bot.services import admin_ai as max_admin_ai
+from max_messenger_bot.services import admin_system_messages as max_system_messages
 from max_messenger_bot.storage import StorageBase
 from provider_models import get_capability_providers
 
@@ -1165,3 +1166,124 @@ async def test_max_unresolved_reasoning_token_is_rejected_without_scope_mutation
 
 async def _true_async():
     return True
+
+
+@pytest.mark.asyncio
+async def test_max_addressing_style_system_message_journey_uses_real_app_callbacks(max_settings_db, monkeypatch):
+    from database import SubscriptionConfig, User
+    from max_messenger_bot import ai as max_ai
+    from max_messenger_bot.services import common as max_common
+
+    monkeypatch.setattr(max_system_messages, "async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_ai, "async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_common, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+
+    captured = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    update_id = 1000
+
+    async def send_message(text):
+        nonlocal update_id
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_created",
+            "update_id": update_id,
+            "message": {
+                "body": {"text": text},
+                "recipient": {"chat_id": 1001},
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+        })
+        return [item for item in captured if item["path"] == "/messages"][-1]["body"]
+
+    async def press(payload):
+        nonlocal update_id
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": payload,
+                "sender": {"user_id": 1001, "name": "Admin"},
+            },
+            "message": {
+                "mid": "admin-message",
+                "recipient": {"chat_id": 1001},
+                "body": {"attachments": []},
+            },
+        })
+        return [item for item in captured if item["path"] == "/messages"][-1]["body"]
+
+    root = await send_message("/admin")
+    assert any(
+        button["payload"] == "admin_general_settings"
+        for attachment in root.get("attachments", [])
+        for row in attachment.get("payload", {}).get("buttons", [])
+        for button in row
+    )
+    general = await press("admin_general_settings")
+    assert "Общие настройки" in general["text"]
+    formal = await press("admin_general_set_addressing_formal")
+    assert "Обращение: <b>Вы</b>" in formal["text"]
+    async with max_settings_db() as session:
+        assert (await session.get(BotGeneralConfig, 1)).addressing_style == "formal"
+
+    await press("admin_system_messages")
+    await press("admin_system_messages_page:2:ru")
+    await press("admin_system_message:ui.ai.busy:ru:2")
+    await press("admin_system_edit:ui.ai.busy:ru:formal:2")
+    await send_message("Пожалуйста, подождите — Ваш предыдущий запрос ещё выполняется.")
+    saved = await press("admin_system_save:ui.ai.busy:ru:formal:2")
+    assert "Ваш предыдущий запрос" in saved["text"]
+    reopened = await press("admin_system_message:ui.ai.busy:ru:2")
+    assert "Ваш предыдущий запрос" in reopened["text"]
+    await press("admin_general_settings")
+
+    async with max_settings_db() as session:
+        config = await session.get(AIConfig, 1)
+        config.provider = "OpenRouter"
+        config.openrouter_api_key = "sk-test-key"
+        config.openrouter_model = "qwen/qwen3.7-plus"
+        config.system_prompt = "Система администратора"
+        session.add(User(
+            id=1001,
+            first_name="Иван",
+            name="Иван",
+            gender="male",
+            accepted_disclaimer=True,
+            current_dialogue_id=1,
+        ))
+        session.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        await session.commit()
+
+    captured_layouts = []
+
+    async def fake_dispatch(config, request_layout, **kwargs):
+        captured_layouts.append(request_layout)
+        return "Ответ MAX пользователю"
+
+    monkeypatch.setattr(max_ai, "_dispatch_provider", fake_dispatch)
+    messages_before_runtime = len([item for item in captured if item["path"] == "/messages"])
+    await max_common.run_ai_dialogue(client, chat_id=1001, user_id=1001, prompt_text="Привет")
+    runtime_messages = [
+        item["body"]
+        for item in captured[messages_before_runtime:]
+        if item["path"] == "/messages"
+    ]
+    assert any(item.get("text") == "Ответ MAX пользователю" for item in runtime_messages)
+    assert captured_layouts
+    assert "ОБРАЩЕНИЕ: обращайся к пользователю на «Вы»" in "\n".join(captured_layouts[-1].runtime_context)
