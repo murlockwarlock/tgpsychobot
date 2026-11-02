@@ -275,9 +275,12 @@ def test_processing_defaults_and_validation():
     }
     labels = [button.text for row in markup.inline_keyboard for button in row]
     assert "admin_general_toggle_ai_processing_message" in callbacks
-    assert "admin_general_edit_ai_processing_message_text" in callbacks
+    assert "admin_system_messages" in callbacks
+    assert "admin_general_edit_ai_processing_message_text" not in callbacks
+    assert "admin_general_open_ai_processing_variants" not in callbacks
     assert any("Сообщение во время ожидания ответа" in label for label in labels)
-    assert any("Изменить текст ожидания ответа" in label for label in labels)
+    assert not any("Изменить текст ожидания ответа" in label for label in labels)
+    assert not any("Настроить варианты ожидания по языку" in label for label in labels)
 
 
 def test_button_ai_context_is_used_without_changing_visible_history():

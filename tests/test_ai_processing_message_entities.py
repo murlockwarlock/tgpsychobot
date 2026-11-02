@@ -293,12 +293,14 @@ def test_storage_overflow_at_16000_limit():
 
 
 @pytest.mark.asyncio
-async def test_admin_prompt_displays_max_4096_symbols(monkeypatch):
+async def test_legacy_waiting_message_callback_opens_canonical_card(monkeypatch):
     config = SimpleNamespace(ai_processing_message_text="Думаю...")
     session = _Session(config)
     monkeypatch.setattr(handlers, "async_session_maker", lambda: session)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
 
     callback = SimpleNamespace(
+        from_user=SimpleNamespace(id=1),
         message=SimpleNamespace(
             message_id=123,
             edit_text=AsyncMock(),
@@ -306,14 +308,22 @@ async def test_admin_prompt_displays_max_4096_symbols(monkeypatch):
         answer=AsyncMock(),
     )
     state = SimpleNamespace(
-        set_state=AsyncMock(),
-        update_data=AsyncMock(),
+        clear=AsyncMock(),
     )
 
     await handlers.admin_edit_ai_processing_message_text(callback, state)
     callback.message.edit_text.assert_awaited_once()
     prompt_text = callback.message.edit_text.await_args[0][0]
-    assert "После очистки текст должен содержать от 1 до 4096 символов." in prompt_text
+    assert "Сообщение во время ожидания ответа" in prompt_text
+    markup = callback.message.edit_text.await_args.kwargs["reply_markup"]
+    callbacks = {
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert any(callback_data.startswith("sm:e:") for callback_data in callbacks)
+    assert all(not callback_data.startswith("admin_general_") for callback_data in callbacks)
 
 
 def test_database_model_column_is_text():

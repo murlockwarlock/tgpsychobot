@@ -292,14 +292,6 @@ def admin_general_settings_keyboard(config, addressing_style=None):
         text=f"Сообщение во время ожидания ответа: {processing_status}",
         callback_data="admin_general_toggle_ai_processing_message",
     )
-    builder.button(
-        text="✏️ Изменить текст ожидания ответа",
-        callback_data="admin_general_edit_ai_processing_message_text",
-    )
-    builder.button(
-        text="🌐 Настроить варианты ожидания по языку",
-        callback_data="admin_general_open_ai_processing_variants",
-    )
     addressing_style = normalize_addressing_style(
         addressing_style if addressing_style is not None else getattr(config, "addressing_style", "informal")
     )
@@ -380,23 +372,52 @@ def admin_system_messages_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_system_message_detail_keyboard(key: str, locale: str, page: int = 0):
+def admin_system_message_detail_keyboard(
+    key: str,
+    locale: str,
+    page: int = 0,
+    *,
+    processing_text_explicit: bool = False,
+):
     rows = []
-    for style in ADDRESSING_STYLES:
-        style_label = "Ты" if style == "informal" else "Вы"
+    if key == "ui.ai.processing_default" and processing_text_explicit:
         rows.append([
             InlineKeyboardButton(
-                text=f"👁 Просмотр «{style_label}»",
-                callback_data=system_message_callback_data("v", key, locale, style, page),
+                text="👁 Просмотр",
+                callback_data=system_message_callback_data("v", key, locale, "informal", page),
             ),
             InlineKeyboardButton(
-                text=f"✏️ Изменить «{style_label}»",
-                callback_data=system_message_callback_data("e", key, locale, style, page),
+                text="✏️ Изменить",
+                callback_data=system_message_callback_data("e", key, locale, "informal", page),
             ),
         ])
+    else:
+        for style in ADDRESSING_STYLES:
+            style_label = "Ты" if style == "informal" else "Вы"
+            rows.append([InlineKeyboardButton(
+                text=f"👁 Просмотр «{style_label}»",
+                callback_data=system_message_callback_data("v", key, locale, style, page),
+            ), InlineKeyboardButton(
+                text=f"✏️ Изменить «{style_label}»",
+                callback_data=system_message_callback_data("e", key, locale, style, page),
+            )])
+            rows.append([InlineKeyboardButton(
+                text=f"↩️ Восстановить «{style_label}» по умолчанию",
+                callback_data=system_message_callback_data("r", key, locale, style, page),
+            )])
+    if key == "ui.ai.processing_default":
         rows.append([InlineKeyboardButton(
-            text=f"↩️ Восстановить «{style_label}» по умолчанию",
-            callback_data=system_message_callback_data("r", key, locale, style, page),
+            text=(
+                "🔀 Включить варианты по языку и обращению"
+                if processing_text_explicit
+                else "🔀 Включить единый текст"
+            ),
+            callback_data=system_message_callback_data(
+                "m0" if processing_text_explicit else "m1",
+                key,
+                locale,
+                page=page,
+            ),
         )])
     rows.append([InlineKeyboardButton(
         text="⬅️ К списку сообщений",
