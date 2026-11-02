@@ -303,12 +303,8 @@ def admin_general_settings_keyboard(config, addressing_style=None):
         addressing_style if addressing_style is not None else getattr(config, "addressing_style", "informal")
     )
     builder.button(
-        text=f"Обращение: {'✅ Ты' if addressing_style == 'informal' else 'Ты'}",
-        callback_data="admin_general_set_addressing_informal",
-    )
-    builder.button(
-        text=f"Обращение: {'✅ Вы' if addressing_style == 'formal' else 'Вы'}",
-        callback_data="admin_general_set_addressing_formal",
+        text=f"Обращение: ✅ {'Ты' if addressing_style == 'informal' else 'Вы'}",
+        callback_data="admin_general_toggle_addressing_style",
     )
     builder.button(
         text="💬 Системные сообщения",

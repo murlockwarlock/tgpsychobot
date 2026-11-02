@@ -86,8 +86,7 @@ async def show_general_settings(client: MaxApiClient, chat_id: int) -> None:
         ),
         attachments=inline_keyboard([
             [
-                callback_button("✅ Ты" if style == "informal" else "Ты", "admin_general_set_addressing_informal"),
-                callback_button("✅ Вы" if style == "formal" else "Вы", "admin_general_set_addressing_formal"),
+                callback_button(f"Обращение: ✅ {'Ты' if style == 'informal' else 'Вы'}", "admin_general_toggle_addressing_style"),
             ],
             [callback_button("💬 Системные сообщения", "admin_system_messages")],
             [callback_button("◀️ Назад", "admin_panel")],
@@ -103,6 +102,15 @@ async def set_addressing_style(client: MaxApiClient, chat_id: int, style: str) -
             config = BotGeneralConfig(id=1)
             session.add(config)
         await save_addressing_style(session, normalized_style, bot_scope="max")
+        await session.commit()
+    await show_general_settings(client, chat_id)
+
+
+async def toggle_addressing_style(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        current_style = await resolve_addressing_style(session, bot_scope="max")
+        next_style = "formal" if current_style == "informal" else "informal"
+        await save_addressing_style(session, next_style, bot_scope="max")
         await session.commit()
     await show_general_settings(client, chat_id)
 

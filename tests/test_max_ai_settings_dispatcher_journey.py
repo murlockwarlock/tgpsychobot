@@ -1337,10 +1337,25 @@ async def test_max_addressing_style_system_message_journey_uses_real_app_callbac
     )
     general = await press("admin_general_settings")
     assert "Общие настройки" in general["text"]
-    formal = await press("admin_general_set_addressing_formal")
+    addressing_buttons = [
+        button
+        for button in _max_buttons(general.get("attachments"))
+        if button["payload"] == "admin_general_toggle_addressing_style"
+        or button["payload"].startswith("admin_general_set_addressing_")
+    ]
+    assert len(addressing_buttons) == 1
+    assert addressing_buttons[0]["payload"] == "admin_general_toggle_addressing_style"
+    assert "Ты" in addressing_buttons[0]["text"]
+    formal = await press("admin_general_toggle_addressing_style")
     assert "Обращение: <b>Вы</b>" in formal["text"]
     async with max_settings_db() as session:
         assert (await session.get(BotAddressingConfig, "max")).addressing_style == "formal"
+    informal = await press("admin_general_toggle_addressing_style")
+    assert "Обращение: <b>Ты</b>" in informal["text"]
+    async with max_settings_db() as session:
+        assert (await session.get(BotAddressingConfig, "max")).addressing_style == "informal"
+    formal = await press("admin_general_toggle_addressing_style")
+    assert "Обращение: <b>Вы</b>" in formal["text"]
 
     await press("admin_system_messages")
     await press(system_message_callback_data("p", locale="ru", page=1))

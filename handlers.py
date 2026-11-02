@@ -813,15 +813,7 @@ async def _resolve_effective_ai_processing_message(
                 fallback=source_text,
             )
         return effective_text, None, source_text
-    localized_text = translate(
-        f"bot_general_config.{getattr(config, 'id', 1)}.ai_processing_message_text",
-        locale,
-        fallback=source_text,
-        source=source_text,
-    ) or source_text
-    if localized_text != source_text:
-        entities = None
-    return localized_text, entities, source_text
+    return source_text, entities, source_text
 
 
 async def _effective_ai_processing_message_html(
@@ -1723,14 +1715,14 @@ async def _send_ai_processing_message(
 ):
     if not config or not bool(getattr(config, "ai_processing_message_enabled", False)):
         return None
-    text, entities, source_text = await _resolve_effective_ai_processing_message(config, locale)
+    text, entities, _ = await _resolve_effective_ai_processing_message(config, locale)
     if not isinstance(text, str) or not text.strip():
         return None
     try:
         if entities:
             message_kwargs = Text.from_entities(text, entities).as_kwargs()
         else:
-            message_kwargs = {"text": text, "parse_mode": "HTML" if text != source_text else None}
+            message_kwargs = {"text": text, "parse_mode": None}
         return await bot.send_message(
             chat_id=user_id,
             **message_kwargs,
@@ -21783,14 +21775,21 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
     await callback.answer(limit_callback_answer(notice))
 
 
-@router.callback_query(F.data.in_({"admin_general_set_addressing_informal", "admin_general_set_addressing_formal"}))
+@router.callback_query(F.data.in_({
+    "admin_general_toggle_addressing_style",
+    "admin_general_set_addressing_informal",
+    "admin_general_set_addressing_formal",
+}))
 async def admin_general_set_addressing_style(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    style = "formal" if callback.data == "admin_general_set_addressing_formal" else "informal"
     async with async_session_maker() as session:
         current_style = await resolve_addressing_style(session, bot_scope="telegram")
+        if callback.data == "admin_general_toggle_addressing_style":
+            style = "formal" if current_style == "informal" else "informal"
+        else:
+            style = "formal" if callback.data == "admin_general_set_addressing_formal" else "informal"
         if current_style == style:
             await callback.answer(limit_callback_answer("Обращение уже выбрано"))
             return

@@ -997,15 +997,15 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
         return rendered[-1]
 
     await press("admin_general_settings", 500)
-    general = await press("admin_general_set_addressing_formal", 501)
+    general = await press("admin_general_toggle_addressing_style", 501)
     assert "Обращение: <b>Вы</b>" in general.text
     async with factory() as db_session:
         assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
-    general = await press("admin_general_set_addressing_informal", 502)
+    general = await press("admin_general_toggle_addressing_style", 502)
     assert "Обращение: <b>Ты</b>" in general.text
     async with factory() as db_session:
         assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "informal"
-    general = await press("admin_general_set_addressing_formal", 503)
+    general = await press("admin_general_toggle_addressing_style", 503)
     assert "Обращение: <b>Вы</b>" in general.text
     async with factory() as db_session:
         assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
@@ -1204,7 +1204,7 @@ async def test_telegram_system_message_ux_journey_uses_visible_stateful_keyboard
         return session.current_message(current)
 
     general = await press(root_message, lambda button: button.callback_data == "admin_general_settings")
-    formal = await press(general, lambda button: button.callback_data == "admin_general_set_addressing_formal")
+    formal = await press(general, lambda button: button.callback_data == "admin_general_toggle_addressing_style")
     assert "Обращение: <b>Вы</b>" in formal.text
     waiting_editor = await press(
         formal,
@@ -1333,7 +1333,7 @@ async def test_telegram_system_message_ux_journey_uses_visible_stateful_keyboard
 
 
 @pytest.mark.asyncio
-async def test_addressing_style_active_button_finishes_callback_without_edit(factory, admin_dispatcher, monkeypatch):
+async def test_addressing_style_toggle_updates_and_finishes_callback(factory, admin_dispatcher, monkeypatch):
     import handlers
     import httpx
 
@@ -1380,61 +1380,30 @@ async def test_addressing_style_active_button_finishes_callback_without_edit(fac
     session.calls.clear()
     await _feed_callback(admin_dispatcher, bot, root_message, "admin_general_settings", 561)
     current = session.current_message(root_message)
-    informal_button = next(button for row in current.reply_markup.inline_keyboard for button in row if button.callback_data == "admin_general_set_addressing_informal")
-    assert "Ты" in informal_button.text
-
-    fsm_context = admin_dispatcher.fsm.get_context(bot=bot, chat_id=18, user_id=18)
-    await fsm_context.update_data(sentinel="preserve")
-    before_fsm_data = await fsm_context.get_data()
-    async with factory() as db_session:
-        before = (await db_session.get(BotGeneralConfig, 1)).addressing_style
+    toggle_button = next(button for row in current.reply_markup.inline_keyboard for button in row if button.callback_data == "admin_general_toggle_addressing_style")
+    assert "Ты" in toggle_button.text
     session.calls.clear()
     await _feed_callback(
         admin_dispatcher,
         bot,
         current,
-        informal_button.callback_data,
+        toggle_button.callback_data,
         562,
     )
-    assert not [method for method in session.calls if isinstance(method, EditMessageText)]
+    assert any(isinstance(method, EditMessageText) for method in session.calls)
     answers = [method for method in session.calls if isinstance(method, AnswerCallbackQuery)]
     assert len(answers) == 1
-    assert answers[0].text == "Обращение уже выбрано"
+    assert answers[0].text == "Обращение: Вы"
     async with factory() as db_session:
-        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == before
-    assert await fsm_context.get_data() == before_fsm_data
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
 
     current = session.current_message(root_message)
     session.calls.clear()
-    await _feed_callback(admin_dispatcher, bot, current, "admin_general_set_addressing_formal", 563)
+    await _feed_callback(admin_dispatcher, bot, current, "admin_general_toggle_addressing_style", 563)
     assert any(isinstance(method, EditMessageText) for method in session.calls)
     assert any(
-        isinstance(method, AnswerCallbackQuery) and method.text == "Обращение: Вы"
+        isinstance(method, AnswerCallbackQuery) and method.text == "Обращение: Ты"
         for method in session.calls
-    )
-    assert "Обращение: <b>Вы</b>" in session.current_message(root_message).text
-
-    session.calls.clear()
-    await _feed_callback(
-        admin_dispatcher,
-        bot,
-        session.current_message(root_message),
-        "admin_general_set_addressing_formal",
-        564,
-    )
-    assert not [method for method in session.calls if isinstance(method, EditMessageText)]
-    assert any(
-        isinstance(method, AnswerCallbackQuery) and method.text == "Обращение уже выбрано"
-        for method in session.calls
-    )
-
-    session.calls.clear()
-    await _feed_callback(
-        admin_dispatcher,
-        bot,
-        session.current_message(root_message),
-        "admin_general_set_addressing_informal",
-        565,
     )
     assert "Обращение: <b>Ты</b>" in session.current_message(root_message).text
     async with factory() as db_session:
@@ -1446,7 +1415,7 @@ async def test_addressing_style_active_button_finishes_callback_without_edit(fac
         bot,
         session.current_message(root_message),
         "admin_panel",
-        566,
+        564,
     )
     assert session.current_message(root_message).text == "Добро пожаловать в админ-панель!"
     session.calls.clear()
@@ -1455,7 +1424,7 @@ async def test_addressing_style_active_button_finishes_callback_without_edit(fac
         bot,
         session.current_message(root_message),
         "admin_general_settings",
-        567,
+        565,
     )
     reopened = session.current_message(root_message)
     assert "Обращение: <b>Ты</b>" in reopened.text
@@ -1476,7 +1445,7 @@ async def test_addressing_style_active_button_finishes_callback_without_edit(fac
         bot,
         reopened,
         "admin_panel",
-        568,
+        566,
     )
     assert session.current_message(root_message).text == "Добро пожаловать в админ-панель!"
 
@@ -1504,7 +1473,7 @@ async def test_addressing_style_edit_failure_finishes_callback(factory, admin_di
         admin_dispatcher,
         bot,
         session.current_message(root_message),
-        "admin_general_set_addressing_formal",
+        "admin_general_toggle_addressing_style",
         572,
     )
 
@@ -1514,6 +1483,53 @@ async def test_addressing_style_edit_failure_finishes_callback(factory, admin_di
     assert answers[0].text == "Не удалось обновить экран. Попробуйте ещё раз."
     async with factory() as db_session:
         assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
+
+
+@pytest.mark.asyncio
+async def test_addressing_style_general_settings_uses_one_toggle_button(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add(DBUser(id=20, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=20, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=580, message=root_message))
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_general_settings", 581)
+    current = session.current_message(root_message)
+    buttons = [
+        button
+        for row in current.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    addressing_buttons = [button for button in buttons if button.callback_data.startswith("admin_general_set_addressing_")]
+    toggle_buttons = [button for button in buttons if button.callback_data == "admin_general_toggle_addressing_style"]
+    assert not addressing_buttons
+    assert len(toggle_buttons) == 1
+    assert "Ты" in toggle_buttons[0].text
+
+    await _feed_callback(admin_dispatcher, bot, current, toggle_buttons[0].callback_data, 582)
+    current = session.current_message(root_message)
+    assert "Обращение: <b>Вы</b>" in current.text
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
+
+    toggle_button = next(
+        button
+        for row in current.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data == "admin_general_toggle_addressing_style"
+    )
+    await _feed_callback(admin_dispatcher, bot, current, toggle_button.callback_data, 583)
+    assert "Обращение: <b>Ты</b>" in session.current_message(root_message).text
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "informal"
 
 
 @pytest.mark.asyncio
@@ -2173,6 +2189,7 @@ async def test_admin_dispatcher_crawls_general_languages_and_ai_sections(factory
         "admin_general_toggle_ai_processing_message",
         "admin_general_edit_ai_processing_message_text",
         "admin_general_open_ai_processing_variants",
+        "admin_general_toggle_addressing_style",
         "admin_main_collections_page_0",
         "admin_language_settings",
         "admin_panel",
@@ -4309,7 +4326,7 @@ async def test_waiting_message_has_one_telegram_admin_path_and_uses_effective_te
         admin_dispatcher,
         bot,
         general,
-        "admin_general_set_addressing_informal",
+        "admin_general_toggle_addressing_style",
         6304,
     )
     await _feed_callback(
@@ -4468,8 +4485,18 @@ async def test_waiting_message_explicit_default_wins_over_legacy_override(
                 addressing_style="formal",
                 text="Variante portuguesa antiga",
             ),
+            BotTranslation(
+                locale="pt",
+                translation_key="bot_general_config.1.ai_processing_message_text",
+                text="Старый PT перевод общего текста",
+                source_hash=source_hash(DEFAULT_AI_PROCESSING_MESSAGE_TEXT),
+            ),
         ])
         await db_session.commit()
+
+    from translation_service import refresh_translation_cache
+
+    await refresh_translation_cache(factory, force=True)
 
     async def fake_provider_post(self, url, *args, **kwargs):
         return httpx.Response(
@@ -4568,6 +4595,16 @@ async def test_waiting_message_explicit_default_wins_over_legacy_override(
         and session.calls.index(method) > session.calls.index(waiting)
         for method in session.calls
     )
+
+    handlers.user_message_buffers[69] = ["Olá"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(69, bot)
+    waiting_pt = next(
+        method
+        for method in session.calls
+        if isinstance(method, SendMessage) and method.chat_id == 69
+    )
+    assert waiting_pt.text == DEFAULT_AI_PROCESSING_MESSAGE_TEXT
 
 
 @pytest.mark.asyncio
@@ -4825,13 +4862,13 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
     )
     await _feed_callback(admin_dispatcher, bot, system_list, general_button.callback_data, 7014)
     general = session.current_message(draft)
-    informal_button = next(
+    toggle_button = next(
         button
         for row in general.reply_markup.inline_keyboard
         for button in row
-        if button.callback_data == "admin_general_set_addressing_informal"
+        if button.callback_data == "admin_general_toggle_addressing_style"
     )
-    await _feed_callback(admin_dispatcher, bot, general, informal_button.callback_data, 7015)
+    await _feed_callback(admin_dispatcher, bot, general, toggle_button.callback_data, 7015)
     general = session.current_message(draft)
     assert "по языку и обращению" in general.text
 
@@ -4851,5 +4888,184 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         isinstance(method, SendMessage)
         and method.chat_id == 72
         and method.text == "Старый русский Ты"
+        for method in session.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_waiting_message_system_variant_with_literal_html_chars_uses_plain_send(
+    factory,
+    admin_dispatcher,
+    monkeypatch,
+):
+    import handlers
+    import httpx
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers.ai_integration, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        config = await db_session.get(BotGeneralConfig, 1)
+        config.ai_processing_message_enabled = True
+        config.ai_processing_message_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+        config.ai_processing_message_text_explicit = False
+        config.telegram_language_selection_enabled = True
+        db_session.add_all([
+            DBUser(id=73, is_admin=True, first_name="Admin", telegram_language_code="ru", current_dialogue_id=1),
+            DBUser(id=74, first_name="Português", telegram_language_code="pt", current_dialogue_id=1),
+            AIConfig(
+                id=1,
+                provider="OpenRouter",
+                openrouter_api_key="sk-test-key",
+                openrouter_model="qwen/qwen3.7-plus",
+                system_prompt="Система",
+                memory_mode="global",
+            ),
+            SubscriptionConfig(id=1, subscriptions_enabled=False),
+            BotAddressingConfig(bot_scope="telegram", addressing_style="informal"),
+        ])
+        await db_session.commit()
+
+    async def fake_provider_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "Ответ"}}]},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_provider_post)
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=73, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=7300, message=root_message))
+
+    def visible(message):
+        return [
+            button
+            for row in (message.reply_markup.inline_keyboard if message.reply_markup else [])
+            for button in row
+            if button.callback_data
+        ]
+
+    async def press(message, predicate, update_id):
+        current = session.current_message(message)
+        button = next(button for button in visible(current) if predicate(button))
+        session.calls.clear()
+        await _feed_callback(admin_dispatcher, bot, current, button.callback_data, update_id)
+        assert any(isinstance(method, AnswerCallbackQuery) for method in session.calls)
+        return session.current_message(current)
+
+    panel = session.current_message(root_message)
+    general = await press(panel, lambda button: button.callback_data == "admin_general_settings", 7301)
+    formal = await press(general, lambda button: button.callback_data == "admin_general_toggle_addressing_style", 7302)
+    variants = await press(formal, lambda button: button.callback_data == "admin_general_open_ai_processing_variants", 7303)
+    processing = next(
+        button
+        for button in visible(variants)
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "d"
+        and parse_system_message_callback(button.callback_data)["key"] == "ui.ai.processing_default"
+    )
+    detail = await press(variants, lambda button: button.callback_data == processing.callback_data, 7304)
+    pt_locale = await press(
+        detail,
+        lambda button: (
+            parse_system_message_callback(button.callback_data or "")
+            and parse_system_message_callback(button.callback_data)["action"] == "p"
+        ),
+        7305,
+    )
+    pt_locale = await press(
+        pt_locale,
+        lambda button: (
+            parse_system_message_callback(button.callback_data or "")
+            and parse_system_message_callback(button.callback_data)["action"] == "l"
+            and parse_system_message_callback(button.callback_data)["locale"] == "pt"
+        ),
+        7306,
+    )
+    processing = next(
+        button
+        for button in visible(pt_locale)
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "d"
+        and parse_system_message_callback(button.callback_data)["key"] == "ui.ai.processing_default"
+    )
+    detail = await press(pt_locale, lambda button: button.callback_data == processing.callback_data, 7307)
+    edit = next(
+        button
+        for button in visible(detail)
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "e"
+        and parse_system_message_callback(button.callback_data)["style"] == "formal"
+    )
+    editor = await press(detail, lambda button: button.callback_data == edit.callback_data, 7308)
+    assert "Язык: <b>Português</b>" in editor.text
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=7309,
+            message=_admin_message(
+                bot,
+                user_id=73,
+                message_id=2,
+                text="Подождите <пример> & продолжайте",
+            ),
+        ),
+    )
+    draft = session.latest_message_with_keyboard(bot, 73, editor.from_user)
+    save = next(
+        button
+        for button in visible(draft)
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "s"
+    )
+    detail = await press(draft, lambda button: button.callback_data == save.callback_data, 7310)
+
+    async with factory() as db_session:
+        saved_text = await db_session.scalar(
+            select(BotSystemMessage.text).where(
+                BotSystemMessage.bot_scope == "telegram",
+                BotSystemMessage.translation_key == "ui.ai.processing_default",
+                BotSystemMessage.locale == "pt",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+    assert saved_text == "Подождите <пример> & продолжайте"
+
+    edit = next(
+        button
+        for button in visible(detail)
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "e"
+        and parse_system_message_callback(button.callback_data)["style"] == "formal"
+    )
+    reopened_editor = await press(detail, lambda button: button.callback_data == edit.callback_data, 7311)
+    assert "Подождите &lt;пример&gt; &amp; продолжайте" in reopened_editor.text
+    cancel = next(
+        button
+        for button in visible(reopened_editor)
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "c"
+    )
+    await press(reopened_editor, lambda button: button.callback_data == cancel.callback_data, 7312)
+
+    handlers.user_message_buffers[74] = ["Olá"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(74, bot)
+    waiting = next(
+        method
+        for method in session.calls
+        if isinstance(method, SendMessage)
+        and method.chat_id == 74
+        and method.text == "Подождите <пример> & продолжайте"
+    )
+    assert waiting.parse_mode is None
+    assert not waiting.entities
+    waiting_index = session.calls.index(waiting)
+    assert any(
+        isinstance(method, DeleteMessage)
+        and method.chat_id == 74
+        and session.calls.index(method) > waiting_index
         for method in session.calls
     )
