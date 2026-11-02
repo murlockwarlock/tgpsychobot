@@ -513,6 +513,8 @@ async def content_callback(callback: CallbackQuery, state):
         if len(parts) > 4 and parts[2] == "mailing" and parts[4] == "detail":
             locale, page = "ru", int(parts[5]) if len(parts) > 5 else 0
             return_context = "mailing_detail"
+        elif len(parts) > 5:
+            locale, page = tail or "ru", int(parts[5])
         elif tail in LOCALE_LABELS:
             locale, page = tail, 0
         else:
