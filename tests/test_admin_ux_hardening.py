@@ -16,6 +16,7 @@ from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetChat, GetMe
 from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User
 from aiogram.client.session.base import BaseSession
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -105,9 +106,14 @@ class RecordingSession(BaseSession):
 
 
 class ValidatingTelegramSession(BaseSession):
-    def __init__(self):
+    def __init__(self, *, stateful=False):
         super().__init__()
         self.calls = []
+        self.stateful = stateful
+        self._screens = {}
+        self._active_screen_keys = {}
+        self._next_message_ids = {}
+        self.next_edit_error = None
 
     async def close(self):
         return None
@@ -116,7 +122,7 @@ class ValidatingTelegramSession(BaseSession):
         self.calls.append(method)
         type(method).model_validate(method.model_dump())
 
-        if isinstance(method, (EditMessageText, SendMessage)):
+        if not self.stateful and isinstance(method, (EditMessageText, SendMessage)):
             return Message(
                 message_id=getattr(method, "message_id", 1),
                 date=datetime.now(timezone.utc),
@@ -124,6 +130,30 @@ class ValidatingTelegramSession(BaseSession):
                 from_user=User(id=999, is_bot=True, first_name="TestBot", username="testbot"),
                 text=getattr(method, "text", ""),
             ).as_(bot)
+        if isinstance(method, EditMessageText):
+            chat_id = int(method.chat_id)
+            message_id = int(method.message_id)
+            screen_key = (chat_id, message_id)
+            if self.next_edit_error:
+                message = self.next_edit_error
+                self.next_edit_error = None
+                raise TelegramBadRequest(method, message)
+            requested = self._screen_payload(method.text, method.entities, method.reply_markup)
+            if self._screens.get(screen_key) == requested:
+                raise TelegramBadRequest(method, "Bad Request: message is not modified")
+            self._screens[screen_key] = requested
+            self._active_screen_keys[chat_id] = screen_key
+            return self._screen_message(bot, chat_id, message_id, requested)
+        if isinstance(method, SendMessage):
+            chat_id = int(method.chat_id)
+            message_id = self._next_message_ids.get(chat_id, 1)
+            self._next_message_ids[chat_id] = message_id + 1
+            requested = self._screen_payload(method.text, method.entities, method.reply_markup)
+            screen_key = (chat_id, message_id)
+            if chat_id not in self._active_screen_keys:
+                self._screens[screen_key] = requested
+                self._active_screen_keys[chat_id] = screen_key
+            return self._screen_message(bot, chat_id, message_id, requested)
         if isinstance(method, GetMe):
             return User(id=999, is_bot=True, first_name="TestBot", username="testbot").as_(bot)
         if isinstance(method, GetChat):
@@ -133,6 +163,47 @@ class ValidatingTelegramSession(BaseSession):
     async def stream_content(self, *args, **kwargs):
         if False:
             yield b""
+
+    @staticmethod
+    def _model_value(value):
+        if value is None:
+            return None
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json", exclude_none=True)
+        return value
+
+    @classmethod
+    def _screen_payload(cls, text, entities, reply_markup):
+        return (
+            text,
+            cls._model_value(entities),
+            cls._model_value(reply_markup),
+        )
+
+    @staticmethod
+    def _screen_message(bot, chat_id, message_id, payload):
+        text, entities, reply_markup = payload
+        return Message(
+            message_id=message_id,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=chat_id, type="private"),
+            from_user=User(id=999, is_bot=True, first_name="TestBot", username="testbot"),
+            text=text,
+            entities=entities,
+            reply_markup=reply_markup,
+        ).as_(bot)
+
+    def current_message(self, message):
+        if not self.stateful:
+            return message
+        chat_id = message.chat.id
+        screen_key = self._active_screen_keys.get(chat_id)
+        if screen_key is None:
+            return message
+        message_id = screen_key[1]
+        payload = self._screens[screen_key]
+        current = self._screen_message(message.bot, chat_id, message_id, payload)
+        return current.model_copy(update={"from_user": message.from_user, "chat": message.chat}).as_(message.bot)
 
 
 def _callback(bot, message, data):
@@ -157,6 +228,9 @@ def _admin_message(bot, user_id=11, message_id=1, text="Админ-панель"
 
 
 async def _feed_callback(dispatcher, bot, message, data, update_id):
+    session = getattr(bot, "session", None)
+    if isinstance(session, ValidatingTelegramSession) and session.stateful:
+        message = session.current_message(message)
     user = message.from_user
     callback = CallbackQuery(
         id=f"callback-{update_id}",
@@ -984,6 +1058,190 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
     assert any(method.text == "Ответ пользователю" for method in outgoing)
     assert provider_payloads
     assert "ОБРАЩЕНИЕ: обращайся к пользователю на «Вы»" in str(provider_payloads[-1])
+
+
+@pytest.mark.asyncio
+async def test_addressing_style_active_button_finishes_callback_without_edit(factory, admin_dispatcher, monkeypatch):
+    import handlers
+    import httpx
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers.ai_integration, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add_all([
+            DBUser(
+                id=18,
+                is_admin=True,
+                first_name="Admin",
+                name="Admin",
+                accepted_disclaimer=True,
+                current_dialogue_id=1,
+            ),
+            AIConfig(
+                id=1,
+                provider="OpenRouter",
+                openrouter_api_key="sk-test-key",
+                openrouter_model="qwen/qwen3.7-plus",
+                system_prompt="Система администратора",
+                memory_mode="global",
+            ),
+            SubscriptionConfig(id=1, subscriptions_enabled=False),
+        ])
+        await db_session.commit()
+
+    provider_payloads = []
+
+    async def fake_provider_post(self, url, *args, **kwargs):
+        provider_payloads.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "Ответ"}}]},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_provider_post)
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=18, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=560, message=root_message))
+    session.calls.clear()
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_general_settings", 561)
+    current = session.current_message(root_message)
+    informal_button = next(button for row in current.reply_markup.inline_keyboard for button in row if button.callback_data == "admin_general_set_addressing_informal")
+    assert "Ты" in informal_button.text
+
+    fsm_context = admin_dispatcher.fsm.get_context(bot=bot, chat_id=18, user_id=18)
+    await fsm_context.update_data(sentinel="preserve")
+    before_fsm_data = await fsm_context.get_data()
+    async with factory() as db_session:
+        before = (await db_session.get(BotGeneralConfig, 1)).addressing_style
+    session.calls.clear()
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        current,
+        informal_button.callback_data,
+        562,
+    )
+    assert not [method for method in session.calls if isinstance(method, EditMessageText)]
+    answers = [method for method in session.calls if isinstance(method, AnswerCallbackQuery)]
+    assert len(answers) == 1
+    assert answers[0].text == "Обращение уже выбрано"
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == before
+    assert await fsm_context.get_data() == before_fsm_data
+
+    current = session.current_message(root_message)
+    session.calls.clear()
+    await _feed_callback(admin_dispatcher, bot, current, "admin_general_set_addressing_formal", 563)
+    assert any(isinstance(method, EditMessageText) for method in session.calls)
+    assert any(
+        isinstance(method, AnswerCallbackQuery) and method.text == "Обращение: Вы"
+        for method in session.calls
+    )
+    assert "Обращение: <b>Вы</b>" in session.current_message(root_message).text
+
+    session.calls.clear()
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        session.current_message(root_message),
+        "admin_general_set_addressing_formal",
+        564,
+    )
+    assert not [method for method in session.calls if isinstance(method, EditMessageText)]
+    assert any(
+        isinstance(method, AnswerCallbackQuery) and method.text == "Обращение уже выбрано"
+        for method in session.calls
+    )
+
+    session.calls.clear()
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        session.current_message(root_message),
+        "admin_general_set_addressing_informal",
+        565,
+    )
+    assert "Обращение: <b>Ты</b>" in session.current_message(root_message).text
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "informal"
+
+    session.calls.clear()
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        session.current_message(root_message),
+        "admin_panel",
+        566,
+    )
+    assert session.current_message(root_message).text == "Добро пожаловать в админ-панель!"
+    session.calls.clear()
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        session.current_message(root_message),
+        "admin_general_settings",
+        567,
+    )
+    reopened = session.current_message(root_message)
+    assert "Обращение: <b>Ты</b>" in reopened.text
+
+    handlers.user_message_buffers[18] = ["Привет"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(18, bot)
+    assert any(
+        isinstance(method, SendMessage) and method.chat_id == 18 and method.text == "Ответ"
+        for method in session.calls
+    )
+    assert provider_payloads
+    assert "ОБРАЩЕНИЕ: обращайся к пользователю на «ты»" in str(provider_payloads[-1])
+
+    session.calls.clear()
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        reopened,
+        "admin_panel",
+        568,
+    )
+    assert session.current_message(root_message).text == "Добро пожаловать в админ-панель!"
+
+
+@pytest.mark.asyncio
+async def test_addressing_style_edit_failure_finishes_callback(factory, admin_dispatcher, monkeypatch):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add(DBUser(id=19, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=19, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=570, message=root_message))
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_general_settings", 571)
+    session.next_edit_error = "Bad Request: simulated edit failure"
+    session.calls.clear()
+
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        session.current_message(root_message),
+        "admin_general_set_addressing_formal",
+        572,
+    )
+
+    answers = [method for method in session.calls if isinstance(method, AnswerCallbackQuery)]
+    assert len(answers) == 1
+    assert answers[0].show_alert is True
+    assert answers[0].text == "Не удалось обновить экран. Попробуйте ещё раз."
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
 
 
 @pytest.mark.asyncio

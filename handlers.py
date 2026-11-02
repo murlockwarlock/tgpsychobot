@@ -21733,9 +21733,18 @@ async def admin_general_set_addressing_style(callback: CallbackQuery, state: FSM
         return
     style = "formal" if callback.data == "admin_general_set_addressing_formal" else "informal"
     async with async_session_maker() as session:
+        current_style = await resolve_addressing_style(session, bot_scope="telegram")
+        if current_style == style:
+            await callback.answer(limit_callback_answer("Обращение уже выбрано"))
+            return
         await save_addressing_style(session, style, bot_scope="telegram")
         await session.commit()
-    await admin_general_settings(callback, state)
+    try:
+        await admin_general_settings(callback, state)
+    except TelegramBadRequest as exc:
+        log.warning("Could not update addressing style admin screen: %s", exception_summary(exc))
+        await callback.answer(limit_callback_answer("Не удалось обновить экран. Попробуйте ещё раз."), show_alert=True)
+        return
     await callback.answer(f"Обращение: {addressing_style_label(style)}")
 
 
