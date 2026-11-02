@@ -303,7 +303,7 @@ async def resource_list(event, kind, page=0):
     await event.message.edit_text(f"<b>{spec.title}</b>{page_suffix}", reply_markup=keyboard(rows), parse_mode="HTML")
 
 
-async def resource_card(event, kind, identity, locale="ru", page=0):
+async def resource_card(event, kind, identity, locale="ru", page=0, return_context=None):
     spec = AUTHORING_RESOURCES.get(kind, RESOURCES[kind])
     identity = identity if spec.identity_field == "key" else int(identity)
     async with async_session_maker() as session:
@@ -372,6 +372,8 @@ async def resource_card(event, kind, identity, locale="ru", page=0):
                 route = f"ca:opt:{identity}:{option.callback_id}:{part}"
             else:
                 route = f"ca:edit:{kind}:{identity}:{locale}:{fields.index((field, title, _))}:{page}"
+                if kind == "mailing" and return_context == "mailing_detail":
+                    route += ":mailing_detail"
             if kind == "content" and field == "text_content":
                 continue
             rows.append([(f"Изменить: {title}", route)])
@@ -404,6 +406,8 @@ async def resource_card(event, kind, identity, locale="ru", page=0):
                     rows.append(filtered)
         if kind == "followup_step":
             rows.append([("⬅️ Назад", f"followup_step_{resource.campaign_id}_{identity}")])
+        elif kind == "mailing" and return_context == "mailing_detail":
+            rows.append([('К списку', f'mailing_details_{identity}_{page}')])
         else:
             rows.append([('К списку', f'ca:list:{kind}:{page}')])
     await event.message.edit_text("\n".join(text), reply_markup=keyboard(rows), parse_mode="HTML")
@@ -443,6 +447,7 @@ async def begin_edit(event, state, kind, identity, field_index, locale="ru"):
         value = await read_content_value(session, kind, resource, field, locale)
     data = await state.get_data()
     page = int(data.get("parent_page", 0) or 0)
+    return_context = data.get("return_context")
     await state.set_state(ContentAuthoringStates.value)
     await state.set_data({
         "kind": kind,
@@ -451,11 +456,17 @@ async def begin_edit(event, state, kind, identity, field_index, locale="ru"):
         "locale": locale,
         "authoring_locale": locale,
         "parent_page": page,
+        "return_context": return_context,
     })
     rows = []
     if value.needs_review:
         rows.append([("Подтвердить перевод", "ca:confirm")])
-    rows.append([("Отмена", f"ca:view:{kind}:{identity}:{locale}:{page}")])
+    cancel_route = (
+        f"mailing_details_{identity}_{page}"
+        if kind == "mailing" and return_context == "mailing_detail"
+        else f"ca:view:{kind}:{identity}:{locale}:{page}"
+    )
+    rows.append([("Отмена", cancel_route)])
     reference = f"\n\nРусский исходник:\n{html.escape((value.russian or 'Не задан')[:1000])}" if locale != "ru" else ""
     heading = f"{locale_heading(locale)}\n\n" if is_localized_resource(kind) else ""
     current_label = value.admin_label() if locale != "ru" else (value.text or "Не задано")
@@ -497,14 +508,16 @@ async def content_callback(callback: CallbackQuery, state):
         await resource_list(callback, parts[2], int(parts[3]))
     elif action == "view":
         await state.clear()
+        return_context = None
         tail = parts[4] if len(parts) > 4 else "ru"
-        if len(parts) > 5:
-            locale, page = tail or "ru", int(parts[5])
+        if len(parts) > 4 and parts[2] == "mailing" and parts[4] == "detail":
+            locale, page = "ru", int(parts[5]) if len(parts) > 5 else 0
+            return_context = "mailing_detail"
         elif tail in LOCALE_LABELS:
             locale, page = tail, 0
         else:
             locale, page = "ru", int(tail or 0)
-        await resource_card(callback, parts[2], parts[3], locale, page)
+        await resource_card(callback, parts[2], parts[3], locale, page, return_context)
     elif action == "edit":
         if len(parts) >= 6:
             locale = parts[4] or "ru"
@@ -515,7 +528,8 @@ async def content_callback(callback: CallbackQuery, state):
             field_token = parts[4]
             page = 0
         field_index = int(field_token) if field_token.isdigit() else field_token
-        await state.update_data(parent_page=page)
+        return_context = parts[7] if len(parts) > 7 else None
+        await state.update_data(parent_page=page, return_context=return_context)
         await begin_edit(callback, state, parts[2], parts[3], field_index, locale)
     elif action == "edit_content":
         from handlers import start_content_edit
@@ -664,6 +678,7 @@ async def content_callback(callback: CallbackQuery, state):
             data["identity"],
             data.get("locale", "ru"),
             int(data.get("parent_page", 0) or 0),
+            data.get("return_context"),
         )
     await callback.answer()
 
@@ -713,11 +728,14 @@ async def content_value_received(message: Message, state):
     locale = data.get("locale", "ru")
     heading = f"{locale_heading(locale)}\n\n" if is_localized_resource(data["kind"]) else ""
     page = int(data.get("parent_page", 0) or 0)
-    route = (
-        f"ca:view:{data['kind']}:{identity}:{locale}:{page}"
-        if is_localized_resource(data["kind"])
-        else f"ca:view:{data['kind']}:{identity}:{page}"
-    )
+    if data["kind"] == "mailing" and data.get("return_context") == "mailing_detail":
+        route = f"mailing_details_{identity}_{page}"
+    else:
+        route = (
+            f"ca:view:{data['kind']}:{identity}:{locale}:{page}"
+            if is_localized_resource(data["kind"])
+            else f"ca:view:{data['kind']}:{identity}:{page}"
+        )
     await message.answer(f"{heading}Сохранено.", reply_markup=keyboard([[('Открыть материал', route)]]))
 
 

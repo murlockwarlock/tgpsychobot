@@ -18598,7 +18598,9 @@ async def admin_mailing_history(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("mailing_details_"))
-async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
+async def admin_mailing_details(callback: CallbackQuery, bot: Bot, state: FSMContext | None = None):
+    if state is not None:
+        await state.clear()
     parsed_callback = parse_mailing_details_callback(callback.data)
     if parsed_callback is None:
         await callback.answer("Рассылка не найдена.", show_alert=True)
@@ -18648,7 +18650,7 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
         text += f"\n\n<b>Переменные:</b> <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
 
     back_keyboard = kb.mailing_details_keyboard(mailing, page)
-    back_keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="Изменить текст", callback_data=f"ca:view:mailing:{mailing_id}")])
+    back_keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="Изменить текст", callback_data=f"ca:view:mailing:{mailing_id}:detail:{page}")])
     details_markup = _merge_telegram_inline_markups(
         _telegram_response_buttons_markup(response_button_rows),
         back_keyboard,
