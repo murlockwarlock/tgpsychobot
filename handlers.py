@@ -417,6 +417,8 @@ from system_messages import (
     save_addressing_style,
     save_system_message,
     system_message_page_count,
+    escape_text_with_limit,
+    TELEGRAM_TEXT_LIMIT,
 )
 from ai_retry_policy import (
     is_retryable_ai_error,
@@ -787,11 +789,15 @@ def _ai_processing_message_html(value: str | None) -> str:
     return html.escape(text)
 
 
-async def _effective_ai_processing_message_html(config: BotGeneralConfig | None, locale: str = "ru") -> str:
+async def _resolve_effective_ai_processing_message(
+    config: BotGeneralConfig | None,
+    locale: str = "ru",
+) -> tuple[str, list[MessageEntity] | None, str]:
     stored_text = getattr(config, "ai_processing_message_text", None) if config else None
-    source_text, _, encoded = _decode_ai_processing_message_text(stored_text)
+    source_text, entities, encoded = _decode_ai_processing_message_text(stored_text)
     if encoded and not source_text:
         source_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+        entities = None
     if source_text == DEFAULT_AI_PROCESSING_MESSAGE_TEXT:
         async with async_session_maker() as session:
             effective_text = await resolve_system_text(
@@ -801,8 +807,32 @@ async def _effective_ai_processing_message_html(config: BotGeneralConfig | None,
                 bot_scope="telegram",
                 fallback=source_text,
             )
-        return html.escape(effective_text)
-    return _ai_processing_message_html(stored_text)
+        return effective_text, None, source_text
+    localized_text = translate(
+        f"bot_general_config.{getattr(config, 'id', 1)}.ai_processing_message_text",
+        locale,
+        fallback=source_text,
+        source=source_text,
+    ) or source_text
+    if localized_text != source_text:
+        entities = None
+    return localized_text, entities, source_text
+
+
+async def _effective_ai_processing_message_html(
+    config: BotGeneralConfig | None,
+    locale: str = "ru",
+    max_length: int | None = None,
+) -> str:
+    effective_text, entities, _ = await _resolve_effective_ai_processing_message(config, locale)
+    if max_length is not None:
+        return escape_text_with_limit(effective_text, max_length)
+    if entities:
+        try:
+            return Text.from_entities(effective_text, entities).as_html()
+        except Exception as exc:
+            logging.warning("Could not render AI processing message preview: %s", exception_summary(exc))
+    return html.escape(effective_text)
 
 
 async def _disable_ai_button_keyboard(callback: CallbackQuery) -> None:
@@ -1688,37 +1718,14 @@ async def _send_ai_processing_message(
 ):
     if not config or not bool(getattr(config, "ai_processing_message_enabled", False)):
         return None
-    stored_text = getattr(config, "ai_processing_message_text", None)
-    text, entities, encoded = _decode_ai_processing_message_text(stored_text)
-    if encoded and not text:
-        text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
-        entities = None
-    source_text = text
-    if source_text == DEFAULT_AI_PROCESSING_MESSAGE_TEXT:
-        async with async_session_maker() as session:
-            localized_text = await resolve_system_text(
-                session,
-                "ui.ai.processing_default",
-                locale,
-                fallback=source_text,
-            )
-    else:
-        localized_text = translate(
-            f"bot_general_config.{getattr(config, 'id', 1)}.ai_processing_message_text",
-            locale,
-            fallback=source_text,
-            source=source_text,
-        ) or source_text
-    if localized_text != source_text:
-        entities = None
-    text = localized_text
+    text, entities, source_text = await _resolve_effective_ai_processing_message(config, locale)
     if not isinstance(text, str) or not text.strip():
         return None
     try:
         if entities:
             message_kwargs = Text.from_entities(text, entities).as_kwargs()
         else:
-            message_kwargs = {"text": text, "parse_mode": "HTML" if localized_text != source_text else None}
+            message_kwargs = {"text": text, "parse_mode": "HTML" if text != source_text else None}
         return await bot.send_message(
             chat_id=user_id,
             **message_kwargs,
@@ -21659,6 +21666,10 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
         await callback.answer(limit_callback_answer("Некорректный вариант сообщения."), show_alert=True)
         return
     if action in {"l", "p"}:
+        locale_button_label = _resolve_ai_button_label(callback, callback.data)
+        if action == "l" and isinstance(locale_button_label, str) and locale_button_label.startswith("✅ "):
+            await callback.answer(limit_callback_answer("Этот язык уже выбран."))
+            return
         await state.clear()
         if action == "l":
             await _render_admin_system_messages(callback, locale, page)
@@ -22016,9 +22027,7 @@ async def admin_general_settings(
         addressing_style = await resolve_addressing_style(session, bot_scope="telegram")
 
     processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
-    processing_text_display = await _effective_ai_processing_message_html(config)
-
-    text = (
+    text_prefix = (
         (notice + "\n\n" if notice else "")
         + "⚙️ <b>Общие настройки</b>\n\n"
         "Выберите, какие данные бот должен запросить у нового пользователя при входе. "
@@ -22027,10 +22036,17 @@ async def admin_general_settings(
         "Отключённое поле можно заполнить позже через настройки пользователя.\n\n"
         f"Сообщение во время ожидания ответа: <b>{'включено' if processing_enabled else 'выключено'}</b>\n"
         "Временно отправляется пользователю до ответа нейросети и затем удаляется.\n"
-        f"Действующий текст: {processing_text_display}\n"
-        "Не влияет на выбор модели и саму генерацию.\n"
+        "Действующий текст: "
+    )
+    text_suffix = (
+        "\nНе влияет на выбор модели и саму генерацию.\n"
         f"Обращение: <b>{addressing_style_label(addressing_style)}</b>"
     )
+    processing_text_display = await _effective_ai_processing_message_html(
+        config,
+        max_length=max(0, TELEGRAM_TEXT_LIMIT - len(text_prefix) - len(text_suffix)),
+    )
+    text = text_prefix + processing_text_display + text_suffix
     await callback.message.edit_text(
         _assert_admin_render_text(text),
         parse_mode="HTML",
@@ -22823,18 +22839,24 @@ async def admin_toggle_ai_processing_message(callback: CallbackQuery):
 async def admin_edit_ai_processing_message_text(callback: CallbackQuery, state: FSMContext):
     async with async_session_maker() as session:
         config = await session.get(BotGeneralConfig, 1)
-        current_text = getattr(config, "ai_processing_message_text", None) if config else None
-    current_text = current_text or DEFAULT_AI_PROCESSING_MESSAGE_TEXT
-    current_text_display = _ai_processing_message_html(current_text)
-    await state.set_state(AdminStates.set_ai_processing_message_text)
-    await state.update_data(message_id=callback.message.message_id)
-    await callback.message.edit_text(
+    editor_prefix = (
         "<b>Сообщение во время ожидания ответа</b>\n"
         "Временно отправляется пользователю до ответа нейросети и затем удаляется.\n"
         "Не влияет на выбор модели и саму генерацию.\n\n"
-        f"Действующий текст: {current_text_display}\n\n"
-        "Отправьте новый текст одним сообщением.\n"
-        f"После очистки текст должен содержать от 1 до {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов.",
+        "Действующий текст: "
+    )
+    editor_suffix = (
+        "\n\nОтправьте новый текст одним сообщением.\n"
+        f"После очистки текст должен содержать от 1 до {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов."
+    )
+    current_text_display = await _effective_ai_processing_message_html(
+        config,
+        max_length=max(0, TELEGRAM_TEXT_LIMIT - len(editor_prefix) - len(editor_suffix)),
+    )
+    await state.set_state(AdminStates.set_ai_processing_message_text)
+    await state.update_data(message_id=callback.message.message_id)
+    await callback.message.edit_text(
+        editor_prefix + current_text_display + editor_suffix,
         parse_mode="HTML",
         reply_markup=kb.back_to_previous_menu("admin_general_settings"),
     )

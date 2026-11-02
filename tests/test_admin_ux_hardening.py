@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetChat, GetMe, SendMessage
+from aiogram.methods import AnswerCallbackQuery, DeleteMessage, EditMessageText, GetChat, GetMe, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User
 from aiogram.client.session.base import BaseSession
 from aiogram import Bot
@@ -24,7 +24,9 @@ from database import (
     AIConfig,
     Base,
     BotGeneralConfig,
+    BotAddressingConfig,
     BotSystemMessage,
+    DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
     BotTranslation,
     Content,
     ContentMedia,
@@ -122,6 +124,9 @@ class ValidatingTelegramSession(BaseSession):
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
         type(method).model_validate(method.model_dump())
+
+        if isinstance(method, EditMessageText) and len(method.text or "") > 4096:
+            raise TelegramBadRequest(method, "Bad Request: message is too long")
 
         if not self.stateful and isinstance(method, (EditMessageText, SendMessage)):
             return Message(
@@ -4079,3 +4084,323 @@ class _JourneyState:
     async def clear(self):
         self.data.clear()
         self.state = None
+
+
+@pytest.mark.asyncio
+async def test_system_message_locale_repeat_finishes_callback_on_every_visible_page(
+    factory,
+    admin_dispatcher,
+    monkeypatch,
+):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add(DBUser(id=61, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=61, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=6100, message=root_message))
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_general_settings", 6101)
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_system_messages", 6102)
+
+    def buttons(message):
+        return [
+            button
+            for row in (message.reply_markup.inline_keyboard if message.reply_markup else [])
+            for button in row
+            if button.callback_data
+        ]
+
+    def locale_button(message, locale):
+        return next(
+            button
+            for button in buttons(message)
+            if parse_system_message_callback(button.callback_data)
+            and parse_system_message_callback(button.callback_data)["action"] == "l"
+            and parse_system_message_callback(button.callback_data)["locale"] == locale
+        )
+
+    total_pages = system_message_page_count("telegram")
+    assert total_pages >= 3
+    for page in range(total_pages):
+        for locale in ("ru", "en", "pt"):
+            current = session.current_message(root_message)
+            selected = locale_button(current, locale)
+            for repeat in range(2):
+                current = session.current_message(root_message)
+                before = current.model_dump(mode="json", exclude_none=True)
+                session.calls.clear()
+                await _feed_callback(
+                    admin_dispatcher,
+                    bot,
+                    current,
+                    selected.callback_data,
+                    6103 + page * 20 + len(locale) * 2 + repeat,
+                )
+                assert any(isinstance(method, AnswerCallbackQuery) for method in session.calls)
+                if repeat == 1:
+                    assert not any(isinstance(method, EditMessageText) for method in session.calls)
+                    assert session.current_message(root_message).model_dump(
+                        mode="json", exclude_none=True
+                    ) == before
+                selected = locale_button(session.current_message(root_message), locale)
+        if page == total_pages - 1:
+            continue
+        current = session.current_message(root_message)
+        next_button = next(
+            button
+            for button in buttons(current)
+            if parse_system_message_callback(button.callback_data)
+            and parse_system_message_callback(button.callback_data)["action"] == "p"
+            and int(parse_system_message_callback(button.callback_data)["page"]) == page + 1
+        )
+        await _feed_callback(
+            admin_dispatcher,
+            bot,
+            current,
+            next_button.callback_data,
+            6200 + page,
+        )
+
+
+@pytest.mark.asyncio
+async def test_waiting_message_has_one_telegram_admin_path_and_uses_effective_text(
+    factory,
+    admin_dispatcher,
+    monkeypatch,
+):
+    import handlers
+    import httpx
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers.ai_integration, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        config = await db_session.get(BotGeneralConfig, 1)
+        config.ai_processing_message_enabled = True
+        config.ai_processing_message_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+        config.telegram_language_selection_enabled = True
+        db_session.add_all([
+            DBUser(id=62, is_admin=True, first_name="Admin", telegram_language_code="ru", current_dialogue_id=1),
+            DBUser(id=63, first_name="Português", telegram_language_code="pt", current_dialogue_id=1),
+            DBUser(id=64, first_name="Русский", telegram_language_code="ru", current_dialogue_id=1),
+            AIConfig(
+                id=1,
+                provider="OpenRouter",
+                openrouter_api_key="sk-test-key",
+                openrouter_model="qwen/qwen3.7-plus",
+                system_prompt="Система",
+                memory_mode="global",
+            ),
+            SubscriptionConfig(id=1, subscriptions_enabled=False),
+            BotAddressingConfig(bot_scope="telegram", addressing_style="formal"),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.processing_default",
+                locale="ru",
+                addressing_style="formal",
+                text="Подождите, пожалуйста...",
+            ),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.processing_default",
+                locale="pt",
+                addressing_style="formal",
+                text="Aguarde, por favor...",
+            ),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.processing_default",
+                locale="pt",
+                addressing_style="informal",
+                text="Aguarde um pouco...",
+            ),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.processing_default",
+                locale="ru",
+                addressing_style="informal",
+                text="Думаю по-дружески...",
+            ),
+        ])
+        await db_session.commit()
+
+    async def fake_provider_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "Ответ"}}]},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_provider_post)
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=62, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=6300, message=root_message))
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_general_settings", 6301)
+    general = session.current_message(root_message)
+    editor_button = next(
+        button
+        for row in general.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data == "admin_general_edit_ai_processing_message_text"
+    )
+    await _feed_callback(admin_dispatcher, bot, general, editor_button.callback_data, 6302)
+    editor = session.current_message(root_message)
+    assert "Подождите, пожалуйста..." in editor.text
+
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=6303,
+            message=_admin_message(bot, user_id=62, message_id=2, text="Meu texto de espera"),
+        ),
+    )
+    general = session.current_message(root_message)
+    assert "Действующий текст: Meu texto de espera" in general.text
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).ai_processing_message_text == "Meu texto de espera"
+
+    await _feed_callback(admin_dispatcher, bot, general, "admin_panel", 63031)
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        session.current_message(root_message),
+        "admin_general_settings",
+        63032,
+    )
+    general = session.current_message(root_message)
+    assert "Действующий текст: Meu texto de espera" in general.text
+
+    handlers.user_message_buffers[63] = ["Olá"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(63, bot)
+    waiting = next(
+        method
+        for method in session.calls
+        if isinstance(method, SendMessage) and method.chat_id == 63 and method.text == "Meu texto de espera"
+    )
+    waiting_index = session.calls.index(waiting)
+    assert any(
+        isinstance(method, DeleteMessage)
+        and method.chat_id == 63
+        and method.message_id == 1
+        and session.calls.index(method) > waiting_index
+        for method in session.calls
+    )
+
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        general,
+        "admin_general_set_addressing_informal",
+        6304,
+    )
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        session.current_message(root_message),
+        "admin_general_edit_ai_processing_message_text",
+        6305,
+    )
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=6306,
+            message=_admin_message(bot, user_id=62, message_id=3, text=DEFAULT_AI_PROCESSING_MESSAGE_TEXT),
+        ),
+    )
+    async with factory() as db_session:
+        config = await db_session.get(BotGeneralConfig, 1)
+        assert config.ai_processing_message_text == DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+
+    handlers.user_message_buffers[63] = ["Olá de novo"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(63, bot)
+    assert any(
+        isinstance(method, SendMessage) and method.chat_id == 63 and method.text == "Aguarde um pouco..."
+        for method in session.calls
+    )
+    handlers.user_message_buffers[64] = ["Привет"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(64, bot)
+    assert any(
+        isinstance(method, SendMessage) and method.chat_id == 64 and method.text == "Думаю по-дружески..."
+        for method in session.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_waiting_message_is_not_exposed_as_a_second_telegram_catalog_setting(
+    factory,
+    admin_dispatcher,
+    monkeypatch,
+):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add(DBUser(id=65, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=65, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=6400, message=root_message))
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_general_settings", 6401)
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_system_messages", 6402)
+
+    for page in range(system_message_page_count("telegram")):
+        current = session.current_message(root_message)
+        for row in current.reply_markup.inline_keyboard:
+            for button in row:
+                parsed = parse_system_message_callback(button.callback_data or "")
+                if parsed and parsed["action"] == "d":
+                    assert parsed["key"] != "ui.ai.processing_default"
+        if page == system_message_page_count("telegram") - 1:
+            break
+        next_button = next(
+            button
+            for row in current.reply_markup.inline_keyboard
+            for button in row
+            if parse_system_message_callback(button.callback_data or "")
+            and parse_system_message_callback(button.callback_data)["action"] == "p"
+            and int(parse_system_message_callback(button.callback_data)["page"]) == page + 1
+        )
+        await _feed_callback(admin_dispatcher, bot, current, next_button.callback_data, 6403 + page)
+
+
+@pytest.mark.asyncio
+async def test_waiting_message_general_screen_is_bounded_and_escaped(
+    factory,
+    admin_dispatcher,
+    monkeypatch,
+):
+    import handlers
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        config = await db_session.get(BotGeneralConfig, 1)
+        config.ai_processing_message_text = "<b>" + ("A" * 4089) + "</b>"
+        db_session.add(DBUser(id=66, is_admin=True, first_name="Admin"))
+        await db_session.commit()
+
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=66, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=6500, message=root_message))
+    session.calls.clear()
+    await _feed_callback(admin_dispatcher, bot, root_message, "admin_general_settings", 6501)
+    rendered = [method for method in session.calls if isinstance(method, EditMessageText)]
+    assert rendered
+    assert len(rendered[-1].text) <= 4096
+    assert "&lt;b&gt;" in rendered[-1].text
