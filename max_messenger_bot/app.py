@@ -97,6 +97,20 @@ def _track_task(tasks: set[asyncio.Task[None]], task: asyncio.Task[None]) -> Non
     task.add_done_callback(_log_background_task_result)
 
 
+async def _reject_unavailable_system_message_locale(
+    client: MaxApiClient,
+    callback_id: str,
+    locale: str,
+) -> bool:
+    if admin_system_messages_service.locale_is_available(locale):
+        return False
+    await client.answer_callback(
+        callback_id,
+        notification="В MAX доступен только русский язык.",
+    )
+    return True
+
+
 def _spawn_update_task(app: web.Application, update: dict[str, Any]) -> None:
     task = asyncio.create_task(app["bot_app"].handle_update(update))
     _track_task(app["background_tasks"], task)
@@ -1142,6 +1156,12 @@ class MaxBotApplication:
             page = compact_system_message.get("page", 0)
             key = compact_system_message.get("key")
             style = compact_system_message.get("style")
+            if await _reject_unavailable_system_message_locale(
+                self.client,
+                callback.callback_id,
+                locale,
+            ):
+                return
             try:
                 if action == "l":
                     await self.states.clear(user_id)
@@ -1243,22 +1263,52 @@ class MaxBotApplication:
                     await admin_system_messages_service.show_system_messages(self.client, chat_id)
                 elif data.startswith("admin_system_messages_locale:"):
                     _, locale, page = data.split(":", 2)
+                    if await _reject_unavailable_system_message_locale(
+                        self.client,
+                        callback.callback_id,
+                        locale,
+                    ):
+                        return
                     await self.states.clear(user_id)
                     await admin_system_messages_service.show_system_messages(self.client, chat_id, locale, page)
                 elif data.startswith("admin_system_messages_page:"):
                     _, page, locale = data.split(":", 2)
+                    if await _reject_unavailable_system_message_locale(
+                        self.client,
+                        callback.callback_id,
+                        locale,
+                    ):
+                        return
                     await self.states.clear(user_id)
                     await admin_system_messages_service.show_system_messages(self.client, chat_id, locale, page)
                 elif data.startswith("admin_system_message:"):
                     _, key, locale, page = data.split(":", 3)
+                    if await _reject_unavailable_system_message_locale(
+                        self.client,
+                        callback.callback_id,
+                        locale,
+                    ):
+                        return
                     await self.states.clear(user_id)
                     await admin_system_messages_service.show_system_message(self.client, chat_id, key, locale, page)
                 elif data.startswith("admin_system_preview:"):
                     _, key, locale, style, page = data.split(":", 4)
+                    if await _reject_unavailable_system_message_locale(
+                        self.client,
+                        callback.callback_id,
+                        locale,
+                    ):
+                        return
                     await self.states.clear(user_id)
                     await admin_system_messages_service.preview_system_message(self.client, chat_id, key, locale, style, page)
                 elif data.startswith("admin_system_edit:"):
                     _, key, locale, style, page = data.split(":", 4)
+                    if await _reject_unavailable_system_message_locale(
+                        self.client,
+                        callback.callback_id,
+                        locale,
+                    ):
+                        return
                     await admin_system_messages_service.start_edit_system_message(
                         self.client,
                         self.states,
@@ -1271,6 +1321,12 @@ class MaxBotApplication:
                     )
                 elif data.startswith("admin_system_save:"):
                     _, key, locale, style, page = data.split(":", 4)
+                    if await _reject_unavailable_system_message_locale(
+                        self.client,
+                        callback.callback_id,
+                        locale,
+                    ):
+                        return
                     await self.states.clear(user_id)
                     await admin_system_messages_service.show_system_message(
                         self.client,
@@ -1286,6 +1342,12 @@ class MaxBotApplication:
                     return
                 elif data.startswith("admin_system_cancel:"):
                     _, key, locale, style, page = data.split(":", 4)
+                    if await _reject_unavailable_system_message_locale(
+                        self.client,
+                        callback.callback_id,
+                        locale,
+                    ):
+                        return
                     await admin_system_messages_service.cancel_system_message_edit(
                         self.client,
                         self.states,
@@ -1298,6 +1360,12 @@ class MaxBotApplication:
                     )
                 elif data.startswith("admin_system_reset:"):
                     _, key, locale, style, page = data.split(":", 4)
+                    if await _reject_unavailable_system_message_locale(
+                        self.client,
+                        callback.callback_id,
+                        locale,
+                    ):
+                        return
                     await self.states.clear(user_id)
                     await admin_system_messages_service.show_system_message(
                         self.client,

@@ -17,6 +17,7 @@ from system_messages import (
     save_system_message,
     resolve_system_text,
     system_message_callback_data,
+    system_message_authoring_locales,
     system_message_catalog_for_platform,
     system_message_page_count,
 )
@@ -27,7 +28,7 @@ from ..legacy import async_session_maker
 from ..storage import StateStore
 
 
-LOCALES = ("ru", "en", "pt")
+LOCALES = system_message_authoring_locales("max")
 
 
 def _locale_label(locale: str) -> str:
@@ -43,6 +44,10 @@ def _valid_page(value: str | int | None) -> int:
 
 def _valid_locale(value: str | None) -> str:
     return value if value in LOCALES else "ru"
+
+
+def locale_is_available(value: str | None) -> bool:
+    return value in LOCALES
 
 
 def _valid_style(value: str | None) -> str:
@@ -134,11 +139,6 @@ async def show_system_messages(
         )]
         for item in definitions
     ]
-    rows.append([
-        callback_button(f"{'✅ ' if locale == 'ru' else ''}RU", system_message_callback_data("l", locale="ru", page=page)),
-        callback_button(f"{'✅ ' if locale == 'en' else ''}EN", system_message_callback_data("l", locale="en", page=page)),
-        callback_button(f"{'✅ ' if locale == 'pt' else ''}PT", system_message_callback_data("l", locale="pt", page=page)),
-    ])
     navigation = []
     if page > 0:
         navigation.append(callback_button("⬅️ Назад", system_message_callback_data("p", locale=locale, page=page - 1)))

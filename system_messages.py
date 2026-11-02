@@ -203,6 +203,30 @@ SYSTEM_MESSAGE_CATALOG = tuple(
     for definition in SYSTEM_MESSAGE_CATALOG
 )
 
+SYSTEM_MESSAGE_AUTHORING_LOCALES = ("ru", "en", "pt")
+
+
+def system_message_authoring_locales(
+    platform: str,
+    *,
+    multilingual_enabled: bool = False,
+) -> tuple[str, ...]:
+    if str(platform or "").strip().lower() == "telegram" and multilingual_enabled:
+        return SYSTEM_MESSAGE_AUTHORING_LOCALES
+    return ("ru",)
+
+
+def system_message_locale_is_available(
+    platform: str,
+    locale: str,
+    *,
+    multilingual_enabled: bool = False,
+) -> bool:
+    return normalize_locale(locale) in system_message_authoring_locales(
+        platform,
+        multilingual_enabled=multilingual_enabled,
+    )
+
 
 def system_message_catalog_for_platform(platform: str) -> tuple[SystemMessageDefinition, ...]:
     normalized_platform = str(platform or "").strip().lower()

@@ -43,6 +43,7 @@ from system_messages import (
     ADDRESSING_STYLES,
     SYSTEM_MESSAGE_PAGE_SIZE,
     normalize_addressing_style,
+    system_message_authoring_locales,
     system_message_catalog_for_platform,
     system_message_callback_data,
     system_message_page_count,
@@ -320,8 +321,18 @@ def admin_general_settings_keyboard(config, addressing_style=None):
     return builder.as_markup()
 
 
-def admin_system_messages_keyboard(locale: str = "ru", page: int = 0):
-    normalized_locale = locale if locale in {"ru", "en", "pt"} else "ru"
+def admin_system_messages_keyboard(
+    locale: str = "ru",
+    page: int = 0,
+    *,
+    multilingual_enabled: bool = True,
+    active_locales: tuple[str, ...] | None = None,
+):
+    available_locales = system_message_authoring_locales(
+        "telegram",
+        multilingual_enabled=multilingual_enabled,
+    )
+    normalized_locale = locale if locale in available_locales else "ru"
     definitions = system_message_catalog_for_platform("telegram")
     total_pages = system_message_page_count("telegram")
     current_page = max(0, min(page, total_pages - 1))
@@ -333,13 +344,25 @@ def admin_system_messages_keyboard(locale: str = "ru", page: int = 0):
         )]
         for definition in definitions[start:start + SYSTEM_MESSAGE_PAGE_SIZE]
     ]
-    rows.append([
-        InlineKeyboardButton(
-            text=f"{'✅ ' if item == normalized_locale else ''}{item.upper()}",
-            callback_data=system_message_callback_data("l", locale=item, page=current_page),
-        )
-        for item in ("ru", "en", "pt")
-    ])
+    if len(available_locales) > 1:
+        active_set = set(active_locales) if active_locales is not None else set(available_locales)
+
+        def locale_prefix(item: str) -> str:
+            if item == normalized_locale:
+                return "✅ "
+            if active_locales is None:
+                return ""
+            if item in active_set:
+                return "🟢 "
+            return "⚪ "
+
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{locale_prefix(item)}{item.upper()}",
+                callback_data=system_message_callback_data("l", locale=item, page=current_page),
+            )
+            for item in available_locales
+        ])
     navigation = []
     if current_page > 0:
         navigation.append(InlineKeyboardButton(

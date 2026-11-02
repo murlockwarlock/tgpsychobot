@@ -416,6 +416,7 @@ from system_messages import (
     reset_system_message,
     save_addressing_style,
     save_system_message,
+    system_message_authoring_locales,
     system_message_page_count,
     system_message_catalog_for_platform,
     SYSTEM_MESSAGE_PAGE_SIZE,
@@ -21591,8 +21592,38 @@ def _system_messages_locale_label(locale: str) -> str:
     return {"ru": "Русский", "en": "English", "pt": "Português"}.get(locale, "Русский")
 
 
+async def _telegram_system_message_scope() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    async with async_session_maker() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        multilingual_enabled = bool(getattr(config, "multilingual_authoring_enabled", False))
+        return (
+            system_message_authoring_locales("telegram", multilingual_enabled=multilingual_enabled),
+            runtime_enabled_languages(config),
+        )
+
+
+async def _telegram_system_message_locales() -> tuple[str, ...]:
+    locales, _ = await _telegram_system_message_scope()
+    return locales
+
+
+async def _telegram_system_message_locale_allowed(locale: str) -> bool:
+    return locale in await _telegram_system_message_locales()
+
+
+async def _reject_hidden_telegram_system_message_locale(callback: CallbackQuery, locale: str) -> bool:
+    if await _telegram_system_message_locale_allowed(locale):
+        return False
+    await callback.answer(
+        limit_callback_answer("Этот язык сейчас скрыт. Включите мультиязычность в разделе «Языки»."),
+        show_alert=True,
+    )
+    return True
+
+
 async def _render_admin_system_messages(callback: CallbackQuery, locale: str = "ru", page: int = 0):
-    normalized_locale = locale if locale in {"ru", "en", "pt"} else "ru"
+    available_locales, active_locales = await _telegram_system_message_scope()
+    normalized_locale = locale if locale in available_locales else "ru"
     total_pages = system_message_page_count("telegram")
     current_page = max(0, min(page, total_pages - 1))
     text = (
@@ -21604,7 +21635,12 @@ async def _render_admin_system_messages(callback: CallbackQuery, locale: str = "
     await callback.message.edit_text(
         text,
         parse_mode="HTML",
-        reply_markup=kb.admin_system_messages_keyboard(normalized_locale, current_page),
+        reply_markup=kb.admin_system_messages_keyboard(
+            normalized_locale,
+            current_page,
+            multilingual_enabled=len(available_locales) > 1,
+            active_locales=active_locales,
+        ),
     )
 
 
@@ -21616,6 +21652,8 @@ async def _render_admin_system_message_detail(callback: CallbackQuery, key: str,
         or locale not in {"ru", "en", "pt"}
     ):
         await callback.answer("Системное сообщение не найдено.", show_alert=True)
+        return
+    if await _reject_hidden_telegram_system_message_locale(callback, locale):
         return
     async with async_session_maker() as session:
         variants = await get_system_message_variants(session, key, locale, bot_scope="telegram")
@@ -21654,6 +21692,8 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
     page = int(parsed.get("page", 0)) if str(parsed.get("page", "0")).isdigit() else 0
     key = parsed.get("key")
     style = parsed.get("style")
+    if await _reject_hidden_telegram_system_message_locale(callback, locale):
+        return
     if action in {"d", "v", "e", "r", "s", "c"} and (
         key not in SYSTEM_MESSAGE_DEFINITIONS
         or not SYSTEM_MESSAGE_DEFINITIONS[key].supports_platform("telegram")
@@ -21841,6 +21881,8 @@ async def admin_system_messages_locale(callback: CallbackQuery, state: FSMContex
     parts = (callback.data or "").split(":")
     locale = parts[1] if len(parts) > 1 else "ru"
     page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    if await _reject_hidden_telegram_system_message_locale(callback, locale):
+        return
     await state.clear()
     await _render_admin_system_messages(callback, locale, page)
     await callback.answer()
@@ -21854,6 +21896,8 @@ async def admin_system_messages_page(callback: CallbackQuery, state: FSMContext)
     parts = (callback.data or "").split(":")
     page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     locale = parts[2] if len(parts) > 2 else "ru"
+    if await _reject_hidden_telegram_system_message_locale(callback, locale):
+        return
     await state.clear()
     await _render_admin_system_messages(callback, locale, page)
     await callback.answer()
@@ -21867,6 +21911,8 @@ async def admin_system_message_detail(callback: CallbackQuery, state: FSMContext
     parts = (callback.data or "").split(":")
     if len(parts) != 4:
         await callback.answer("Некорректный ключ сообщения.", show_alert=True)
+        return
+    if await _reject_hidden_telegram_system_message_locale(callback, parts[2]):
         return
     await state.clear()
     await _render_admin_system_message_detail(
@@ -21894,6 +21940,8 @@ async def admin_system_message_preview(callback: CallbackQuery, state: FSMContex
         await callback.answer("Некорректный вариант сообщения.", show_alert=True)
         return
     key, locale, style = parts[1], parts[2], parts[3]
+    if await _reject_hidden_telegram_system_message_locale(callback, locale):
+        return
     await state.clear()
     async with async_session_maker() as session:
         text_value = await resolve_system_text(session, key, locale, style, bot_scope="telegram")
@@ -21926,6 +21974,8 @@ async def admin_system_message_edit(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Некорректный вариант сообщения.", show_alert=True)
         return
     key, locale, style = parts[1], parts[2], parts[3]
+    if await _reject_hidden_telegram_system_message_locale(callback, locale):
+        return
     async with async_session_maker() as session:
         current_text = await resolve_system_text(session, key, locale, style, bot_scope="telegram")
     await state.set_state(AdminStates.set_system_message_text)
@@ -21990,6 +22040,8 @@ async def admin_system_message_save(callback: CallbackQuery, state: FSMContext):
     ):
         await callback.answer(limit_callback_answer("Некорректная кнопка системного сообщения."), show_alert=True)
         return
+    if await _reject_hidden_telegram_system_message_locale(callback, parts[2]):
+        return
     await state.clear()
     await _render_admin_system_message_detail(
         callback,
@@ -22008,6 +22060,8 @@ async def admin_system_message_cancel(callback: CallbackQuery, state: FSMContext
     parts = (callback.data or "").split(":")
     if len(parts) != 4:
         await callback.answer("Некорректное состояние редактирования.", show_alert=True)
+        return
+    if await _reject_hidden_telegram_system_message_locale(callback, parts[2]):
         return
     data = await state.get_data()
     style = data.get("system_message_style")
@@ -22035,6 +22089,8 @@ async def admin_system_message_reset(callback: CallbackQuery, state: FSMContext)
         or parts[3] not in {"informal", "formal"}
     ):
         await callback.answer("Некорректный вариант сообщения.", show_alert=True)
+        return
+    if await _reject_hidden_telegram_system_message_locale(callback, parts[2]):
         return
     await state.clear()
     await _render_admin_system_message_detail(callback, parts[1], parts[2], int(parts[4]) if parts[4].isdigit() else 0)
