@@ -861,6 +861,34 @@ def test_system_message_keyboard_is_friendly_and_keeps_canonical_rows():
     assert all(len(button.callback_data.encode("utf-8")) <= 64 for button in buttons)
 
 
+def test_system_message_keyboard_hides_locale_switch_when_multilingual_is_off():
+    import keyboards
+
+    markup = keyboards.admin_system_messages_keyboard(
+        locale="pt",
+        page=0,
+        multilingual_enabled=False,
+    )
+    buttons = [button for row in markup.inline_keyboard for button in row]
+    assert not any(
+        (parse_system_message_callback(button.callback_data or "") or {}).get("action") == "l"
+        for button in buttons
+    )
+
+    enabled_markup = keyboards.admin_system_messages_keyboard(
+        locale="ru",
+        page=0,
+        multilingual_enabled=True,
+        active_locales=("ru",),
+    )
+    locale_row = next(
+        row
+        for row in enabled_markup.inline_keyboard
+        if any((parse_system_message_callback(button.callback_data or "") or {}).get("action") == "l" for button in row)
+    )
+    assert [button.text for button in locale_row] == ["✅ RU", "⚪ EN", "⚪ PT"]
+
+
 def test_system_message_keyboard_hides_pagination_for_single_page(monkeypatch):
     import keyboards
     import system_messages
@@ -878,6 +906,453 @@ def test_system_message_keyboard_hides_pagination_for_single_page(monkeypatch):
         (parse_system_message_callback(button.callback_data or "") or {}).get("action") == "p"
         for button in buttons
     )
+
+
+@pytest.mark.asyncio
+async def test_telegram_system_message_locale_scope_survives_toggle_and_reopen(
+    factory,
+    admin_dispatcher,
+    monkeypatch,
+):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+    from system_messages import resolve_system_text
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", factory)
+    monkeypatch.setattr(automation_admin, "async_session_maker", factory)
+    monkeypatch.setattr(keyboards, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    async with factory() as session:
+        config = await session.get(BotGeneralConfig, 1)
+        config.multilingual_authoring_enabled = False
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin"),
+            AIConfig(id=1, provider="Deepseek"),
+            SubscriptionConfig(id=1),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key="ui.ai.thinking",
+                locale="pt",
+                addressing_style="formal",
+                text="Сохранённый PT текст",
+            ),
+            BotTranslation(
+                locale="pt",
+                translation_key="content.saved_translation",
+                text="Сохранённый перевод PT",
+                source_hash=source_hash("Исходный текст"),
+            ),
+        ])
+        await session.commit()
+
+    telegram_session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=telegram_session)
+    root = _admin_message(bot, text="/admin")
+    update_id = 7000
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(update_id=update_id, message=root),
+    )
+
+    def buttons(message):
+        return [
+            button
+            for row in (message.reply_markup.inline_keyboard if message.reply_markup else [])
+            for button in row
+            if button.callback_data
+        ]
+
+    def parsed_buttons(message, action=None):
+        result = []
+        for button in buttons(message):
+            parsed = parse_system_message_callback(button.callback_data)
+            if parsed is not None and (action is None or parsed["action"] == action):
+                result.append((button, parsed))
+        return result
+
+    async def press(message, predicate):
+        nonlocal update_id
+        visible = telegram_session.current_message(message)
+        button = next(button for button in buttons(visible) if predicate(button))
+        update_id += 1
+        await _feed_callback(admin_dispatcher, bot, visible, button.callback_data, update_id)
+        return telegram_session.current_message(visible)
+
+    screen = await press(root, lambda button: button.callback_data == "admin_general_settings")
+    system_list = await press(screen, lambda button: button.callback_data == "admin_system_messages")
+    assert not parsed_buttons(system_list, "l")
+
+    before_hidden_callback = telegram_session.current_message(system_list)
+    calls_before_hidden_callback = len(telegram_session.calls)
+    update_id += 1
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        before_hidden_callback,
+        "admin_system_messages_locale:pt:0",
+        update_id,
+    )
+    hidden_calls = telegram_session.calls[calls_before_hidden_callback:]
+    assert any(isinstance(method, AnswerCallbackQuery) for method in hidden_calls)
+    assert not any(isinstance(method, EditMessageText) for method in hidden_calls)
+    assert telegram_session.current_message(system_list).text == before_hidden_callback.text
+
+    calls_before_hidden_compact_callback = len(telegram_session.calls)
+    update_id += 1
+    await _feed_callback(
+        admin_dispatcher,
+        bot,
+        before_hidden_callback,
+        "sm:l:pt:0",
+        update_id,
+    )
+    hidden_compact_calls = telegram_session.calls[calls_before_hidden_compact_callback:]
+    assert any(isinstance(method, AnswerCallbackQuery) for method in hidden_compact_calls)
+    assert not any(isinstance(method, EditMessageText) for method in hidden_compact_calls)
+    assert telegram_session.current_message(system_list).text == before_hidden_callback.text
+
+    screen = await press(system_list, lambda button: button.callback_data == "admin_general_settings")
+    language = await press(screen, lambda button: button.callback_data == "admin_language_settings")
+    assert any(
+        button.callback_data == "admin_toggle_multilingual_authoring"
+        for button in buttons(language)
+    )
+    language = await press(language, lambda button: button.callback_data == "admin_toggle_multilingual_authoring")
+    screen = await press(language, lambda button: button.callback_data == "admin_general_settings")
+    system_list = await press(screen, lambda button: button.callback_data == "admin_system_messages")
+    locale_buttons = parsed_buttons(system_list, "l")
+    assert {parsed["locale"] for _, parsed in locale_buttons} == {"ru", "en", "pt"}
+    assert any(button.text.startswith("✅ ") for button, _ in locale_buttons)
+    assert all(len(button.callback_data.encode("utf-8")) <= 64 for button in buttons(system_list))
+
+    system_list = await press(
+        system_list,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("locale") == "pt"
+        and (parse_system_message_callback(button.callback_data) or {}).get("action") == "l",
+    )
+    current_page = 0
+    while True:
+        target = [
+            (button, parsed)
+            for button, parsed in parsed_buttons(system_list, "d")
+            if parsed["key"] == "ui.ai.thinking"
+        ]
+        if target:
+            break
+        next_page = next(
+            button
+            for button, parsed in parsed_buttons(system_list, "p")
+            if int(parsed["page"]) == current_page + 1
+        )
+        system_list = await press(system_list, lambda button, target=next_page: button.callback_data == target.callback_data)
+        current_page += 1
+
+    detail = await press(system_list, lambda button, target=target[0][0]: button.callback_data == target.callback_data)
+    editor = await press(
+        detail,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "e"
+        and (parse_system_message_callback(button.callback_data) or {}).get("style") == "formal",
+    )
+    assert "Язык: <b>Português</b>" in editor.text
+    assert "<b>Вы</b>" in editor.text
+    telegram_session._next_message_ids[11] = 100
+    user = root.from_user
+    draft_message = Message(
+        message_id=90,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=11, type="private"),
+        from_user=user,
+        text="Сохранённый PT текст после выключения",
+    ).as_(bot)
+    update_id += 1
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(update_id=update_id, message=draft_message),
+    )
+    draft_screen = telegram_session.latest_message_with_keyboard(bot, 11, user)
+    detail = await press(
+        draft_screen,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "s",
+    )
+    system_list = await press(
+        detail,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "p",
+    )
+    screen = await press(system_list, lambda button: button.callback_data == "admin_general_settings")
+    language = await press(screen, lambda button: button.callback_data == "admin_language_settings")
+    language = await press(language, lambda button: button.callback_data == "admin_toggle_multilingual_authoring")
+    screen = await press(language, lambda button: button.callback_data == "admin_general_settings")
+    system_list = await press(screen, lambda button: button.callback_data == "admin_system_messages")
+    assert not parsed_buttons(system_list, "l")
+
+    screen = await press(system_list, lambda button: button.callback_data == "admin_general_settings")
+    language = await press(screen, lambda button: button.callback_data == "admin_language_settings")
+    language = await press(language, lambda button: button.callback_data == "admin_toggle_multilingual_authoring")
+    screen = await press(language, lambda button: button.callback_data == "admin_general_settings")
+    system_list = await press(screen, lambda button: button.callback_data == "admin_system_messages")
+    system_list = await press(
+        system_list,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("locale") == "pt"
+        and (parse_system_message_callback(button.callback_data) or {}).get("action") == "l",
+    )
+    current_page = 0
+    while not any(
+        parsed["key"] == "ui.ai.thinking"
+        for _, parsed in parsed_buttons(system_list, "d")
+    ):
+        current_page += 1
+        system_list = await press(
+            system_list,
+            lambda button, page=current_page: (parse_system_message_callback(button.callback_data) or {}).get("action") == "p"
+            and int((parse_system_message_callback(button.callback_data) or {}).get("page", -1)) == page,
+        )
+    detail = await press(
+        system_list,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "d"
+        and (parse_system_message_callback(button.callback_data) or {}).get("key") == "ui.ai.thinking",
+    )
+    assert "Сохранённый PT текст после выключения" in detail.text
+
+    async with factory() as session:
+        assert await resolve_system_text(
+            session,
+            "ui.ai.thinking",
+            "pt",
+            "formal",
+            bot_scope="telegram",
+        ) == "Сохранённый PT текст после выключения"
+        translation = await session.scalar(
+            select(BotTranslation).where(
+                BotTranslation.locale == "pt",
+                BotTranslation.translation_key == "content.saved_translation",
+            )
+        )
+        assert translation.text == "Сохранённый перевод PT"
+
+
+@pytest.mark.parametrize("hidden_locale", ["en", "pt"])
+@pytest.mark.asyncio
+async def test_telegram_hidden_locale_cancel_returns_to_ru_list_and_clears_state(
+    factory,
+    admin_dispatcher,
+    monkeypatch,
+    hidden_locale,
+):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+    from handlers import AdminStates
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", factory)
+    monkeypatch.setattr(automation_admin, "async_session_maker", factory)
+    monkeypatch.setattr(keyboards, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11, 12}))
+
+    key = "ui.ai.thinking"
+    original_text = "Сохранённый PT текст"
+    original_translation = "Сохранённый перевод PT"
+    async with factory() as session:
+        session.add_all([
+            DBUser(id=11, is_admin=True, first_name="Admin 11"),
+            DBUser(id=12, is_admin=True, first_name="Admin 12"),
+            AIConfig(id=1, provider="Deepseek"),
+            SubscriptionConfig(id=1),
+            BotSystemMessage(
+                bot_scope="telegram",
+                translation_key=key,
+                locale=hidden_locale,
+                addressing_style="formal",
+                text=original_text,
+            ),
+            BotTranslation(
+                locale=hidden_locale,
+                translation_key="content.saved_translation",
+                text=original_translation,
+                source_hash=source_hash("Исходный текст"),
+            ),
+        ])
+        await session.commit()
+
+    telegram_session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=telegram_session)
+    update_id = 7100
+    root_11 = _admin_message(bot, user_id=11, text="/admin")
+    root_12 = _admin_message(bot, user_id=12, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=update_id, message=root_11))
+    update_id += 1
+    await admin_dispatcher.feed_update(bot, Update(update_id=update_id, message=root_12))
+
+    def buttons(message):
+        visible = telegram_session.current_message(message)
+        return [
+            button
+            for row in (visible.reply_markup.inline_keyboard if visible.reply_markup else [])
+            for button in row
+            if button.callback_data
+        ]
+
+    def parsed_buttons(message, action=None):
+        result = []
+        for button in buttons(message):
+            parsed = parse_system_message_callback(button.callback_data)
+            if parsed is not None and (action is None or parsed["action"] == action):
+                result.append((button, parsed))
+        return result
+
+    async def press(message, predicate):
+        nonlocal update_id
+        visible = telegram_session.current_message(message)
+        button = next(button for button in buttons(visible) if predicate(button))
+        update_id += 1
+        calls_before = len(telegram_session.calls)
+        await _feed_callback(admin_dispatcher, bot, visible, button.callback_data, update_id)
+        return (
+            telegram_session.current_message(visible),
+            telegram_session.calls[calls_before:],
+        )
+
+    async def feed(message, callback_data):
+        nonlocal update_id
+        update_id += 1
+        visible = telegram_session.current_message(message)
+        calls_before = len(telegram_session.calls)
+        await _feed_callback(admin_dispatcher, bot, visible, callback_data, update_id)
+        return telegram_session.current_message(visible), telegram_session.calls[calls_before:]
+
+    screen_11, _ = await press(root_11, lambda button: button.callback_data == "admin_general_settings")
+    system_list_11, _ = await press(screen_11, lambda button: button.callback_data == "admin_system_messages")
+    system_list_11, _ = await press(
+        system_list_11,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "l"
+        and (parse_system_message_callback(button.callback_data) or {}).get("locale") == hidden_locale,
+    )
+    while not any(parsed["key"] == key for _, parsed in parsed_buttons(system_list_11, "d")):
+        system_list_11, _ = await press(
+            system_list_11,
+            lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "p"
+            and int((parse_system_message_callback(button.callback_data) or {}).get("page", -1))
+            == max(
+                int(parsed["page"])
+                for _, parsed in parsed_buttons(system_list_11, "p")
+            ),
+        )
+    detail_11, _ = await press(
+        system_list_11,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "d"
+        and (parse_system_message_callback(button.callback_data) or {}).get("key") == key,
+    )
+    editor_11, _ = await press(
+        detail_11,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "e"
+        and (parse_system_message_callback(button.callback_data) or {}).get("style") == "formal",
+    )
+    context_11 = admin_dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+    assert (await context_11.get_state()).endswith("set_system_message_text")
+    assert (await context_11.get_data())["system_message_locale"] == hidden_locale
+
+    screen_12, _ = await press(root_12, lambda button: button.callback_data == "admin_general_settings")
+    language_12, _ = await press(screen_12, lambda button: button.callback_data == "admin_language_settings")
+    language_12, _ = await press(
+        language_12,
+        lambda button: button.callback_data == "admin_toggle_multilingual_authoring",
+    )
+    async with factory() as session:
+        assert not (await session.get(BotGeneralConfig, 1)).multilingual_authoring_enabled
+
+    _, blocked_mutation_calls = await feed(
+        editor_11,
+        system_message_callback_data("r", key, hidden_locale, "formal", 0),
+    )
+    assert any(isinstance(method, AnswerCallbackQuery) for method in blocked_mutation_calls)
+    assert not any(isinstance(method, EditMessageText) for method in blocked_mutation_calls)
+    assert (await context_11.get_data())["system_message_locale"] == hidden_locale
+
+    ru_list, cancel_calls = await press(
+        editor_11,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "c",
+    )
+    assert any(isinstance(method, EditMessageText) for method in cancel_calls)
+    assert any(isinstance(method, AnswerCallbackQuery) for method in cancel_calls)
+    assert "Язык: <b>Русский</b>" in ru_list.text
+    assert not parsed_buttons(ru_list, "l")
+    assert await context_11.get_state() is None
+    assert await context_11.get_data() == {}
+
+    ru_page, legacy_page_calls = await feed(ru_list, f"admin_system_messages_page:1:{hidden_locale}")
+    assert any(isinstance(method, EditMessageText) for method in legacy_page_calls)
+    assert "страница 2/" in ru_page.text
+    await context_11.set_state(AdminStates.set_system_message_text)
+    await context_11.update_data(
+        system_message_key=key,
+        system_message_locale=hidden_locale,
+        system_message_style="formal",
+        system_message_page=0,
+        system_message_draft="Не сохранять",
+    )
+    ru_list, legacy_cancel_calls = await feed(ru_page, f"admin_system_cancel:{key}:{hidden_locale}:0")
+    assert any(isinstance(method, EditMessageText) for method in legacy_cancel_calls)
+    assert "Язык: <b>Русский</b>" in ru_list.text
+    assert await context_11.get_state() is None
+    assert await context_11.get_data() == {}
+
+    screen_11, _ = await press(ru_list, lambda button: button.callback_data == "admin_general_settings")
+    language_11, _ = await press(screen_11, lambda button: button.callback_data == "admin_language_settings")
+    language_11, _ = await press(
+        language_11,
+        lambda button: button.callback_data == "admin_toggle_multilingual_authoring",
+    )
+    screen_11, _ = await press(language_11, lambda button: button.callback_data == "admin_general_settings")
+    system_list_11, _ = await press(screen_11, lambda button: button.callback_data == "admin_system_messages")
+    assert {
+        parsed["locale"]
+        for _, parsed in parsed_buttons(system_list_11, "l")
+    } == {"ru", "en", "pt"}
+    system_list_11, _ = await press(
+        system_list_11,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "l"
+        and (parse_system_message_callback(button.callback_data) or {}).get("locale") == hidden_locale,
+    )
+    while not any(parsed["key"] == key for _, parsed in parsed_buttons(system_list_11, "d")):
+        next_page = max(
+            int(parsed["page"])
+            for _, parsed in parsed_buttons(system_list_11, "p")
+        )
+        system_list_11, _ = await press(
+            system_list_11,
+            lambda button, next_page=next_page: (parse_system_message_callback(button.callback_data) or {}).get("action") == "p"
+            and int((parse_system_message_callback(button.callback_data) or {}).get("page", -1)) == next_page,
+        )
+    detail_11, _ = await press(
+        system_list_11,
+        lambda button: (parse_system_message_callback(button.callback_data) or {}).get("action") == "d"
+        and (parse_system_message_callback(button.callback_data) or {}).get("key") == key,
+    )
+    assert original_text in detail_11.text
+    async with factory() as session:
+        row = await session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "telegram",
+                BotSystemMessage.translation_key == key,
+                BotSystemMessage.locale == hidden_locale,
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        translation = await session.scalar(
+            select(BotTranslation).where(
+                BotTranslation.locale == hidden_locale,
+                BotTranslation.translation_key == "content.saved_translation",
+            )
+        )
+        assert row.text == original_text
+        assert translation.text == original_translation
 
 
 @pytest.mark.asyncio
@@ -1248,7 +1723,7 @@ async def test_telegram_system_message_ux_journey_uses_visible_stateful_keyboard
     )
     assert "Язык: <b>Português</b>" in system_list.text
     assert any(
-        {button.text for button in row} == {"RU", "EN", "✅ PT"}
+        {button.text for button in row} == {"🟢 RU", "🟢 EN", "✅ PT"}
         for row in system_list.reply_markup.inline_keyboard
     )
     target_button = next(

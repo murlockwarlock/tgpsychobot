@@ -1559,6 +1559,7 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
     await app.handle_update(user_msg_update)
     if max_user_id in app.user_tasks:
         await app.user_tasks[max_user_id]
+    assert not single_flight.is_busy("max", max_user_id)
 
     assert len(primary_calls) == 1
     assert len(fallback_calls) == 1
@@ -1622,6 +1623,7 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
     await app.handle_update(retry_update)
     if max_user_id in app.user_tasks:
         await app.user_tasks[max_user_id]
+    assert not single_flight.is_busy("max", max_user_id)
 
     # Verify primary provider was called on retry with prompt
     assert len(primary_calls) == 2
@@ -1687,6 +1689,7 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
         await app.user_tasks[max_user_id]
 
     assert len(primary_calls) == 2
+    assert not single_flight.is_busy("max", max_user_id)
     async with session_factory() as s:
         history = (await s.scalars(select(DBMessage).where(DBMessage.user_id == max_user_id).order_by(DBMessage.id))).all()
         assert len(history) == 2
