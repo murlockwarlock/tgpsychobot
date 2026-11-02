@@ -404,7 +404,12 @@ def admin_system_message_detail_keyboard(
                 if processing_text_explicit
                 else "🔀 Включить единый текст"
             ),
-            callback_data=system_message_callback_data("m", key, locale, page=page),
+            callback_data=system_message_callback_data(
+                "m0" if processing_text_explicit else "m1",
+                key,
+                locale,
+                page=page,
+            ),
         )])
     rows.append([InlineKeyboardButton(
         text="⬅️ К списку сообщений",

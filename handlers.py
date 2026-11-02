@@ -21842,11 +21842,11 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
         return
     if await _reject_hidden_telegram_system_message_locale(callback, locale):
         return
-    if action in {"d", "m", "v", "e", "r", "s", "c"} and (
+    if action in {"d", "m", "m0", "m1", "v", "e", "r", "s", "c"} and (
         key not in SYSTEM_MESSAGE_DEFINITIONS
         or not SYSTEM_MESSAGE_DEFINITIONS[key].supports_platform("telegram")
         or locale not in {"ru", "en", "pt"}
-        or (action not in {"d", "m"} and style not in {"informal", "formal"})
+        or (action not in {"d", "m", "m0", "m1"} and style not in {"informal", "formal"})
     ):
         await callback.answer(limit_callback_answer("Некорректный вариант сообщения."), show_alert=True)
         return
@@ -21868,6 +21868,10 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
         await callback.answer()
         return
     if action == "m":
+        await state.clear()
+        await callback.answer(limit_callback_answer("Кнопка устарела. Откройте карточку заново."))
+        return
+    if action in {"m0", "m1"}:
         if key != "ui.ai.processing_default":
             await callback.answer(limit_callback_answer("Режим доступен только для сообщения ожидания."), show_alert=True)
             return
@@ -21884,13 +21888,20 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
                 current_explicit = False
             else:
                 _, _, current_explicit = _ai_processing_message_state(config)
-            config.ai_processing_message_text_explicit = not current_explicit
-            await session.commit()
+            target_explicit = action == "m1"
+            already_selected = current_explicit == target_explicit
+            if not already_selected:
+                config.ai_processing_message_text_explicit = target_explicit
+                await session.commit()
+        if already_selected:
+            await state.clear()
+            await callback.answer(limit_callback_answer("Этот режим уже выбран."))
+            return
         await state.clear()
         await _render_admin_system_message_detail(callback, key, locale, page)
         notice = (
             "Включены варианты по языку и обращению."
-            if current_explicit
+            if target_explicit is False
             else "Включён единый текст для всех языков и вариантов обращения."
         )
         await callback.answer(limit_callback_answer(notice))
@@ -21996,6 +22007,19 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
         notice = "Системное сообщение сохранено."
         await callback.answer(limit_callback_answer(notice))
         return
+    if key == "ui.ai.processing_default":
+        async with async_session_maker() as session:
+            config = await session.get(BotGeneralConfig, 1)
+            _, _, processing_text_explicit = _ai_processing_message_state(config)
+        if processing_text_explicit:
+            await state.clear()
+            try:
+                await _render_admin_system_message_detail(callback, key, locale, page)
+            except TelegramBadRequest as exc:
+                if "message is not modified" not in str(exc).lower():
+                    raise
+            await callback.answer(limit_callback_answer("Включён единый режим. Вариант не изменён."))
+            return
     async with async_session_maker() as session:
         await state.clear()
         await reset_system_message(session, key, locale, style, bot_scope="telegram")

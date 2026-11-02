@@ -2152,7 +2152,7 @@ async def test_system_message_catalog_uses_valid_callback_data_on_every_detail_p
         action = parsed["action"]
         if action == "r":
             return "destructive"
-        if action in {"e", "m", "s"}:
+        if action in {"e", "m", "m0", "m1", "s"}:
             return "mutation"
         if action in {"c", "d", "l", "p", "v"}:
             return "navigation"
@@ -5236,7 +5236,7 @@ async def test_waiting_message_canonical_editor_preserves_existing_variants(
         for row in detail.reply_markup.inline_keyboard
         for button in row
         if parse_system_message_callback(button.callback_data or "")
-        and parse_system_message_callback(button.callback_data)["action"] == "m"
+        and parse_system_message_callback(button.callback_data)["action"] in {"m0", "m1"}
     )
     assert mode_to_explicit.text == "🔀 Включить единый текст"
     await _feed_callback(admin_dispatcher, bot, detail, mode_to_explicit.callback_data, 67031)
@@ -5250,7 +5250,7 @@ async def test_waiting_message_canonical_editor_preserves_existing_variants(
         for row in detail.reply_markup.inline_keyboard
         for button in row
         if parse_system_message_callback(button.callback_data or "")
-        and parse_system_message_callback(button.callback_data)["action"] == "m"
+        and parse_system_message_callback(button.callback_data)["action"] in {"m0", "m1"}
     )
     await _feed_callback(admin_dispatcher, bot, detail, mode_to_variants.callback_data, 67032)
     detail = session.current_message(root_message)
@@ -5511,7 +5511,7 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
     )
     assert any(
         parse_system_message_callback(button.callback_data or "")
-        and parse_system_message_callback(button.callback_data)["action"] == "m"
+        and parse_system_message_callback(button.callback_data)["action"] in {"m0", "m1"}
         and button.text == "🔀 Включить варианты по языку и обращению"
         for row in detail.reply_markup.inline_keyboard
         for button in row
@@ -5697,16 +5697,19 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         for row in detail.reply_markup.inline_keyboard
         for button in row
         if parse_system_message_callback(button.callback_data or "")
-        and parse_system_message_callback(button.callback_data)["action"] == "m"
+        and parse_system_message_callback(button.callback_data)["action"] in {"m0", "m1"}
     )
-    await _feed_callback(admin_dispatcher, bot, detail, mode_button.callback_data, 70115)
+    stale_mode_callback = mode_button.callback_data
+    await _feed_callback(admin_dispatcher, bot, detail, stale_mode_callback, 70115)
+    detail = session.current_message(draft)
+    await _feed_callback(admin_dispatcher, bot, detail, stale_mode_callback, 70116)
     detail = session.current_message(draft)
     reverse_mode_button = next(
         button
         for row in detail.reply_markup.inline_keyboard
         for button in row
         if parse_system_message_callback(button.callback_data or "")
-        and parse_system_message_callback(button.callback_data)["action"] == "m"
+        and parse_system_message_callback(button.callback_data)["action"] in {"m0", "m1"}
     )
     assert reverse_mode_button.text == "🔀 Включить единый текст"
     async with factory() as db_session:
@@ -5776,6 +5779,45 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
                 BotSystemMessage.addressing_style == "formal",
             )
         ) == "Старый русский Вы"
+
+    stale_reset_button = next(
+        button
+        for row in detail.reply_markup.inline_keyboard
+        for button in row
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "r"
+        and parse_system_message_callback(button.callback_data)["style"] == "formal"
+    )
+    enable_unified = next(
+        button
+        for row in detail.reply_markup.inline_keyboard
+        for button in row
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "m1"
+    )
+    await _feed_callback(admin_dispatcher, bot, detail, enable_unified.callback_data, 70151)
+    detail = session.current_message(detail)
+    await _feed_callback(admin_dispatcher, bot, detail, stale_reset_button.callback_data, 70152)
+    detail = session.current_message(detail)
+    async with factory() as db_session:
+        config = await db_session.get(BotGeneralConfig, 1)
+        assert config.ai_processing_message_text_explicit is True
+        assert await db_session.scalar(
+            select(BotSystemMessage.text).where(
+                BotSystemMessage.translation_key == "ui.ai.processing_default",
+                BotSystemMessage.locale == "pt",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        ) == "Новый PT Вы"
+    disable_unified = next(
+        button
+        for row in detail.reply_markup.inline_keyboard
+        for button in row
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "m0"
+    )
+    await _feed_callback(admin_dispatcher, bot, detail, disable_unified.callback_data, 70153)
+    detail = session.current_message(detail)
 
     edit_informal = next(
         button
@@ -5892,7 +5934,7 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         for row in detail.reply_markup.inline_keyboard
         for button in row
         if parse_system_message_callback(button.callback_data or "")
-        and parse_system_message_callback(button.callback_data)["action"] == "m"
+        and parse_system_message_callback(button.callback_data)["action"] in {"m0", "m1"}
     )
     assert reverse_mode_button.text == "🔀 Включить единый текст"
     await _feed_callback(admin_dispatcher, bot, detail, reverse_mode_button.callback_data, 7024)
@@ -5932,6 +5974,56 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         isinstance(method, DeleteMessage)
         and method.chat_id == 72
         and session.calls.index(method) > session.calls.index(explicit_ru)
+        for method in session.calls
+    )
+
+    long_text = "<>&" + ("😀" * 2046) + "a"
+    long_entities = [MessageEntity(type="bold", offset=0, length=3)]
+    async with factory() as db_session:
+        config = await db_session.get(BotGeneralConfig, 1)
+        config.ai_processing_message_text = handlers.serialize_ai_processing_message_text(
+            long_text,
+            long_entities,
+        )
+        config.ai_processing_message_text_explicit = True
+        await db_session.commit()
+    preview_button = next(
+        button
+        for row in detail.reply_markup.inline_keyboard
+        for button in row
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "v"
+        and parse_system_message_callback(button.callback_data)["style"] == "formal"
+    )
+    await _feed_callback(admin_dispatcher, bot, detail, preview_button.callback_data, 7025)
+    preview = session.current_message(detail)
+    assert len(preview.text) <= 4096
+    assert len(preview.text.encode("utf-16-le")) // 2 <= 4096
+    assert "&lt;&gt;&amp;" in preview.text
+    preview_back = next(
+        button
+        for row in preview.reply_markup.inline_keyboard
+        for button in row
+        if parse_system_message_callback(button.callback_data or "")
+        and parse_system_message_callback(button.callback_data)["action"] == "d"
+    )
+    await _feed_callback(admin_dispatcher, bot, preview, preview_back.callback_data, 7026)
+    detail = session.current_message(preview)
+    handlers.user_message_buffers[72] = ["Привет long"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(72, bot)
+    long_waiting = next(
+        method
+        for method in session.calls
+        if isinstance(method, SendMessage)
+        and method.chat_id == 72
+        and method.text == long_text
+    )
+    assert long_waiting.entities[0].type == "bold"
+    assert any(
+        isinstance(method, DeleteMessage)
+        and method.chat_id == 72
+        and session.calls.index(method) > session.calls.index(long_waiting)
         for method in session.calls
     )
 

@@ -270,7 +270,7 @@ def system_message_callback_data(
     style: str | None = None,
     page: int = 0,
 ) -> str:
-    if action in {"d", "m"}:
+    if action in {"d", "m", "m0", "m1"}:
         parts = ("sm", action, system_message_callback_token(key or ""), locale, str(page))
     elif action in {"v", "e", "r", "s", "c"}:
         parts = (
@@ -306,7 +306,7 @@ def parse_system_message_callback(data: str) -> dict[str, Any] | None:
         return {"action": action, "locale": parts[2], "page": parts[3]}
     if action == "p" and len(parts) == 4:
         return {"action": action, "page": parts[2], "locale": parts[3]}
-    if action in {"d", "m"} and len(parts) == 5:
+    if action in {"d", "m", "m0", "m1"} and len(parts) == 5:
         key = SYSTEM_MESSAGE_KEYS_BY_CALLBACK_TOKEN.get(parts[2])
         return {"action": action, "key": key, "locale": parts[3], "page": parts[4]} if key else None
     if action in {"v", "e", "r", "s", "c"} and len(parts) == 6:
@@ -337,6 +337,49 @@ def escape_text_with_limit(value: Any, limit: int) -> str:
         escaped.append(escaped_character)
         used += len(escaped_character)
     if truncated and used < limit:
+        escaped.append("…")
+    return "".join(escaped)
+
+
+def _telegram_utf16_length(value: Any) -> int:
+    return len(str(value or "").encode("utf-16-le")) // 2
+
+
+def _escape_text_with_telegram_limit(
+    value: Any,
+    raw_limit: int,
+    visible_limit: int | None = None,
+    raw_utf16_limit: int | None = None,
+) -> str:
+    source = str(value or "")
+    escaped = []
+    raw_length = 0
+    raw_utf16_length = 0
+    visible_length = 0
+    visible_limit = raw_limit if visible_limit is None else visible_limit
+    raw_utf16_limit = raw_limit if raw_utf16_limit is None else raw_utf16_limit
+    truncated = False
+    for character in source:
+        escaped_character = html.escape(character)
+        escaped_character_utf16_length = _telegram_utf16_length(escaped_character)
+        character_length = _telegram_utf16_length(character)
+        if (
+            raw_length + len(escaped_character) > raw_limit
+            or raw_utf16_length + escaped_character_utf16_length > raw_utf16_limit
+            or visible_length + character_length > visible_limit
+        ):
+            truncated = True
+            break
+        escaped.append(escaped_character)
+        raw_length += len(escaped_character)
+        raw_utf16_length += escaped_character_utf16_length
+        visible_length += character_length
+    if (
+        truncated
+        and raw_length + len("…") <= raw_limit
+        and raw_utf16_length + 1 <= raw_utf16_limit
+        and visible_length + 1 <= visible_limit
+    ):
         escaped.append("…")
     return "".join(escaped)
 
@@ -378,10 +421,19 @@ def render_system_message_preview(
     definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
     title = definition.title if definition else "Сообщение бота"
     header = f"👁 <b>Предпросмотр · {html.escape(title)} · {style_label}</b>\n\n"
-    body = (
-        formatted_text
-        if formatted_text is not None
-        else escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(header)))
+    raw_available = max(0, TELEGRAM_TEXT_LIMIT - len(header))
+    raw_utf16_available = max(0, TELEGRAM_TEXT_LIMIT - _telegram_utf16_length(header))
+    visible_available = raw_utf16_available
+    body = formatted_text if (
+        formatted_text is not None
+        and len(formatted_text) <= raw_available
+        and _telegram_utf16_length(formatted_text) <= raw_utf16_available
+        and _telegram_utf16_length(text) <= visible_available
+    ) else _escape_text_with_telegram_limit(
+        text,
+        raw_available,
+        visible_available,
+        raw_utf16_available,
     )
     return header + body
 
