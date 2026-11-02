@@ -403,8 +403,6 @@ from universal_tests import (
 from ai_request_singleflight import AI_BUSY_MESSAGE, SingleFlightLease, single_flight
 from system_messages import (
     SYSTEM_MESSAGE_DEFINITIONS,
-    SYSTEM_MESSAGE_PAGE_SIZE,
-    SYSTEM_MESSAGE_CATALOG,
     addressing_style_label,
     get_system_message_variants,
     limit_callback_answer,
@@ -418,6 +416,7 @@ from system_messages import (
     reset_system_message,
     save_addressing_style,
     save_system_message,
+    system_message_page_count,
 )
 from ai_retry_policy import (
     is_retryable_ai_error,
@@ -786,6 +785,24 @@ def _ai_processing_message_html(value: str | None) -> str:
         except Exception as exc:
             logging.warning("Could not render AI processing message preview: %s", exception_summary(exc))
     return html.escape(text)
+
+
+async def _effective_ai_processing_message_html(config: BotGeneralConfig | None, locale: str = "ru") -> str:
+    stored_text = getattr(config, "ai_processing_message_text", None) if config else None
+    source_text, _, encoded = _decode_ai_processing_message_text(stored_text)
+    if encoded and not source_text:
+        source_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+    if source_text == DEFAULT_AI_PROCESSING_MESSAGE_TEXT:
+        async with async_session_maker() as session:
+            effective_text = await resolve_system_text(
+                session,
+                "ui.ai.processing_default",
+                locale,
+                bot_scope="telegram",
+                fallback=source_text,
+            )
+        return html.escape(effective_text)
+    return _ai_processing_message_html(stored_text)
 
 
 async def _disable_ai_button_keyboard(callback: CallbackQuery) -> None:
@@ -21572,13 +21589,13 @@ def _system_messages_locale_label(locale: str) -> str:
 
 async def _render_admin_system_messages(callback: CallbackQuery, locale: str = "ru", page: int = 0):
     normalized_locale = locale if locale in {"ru", "en", "pt"} else "ru"
-    total_pages = max(1, (len(SYSTEM_MESSAGE_CATALOG) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE)
+    total_pages = system_message_page_count("telegram")
     current_page = max(0, min(page, total_pages - 1))
     text = (
-        "💬 <b>Системные сообщения</b>\n\n"
+        f"💬 <b>Сообщения бота · страница {current_page + 1}/{total_pages}</b>\n\n"
         f"Язык: <b>{_system_messages_locale_label(normalized_locale)}</b>\n"
-        "Ключи стабильны. Варианты «Ты» и «Вы» редактируются независимо.\n"
-        "Автоматическая замена слов не используется."
+        "Выберите сообщение, которое хотите посмотреть или изменить.\n"
+        "Варианты «Ты» и «Вы» хранятся независимо."
     )
     await callback.message.edit_text(
         text,
@@ -21589,7 +21606,11 @@ async def _render_admin_system_messages(callback: CallbackQuery, locale: str = "
 
 async def _render_admin_system_message_detail(callback: CallbackQuery, key: str, locale: str, page: int = 0):
     definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
-    if definition is None or locale not in {"ru", "en", "pt"}:
+    if (
+        definition is None
+        or not definition.supports_platform("telegram")
+        or locale not in {"ru", "en", "pt"}
+    ):
         await callback.answer("Системное сообщение не найдено.", show_alert=True)
         return
     async with async_session_maker() as session:
@@ -21631,6 +21652,7 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
     style = parsed.get("style")
     if action in {"d", "v", "e", "r", "s", "c"} and (
         key not in SYSTEM_MESSAGE_DEFINITIONS
+        or not SYSTEM_MESSAGE_DEFINITIONS[key].supports_platform("telegram")
         or locale not in {"ru", "en", "pt"}
         or (action != "d" and style not in {"informal", "formal"})
     ):
@@ -21684,7 +21706,12 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
             system_message_draft=None,
         )
         await callback.message.edit_text(
-            render_system_message_editor(key, style, current_text),
+            render_system_message_editor(
+                key,
+                style,
+                current_text,
+                _system_messages_locale_label(locale),
+            ),
             parse_mode="HTML",
             reply_markup=kb.admin_system_message_draft_keyboard(key, locale, style, page),
         )
@@ -21812,6 +21839,7 @@ async def admin_system_message_preview(callback: CallbackQuery, state: FSMContex
     if (
         len(parts) != 5
         or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
+        or not SYSTEM_MESSAGE_DEFINITIONS[parts[1]].supports_platform("telegram")
         or parts[2] not in {"ru", "en", "pt"}
         or parts[3] not in {"informal", "formal"}
     ):
@@ -21843,6 +21871,7 @@ async def admin_system_message_edit(callback: CallbackQuery, state: FSMContext):
     if (
         len(parts) != 5
         or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
+        or not SYSTEM_MESSAGE_DEFINITIONS[parts[1]].supports_platform("telegram")
         or parts[2] not in {"ru", "en", "pt"}
         or parts[3] not in {"informal", "formal"}
     ):
@@ -21860,7 +21889,12 @@ async def admin_system_message_edit(callback: CallbackQuery, state: FSMContext):
         system_message_draft=None,
     )
     await callback.message.edit_text(
-        render_system_message_editor(key, style, current_text),
+        render_system_message_editor(
+            key,
+            style,
+            current_text,
+            _system_messages_locale_label(locale),
+        ),
         parse_mode="HTML",
         reply_markup=kb.admin_system_message_draft_keyboard(key, locale, style, int(parts[4]) if parts[4].isdigit() else 0),
     )
@@ -21902,6 +21936,7 @@ async def admin_system_message_save(callback: CallbackQuery, state: FSMContext):
     if (
         len(parts) != 5
         or parts[1] not in SYSTEM_MESSAGE_DEFINITIONS
+        or not SYSTEM_MESSAGE_DEFINITIONS[parts[1]].supports_platform("telegram")
         or parts[2] not in {"ru", "en", "pt"}
         or parts[3] not in {"informal", "formal"}
     ):
@@ -21981,9 +22016,7 @@ async def admin_general_settings(
         addressing_style = await resolve_addressing_style(session, bot_scope="telegram")
 
     processing_enabled = bool(getattr(config, "ai_processing_message_enabled", False))
-    from content_authoring import admin_value
-    async with async_session_maker() as session:
-        processing_text_display = html.escape(await admin_value(session, "bot_general_config", config, "ai_processing_message_text", label=True))
+    processing_text_display = await _effective_ai_processing_message_html(config)
 
     text = (
         (notice + "\n\n" if notice else "")
@@ -21992,8 +22025,10 @@ async def admin_general_settings(
         "Настройки действуют на весь бот, а не только на тест.\n\n"
         "Если поле уже заполнено в профиле, бот повторно его не спрашивает. "
         "Отключённое поле можно заполнить позже через настройки пользователя.\n\n"
-        f"Сообщение ожидания ИИ: {'включено' if processing_enabled else 'выключено'}\n"
-        f"Текущий текст: {processing_text_display}\n"
+        f"Сообщение во время ожидания ответа: <b>{'включено' if processing_enabled else 'выключено'}</b>\n"
+        "Временно отправляется пользователю до ответа нейросети и затем удаляется.\n"
+        f"Действующий текст: {processing_text_display}\n"
+        "Не влияет на выбор модели и саму генерацию.\n"
         f"Обращение: <b>{addressing_style_label(addressing_style)}</b>"
     )
     await callback.message.edit_text(
@@ -22794,8 +22829,11 @@ async def admin_edit_ai_processing_message_text(callback: CallbackQuery, state: 
     await state.set_state(AdminStates.set_ai_processing_message_text)
     await state.update_data(message_id=callback.message.message_id)
     await callback.message.edit_text(
-        "Введите текст временного сообщения во время ответа ИИ.\n"
-        f"Текущее значение: {current_text_display}\n\n"
+        "<b>Сообщение во время ожидания ответа</b>\n"
+        "Временно отправляется пользователю до ответа нейросети и затем удаляется.\n"
+        "Не влияет на выбор модели и саму генерацию.\n\n"
+        f"Действующий текст: {current_text_display}\n\n"
+        "Отправьте новый текст одним сообщением.\n"
         f"После очистки текст должен содержать от 1 до {AI_PROCESSING_MESSAGE_MAX_LENGTH} символов.",
         parse_mode="HTML",
         reply_markup=kb.back_to_previous_menu("admin_general_settings"),

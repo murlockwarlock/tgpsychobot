@@ -42,6 +42,7 @@ from system_messages import (
     SYSTEM_MESSAGE_CATALOG,
     SYSTEM_MESSAGE_PAGE_SIZE,
     parse_system_message_callback,
+    system_message_page_count,
     system_message_callback_data,
 )
 
@@ -150,9 +151,8 @@ class ValidatingTelegramSession(BaseSession):
             self._next_message_ids[chat_id] = message_id + 1
             requested = self._screen_payload(method.text, method.entities, method.reply_markup)
             screen_key = (chat_id, message_id)
-            if chat_id not in self._active_screen_keys:
-                self._screens[screen_key] = requested
-                self._active_screen_keys[chat_id] = screen_key
+            self._screens[screen_key] = requested
+            self._active_screen_keys[chat_id] = screen_key
             return self._screen_message(bot, chat_id, message_id, requested)
         if isinstance(method, GetMe):
             return User(id=999, is_bot=True, first_name="TestBot", username="testbot").as_(bot)
@@ -197,13 +197,28 @@ class ValidatingTelegramSession(BaseSession):
         if not self.stateful:
             return message
         chat_id = message.chat.id
-        screen_key = self._active_screen_keys.get(chat_id)
+        screen_key = (chat_id, message.message_id)
+        if screen_key not in self._screens:
+            screen_key = self._active_screen_keys.get(chat_id)
         if screen_key is None:
             return message
         message_id = screen_key[1]
         payload = self._screens[screen_key]
         current = self._screen_message(message.bot, chat_id, message_id, payload)
         return current.model_copy(update={"from_user": message.from_user, "chat": message.chat}).as_(message.bot)
+
+    def message_for(self, bot, chat_id, message_id, user):
+        payload = self._screens[(int(chat_id), int(message_id))]
+        current = self._screen_message(bot, int(chat_id), int(message_id), payload)
+        return current.model_copy(update={"from_user": user, "chat": current.chat}).as_(bot)
+
+    def latest_message_with_keyboard(self, bot, chat_id, user):
+        candidates = [
+            key for key, payload in self._screens.items()
+            if key[0] == int(chat_id) and payload[2] is not None
+        ]
+        message_id = max(candidates, key=lambda item: item[1])[1]
+        return self.message_for(bot, chat_id, message_id, user)
 
 
 def _callback(bot, message, data):
@@ -808,6 +823,58 @@ def test_general_settings_exposes_existing_language_request_setting():
     assert language.callback_data == "admin_general_toggle_language_selection"
 
 
+def test_system_message_catalog_uses_admin_friendly_metadata_and_platform_scope():
+    import system_messages
+
+    busy = system_messages.SYSTEM_MESSAGE_DEFINITIONS["ui.ai.busy"]
+    assert busy.title == "Предыдущий запрос ещё выполняется"
+    assert busy.description
+    assert "ui.ai.busy" not in busy.title
+    assert all(definition.description for definition in system_messages.SYSTEM_MESSAGE_CATALOG)
+    assert all("ui." not in definition.title for definition in system_messages.SYSTEM_MESSAGE_CATALOG)
+    assert "ui.ai.internal_failed" not in {
+        definition.key
+        for definition in system_messages.system_message_catalog_for_platform("telegram")
+    }
+    assert "ui.access.subscription_required" not in {
+        definition.key
+        for definition in system_messages.system_message_catalog_for_platform("max")
+    }
+
+
+def test_system_message_keyboard_is_friendly_and_keeps_canonical_rows():
+    import keyboards
+
+    markup = keyboards.admin_system_messages_keyboard(locale="pt", page=1)
+    rows = markup.inline_keyboard
+    buttons = [button for row in rows for button in row]
+    assert all(button.callback_data != "noop" for button in buttons)
+    assert all("ui." not in button.text for button in buttons)
+    assert any(button.text == "⬅️ Назад" for button in buttons)
+    assert any(button.text == "Далее ➡️" for button in buttons)
+    assert any({button.text for button in row} == {"RU", "EN", "✅ PT"} for row in rows)
+    assert all(len(button.callback_data.encode("utf-8")) <= 64 for button in buttons)
+
+
+def test_system_message_keyboard_hides_pagination_for_single_page(monkeypatch):
+    import keyboards
+    import system_messages
+
+    monkeypatch.setattr(
+        keyboards,
+        "system_message_catalog_for_platform",
+        lambda _platform: (system_messages.SYSTEM_MESSAGE_CATALOG[0],),
+    )
+    monkeypatch.setattr(keyboards, "system_message_page_count", lambda _platform: 1)
+    markup = keyboards.admin_system_messages_keyboard(locale="ru", page=0)
+    buttons = [button for row in markup.inline_keyboard for button in row]
+    assert not any(button.text in {"⬅️ Назад", "Далее ➡️"} for button in buttons)
+    assert not any(
+        (parse_system_message_callback(button.callback_data or "") or {}).get("action") == "p"
+        for button in buttons
+    )
+
+
 @pytest.mark.asyncio
 async def test_general_settings_handler_builds_validated_telegram_method(factory, monkeypatch):
     import handlers
@@ -939,18 +1006,19 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
         assert (await db_session.get(BotGeneralConfig, 1)).addressing_style == "formal"
 
     system_list = await press("admin_system_messages", 504)
-    assert "Системные сообщения" in system_list.text
+    assert "Сообщения бота" in system_list.text
     system_list = await press(system_message_callback_data("p", locale="ru", page=1), 505)
-    system_list = await press(system_message_callback_data("p", locale="ru", page=2), 506)
     assert any(
-        button.callback_data == system_message_callback_data("d", "ui.ai.busy", "ru", page=2)
+        button.callback_data == system_message_callback_data("d", "ui.ai.busy", "ru", page=1)
         for row in system_list.reply_markup.inline_keyboard
         for button in row
     )
 
-    detail = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=2), 507)
-    assert "ui.ai.busy" in detail.text
-    await press(system_message_callback_data("e", "ui.ai.busy", "ru", "formal", 2), 508)
+    detail = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=1), 506)
+    assert "Предыдущий запрос ещё выполняется" in detail.text
+    assert "Когда появляется:" in detail.text
+    assert "ui.ai.busy" not in detail.text
+    await press(system_message_callback_data("e", "ui.ai.busy", "ru", "formal", 1), 507)
 
     draft_message = _admin_message(
         bot,
@@ -959,14 +1027,14 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
     )
     await admin_dispatcher.feed_update(
         bot,
-        Update(update_id=509, message=draft_message),
+        Update(update_id=508, message=draft_message),
     )
     assert any(
         isinstance(method, SendMessage) and "Черновик сохранён" in method.text
         for method in session.calls
     )
 
-    saved = await press(system_message_callback_data("s", "ui.ai.busy", "ru", "formal", 2), 510)
+    saved = await press(system_message_callback_data("s", "ui.ai.busy", "ru", "formal", 1), 509)
     assert "Ваш предыдущий запрос" in saved.text
     async with factory() as db_session:
         formal_row = await db_session.scalar(
@@ -977,13 +1045,13 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
         )
         assert formal_row.text == "Пожалуйста, подождите — Ваш предыдущий запрос ещё выполняется."
 
-    reopened = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=2), 511)
+    reopened = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=1), 510)
     assert "Ваш предыдущий запрос" in reopened.text
-    await press(system_message_callback_data("e", "ui.ai.busy", "ru", "formal", 2), 512)
+    await press(system_message_callback_data("e", "ui.ai.busy", "ru", "formal", 1), 511)
     await admin_dispatcher.feed_update(
         bot,
         Update(
-            update_id=513,
+            update_id=512,
             message=_admin_message(
                 bot,
                 message_id=3,
@@ -991,14 +1059,14 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
             ),
         ),
     )
-    cancelled = await press(system_message_callback_data("c", "ui.ai.busy", "ru", "formal", 2), 514)
+    cancelled = await press(system_message_callback_data("c", "ui.ai.busy", "ru", "formal", 1), 513)
     assert "Ваш предыдущий запрос" in cancelled.text
-    await press(system_message_callback_data("r", "ui.ai.busy", "ru", "formal", 2), 515)
-    reset_detail = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=2), 516)
+    await press(system_message_callback_data("r", "ui.ai.busy", "ru", "formal", 1), 514)
+    reset_detail = await press(system_message_callback_data("d", "ui.ai.busy", "ru", page=1), 515)
     assert "Пожалуйста, не так быстро" in reset_detail.text
 
-    await press(system_message_callback_data("p", locale="ru", page=2), 517)
-    english_list = await press(system_message_callback_data("l", locale="en", page=2), 518)
+    await press(system_message_callback_data("p", locale="ru", page=1), 516)
+    english_list = await press(system_message_callback_data("l", locale="en", page=1), 517)
     assert "Язык: <b>English</b>" in english_list.text
     returned = await press("admin_general_settings", 519)
     assert "Общие настройки" in returned.text
@@ -1056,6 +1124,205 @@ async def test_addressing_style_system_message_journey_uses_real_dispatcher(fact
     await handlers.process_buffered_messages(12, bot)
     outgoing = [method for method in session.calls if isinstance(method, SendMessage) and method.chat_id == 12]
     assert any(method.text == "Ответ пользователю" for method in outgoing)
+    assert provider_payloads
+    assert "ОБРАЩЕНИЕ: обращайся к пользователю на «Вы»" in str(provider_payloads[-1])
+
+
+@pytest.mark.asyncio
+async def test_telegram_system_message_ux_journey_uses_visible_stateful_keyboard(factory, admin_dispatcher, monkeypatch):
+    import handlers
+    import httpx
+
+    monkeypatch.setattr(handlers, "async_session_maker", factory)
+    monkeypatch.setattr(handlers.ai_integration, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+
+    async with factory() as db_session:
+        db_session.add_all([
+            DBUser(
+                id=21,
+                is_admin=True,
+                first_name="Admin",
+                name="Admin",
+                accepted_disclaimer=True,
+                current_dialogue_id=1,
+            ),
+            AIConfig(
+                id=1,
+                provider="OpenRouter",
+                openrouter_api_key="sk-test-key",
+                openrouter_model="qwen/qwen3.7-plus",
+                system_prompt="Система администратора",
+                memory_mode="global",
+            ),
+            SubscriptionConfig(id=1, subscriptions_enabled=False),
+        ])
+        await db_session.commit()
+
+    provider_payloads = []
+
+    async def fake_provider_post(self, url, *args, **kwargs):
+        provider_payloads.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "Ответ"}}]},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_provider_post)
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    root_message = _admin_message(bot, user_id=21, text="/admin")
+    await admin_dispatcher.feed_update(bot, Update(update_id=2000, message=root_message))
+    update_id = 2000
+
+    def visible_buttons(message):
+        buttons = [
+            button
+            for row in (message.reply_markup.inline_keyboard if message.reply_markup else [])
+            for button in row
+            if button.callback_data
+        ]
+        assert buttons
+        for button in buttons:
+            assert len(button.callback_data.encode("utf-8")) <= 64
+            assert "ui." not in button.text
+        return buttons
+
+    async def press(message, predicate):
+        nonlocal update_id
+        current = session.current_message(message)
+        button = next(button for button in visible_buttons(current) if predicate(button))
+        update_id += 1
+        session.calls.clear()
+        await _feed_callback(admin_dispatcher, bot, current, button.callback_data, update_id)
+        assert any(isinstance(method, AnswerCallbackQuery) for method in session.calls)
+        return session.current_message(current)
+
+    general = await press(root_message, lambda button: button.callback_data == "admin_general_settings")
+    formal = await press(general, lambda button: button.callback_data == "admin_general_set_addressing_formal")
+    assert "Обращение: <b>Вы</b>" in formal.text
+    waiting_editor = await press(
+        formal,
+        lambda button: button.callback_data == "admin_general_edit_ai_processing_message_text",
+    )
+    assert "Временно отправляется пользователю до ответа нейросети" in waiting_editor.text
+    assert "Не влияет на выбор модели и саму генерацию" in waiting_editor.text
+    update_id += 1
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=update_id,
+            message=_admin_message(bot, user_id=21, message_id=2, text="Custom waiting"),
+        ),
+    )
+    formal = session.current_message(root_message)
+    assert "Действующий текст: Custom waiting" in formal.text
+    async with factory() as db_session:
+        assert (await db_session.get(BotGeneralConfig, 1)).ai_processing_message_text == "Custom waiting"
+
+    system_list = await press(formal, lambda button: button.callback_data == "admin_system_messages")
+    assert "Сообщения бота · страница 1/" in system_list.text
+    system_list = await press(
+        system_list,
+        lambda button: (
+            parse_system_message_callback(button.callback_data) is not None
+            and parse_system_message_callback(button.callback_data)["action"] == "p"
+            and parse_system_message_callback(button.callback_data)["page"] == "1"
+        ),
+    )
+    assert "страница 2/" in system_list.text
+    assert any(button.text == "⬅️ Назад" for button in visible_buttons(system_list))
+    assert any(button.text == "Далее ➡️" for button in visible_buttons(system_list))
+    system_list = await press(
+        system_list,
+        lambda button: (
+            parse_system_message_callback(button.callback_data) is not None
+            and parse_system_message_callback(button.callback_data)["action"] == "l"
+            and parse_system_message_callback(button.callback_data)["locale"] == "pt"
+        ),
+    )
+    assert "Язык: <b>Português</b>" in system_list.text
+    assert any(
+        {button.text for button in row} == {"RU", "EN", "✅ PT"}
+        for row in system_list.reply_markup.inline_keyboard
+    )
+    target_button = next(
+        button
+        for button in visible_buttons(system_list)
+        if parse_system_message_callback(button.callback_data)
+        and parse_system_message_callback(button.callback_data)["action"] == "d"
+        and parse_system_message_callback(button.callback_data)["key"] == "ui.ai.busy"
+    )
+    detail = await press(system_list, lambda button: button.callback_data == target_button.callback_data)
+    assert "Предыдущий запрос ещё выполняется" in detail.text
+    assert "Когда появляется:" in detail.text
+    assert "ui.ai.busy" not in detail.text
+    editor = await press(
+        detail,
+        lambda button: (
+            parse_system_message_callback(button.callback_data) is not None
+            and parse_system_message_callback(button.callback_data)["action"] == "e"
+            and parse_system_message_callback(button.callback_data)["style"] == "formal"
+        ),
+    )
+    assert "Язык: <b>Português</b>" in editor.text
+    assert "Обращение: <b>Вы</b>" in editor.text
+    assert "ui.ai.busy" not in editor.text
+
+    await admin_dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=update_id + 1,
+            message=_admin_message(
+                bot,
+                user_id=21,
+                message_id=2,
+                text="PT formal custom busy",
+            ),
+        ),
+    )
+    draft = session.latest_message_with_keyboard(bot, 21, User(id=21, is_bot=False, first_name="Admin"))
+    save_button = next(
+        button
+        for button in visible_buttons(draft)
+        if parse_system_message_callback(button.callback_data)
+        and parse_system_message_callback(button.callback_data)["action"] == "s"
+    )
+    update_id += 2
+    await _feed_callback(admin_dispatcher, bot, draft, save_button.callback_data, update_id)
+    detail = session.current_message(draft)
+    assert "PT formal custom busy" in detail.text
+    async with factory() as db_session:
+        saved = await db_session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "telegram",
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.locale == "pt",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        assert saved.text == "PT formal custom busy"
+
+    system_list = await press(detail, lambda button: parse_system_message_callback(button.callback_data) and parse_system_message_callback(button.callback_data)["action"] == "p")
+    assert "страница 2/" in system_list.text
+    assert "Язык: <b>Português</b>" in system_list.text
+    detail = await press(system_list, lambda button: button.callback_data == target_button.callback_data)
+    assert "PT formal custom busy" in detail.text
+    system_list = await press(
+        detail,
+        lambda button: parse_system_message_callback(button.callback_data)
+        and parse_system_message_callback(button.callback_data)["action"] == "p",
+    )
+    assert "страница 2/" in system_list.text
+    general = await press(system_list, lambda button: button.callback_data == "admin_general_settings")
+    assert "Общие настройки" in general.text
+    assert "Сообщение во время ожидания ответа" in general.text
+    assert "Действующий текст: Custom waiting" in general.text
+
+    handlers.user_message_buffers[21] = ["Привет"]
+    session.calls.clear()
+    await handlers.process_buffered_messages(21, bot)
+    assert any(isinstance(method, SendMessage) and method.chat_id == 21 and method.text == "Ответ" for method in session.calls)
     assert provider_payloads
     assert "ОБРАЩЕНИЕ: обращайся к пользователю на «Вы»" in str(provider_payloads[-1])
 
@@ -1289,6 +1556,7 @@ async def test_system_message_catalog_uses_valid_callback_data_on_every_detail_p
         assert buttons
         for button in buttons:
             assert len(button.callback_data.encode("utf-8")) <= 64
+            assert "ui." not in button.text
             categories[button.callback_data] = classify(button.callback_data)
         return buttons
 
@@ -1308,7 +1576,7 @@ async def test_system_message_catalog_uses_valid_callback_data_on_every_detail_p
 
     await press("admin_general_settings")
     system_list = await press("admin_system_messages")
-    total_pages = (len(SYSTEM_MESSAGE_CATALOG) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE
+    total_pages = system_message_page_count("telegram")
 
     async def restore_page(target_page, current_list):
         current_page = 0
@@ -1346,7 +1614,6 @@ async def test_system_message_catalog_uses_valid_callback_data_on_every_detail_p
         system_list = await press(ru_button.callback_data)
         list_buttons = inspect_markup(system_list.reply_markup)
 
-        await press("noop", expect_render=False)
         item_buttons = [
             button
             for button in list_buttons

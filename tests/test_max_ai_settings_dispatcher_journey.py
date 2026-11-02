@@ -20,6 +20,7 @@ from system_messages import (
     SYSTEM_MESSAGE_CATALOG,
     SYSTEM_MESSAGE_PAGE_SIZE,
     parse_system_message_callback,
+    system_message_page_count,
     system_message_callback_data,
 )
 
@@ -1434,6 +1435,165 @@ async def test_max_addressing_style_system_message_journey_uses_real_app_callbac
 
 
 @pytest.mark.asyncio
+async def test_max_system_message_ux_journey_uses_real_keyboard_and_payloads(max_settings_db, monkeypatch):
+    from max_messenger_bot.services import common as max_common
+
+    monkeypatch.setattr(max_system_messages, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+    monkeypatch.setattr(max_common, "async_session_maker", max_settings_db)
+
+    captured = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "params": params or {}, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    update_id = 4000
+
+    def inspect_body(body):
+        buttons = _max_buttons(body.get("attachments", []))
+        assert buttons
+        for button in buttons:
+            assert len(button["payload"].encode("utf-8")) <= 64
+            assert "ui." not in button["text"]
+        return buttons
+
+    async def send_message(text):
+        nonlocal update_id
+        before = len([item for item in captured if item["path"] == "/messages"])
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_created",
+            "update_id": update_id,
+            "message": {
+                "body": {"text": text},
+                "recipient": {"chat_id": 1002},
+                "sender": {"user_id": 1002, "name": "Admin"},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert len(messages) > before
+        body = messages[-1]["body"]
+        inspect_body(body)
+        return body
+
+    async def press(body, predicate):
+        nonlocal update_id
+        button = next(button for button in inspect_body(body) if predicate(button))
+        before = len([item for item in captured if item["path"] == "/messages"])
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": button["payload"],
+                "sender": {"user_id": 1002, "name": "Admin"},
+            },
+            "message": {
+                "mid": "visible-admin-screen",
+                "recipient": {"chat_id": 1002},
+                "body": {"attachments": body.get("attachments", [])},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert len(messages) > before
+        rendered = messages[-1]["body"]
+        inspect_body(rendered)
+        return rendered
+
+    root = await send_message("/admin")
+    general = await press(root, lambda button: button["payload"] == "admin_general_settings")
+    system_list = await press(general, lambda button: button["payload"] == "admin_system_messages")
+    assert "Сообщения бота · страница 1/2" in system_list["text"]
+    system_list = await press(
+        system_list,
+        lambda button: parse_system_message_callback(button["payload"])
+        and parse_system_message_callback(button["payload"])["action"] == "p"
+        and parse_system_message_callback(button["payload"])["page"] == "1",
+    )
+    assert "Сообщения бота · страница 2/2" in system_list["text"]
+    rows = next(
+        attachment["payload"]["buttons"]
+        for attachment in system_list["attachments"]
+        if attachment["type"] == "inline_keyboard"
+    )
+    assert any({button["text"] for button in row} == {"⬅️ Назад"} for row in rows)
+    system_list = await press(
+        system_list,
+        lambda button: parse_system_message_callback(button["payload"])
+        and parse_system_message_callback(button["payload"])["action"] == "l"
+        and parse_system_message_callback(button["payload"])["locale"] == "pt",
+    )
+    assert "Язык: <b>Português</b>" in system_list["text"]
+    assert all(
+        parse_system_message_callback(button["payload"]) is None
+        or parse_system_message_callback(button["payload"]).get("key") != "ui.access.subscription_required"
+        for button in inspect_body(system_list)
+    )
+    target = next(
+        button
+        for button in inspect_body(system_list)
+        if parse_system_message_callback(button["payload"])
+        and parse_system_message_callback(button["payload"])["action"] == "d"
+        and parse_system_message_callback(button["payload"])["key"] == "ui.ai.busy"
+    )
+    detail = await press(system_list, lambda button: button["payload"] == target["payload"])
+    assert "Предыдущий запрос ещё выполняется" in detail["text"]
+    assert "ui.ai.busy" not in detail["text"]
+    editor = await press(
+        detail,
+        lambda button: parse_system_message_callback(button["payload"])
+        and parse_system_message_callback(button["payload"])["action"] == "e"
+        and parse_system_message_callback(button["payload"])["style"] == "formal",
+    )
+    assert "Язык: <b>Português</b>" in editor["text"]
+    await send_message("MAX PT formal custom busy")
+    draft = [item for item in captured if item["path"] == "/messages"][-1]["body"]
+    saved_detail = await press(
+        draft,
+        lambda button: parse_system_message_callback(button["payload"])
+        and parse_system_message_callback(button["payload"])["action"] == "s",
+    )
+    assert "MAX PT formal custom busy" in saved_detail["text"]
+    async with max_settings_db() as session:
+        saved = await session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "max",
+                BotSystemMessage.translation_key == "ui.ai.busy",
+                BotSystemMessage.locale == "pt",
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        assert saved.text == "MAX PT formal custom busy"
+
+    system_list = await press(
+        saved_detail,
+        lambda button: parse_system_message_callback(button["payload"])
+        and parse_system_message_callback(button["payload"])["action"] == "p",
+    )
+    assert "Сообщения бота · страница 2/2" in system_list["text"]
+    assert "Язык: <b>Português</b>" in system_list["text"]
+    detail = await press(system_list, lambda button: button["payload"] == target["payload"])
+    assert "MAX PT formal custom busy" in detail["text"]
+    system_list = await press(
+        detail,
+        lambda button: parse_system_message_callback(button["payload"])
+        and parse_system_message_callback(button["payload"])["action"] == "p",
+    )
+    general = await press(system_list, lambda button: button["payload"] == "admin_general_settings")
+    assert "Общие настройки" in general["text"]
+
+
+@pytest.mark.asyncio
 async def test_max_system_message_catalog_walks_every_real_editor_button(max_settings_db, monkeypatch):
     from max_messenger_bot.services import common as max_common
 
@@ -1501,6 +1661,7 @@ async def test_max_system_message_catalog_walks_every_real_editor_button(max_set
                         continue
                     payload = button["payload"]
                     assert len(payload.encode("utf-8")) <= 64
+                    assert "ui." not in button.get("text", "")
                     categories[payload] = classify(payload)
                     buttons.append(button)
         assert buttons
@@ -1556,7 +1717,7 @@ async def test_max_system_message_catalog_walks_every_real_editor_button(max_set
     general = await press(general_button["payload"])
     system_button = next(button for button in inspect_body(general) if button["payload"] == "admin_system_messages")
     system_list = await press(system_button["payload"])
-    total_pages = (len(SYSTEM_MESSAGE_CATALOG) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE
+    total_pages = system_message_page_count("max")
 
     async def restore_page(target_page, current_list):
         current_page = 0
@@ -1593,8 +1754,6 @@ async def test_max_system_message_catalog_walks_every_real_editor_button(max_set
         )
         system_list = await press(ru_button["payload"])
         list_buttons = inspect_body(system_list)
-        await press("noop", expect_message=False)
-
         item_buttons = [
             button
             for button in list_buttons
