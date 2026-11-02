@@ -1208,6 +1208,7 @@ class MaxBotApplication:
         is_system_message_admin_callback = (
             data in {
                 "admin_general_settings",
+                "admin_general_toggle_addressing_style",
                 "admin_general_set_addressing_informal",
                 "admin_general_set_addressing_formal",
                 "admin_system_messages",
@@ -1228,6 +1229,9 @@ class MaxBotApplication:
                 if data == "admin_general_settings":
                     await self.states.clear(user_id)
                     await admin_system_messages_service.show_general_settings(self.client, chat_id)
+                elif data == "admin_general_toggle_addressing_style":
+                    await self.states.clear(user_id)
+                    await admin_system_messages_service.toggle_addressing_style(self.client, chat_id)
                 elif data == "admin_general_set_addressing_informal":
                     await self.states.clear(user_id)
                     await admin_system_messages_service.set_addressing_style(self.client, chat_id, "informal")

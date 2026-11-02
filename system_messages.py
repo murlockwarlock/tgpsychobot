@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import html
 from typing import Any
@@ -25,6 +25,11 @@ class SystemMessageDefinition:
     key: str
     title: str
     defaults: dict[str, dict[str, str]]
+    description: str = ""
+    platforms: tuple[str, ...] = ("telegram", "max")
+
+    def supports_platform(self, platform: str) -> bool:
+        return str(platform or "").strip().lower() in self.platforms
 
 
 def _styles(informal: str, formal: str | None = None) -> dict[str, str]:
@@ -108,6 +113,117 @@ SYSTEM_MESSAGE_CATALOG = (
     SystemMessageDefinition("ui.access.subscription_required", "Доступ: нужна подписка", {"ru": _styles("Чтобы продолжить диалог, активируйте подписку / бонусные дни.")}),
     SystemMessageDefinition("ui.access.photo_subscription_required", "Доступ: нужна подписка для фото", {"ru": _styles("Чтобы отправлять фото и получать разборы, активируйте подписку.")}),
 )
+
+
+SYSTEM_MESSAGE_ADMIN_METADATA = {
+    "ui.ai.thinking": ("Нейросеть готовит ответ", "Показывается, пока бот готовит ответ на сообщение."),
+    "ui.ai.processing_default": ("Сообщение во время ожидания ответа", "Временно показывается до ответа нейросети, а затем удаляется."),
+    "ui.ai.button_accepted": ("Подтверждение кнопки", "Показывается после нажатия кнопки с вариантом ответа."),
+    "ui.ai.choose_action": ("Выбор действия", "Показывается, когда пользователю нужно выбрать следующий шаг."),
+    "ui.ai.image_ready": ("Изображение готово", "Показывается после успешного создания изображения."),
+    "ui.ai.image_failed": ("Не удалось создать изображение", "Показывается, если создать изображение не удалось."),
+    "ui.ai.service_unavailable": ("Сервис ИИ временно недоступен", "Показывается при временной недоступности сервиса ИИ."),
+    "ui.ai.service_unavailable.max": ("Сервис ИИ временно недоступен", "Показывается пользователю MAX при временной недоступности сервиса ИИ."),
+    "ui.ai.overloaded": ("Нейросеть временно перегружена", "Показывается, когда нейросеть не успевает обработать запрос."),
+    "ui.ai.overloaded.max": ("Нейросеть временно перегружена", "Показывается пользователю MAX при перегрузке нейросети."),
+    "ui.ai.retry_request": ("Повторить запрос", "Текст кнопки для повторной отправки запроса."),
+    "ui.ai.retry_stale": ("Повтор больше не доступен", "Показывается, если кнопка повтора относится к предыдущему диалогу."),
+    "ui.ai.retry_already_used": ("Повтор уже выполнен", "Показывается после повторного нажатия уже использованной кнопки."),
+    "ui.ai.processing_failed": ("Не удалось обработать сообщение", "Показывается, если обработка сообщения завершилась ошибкой."),
+    "ui.ai.internal_failed": ("Не удалось обработать запрос", "Показывается пользователю MAX при неожиданной внутренней ошибке."),
+    "ui.ai.unexpected_failed": ("Произошла непредвиденная ошибка", "Показывается при ошибке, для которой нет отдельного сообщения."),
+    "ui.ai.busy": ("Предыдущий запрос ещё выполняется", "Показывается, если пользователь отправляет новый запрос слишком быстро."),
+    "ui.ai.image_inspecting": ("Изучение изображения", "Показывается во время подготовки изображения к анализу в Telegram."),
+    "ui.ai.image_analyzing": ("Анализ изображения", "Показывается во время анализа изображения в MAX."),
+    "ui.ai.editing_image": ("Редактирование изображения", "Показывается во время изменения фотографии."),
+    "ui.ai.edited_image": ("Результат редактирования", "Показывается перед результатом изменения фотографии."),
+    "ui.ai.edit_image_failed": ("Не удалось отредактировать изображение", "Показывается, если изменить фотографию не удалось."),
+    "ui.ai.generating_image": ("Создание изображения", "Показывается во время создания нового изображения."),
+    "ui.ai.generated_image": ("Результат создания изображения", "Показывается перед созданным изображением."),
+    "ui.ai.photo_failed": ("Не удалось обработать фотографию", "Показывается, если обработка фотографии завершилась ошибкой."),
+    "ui.card.selection_prompt": ("Выбор карты", "Показывается, когда пользователю нужно выбрать карту."),
+    "ui.card.next_selection_prompt": ("Выбор следующей карты", "Показывается перед выбором следующей карты."),
+    "ui.card.stale_choice": ("Выбор карты больше недоступен", "Показывается, если карта уже не относится к текущему раскладу."),
+    "ui.card.invalid_back": ("Недоступная карта", "Показывается при попытке выбрать недоступную карту."),
+    "ui.card.selected": ("Выбор карты подтверждён", "Показывается после подтверждения выбранной карты."),
+    "ui.card.interpretation_failed": ("Не удалось истолковать карту", "Показывается, если получить толкование карты не удалось."),
+    "ui.card.not_found": ("Карта не найдена", "Показывается, если выбранная карта больше недоступна."),
+    "ui.card.spread_heading": ("Готовый расклад", "Показывается перед итогом расклада."),
+    "ui.card.next_failed": ("Не удалось показать следующие карты", "Показывается, если следующий шаг расклада не загрузился."),
+    "ui.card.round_prompt": ("Выбор карты в раунде", "Показывается перед выбором карты в текущем раунде."),
+    "ui.navigation.continue_prompt": ("Начало или продолжение диалога", "Показывается, когда бот ждёт первое или следующее сообщение пользователя."),
+    "ui.navigation.main_resume": ("Возврат в основной диалог", "Показывается после возврата пользователя в основной диалог."),
+    "ui.navigation.continue_ready": ("Диалог готов к продолжению", "Показывается, когда пользователь может задать следующий вопрос."),
+    "ui.navigation.user_error": ("Ошибка в данных пользователя", "Показывается, если данные пользователя нельзя обработать."),
+    "ui.access.subscription_required": ("Нужна подписка", "Показывается, когда для продолжения нужна активная подписка."),
+    "ui.access.photo_subscription_required": ("Нужна подписка для фотографий", "Показывается, когда для работы с фотографией нужна активная подписка."),
+}
+
+SYSTEM_MESSAGE_PLATFORM_SCOPES = {
+    "ui.ai.processing_default": ("telegram",),
+    "ui.ai.button_accepted": ("telegram",),
+    "ui.ai.image_ready": ("telegram",),
+    "ui.ai.image_failed": ("telegram",),
+    "ui.ai.overloaded": ("telegram",),
+    "ui.ai.processing_failed": ("telegram",),
+    "ui.ai.unexpected_failed": ("telegram",),
+    "ui.ai.image_inspecting": ("telegram",),
+    "ui.ai.edited_image": ("telegram",),
+    "ui.ai.edit_image_failed": ("telegram",),
+    "ui.ai.generated_image": ("telegram",),
+    "ui.ai.photo_failed": ("telegram",),
+    "ui.card.selection_prompt": ("telegram",),
+    "ui.card.next_selection_prompt": ("telegram",),
+    "ui.card.stale_choice": ("telegram",),
+    "ui.card.invalid_back": ("telegram",),
+    "ui.card.selected": ("telegram",),
+    "ui.card.interpretation_failed": ("telegram",),
+    "ui.card.not_found": ("telegram",),
+    "ui.card.spread_heading": ("telegram",),
+    "ui.card.next_failed": ("telegram",),
+    "ui.card.round_prompt": ("telegram",),
+    "ui.navigation.main_resume": ("telegram",),
+    "ui.navigation.continue_ready": ("telegram",),
+    "ui.navigation.user_error": ("telegram",),
+    "ui.access.subscription_required": ("telegram",),
+    "ui.access.photo_subscription_required": ("telegram",),
+    "ui.ai.service_unavailable.max": ("max",),
+    "ui.ai.overloaded.max": ("max",),
+    "ui.ai.internal_failed": ("max",),
+    "ui.ai.image_analyzing": ("max",),
+}
+
+SYSTEM_MESSAGE_CATALOG = tuple(
+    replace(
+        definition,
+        title=SYSTEM_MESSAGE_ADMIN_METADATA[definition.key][0],
+        description=SYSTEM_MESSAGE_ADMIN_METADATA[definition.key][1],
+        platforms=SYSTEM_MESSAGE_PLATFORM_SCOPES.get(definition.key, ("telegram", "max")),
+    )
+    for definition in SYSTEM_MESSAGE_CATALOG
+)
+
+
+def system_message_catalog_for_platform(platform: str) -> tuple[SystemMessageDefinition, ...]:
+    normalized_platform = str(platform or "").strip().lower()
+    return tuple(
+        definition
+        for definition in SYSTEM_MESSAGE_CATALOG
+        if definition.supports_platform(normalized_platform)
+    )
+
+
+def system_message_page_count(platform: str) -> int:
+    definitions = system_message_catalog_for_platform(platform)
+    return max(1, (len(definitions) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE)
+
+
+def system_message_page_definitions(platform: str, page: int) -> tuple[SystemMessageDefinition, ...]:
+    definitions = system_message_catalog_for_platform(platform)
+    total_pages = system_message_page_count(platform)
+    current_page = max(0, min(int(page), total_pages - 1))
+    start = current_page * SYSTEM_MESSAGE_PAGE_SIZE
+    return definitions[start:start + SYSTEM_MESSAGE_PAGE_SIZE]
 
 
 SYSTEM_MESSAGE_DEFINITIONS = {item.key: item for item in SYSTEM_MESSAGE_CATALOG}
@@ -208,9 +324,9 @@ def render_system_message_detail(
     variants: dict[str, str],
 ) -> str:
     header = (
-        "💬 <b>Системное сообщение</b>\n\n"
+        "💬 <b>Сообщение бота</b>\n\n"
         f"<b>{html.escape(definition.title)}</b>\n"
-        f"Ключ: <code>{html.escape(key)}</code>\n"
+        f"Когда появляется: {html.escape(definition.description)}\n"
         f"Язык: <b>{html.escape(locale)}</b>"
     )
     informal_prefix = f"{header}\n\n<b>Ты:</b>\n"
@@ -232,15 +348,25 @@ def render_system_message_preview(
     text: str,
 ) -> str:
     style_label = "Вы" if normalize_addressing_style(style) == "formal" else "Ты"
-    header = f"👁 <b>Предпросмотр · {style_label}</b>\n\n<code>{html.escape(key)}</code>\n\n"
+    definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
+    title = definition.title if definition else "Сообщение бота"
+    header = f"👁 <b>Предпросмотр · {html.escape(title)} · {style_label}</b>\n\n"
     return header + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(header)))
 
 
-def render_system_message_editor(key: str, style: Any, text: str) -> str:
+def render_system_message_editor(
+    key: str,
+    style: Any,
+    text: str,
+    locale: str = "Русский",
+) -> str:
+    definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
+    title = definition.title if definition else "Сообщение бота"
     prefix = (
-        f"✏️ <b>Редактирование «{addressing_style_label(style)}»</b>\n\n"
-        f"Ключ: <code>{html.escape(key)}</code>\n"
-        "Текущее значение:\n"
+        f"✏️ <b>{html.escape(title)}</b>\n"
+        f"Язык: <b>{html.escape(locale)}</b>\n"
+        f"Обращение: <b>{addressing_style_label(style)}</b>\n\n"
+        "Текущий текст:\n"
     )
     suffix = "\n\nОтправьте новый текст одним сообщением. Затем нажмите «Сохранить» или «Отмена»."
     return prefix + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(prefix) - len(suffix))) + suffix

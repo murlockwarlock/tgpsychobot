@@ -3,7 +3,6 @@ from __future__ import annotations
 from database import BotGeneralConfig
 from system_messages import (
     ADDRESSING_STYLES,
-    SYSTEM_MESSAGE_CATALOG,
     SYSTEM_MESSAGE_DEFINITIONS,
     SYSTEM_MESSAGE_PAGE_SIZE,
     addressing_style_label,
@@ -18,6 +17,8 @@ from system_messages import (
     save_system_message,
     resolve_system_text,
     system_message_callback_data,
+    system_message_catalog_for_platform,
+    system_message_page_count,
 )
 
 from ..api import MaxApiClient
@@ -85,8 +86,7 @@ async def show_general_settings(client: MaxApiClient, chat_id: int) -> None:
         ),
         attachments=inline_keyboard([
             [
-                callback_button("✅ Ты" if style == "informal" else "Ты", "admin_general_set_addressing_informal"),
-                callback_button("✅ Вы" if style == "formal" else "Вы", "admin_general_set_addressing_formal"),
+                callback_button(f"Обращение: ✅ {'Ты' if style == 'informal' else 'Вы'}", "admin_general_toggle_addressing_style"),
             ],
             [callback_button("💬 Системные сообщения", "admin_system_messages")],
             [callback_button("◀️ Назад", "admin_panel")],
@@ -106,6 +106,15 @@ async def set_addressing_style(client: MaxApiClient, chat_id: int, style: str) -
     await show_general_settings(client, chat_id)
 
 
+async def toggle_addressing_style(client: MaxApiClient, chat_id: int) -> None:
+    async with async_session_maker() as session:
+        current_style = await resolve_addressing_style(session, bot_scope="max")
+        next_style = "formal" if current_style == "informal" else "informal"
+        await save_addressing_style(session, next_style, bot_scope="max")
+        await session.commit()
+    await show_general_settings(client, chat_id)
+
+
 async def show_system_messages(
     client: MaxApiClient,
     chat_id: int,
@@ -113,39 +122,37 @@ async def show_system_messages(
     page: int = 0,
 ) -> None:
     locale = _valid_locale(locale)
-    total_pages = max(1, (len(SYSTEM_MESSAGE_CATALOG) + SYSTEM_MESSAGE_PAGE_SIZE - 1) // SYSTEM_MESSAGE_PAGE_SIZE)
+    definitions_catalog = system_message_catalog_for_platform("max")
+    total_pages = system_message_page_count("max")
     page = min(_valid_page(page), total_pages - 1)
     start = page * SYSTEM_MESSAGE_PAGE_SIZE
-    definitions = SYSTEM_MESSAGE_CATALOG[start:start + SYSTEM_MESSAGE_PAGE_SIZE]
+    definitions = definitions_catalog[start:start + SYSTEM_MESSAGE_PAGE_SIZE]
     rows = [
         [callback_button(
-            f"{item.title} · {item.key}",
+            item.title,
             system_message_callback_data("d", item.key, locale, page=page),
         )]
         for item in definitions
     ]
-    rows.append([callback_button(
-        f"✅ {_locale_label(locale)}",
-        system_message_callback_data("l", locale=locale, page=page),
-    )])
     rows.append([
-        callback_button("Русский", system_message_callback_data("l", locale="ru", page=page)),
-        callback_button("English", system_message_callback_data("l", locale="en", page=page)),
-        callback_button("Português", system_message_callback_data("l", locale="pt", page=page)),
+        callback_button(f"{'✅ ' if locale == 'ru' else ''}RU", system_message_callback_data("l", locale="ru", page=page)),
+        callback_button(f"{'✅ ' if locale == 'en' else ''}EN", system_message_callback_data("l", locale="en", page=page)),
+        callback_button(f"{'✅ ' if locale == 'pt' else ''}PT", system_message_callback_data("l", locale="pt", page=page)),
     ])
     navigation = []
     if page > 0:
-        navigation.append(callback_button("◀️", system_message_callback_data("p", locale=locale, page=page - 1)))
+        navigation.append(callback_button("⬅️ Назад", system_message_callback_data("p", locale=locale, page=page - 1)))
     if page < total_pages - 1:
-        navigation.append(callback_button("▶️", system_message_callback_data("p", locale=locale, page=page + 1)))
+        navigation.append(callback_button("Далее ➡️", system_message_callback_data("p", locale=locale, page=page + 1)))
     if navigation:
         rows.append(navigation)
     rows.append([callback_button("⚙️ Общие настройки", "admin_general_settings")])
     await client.send_message(
         chat_id=chat_id,
         text=(
-            "💬 <b>Системные сообщения</b>\n\n"
-            f"Язык: <b>{_locale_label(locale)}</b> · страница {page + 1}/{total_pages}\n"
+            f"💬 <b>Сообщения бота · страница {page + 1}/{total_pages}</b>\n\n"
+            f"Язык: <b>{_locale_label(locale)}</b>\n"
+            "Выберите сообщение, которое хотите посмотреть или изменить.\n"
             "Варианты «Ты» и «Вы» хранятся независимо."
         ),
         attachments=inline_keyboard(rows),
@@ -161,7 +168,7 @@ async def show_system_message(
 ) -> None:
     locale = _valid_locale(locale)
     definition = _definition(key)
-    if definition is None:
+    if definition is None or not definition.supports_platform("max"):
         await client.send_message(chat_id=chat_id, text="Системное сообщение не найдено.")
         return
     async with async_session_maker() as session:
@@ -185,7 +192,7 @@ async def show_system_message(
             )
         ])
     rows.append([callback_button(
-        "◀️ К списку",
+        "⬅️ К списку сообщений",
         system_message_callback_data("p", locale=locale, page=_valid_page(page)),
     )])
     message_text = render_system_message_detail(definition, key, _locale_label(locale), variants)
@@ -204,7 +211,7 @@ async def preview_system_message(
     style: str,
     page: int,
 ) -> None:
-    if _definition(key) is None:
+    if _definition(key) is None or not _definition(key).supports_platform("max"):
         await client.send_message(chat_id=chat_id, text="Системное сообщение не найдено.")
         return
     locale = _valid_locale(locale)
@@ -216,7 +223,7 @@ async def preview_system_message(
         text=render_system_message_preview(key, style, text),
         attachments=inline_keyboard([
             [callback_button(
-                "◀️ К сообщению",
+                "⬅️ Назад к сообщению",
                 system_message_callback_data("d", key, locale, page=_valid_page(page)),
             )],
         ]),
@@ -233,7 +240,7 @@ async def start_edit_system_message(
     style: str,
     page: int,
 ) -> None:
-    if _definition(key) is None:
+    if _definition(key) is None or not _definition(key).supports_platform("max"):
         await client.send_message(chat_id=chat_id, text="Системное сообщение не найдено.")
         return
     locale = _valid_locale(locale)
@@ -248,7 +255,7 @@ async def start_edit_system_message(
         current_text = await resolve_system_text(session, key, locale, style, bot_scope="max")
     await client.send_message(
         chat_id=chat_id,
-        text=render_system_message_editor(key, style, current_text),
+        text=render_system_message_editor(key, style, current_text, _locale_label(locale)),
         attachments=inline_keyboard([
             [callback_button(
                 "Отмена",
@@ -299,6 +306,10 @@ async def save_system_message_draft(
     style: str,
     page: int,
 ) -> None:
+    definition = _definition(key)
+    if definition is None or not definition.supports_platform("max"):
+        await client.send_message(chat_id=chat_id, text="Системное сообщение не найдено.")
+        return
     snapshot = await states.get(user_id)
     normalized_locale = _valid_locale(locale)
     normalized_style = _valid_style(style)
@@ -338,6 +349,10 @@ async def cancel_system_message_edit(
     style: str,
     page: int,
 ) -> None:
+    definition = _definition(key)
+    if definition is None or not definition.supports_platform("max"):
+        await client.send_message(chat_id=chat_id, text="Системное сообщение не найдено.")
+        return
     snapshot = await states.get(user_id)
     normalized_locale = _valid_locale(locale)
     normalized_style = _valid_style(style)
@@ -357,6 +372,10 @@ async def reset_system_message_text(
     style: str,
     page: int,
 ) -> None:
+    definition = _definition(key)
+    if definition is None or not definition.supports_platform("max"):
+        await client.send_message(chat_id=chat_id, text="Системное сообщение не найдено.")
+        return
     try:
         async with async_session_maker() as session:
             await reset_system_message(session, key, locale, style, bot_scope="max")

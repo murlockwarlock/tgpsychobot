@@ -329,6 +329,8 @@ def test_database_model_column_is_text():
     assert isinstance(BotGeneralConfig.ai_processing_message_text.type, Text)
     assert BotGeneralConfig.ai_processing_message_text.default.arg == "Думаю..."
     assert BotGeneralConfig.ai_processing_message_text.nullable is False
+    assert BotGeneralConfig.ai_processing_message_text_explicit.default.arg is False
+    assert BotGeneralConfig.ai_processing_message_text_explicit.nullable is False
 
 
 def _run_mock_init_db(monkeypatch, dialect_name: str, bot_general_config_cols: list[dict]):

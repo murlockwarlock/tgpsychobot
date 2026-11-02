@@ -1219,7 +1219,7 @@ async def test_database_checks_are_concurrent_but_bounded(monkeypatch):
 async def test_general_config_migration_check_is_read_only_and_disposes_engine(monkeypatch):
     class Result:
         def first(self):
-            return (True, "configured")
+            return (True, "configured", False)
 
     class Connection:
         async def __aenter__(self):
@@ -1257,6 +1257,7 @@ async def test_general_config_migration_check_is_read_only_and_disposes_engine(m
             get_columns=lambda _table: [
                 {"name": "ai_processing_message_enabled"},
                 {"name": "ai_processing_message_text"},
+                {"name": "ai_processing_message_text_explicit"},
             ]
         ),
     )
