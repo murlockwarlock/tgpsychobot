@@ -348,6 +348,7 @@ class DialogueResetConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         bot = MagicMock()
         bot.send_message = AsyncMock()
+        bot.send_chat_action = AsyncMock()
 
         # 1. Stale token
         cb_stale = MagicMock()
