@@ -383,16 +383,18 @@ def render_system_message_editor(
     style: Any,
     text: str,
     locale: str = "Русский",
+    mode_note: str = "",
 ) -> str:
     definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
     title = definition.title if definition else "Сообщение бота"
+    note = f"\n\n{html.escape(mode_note)}" if mode_note else ""
     prefix = (
         f"✏️ <b>{html.escape(title)}</b>\n"
         f"Язык: <b>{html.escape(locale)}</b>\n"
         f"Обращение: <b>{addressing_style_label(style)}</b>\n\n"
         "Текущий текст:\n"
     )
-    suffix = "\n\nОтправьте новый текст одним сообщением. Затем нажмите «Сохранить» или «Отмена»."
+    suffix = note + "\n\nОтправьте новый текст одним сообщением. Затем нажмите «Сохранить» или «Отмена»."
     return prefix + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(prefix) - len(suffix))) + suffix
 
 

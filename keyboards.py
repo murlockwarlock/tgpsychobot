@@ -292,14 +292,6 @@ def admin_general_settings_keyboard(config, addressing_style=None):
         text=f"Сообщение во время ожидания ответа: {processing_status}",
         callback_data="admin_general_toggle_ai_processing_message",
     )
-    builder.button(
-        text="✏️ Изменить текст ожидания ответа",
-        callback_data="admin_general_edit_ai_processing_message_text",
-    )
-    builder.button(
-        text="🌐 Настроить варианты ожидания по языку",
-        callback_data="admin_general_open_ai_processing_variants",
-    )
     addressing_style = normalize_addressing_style(
         addressing_style if addressing_style is not None else getattr(config, "addressing_style", "informal")
     )

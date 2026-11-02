@@ -79,6 +79,16 @@ def _make_message(text: str, user_id=12345, message_id=101) -> Message:
     return msg
 
 
+def _future_msk_text(days: int = 30, hour: int = 19, minute: int = 0) -> str:
+    value = (datetime.utcnow() + timedelta(days=days)).replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+    return value.strftime("%d.%m.%Y %H:%M")
+
+
 @pytest.mark.asyncio
 async def test_telegram_admin_root_list_and_card(db_session_maker, monkeypatch):
     monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
@@ -155,7 +165,7 @@ async def test_telegram_webinar_creation_flow(db_session_maker, monkeypatch):
     assert await state.get_state() == event_admin_telegram.EventAdminStates.create_starts_at.state
 
     # Step 3: Input Starts at MSK
-    msg_time = _make_message("29.10.2026 18:30")
+    msg_time = _make_message(_future_msk_text())
     await event_admin_telegram.process_create_starts_at(msg_time, state)
     assert await state.get_state() == event_admin_telegram.EventAdminStates.create_duration.state
 
@@ -188,7 +198,7 @@ async def test_telegram_meeting_creation_flow(db_session_maker, monkeypatch):
 
     await event_admin_telegram.process_create_code(_make_message("moscow_meetup"), state)
     await event_admin_telegram.process_create_title(_make_message("Moscow Offline Meetup"), state)
-    await event_admin_telegram.process_create_starts_at(_make_message("30.10.2026 19:00"), state)
+    await event_admin_telegram.process_create_starts_at(_make_message(_future_msk_text()), state)
     await event_admin_telegram.process_create_duration(_make_message("180"), state)
     assert await state.get_state() == event_admin_telegram.EventAdminStates.create_place.state
 
@@ -226,7 +236,7 @@ async def test_telegram_reschedule_and_copy(db_session_maker, monkeypatch):
     await event_admin_telegram.start_reschedule(cb_resched, state)
     assert await state.get_state() == event_admin_telegram.EventAdminStates.reschedule_starts_at.state
 
-    msg_new_time = _make_message("05.11.2026 20:00")
+    msg_new_time = _make_message(_future_msk_text(days=10, hour=20))
     await event_admin_telegram.process_reschedule(msg_new_time, state)
     assert await state.get_state() is None
     msg_new_time.answer.assert_called_once()
@@ -241,7 +251,7 @@ async def test_telegram_reschedule_and_copy(db_session_maker, monkeypatch):
     await event_admin_telegram.process_copy_code(msg_copy_code, state)
     assert await state.get_state() == event_admin_telegram.EventAdminStates.copy_starts_at.state
 
-    msg_copy_time = _make_message("10.11.2026 19:00")
+    msg_copy_time = _make_message(_future_msk_text(days=20))
     await event_admin_telegram.process_copy_starts_at(msg_copy_time, state)
     assert await state.get_state() is None
     msg_copy_time.answer.assert_called_once()
@@ -618,7 +628,7 @@ def test_scenario_card_text_with_and_without_bot_username():
         event_type="webinar",
         title="Webinar AI",
         starts_at=datetime.utcnow() + timedelta(days=2),
-        starts_at_msk="15.10.2026 19:00 (МСК)",
+        starts_at_msk=f"{_future_msk_text(days=2)} (МСК)",
         duration_minutes=60,
         place=None,
         link="https://example.com/join",
