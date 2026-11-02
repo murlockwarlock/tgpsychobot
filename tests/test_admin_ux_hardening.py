@@ -13,7 +13,16 @@ import pytest_asyncio
 from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import AnswerCallbackQuery, DeleteMessage, EditMessageText, GetChat, GetMe, SendMessage
-from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    MessageEntity,
+    Update,
+    User,
+)
 from aiogram.client.session.base import BaseSession
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -5480,19 +5489,35 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
     assert processing_button.text == "Сообщение во время ожидания ответа"
     await _feed_callback(admin_dispatcher, bot, system_list, processing_button.callback_data, 7003)
     detail = session.current_message(root_message)
-    assert detail.text.count("Единый текст") >= 2
+    assert detail.text.count("Единый текст") == 1
     assert "Старый португальский Вы" not in detail.text
-    preview_formal = next(
+    visible_detail_buttons = _ai_callback_buttons(detail.reply_markup)
+    assert sum(
+        parse_system_message_callback(button.callback_data or "")["action"] == "v"
+        for button in visible_detail_buttons
+        if parse_system_message_callback(button.callback_data or "")
+    ) == 1
+    assert sum(
+        parse_system_message_callback(button.callback_data or "")["action"] == "e"
+        for button in visible_detail_buttons
+        if parse_system_message_callback(button.callback_data or "")
+    ) == 1
+    assert {button.text for button in visible_detail_buttons if button.text in {"👁 Просмотр", "✏️ Изменить"}} == {
+        "👁 Просмотр",
+        "✏️ Изменить",
+    }
+    preview_button = next(
         button
         for row in detail.reply_markup.inline_keyboard
         for button in row
         if parse_system_message_callback(button.callback_data or "")
         and parse_system_message_callback(button.callback_data)["action"] == "v"
-        and parse_system_message_callback(button.callback_data)["style"] == "formal"
     )
-    await _feed_callback(admin_dispatcher, bot, detail, preview_formal.callback_data, 70031)
+    await _feed_callback(admin_dispatcher, bot, detail, preview_button.callback_data, 70031)
     preview = session.current_message(root_message)
     assert "Единый текст" in preview.text
+    assert "· Ты" not in preview.text
+    assert "· Вы" not in preview.text
     assert "Старый португальский Вы" not in preview.text
     preview_back = next(
         button
@@ -5551,12 +5576,12 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         for button in row
         if parse_system_message_callback(button.callback_data or "")
         and parse_system_message_callback(button.callback_data)["action"] == "e"
-        and parse_system_message_callback(button.callback_data)["style"] == "formal"
     )
     await _feed_callback(admin_dispatcher, bot, detail, edit_formal.callback_data, 7007)
     editor = session.current_message(root_message)
     assert "Единый текст" in editor.text
     assert "Сейчас используется единый текст" in editor.text
+    assert "Обращение:" not in editor.text
     assert {button.text for button in _ai_callback_buttons(editor.reply_markup)} >= {"💾 Сохранить", "Отмена"}
     cancel_button = next(
         button
@@ -5581,7 +5606,6 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         for button in _ai_callback_buttons(detail.reply_markup)
         if parse_system_message_callback(button.callback_data or "")
         and parse_system_message_callback(button.callback_data)["action"] == "e"
-        and parse_system_message_callback(button.callback_data)["style"] == "formal"
     )
     await _feed_callback(admin_dispatcher, bot, detail, edit_formal.callback_data, 7009)
     assert "Единый текст" in session.current_message(root_message).text
@@ -5614,7 +5638,6 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         for button in row
         if parse_system_message_callback(button.callback_data or "")
         and parse_system_message_callback(button.callback_data)["action"] == "e"
-        and parse_system_message_callback(button.callback_data)["style"] == "formal"
     )
     await _feed_callback(admin_dispatcher, bot, detail, reopened_editor_button.callback_data, 70105)
     reopened_editor = session.current_message(detail)
@@ -5634,7 +5657,6 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         for button in row
         if parse_system_message_callback(button.callback_data or "")
         and parse_system_message_callback(button.callback_data)["action"] == "v"
-        and parse_system_message_callback(button.callback_data)["style"] == "formal"
     )
     await _feed_callback(admin_dispatcher, bot, detail, preview_with_entities.callback_data, 70107)
     preview = session.current_message(detail)
@@ -5699,11 +5721,24 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         if parse_system_message_callback(button.callback_data or "")
         and parse_system_message_callback(button.callback_data)["action"] in {"m0", "m1"}
     )
-    legacy_mode_callback = system_message_callback_data(
-        "m",
-        "ui.ai.processing_default",
-        "pt",
-        page=0,
+    legacy_detail_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🔀 Включить варианты по языку и обращению",
+                callback_data=system_message_callback_data(
+                    "m",
+                    "ui.ai.processing_default",
+                    "pt",
+                    page=0,
+                ),
+            ),
+        ]]
+    )
+    legacy_mode_callback = next(
+        button.callback_data
+        for row in legacy_detail_keyboard.inline_keyboard
+        for button in row
+        if button.text == "🔀 Включить варианты по языку и обращению"
     )
     await _feed_callback(admin_dispatcher, bot, detail, legacy_mode_callback, 70114)
     detail = session.current_message(draft)
@@ -5831,6 +5866,17 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
     )
     await _feed_callback(admin_dispatcher, bot, detail, disable_unified.callback_data, 70153)
     detail = session.current_message(detail)
+    visible_variant_buttons = _ai_callback_buttons(detail.reply_markup)
+    assert sum(
+        parse_system_message_callback(button.callback_data or "")["action"] == "v"
+        for button in visible_variant_buttons
+        if parse_system_message_callback(button.callback_data or "")
+    ) == 2
+    assert sum(
+        parse_system_message_callback(button.callback_data or "")["action"] == "e"
+        for button in visible_variant_buttons
+        if parse_system_message_callback(button.callback_data or "")
+    ) == 2
 
     edit_informal = next(
         button
@@ -6006,7 +6052,6 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         for button in row
         if parse_system_message_callback(button.callback_data or "")
         and parse_system_message_callback(button.callback_data)["action"] == "v"
-        and parse_system_message_callback(button.callback_data)["style"] == "formal"
     )
     await _feed_callback(admin_dispatcher, bot, detail, preview_button.callback_data, 7025)
     preview = session.current_message(detail)

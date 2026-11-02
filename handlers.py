@@ -21695,6 +21695,7 @@ async def _render_admin_system_message_detail(callback: CallbackQuery, key: str,
         _system_messages_locale_label(locale),
         variants,
         mode_note=mode_note,
+        single_text=key == "ui.ai.processing_default" and processing_text_explicit,
     )
     await callback.message.edit_text(
         text,
@@ -21817,6 +21818,7 @@ async def _open_telegram_system_message_editor(
             current_text,
             _system_messages_locale_label(locale),
             mode_note=mode_note,
+            single_text=processing_text_explicit,
         ),
         parse_mode="HTML",
         reply_markup=kb.admin_system_message_draft_keyboard(key, locale, style, page),
@@ -21909,7 +21911,7 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
     if action == "v":
         await state.clear()
         async with async_session_maker() as session:
-            variants, _, entities = await _telegram_system_message_variants(
+            variants, processing_text_explicit, entities = await _telegram_system_message_variants(
                 session,
                 key,
                 locale,
@@ -21921,6 +21923,7 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
                 style,
                 text_value,
                 formatted_text=_telegram_system_message_preview_html(text_value, entities),
+                single_text=key == "ui.ai.processing_default" and processing_text_explicit,
             ),
             parse_mode="HTML",
             reply_markup=kb.admin_system_message_preview_keyboard(key, locale, style, page),
@@ -22150,7 +22153,7 @@ async def admin_system_message_preview(callback: CallbackQuery, state: FSMContex
         return
     await state.clear()
     async with async_session_maker() as session:
-        variants, _, entities = await _telegram_system_message_variants(session, key, locale)
+        variants, processing_text_explicit, entities = await _telegram_system_message_variants(session, key, locale)
         text_value = variants.get(style, "")
     await callback.message.edit_text(
         render_system_message_preview(
@@ -22158,6 +22161,7 @@ async def admin_system_message_preview(callback: CallbackQuery, state: FSMContex
             style,
             text_value,
             formatted_text=_telegram_system_message_preview_html(text_value, entities),
+            single_text=key == "ui.ai.processing_default" and processing_text_explicit,
         ),
         parse_mode="HTML",
         reply_markup=kb.admin_system_message_preview_keyboard(

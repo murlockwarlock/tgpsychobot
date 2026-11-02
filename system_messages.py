@@ -390,6 +390,7 @@ def render_system_message_detail(
     locale: str,
     variants: dict[str, str],
     mode_note: str = "",
+    single_text: bool = False,
 ) -> str:
     header = (
         "💬 <b>Сообщение бота</b>\n\n"
@@ -398,6 +399,11 @@ def render_system_message_detail(
         f"Язык: <b>{html.escape(locale)}</b>"
         + (f"\nРежим: <b>{html.escape(mode_note)}</b>" if mode_note else "")
     )
+    if single_text:
+        prefix = f"{header}\n\n<b>Текущий текст:</b>\n"
+        text = variants.get("informal", variants.get("formal", ""))
+        return prefix + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(prefix)))
+
     informal_prefix = f"{header}\n\n<b>Ты:</b>\n"
     formal_prefix = "\n\n<b>Вы:</b>\n"
     available = max(0, TELEGRAM_TEXT_LIMIT - len(informal_prefix) - len(formal_prefix))
@@ -416,11 +422,12 @@ def render_system_message_preview(
     style: Any,
     text: str,
     formatted_text: str | None = None,
+    single_text: bool = False,
 ) -> str:
-    style_label = "Вы" if normalize_addressing_style(style) == "formal" else "Ты"
     definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
     title = definition.title if definition else "Сообщение бота"
-    header = f"👁 <b>Предпросмотр · {html.escape(title)} · {style_label}</b>\n\n"
+    style_suffix = "" if single_text else f" · {'Вы' if normalize_addressing_style(style) == 'formal' else 'Ты'}"
+    header = f"👁 <b>Предпросмотр · {html.escape(title)}{style_suffix}</b>\n\n"
     raw_available = max(0, TELEGRAM_TEXT_LIMIT - len(header))
     raw_utf16_available = max(0, TELEGRAM_TEXT_LIMIT - _telegram_utf16_length(header))
     visible_available = raw_utf16_available
@@ -444,15 +451,18 @@ def render_system_message_editor(
     text: str,
     locale: str = "Русский",
     mode_note: str = "",
+    single_text: bool = False,
 ) -> str:
     definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
     title = definition.title if definition else "Сообщение бота"
     note = f"\n\n{html.escape(mode_note)}" if mode_note else ""
+    addressing_line = "" if single_text else f"Обращение: <b>{addressing_style_label(style)}</b>\n"
     prefix = (
         f"✏️ <b>{html.escape(title)}</b>\n"
         f"Язык: <b>{html.escape(locale)}</b>\n"
-        f"Обращение: <b>{addressing_style_label(style)}</b>\n\n"
-        "Текущий текст:\n"
+        + addressing_line
+        + "\n"
+        + "Текущий текст:\n"
     )
     suffix = note + "\n\nОтправьте новый текст одним сообщением. Затем нажмите «Сохранить» или «Отмена»."
     return prefix + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(prefix) - len(suffix))) + suffix
