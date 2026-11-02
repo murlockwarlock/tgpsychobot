@@ -392,13 +392,18 @@ def admin_system_message_detail_keyboard(
                 callback_data=system_message_callback_data("e", key, locale, style, page),
             ),
         ])
+        if key != "ui.ai.processing_default" or not processing_text_explicit:
+            rows.append([InlineKeyboardButton(
+                text=f"↩️ Восстановить «{style_label}» по умолчанию",
+                callback_data=system_message_callback_data("r", key, locale, style, page),
+            )])
+    if key == "ui.ai.processing_default":
         rows.append([InlineKeyboardButton(
-            text=f"↩️ Восстановить «{style_label}» по умолчанию",
-            callback_data=system_message_callback_data("r", key, locale, style, page),
-        )])
-    if key == "ui.ai.processing_default" and processing_text_explicit:
-        rows.append([InlineKeyboardButton(
-            text="🔀 Включить варианты по языку и обращению",
+            text=(
+                "🔀 Включить варианты по языку и обращению"
+                if processing_text_explicit
+                else "🔀 Включить единый текст"
+            ),
             callback_data=system_message_callback_data("m", key, locale, page=page),
         )])
     rows.append([InlineKeyboardButton(

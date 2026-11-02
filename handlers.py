@@ -21677,7 +21677,7 @@ async def _render_admin_system_message_detail(callback: CallbackQuery, key: str,
     if await _reject_hidden_telegram_system_message_locale(callback, locale):
         return
     async with async_session_maker() as session:
-        variants, processing_text_explicit = await _telegram_system_message_variants(
+        variants, processing_text_explicit, _ = await _telegram_system_message_variants(
             session,
             key,
             locale,
@@ -21746,15 +21746,28 @@ async def _telegram_system_message_variants(
     session,
     key: str,
     locale: str,
-) -> tuple[dict[str, str], bool]:
+) -> tuple[dict[str, str], bool, list[MessageEntity] | None]:
     if key != "ui.ai.processing_default":
-        return await get_system_message_variants(session, key, locale, bot_scope="telegram"), False
+        return await get_system_message_variants(session, key, locale, bot_scope="telegram"), False, None
     config = await session.get(BotGeneralConfig, 1)
-    source_text, _, explicit = _ai_processing_message_state(config)
+    source_text, entities, explicit = _ai_processing_message_state(config)
     if explicit:
         text = source_text or DEFAULT_AI_PROCESSING_MESSAGE_TEXT
-        return {"informal": text, "formal": text}, True
-    return await get_system_message_variants(session, key, locale, bot_scope="telegram"), False
+        return {"informal": text, "formal": text}, True, entities
+    return await get_system_message_variants(session, key, locale, bot_scope="telegram"), False, None
+
+
+def _telegram_system_message_preview_html(
+    text: str,
+    entities: list[MessageEntity] | None,
+) -> str | None:
+    if not entities:
+        return None
+    try:
+        return Text.from_entities(text, entities).as_html()
+    except Exception as exc:
+        logging.warning("Could not render system message preview entities: %s", exception_summary(exc))
+        return None
 
 
 async def _open_telegram_processing_system_message(callback: CallbackQuery, state: FSMContext) -> None:
@@ -21868,23 +21881,36 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
                     ai_processing_message_text_explicit=False,
                 )
                 session.add(config)
-            config.ai_processing_message_text_explicit = False
+                current_explicit = False
+            else:
+                _, _, current_explicit = _ai_processing_message_state(config)
+            config.ai_processing_message_text_explicit = not current_explicit
             await session.commit()
         await state.clear()
         await _render_admin_system_message_detail(callback, key, locale, page)
-        await callback.answer(limit_callback_answer("Включены варианты по языку и обращению."))
+        notice = (
+            "Включены варианты по языку и обращению."
+            if current_explicit
+            else "Включён единый текст для всех языков и вариантов обращения."
+        )
+        await callback.answer(limit_callback_answer(notice))
         return
     if action == "v":
         await state.clear()
         async with async_session_maker() as session:
-            variants, _ = await _telegram_system_message_variants(
+            variants, _, entities = await _telegram_system_message_variants(
                 session,
                 key,
                 locale,
             )
             text_value = variants.get(style, "")
         await callback.message.edit_text(
-            render_system_message_preview(key, style, text_value),
+            render_system_message_preview(
+                key,
+                style,
+                text_value,
+                formatted_text=_telegram_system_message_preview_html(text_value, entities),
+            ),
             parse_mode="HTML",
             reply_markup=kb.admin_system_message_preview_keyboard(key, locale, style, page),
         )
@@ -22100,10 +22126,15 @@ async def admin_system_message_preview(callback: CallbackQuery, state: FSMContex
         return
     await state.clear()
     async with async_session_maker() as session:
-        variants, _ = await _telegram_system_message_variants(session, key, locale)
+        variants, _, entities = await _telegram_system_message_variants(session, key, locale)
         text_value = variants.get(style, "")
     await callback.message.edit_text(
-        render_system_message_preview(key, style, text_value),
+        render_system_message_preview(
+            key,
+            style,
+            text_value,
+            formatted_text=_telegram_system_message_preview_html(text_value, entities),
+        ),
         parse_mode="HTML",
         reply_markup=kb.admin_system_message_preview_keyboard(
             key,

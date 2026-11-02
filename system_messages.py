@@ -372,12 +372,18 @@ def render_system_message_preview(
     key: str,
     style: Any,
     text: str,
+    formatted_text: str | None = None,
 ) -> str:
     style_label = "Вы" if normalize_addressing_style(style) == "formal" else "Ты"
     definition = SYSTEM_MESSAGE_DEFINITIONS.get(key)
     title = definition.title if definition else "Сообщение бота"
     header = f"👁 <b>Предпросмотр · {html.escape(title)} · {style_label}</b>\n\n"
-    return header + escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(header)))
+    body = (
+        formatted_text
+        if formatted_text is not None
+        else escape_text_with_limit(text, max(0, TELEGRAM_TEXT_LIMIT - len(header)))
+    )
+    return header + body
 
 
 def render_system_message_editor(
