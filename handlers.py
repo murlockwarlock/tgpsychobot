@@ -252,6 +252,7 @@ from mailing_utils import (
     get_mailing_status_label,
     is_birthday_mailing,
     parse_mailing_text,
+    parse_mailing_details_callback,
     render_mailing_text,
     resolve_mailing_platform,
     send_mailing_content,
@@ -18598,7 +18599,11 @@ async def admin_mailing_history(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("mailing_details_"))
 async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
-    mailing_id = int(callback.data.split("_")[-1])
+    parsed_callback = parse_mailing_details_callback(callback.data)
+    if parsed_callback is None:
+        await callback.answer("Рассылка не найдена.", show_alert=True)
+        return
+    mailing_id, page = parsed_callback
     async with async_session_maker() as session:
         mailing = await session.get(Mailing, mailing_id)
         if mailing:
@@ -18642,7 +18647,7 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
     if is_birthday_mailing(mailing):
         text += f"\n\n<b>Переменные:</b> <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
 
-    back_keyboard = kb.mailing_details_keyboard(mailing)
+    back_keyboard = kb.mailing_details_keyboard(mailing, page)
     back_keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="Изменить текст", callback_data=f"ca:view:mailing:{mailing_id}")])
     details_markup = _merge_telegram_inline_markups(
         _telegram_response_buttons_markup(response_button_rows),

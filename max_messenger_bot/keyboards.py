@@ -848,14 +848,14 @@ def admin_mailing_history_keyboard(mailings: list, page: int, total_pages: int) 
     status_map = {"pending": "⏳", "sending": "🚀", "completed": "✅", "failed": "❌"}
     for mailing in mailings:
         preview = (mailing.text or "Без текста").replace("\n", " ")[:28]
-        rows.append([callback_button(f"{status_map.get(mailing.status, '❓')} #{mailing.id} {preview}", f"mailing_details_{mailing.id}")])
-    nav_row: list[dict] = []
-    if page > 0:
-        nav_row.append(callback_button("⬅️", f"mailing_history_page_{page - 1}"))
-    nav_row.append(callback_button(f"{page + 1}/{total_pages}", "noop"))
-    if page < total_pages - 1:
-        nav_row.append(callback_button("➡️", f"mailing_history_page_{page + 1}"))
-    if nav_row:
+        rows.append([callback_button(f"{status_map.get(mailing.status, '❓')} #{mailing.id} {preview}", f"mailing_details_{mailing.id}_{page}")])
+    if total_pages > 1:
+        nav_row: list[dict] = []
+        if page > 0:
+            nav_row.append(callback_button("⬅️", f"mailing_history_page_{page - 1}"))
+        nav_row.append(callback_button(f"{page + 1}/{total_pages}", "noop"))
+        if page < total_pages - 1:
+            nav_row.append(callback_button("➡️", f"mailing_history_page_{page + 1}"))
         rows.append(nav_row)
     rows.append([callback_button("⬅️ Назад", "admin_mailing_menu")])
     return inline_keyboard(rows)

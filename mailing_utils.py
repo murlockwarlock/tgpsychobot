@@ -68,6 +68,18 @@ def get_mailing_platform_label(mailing) -> str:
     return MAILING_PLATFORM_LABELS.get(resolve_mailing_platform(mailing), "Не определена")
 
 
+def parse_mailing_details_callback(data: str) -> tuple[int, int] | None:
+    prefix = "mailing_details_"
+    if not isinstance(data, str) or not data.startswith(prefix):
+        return None
+    parts = data[len(prefix):].split("_")
+    if len(parts) == 1 and parts[0].isdigit():
+        return int(parts[0]), 0
+    if len(parts) == 2 and all(part.isdigit() for part in parts):
+        return int(parts[0]), int(parts[1])
+    return None
+
+
 def is_birthday_mailing(mailing) -> bool:
     return getattr(mailing, "recurring_type", None) == BIRTHDAY_MAILING_TYPE
 

@@ -17,8 +17,67 @@ import background_worker
 import birthday_mailings
 import database
 from database import Base, Mailing, MailingDeliveryLog, User
+from max_messenger_bot.keyboards import admin_mailing_history_keyboard
 from max_messenger_bot.services import admin_mailing as max_admin_mailing
-from mailing_utils import get_mailing_platform_label, resolve_mailing_platform
+from mailing_utils import (
+    get_mailing_platform_label,
+    parse_mailing_details_callback,
+    resolve_mailing_platform,
+)
+
+
+def _max_keyboard_payloads(attachments: list[dict]) -> list[str]:
+    return [
+        button["payload"]
+        for attachment in attachments
+        if attachment.get("type") == "inline_keyboard"
+        for row in attachment["payload"]["buttons"]
+        for button in row
+        if button.get("type") == "callback"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ("mailing_details_7", (7, 0)),
+        ("mailing_details_7_0", (7, 0)),
+        ("mailing_details_42_3", (42, 3)),
+        ("mailing_details_7_bad", None),
+        ("mailing_details_bad", None),
+    ],
+)
+def test_mailing_details_callback_parser_keeps_legacy_compatibility(data, expected):
+    assert parse_mailing_details_callback(data) == expected
+
+
+@pytest.mark.parametrize(
+    ("count", "total_pages", "has_pagination"),
+    [(0, 1, False), (1, 1, False), (10, 1, False), (11, 2, True)],
+)
+def test_max_history_keyboard_hides_noop_pagination_on_single_page(count, total_pages, has_pagination):
+    mailings = [
+        SimpleNamespace(id=index + 1, status="completed", text=f"mailing-{index}")
+        for index in range(count)
+    ]
+
+    payloads = _max_keyboard_payloads(admin_mailing_history_keyboard(mailings, 0, total_pages))
+
+    assert ("noop" in payloads) is has_pagination
+    assert all(payload.endswith("_0") for payload in payloads if payload.startswith("mailing_details_"))
+
+
+@pytest.mark.parametrize("page", [0, 1, 2])
+def test_max_history_detail_callbacks_preserve_first_middle_and_last_page(page):
+    payloads = _max_keyboard_payloads(
+        admin_mailing_history_keyboard(
+            [SimpleNamespace(id=7, status="completed", text="mailing")],
+            page,
+            3,
+        )
+    )
+
+    assert f"mailing_details_7_{page}" in payloads
 
 
 @pytest.mark.parametrize(

@@ -25,7 +25,13 @@ from ..storage import StateStore
 from ..time_utils import utc_now
 from .subscription_access import effective_subscription_filters
 from result_history import non_technical_role_filter
-from mailing_utils import get_mailing_platform_label, mailing_text_to_html, parse_mailing_text, render_mailing_text
+from mailing_utils import (
+    get_mailing_platform_label,
+    mailing_text_to_html,
+    parse_mailing_details_callback,
+    parse_mailing_text,
+    render_mailing_text,
+)
 
 
 PAGE_SIZE = 10
@@ -480,7 +486,7 @@ async def show_history(client: MaxApiClient, chat_id: int, page: int) -> None:
     await client.send_message(chat_id=chat_id, text=text, attachments=admin_mailing_history_keyboard(mailings, page, total_pages))
 
 
-async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> None:
+async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int, page: int = 0) -> None:
     from ..keyboards import callback_button, inline_keyboard
     async with async_session_maker() as session:
         mailing = await session.get(Mailing, mailing_id)
@@ -508,7 +514,7 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
         f"<pre><code>{html.escape(preview or 'Нет текста')}</code></pre>"
     )
     detail_rows = [
-        [callback_button("⬅️ К истории", "mailing_history_page_0")],
+        [callback_button("⬅️ К истории", f"mailing_history_page_{page}")],
     ]
     attachments = []
     media_type, media_token = _normalize_media(mailing.media_file_type, mailing.media_file_id)
