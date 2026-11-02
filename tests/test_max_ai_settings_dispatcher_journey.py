@@ -12,6 +12,7 @@ from database import AIConfig, Base, BotAddressingConfig, BotGeneralConfig, BotS
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.app import MaxBotApplication
 from max_messenger_bot import app as max_app_module
+from max_messenger_bot.keyboards import callback_button, inline_keyboard
 from max_messenger_bot.services import admin_ai as max_admin_ai
 from max_messenger_bot.services import admin_system_messages as max_system_messages
 from max_messenger_bot.storage import StorageBase
@@ -1925,12 +1926,36 @@ async def test_max_system_message_scope_matches_ru_only_runtime(max_settings_db,
     assert len([item for item in captured if item["path"] == "/answers"]) > answers_before
 
 
+def _historical_max_system_message_screen(key, locale, style, page, protocol, screen):
+    if screen == "editor":
+        text = "✏️ <b>Редактирование сообщения</b>"
+        label = "Отмена"
+        payload = (
+            system_message_callback_data("c", key, locale, style, page)
+            if protocol == "compact"
+            else f"admin_system_cancel:{key}:{locale}:{style}:{page}"
+        )
+    else:
+        text = "💬 <b>Системное сообщение</b>"
+        label = "◀️ К списку"
+        payload = (
+            system_message_callback_data("p", locale=locale, page=page)
+            if protocol == "compact"
+            else f"admin_system_messages_page:{page}:{locale}"
+        )
+    return {"text": text, "attachments": inline_keyboard([[callback_button(label, payload)]])}
+
+
 @pytest.mark.parametrize("hidden_locale", ["en", "pt"])
+@pytest.mark.parametrize("protocol", ["compact", "legacy"])
+@pytest.mark.parametrize("screen", ["editor", "detail"])
 @pytest.mark.asyncio
 async def test_max_hidden_locale_cancel_returns_to_ru_list_and_clears_state(
     max_settings_db,
     monkeypatch,
     hidden_locale,
+    protocol,
+    screen,
 ):
     monkeypatch.setattr(max_system_messages, "async_session_maker", max_settings_db)
     monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
@@ -1938,7 +1963,7 @@ async def test_max_hidden_locale_cancel_returns_to_ru_list_and_clears_state(
     monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
 
     key = "ui.ai.thinking"
-    original_text = "Сохранённый MAX текст"
+    original_text = f"Сохранённый MAX текст {hidden_locale}"
     async with max_settings_db() as session:
         session.add(
             BotSystemMessage(
@@ -1950,6 +1975,17 @@ async def test_max_hidden_locale_cancel_returns_to_ru_list_and_clears_state(
             )
         )
         await session.commit()
+        rows_before = [
+            (row.translation_key, row.locale, row.addressing_style, row.text)
+            for row in (
+                await session.scalars(
+                    select(BotSystemMessage).where(
+                        BotSystemMessage.bot_scope == "max",
+                        BotSystemMessage.locale == hidden_locale,
+                    )
+                )
+            ).all()
+        ]
 
     captured = []
 
@@ -1985,28 +2021,8 @@ async def test_max_hidden_locale_cancel_returns_to_ru_list_and_clears_state(
 
     async def press(body, payload):
         nonlocal update_id
-        before = len([item for item in captured if item["path"] == "/messages"])
-        update_id += 1
-        await app.handle_update({
-            "update_type": "message_callback",
-            "update_id": update_id,
-            "callback": {
-                "callback_id": f"cb-{update_id}",
-                "payload": payload,
-                "sender": {"user_id": 1002, "name": "Admin"},
-            },
-            "message": {
-                "mid": "visible-admin-screen",
-                "recipient": {"chat_id": 1002},
-                "body": {"attachments": body.get("attachments", [])},
-            },
-        })
-        messages = [item for item in captured if item["path"] == "/messages"]
-        assert len(messages) > before
-        return messages[-1]["body"]
-
-    async def press_without_message(body, payload):
-        nonlocal update_id
+        buttons = _max_buttons(body.get("attachments", []))
+        assert any(button["payload"] == payload for button in buttons), payload
         before_messages = len([item for item in captured if item["path"] == "/messages"])
         before_answers = len([item for item in captured if item["path"] == "/answers"])
         update_id += 1
@@ -2021,62 +2037,91 @@ async def test_max_hidden_locale_cancel_returns_to_ru_list_and_clears_state(
             "message": {
                 "mid": "visible-admin-screen",
                 "recipient": {"chat_id": 1002},
-                "body": {"attachments": body.get("attachments", [])},
+                "body": {
+                    "text": body.get("text", ""),
+                    "attachments": body.get("attachments", []),
+                },
             },
         })
-        assert len([item for item in captured if item["path"] == "/messages"]) == before_messages
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert len(messages) > before_messages
         assert len([item for item in captured if item["path"] == "/answers"]) > before_answers
+        return messages[-1]["body"]
+
+    def button(body, predicate):
+        for item in _max_buttons(body.get("attachments", [])):
+            assert len(item["payload"].encode("utf-8")) <= 64
+        return next(item for item in _max_buttons(body.get("attachments", [])) if predicate(item))
 
     def has_locale_buttons(body):
         return [
-            button
-            for button in _max_buttons(body.get("attachments", []))
-            if (parse_system_message_callback(button["payload"]) or {}).get("action") == "l"
+            item
+            for item in _max_buttons(body.get("attachments", []))
+            if (parse_system_message_callback(item["payload"]) or {}).get("action") == "l"
         ]
 
     root = await send_message("/admin")
-    general = await press(root, "admin_general_settings")
-    system_list = await press(general, "admin_system_messages")
+    general = await press(root, button(root, lambda item: item["payload"] == "admin_general_settings")["payload"])
+    system_list = await press(general, button(general, lambda item: item["payload"] == "admin_system_messages")["payload"])
     assert has_locale_buttons(system_list) == []
+    page_two = await press(
+        system_list,
+        button(
+            system_list,
+            lambda item: (parse_system_message_callback(item["payload"]) or {}).get("action") == "p"
+            and (parse_system_message_callback(item["payload"]) or {}).get("page") == "1",
+        )["payload"],
+    )
+    assert "Сообщения бота · страница 2/2" in page_two["text"]
 
+    historical_screen = _historical_max_system_message_screen(
+        key,
+        hidden_locale,
+        "formal",
+        1,
+        protocol,
+        screen,
+    )
     await app.states.set(
         max_user_id,
         1002,
         "max_system_message_edit",
-        {"key": key, "locale": hidden_locale, "style": "formal", "page": 0, "draft": "Не сохранять"},
+        {"key": key, "locale": hidden_locale, "style": "formal", "page": 1, "draft": "Не сохранять"},
     )
-    await press_without_message(
-        system_list,
-        system_message_callback_data("r", key, hidden_locale, "formal", 0),
-    )
-    assert await app.states.get(max_user_id) is not None
-    ru_list = await press(
-        system_list,
-        system_message_callback_data("c", key, hidden_locale, "formal", 0),
-    )
+    hidden_button = button(historical_screen, lambda item: item["text"] in {"Отмена", "◀️ К списку"})
+    ru_list = await press(historical_screen, hidden_button["payload"])
+    assert "Сообщения бота · страница 2/2" in ru_list["text"]
     assert "Язык: <b>Русский</b>" in ru_list["text"]
     assert has_locale_buttons(ru_list) == []
+    assert all(not item["payload"].startswith("admin_system_") for item in _max_buttons(ru_list.get("attachments", [])))
     assert await app.states.get(max_user_id) is None
 
-    await app.states.set(
-        max_user_id,
-        1002,
-        "max_system_message_edit",
-        {"key": key, "locale": hidden_locale, "style": "formal", "page": 0, "draft": "Не сохранять"},
+    ru_first_page = await press(
+        ru_list,
+        button(
+            ru_list,
+            lambda item: (parse_system_message_callback(item["payload"]) or {}).get("action") == "p"
+            and (parse_system_message_callback(item["payload"]) or {}).get("page") == "0",
+        )["payload"],
     )
-    ru_page = await press(ru_list, f"admin_system_messages_page:1:{hidden_locale}")
-    ru_list = await press(ru_page, f"admin_system_cancel:{key}:{hidden_locale}:formal:0")
-    assert "Язык: <b>Русский</b>" in ru_list["text"]
-    assert has_locale_buttons(ru_list) == []
-    assert await app.states.get(max_user_id) is None
+    assert "Сообщения бота · страница 1/2" in ru_first_page["text"]
+    general = await press(ru_first_page, button(ru_first_page, lambda item: item["payload"] == "admin_general_settings")["payload"])
+    reopened = await press(general, button(general, lambda item: item["payload"] == "admin_system_messages")["payload"])
+    assert "Сообщения бота · страница 1/2" in reopened["text"]
+    assert "Язык: <b>Русский</b>" in reopened["text"]
+    assert has_locale_buttons(reopened) == []
+    assert all(not item["payload"].startswith("admin_system_") for item in _max_buttons(reopened.get("attachments", [])))
 
     async with max_settings_db() as session:
-        row = await session.scalar(
-            select(BotSystemMessage).where(
-                BotSystemMessage.bot_scope == "max",
-                BotSystemMessage.translation_key == key,
-                BotSystemMessage.locale == hidden_locale,
-                BotSystemMessage.addressing_style == "formal",
-            )
-        )
-        assert row.text == original_text
+        rows_after = [
+            (row.translation_key, row.locale, row.addressing_style, row.text)
+            for row in (
+                await session.scalars(
+                    select(BotSystemMessage).where(
+                        BotSystemMessage.bot_scope == "max",
+                        BotSystemMessage.locale == hidden_locale,
+                    )
+                )
+            ).all()
+        ]
+    assert rows_after == rows_before
