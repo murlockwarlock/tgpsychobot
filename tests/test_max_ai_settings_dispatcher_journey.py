@@ -1923,3 +1923,160 @@ async def test_max_system_message_scope_matches_ru_only_runtime(max_settings_db,
     })
     assert len([item for item in captured if item["path"] == "/messages"]) == messages_before
     assert len([item for item in captured if item["path"] == "/answers"]) > answers_before
+
+
+@pytest.mark.parametrize("hidden_locale", ["en", "pt"])
+@pytest.mark.asyncio
+async def test_max_hidden_locale_cancel_returns_to_ru_list_and_clears_state(
+    max_settings_db,
+    monkeypatch,
+    hidden_locale,
+):
+    monkeypatch.setattr(max_system_messages, "async_session_maker", max_settings_db)
+    monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", max_settings_db)
+    monkeypatch.setattr(max_app_module.common, "is_admin", lambda _user_id: _true_async())
+    monkeypatch.setattr(max_app_module.common, "ensure_user", lambda *args, **kwargs: _true_async())
+
+    key = "ui.ai.thinking"
+    original_text = "Сохранённый MAX текст"
+    async with max_settings_db() as session:
+        session.add(
+            BotSystemMessage(
+                bot_scope="max",
+                translation_key=key,
+                locale=hidden_locale,
+                addressing_style="formal",
+                text=original_text,
+            )
+        )
+        await session.commit()
+
+    captured = []
+
+    async def fake_request(method, path, *, params=None, json_data=None, expected_status=200):
+        _validate_max_payload(path, json_data)
+        captured.append({"method": method, "path": path, "body": json_data or {}})
+        if path == "/messages":
+            return {"message": {"body": {"mid": str(len(captured))}}}
+        return {}
+
+    client = MaxApiClient(token="test", base_url="http://max.test")
+    client._request = fake_request
+    app = MaxBotApplication(client=client)
+    update_id = 9000
+    max_user_id = 100_000_001_002
+
+    async def send_message(text):
+        nonlocal update_id
+        before = len([item for item in captured if item["path"] == "/messages"])
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_created",
+            "update_id": update_id,
+            "message": {
+                "body": {"text": text},
+                "recipient": {"chat_id": 1002},
+                "sender": {"user_id": 1002, "name": "Admin"},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert len(messages) > before
+        return messages[-1]["body"]
+
+    async def press(body, payload):
+        nonlocal update_id
+        before = len([item for item in captured if item["path"] == "/messages"])
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": payload,
+                "sender": {"user_id": 1002, "name": "Admin"},
+            },
+            "message": {
+                "mid": "visible-admin-screen",
+                "recipient": {"chat_id": 1002},
+                "body": {"attachments": body.get("attachments", [])},
+            },
+        })
+        messages = [item for item in captured if item["path"] == "/messages"]
+        assert len(messages) > before
+        return messages[-1]["body"]
+
+    async def press_without_message(body, payload):
+        nonlocal update_id
+        before_messages = len([item for item in captured if item["path"] == "/messages"])
+        before_answers = len([item for item in captured if item["path"] == "/answers"])
+        update_id += 1
+        await app.handle_update({
+            "update_type": "message_callback",
+            "update_id": update_id,
+            "callback": {
+                "callback_id": f"cb-{update_id}",
+                "payload": payload,
+                "sender": {"user_id": 1002, "name": "Admin"},
+            },
+            "message": {
+                "mid": "visible-admin-screen",
+                "recipient": {"chat_id": 1002},
+                "body": {"attachments": body.get("attachments", [])},
+            },
+        })
+        assert len([item for item in captured if item["path"] == "/messages"]) == before_messages
+        assert len([item for item in captured if item["path"] == "/answers"]) > before_answers
+
+    def has_locale_buttons(body):
+        return [
+            button
+            for button in _max_buttons(body.get("attachments", []))
+            if (parse_system_message_callback(button["payload"]) or {}).get("action") == "l"
+        ]
+
+    root = await send_message("/admin")
+    general = await press(root, "admin_general_settings")
+    system_list = await press(general, "admin_system_messages")
+    assert has_locale_buttons(system_list) == []
+
+    await app.states.set(
+        max_user_id,
+        1002,
+        "max_system_message_edit",
+        {"key": key, "locale": hidden_locale, "style": "formal", "page": 0, "draft": "Не сохранять"},
+    )
+    await press_without_message(
+        system_list,
+        system_message_callback_data("r", key, hidden_locale, "formal", 0),
+    )
+    assert await app.states.get(max_user_id) is not None
+    ru_list = await press(
+        system_list,
+        system_message_callback_data("c", key, hidden_locale, "formal", 0),
+    )
+    assert "Язык: <b>Русский</b>" in ru_list["text"]
+    assert has_locale_buttons(ru_list) == []
+    assert await app.states.get(max_user_id) is None
+
+    await app.states.set(
+        max_user_id,
+        1002,
+        "max_system_message_edit",
+        {"key": key, "locale": hidden_locale, "style": "formal", "page": 0, "draft": "Не сохранять"},
+    )
+    ru_page = await press(ru_list, f"admin_system_messages_page:1:{hidden_locale}")
+    ru_list = await press(ru_page, f"admin_system_cancel:{key}:{hidden_locale}:formal:0")
+    assert "Язык: <b>Русский</b>" in ru_list["text"]
+    assert has_locale_buttons(ru_list) == []
+    assert await app.states.get(max_user_id) is None
+
+    async with max_settings_db() as session:
+        row = await session.scalar(
+            select(BotSystemMessage).where(
+                BotSystemMessage.bot_scope == "max",
+                BotSystemMessage.translation_key == key,
+                BotSystemMessage.locale == hidden_locale,
+                BotSystemMessage.addressing_style == "formal",
+            )
+        )
+        assert row.text == original_text

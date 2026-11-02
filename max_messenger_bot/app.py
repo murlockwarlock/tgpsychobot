@@ -111,6 +111,24 @@ async def _reject_unavailable_system_message_locale(
     return True
 
 
+async def _return_to_max_system_message_ru_list(
+    app: "MaxBotApplication",
+    callback: IncomingCallback,
+    page: int,
+) -> None:
+    await app.states.clear(callback.sender.user_id)
+    await admin_system_messages_service.show_system_messages(
+        app.client,
+        callback.chat_id,
+        "ru",
+        page,
+    )
+    await app.client.answer_callback(
+        callback.callback_id,
+        notification="Язык скрыт. Открыт русский список.",
+    )
+
+
 def _spawn_update_task(app: web.Application, update: dict[str, Any]) -> None:
     task = asyncio.create_task(app["bot_app"].handle_update(update))
     _track_task(app["background_tasks"], task)
@@ -1156,6 +1174,9 @@ class MaxBotApplication:
             page = compact_system_message.get("page", 0)
             key = compact_system_message.get("key")
             style = compact_system_message.get("style")
+            if not admin_system_messages_service.locale_is_available(locale) and action in {"p", "c"}:
+                await _return_to_max_system_message_ru_list(self, callback, page)
+                return
             if await _reject_unavailable_system_message_locale(
                 self.client,
                 callback.callback_id,
@@ -1273,6 +1294,9 @@ class MaxBotApplication:
                     await admin_system_messages_service.show_system_messages(self.client, chat_id, locale, page)
                 elif data.startswith("admin_system_messages_page:"):
                     _, page, locale = data.split(":", 2)
+                    if not admin_system_messages_service.locale_is_available(locale):
+                        await _return_to_max_system_message_ru_list(self, callback, int(page) if page.isdigit() else 0)
+                        return
                     if await _reject_unavailable_system_message_locale(
                         self.client,
                         callback.callback_id,
@@ -1342,6 +1366,9 @@ class MaxBotApplication:
                     return
                 elif data.startswith("admin_system_cancel:"):
                     _, key, locale, style, page = data.split(":", 4)
+                    if not admin_system_messages_service.locale_is_available(locale):
+                        await _return_to_max_system_message_ru_list(self, callback, int(page) if page.isdigit() else 0)
+                        return
                     if await _reject_unavailable_system_message_locale(
                         self.client,
                         callback.callback_id,

@@ -21621,6 +21621,20 @@ async def _reject_hidden_telegram_system_message_locale(callback: CallbackQuery,
     return True
 
 
+async def _return_to_telegram_system_message_ru_list(
+    callback: CallbackQuery,
+    state: FSMContext,
+    page: int,
+) -> None:
+    await state.clear()
+    try:
+        await _render_admin_system_messages(callback, "ru", page)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+    await callback.answer(limit_callback_answer("Язык скрыт. Открыт русский список."))
+
+
 async def _render_admin_system_messages(callback: CallbackQuery, locale: str = "ru", page: int = 0):
     available_locales, active_locales = await _telegram_system_message_scope()
     normalized_locale = locale if locale in available_locales else "ru"
@@ -21692,6 +21706,9 @@ async def admin_system_message_compact_callback(callback: CallbackQuery, state: 
     page = int(parsed.get("page", 0)) if str(parsed.get("page", "0")).isdigit() else 0
     key = parsed.get("key")
     style = parsed.get("style")
+    if locale not in await _telegram_system_message_locales() and action in {"p", "c"}:
+        await _return_to_telegram_system_message_ru_list(callback, state, page)
+        return
     if await _reject_hidden_telegram_system_message_locale(callback, locale):
         return
     if action in {"d", "v", "e", "r", "s", "c"} and (
@@ -21896,6 +21913,9 @@ async def admin_system_messages_page(callback: CallbackQuery, state: FSMContext)
     parts = (callback.data or "").split(":")
     page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     locale = parts[2] if len(parts) > 2 else "ru"
+    if not await _telegram_system_message_locale_allowed(locale):
+        await _return_to_telegram_system_message_ru_list(callback, state, page)
+        return
     if await _reject_hidden_telegram_system_message_locale(callback, locale):
         return
     await state.clear()
@@ -22060,6 +22080,10 @@ async def admin_system_message_cancel(callback: CallbackQuery, state: FSMContext
     parts = (callback.data or "").split(":")
     if len(parts) != 4:
         await callback.answer("Некорректное состояние редактирования.", show_alert=True)
+        return
+    if not await _telegram_system_message_locale_allowed(parts[2]):
+        page = int(parts[3]) if parts[3].isdigit() else 0
+        await _return_to_telegram_system_message_ru_list(callback, state, page)
         return
     if await _reject_hidden_telegram_system_message_locale(callback, parts[2]):
         return
