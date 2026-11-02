@@ -372,7 +372,13 @@ def admin_system_messages_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_system_message_detail_keyboard(key: str, locale: str, page: int = 0):
+def admin_system_message_detail_keyboard(
+    key: str,
+    locale: str,
+    page: int = 0,
+    *,
+    processing_text_explicit: bool = False,
+):
     rows = []
     for style in ADDRESSING_STYLES:
         style_label = "Ты" if style == "informal" else "Вы"
@@ -389,6 +395,11 @@ def admin_system_message_detail_keyboard(key: str, locale: str, page: int = 0):
         rows.append([InlineKeyboardButton(
             text=f"↩️ Восстановить «{style_label}» по умолчанию",
             callback_data=system_message_callback_data("r", key, locale, style, page),
+        )])
+    if key == "ui.ai.processing_default" and processing_text_explicit:
+        rows.append([InlineKeyboardButton(
+            text="🔀 Включить варианты по языку и обращению",
+            callback_data=system_message_callback_data("m", key, locale, page=page),
         )])
     rows.append([InlineKeyboardButton(
         text="⬅️ К списку сообщений",

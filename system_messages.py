@@ -270,7 +270,7 @@ def system_message_callback_data(
     style: str | None = None,
     page: int = 0,
 ) -> str:
-    if action in {"d"}:
+    if action in {"d", "m"}:
         parts = ("sm", action, system_message_callback_token(key or ""), locale, str(page))
     elif action in {"v", "e", "r", "s", "c"}:
         parts = (
@@ -306,7 +306,7 @@ def parse_system_message_callback(data: str) -> dict[str, Any] | None:
         return {"action": action, "locale": parts[2], "page": parts[3]}
     if action == "p" and len(parts) == 4:
         return {"action": action, "page": parts[2], "locale": parts[3]}
-    if action == "d" and len(parts) == 5:
+    if action in {"d", "m"} and len(parts) == 5:
         key = SYSTEM_MESSAGE_KEYS_BY_CALLBACK_TOKEN.get(parts[2])
         return {"action": action, "key": key, "locale": parts[3], "page": parts[4]} if key else None
     if action in {"v", "e", "r", "s", "c"} and len(parts) == 6:
@@ -346,12 +346,14 @@ def render_system_message_detail(
     key: str,
     locale: str,
     variants: dict[str, str],
+    mode_note: str = "",
 ) -> str:
     header = (
         "💬 <b>Сообщение бота</b>\n\n"
         f"<b>{html.escape(definition.title)}</b>\n"
         f"Когда появляется: {html.escape(definition.description)}\n"
         f"Язык: <b>{html.escape(locale)}</b>"
+        + (f"\nРежим: <b>{html.escape(mode_note)}</b>" if mode_note else "")
     )
     informal_prefix = f"{header}\n\n<b>Ты:</b>\n"
     formal_prefix = "\n\n<b>Вы:</b>\n"
