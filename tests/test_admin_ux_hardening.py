@@ -5699,10 +5699,23 @@ async def test_waiting_message_variants_use_canonical_ui_and_preserve_other_loca
         if parse_system_message_callback(button.callback_data or "")
         and parse_system_message_callback(button.callback_data)["action"] in {"m0", "m1"}
     )
-    stale_mode_callback = mode_button.callback_data
-    await _feed_callback(admin_dispatcher, bot, detail, stale_mode_callback, 70115)
+    legacy_mode_callback = system_message_callback_data(
+        "m",
+        "ui.ai.processing_default",
+        "pt",
+        page=0,
+    )
+    await _feed_callback(admin_dispatcher, bot, detail, legacy_mode_callback, 70114)
     detail = session.current_message(draft)
+    await _feed_callback(admin_dispatcher, bot, detail, legacy_mode_callback, 70115)
+    detail = session.current_message(draft)
+    async with factory() as db_session:
+        config = await db_session.get(BotGeneralConfig, 1)
+        assert config.ai_processing_message_text_explicit is True
+    stale_mode_callback = mode_button.callback_data
     await _feed_callback(admin_dispatcher, bot, detail, stale_mode_callback, 70116)
+    detail = session.current_message(draft)
+    await _feed_callback(admin_dispatcher, bot, detail, stale_mode_callback, 70117)
     detail = session.current_message(draft)
     reverse_mode_button = next(
         button
