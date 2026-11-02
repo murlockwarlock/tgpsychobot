@@ -160,7 +160,7 @@ SYSTEM_MESSAGE_ADMIN_METADATA = {
 }
 
 SYSTEM_MESSAGE_PLATFORM_SCOPES = {
-    "ui.ai.processing_default": (),
+    "ui.ai.processing_default": ("telegram",),
     "ui.ai.button_accepted": ("telegram",),
     "ui.ai.image_ready": ("telegram",),
     "ui.ai.image_failed": ("telegram",),

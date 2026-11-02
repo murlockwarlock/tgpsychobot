@@ -684,6 +684,7 @@ class BotGeneralConfig(Base):
         default=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
         nullable=False,
     )
+    ai_processing_message_text_explicit = Column(Boolean, default=False, nullable=False)
     addressing_style = Column(String(16), default=DEFAULT_ADDRESSING_STYLE, nullable=False)
     telegram_default_language = Column(String(8), default="ru", nullable=False)
     telegram_language_selection_enabled = Column(Boolean, default=False, nullable=False)
@@ -1733,6 +1734,16 @@ async def init_db():
                         "ALTER TABLE bot_general_config "
                         "ALTER COLUMN ai_processing_message_text TYPE TEXT"
                     ))
+            if 'ai_processing_message_text_explicit' not in general_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE bot_general_config "
+                    "ADD COLUMN ai_processing_message_text_explicit BOOLEAN DEFAULT FALSE NOT NULL"
+                ))
+                sync_conn.execute(text(
+                    "UPDATE bot_general_config SET ai_processing_message_text_explicit = "
+                    "CASE WHEN TRIM(COALESCE(ai_processing_message_text, '')) <> 'Думаю...' "
+                    "THEN TRUE ELSE FALSE END"
+                ))
             if 'telegram_default_language' not in general_columns:
                 sync_conn.execute(text(
                     "ALTER TABLE bot_general_config "
@@ -2223,6 +2234,7 @@ async def init_db():
                 profile_collect_age=bool(getattr(test_conf, 'profile_collect_age', False)),
                 ai_processing_message_enabled=False,
                 ai_processing_message_text=DEFAULT_AI_PROCESSING_MESSAGE_TEXT,
+                ai_processing_message_text_explicit=False,
                 addressing_style=DEFAULT_ADDRESSING_STYLE,
                 telegram_default_language='ru',
                 telegram_language_selection_enabled=False,
@@ -2235,6 +2247,11 @@ async def init_db():
                 general_conf.ai_processing_message_enabled = False
             if getattr(general_conf, 'ai_processing_message_text', None) is None:
                 general_conf.ai_processing_message_text = DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+            if getattr(general_conf, 'ai_processing_message_text_explicit', None) is None:
+                general_conf.ai_processing_message_text_explicit = (
+                    str(getattr(general_conf, 'ai_processing_message_text', '') or '').strip()
+                    != DEFAULT_AI_PROCESSING_MESSAGE_TEXT
+                )
             if getattr(general_conf, 'addressing_style', None) not in ADDRESSING_STYLES:
                 general_conf.addressing_style = DEFAULT_ADDRESSING_STYLE
             if getattr(general_conf, 'telegram_default_language', None) is None:

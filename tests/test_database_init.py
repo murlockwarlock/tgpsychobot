@@ -184,6 +184,7 @@ async def test_init_db_adds_multilingual_foundation_with_safe_defaults(tmp_path,
 
         assert "telegram_language_code" in user_columns
         assert {
+            "ai_processing_message_text_explicit",
             "telegram_default_language",
             "telegram_language_selection_enabled",
             "telegram_enabled_languages",
@@ -202,6 +203,7 @@ async def test_init_db_adds_multilingual_foundation_with_safe_defaults(tmp_path,
         assert config.telegram_enabled_languages == '["ru"]'
         assert config.multilingual_authoring_enabled is False
         assert config.translations_revision == 0
+        assert config.ai_processing_message_text_explicit is False
         assert user.telegram_language_code is None
     finally:
         await engine.dispose()
@@ -226,6 +228,37 @@ async def test_init_db_adds_multilingual_authoring_flag_to_legacy_config(tmp_pat
         async with sessions() as session:
             config = await session.get(BotGeneralConfig, 1)
             assert config.multilingual_authoring_enabled is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_preserves_legacy_waiting_text_and_marks_it_explicit(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'legacy-waiting-text.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(BotGeneralConfig(id=1, ai_processing_message_text="Старый текст ожидания"))
+            await session.commit()
+        async with engine.begin() as connection:
+            await connection.execute(text(
+                "ALTER TABLE bot_general_config DROP COLUMN ai_processing_message_text_explicit"
+            ))
+
+        await database.init_db()
+
+        async with sessions() as session:
+            config = await session.get(BotGeneralConfig, 1)
+
+        assert config.ai_processing_message_text == "Старый текст ожидания"
+        assert config.ai_processing_message_text_explicit is True
     finally:
         await engine.dispose()
 

@@ -771,7 +771,6 @@ FIELD_ROUTES = (
     (r"admin_coll_media_editdesc_(\d+)_\d+_\d+_\d+", "media_library", 0),
 )
 SINGLE_FIELDS = {
-    "admin_general_edit_ai_processing_message_text": ("bot_general_config", 0),
     "admin_rename_topics_btn": ("subscription_config", 0),
     "admin_referral_set_btn_name": ("subscription_config", 1),
     "admin_referral_set_sub_btn_name": ("subscription_config", 2),

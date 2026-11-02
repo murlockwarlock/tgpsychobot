@@ -29,6 +29,7 @@ REQUIRED_GENERAL_CONFIG_COLUMNS = frozenset(
     {
         "ai_processing_message_enabled",
         "ai_processing_message_text",
+        "ai_processing_message_text_explicit",
     }
 )
 BASELINE_PREFIX = "tgpsychobot-deploy-log-baseline-"
@@ -1270,12 +1271,18 @@ async def verify_general_config(database_url: str) -> bool:
                 return False
             query_result = await connection.execute(
                 text(
-                    "SELECT ai_processing_message_enabled, ai_processing_message_text "
+                    "SELECT ai_processing_message_enabled, ai_processing_message_text, "
+                    "ai_processing_message_text_explicit "
                     "FROM bot_general_config WHERE id = 1"
                 )
             )
             row = query_result.first()
-            result = row is not None and row[0] is not None and row[1] is not None
+            result = (
+                row is not None
+                and row[0] is not None
+                and row[1] is not None
+                and row[2] is not None
+            )
     except Exception:
         result = False
     finally:
