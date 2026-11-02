@@ -554,6 +554,7 @@ async def test_max_formatted_mailing_round_trip_media_buttons_and_reopen(mailing
         mailing = await session.scalar(select(Mailing).where(Mailing.creator_id == user_id))
         assert mailing is not None
         assert mailing.text == source
+        assert mailing.platform == "max"
 
     await max_admin_mailing.show_details(client, 99, mailing.id)
     details_body = client.transport.requests[-1]["body"]
@@ -633,7 +634,10 @@ async def test_max_formatted_mailing_real_admin_journey(mailing_db):
     )
     await app.handle_update(_max_admin_callback("journey-mailing-details", history_button["payload"], history["body"]["attachments"]))
     details = client.transport.requests[-1]
+    assert "<b>Платформа доставки:</b> MAX" in details["body"]["text"]
     assert {button["text"] for button in _max_request_buttons(details)} >= {"Продолжить", "Сайт"}
+    await _press_max_admin_button(app, client, "journey-mailing-back", "⬅️ К истории")
+    assert "История рассылок" in client.transport.requests[-1]["body"]["text"]
 
     run_ai = AsyncMock()
     with patch.object(max_common, "ensure_access_before_chat", AsyncMock(return_value=True)), patch.object(
@@ -724,6 +728,7 @@ async def test_telegram_formatted_mailing_real_admin_journey(telegram_mailing_db
         mailing = await db_session.scalar(select(Mailing).where(Mailing.creator_id == 11))
         assert mailing is not None
         assert mailing.text == '<b>Привет</b>\n\n[Продолжить](btn:continue)\n[Сайт](https://example.com)'
+        assert mailing.platform == "telegram"
 
     await send_mailing_content(bot, 11, mailing)
     delivery = session.last_message
@@ -747,3 +752,30 @@ async def test_telegram_formatted_mailing_real_admin_journey(telegram_mailing_db
         ).as_(bot)
         await dispatcher.feed_update(bot, Update(update_id=7, callback_query=callback))
     process.assert_awaited_once()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=8,
+            message=Message(
+                message_id=8,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=11, type="private"),
+                from_user=admin,
+                text="/admin",
+            ).as_(bot),
+        ),
+    )
+    await _feed_telegram_button(dispatcher, bot, session.last_message, "✉️ Рассылка", 9)
+    await _feed_telegram_button(dispatcher, bot, session.last_message, "📜 История рассылок", 10)
+    history = session.last_message
+    history_button = next(
+        button
+        for button in _telegram_inline_buttons(history)
+        if button.callback_data and button.callback_data.startswith("mailing_details_")
+    )
+    await _feed_telegram_button(dispatcher, bot, history, history_button.text, 11)
+    details = session.last_message
+    assert "<b>Платформа доставки:</b> Telegram" in details.text
+    await _feed_telegram_button(dispatcher, bot, details, "⬅️ Назад к истории", 12)
+    assert "История рассылок" in session.last_message.text

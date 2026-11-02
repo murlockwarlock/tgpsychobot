@@ -4,12 +4,13 @@ from datetime import datetime
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from config import OWNER_IDS
 from database import BotGeneralConfig, Mailing, MailingDeliveryLog, User, async_session_maker
 from mailing_utils import (
     BIRTHDAY_MAILING_TYPE,
+    MAX_PLATFORM_USER_ID_OFFSET,
     get_mailing_audience_label,
     render_mailing_text,
     send_mailing_content,
@@ -38,6 +39,15 @@ async def process_birthday_mailings(bot: Bot, *, now: datetime | None = None):
                 select(Mailing).where(
                     Mailing.recurring_type == BIRTHDAY_MAILING_TYPE,
                     Mailing.is_enabled == True,
+                    or_(
+                        Mailing.platform == "telegram",
+                        and_(
+                            Mailing.platform.is_(None),
+                            Mailing.creator_id.is_not(None),
+                            Mailing.creator_id > 0,
+                            Mailing.creator_id < MAX_PLATFORM_USER_ID_OFFSET,
+                        ),
+                    ),
                 )
             )
             mailings = result.scalars().all()
@@ -51,6 +61,7 @@ async def process_birthday_mailings(bot: Bot, *, now: datetime | None = None):
                 select(User).where(
                     User.birth_day == today.day,
                     User.birth_month == today.month,
+                    User.id < MAX_PLATFORM_USER_ID_OFFSET,
                 )
             )
             users = users_result.scalars().all()
@@ -83,7 +94,7 @@ async def process_birthday_mailings(bot: Bot, *, now: datetime | None = None):
                         getattr(general_config, "telegram_default_language", "ru"),
                         runtime_language_selection_enabled(general_config),
                         runtime_enabled_languages(general_config),
-                        platform="max" if user.id >= 100_000_000_000 else "telegram",
+                        platform="telegram",
                     )
                     localized_text = translate(
                         f"mailing.{mailing.id}.text",

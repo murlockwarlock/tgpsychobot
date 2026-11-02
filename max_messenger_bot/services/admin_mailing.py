@@ -25,7 +25,7 @@ from ..storage import StateStore
 from ..time_utils import utc_now
 from .subscription_access import effective_subscription_filters
 from result_history import non_technical_role_filter
-from mailing_utils import mailing_text_to_html, parse_mailing_text, render_mailing_text
+from mailing_utils import get_mailing_platform_label, mailing_text_to_html, parse_mailing_text, render_mailing_text
 
 
 PAGE_SIZE = 10
@@ -371,6 +371,7 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
             media_file_type=media_type,
             target_audience=audience,
             creator_id=user_id,
+            platform="max",
             status="pending",
             success_count=0,
             failure_count=0,
@@ -456,16 +457,20 @@ async def confirm_send(client: MaxApiClient, states: StateStore, chat_id: int, u
 
 async def show_history(client: MaxApiClient, chat_id: int, page: int) -> None:
     from ..models import MAX_ID_OFFSET
+    max_history_filter = or_(
+        Mailing.platform == "max",
+        (Mailing.platform.is_(None) & (Mailing.creator_id >= MAX_ID_OFFSET)),
+    )
     async with async_session_maker() as session:
         total_mailings = await session.scalar(
-            select(func.count()).select_from(Mailing).where(Mailing.creator_id >= MAX_ID_OFFSET)
+            select(func.count()).select_from(Mailing).where(max_history_filter)
         ) or 0
         total_pages = max(1, math.ceil(total_mailings / PAGE_SIZE))
         page = max(0, min(page, total_pages - 1))
         mailings = (
             await session.execute(
                 select(Mailing)
-                .where(Mailing.creator_id >= MAX_ID_OFFSET)
+                .where(max_history_filter)
                 .order_by(Mailing.created_at.desc(), Mailing.id.desc())
                 .offset(page * PAGE_SIZE)
                 .limit(PAGE_SIZE)
@@ -492,6 +497,7 @@ async def show_details(client: MaxApiClient, chat_id: int, mailing_id: int) -> N
     text = (
         f"<b>Рассылка #{mailing.id}</b>\n\n"
         f"<b>Аудитория:</b> {html.escape(AUDIENCE_NAMES.get(mailing.target_audience or '', mailing.target_audience or ''))}\n"
+        f"<b>Платформа доставки:</b> {get_mailing_platform_label(mailing)}\n"
         f"<b>Статус:</b> {STATUS_NAMES.get(mailing.status, mailing.status)}\n"
         f"<b>Создана:</b> {created}\n"
         f"<b>Старт:</b> {started}\n"

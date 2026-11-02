@@ -4,6 +4,7 @@ from typing import Optional
 from aiogram import Bot
 
 from canonical_content import canonical_markup_to_html
+from max_messenger_bot.models import MAX_ID_OFFSET as MAX_PLATFORM_USER_ID_OFFSET
 from response_button_renderers import telegram_response_buttons_markup
 from response_buttons import ResponseButton, extract_response_buttons
 from telegram_birthdate import format_birthdate
@@ -17,6 +18,11 @@ MAILING_AUDIENCE_LABELS = {
     "inactive_subscription": "Кто отменил подписку",
     "self": "👤 Только себе (тест)",
     "birthday_today": "🎂 У кого сегодня день рождения",
+}
+
+MAILING_PLATFORM_LABELS = {
+    "telegram": "Telegram",
+    "max": "MAX",
 }
 
 BIRTHDAY_MAILING_TYPE = "birthday"
@@ -45,6 +51,21 @@ class RenderedMailingText(str):
 
 def get_mailing_audience_label(audience: str) -> str:
     return MAILING_AUDIENCE_LABELS.get(audience, audience)
+
+
+def resolve_mailing_platform(mailing) -> str | None:
+    platform = getattr(mailing, "platform", None)
+    if platform is not None:
+        return platform if platform in MAILING_PLATFORM_LABELS else None
+
+    creator_id = getattr(mailing, "creator_id", None)
+    if isinstance(creator_id, int) and creator_id > 0:
+        return "max" if creator_id >= MAX_PLATFORM_USER_ID_OFFSET else "telegram"
+    return None
+
+
+def get_mailing_platform_label(mailing) -> str:
+    return MAILING_PLATFORM_LABELS.get(resolve_mailing_platform(mailing), "Не определена")
 
 
 def is_birthday_mailing(mailing) -> bool:

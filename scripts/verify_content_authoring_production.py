@@ -36,6 +36,39 @@ def digest(rows):
     return hashlib.sha256(json.dumps(rows, ensure_ascii=False, default=str, separators=(",", ":")).encode()).hexdigest()
 
 
+def normalize_language_configuration(config):
+    default_language, enabled_raw, selector_enabled, revision = config
+    enabled = json.loads(enabled_raw) if isinstance(enabled_raw, str) else enabled_raw
+    if default_language != "ru" or set(enabled) != {"ru", "en", "pt"}:
+        raise RuntimeError("Production language configuration changed")
+    if not isinstance(selector_enabled, (bool, int)) or selector_enabled not in (False, True, 0, 1):
+        raise RuntimeError("Invalid language selector configuration")
+    return {
+        "default": default_language,
+        "enabled": sorted(enabled),
+        "selector": bool(selector_enabled),
+        "revision": revision,
+    }
+
+
+def language_configuration_changes(current, baseline):
+    current_config = current.get("language_config") or {
+        "default": current["default"],
+        "enabled": sorted(current["enabled"]),
+        "selector": current["selector"],
+    }
+    baseline_config = baseline.get("language_config") or {
+        "default": baseline["default"],
+        "enabled": sorted(baseline["enabled"]),
+        "selector": baseline["selector"],
+    }
+    return [
+        field
+        for field in ("default", "enabled", "selector")
+        if current_config[field] != baseline_config[field]
+    ]
+
+
 async def inspect_database(database_url, expected_database):
     url = make_url(database_url)
     if url.database != expected_database:
@@ -50,12 +83,10 @@ async def inspect_database(database_url, expected_database):
             rows = (await connection.execute(text("SELECT locale, translation_key, text, source_hash, created_at, updated_at FROM bot_translations ORDER BY locale, translation_key"))).all()
             counts = {locale: sum(row[0] == locale for row in rows) for locale in ("en", "pt")}
             config = (await connection.execute(text("SELECT telegram_default_language, telegram_enabled_languages, telegram_language_selection_enabled, translations_revision FROM bot_general_config WHERE id=1"))).one()
-            enabled = json.loads(config[1]) if isinstance(config[1], str) else config[1]
-            if config[0] != "ru" or set(enabled) != {"ru", "en", "pt"} or not config[2]:
-                raise RuntimeError("Production language configuration changed")
+            language_config = normalize_language_configuration(config)
             size = await connection.scalar(text("SELECT pg_database_size(current_database())"))
             preferences = (await connection.execute(text("SELECT telegram_language_code, count(*) FROM users GROUP BY telegram_language_code ORDER BY telegram_language_code NULLS FIRST"))).all()
-            return {"database": expected_database, "counts": counts, "translation_digest": digest([tuple(row) for row in rows]), "default": config[0], "enabled": enabled, "selector": bool(config[2]), "revision": config[3], "size_bytes": size, "preference_counts": [tuple(row) for row in preferences]}
+            return {"database": expected_database, "counts": counts, "translation_digest": digest([tuple(row) for row in rows]), "default": language_config["default"], "enabled": language_config["enabled"], "selector": language_config["selector"], "revision": language_config["revision"], "language_config": language_config, "size_bytes": size, "preference_counts": [tuple(row) for row in preferences]}
     finally:
         await engine.dispose()
 
@@ -161,8 +192,18 @@ async def main():
         baseline = json.loads(args.baseline.read_text())
         expected = {item["database"]: item for item in baseline["reports"]}
         for report in reports:
-            if report["translation_digest"] != expected[report["database"]]["translation_digest"]:
+            baseline_report = expected[report["database"]]
+            if report["translation_digest"] != baseline_report["translation_digest"]:
                 raise RuntimeError("Translation rows changed since baseline: " + report["database"])
+            changes = language_configuration_changes(report, baseline_report)
+            if changes:
+                raise RuntimeError(
+                    "Language configuration changed since baseline: "
+                    + report["database"]
+                    + " ("
+                    + ", ".join(changes)
+                    + ")"
+                )
         if args.action == "backup":
             required = sum(item["size_bytes"] for item in reports)
             if shutil.disk_usage(WORK).free < required * 1.5:

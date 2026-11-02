@@ -499,6 +499,47 @@ def test_max_identity_verification_uses_read_only_me(monkeypatch):
     assert calls[0][2]["headers"] == {"Authorization": "max-secret"}
 
 
+def test_max_identity_verification_ignores_display_name_changes(monkeypatch):
+    entry = _entry()
+    entry.update(
+        {
+            "platform": "max",
+            "username": "registry_name",
+            "platform_id": 987654321,
+        }
+    )
+    monkeypatch.setattr(
+        verifier,
+        "request_json",
+        lambda *_args, **_kwargs: {"name": "renamed in MAX", "user_id": entry["platform_id"]},
+    )
+
+    result = verifier.verify_identity(entry, "max-secret", {})
+
+    assert result["status"] == "verified"
+
+
+def test_max_identity_verification_rejects_platform_id_mismatch(monkeypatch):
+    entry = _entry()
+    entry.update(
+        {
+            "platform": "max",
+            "username": "registry_name",
+            "platform_id": 987654321,
+        }
+    )
+    monkeypatch.setattr(
+        verifier,
+        "request_json",
+        lambda *_args, **_kwargs: {"name": "renamed in MAX", "user_id": 987654322},
+    )
+
+    result = verifier.verify_identity(entry, "max-secret", {})
+
+    assert result["status"] == "mismatch"
+    assert result["platform_id"] == 987654322
+
+
 def test_registry_duplicate_username_with_conflicting_database_is_rejected():
     first = _entry()
     second = _entry(
