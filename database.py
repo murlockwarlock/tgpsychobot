@@ -1252,6 +1252,14 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
         "event_deliveries",
         "event_delivery_resolutions",
     ]
+    new_schema_available = (
+        insp.has_table("event_scenario_media")
+        and insp.has_table("event_delivery_parts")
+        and any(column.get("name") == "file_id" for column in insp.get_columns("event_scenario_media"))
+        and any(column.get("name") == "payload_json" for column in insp.get_columns("event_delivery_parts"))
+    )
+    if new_schema_available:
+        required_tables.extend(("event_scenario_media", "event_delivery_parts"))
     for tbl in required_tables:
         if not insp.has_table(tbl):
             raise RuntimeError(f"Critical table {tbl} is missing")
@@ -1265,15 +1273,15 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
         "event_scenarios": {
             "required_not_null": {
                 "id", "code", "event_type", "title", "starts_at", "duration_minutes",
-                "is_active", "is_archived", "schedule_revision", "content_version",
+                "is_active", "is_archived", "schedule_revision", "content_version", "media_order",
                 "created_at", "updated_at",
             },
-            "optional_nullable": {"place", "link", "archived_at"},
+            "optional_nullable": {"place", "link", "archived_at", "description"},
         },
         "event_steps": {
             "required_not_null": {
                 "id", "event_id", "offset_minutes", "message_text", "step_version",
-                "sort_order", "is_archived", "created_at", "updated_at",
+                "sort_order", "is_archived", "include_event_details", "created_at", "updated_at",
             },
             "optional_nullable": set(),
         },
@@ -1289,7 +1297,7 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
                 "id", "event_id", "user_id", "registration_id", "retry_index",
                 "message_kind", "delivery_key", "due_at", "next_attempt_at",
                 "schedule_revision", "registration_generation", "platform",
-                "status", "attempt_count", "created_at", "updated_at",
+                "status", "attempt_count", "content_version_snapshot", "created_at", "updated_at",
             },
             "optional_nullable": {
                 "step_id", "parent_delivery_id", "expires_at", "skip_reason",
@@ -1305,7 +1313,29 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
             },
             "optional_nullable": set(),
         },
+        "event_scenario_media": {
+            "required_not_null": {"id", "event_id", "file_type", "file_id", "sort_order", "created_at", "updated_at"},
+            "optional_nullable": {"max_token", "source_platform", "source_file_id"},
+        },
+        "event_delivery_parts": {
+            "required_not_null": {
+                "id", "delivery_id", "part_index", "part_kind", "payload_json", "content_version",
+                "status", "attempt_count", "next_attempt_at", "created_at", "updated_at",
+            },
+            "optional_nullable": {
+                "claim_token", "lease_until", "send_started_at", "sent_at", "finished_at",
+                "external_message_id", "last_error",
+            },
+        },
     }
+
+    if not new_schema_available:
+        table_column_specs["event_scenarios"]["required_not_null"].discard("media_order")
+        table_column_specs["event_scenarios"]["optional_nullable"].discard("description")
+        table_column_specs["event_steps"]["required_not_null"].discard("include_event_details")
+        table_column_specs["event_deliveries"]["required_not_null"].discard("content_version_snapshot")
+        table_column_specs.pop("event_scenario_media", None)
+        table_column_specs.pop("event_delivery_parts", None)
 
     for tbl, specs in table_column_specs.items():
         cols = {c["name"]: c for c in insp.get_columns(tbl)}
@@ -1381,7 +1411,26 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
                 "ondelete": "RESTRICT",
             },
         ],
+        "event_scenario_media": [
+            {
+                "constrained_columns": ["event_id"],
+                "referred_table": "event_scenarios",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+        ],
+        "event_delivery_parts": [
+            {
+                "constrained_columns": ["delivery_id"],
+                "referred_table": "event_deliveries",
+                "referred_columns": ["id"],
+                "ondelete": "RESTRICT",
+            },
+        ],
     }
+    if not new_schema_available:
+        expected_foreign_keys.pop("event_scenario_media", None)
+        expected_foreign_keys.pop("event_delivery_parts", None)
 
     for tbl, fks_expected in expected_foreign_keys.items():
         actual_fks = insp.get_foreign_keys(tbl)
@@ -1421,6 +1470,7 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
             "ck_event_scenarios_revision",
             "ck_event_scenarios_content_version",
             "ck_event_scenarios_location",
+            "ck_event_scenarios_media_order",
         },
         "event_steps": {
             "ck_event_steps_step_version",
@@ -1438,11 +1488,27 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
             "ck_event_deliveries_retry_index",
             "ck_event_deliveries_reg_gen",
             "ck_event_deliveries_attempt_count",
+            "ck_event_deliveries_content_version",
         },
         "event_delivery_resolutions": {
             "ck_event_delivery_resolution_type",
         },
+        "event_scenario_media": {
+            "ck_event_scenario_media_type",
+            "ck_event_scenario_media_order",
+        },
+        "event_delivery_parts": {
+            "ck_event_delivery_part_kind",
+            "ck_event_delivery_part_status",
+            "ck_event_delivery_part_order",
+            "ck_event_delivery_part_attempt_count",
+        },
     }
+    if not new_schema_available:
+        expected_check_constraints["event_scenarios"].discard("ck_event_scenarios_media_order")
+        expected_check_constraints["event_deliveries"].discard("ck_event_deliveries_content_version")
+        expected_check_constraints.pop("event_scenario_media", None)
+        expected_check_constraints.pop("event_delivery_parts", None)
 
     for tbl, expected_cks in expected_check_constraints.items():
         actual_ck_names = {ck.get("name") for ck in insp.get_check_constraints(tbl)}
@@ -1500,6 +1566,14 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
         raise RuntimeError(
             "Critical index ix_event_steps_execution_order with ordered columns (event_id, offset_minutes, sort_order, id) is missing"
         )
+
+    if new_schema_available:
+        if not _has_ordered_unique("event_scenario_media", ["event_id", "sort_order"]):
+            raise RuntimeError("Critical unique constraint uq_event_scenario_media_order is missing")
+        if not _has_ordered_unique("event_delivery_parts", ["delivery_id", "part_index"]):
+            raise RuntimeError("Critical unique constraint uq_event_delivery_part_index is missing")
+        if not _has_ordered_index("event_delivery_parts", ["status", "next_attempt_at"], unique=False):
+            raise RuntimeError("Critical index ix_event_delivery_parts_poll is missing")
 
 
 
@@ -2030,10 +2104,31 @@ async def init_db():
                 except Exception:
                     pass
             EventScenario.__table__.create(sync_conn, checkfirst=True)
+            event_scenario_columns = {c['name'] for c in insp.get_columns('event_scenarios')}
+            if 'description' not in event_scenario_columns:
+                sync_conn.execute(text("ALTER TABLE event_scenarios ADD COLUMN description TEXT"))
+            if 'media_order' not in event_scenario_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE event_scenarios ADD COLUMN media_order VARCHAR(16) DEFAULT 'media_top' NOT NULL "
+                    "CONSTRAINT ck_event_scenarios_media_order CHECK (media_order IN ('media_top', 'text_top'))"
+                ))
+            sync_conn.execute(text("UPDATE event_scenarios SET media_order = 'media_top' WHERE media_order IS NULL OR media_order NOT IN ('media_top', 'text_top')"))
             EventStep.__table__.create(sync_conn, checkfirst=True)
+            event_step_columns = {c['name'] for c in insp.get_columns('event_steps')}
+            if 'include_event_details' not in event_step_columns:
+                sync_conn.execute(text("ALTER TABLE event_steps ADD COLUMN include_event_details BOOLEAN DEFAULT FALSE NOT NULL"))
             EventRegistration.__table__.create(sync_conn, checkfirst=True)
             EventDelivery.__table__.create(sync_conn, checkfirst=True)
+            event_delivery_columns = {c['name'] for c in insp.get_columns('event_deliveries')}
+            if 'content_version_snapshot' not in event_delivery_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE event_deliveries ADD COLUMN content_version_snapshot INTEGER DEFAULT 1 NOT NULL "
+                    "CONSTRAINT ck_event_deliveries_content_version CHECK (content_version_snapshot >= 1)"
+                ))
+            sync_conn.execute(text("UPDATE event_deliveries SET content_version_snapshot = 1 WHERE content_version_snapshot IS NULL OR content_version_snapshot < 1"))
             EventDeliveryResolution.__table__.create(sync_conn, checkfirst=True)
+            EventScenarioMedia.__table__.create(sync_conn, checkfirst=True)
+            EventDeliveryPart.__table__.create(sync_conn, checkfirst=True)
 
             # Seed system reserved codes in deep_link_namespace
             system_codes = [
@@ -2779,6 +2874,7 @@ class EventScenario(Base):
         CheckConstraint("duration_minutes >= 15 AND duration_minutes <= 1440", name="ck_event_scenarios_duration"),
         CheckConstraint("schedule_revision >= 1", name="ck_event_scenarios_revision"),
         CheckConstraint("content_version >= 1", name="ck_event_scenarios_content_version"),
+        CheckConstraint("media_order IN ('media_top', 'text_top')", name="ck_event_scenarios_media_order"),
         CheckConstraint(
             "((event_type = 'webinar' AND link IS NOT NULL AND length(trim(link)) > 0 AND place IS NULL) "
             "OR (event_type = 'meeting' AND place IS NOT NULL AND length(trim(place)) > 0))",
@@ -2799,12 +2895,15 @@ class EventScenario(Base):
     archived_at = Column(DateTime, nullable=True)
     schedule_revision = Column(Integer, default=1, nullable=False)
     content_version = Column(Integer, default=1, nullable=False)
+    description = Column(Text, nullable=True)
+    media_order = Column(String(16), default='media_top', nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     steps = relationship("EventStep", back_populates="event")
     registrations = relationship("EventRegistration", back_populates="event")
     deliveries = relationship("EventDelivery", back_populates="event")
+    media = relationship("EventScenarioMedia", back_populates="event", cascade="all, delete-orphan", order_by="EventScenarioMedia.sort_order")
 
     @validates("code")
     def _validate_code_immutable(self, key, value):
@@ -2830,6 +2929,7 @@ class EventStep(Base):
     step_version = Column(Integer, default=1, nullable=False)
     sort_order = Column(Integer, default=0, nullable=False)
     is_archived = Column(Boolean, default=False, nullable=False)
+    include_event_details = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -2888,6 +2988,7 @@ class EventDelivery(Base):
         CheckConstraint("retry_index >= 0", name="ck_event_deliveries_retry_index"),
         CheckConstraint("registration_generation >= 1", name="ck_event_deliveries_reg_gen"),
         CheckConstraint("attempt_count >= 0", name="ck_event_deliveries_attempt_count"),
+        CheckConstraint("content_version_snapshot >= 1", name="ck_event_deliveries_content_version"),
         Index('ix_event_deliveries_poll', 'status', 'next_attempt_at', 'due_at'),
     )
 
@@ -2919,6 +3020,7 @@ class EventDelivery(Base):
     external_message_id = Column(String(128), nullable=True)
     rendered_text_snapshot = Column(Text, nullable=True)
     template_text_snapshot = Column(Text, nullable=True)
+    content_version_snapshot = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -2928,6 +3030,63 @@ class EventDelivery(Base):
     step = relationship("EventStep", back_populates="deliveries")
     parent_delivery = relationship("EventDelivery", remote_side=[id])
     resolutions = relationship("EventDeliveryResolution", back_populates="delivery")
+    parts = relationship("EventDeliveryPart", back_populates="delivery", cascade="all, delete-orphan", order_by="EventDeliveryPart.part_index")
+
+
+class EventScenarioMedia(Base):
+    __tablename__ = 'event_scenario_media'
+    __table_args__ = (
+        CheckConstraint("file_type IN ('photo', 'video')", name="ck_event_scenario_media_type"),
+        CheckConstraint("sort_order >= 0", name="ck_event_scenario_media_order"),
+        UniqueConstraint('event_id', 'sort_order', name='uq_event_scenario_media_order'),
+        Index('ix_event_scenario_media_event_order', 'event_id', 'sort_order'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(Integer, ForeignKey('event_scenarios.id', ondelete='RESTRICT'), nullable=False, index=True)
+    file_type = Column(String(16), nullable=False)
+    file_id = Column(String(512), nullable=False)
+    max_token = Column(String(512), nullable=True)
+    source_platform = Column(String(16), nullable=True)
+    source_file_id = Column(String(512), nullable=True)
+    sort_order = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    event = relationship("EventScenario", back_populates="media")
+
+
+class EventDeliveryPart(Base):
+    __tablename__ = 'event_delivery_parts'
+    __table_args__ = (
+        UniqueConstraint('delivery_id', 'part_index', name='uq_event_delivery_part_index'),
+        CheckConstraint("part_kind IN ('media', 'text', 'control')", name='ck_event_delivery_part_kind'),
+        CheckConstraint("status IN ('pending', 'sending', 'sent', 'skipped', 'uncertain', 'resolved_sent', 'resolved_skipped', 'failed')", name='ck_event_delivery_part_status'),
+        CheckConstraint("part_index >= 0", name='ck_event_delivery_part_order'),
+        CheckConstraint("attempt_count >= 0", name='ck_event_delivery_part_attempt_count'),
+        Index('ix_event_delivery_parts_poll', 'status', 'next_attempt_at'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    delivery_id = Column(Integer, ForeignKey('event_deliveries.id', ondelete='RESTRICT'), nullable=False, index=True)
+    part_index = Column(Integer, nullable=False)
+    part_kind = Column(String(16), nullable=False)
+    payload_json = Column(Text, nullable=False)
+    content_version = Column(Integer, nullable=False)
+    status = Column(String(24), default='pending', nullable=False)
+    attempt_count = Column(Integer, default=0, nullable=False)
+    claim_token = Column(String(64), nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    send_started_at = Column(DateTime, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    external_message_id = Column(String(128), nullable=True)
+    last_error = Column(Text, nullable=True)
+    next_attempt_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    delivery = relationship("EventDelivery", back_populates="parts")
 
 
 class EventDeliveryResolution(Base):
@@ -3038,7 +3197,7 @@ async def create_event_delivery_force_retry(
     - If a retry-child itself becomes uncertain, a new retry can be
       created referencing that child as parent.
     - retry_index increments monotonically along the chain (parent.retry_index + 1).
-    - expires_at is preserved from parent.expires_at to maintain the business validity window.
+    - A retry on the same content/schedule preserves the parent's expiry; a retry after a content or schedule change uses the current event window and rebuilds all parts.
     - Writes an audit log record into event_delivery_resolutions.
     """
     from sqlalchemy import select
@@ -3052,6 +3211,10 @@ async def create_event_delivery_force_retry(
     parent = await session.scalar(parent_stmt)
     if not parent:
         raise ValueError(f"Event delivery {delivery_id} not found")
+
+    scenario = await session.get(EventScenario, parent.event_id)
+    if not scenario:
+        raise ValueError(f"Event scenario {parent.event_id} not found")
 
     if parent.status != "uncertain":
         raise ValueError(
@@ -3081,6 +3244,7 @@ async def create_event_delivery_force_retry(
     await session.flush()
 
     new_retry_index = parent.retry_index + 1
+    content_changed = parent.content_version_snapshot != scenario.content_version
     if parent.step_id is not None:
         new_delivery_key = (
             f"ev:{parent.event_id}:reg:{parent.registration_id}:step:{parent.step_id}:"
@@ -3093,6 +3257,11 @@ async def create_event_delivery_force_retry(
         )
 
     now = datetime.utcnow()
+    schedule_changed = parent.schedule_revision != scenario.schedule_revision
+    fresh_sequence = content_changed or schedule_changed
+    current_expiry = None
+    if parent.message_kind in ("immediate_confirmation", "immediate_live", "reschedule_notice"):
+        current_expiry = scenario.starts_at + timedelta(minutes=scenario.duration_minutes)
     child_delivery = EventDelivery(
         event_id=parent.event_id,
         user_id=parent.user_id,
@@ -3102,15 +3271,16 @@ async def create_event_delivery_force_retry(
         parent_delivery_id=parent.id,
         message_kind=parent.message_kind,
         delivery_key=new_delivery_key,
-        due_at=parent.due_at,
+        due_at=now,
         next_attempt_at=now,
-        expires_at=parent.expires_at,
-        schedule_revision=parent.schedule_revision,
+        expires_at=current_expiry if fresh_sequence else parent.expires_at,
+        schedule_revision=scenario.schedule_revision if fresh_sequence else parent.schedule_revision,
         registration_generation=parent.registration_generation,
         platform=parent.platform,
         status="pending",
-        rendered_text_snapshot=parent.rendered_text_snapshot,
-        template_text_snapshot=parent.template_text_snapshot,
+        rendered_text_snapshot=None if fresh_sequence else parent.rendered_text_snapshot,
+        template_text_snapshot=None if fresh_sequence else parent.template_text_snapshot,
+        content_version_snapshot=scenario.content_version if fresh_sequence else parent.content_version_snapshot,
     )
     session.add(child_delivery)
     try:
@@ -3129,6 +3299,29 @@ async def create_event_delivery_force_retry(
                 )
             return existing_child, False
         raise
+
+    if not fresh_sequence:
+        parent_parts = (
+            await session.execute(
+                select(EventDeliveryPart)
+                .where(EventDeliveryPart.delivery_id == parent.id)
+                .order_by(EventDeliveryPart.part_index.asc())
+            )
+        ).scalars().all()
+        for parent_part in parent_parts:
+            session.add(EventDeliveryPart(
+                delivery_id=child_delivery.id,
+                part_index=parent_part.part_index,
+                part_kind=parent_part.part_kind,
+                payload_json=parent_part.payload_json,
+                content_version=parent_part.content_version,
+                status="sent" if parent_part.status in {"sent", "resolved_sent"} else "pending",
+                attempt_count=0,
+                next_attempt_at=now,
+                external_message_id=parent_part.external_message_id if parent_part.status in {"sent", "resolved_sent"} else None,
+                sent_at=parent_part.sent_at if parent_part.status in {"sent", "resolved_sent"} else None,
+            ))
+    await session.flush()
 
     return child_delivery, True
 

@@ -38,6 +38,7 @@ from event_admin_service import (
     get_scenario_summary,
     get_step_item,
     list_problem_deliveries,
+    list_scenario_media,
     list_scenarios,
     list_steps,
     parse_msk_datetime,
@@ -46,8 +47,10 @@ from event_admin_service import (
     reorder_steps,
     reschedule_scenario,
     resolve_uncertain_delivery,
+    set_step_event_details,
     toggle_scenario_active,
     update_scenario_fields,
+    replace_scenario_media,
     update_step,
     validate_event_code,
     validate_scenario_input,
@@ -72,6 +75,9 @@ MAX_EVENT_INPUT_STATES = frozenset({
     "max_event_edit_duration",
     "max_event_edit_link",
     "max_event_edit_place",
+    "max_event_edit_description",
+    "max_event_edit_media",
+    "max_event_edit_media_add",
     "max_event_reschedule_starts_at",
     "max_event_copy_code",
     "max_event_copy_starts_at",
@@ -124,10 +130,11 @@ async def show_scenarios(
 
     # Pagination
     nav_row = []
+    archive_flag = 1 if include_archived else 0
     if page > 0:
-        nav_row.append(callback_button("◀️ Назад", f"admin_ev_page_{page - 1}"))
+        nav_row.append(callback_button("◀️ Назад", f"admin_ev_page_{page - 1}_{archive_flag}"))
     if page < total_pages - 1:
-        nav_row.append(callback_button("Вперёд ▶️", f"admin_ev_page_{page + 1}"))
+        nav_row.append(callback_button("Вперёд ▶️", f"admin_ev_page_{page + 1}_{archive_flag}"))
     if nav_row:
         rows.append(nav_row)
 
@@ -211,6 +218,8 @@ async def show_scenario(
         f"• <b>Статус:</b> {status_str}\n"
         f"• <b>Регистраций:</b> <b>{s.registrations_count}</b>\n"
         f"• <b>Ревизия:</b> {s.schedule_revision} (контент v{s.content_version})\n"
+        f"• <b>Описание:</b> {html.escape((s.description or '—')[:160])}{'…' if s.description and len(s.description) > 160 else ''}\n"
+        f"• <b>Медиа:</b> {s.media_count} | порядок: {'медиа → текст' if s.media_order == 'media_top' else 'текст → медиа'}\n"
     )
 
     rows = []
@@ -545,6 +554,12 @@ async def show_edit_menu(client: MaxApiClient, chat_id: int, event_id: int) -> N
     rows = [
         [callback_button("✏️ Изменить название", f"admin_ev_edit_title_{s.id}")],
         [callback_button("⏱ Изменить длительность", f"admin_ev_edit_duration_{s.id}")],
+        [callback_button("📝 Описание", f"admin_ev_edit_description_{s.id}")],
+        [callback_button("🖼 Медиа", f"admin_ev_edit_media_{s.id}")],
+        [callback_button(
+            f"↕️ Порядок: {'медиа → текст' if s.media_order == 'media_top' else 'текст → медиа'}",
+            f"admin_ev_toggle_media_order_{s.id}",
+        )],
     ]
     if s.event_type == "webinar":
         rows.append([callback_button("🔗 Изменить ссылку на вебинар", f"admin_ev_edit_link_{s.id}")])
@@ -559,6 +574,156 @@ async def show_edit_menu(client: MaxApiClient, chat_id: int, event_id: int) -> N
         text=f"✏️ <b>Редактирование мероприятия: {html.escape(s.title)}</b>\n\nВыберите поле для изменения:",
         attachments=inline_keyboard(rows),
     )
+
+
+def _description_editor_keyboard(event_id: int) -> list[list[dict]]:
+    return [
+        [callback_button("✅ Сохранить и выйти", f"admin_ev_description_save_{event_id}")],
+        [callback_button("🗑 Удалить описание", f"admin_ev_description_delete_{event_id}")],
+        _back(f"admin_ev_edit_menu_{event_id}"),
+    ]
+
+
+async def start_edit_description(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
+    s = await get_scenario_summary(async_session_maker, event_id)
+    if not s:
+        return
+    await states.set(user_id, chat_id, "max_event_edit_description", {"event_id": event_id, "description_draft": s.description or ""})
+    await client.send_message(
+        chat_id=chat_id,
+        text=(
+            "📝 <b>Описание мероприятия</b>\n\n"
+            "Отправьте новый текст. Описание не ограничивается лимитом caption; при доставке длинный текст будет разделён безопасно.\n\n"
+            f"Текущий черновик:\n<blockquote>{html.escape(s.description or '—')}</blockquote>"
+        ),
+        attachments=inline_keyboard(_description_editor_keyboard(event_id)),
+    )
+
+
+async def receive_edit_description(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, raw_text: str) -> None:
+    snapshot = await states.get(user_id)
+    if not snapshot:
+        return
+    await states.update(user_id, description_draft=raw_text)
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"📝 Черновик обновлён ({len(raw_text)} символов).\n\n<blockquote>{html.escape(raw_text[:3000])}</blockquote>",
+        attachments=inline_keyboard(_description_editor_keyboard(snapshot.data["event_id"])),
+    )
+
+
+async def save_description(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int) -> None:
+    snapshot = await states.get(user_id)
+    if not snapshot:
+        return
+    event_id = snapshot.data["event_id"]
+    try:
+        s = await update_scenario_fields(async_session_maker, event_id, description=snapshot.data.get("description_draft", ""))
+        await states.clear(user_id)
+        await client.send_message(chat_id=chat_id, text="✅ Описание сохранено.", attachments=inline_keyboard([_back(f"admin_ev_open_{s.id}")]))
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+
+
+async def delete_description(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
+    try:
+        s = await update_scenario_fields(async_session_maker, event_id, description=None)
+        await states.clear(user_id)
+        await client.send_message(chat_id=chat_id, text="✅ Описание удалено.", attachments=inline_keyboard([_back(f"admin_ev_open_{s.id}")]))
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+
+
+def _media_editor_keyboard(event_id: int, draft: list[dict[str, Any]]) -> list[list[dict]]:
+    rows: list[list[dict]] = []
+    for index, item in enumerate(draft):
+        row = [callback_button(f"🗑 {index + 1}. {'Фото' if item['file_type'] == 'photo' else 'Видео'}", f"admin_ev_media_remove_{event_id}_{index}")]
+        if index > 0:
+            row.append(callback_button("⬆️", f"admin_ev_media_up_{event_id}_{index}"))
+        if index < len(draft) - 1:
+            row.append(callback_button("⬇️", f"admin_ev_media_down_{event_id}_{index}"))
+        rows.append(row)
+    rows.extend([
+        [callback_button("➕ Добавить фото/видео", f"admin_ev_media_add_{event_id}")],
+        [callback_button("✅ Сохранить и выйти", f"admin_ev_media_save_{event_id}")],
+        _back(f"admin_ev_edit_menu_{event_id}"),
+    ])
+    return rows
+
+
+async def show_media_editor(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
+    media = await list_scenario_media(async_session_maker, event_id)
+    draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
+    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": event_id, "media_draft": draft})
+    await client.send_message(
+        chat_id=chat_id,
+        text=f"🖼 <b>Медиа мероприятия</b>\n\nВ черновике: <b>{len(draft)}</b>. Отправьте медиа после кнопки добавления и сохраните изменения.",
+        attachments=inline_keyboard(_media_editor_keyboard(event_id, draft)),
+    )
+
+
+async def start_add_media(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
+    snapshot = await states.get(user_id)
+    draft = snapshot.data.get("media_draft", []) if snapshot else []
+    await states.set(user_id, chat_id, "max_event_edit_media_add", {"event_id": event_id, "media_draft": draft})
+    await client.send_message(chat_id=chat_id, text="🖼 Отправьте фото или видео одним сообщением.", attachments=inline_keyboard([_back(f"admin_ev_edit_media_{event_id}")]))
+
+
+async def receive_media(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, *, media_type: str | None, media_token: str | None) -> None:
+    snapshot = await states.get(user_id)
+    if not snapshot or not media_token or media_type not in {"photo", "image", "video"}:
+        await client.send_message(chat_id=chat_id, text="❌ Отправьте фото или видео.")
+        return
+    draft = list(snapshot.data.get("media_draft", []))
+    draft.append({"file_type": "photo" if media_type == "image" else media_type, "file_id": media_token, "max_token": media_token, "source_platform": "max"})
+    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": snapshot.data["event_id"], "media_draft": draft})
+    await client.send_message(chat_id=chat_id, text=f"✅ Медиа добавлено. В черновике: {len(draft)}.", attachments=inline_keyboard(_media_editor_keyboard(snapshot.data["event_id"], draft)))
+
+
+async def mutate_media_draft(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    event_id: int,
+    index: int,
+    direction: int | None = None,
+) -> None:
+    snapshot = await states.get(user_id)
+    if not snapshot:
+        return
+    draft = list(snapshot.data.get("media_draft", []))
+    if 0 <= index < len(draft):
+        if direction is None:
+            draft.pop(index)
+        else:
+            target = index + direction
+            if 0 <= target < len(draft):
+                draft[index], draft[target] = draft[target], draft[index]
+    await states.update(user_id, media_draft=draft)
+    await client.send_message(chat_id=chat_id, text=f"🖼 В черновике: {len(draft)}.", attachments=inline_keyboard(_media_editor_keyboard(event_id, draft)))
+
+
+async def save_media(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
+    snapshot = await states.get(user_id)
+    draft = snapshot.data.get("media_draft", []) if snapshot else []
+    try:
+        await replace_scenario_media(async_session_maker, event_id, draft)
+        await states.clear(user_id)
+        await client.send_message(chat_id=chat_id, text="✅ Медиа сохранены.", attachments=inline_keyboard([_back(f"admin_ev_open_{event_id}")]))
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+
+
+async def toggle_media_order(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+    s = await get_scenario_summary(async_session_maker, event_id)
+    if not s:
+        return
+    try:
+        updated = await update_scenario_fields(async_session_maker, event_id, media_order="text_top" if s.media_order == "media_top" else "media_top")
+        await show_edit_menu(client, chat_id, updated.id)
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
 async def start_edit_title(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
@@ -815,6 +980,10 @@ async def show_step(client: MaxApiClient, chat_id: int, step_id: int) -> None:
     if not s.is_archived:
         rows.append([callback_button("✏️ Изменить текст", f"admin_ev_step_edit_text_{st.id}")])
         rows.append([callback_button("⏱ Изменить время отправки", f"admin_ev_step_edit_offset_{st.id}")])
+        rows.append([callback_button(
+            f"📎 Детали события: {'вкл.' if st.include_event_details else 'выкл.'}",
+            f"admin_ev_step_toggle_details_{st.id}",
+        )])
 
         order_row = []
         if not is_first:
@@ -834,6 +1003,7 @@ async def show_step(client: MaxApiClient, chat_id: int, step_id: int) -> None:
         f"• Мероприятие: {html.escape(s.title)}\n"
         f"• Время отправки: <b>{st.offset_display}</b> ({st.offset_minutes} мин.)\n"
         f"• Версия: v{st.step_version}\n\n"
+        f"• Детали события: {'включены' if st.include_event_details else 'выключены'}\n\n"
         f"<b>Текст сообщения:</b>\n"
         f"<blockquote>{html.escape(st.message_text)}</blockquote>"
     )
@@ -843,6 +1013,17 @@ async def show_step(client: MaxApiClient, chat_id: int, step_id: int) -> None:
         text=text,
         attachments=inline_keyboard(rows),
     )
+
+
+async def toggle_step_event_details(client: MaxApiClient, chat_id: int, step_id: int) -> None:
+    step = await get_step_item(async_session_maker, step_id)
+    if not step:
+        return
+    try:
+        await set_step_event_details(async_session_maker, step_id, not step.include_event_details)
+        await show_step(client, chat_id, step_id)
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
 async def start_step_add(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
@@ -1249,7 +1430,11 @@ async def start_resolve(
 
     await client.send_message(
         chat_id=chat_id,
-        text=f"📝 <b>Разрешение доставки ID {delivery_id}: {label}</b>\n\nВведите причину разрешения (для аудита):",
+        text=(
+            f"📝 <b>Разрешение доставки ID {delivery_id}: {label}</b>\n\n"
+            + ("⚠️ Повторная отправка может привести к дублю части медиа, если провайдер уже принял запрос.\n\n" if res_type == "force_retry" else "")
+            + "Введите причину разрешения (для аудита):"
+        ),
         attachments=inline_keyboard([_back(f"admin_ev_problem_item_{delivery_id}")]),
     )
 

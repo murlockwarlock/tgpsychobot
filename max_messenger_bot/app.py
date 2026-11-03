@@ -555,6 +555,19 @@ class MaxBotApplication:
                 if state.state == "max_event_edit_place":
                     await admin_events_service.receive_edit_place(self.client, self.states, message.chat_id, message.sender.user_id, text)
                     return
+                if state.state == "max_event_edit_description":
+                    await admin_events_service.receive_edit_description(self.client, self.states, message.chat_id, message.sender.user_id, message.html_text or text)
+                    return
+                if state.state == "max_event_edit_media_add":
+                    await admin_events_service.receive_media(
+                        self.client,
+                        self.states,
+                        message.chat_id,
+                        message.sender.user_id,
+                        media_type=message.media_type,
+                        media_token=message.media_token,
+                    )
+                    return
                 if state.state == "max_event_reschedule_starts_at":
                     await admin_events_service.receive_reschedule(self.client, self.states, message.chat_id, message.sender.user_id, text)
                     return
@@ -1935,8 +1948,15 @@ class MaxBotApplication:
                 await admin_events_service.show_scenarios(self.client, chat_id, page=0, include_archived=False)
                 return
             if data.startswith("admin_ev_page_"):
-                page = int(data.split("_")[-1])
-                await admin_events_service.show_scenarios(self.client, chat_id, page=page)
+                parts = data.split("_")
+                page = int(parts[3])
+                include_archived = bool(int(parts[4])) if len(parts) > 4 else False
+                await admin_events_service.show_scenarios(
+                    self.client,
+                    chat_id,
+                    page=page,
+                    include_archived=include_archived,
+                )
                 return
             if data.startswith("admin_ev_toggle_archive_view_"):
                 inc_arch = data.endswith("_1")
@@ -1948,6 +1968,9 @@ class MaxBotApplication:
                 await admin_events_service.show_scenario(self.client, chat_id, event_id)
                 return
             if data.startswith("admin_ev_toggle_"):
+                if data.startswith("admin_ev_toggle_media_order_"):
+                    await admin_events_service.toggle_media_order(self.client, chat_id, int(data.split("_")[-1]))
+                    return
                 event_id = int(data.split("_")[-1])
                 await admin_events_service.toggle_scenario(self.client, chat_id, event_id)
                 return
@@ -1971,6 +1994,41 @@ class MaxBotApplication:
             if data.startswith("admin_ev_edit_menu_"):
                 event_id = int(data.split("_")[-1])
                 await admin_events_service.show_edit_menu(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_edit_description_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_edit_description(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_description_save_"):
+                await admin_events_service.save_description(self.client, self.states, chat_id, user_id)
+                return
+            if data.startswith("admin_ev_description_delete_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.delete_description(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_edit_media_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.show_media_editor(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_media_add_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.start_add_media(self.client, self.states, chat_id, user_id, event_id)
+                return
+            if data.startswith("admin_ev_media_remove_"):
+                parts = data.split("_")
+                await admin_events_service.mutate_media_draft(self.client, self.states, chat_id, user_id, int(parts[4]), int(parts[5]))
+                return
+            if data.startswith("admin_ev_media_up_"):
+                parts = data.split("_")
+                await admin_events_service.mutate_media_draft(self.client, self.states, chat_id, user_id, int(parts[4]), int(parts[5]), -1)
+                return
+            if data.startswith("admin_ev_media_down_"):
+                parts = data.split("_")
+                await admin_events_service.mutate_media_draft(self.client, self.states, chat_id, user_id, int(parts[4]), int(parts[5]), 1)
+                return
+            if data.startswith("admin_ev_media_save_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.save_media(self.client, self.states, chat_id, user_id, event_id)
                 return
             if data.startswith("admin_ev_edit_title_"):
                 event_id = int(data.split("_")[-1])
@@ -2016,6 +2074,10 @@ class MaxBotApplication:
             if data.startswith("admin_ev_step_edit_text_"):
                 step_id = int(data.split("_")[-1])
                 await admin_events_service.start_edit_step_text(self.client, self.states, chat_id, user_id, step_id)
+                return
+            if data.startswith("admin_ev_step_toggle_details_"):
+                step_id = int(data.split("_")[-1])
+                await admin_events_service.toggle_step_event_details(self.client, chat_id, step_id)
                 return
             if data.startswith("admin_ev_step_edit_offset_"):
                 step_id = int(data.split("_")[-1])

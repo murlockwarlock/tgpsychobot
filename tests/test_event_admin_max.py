@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 os.environ.setdefault("BOT_TOKEN", "test_token")
@@ -8,12 +9,14 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import select
 
 from database import (
     Base,
     EventDelivery,
     EventRegistration,
     EventScenario,
+    EventScenarioMedia,
     EventStep,
     User,
 )
@@ -109,6 +112,108 @@ async def test_max_admin_list_and_card(db_session_maker, mock_client, states, mo
 
     await max_admin_events.archive_scenario_confirm(mock_client, chat_id=123, event_id=scen.id)
     assert "Мероприятие архивировано" in mock_client.send_message.call_args_list[-2].kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_max_pagination_callback_preserves_archive_filter(mock_client, monkeypatch):
+    scenarios = [
+        SimpleNamespace(
+            id=index,
+            title=f"Event {index}",
+            starts_at_msk="01.01.2030 12:00",
+            code=f"event_{index}",
+            event_type="webinar",
+            is_archived=index == 7,
+            is_active=True,
+            registrations_count=0,
+        )
+        for index in range(1, 8)
+    ]
+    monkeypatch.setattr(max_admin_events, "list_scenarios", AsyncMock(return_value=scenarios))
+
+    await max_admin_events.show_scenarios(mock_client, chat_id=123, page=0, include_archived=True)
+
+    buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+    callbacks = [button["payload"] for row in buttons for button in row if "payload" in button]
+    assert "admin_ev_page_1_1" in callbacks
+
+
+@pytest.mark.asyncio
+async def test_max_description_and_media_edit_routes(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_media_edit",
+        event_type="webinar",
+        title="MAX edit routes",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-edit",
+    )
+
+    await max_admin_events.start_edit_description(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.receive_edit_description(mock_client, states, 123, 456, "<b>MAX формат</b>")
+    await max_admin_events.save_description(mock_client, states, 123, 456)
+
+    await max_admin_events.show_media_editor(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.start_add_media(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.receive_media(
+        mock_client,
+        states,
+        123,
+        456,
+        media_type="image",
+        media_token="max-photo",
+    )
+    await max_admin_events.save_media(mock_client, states, 123, 456, scen.id)
+
+    async with db_session_maker() as session:
+        saved = await session.get(EventScenario, scen.id)
+        media = (await session.execute(select(EventScenarioMedia).where(EventScenarioMedia.event_id == scen.id))).scalars().all()
+        assert saved.description == "<b>MAX формат</b>"
+        assert [(item.file_type, item.file_id, item.max_token) for item in media] == [("photo", "max-photo", "max-photo")]
+
+
+@pytest.mark.asyncio
+async def test_max_description_and_media_buttons_are_displayed(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_button_contract",
+        event_type="webinar",
+        title="MAX button contract",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-buttons",
+    )
+
+    await max_admin_events.start_edit_description(mock_client, states, 123, 456, scen.id)
+    description_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+    description_payloads = [button["payload"] for row in description_buttons for button in row]
+    assert description_payloads == [
+        f"admin_ev_description_save_{scen.id}",
+        f"admin_ev_description_delete_{scen.id}",
+        f"admin_ev_edit_menu_{scen.id}",
+    ]
+    assert (await states.get(456)).state == "max_event_edit_description"
+
+    mock_client.send_message.reset_mock()
+    await max_admin_events.show_media_editor(mock_client, states, 123, 456, scen.id)
+    media_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+    media_payloads = [button["payload"] for row in media_buttons for button in row]
+    assert media_payloads == [
+        f"admin_ev_media_add_{scen.id}",
+        f"admin_ev_media_save_{scen.id}",
+        f"admin_ev_edit_menu_{scen.id}",
+    ]
+
+    mock_client.send_message.reset_mock()
+    await max_admin_events.start_add_media(mock_client, states, 123, 456, scen.id)
+    assert (await states.get(456)).state == "max_event_edit_media_add"
+    add_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+    assert add_buttons[0][0]["payload"] == f"admin_ev_edit_media_{scen.id}"
 
 
 @pytest.mark.asyncio

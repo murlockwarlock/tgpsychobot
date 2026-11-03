@@ -45,6 +45,7 @@ from event_admin_service import (
     get_scenario_summary,
     get_step_item,
     list_problem_deliveries,
+    list_scenario_media,
     list_scenarios,
     list_steps,
     parse_msk_datetime,
@@ -53,8 +54,10 @@ from event_admin_service import (
     reorder_steps,
     reschedule_scenario,
     resolve_uncertain_delivery,
+    set_step_event_details,
     toggle_scenario_active,
     update_scenario_fields,
+    replace_scenario_media,
     update_step,
     validate_event_code,
     validate_scenario_input,
@@ -110,6 +113,9 @@ class EventAdminStates(StatesGroup):
     edit_duration = State()
     edit_link = State()
     edit_place = State()
+    edit_description = State()
+    edit_media = State()
+    edit_media_add = State()
 
     # Reschedule
     reschedule_starts_at = State()
@@ -156,9 +162,11 @@ def _scenarios_list_keyboard(
     # Pagination row
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_ev_page_{page - 1}"))
+        archive_flag = 1 if include_archived else 0
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_ev_page_{page - 1}_{archive_flag}"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_ev_page_{page + 1}"))
+        archive_flag = 1 if include_archived else 0
+        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_ev_page_{page + 1}_{archive_flag}"))
     if nav_row:
         builder.row(*nav_row)
 
@@ -213,6 +221,13 @@ def _scenario_edit_keyboard(s: ScenarioSummary) -> Any:
         link_btn = "🔗 Изменить ссылку" if s.link else "🔗 Добавить ссылку"
         builder.button(text=link_btn, callback_data=f"admin_ev_edit_link_{s.id}")
 
+    builder.button(text="📝 Описание", callback_data=f"admin_ev_edit_description_{s.id}")
+    builder.button(text="🖼 Медиа", callback_data=f"admin_ev_edit_media_{s.id}")
+    builder.button(
+        text=f"↕️ Порядок: {'медиа → текст' if s.media_order == 'media_top' else 'текст → медиа'}",
+        callback_data=f"admin_ev_toggle_media_order_{s.id}",
+    )
+
     builder.button(text="⬅️ Назад в карточку", callback_data=f"admin_ev_open_{s.id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -243,6 +258,10 @@ def _step_card_keyboard(event_id: int, step: StepItem, is_first: bool, is_last: 
     if not is_archived:
         builder.button(text="✏️ Изменить текст", callback_data=f"admin_ev_step_edit_text_{step.id}")
         builder.button(text="⏱ Изменить время отправки", callback_data=f"admin_ev_step_edit_offset_{step.id}")
+        builder.button(
+            text=f"📎 Детали события: {'вкл.' if step.include_event_details else 'выкл.'}",
+            callback_data=f"admin_ev_step_toggle_details_{step.id}",
+        )
 
         # Reorder row
         order_row: list[InlineKeyboardButton] = []
@@ -371,11 +390,12 @@ async def show_events_root(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("admin_ev_page_"))
 async def show_events_page(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    page = int(callback.data.split("_")[-1])
-    # check user state for include_archived or default False
     data = await state.get_data()
-    inc_arch = bool(data.get("include_archived", False))
+    parts = callback.data.split("_")
+    page = int(parts[3])
+    inc_arch = bool(int(parts[4])) if len(parts) > 4 else bool(data.get("include_archived", False))
+    await state.clear()
+    await state.update_data(include_archived=inc_arch)
     await _show_scenarios_page(callback, page=page, include_archived=inc_arch)
 
 
@@ -467,6 +487,10 @@ def _format_scenario_card_text(s: ScenarioSummary, bot_username: str | None = No
             loc_lines.append(f"• <b>Ссылка:</b> {html.escape(s.link)}")
 
     loc_block = "\n".join(loc_lines)
+    details_block = (
+        f"• <b>Описание:</b> {html.escape(s.description[:160])}{'…' if len(s.description) > 160 else ''}\n"
+        if s.description else "• <b>Описание:</b> —\n"
+    )
 
     if bot_username:
         reg_link = f"https://t.me/{html.escape(bot_username)}?start={html.escape(s.code)}"
@@ -484,6 +508,8 @@ def _format_scenario_card_text(s: ScenarioSummary, bot_username: str | None = No
         f"• <b>Дата и время начала:</b> {s.starts_at_msk}\n"
         f"• <b>Длительность:</b> {s.duration_minutes} мин.\n"
         f"{loc_block}\n"
+        f"{details_block}"
+        f"• <b>Медиа:</b> {s.media_count} | порядок: {'медиа → текст' if s.media_order == 'media_top' else 'текст → медиа'}\n"
         f"• <b>Статус:</b> {status_str}\n"
         f"• <b>Всего регистраций:</b> <b>{s.registrations_count}</b>\n"
         f"• <b>Ревизия расписания:</b> {s.schedule_revision} (версия контента: {s.content_version})\n"
@@ -492,6 +518,9 @@ def _format_scenario_card_text(s: ScenarioSummary, bot_username: str | None = No
 
 @router.callback_query(F.data.startswith("admin_ev_toggle_"))
 async def toggle_active_handler(callback: CallbackQuery) -> None:
+    if callback.data.startswith("admin_ev_toggle_media_order_"):
+        await toggle_media_order(callback, None)
+        return
     event_id = int(callback.data.split("_")[-1])
     try:
         new_active = await toggle_scenario_active(async_session_maker, event_id)
@@ -880,6 +909,213 @@ async def process_edit_place(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ Ошибка: {exc}")
 
 
+def _description_editor_keyboard(event_id: int) -> Any:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Сохранить и выйти", callback_data=f"admin_ev_description_save_{event_id}")
+    builder.button(text="🗑 Удалить описание", callback_data=f"admin_ev_description_delete_{event_id}")
+    builder.button(text="❌ Отмена", callback_data=f"admin_ev_edit_menu_{event_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data.startswith("admin_ev_edit_description_"))
+async def start_edit_description(callback: CallbackQuery, state: FSMContext) -> None:
+    event_id = int(callback.data.split("_")[-1])
+    scen = await get_scenario_summary(async_session_maker, event_id)
+    if not scen:
+        await callback.answer("Мероприятие не найдено.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(edit_event_id=event_id, description_draft=scen.description or "")
+    await state.set_state(EventAdminStates.edit_description)
+    await callback.message.edit_text(
+        "📝 <b>Описание мероприятия</b>\n\n"
+        "Отправьте новый текст. Поддерживается длинное описание без лимита caption; текст больше 4096 символов будет разделён при доставке.\n\n"
+        f"Текущий черновик:\n<blockquote>{html.escape(scen.description or '—')}</blockquote>",
+        parse_mode="HTML",
+        reply_markup=_description_editor_keyboard(event_id),
+    )
+
+
+@router.message(EventAdminStates.edit_description)
+async def process_edit_description(message: Message, state: FSMContext) -> None:
+    text = message.html_text or message.text or message.caption or ""
+    data = await state.get_data()
+    event_id = data["edit_event_id"]
+    await state.update_data(description_draft=text)
+    await message.answer(
+        f"📝 Черновик обновлён ({len(text)} символов).\n\n<blockquote>{html.escape(text[:3000])}</blockquote>",
+        parse_mode="HTML",
+        reply_markup=_description_editor_keyboard(event_id),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_ev_description_save_"))
+async def save_description(callback: CallbackQuery, state: FSMContext) -> None:
+    event_id = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    try:
+        scen = await update_scenario_fields(
+            async_session_maker,
+            event_id,
+            description=data.get("description_draft", ""),
+        )
+        await state.clear()
+        await callback.message.edit_text(
+            "✅ Описание сохранено.",
+            reply_markup=_scenario_card_keyboard(scen),
+        )
+    except Exception as exc:
+        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_ev_description_delete_"))
+async def delete_description(callback: CallbackQuery, state: FSMContext) -> None:
+    event_id = int(callback.data.split("_")[-1])
+    try:
+        scen = await update_scenario_fields(async_session_maker, event_id, description=None)
+        await state.clear()
+        await callback.message.edit_text("✅ Описание удалено.", reply_markup=_scenario_card_keyboard(scen))
+    except Exception as exc:
+        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+
+
+def _media_editor_keyboard(event_id: int, draft: list[dict[str, Any]]) -> Any:
+    builder = InlineKeyboardBuilder()
+    for index, item in enumerate(draft):
+        label = f"{index + 1}. {'Фото' if item['file_type'] == 'photo' else 'Видео'}"
+        builder.button(text=f"🗑 {label}", callback_data=f"admin_ev_media_remove_{event_id}_{index}")
+        if index > 0:
+            builder.button(text=f"⬆️ {index + 1}", callback_data=f"admin_ev_media_up_{event_id}_{index}")
+        if index < len(draft) - 1:
+            builder.button(text=f"⬇️ {index + 1}", callback_data=f"admin_ev_media_down_{event_id}_{index}")
+    builder.button(text="➕ Добавить фото/видео", callback_data=f"admin_ev_media_add_{event_id}")
+    builder.button(text="✅ Сохранить и выйти", callback_data=f"admin_ev_media_save_{event_id}")
+    builder.button(text="❌ Отмена", callback_data=f"admin_ev_edit_menu_{event_id}")
+    builder.adjust(3)
+    return builder.as_markup()
+
+
+async def _render_media_editor(message: Message, event_id: int, state: FSMContext, *, edit: bool = True) -> None:
+    data = await state.get_data()
+    draft = data.get("media_draft", [])
+    text = (
+        "🖼 <b>Медиа мероприятия</b>\n\n"
+        f"В черновике: <b>{len(draft)}</b>. Фото и видео сохраняются в заданном порядке.\n"
+        "Добавьте вложения сообщениями, затем сохраните изменения."
+    )
+    if edit:
+        await message.edit_text(text, parse_mode="HTML", reply_markup=_media_editor_keyboard(event_id, draft))
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=_media_editor_keyboard(event_id, draft))
+
+
+@router.callback_query(F.data.startswith("admin_ev_edit_media_"))
+async def start_edit_media(callback: CallbackQuery, state: FSMContext) -> None:
+    event_id = int(callback.data.split("_")[-1])
+    media = await list_scenario_media(async_session_maker, event_id)
+    draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
+    await state.clear()
+    await state.update_data(edit_event_id=event_id, media_draft=draft)
+    await state.set_state(EventAdminStates.edit_media)
+    await _render_media_editor(callback.message, event_id, state)
+
+
+@router.callback_query(F.data.startswith("admin_ev_media_add_"))
+async def start_add_media(callback: CallbackQuery, state: FSMContext) -> None:
+    event_id = int(callback.data.split("_")[-1])
+    await state.update_data(edit_event_id=event_id)
+    await state.set_state(EventAdminStates.edit_media_add)
+    await callback.message.edit_text(
+        "🖼 Отправьте фото или видео одним сообщением. Для отмены нажмите кнопку ниже.",
+        reply_markup=InlineKeyboardBuilder().button(text="⬅️ К медиа", callback_data=f"admin_ev_edit_media_{event_id}").as_markup(),
+    )
+
+
+@router.message(EventAdminStates.edit_media_add)
+async def receive_media(message: Message, state: FSMContext) -> None:
+    file_type = None
+    file_id = None
+    if getattr(message, "photo", None):
+        file_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif getattr(message, "video", None):
+        file_type = "video"
+        file_id = message.video.file_id
+    if not file_type or not file_id:
+        await message.answer("❌ Отправьте фото или видео.")
+        return
+    data = await state.get_data()
+    draft = list(data.get("media_draft", []))
+    draft.append({"file_type": file_type, "file_id": file_id, "max_token": None, "source_platform": "telegram"})
+    await state.update_data(media_draft=draft)
+    await state.set_state(EventAdminStates.edit_media)
+    await _render_media_editor(message, data["edit_event_id"], state, edit=False)
+
+
+async def _mutate_media_draft(callback: CallbackQuery, state: FSMContext, direction: int | None = None) -> None:
+    parts = callback.data.split("_")
+    event_id = int(parts[4])
+    index = int(parts[5]) if len(parts) > 5 else None
+    data = await state.get_data()
+    draft = list(data.get("media_draft", []))
+    if index is not None and 0 <= index < len(draft):
+        if direction is None:
+            draft.pop(index)
+        else:
+            target = index + direction
+            if 0 <= target < len(draft):
+                draft[index], draft[target] = draft[target], draft[index]
+    await state.update_data(media_draft=draft)
+    await _render_media_editor(callback.message, event_id, state)
+
+
+@router.callback_query(F.data.startswith("admin_ev_media_remove_"))
+async def remove_media(callback: CallbackQuery, state: FSMContext) -> None:
+    await _mutate_media_draft(callback, state)
+
+
+@router.callback_query(F.data.startswith("admin_ev_media_up_"))
+async def move_media_up(callback: CallbackQuery, state: FSMContext) -> None:
+    await _mutate_media_draft(callback, state, -1)
+
+
+@router.callback_query(F.data.startswith("admin_ev_media_down_"))
+async def move_media_down(callback: CallbackQuery, state: FSMContext) -> None:
+    await _mutate_media_draft(callback, state, 1)
+
+
+@router.callback_query(F.data.startswith("admin_ev_media_save_"))
+async def save_media(callback: CallbackQuery, state: FSMContext) -> None:
+    event_id = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    try:
+        await replace_scenario_media(async_session_maker, event_id, data.get("media_draft", []))
+        scen = await get_scenario_summary(async_session_maker, event_id)
+        await state.clear()
+        await callback.message.edit_text("✅ Медиа сохранены.", reply_markup=_scenario_card_keyboard(scen))
+    except Exception as exc:
+        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_ev_toggle_media_order_"))
+async def toggle_media_order(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    event_id = int(callback.data.split("_")[-1])
+    scen = await get_scenario_summary(async_session_maker, event_id)
+    if not scen:
+        await callback.answer("Мероприятие не найдено.", show_alert=True)
+        return
+    updated = await update_scenario_fields(
+        async_session_maker,
+        event_id,
+        media_order="text_top" if scen.media_order == "media_top" else "media_top",
+    )
+    await callback.message.edit_text(
+        f"✅ Порядок изменён: {'текст → медиа' if updated.media_order == 'text_top' else 'медиа → текст'}",
+        reply_markup=_scenario_edit_keyboard(updated),
+    )
+
+
 # ==============================================================================
 # RESCHEDULE EVENT TIME
 # ==============================================================================
@@ -1180,6 +1416,7 @@ async def _render_step_card_view(callback: CallbackQuery, step_id: int) -> None:
         f"• <b>Мероприятие:</b> {html.escape(scen.title)}\n"
         f"• <b>Время отправки:</b> <b>{step.offset_display}</b> ({step.offset_minutes} мин.)\n"
         f"• <b>Версия шага:</b> v{step.step_version}\n\n"
+        f"• <b>Детали события:</b> {'включены' if step.include_event_details else 'выключены'}\n\n"
         f"<b>Текст сообщения:</b>\n"
         f"<blockquote>{html.escape(step.message_text)}</blockquote>"
     )
@@ -1197,6 +1434,20 @@ async def open_step_card(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     step_id = int(callback.data.split("_")[-1])
     await _render_step_card_view(callback, step_id)
+
+
+@router.callback_query(F.data.startswith("admin_ev_step_toggle_details_"))
+async def toggle_step_event_details(callback: CallbackQuery) -> None:
+    step_id = int(callback.data.split("_")[-1])
+    step = await get_step_item(async_session_maker, step_id)
+    if not step:
+        await callback.answer("Шаг не найден.", show_alert=True)
+        return
+    try:
+        await set_step_event_details(async_session_maker, step_id, not step.include_event_details)
+        await _render_step_card_view(callback, step_id)
+    except Exception as exc:
+        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_edit_text_"))
@@ -1525,10 +1776,12 @@ async def prompt_resolution_reason(callback: CallbackQuery, state: FSMContext) -
     await state.update_data(res_delivery_id=delivery_id, res_type=res_type)
     await state.set_state(EventAdminStates.resolve_reason)
 
+    warning = "⚠️ Повторная отправка может привести к дублю части медиа, если провайдер уже принял запрос.\n\n" if res_type == "force_retry" else ""
     await callback.message.edit_text(
         f"📝 <b>Ручное разрешение доставки ID {delivery_id}</b>\n\n"
         f"Действие: <b>{title}</b>\n\n"
-        f"Введите причину разрешения (обязательно для аудита):",
+        f"{warning}"
+        "Введите причину разрешения (обязательно для аудита):",
         parse_mode="HTML",
         reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_problem_item_{delivery_id}").as_markup(),
     )

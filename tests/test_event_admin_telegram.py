@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 os.environ.setdefault("BOT_TOKEN", "test_token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -12,12 +13,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, Update, User as TgUser
+from sqlalchemy import select
 
 from database import (
     Base,
     EventDelivery,
     EventRegistration,
     EventScenario,
+    EventScenarioMedia,
     EventStep,
     User,
 )
@@ -139,6 +142,106 @@ async def test_telegram_admin_root_list_and_card(db_session_maker, monkeypatch):
     cb_yes_arch = _make_callback(f"admin_ev_archive_yes_{scen.id}")
     await event_admin_telegram.archive_yes_handler(cb_yes_arch)
     cb_yes_arch.answer.assert_called_with("Мероприятие архивировано.")
+
+
+@pytest.mark.asyncio
+async def test_telegram_pagination_preserves_archive_filter(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
+    await state.update_data(include_archived=True)
+    rendered = AsyncMock()
+    monkeypatch.setattr(event_admin_telegram, "_show_scenarios_page", rendered)
+
+    await event_admin_telegram.show_events_page(_make_callback("admin_ev_page_2"), state)
+
+    rendered.assert_awaited_once_with(ANY, page=2, include_archived=True)
+    assert (await state.get_data())["include_archived"] is True
+
+
+@pytest.mark.asyncio
+async def test_telegram_description_and_media_edit_routes(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr("event_admin_telegram.get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_media_edit",
+        event_type="webinar",
+        title="Edit routes",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/edit",
+    )
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
+
+    await event_admin_telegram.start_edit_description(_make_callback(f"admin_ev_edit_description_{scen.id}"), state)
+    description_message = _make_message("ignored")
+    description_message.html_text = "<b>С форматированием</b>"
+    await event_admin_telegram.process_edit_description(description_message, state)
+    await event_admin_telegram.save_description(_make_callback(f"admin_ev_description_save_{scen.id}"), state)
+
+    await event_admin_telegram.start_edit_media(_make_callback(f"admin_ev_edit_media_{scen.id}"), state)
+    await event_admin_telegram.start_add_media(_make_callback(f"admin_ev_media_add_{scen.id}"), state)
+    media_message = _make_message("")
+    media_message.text = None
+    media_message.caption = None
+    media_message.photo = [SimpleNamespace(file_id="telegram-photo")]
+    media_message.video = None
+    await event_admin_telegram.receive_media(media_message, state)
+    await event_admin_telegram.save_media(_make_callback(f"admin_ev_media_save_{scen.id}"), state)
+
+    async with db_session_maker() as session:
+        saved = await session.get(EventScenario, scen.id)
+        media = (await session.execute(select(EventScenarioMedia).where(EventScenarioMedia.event_id == scen.id))).scalars().all()
+        assert saved.description == "<b>С форматированием</b>"
+        assert [(item.file_type, item.file_id) for item in media] == [("photo", "telegram-photo")]
+
+
+@pytest.mark.asyncio
+async def test_telegram_description_and_media_buttons_are_displayed(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr("event_admin_telegram.get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_button_contract",
+        event_type="webinar",
+        title="Button contract",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/buttons",
+    )
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
+
+    callback = _make_callback(f"admin_ev_edit_description_{scen.id}")
+    await event_admin_telegram.start_edit_description(callback, state)
+    assert await state.get_state() == event_admin_telegram.EventAdminStates.edit_description.state
+    markup = callback.message.edit_text.call_args.kwargs["reply_markup"]
+    callback_data = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert callback_data == [
+        f"admin_ev_description_save_{scen.id}",
+        f"admin_ev_description_delete_{scen.id}",
+        f"admin_ev_edit_menu_{scen.id}",
+    ]
+
+    media_callback = _make_callback(f"admin_ev_edit_media_{scen.id}")
+    await event_admin_telegram.start_edit_media(media_callback, state)
+    media_markup = media_callback.message.edit_text.call_args.kwargs["reply_markup"]
+    media_data = [button.callback_data for row in media_markup.inline_keyboard for button in row]
+    assert media_data == [
+        f"admin_ev_media_add_{scen.id}",
+        f"admin_ev_media_save_{scen.id}",
+        f"admin_ev_edit_menu_{scen.id}",
+    ]
+
+    add_callback = _make_callback(f"admin_ev_media_add_{scen.id}")
+    await event_admin_telegram.start_add_media(add_callback, state)
+    assert await state.get_state() == event_admin_telegram.EventAdminStates.edit_media_add.state
+    add_markup = add_callback.message.edit_text.call_args.kwargs["reply_markup"]
+    assert add_markup.inline_keyboard[0][0].callback_data == f"admin_ev_edit_media_{scen.id}"
 
 
 @pytest.mark.asyncio
