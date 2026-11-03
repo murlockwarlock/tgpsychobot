@@ -3,7 +3,7 @@ import logging
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import select, update, func
+from sqlalchemy import and_, or_, select, update, func
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.orm import selectinload
 from aiogram import Bot
@@ -12,7 +12,12 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from database import (async_session_maker, BotGeneralConfig, IndexingQueue, KnowledgeBase, Mailing, User,
                       UserSubscription, Message as DBMessage)
 from file_parser import parse_file
-from mailing_utils import get_mailing_audience_label, render_mailing_text, send_mailing_content
+from mailing_utils import (
+    MAX_PLATFORM_USER_ID_OFFSET,
+    get_mailing_audience_label,
+    render_mailing_text,
+    send_mailing_content,
+)
 from result_history import non_technical_role_filter
 from time_helpers import utc_now
 from vector_store import delete_document_vectors, update_vector_index
@@ -296,9 +301,19 @@ async def process_mailings(bot: Bot):
             await refresh_translation_cache(async_session_maker)
             async with async_session_maker() as session:
                 now = utc_now()
+                telegram_mailing_filter = or_(
+                    Mailing.platform == "telegram",
+                    and_(
+                        Mailing.platform.is_(None),
+                        Mailing.creator_id.is_not(None),
+                        Mailing.creator_id > 0,
+                        Mailing.creator_id < MAX_PLATFORM_USER_ID_OFFSET,
+                    ),
+                )
                 stale_stmt = select(Mailing).where(
                     Mailing.status == 'sending',
                     Mailing.recurring_type.is_(None),
+                    telegram_mailing_filter,
                     Mailing.start_time.is_not(None),
                     Mailing.start_time < (now - STALE_MAILING_TIMEOUT),
                 )
@@ -330,7 +345,11 @@ async def process_mailings(bot: Bot):
 
                 stmt = (
                     select(Mailing)
-                    .where(Mailing.status == 'pending', Mailing.recurring_type.is_(None))
+                    .where(
+                        Mailing.status == 'pending',
+                        Mailing.recurring_type.is_(None),
+                        telegram_mailing_filter,
+                    )
                     .order_by(Mailing.created_at)
                     .limit(1)
                 )
@@ -349,25 +368,35 @@ async def process_mailings(bot: Bot):
                 audience = mailing.target_audience
                 success_count, failure_count = 0, 0
                 try:
+                    telegram_user_filter = User.id < MAX_PLATFORM_USER_ID_OFFSET
                     target_users_stmt = None
                     if audience == "all":
-                        target_users_stmt = select(User.id)
+                        target_users_stmt = select(User.id).where(telegram_user_filter)
                     elif audience == "self":
-                        target_users_stmt = select(User.id).where(User.id == mailing.creator_id)
+                        target_users_stmt = select(User.id).where(
+                            User.id == mailing.creator_id,
+                            telegram_user_filter,
+                        )
                     elif audience == "no_dialogue":
                         subquery = select(DBMessage.user_id, func.count(DBMessage.id).label("msg_count")).where(
                             non_technical_role_filter(DBMessage)
                         ).group_by(
                             DBMessage.user_id).subquery()
                         target_users_stmt = select(User.id).outerjoin(subquery, User.id == subquery.c.user_id).where(
+                            telegram_user_filter,
                             (subquery.c.msg_count == None) | (subquery.c.msg_count <= 1))
                     elif audience == "no_subscription":
-                        target_users_stmt = select(User.id).outerjoin(UserSubscription).where(UserSubscription.id == None)
+                        target_users_stmt = select(User.id).outerjoin(UserSubscription).where(
+                            telegram_user_filter,
+                            UserSubscription.id == None,
+                        )
                     elif audience == "active_subscription":
                         target_users_stmt = select(User.id).join(UserSubscription).where(
+                            telegram_user_filter,
                             UserSubscription.end_date > now)
                     elif audience == "inactive_subscription":
                         target_users_stmt = select(User.id).join(UserSubscription).where(
+                            telegram_user_filter,
                             UserSubscription.end_date <= now)
 
                     if target_users_stmt is None:
@@ -392,7 +421,7 @@ async def process_mailings(bot: Bot):
                                 getattr(general_config, "telegram_default_language", "ru"),
                                 runtime_language_selection_enabled(general_config),
                                 runtime_enabled_languages(general_config),
-                                platform="max" if user_id >= 100_000_000_000 else "telegram",
+                                platform="telegram",
                             )
                             localized_text = translate(
                                 f"mailing.{mailing.id}.text",

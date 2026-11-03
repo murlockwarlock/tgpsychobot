@@ -1848,7 +1848,7 @@ def mailing_history_keyboard(mailings: list, page: int, total_pages: int):
         text_preview = (mailing.text or "Без текста")[:20]
         builder.button(
             text=f"{status} {date.strftime('%d.%m %H:%M')} | {text_preview}...",
-            callback_data=f"mailing_details_{mailing.id}"
+            callback_data=f"mailing_details_{mailing.id}_{page}"
         )
     builder.adjust(1)
 
@@ -1885,11 +1885,11 @@ def birthday_template_delete_keyboard(mailing_id: int):
     builder.adjust(1)
     return builder.as_markup()
 
-def mailing_details_keyboard(mailing):
+def mailing_details_keyboard(mailing, page: int = 0):
     builder = InlineKeyboardBuilder()
     if is_birthday_mailing(mailing):
         return birthday_template_keyboard(mailing.id, mailing.is_enabled)
-    builder.button(text="⬅️ Назад к истории", callback_data="mailing_history_page_0")
+    builder.button(text="⬅️ Назад к истории", callback_data=f"mailing_history_page_{page}")
     builder.adjust(1)
     return builder.as_markup()
 

@@ -9,7 +9,7 @@ import pytest
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-from aiogram.methods import SendMessage, SendPhoto
+from aiogram.methods import SendMessage, SendPhoto, SendVideo
 
 from database import FollowupStep, User
 from followups import FollowupStepSendResult, FollowupTransportRegistry, emit_followup_step
@@ -34,6 +34,12 @@ class TelegramBoundary:
         kwargs = {"chat_id": chat_id, "photo": photo, **kwargs}
         SendPhoto(**kwargs)
         self.calls.append(("photo", kwargs))
+        return SimpleNamespace(message_id=1)
+
+    async def send_video(self, chat_id, video, **kwargs):
+        kwargs = {"chat_id": chat_id, "video": video, **kwargs}
+        SendVideo(**kwargs)
+        self.calls.append(("video", kwargs))
         return SimpleNamespace(message_id=1)
 
 
@@ -193,6 +199,24 @@ async def test_formatted_telegram_mailing_media_caption_uses_validated_transport
 
     kind, payload = bot.calls[-1]
     assert kind == "photo"
+    assert payload["caption"] == "<i>Подпись</i>"
+    assert payload["reply_markup"].inline_keyboard[0][0].callback_data == "ai_btn:continue"
+
+
+@pytest.mark.asyncio
+async def test_formatted_telegram_mailing_video_caption_uses_validated_transport():
+    bot = TelegramBoundary()
+    mailing = SimpleNamespace(
+        text='<i>Подпись</i>\n\n[Продолжить](btn:continue)',
+        media_file_id="video-token",
+        media_file_type="video",
+        media_position="media_top",
+    )
+
+    await send_mailing_content(bot, 42, mailing)
+
+    kind, payload = bot.calls[-1]
+    assert kind == "video"
     assert payload["caption"] == "<i>Подпись</i>"
     assert payload["reply_markup"].inline_keyboard[0][0].callback_data == "ai_btn:continue"
 

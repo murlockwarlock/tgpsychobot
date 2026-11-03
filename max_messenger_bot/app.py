@@ -3085,7 +3085,12 @@ class MaxBotApplication:
                 await admin_mailing_service.show_history(self.client, chat_id, int(data.rsplit("_", 1)[1]))
                 return
             if data.startswith("mailing_details_"):
-                await admin_mailing_service.show_details(self.client, chat_id, int(data.rsplit("_", 1)[1]))
+                parsed_callback = admin_mailing_service.parse_mailing_details_callback(data)
+                if parsed_callback is None:
+                    await self.client.answer_callback(callback.callback_id, notification="Рассылка не найдена.")
+                    return
+                mailing_id, page = parsed_callback
+                await admin_mailing_service.show_details(self.client, chat_id, mailing_id, page)
                 return
             if data == "admin_test_menu":
                 await admin_tests_service.show_menu(self.client, chat_id)

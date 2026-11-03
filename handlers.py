@@ -246,11 +246,15 @@ from mailing_utils import (
     BIRTHDAY_MAILING_TYPE,
     BIRTHDAY_PLACEHOLDER_HINT,
     DEFAULT_BIRTHDAY_TEMPLATE,
+    MAX_PLATFORM_USER_ID_OFFSET,
     get_mailing_audience_label,
+    get_mailing_platform_label,
     get_mailing_status_label,
     is_birthday_mailing,
     parse_mailing_text,
+    parse_mailing_details_callback,
     render_mailing_text,
+    resolve_mailing_platform,
     send_mailing_content,
 )
 from prompt_blocks import (
@@ -17524,7 +17528,18 @@ def _birthday_mailing_step_text() -> str:
 async def _get_latest_birthday_mailing(session):
     return await session.scalar(
         select(Mailing)
-        .where(Mailing.recurring_type == BIRTHDAY_MAILING_TYPE)
+        .where(
+            Mailing.recurring_type == BIRTHDAY_MAILING_TYPE,
+            or_(
+                Mailing.platform == "telegram",
+                and_(
+                    Mailing.platform.is_(None),
+                    Mailing.creator_id.is_not(None),
+                    Mailing.creator_id > 0,
+                    Mailing.creator_id < MAX_PLATFORM_USER_ID_OFFSET,
+                ),
+            ),
+        )
         .order_by(Mailing.created_at.desc(), Mailing.id.desc())
         .limit(1)
     )
@@ -17774,6 +17789,7 @@ async def admin_confirm_mailing(callback: CallbackQuery, state: FSMContext):
                 new_mailing = Mailing(
                     target_audience=audience,
                     creator_id=callback.from_user.id,
+                    platform="telegram",
                     recurring_type=BIRTHDAY_MAILING_TYPE,
                     is_enabled=True,
                     status='active'
@@ -17785,6 +17801,7 @@ async def admin_confirm_mailing(callback: CallbackQuery, state: FSMContext):
             new_mailing.media_position = data.get('media_position', 'media_top')
             new_mailing.target_audience = audience
             new_mailing.creator_id = callback.from_user.id
+            new_mailing.platform = "telegram"
             new_mailing.recurring_type = BIRTHDAY_MAILING_TYPE
             new_mailing.is_enabled = True
             new_mailing.status = 'active'
@@ -17796,6 +17813,7 @@ async def admin_confirm_mailing(callback: CallbackQuery, state: FSMContext):
                 media_position=data.get('media_position', 'media_top'),
                 target_audience=audience,
                 creator_id=callback.from_user.id,
+                platform="telegram",
                 recurring_type=None,
                 is_enabled=True,
                 status='pending'
@@ -18580,8 +18598,14 @@ async def admin_mailing_history(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("mailing_details_"))
-async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
-    mailing_id = int(callback.data.split("_")[-1])
+async def admin_mailing_details(callback: CallbackQuery, bot: Bot, state: FSMContext | None = None):
+    if state is not None:
+        await state.clear()
+    parsed_callback = parse_mailing_details_callback(callback.data)
+    if parsed_callback is None:
+        await callback.answer("Рассылка не найдена.", show_alert=True)
+        return
+    mailing_id, page = parsed_callback
     async with async_session_maker() as session:
         mailing = await session.get(Mailing, mailing_id)
         if mailing:
@@ -18602,6 +18626,7 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
     if is_birthday_mailing(mailing):
         text = (
             "<b>🎂 Шаблон ДР-рассылки</b>\n\n"
+            f"<b>Платформа доставки:</b> {get_mailing_platform_label(mailing)}\n"
             f"<b>Статус:</b> {status}\n"
             f"<b>Создан:</b> {to_msk(mailing.created_at).strftime('%d.%m.%Y %H:%M')}\n"
             f"<b>Отправлено успешно:</b> {mailing.success_count}\n"
@@ -18613,6 +18638,7 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
             f"<b>Детали рассылки #{mailing.id}</b>\n\n"
             f"<b>Тип:</b> {mailing_type}\n"
             f"<b>Аудитория:</b> {audience_name}\n"
+            f"<b>Платформа доставки:</b> {get_mailing_platform_label(mailing)}\n"
             f"<b>Статус:</b> {status}\n"
             f"<b>Начало:</b> {start_time_str}\n"
             f"<b>Конец:</b> {end_time_str}\n"
@@ -18623,8 +18649,8 @@ async def admin_mailing_details(callback: CallbackQuery, bot: Bot):
     if is_birthday_mailing(mailing):
         text += f"\n\n<b>Переменные:</b> <code>{html.escape(BIRTHDAY_PLACEHOLDER_HINT)}</code>"
 
-    back_keyboard = kb.mailing_details_keyboard(mailing)
-    back_keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="Изменить текст", callback_data=f"ca:view:mailing:{mailing_id}")])
+    back_keyboard = kb.mailing_details_keyboard(mailing, page)
+    back_keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="Изменить текст", callback_data=f"ca:view:mailing:{mailing_id}:detail:{page}")])
     details_markup = _merge_telegram_inline_markups(
         _telegram_response_buttons_markup(response_button_rows),
         back_keyboard,
@@ -18666,7 +18692,7 @@ async def admin_delete_birthday_template_prompt(callback: CallbackQuery):
 
     async with async_session_maker() as session:
         mailing = await session.get(Mailing, mailing_id)
-        if not mailing or not is_birthday_mailing(mailing):
+        if not mailing or not is_birthday_mailing(mailing) or resolve_mailing_platform(mailing) != "telegram":
             await callback.answer("Шаблон не найден.", show_alert=True)
             return
 
@@ -18690,7 +18716,18 @@ async def admin_delete_birthday_template_confirm(callback: CallbackQuery, state:
     async with async_session_maker() as session:
         birthday_ids = (
             await session.execute(
-                select(Mailing.id).where(Mailing.recurring_type == BIRTHDAY_MAILING_TYPE)
+                select(Mailing.id).where(
+                    Mailing.recurring_type == BIRTHDAY_MAILING_TYPE,
+                    or_(
+                        Mailing.platform == "telegram",
+                        and_(
+                            Mailing.platform.is_(None),
+                            Mailing.creator_id.is_not(None),
+                            Mailing.creator_id > 0,
+                            Mailing.creator_id < MAX_PLATFORM_USER_ID_OFFSET,
+                        ),
+                    ),
+                )
             )
         ).scalars().all()
 
@@ -18711,7 +18748,7 @@ async def admin_toggle_mailing_enabled(callback: CallbackQuery, bot: Bot):
 
     async with async_session_maker() as session:
         mailing = await session.get(Mailing, mailing_id)
-        if not mailing or not is_birthday_mailing(mailing):
+        if not mailing or not is_birthday_mailing(mailing) or resolve_mailing_platform(mailing) != "telegram":
             await callback.answer("Шаблон не найден.", show_alert=True)
             return
 
@@ -18727,7 +18764,7 @@ async def admin_send_test_birthday_mailing(callback: CallbackQuery, bot: Bot):
 
     async with async_session_maker() as session:
         mailing = await session.get(Mailing, mailing_id)
-        if not mailing or not is_birthday_mailing(mailing):
+        if not mailing or not is_birthday_mailing(mailing) or resolve_mailing_platform(mailing) != "telegram":
             await callback.answer("Шаблон не найден.", show_alert=True)
             return
 

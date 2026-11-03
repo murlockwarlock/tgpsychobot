@@ -536,6 +536,7 @@ class Mailing(Base):
     media_position = Column(String, default='media_top')
     target_audience = Column(String, nullable=False)
     creator_id = Column(BigInteger, nullable=True)
+    platform = Column(String(16), nullable=True)
     recurring_type = Column(String, nullable=True)
     is_enabled = Column(Boolean, default=True, nullable=False)
     status = Column(String, default='pending')
@@ -1990,6 +1991,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE mailings ADD COLUMN recurring_type VARCHAR"))
             if 'is_enabled' not in mailing_columns:
                 sync_conn.execute(text("ALTER TABLE mailings ADD COLUMN is_enabled BOOLEAN DEFAULT TRUE NOT NULL"))
+            if 'platform' not in mailing_columns:
+                sync_conn.execute(text("ALTER TABLE mailings ADD COLUMN platform VARCHAR(16)"))
 
             AutomationDialogueState.__table__.create(sync_conn, checkfirst=True)
             UserAIActivity.__table__.create(sync_conn, checkfirst=True)

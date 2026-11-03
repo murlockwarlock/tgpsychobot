@@ -406,7 +406,15 @@ def verify_identity(
     except (HTTPError, OSError, ValueError, json.JSONDecodeError):
         return {"status": "unavailable"}
 
-    if actual_username != str(entry["username"]).lower() or actual_id != entry["platform_id"]:
+    if entry["platform"] == "telegram":
+        identity_mismatch = (
+            actual_username != str(entry["username"]).lower()
+            or actual_id != entry["platform_id"]
+        )
+    else:
+        identity_mismatch = actual_id != entry["platform_id"]
+
+    if identity_mismatch:
         return {
             "status": "mismatch",
             "username": actual_username,

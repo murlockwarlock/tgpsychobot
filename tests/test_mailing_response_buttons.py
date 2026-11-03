@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -554,6 +554,7 @@ async def test_max_formatted_mailing_round_trip_media_buttons_and_reopen(mailing
         mailing = await session.scalar(select(Mailing).where(Mailing.creator_id == user_id))
         assert mailing is not None
         assert mailing.text == source
+        assert mailing.platform == "max"
 
     await max_admin_mailing.show_details(client, 99, mailing.id)
     details_body = client.transport.requests[-1]["body"]
@@ -625,15 +626,64 @@ async def test_max_formatted_mailing_real_admin_journey(mailing_db):
     )
     assert {button["text"] for button in _max_request_buttons(delivery)} == {"Продолжить", "Сайт"}
 
-    summary = client.transport.requests[-1]
+    async with mailing_db() as session:
+        mailing = await session.scalar(
+            select(Mailing)
+            .where(Mailing.creator_id == MAX_ID_OFFSET + 99)
+            .order_by(Mailing.id.desc())
+        )
+        assert mailing is not None
+        session.add_all(
+            [
+                Mailing(
+                    text=f"old-max-{index}",
+                    target_audience="all",
+                    creator_id=MAX_ID_OFFSET + 99,
+                    platform="max",
+                    status="completed",
+                    created_at=mailing.created_at - timedelta(days=index + 1),
+                )
+                for index in range(10)
+            ]
+        )
+        await session.commit()
+
     await _press_max_admin_button(app, client, "journey-mailing-history", "📜 История рассылок")
-    history = client.transport.requests[-1]
+    history_page1 = client.transport.requests[-1]
+    assert "Страница 1/2" in history_page1["body"]["text"]
+    await _press_max_admin_button(app, client, "journey-mailing-next", "➡️")
+    history_page2 = client.transport.requests[-1]
+    assert "Страница 2/2" in history_page2["body"]["text"]
     history_button = next(
-        button for button in _max_request_buttons(history) if button["payload"].startswith("mailing_details_")
+        button for button in _max_request_buttons(history_page2) if button["payload"].startswith("mailing_details_")
     )
-    await app.handle_update(_max_admin_callback("journey-mailing-details", history_button["payload"], history["body"]["attachments"]))
+    await app.handle_update(
+        _max_admin_callback(
+            "journey-mailing-details",
+            history_button["payload"],
+            history_page2["body"]["attachments"],
+        )
+    )
     details = client.transport.requests[-1]
-    assert {button["text"] for button in _max_request_buttons(details)} >= {"Продолжить", "Сайт"}
+    assert "<b>Платформа доставки:</b> MAX" in details["body"]["text"]
+    back_button = next(button for button in _max_request_buttons(details) if button["text"] == "⬅️ К истории")
+    assert back_button["payload"] == "mailing_history_page_1"
+    await _press_max_admin_button(app, client, "journey-mailing-back", "⬅️ К истории")
+    assert "Страница 2/2" in client.transport.requests[-1]["body"]["text"]
+
+    await app.handle_update(
+        _max_admin_callback(
+            "journey-mailing-legacy",
+            f"mailing_details_{mailing.id}",
+            history_page2["body"]["attachments"],
+        )
+    )
+    legacy_details = client.transport.requests[-1]
+    assert "<b>Платформа доставки:</b> MAX" in legacy_details["body"]["text"]
+    legacy_back = next(button for button in _max_request_buttons(legacy_details) if button["text"] == "⬅️ К истории")
+    assert legacy_back["payload"] == "mailing_history_page_0"
+    await _press_max_admin_button(app, client, "journey-mailing-legacy-back", "⬅️ К истории")
+    assert "Страница 1/2" in client.transport.requests[-1]["body"]["text"]
 
     run_ai = AsyncMock()
     with patch.object(max_common, "ensure_access_before_chat", AsyncMock(return_value=True)), patch.object(
@@ -677,9 +727,14 @@ async def test_telegram_formatted_mailing_real_admin_journey(telegram_mailing_db
     if telegram_handlers.router.parent_router is not None:
         telegram_handlers = importlib.reload(telegram_handlers)
         monkeypatch.setattr(telegram_handlers, "async_session_maker", telegram_mailing_db)
+    import admin_content_authoring
+    if admin_content_authoring.router.parent_router is not None:
+        admin_content_authoring = importlib.reload(admin_content_authoring)
+    monkeypatch.setattr(admin_content_authoring, "async_session_maker", telegram_mailing_db)
 
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(telegram_handlers.router)
+    dispatcher.include_router(admin_content_authoring.router)
     session = _TelegramBoundarySession()
     bot = Bot("123456:test", session=session)
     admin = TelegramUser(id=11, is_bot=False, first_name="Администратор")
@@ -724,6 +779,21 @@ async def test_telegram_formatted_mailing_real_admin_journey(telegram_mailing_db
         mailing = await db_session.scalar(select(Mailing).where(Mailing.creator_id == 11))
         assert mailing is not None
         assert mailing.text == '<b>Привет</b>\n\n[Продолжить](btn:continue)\n[Сайт](https://example.com)'
+        assert mailing.platform == "telegram"
+        db_session.add_all(
+            [
+                Mailing(
+                    text=f"old-telegram-{index}",
+                    target_audience="all",
+                    creator_id=11,
+                    platform="telegram",
+                    status="completed",
+                    created_at=mailing.created_at - timedelta(days=index + 1),
+                )
+                for index in range(15)
+            ]
+        )
+        await db_session.commit()
 
     await send_mailing_content(bot, 11, mailing)
     delivery = session.last_message
@@ -747,3 +817,98 @@ async def test_telegram_formatted_mailing_real_admin_journey(telegram_mailing_db
         ).as_(bot)
         await dispatcher.feed_update(bot, Update(update_id=7, callback_query=callback))
     process.assert_awaited_once()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=8,
+            message=Message(
+                message_id=8,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=11, type="private"),
+                from_user=admin,
+                text="/admin",
+            ).as_(bot),
+        ),
+    )
+    await _feed_telegram_button(dispatcher, bot, session.last_message, "✉️ Рассылка", 9)
+    await _feed_telegram_button(dispatcher, bot, session.last_message, "📜 История рассылок", 10)
+    history = session.last_message
+    assert "стр. 1/2" in history.text
+    await _feed_telegram_button(dispatcher, bot, history, "➡️", 11)
+    history_page2 = session.last_message
+    assert "стр. 2/2" in history_page2.text
+    history_button = next(
+        button
+        for button in _telegram_inline_buttons(history_page2)
+        if button.callback_data and button.callback_data.startswith("mailing_details_")
+    )
+    await _feed_telegram_button(dispatcher, bot, history_page2, history_button.text, 12)
+    details = session.last_message
+    assert "<b>Платформа доставки:</b> Telegram" in details.text
+    edited_mailing_id = int(history_button.callback_data.split("_")[2])
+    await _feed_telegram_button(dispatcher, bot, details, "Изменить текст", 13)
+    authoring_card = session.last_message
+    assert f"Рассылки #{edited_mailing_id}" in authoring_card.text
+    edit_button = next(button for button in _telegram_inline_buttons(authoring_card) if button.text == "Изменить: Текст")
+    assert edit_button.callback_data == f"ca:edit:mailing:{edited_mailing_id}:ru:0:1:mailing_detail"
+    await _feed_telegram_button(dispatcher, bot, authoring_card, "Изменить: Текст", 14)
+    edit_screen = session.last_message
+    cancel_button = next(button for button in _telegram_inline_buttons(edit_screen) if button.text == "Отмена")
+    assert cancel_button.callback_data == f"mailing_details_{edited_mailing_id}_1"
+    await _feed_telegram_button(dispatcher, bot, edit_screen, "Отмена", 15)
+    cancelled_details = session.last_message
+    assert f"Детали рассылки #{edited_mailing_id}" in cancelled_details.text
+    authoring_state = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+    assert await authoring_state.get_state() is None
+    await _feed_telegram_button(dispatcher, bot, cancelled_details, "⬅️ Назад к истории", 16)
+    assert "стр. 2/2" in session.last_message.text
+
+    history_page2 = session.last_message
+    await _feed_telegram_button(dispatcher, bot, history_page2, history_button.text, 17)
+    details = session.last_message
+    await _feed_telegram_button(dispatcher, bot, details, "Изменить текст", 18)
+    authoring_card = session.last_message
+    await _feed_telegram_button(dispatcher, bot, authoring_card, "Изменить: Текст", 19)
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=20,
+            message=Message(
+                message_id=20,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=11, type="private"),
+                from_user=admin,
+                text="Обновлённый текст",
+            ).as_(bot),
+        ),
+    )
+    saved = session.last_message
+    open_material = next(button for button in _telegram_inline_buttons(saved) if button.text == "Открыть материал")
+    assert open_material.callback_data == f"mailing_details_{edited_mailing_id}_1"
+    assert await authoring_state.get_state() is None
+    await _feed_telegram_button(dispatcher, bot, saved, "Открыть материал", 21)
+    saved_details = session.last_message
+    assert f"Детали рассылки #{edited_mailing_id}" in saved_details.text
+    assert "Обновлённый текст" in saved_details.text
+    async with telegram_mailing_db() as db_session:
+        saved_mailing = await db_session.get(Mailing, edited_mailing_id)
+        assert saved_mailing.text == "Обновлённый текст"
+    await _feed_telegram_button(dispatcher, bot, saved_details, "⬅️ Назад к истории", 22)
+    assert "стр. 2/2" in session.last_message.text
+
+    back_button = next(button for button in _telegram_inline_buttons(details) if button.text == "⬅️ Назад к истории")
+    assert back_button.callback_data == "mailing_history_page_1"
+
+    legacy_callback = CallbackQuery(
+        id="telegram-legacy-mailing-callback",
+        from_user=admin,
+        chat_instance="mailing",
+        message=session.last_message,
+        data=f"mailing_details_{mailing.id}",
+    ).as_(bot)
+    await dispatcher.feed_update(bot, Update(update_id=23, callback_query=legacy_callback))
+    legacy_details = session.last_message
+    assert "<b>Платформа доставки:</b> Telegram" in legacy_details.text
+    legacy_back = next(button for button in _telegram_inline_buttons(legacy_details) if button.text == "⬅️ Назад к истории")
+    assert legacy_back.callback_data == "mailing_history_page_0"

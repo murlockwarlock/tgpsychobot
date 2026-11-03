@@ -19,6 +19,7 @@ from database import (
     BotGeneralConfig,
     BotSystemMessage,
     BotTranslation,
+    Mailing,
     TelegramPendingAIReply,
     User,
 )
@@ -619,6 +620,48 @@ async def test_init_db_keeps_multilingual_mode_off_for_legacy_ru_only_config(tmp
             assert config.multilingual_authoring_enabled is False
             assert config.telegram_enabled_languages == '["ru"]'
             assert config.telegram_language_selection_enabled is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_db_adds_mailing_platform_without_rewriting_history(tmp_path, monkeypatch):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'mailing-platform-migration.db'}"
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session_maker", sessions)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(Mailing(
+                text="historical",
+                target_audience="all",
+                creator_id=42,
+                status="completed",
+                success_count=3,
+                failure_count=1,
+            ))
+            await session.commit()
+        async with engine.begin() as connection:
+            await connection.execute(text("ALTER TABLE mailings DROP COLUMN platform"))
+
+        await database.init_db()
+
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(
+                lambda sync_connection: {column["name"] for column in inspect(sync_connection).get_columns("mailings")}
+            )
+        async with sessions() as session:
+            mailing = await session.scalar(select(Mailing))
+        assert "platform" in columns
+        assert mailing.text == "historical"
+        assert mailing.success_count == 3
+        assert mailing.failure_count == 1
+        assert mailing.platform is None
     finally:
         await engine.dispose()
 

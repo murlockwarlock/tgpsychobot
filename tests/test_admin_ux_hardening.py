@@ -4066,6 +4066,138 @@ async def test_admin_dispatcher_content_journey_validates_rendering_and_runtime(
 
 
 @pytest.mark.asyncio
+async def test_localized_content_editor_preserves_page_through_real_dispatcher(factory, admin_dispatcher, monkeypatch):
+    import admin_content_authoring
+    import automation_admin
+    import handlers
+    import keyboards
+    from content_authoring import save_content_value
+
+    for module in (admin_content_authoring, automation_admin, handlers, keyboards):
+        monkeypatch.setattr(module, "async_session_maker", factory)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, "get_all_admin_ids", AsyncMock(return_value={11}))
+
+    content_key = "content_15"
+    async with factory() as session:
+        session.add(DBUser(id=11, is_admin=True, first_name="Admin"))
+        session.add_all([
+            Content(
+                key=f"content_{index:02d}",
+                button_title=f"Материал {index}",
+                text_content=f"Русский текст {index}",
+                is_visible=True,
+            )
+            for index in range(16)
+        ])
+        await session.flush()
+        target = await session.get(Content, content_key)
+        await save_content_value(session, "content", target, "button_title", "en", "Material 15")
+        await save_content_value(session, "content", target, "button_title", "pt", "Material PT 15")
+        await session.commit()
+
+    session = ValidatingTelegramSession(stateful=True)
+    bot = Bot("123456:TEST", session=session)
+    dispatcher = admin_dispatcher
+    root_message = _admin_message(bot, user_id=11, text="/admin")
+    await dispatcher.feed_update(bot, Update(update_id=1000, message=root_message))
+    await _feed_callback(dispatcher, bot, root_message, "admin_content", 1001)
+    content_list = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    next_button = next(
+        button
+        for row in content_list.reply_markup.inline_keyboard
+        for button in row
+        if button.text == "Далее ➡️"
+    )
+    await _feed_callback(dispatcher, bot, root_message, next_button.callback_data, 1002)
+    page_two = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
+    assert "Страница 2/2" in page_two.text
+
+    async def open_locale(locale, update_id):
+        current_list = session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+        view_button = next(
+            button
+            for row in current_list.reply_markup.inline_keyboard
+            for button in row
+            if button.callback_data == f"ca:view:content:{content_key}:1"
+        )
+        await _feed_callback(dispatcher, bot, current_list, view_button.callback_data, update_id)
+        card = session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+        locale_button = next(
+            button
+            for row in card.reply_markup.inline_keyboard
+            for button in row
+            if button.callback_data == f"ca:locale:content:{content_key}:{locale}:1"
+        )
+        if locale == "ru":
+            return card
+        await _feed_callback(dispatcher, bot, card, locale_button.callback_data, update_id + 1)
+        return session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+
+    async def cancel_locale(locale, update_id):
+        card = await open_locale(locale, update_id)
+        edit_button = next(
+            button
+            for row in card.reply_markup.inline_keyboard
+            for button in row
+            if button.text == "Изменить: Название кнопки"
+        )
+        await _feed_callback(dispatcher, bot, card, edit_button.callback_data, update_id + 2)
+        editor = session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+        cancel_button = next(button for row in editor.reply_markup.inline_keyboard for button in row if button.text == "Отмена")
+        assert cancel_button.callback_data == f"ca:view:content:{content_key}:{locale}:1"
+        await _feed_callback(dispatcher, bot, editor, cancel_button.callback_data, update_id + 3)
+        returned_card = session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+        list_button = next(button for row in returned_card.reply_markup.inline_keyboard for button in row if button.text == "К списку")
+        assert list_button.callback_data == "ca:list:content:1"
+        state = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+        assert await state.get_state() is None
+        await _feed_callback(dispatcher, bot, returned_card, list_button.callback_data, update_id + 4)
+        returned_list = session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+        assert "Страница 2/2" in returned_list.text
+
+    await cancel_locale("ru", 1010)
+    await cancel_locale("pt", 1020)
+
+    card = await open_locale("en", 1030)
+    edit_button = next(
+        button
+        for row in card.reply_markup.inline_keyboard
+        for button in row
+        if button.text == "Изменить: Название кнопки"
+    )
+    await _feed_callback(dispatcher, bot, card, edit_button.callback_data, 1032)
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1033,
+            message=_admin_message(bot, user_id=11, text="Material 15 updated"),
+        ),
+    )
+    saved = session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+    open_button = next(button for row in saved.reply_markup.inline_keyboard for button in row if button.text == "Открыть материал")
+    assert open_button.callback_data == f"ca:view:content:{content_key}:en:1"
+    state = dispatcher.fsm.get_context(bot=bot, chat_id=11, user_id=11)
+    assert await state.get_state() is None
+    await _feed_callback(dispatcher, bot, saved, open_button.callback_data, 1034)
+    reopened = session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+    assert "Язык: 🇬🇧 English" in reopened.text
+    list_button = next(button for row in reopened.reply_markup.inline_keyboard for button in row if button.text == "К списку")
+    assert list_button.callback_data == "ca:list:content:1"
+    await _feed_callback(dispatcher, bot, reopened, list_button.callback_data, 1035)
+    returned_list = session.latest_message_with_keyboard(bot, 11, root_message.from_user)
+    assert "Страница 2/2" in returned_list.text
+    async with factory() as session:
+        translation = await session.scalar(
+            select(BotTranslation.text).where(
+                BotTranslation.locale == "en",
+                BotTranslation.translation_key == f"content.{content_key}.button_title",
+            )
+        )
+        assert translation == "Material 15 updated"
+
+
+@pytest.mark.asyncio
 async def test_subscription_reset_then_real_start_regrants_welcome_bonus(factory, admin_dispatcher, monkeypatch):
     import handlers
 
