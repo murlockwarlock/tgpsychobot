@@ -1,5 +1,7 @@
 import os
 import re
+import json
+from functools import wraps
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -13,6 +15,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, Update, User as TgUser
 from sqlalchemy import select
@@ -20,6 +23,7 @@ from sqlalchemy import select
 from database import (
     Base,
     EventDelivery,
+    EventDeliveryPart,
     EventRegistration,
     EventScenario,
     EventScenarioMedia,
@@ -172,36 +176,54 @@ def _telegram_event_callbacks(markup) -> list[str]:
 
 
 _TELEGRAM_EVENT_BUTTON_CONTRACTS = (
-    (re.compile(r"(?:admin_events|admin_panel|admin_ev_create_(?:webinar|meeting))"), "navigation", "events/list", "telegram.events.root"),
-    (re.compile(r"admin_ev_skip_meeting_link$"), "fsm", "events/create", "telegram.events.root"),
-    (re.compile(r"admin_ev_page_\d+_[01]$"), "navigation", "events/list", "telegram.events.pagination"),
-    (re.compile(r"admin_ev_toggle_archive_view_[01]$"), "navigation", "events/list", "telegram.events.pagination"),
-    (re.compile(r"admin_ev_open_\d+(?:_\d+_[01])?$"), "navigation", "events/card", "telegram.events.card"),
-    (re.compile(r"admin_ev_toggle_media_order_\d+$"), "mutation", "events/edit", "telegram.description-media"),
-    (re.compile(r"admin_ev_toggle_\d+$"), "mutation", "events/card", "telegram.events.card"),
-    (re.compile(r"admin_ev_stats_\d+$"), "navigation", "events/stats", "telegram.delivery.lifecycle"),
-    (re.compile(r"admin_ev_reschedule_\d+$"), "fsm", "events/reschedule", "telegram.events.card"),
-    (re.compile(r"admin_ev_edit_menu_\d+(?:_\d+_[01])?$"), "navigation", "events/edit", "telegram.events.edit"),
-    (re.compile(r"admin_ev_copy_\d+$"), "mutation", "events/copy", "telegram.events.card"),
-    (re.compile(r"admin_ev_test_send_menu_\d+$"), "navigation", "events/test-send", "telegram.delivery.test-send"),
-    (re.compile(r"admin_ev_archive_(?:ask|yes)_\d+$"), "destructive", "events/archive", "telegram.delivery.lifecycle"),
-    (re.compile(r"admin_ev_edit_(?:title|duration|link|place|description|media)_\d+$"), "fsm", "events/edit", "telegram.events.edit"),
-    (re.compile(r"admin_ev_description_(?:save|delete)_\d+$"), "mutation", "events/edit", "telegram.description-media"),
-    (re.compile(r"admin_ev_media_(?:add|save)_\d+$"), "mutation", "events/edit-media", "telegram.description-media"),
-    (re.compile(r"admin_ev_media_(?:remove|up|down)_\d+_\d+$"), "mutation", "events/edit-media", "telegram.description-media"),
-    (re.compile(r"admin_ev_steps_\d+(?:_\d+_[01])?$"), "navigation", "events/steps", "telegram.steps.roundtrip"),
-    (re.compile(r"admin_ev_step_add_\d+$"), "fsm", "events/steps", "telegram.steps.roundtrip"),
-    (re.compile(r"admin_ev_offset_preset_\d+_-?\d+$"), "fsm", "events/steps", "telegram.steps.roundtrip"),
-    (re.compile(r"admin_ev_offset_custom_\d+$"), "fsm", "events/steps", "telegram.steps.roundtrip"),
-    (re.compile(r"admin_ev_step_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "telegram.steps.roundtrip"),
-    (re.compile(r"admin_ev_step_(?:toggle_details|edit_text|edit_offset|up|down|del_ask|del_yes)_\d+$"), "mutation", "events/step", "telegram.steps.dispatcher"),
-    (re.compile(r"admin_ev_step_edit_preset_\d+_-?\d+$"), "fsm", "events/step", "telegram.steps.dispatcher"),
-    (re.compile(r"admin_ev_step_edit_custom_\d+$"), "fsm", "events/step", "telegram.steps.dispatcher"),
-    (re.compile(r"admin_ev_problems_\d+_\d+$"), "navigation", "events/problems", "telegram.delivery.lifecycle"),
-    (re.compile(r"admin_ev_problem_item_\d+$"), "navigation", "events/problem", "telegram.delivery.lifecycle"),
-    (re.compile(r"admin_ev_resolve_(?:force|sent|skipped)_\d+(?:_\d+)?$"), "fsm", "events/problem", "telegram.delivery.resolution"),
-    (re.compile(r"admin_ev_test_step_\d+$"), "external", "telegram/test-send", "telegram.delivery.test-send"),
-    (re.compile(r"admin_ev_do_test_send_\d+_\d+$"), "external", "telegram/test-send", "telegram.delivery.test-send"),
+    (re.compile(r"admin_events$"), "navigation", "events/list", "telegram.events.root", "show_events_root", None),
+    (re.compile(r"admin_panel$"), "navigation", "admin/panel", "telegram.events.root", "back_to_admin_panel", None),
+    (re.compile(r"admin_ev_create_(?:webinar|meeting)$"), "navigation", "events/create", "telegram.events.root", "start_scenario_creation", "EventAdminStates.create_code"),
+    (re.compile(r"admin_ev_skip_meeting_link$"), "mutation", "events/create", "telegram.events.root", "skip_meeting_link", None),
+    (re.compile(r"admin_ev_page_\d+_[01]$"), "navigation", "events/list", "telegram.events.pagination", "show_events_page", None),
+    (re.compile(r"admin_ev_toggle_archive_view_[01]$"), "navigation", "events/list", "telegram.events.pagination", "toggle_archive_view", None),
+    (re.compile(r"admin_ev_open_\d+(?:_\d+_[01])?$"), "navigation", "events/card", "telegram.events.card", "open_scenario_card", None),
+    (re.compile(r"admin_ev_toggle_media_order_\d+$"), "mutation", "events/edit", "telegram.description-media", "toggle_active_handler", None),
+    (re.compile(r"admin_ev_toggle_\d+$"), "mutation", "events/card", "telegram.events.card", "toggle_active_handler", None),
+    (re.compile(r"admin_ev_stats_\d+$"), "navigation", "events/stats", "telegram.delivery.lifecycle", "show_delivery_stats", None),
+    (re.compile(r"admin_ev_reschedule_\d+$"), "mutation", "events/reschedule", "telegram.events.card", "start_reschedule", "EventAdminStates.reschedule_starts_at"),
+    (re.compile(r"admin_ev_edit_menu_\d+(?:_\d+_[01])?$"), "navigation", "events/edit", "telegram.events.edit", "show_edit_menu", None),
+    (re.compile(r"admin_ev_copy_\d+$"), "navigation", "events/copy", "telegram.events.card", "start_copy", "EventAdminStates.copy_code"),
+    (re.compile(r"admin_ev_test_send_menu_\d+$"), "navigation", "events/test-send", "telegram.delivery.test-send", "show_test_send_picker", None),
+    (re.compile(r"admin_ev_archive_ask_\d+$"), "navigation", "events/archive", "telegram.delivery.lifecycle", "ask_archive_handler", None),
+    (re.compile(r"admin_ev_archive_yes_\d+$"), "destructive", "events/archive", "telegram.delivery.lifecycle", "archive_yes_handler", None),
+    (re.compile(r"admin_ev_edit_title_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_title", "EventAdminStates.edit_title"),
+    (re.compile(r"admin_ev_edit_duration_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_duration", "EventAdminStates.edit_duration"),
+    (re.compile(r"admin_ev_edit_link_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_link", "EventAdminStates.edit_link"),
+    (re.compile(r"admin_ev_edit_place_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_place", "EventAdminStates.edit_place"),
+    (re.compile(r"admin_ev_edit_description_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_description", "EventAdminStates.edit_description"),
+    (re.compile(r"admin_ev_edit_media_\d+$"), "navigation", "events/edit-media", "telegram.description-media", "start_edit_media", "EventAdminStates.edit_media"),
+    (re.compile(r"admin_ev_description_save_\d+$"), "mutation", "events/edit", "telegram.description-media", "save_description", None),
+    (re.compile(r"admin_ev_description_delete_\d+$"), "destructive", "events/edit", "telegram.description-media", "delete_description", "EventAdminStates.edit_description"),
+    (re.compile(r"admin_ev_media_add_\d+$"), "navigation", "events/edit-media", "telegram.description-media", "start_add_media", "EventAdminStates.edit_media_add"),
+    (re.compile(r"admin_ev_media_save_\d+$"), "mutation", "events/edit-media", "telegram.description-media", "save_media", None),
+    (re.compile(r"admin_ev_media_remove_\d+_\d+$"), "destructive", "events/edit-media", "telegram.description-media", "remove_media", "EventAdminStates.edit_media"),
+    (re.compile(r"admin_ev_media_up_\d+_\d+$"), "mutation", "events/edit-media", "telegram.description-media", "move_media_up", "EventAdminStates.edit_media"),
+    (re.compile(r"admin_ev_media_down_\d+_\d+$"), "mutation", "events/edit-media", "telegram.description-media", "move_media_down", "EventAdminStates.edit_media"),
+    (re.compile(r"admin_ev_steps_\d+(?:_\d+_[01])?$"), "navigation", "events/steps", "telegram.steps.roundtrip", "show_steps_list", None),
+    (re.compile(r"admin_ev_step_add_\d+$"), "navigation", "events/steps", "telegram.steps.roundtrip", "start_add_step", None),
+    (re.compile(r"admin_ev_offset_preset_\d+_-?\d+$"), "mutation", "events/steps", "telegram.steps.roundtrip", "process_offset_preset", "EventAdminStates.step_text"),
+    (re.compile(r"admin_ev_offset_custom_\d+$"), "navigation", "events/steps", "telegram.steps.roundtrip", "start_offset_custom", "EventAdminStates.step_offset_custom"),
+    (re.compile(r"admin_ev_step_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "telegram.steps.roundtrip", "open_step_card", None),
+    (re.compile(r"admin_ev_step_toggle_details_\d+$"), "mutation", "events/step", "telegram.steps.dispatcher", "toggle_step_event_details", None),
+    (re.compile(r"admin_ev_step_edit_text_\d+$"), "mutation", "events/step", "telegram.steps.dispatcher", "start_edit_step_text", "EventAdminStates.step_edit_text"),
+    (re.compile(r"admin_ev_step_edit_offset_\d+$"), "navigation", "events/step", "telegram.steps.dispatcher", "start_edit_step_offset", None),
+    (re.compile(r"admin_ev_step_up_\d+$"), "mutation", "events/step", "telegram.steps.dispatcher", "step_move_up", None),
+    (re.compile(r"admin_ev_step_down_\d+$"), "mutation", "events/step", "telegram.steps.dispatcher", "step_move_down", None),
+    (re.compile(r"admin_ev_step_del_ask_\d+$"), "navigation", "events/step", "telegram.steps.dispatcher", "ask_delete_step", None),
+    (re.compile(r"admin_ev_step_del_yes_\d+$"), "destructive", "events/step", "telegram.steps.dispatcher", "delete_step_yes", None),
+    (re.compile(r"admin_ev_step_edit_preset_\d+_-?\d+$"), "mutation", "events/step", "telegram.steps.dispatcher", "process_edit_offset_preset", None),
+    (re.compile(r"admin_ev_step_edit_custom_\d+$"), "navigation", "events/step", "telegram.steps.dispatcher", "start_edit_offset_custom", "EventAdminStates.step_edit_offset_custom"),
+    (re.compile(r"admin_ev_problems_\d+_\d+$"), "navigation", "events/problems", "telegram.delivery.lifecycle", "show_problem_deliveries", None),
+    (re.compile(r"admin_ev_problem_item_\d+$"), "navigation", "events/problem", "telegram.delivery.lifecycle", "open_problem_delivery", None),
+    (re.compile(r"admin_ev_resolve_(?:force|sent|skipped)_\d+(?:_\d+)?$"), "mutation", "events/problem", "telegram.delivery.resolution", "prompt_resolution_reason", "EventAdminStates.resolve_reason"),
+    (re.compile(r"admin_ev_test_step_\d+$"), "external", "telegram/test-send", "telegram.delivery.test-send", "test_send_single_step", None),
+    (re.compile(r"admin_ev_do_test_send_\d+_\d+$"), "external", "telegram/test-send", "telegram.delivery.test-send", "do_test_send", None),
 )
 
 _TELEGRAM_EVENT_JOURNEY_COVERAGE = {
@@ -217,15 +239,84 @@ _TELEGRAM_EVENT_JOURNEY_COVERAGE = {
     "telegram.delivery.test-send",
 }
 
+_TELEGRAM_REAL_JOURNEY_TESTS = {
+    "telegram.events.root": (
+        "test_telegram_admin_root_list_and_card",
+        "test_telegram_webinar_creation_flow",
+        "test_telegram_meeting_creation_flow",
+    ),
+    "telegram.events.pagination": (
+        "test_telegram_pagination_preserves_archive_filter",
+        "test_telegram_pagination_boundaries_for_scenarios_and_problems",
+    ),
+    "telegram.events.card": (
+        "test_telegram_admin_root_list_and_card",
+        "test_telegram_reschedule_and_copy",
+        "test_telegram_dispatcher_lifecycle_monitoring_and_test_send",
+    ),
+    "telegram.events.edit": (
+        "test_telegram_description_and_media_edit_routes",
+        "test_telegram_paginated_edit_roundtrip_and_delete_stays_draft",
+        "test_telegram_dispatcher_description_chunks_save_reopen_and_runtime_split",
+    ),
+    "telegram.description-media": (
+        "test_telegram_description_and_media_edit_routes",
+        "test_telegram_media_back_preserves_draft_and_cancel_discards_it",
+        "test_telegram_paginated_edit_roundtrip_and_delete_stays_draft",
+    ),
+    "telegram.steps.roundtrip": (
+        "test_telegram_dispatcher_steps_buttons_roundtrip_page_context",
+        "test_telegram_steps_management",
+    ),
+    "telegram.steps.dispatcher": (
+        "test_telegram_dispatcher_step_routing_and_ordering",
+        "test_telegram_dispatcher_delete_last_step_returns_empty_page",
+    ),
+    "telegram.delivery.lifecycle": (
+        "test_telegram_dispatcher_lifecycle_monitoring_and_test_send",
+        "test_telegram_monitoring_and_uncertain_resolution",
+    ),
+    "telegram.delivery.resolution": (
+        "test_telegram_monitoring_and_uncertain_resolution",
+        "test_telegram_uncertain_resolution_buttons_target_specific_part",
+    ),
+    "telegram.delivery.test-send": (
+        "test_telegram_test_send_to_self",
+        "test_telegram_test_send_uses_runtime_media_plan_without_delivery_rows",
+    ),
+}
+
+_TELEGRAM_EXECUTED_JOURNEYS: set[str] = set()
+
+
+@pytest.fixture(autouse=True)
+def _record_telegram_real_journey(request):
+    for journey_id, test_names in _TELEGRAM_REAL_JOURNEY_TESTS.items():
+        if request.node.name in test_names:
+            _TELEGRAM_EXECUTED_JOURNEYS.add(journey_id)
+    yield
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _assert_telegram_real_journey_coverage(request):
+    yield
+    required_tests = {name for names in _TELEGRAM_REAL_JOURNEY_TESTS.values() for name in names}
+    selected_tests = {item.name for item in request.session.items}
+    if required_tests <= selected_tests:
+        assert _TELEGRAM_EXECUTED_JOURNEYS == _TELEGRAM_EVENT_JOURNEY_COVERAGE
+
 
 def _event_callback_contract(callback: str) -> dict[str, str]:
-    for pattern, classification, target, journey_id in _TELEGRAM_EVENT_BUTTON_CONTRACTS:
+    for pattern, classification, target, journey_id, route, expected_state in _TELEGRAM_EVENT_BUTTON_CONTRACTS:
         if pattern.fullmatch(callback):
             assert journey_id in _TELEGRAM_EVENT_JOURNEY_COVERAGE
+            assert classification in {"navigation", "mutation", "destructive", "external"}
             return {
                 "classification": classification,
                 "target": target,
                 "journey_id": journey_id,
+                "route": route,
+                "expected_state": expected_state,
             }
     raise AssertionError(f"Uncontracted event callback: {callback}")
 
@@ -402,8 +493,7 @@ async def test_telegram_visible_event_buttons_dispatch_through_router_contract(m
     ]
     callbacks = [callback for keyboard in keyboards for callback in _telegram_event_callbacks(keyboard)]
     assert callbacks
-    for callback in callbacks:
-        _event_callback_contract(callback)
+    contracts = {callback: _event_callback_contract(callback) for callback in callbacks}
 
     import handlers
 
@@ -448,7 +538,7 @@ async def test_telegram_visible_event_buttons_dispatch_through_router_contract(m
             )
             result = await dp.feed_update(bot, Update(update_id=100, callback_query=query))
             assert result is not UNHANDLED, f"Visible callback was not routed: {callback}"
-            assert len(routed) == 1, f"Visible callback selected {routed}: {callback}"
+            assert routed == [contracts[callback]["route"]], f"Visible callback selected {routed}: {callback}"
             methods = [call.args[0] for call in bot.call_args_list if call.args]
             assert any(isinstance(method, EditMessageText) for method in methods), callback
     finally:
@@ -456,6 +546,202 @@ async def test_telegram_visible_event_buttons_dispatch_through_router_contract(m
             for handler, original in zip(router.callback_query.handlers, original_callbacks[router]):
                 handler.callback = original
             router._parent_router = None
+
+
+@pytest.mark.asyncio
+async def test_telegram_visible_event_buttons_execute_real_dispatcher_journeys(db_session_maker, monkeypatch):
+    """Every changed visible callback executes its registered handler unpatched."""
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import add_step, create_scenario, get_scenario_summary, list_scenario_media, list_steps, replace_scenario_media
+
+    scenario = await create_scenario(
+        db_session_maker,
+        code="telegram_real_contract",
+        event_type="meeting",
+        title="Telegram real contract",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        place="Room 1",
+    )
+    first_step = await add_step(db_session_maker, scenario.id, -1440, "First reminder")
+    second_step = await add_step(db_session_maker, scenario.id, -60, "Second reminder")
+    await replace_scenario_media(
+        db_session_maker,
+        scenario.id,
+        [
+            {"file_type": "photo", "file_id": "telegram-photo", "source_platform": "telegram"},
+            {"file_type": "video", "file_id": "telegram-video", "source_platform": "telegram"},
+        ],
+    )
+    async with db_session_maker() as session:
+        user = User(id=40, first_name="Problem user")
+        session.add(user)
+        await session.flush()
+        registration = EventRegistration(event_id=scenario.id, user_id=user.id, status="started")
+        session.add(registration)
+        await session.flush()
+        delivery = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=registration.id,
+            message_kind="immediate_confirmation",
+            delivery_key="telegram_real_contract_delivery",
+            due_at=utc_now(),
+            next_attempt_at=utc_now(),
+            platform="telegram",
+            status="uncertain",
+            attempt_count=1,
+            last_error="timeout",
+            content_version_snapshot=1,
+        )
+        session.add(delivery)
+        await session.flush()
+        part = EventDeliveryPart(
+            delivery_id=delivery.id,
+            part_index=0,
+            part_kind="media",
+            payload_json=json.dumps({"kind": "photo", "file_id": "telegram-photo"}),
+            content_version=1,
+            status="uncertain",
+            attempt_count=1,
+            last_error="timeout",
+        )
+        session.add(part)
+        await session.commit()
+        delivery_id, part_id = delivery.id, part.id
+
+    scenario = await get_scenario_summary(db_session_maker, scenario.id)
+    assert scenario is not None
+    steps = await list_steps(db_session_maker, scenario.id, include_archived=False)
+    media = await list_scenario_media(db_session_maker, scenario.id)
+    delivery_item = DeliveryItem(
+        id=delivery_id,
+        event_id=scenario.id,
+        user_id=40,
+        user_display="Problem user",
+        message_kind="immediate_confirmation",
+        step_id=None,
+        status="uncertain",
+        due_at_msk="01.01.2030 11:00",
+        attempt_count=1,
+        last_error="timeout",
+        sent_or_finished_msk=None,
+        platform="telegram",
+        retry_index=0,
+        parent_delivery_id=None,
+    )
+    part_item = DeliveryPartItem(
+        id=part_id,
+        part_index=0,
+        part_kind="media",
+        status="uncertain",
+        attempt_count=1,
+        last_error="timeout",
+        external_message_id=None,
+    )
+    keyboards = [
+        event_admin_telegram._scenarios_list_keyboard([scenario], 0, 2, True),
+        event_admin_telegram._scenario_card_keyboard(scenario, "admin_ev_page_1_1"),
+        event_admin_telegram._scenario_edit_keyboard(scenario, list_back="admin_ev_page_1_1"),
+        event_admin_telegram._steps_list_keyboard(scenario.id, steps, False, back="admin_ev_page_1_1"),
+        event_admin_telegram._step_card_keyboard(scenario.id, steps[0], False, False, False, back="admin_ev_page_1_1"),
+        event_admin_telegram._step_offset_picker_keyboard(scenario.id, f"admin_ev_steps_{scenario.id}_1_1"),
+        event_admin_telegram._step_edit_offset_picker_keyboard(steps[0].id),
+        event_admin_telegram._media_editor_keyboard(scenario.id, [
+            {"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform}
+            for item in media
+        ]),
+        event_admin_telegram._delivery_stats_keyboard(scenario.id, DeliveryStats(uncertain=1)),
+        event_admin_telegram._problem_deliveries_keyboard(scenario.id, [delivery_item], 0, 2),
+        event_admin_telegram._delivery_resolution_keyboard(delivery_item, [part_item]),
+        event_admin_telegram._test_send_picker_keyboard(scenario.id, steps, back="admin_ev_page_1_1"),
+        event_admin_telegram.InlineKeyboardBuilder().button(
+            text="Пропустить ссылку", callback_data="admin_ev_skip_meeting_link"
+        ).as_markup(),
+    ]
+    callbacks = list(dict.fromkeys(
+        callback for keyboard in keyboards for callback in _telegram_event_callbacks(keyboard)
+    ))
+    contracts = {callback: _event_callback_contract(callback) for callback in callbacks}
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_callbacks = {
+        router: [handler.callback for handler in router.callback_query.handlers]
+        for router in routers
+    }
+    original_parents = {router: router._parent_router for router in routers}
+    routed: list[str] = []
+
+    def wrap_handler(original):
+        @wraps(original)
+        async def wrapped(*args, **kwargs):
+            routed.append(original.__name__)
+            return await original(*args, **kwargs)
+
+        return wrapped
+
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        for handler in router.callback_query.handlers:
+            handler.callback = wrap_handler(handler.callback)
+        router._parent_router = None
+        dp.include_router(router)
+    state = FSMContext(storage=storage, key=StorageKey(bot_id=bot.id, chat_id=12345, user_id=12345))
+
+    async def prepare_state(callback: str) -> None:
+        await state.clear()
+        event_id = scenario.id
+        if callback == "admin_ev_skip_meeting_link":
+            await state.update_data(
+                create_event_type="meeting",
+                create_code="telegram_real_created",
+                create_title="Created from route",
+                create_starts_at=(datetime.utcnow() + timedelta(days=3)).isoformat(),
+                create_duration=120,
+                create_place="Room 1",
+            )
+            await state.set_state(event_admin_telegram.EventAdminStates.create_meeting_link)
+        elif callback.startswith("admin_ev_description_save_"):
+            await state.update_data(edit_event_id=event_id, description_draft="Updated description", event_list_back="admin_ev_page_1_1")
+            await state.set_state(event_admin_telegram.EventAdminStates.edit_description)
+        elif callback.startswith("admin_ev_media_"):
+            await state.update_data(
+                edit_event_id=event_id,
+                media_draft=[
+                    {"file_type": "photo", "file_id": "telegram-photo", "max_token": None, "source_platform": "telegram"},
+                    {"file_type": "video", "file_id": "telegram-video", "max_token": None, "source_platform": "telegram"},
+                ],
+                media_draft_dirty=True,
+                event_list_back="admin_ev_page_1_1",
+            )
+            await state.set_state(event_admin_telegram.EventAdminStates.edit_media)
+        elif callback.startswith("admin_ev_offset_"):
+            await state.update_data(step_event_id=event_id, event_list_back="admin_ev_page_1_1")
+        elif callback.startswith("admin_ev_step_edit_preset_"):
+            await state.update_data(edit_step_id=first_step.id, event_list_back="admin_ev_page_1_1")
+        elif callback.startswith("admin_ev_step_edit_custom_"):
+            await state.update_data(edit_step_id=first_step.id, event_list_back="admin_ev_page_1_1")
+
+    try:
+        for callback in callbacks:
+            await prepare_state(callback)
+            routed.clear()
+            methods = await _feed_callback(dp, bot, callback)
+            assert routed == [contracts[callback]["route"]], f"Unexpected real handler for {callback}: {routed}"
+            assert any(isinstance(method, (EditMessageText, SendMessage, AnswerCallbackQuery)) for method in methods), callback
+            expected_state = contracts[callback]["expected_state"]
+            if expected_state is not None and expected_state.startswith("EventAdminStates."):
+                assert await state.get_state() == getattr(event_admin_telegram.EventAdminStates, expected_state.rsplit(".", 1)[1]).state
+    finally:
+        for router in routers:
+            for handler, original in zip(router.callback_query.handlers, original_callbacks[router]):
+                handler.callback = original
+            router._parent_router = original_parents[router]
 
 
 @pytest.mark.asyncio

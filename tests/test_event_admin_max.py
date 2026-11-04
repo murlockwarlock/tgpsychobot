@@ -1,6 +1,8 @@
 import io
 import os
 import re
+import json
+from functools import wraps
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -16,6 +18,7 @@ from sqlalchemy import select
 from database import (
     Base,
     EventDelivery,
+    EventDeliveryPart,
     EventRegistration,
     EventScenario,
     EventScenarioMedia,
@@ -155,36 +158,55 @@ def _max_event_payloads(mock_client) -> list[str]:
 
 
 _MAX_EVENT_BUTTON_CONTRACTS = (
-    (re.compile(r"(?:admin_events|admin_panel|admin_ev_create_(?:webinar|meeting))"), "navigation", "events/list", "max.events.root"),
-    (re.compile(r"admin_ev_skip_meeting_link$"), "fsm", "events/create", "max.events.root"),
-    (re.compile(r"admin_ev_page_\d+_[01]$"), "navigation", "events/list", "max.events.pagination"),
-    (re.compile(r"admin_ev_toggle_archive_view_[01]$"), "navigation", "events/list", "max.events.pagination"),
-    (re.compile(r"admin_ev_open_\d+(?:_\d+_[01])?$"), "navigation", "events/card", "max.events.card"),
-    (re.compile(r"admin_ev_toggle_media_order_\d+$"), "mutation", "events/edit", "max.description-media"),
-    (re.compile(r"admin_ev_toggle_\d+$"), "mutation", "events/card", "max.events.card"),
-    (re.compile(r"admin_ev_stats_\d+$"), "navigation", "events/stats", "max.delivery.lifecycle"),
-    (re.compile(r"admin_ev_reschedule_\d+$"), "fsm", "events/reschedule", "max.events.card"),
-    (re.compile(r"admin_ev_edit_menu_\d+(?:_\d+_[01])?$"), "navigation", "events/edit", "max.events.edit"),
-    (re.compile(r"admin_ev_copy_\d+$"), "mutation", "events/copy", "max.events.card"),
-    (re.compile(r"admin_ev_test_send_menu_\d+$"), "navigation", "events/test-send", "max.delivery.test-send"),
-    (re.compile(r"admin_ev_archive_(?:ask|yes)_\d+$"), "destructive", "events/archive", "max.delivery.lifecycle"),
-    (re.compile(r"admin_ev_edit_(?:title|duration|link|place|description|media)_\d+$"), "fsm", "events/edit", "max.events.edit"),
-    (re.compile(r"admin_ev_description_(?:save|delete)_\d+$"), "mutation", "events/edit", "max.description-media"),
-    (re.compile(r"admin_ev_media_(?:add|save)_\d+$"), "mutation", "events/edit-media", "max.description-media"),
-    (re.compile(r"admin_ev_media_(?:remove|up|down)_\d+_\d+$"), "mutation", "events/edit-media", "max.description-media"),
-    (re.compile(r"admin_ev_steps_\d+(?:_\d+_[01])?$"), "navigation", "events/steps", "max.steps.roundtrip"),
-    (re.compile(r"admin_ev_step_add_\d+(?:_\d+_[01])?$"), "fsm", "events/steps", "max.steps.roundtrip"),
-    (re.compile(r"admin_ev_offset_preset_\d+_-?\d+$"), "fsm", "events/steps", "max.steps.roundtrip"),
-    (re.compile(r"admin_ev_offset_custom_\d+$"), "fsm", "events/steps", "max.steps.roundtrip"),
-    (re.compile(r"admin_ev_step_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "max.steps.roundtrip"),
-    (re.compile(r"admin_ev_step_(?:toggle_details|edit_text|edit_offset|up|down|del_ask|del_yes)_\d+(?:_\d+_[01])?$"), "mutation", "events/step", "max.steps.dispatcher"),
-    (re.compile(r"admin_ev_step_edit_preset_\d+_-?\d+(?:_\d+_[01])?$"), "fsm", "events/step", "max.steps.dispatcher"),
-    (re.compile(r"admin_ev_step_edit_custom_\d+(?:_\d+_[01])?$"), "fsm", "events/step", "max.steps.dispatcher"),
-    (re.compile(r"admin_ev_problems_\d+_\d+$"), "navigation", "events/problems", "max.delivery.lifecycle"),
-    (re.compile(r"admin_ev_problem_item_\d+$"), "navigation", "events/problem", "max.delivery.lifecycle"),
-    (re.compile(r"admin_ev_resolve_(?:force|sent|skipped)_\d+(?:_\d+)?$"), "fsm", "events/problem", "max.delivery.resolution"),
-    (re.compile(r"admin_ev_test_step_\d+(?:_\d+_[01])?$"), "external", "max/test-send", "max.delivery.test-send"),
-    (re.compile(r"admin_ev_do_test_send_\d+_\d+$"), "external", "max/test-send", "max.delivery.test-send"),
+    (re.compile(r"admin_events$"), "navigation", "events/list", "max.events.root", "show_scenarios", None),
+    (re.compile(r"admin_panel$"), "navigation", "admin/panel", "max.events.root", "show_admin_panel", None),
+    (re.compile(r"admin_ev_create_(?:webinar|meeting)$"), "navigation", "events/create", "max.events.root", "start_scenario_create", "max_event_create_code"),
+    (re.compile(r"admin_ev_skip_meeting_link$"), "mutation", "events/create", "max.events.root", "skip_meeting_link", None),
+    (re.compile(r"admin_ev_page_\d+_[01]$"), "navigation", "events/list", "max.events.pagination", "show_scenarios", None),
+    (re.compile(r"admin_ev_toggle_archive_view_[01]$"), "navigation", "events/list", "max.events.pagination", "show_scenarios", None),
+    (re.compile(r"admin_ev_open_\d+(?:_\d+_[01])?$"), "navigation", "events/card", "max.events.card", "show_scenario", "max_event_card"),
+    (re.compile(r"admin_ev_toggle_media_order_\d+$"), "mutation", "events/edit", "max.description-media", "toggle_media_order", None),
+    (re.compile(r"admin_ev_toggle_\d+$"), "mutation", "events/card", "max.events.card", "toggle_scenario", None),
+    (re.compile(r"admin_ev_stats_\d+$"), "navigation", "events/stats", "max.delivery.lifecycle", "show_stats", None),
+    (re.compile(r"admin_ev_reschedule_\d+$"), "mutation", "events/reschedule", "max.events.card", "start_reschedule", "max_event_reschedule_starts_at"),
+    (re.compile(r"admin_ev_edit_menu_\d+_\d+_[01]$"), "navigation", "events/edit", "max.events.edit", "show_edit_menu", "max_event_edit_menu"),
+    (re.compile(r"admin_ev_edit_menu_\d+$"), "navigation", "events/edit", "max.events.edit", "show_edit_menu", None),
+    (re.compile(r"admin_ev_copy_\d+$"), "navigation", "events/copy", "max.events.card", "start_copy", "max_event_copy_code"),
+    (re.compile(r"admin_ev_test_send_menu_\d+$"), "navigation", "events/test-send", "max.delivery.test-send", "show_test_send_menu", None),
+    (re.compile(r"admin_ev_archive_ask_\d+$"), "navigation", "events/archive", "max.delivery.lifecycle", "archive_scenario_ask", None),
+    (re.compile(r"admin_ev_archive_yes_\d+$"), "destructive", "events/archive", "max.delivery.lifecycle", "archive_scenario_confirm", None),
+    (re.compile(r"admin_ev_edit_title_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_title", "max_event_edit_title"),
+    (re.compile(r"admin_ev_edit_duration_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_duration", "max_event_edit_duration"),
+    (re.compile(r"admin_ev_edit_link_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_link", "max_event_edit_link"),
+    (re.compile(r"admin_ev_edit_place_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_place", "max_event_edit_place"),
+    (re.compile(r"admin_ev_edit_description_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_description", "max_event_edit_description"),
+    (re.compile(r"admin_ev_edit_media_\d+$"), "navigation", "events/edit-media", "max.description-media", "show_media_editor", "max_event_edit_media"),
+    (re.compile(r"admin_ev_description_save_\d+$"), "mutation", "events/edit", "max.description-media", "save_description", None),
+    (re.compile(r"admin_ev_description_delete_\d+$"), "destructive", "events/edit", "max.description-media", "delete_description", "max_event_edit_description"),
+    (re.compile(r"admin_ev_media_add_\d+$"), "navigation", "events/edit-media", "max.description-media", "start_add_media", "max_event_edit_media_add"),
+    (re.compile(r"admin_ev_media_save_\d+$"), "mutation", "events/edit-media", "max.description-media", "save_media", None),
+    (re.compile(r"admin_ev_media_remove_\d+_\d+$"), "destructive", "events/edit-media", "max.description-media", "mutate_media_draft", "max_event_edit_media"),
+    (re.compile(r"admin_ev_media_up_\d+_\d+$"), "mutation", "events/edit-media", "max.description-media", "mutate_media_draft", "max_event_edit_media"),
+    (re.compile(r"admin_ev_media_down_\d+_\d+$"), "mutation", "events/edit-media", "max.description-media", "mutate_media_draft", "max_event_edit_media"),
+    (re.compile(r"admin_ev_steps_\d+(?:_\d+_[01])?$"), "navigation", "events/steps", "max.steps.roundtrip", "show_steps", "max_event_steps_menu"),
+    (re.compile(r"admin_ev_step_add_\d+(?:_\d+_[01])?$"), "navigation", "events/steps", "max.steps.roundtrip", "start_step_add", "max_event_step_offset"),
+    (re.compile(r"admin_ev_offset_preset_\d+_-?\d+$"), "mutation", "events/steps", "max.steps.roundtrip", "select_step_offset_preset", "max_event_step_text"),
+    (re.compile(r"admin_ev_offset_custom_\d+$"), "navigation", "events/steps", "max.steps.roundtrip", "start_step_offset_custom", "max_event_step_offset_custom"),
+    (re.compile(r"admin_ev_step_toggle_details_\d+(?:_\d+_[01])?$"), "mutation", "events/step", "max.steps.dispatcher", "toggle_step_event_details", None),
+    (re.compile(r"admin_ev_step_edit_text_\d+(?:_\d+_[01])?$"), "mutation", "events/step", "max.steps.dispatcher", "start_edit_step_text", "max_event_step_edit_text"),
+    (re.compile(r"admin_ev_step_edit_offset_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "max.steps.dispatcher", "start_edit_step_offset", "max_event_step_edit_offset"),
+    (re.compile(r"admin_ev_step_up_\d+(?:_\d+_[01])?$"), "mutation", "events/step", "max.steps.dispatcher", "step_move_up", None),
+    (re.compile(r"admin_ev_step_down_\d+(?:_\d+_[01])?$"), "mutation", "events/step", "max.steps.dispatcher", "step_move_down", None),
+    (re.compile(r"admin_ev_step_del_ask_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "max.steps.dispatcher", "ask_delete_step", None),
+    (re.compile(r"admin_ev_step_del_yes_\d+(?:_\d+_[01])?$"), "destructive", "events/step", "max.steps.dispatcher", "confirm_delete_step", None),
+    (re.compile(r"admin_ev_step_edit_preset_\d+_-?\d+(?:_\d+_[01])?$"), "mutation", "events/step", "max.steps.dispatcher", "select_edit_step_offset_preset", None),
+    (re.compile(r"admin_ev_step_edit_custom_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "max.steps.dispatcher", "start_edit_step_offset_custom", "max_event_step_edit_offset_custom"),
+    (re.compile(r"admin_ev_step_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "max.steps.roundtrip", "show_step", None),
+    (re.compile(r"admin_ev_problems_\d+_\d+$"), "navigation", "events/problems", "max.delivery.lifecycle", "show_problems", None),
+    (re.compile(r"admin_ev_problem_item_\d+$"), "navigation", "events/problem", "max.delivery.lifecycle", "show_problem_detail", None),
+    (re.compile(r"admin_ev_resolve_(?:force|sent|skipped)_\d+(?:_\d+)?$"), "mutation", "events/problem", "max.delivery.resolution", "start_resolve", "max_event_resolve_reason"),
+    (re.compile(r"admin_ev_test_step_\d+(?:_\d+_[01])?$"), "external", "max/test-send", "max.delivery.test-send", "do_test_send", None),
+    (re.compile(r"admin_ev_do_test_send_\d+_\d+$"), "external", "max/test-send", "max.delivery.test-send", "do_test_send", None),
 )
 
 _MAX_EVENT_JOURNEY_COVERAGE = {
@@ -200,15 +222,84 @@ _MAX_EVENT_JOURNEY_COVERAGE = {
     "max.delivery.test-send",
 }
 
+_MAX_REAL_JOURNEY_TESTS = {
+    "max.events.root": (
+        "test_max_admin_list_and_card",
+        "test_max_webinar_creation_flow",
+        "test_max_meeting_creation_flow",
+    ),
+    "max.events.pagination": (
+        "test_max_pagination_callback_preserves_archive_filter",
+        "test_max_pagination_boundaries_for_scenarios_and_problems",
+    ),
+    "max.events.card": (
+        "test_max_admin_list_and_card",
+        "test_max_reschedule_and_copy_flow",
+        "test_max_callback_open_and_edit_preserve_page_context",
+    ),
+    "max.events.edit": (
+        "test_max_description_and_media_edit_routes",
+        "test_max_paginated_edit_roundtrip_and_delete_stays_draft",
+        "test_max_callback_open_and_edit_preserve_page_context",
+    ),
+    "max.description-media": (
+        "test_max_description_and_media_edit_routes",
+        "test_max_media_back_preserves_draft_and_cancel_state_is_clear",
+        "test_max_paginated_edit_roundtrip_and_delete_stays_draft",
+    ),
+    "max.steps.roundtrip": (
+        "test_max_dispatcher_steps_roundtrip_page_context",
+        "test_max_steps_management",
+    ),
+    "max.steps.dispatcher": (
+        "test_max_dispatcher_steps_roundtrip_page_context",
+        "test_max_dispatcher_delete_last_step_returns_empty_page",
+    ),
+    "max.delivery.lifecycle": (
+        "test_max_stats_and_resolution",
+        "test_max_dispatcher_delete_last_step_returns_empty_page",
+    ),
+    "max.delivery.resolution": (
+        "test_max_stats_and_resolution",
+    ),
+    "max.delivery.test-send": (
+        "test_max_test_send_to_self",
+        "test_max_test_send_uses_runtime_media_plan_without_delivery_rows",
+        "test_max_test_send_materializes_telegram_media_without_delivery_rows",
+    ),
+}
+
+_MAX_EXECUTED_JOURNEYS: set[str] = set()
+
+
+@pytest.fixture(autouse=True)
+def _record_max_real_journey(request):
+    for journey_id, test_names in _MAX_REAL_JOURNEY_TESTS.items():
+        if request.node.name in test_names:
+            _MAX_EXECUTED_JOURNEYS.add(journey_id)
+    yield
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _assert_max_real_journey_coverage(request):
+    yield
+    required_tests = {name for names in _MAX_REAL_JOURNEY_TESTS.values() for name in names}
+    selected_tests = {item.name for item in request.session.items}
+    if required_tests <= selected_tests:
+        assert _MAX_EXECUTED_JOURNEYS == _MAX_EVENT_JOURNEY_COVERAGE
+
 
 def _max_event_callback_contract(payload: str) -> dict[str, str]:
-    for pattern, classification, target, journey_id in _MAX_EVENT_BUTTON_CONTRACTS:
+    for pattern, classification, target, journey_id, route, expected_state in _MAX_EVENT_BUTTON_CONTRACTS:
         if pattern.fullmatch(payload):
             assert journey_id in _MAX_EVENT_JOURNEY_COVERAGE
+            assert classification in {"navigation", "mutation", "destructive", "external"}
             return {
                 "classification": classification,
                 "target": target,
                 "journey_id": journey_id,
+                "route": route,
+                "expected_state": expected_state,
             }
     raise AssertionError(f"Uncontracted event payload: {payload}")
 
@@ -352,8 +443,7 @@ async def test_max_visible_event_buttons_dispatch_through_application_contract(d
     await max_admin_events.show_problem_detail(render_client, chat_id=123, delivery_id=delivery.id)
     payloads = _max_event_payloads(render_client)
     assert payloads
-    for payload in payloads:
-        _max_event_callback_contract(payload)
+    contracts = {payload: _max_event_callback_contract(payload) for payload in payloads}
 
     import event_admin_service
     from max_messenger_bot import app as max_app_module
@@ -395,7 +485,7 @@ async def test_max_visible_event_buttons_dispatch_through_application_contract(d
     for name in service_names:
         mock = AsyncMock(side_effect=make_probe(name))
         monkeypatch.setattr(max_admin_events, name, mock)
-    admin_panel_mock = AsyncMock(side_effect=make_probe("admin_panel"))
+    admin_panel_mock = AsyncMock(side_effect=make_probe("show_admin_panel"))
     monkeypatch.setattr(max_app_module.admin_service, "show_admin_panel", admin_panel_mock)
 
     for payload in payloads:
@@ -412,8 +502,218 @@ async def test_max_visible_event_buttons_dispatch_through_application_contract(d
             )
         )
         assert result is None
-        assert len(routed) == 1, f"Visible payload selected {routed}: {payload}"
+        assert routed == [contracts[payload]["route"]], f"Visible payload selected {routed}: {payload}"
         assert client.send_message.called, payload
+
+
+@pytest.mark.asyncio
+async def test_max_visible_event_buttons_execute_real_application_journeys(db_session_maker, monkeypatch):
+    """Every changed visible payload executes its real MAX service route and state transition."""
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import add_step, create_scenario, get_scenario_summary, list_scenario_media, list_steps, replace_scenario_media
+
+    scenario = await create_scenario(
+        db_session_maker,
+        code="max_real_contract",
+        event_type="meeting",
+        title="MAX real contract",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        place="Room 1",
+    )
+    first_step = await add_step(db_session_maker, scenario.id, -1440, "First reminder")
+    second_step = await add_step(db_session_maker, scenario.id, -60, "Second reminder")
+    await replace_scenario_media(
+        db_session_maker,
+        scenario.id,
+        [
+            {"file_type": "photo", "file_id": "max-photo", "max_token": "max-photo", "source_platform": "max"},
+            {"file_type": "video", "file_id": "max-video", "max_token": "max-video", "source_platform": "max"},
+        ],
+    )
+    async with db_session_maker() as session:
+        user = User(id=40, first_name="Problem user")
+        session.add(user)
+        await session.flush()
+        registration = EventRegistration(event_id=scenario.id, user_id=user.id, status="started")
+        session.add(registration)
+        await session.flush()
+        delivery = EventDelivery(
+            event_id=scenario.id,
+            user_id=user.id,
+            registration_id=registration.id,
+            message_kind="immediate_confirmation",
+            delivery_key="max_real_contract_delivery",
+            due_at=utc_now(),
+            next_attempt_at=utc_now(),
+            platform="max",
+            status="uncertain",
+            attempt_count=1,
+            last_error="timeout",
+            content_version_snapshot=1,
+        )
+        session.add(delivery)
+        await session.flush()
+        part = EventDeliveryPart(
+            delivery_id=delivery.id,
+            part_index=0,
+            part_kind="media",
+            payload_json=json.dumps({"kind": "image", "token": "max-photo"}),
+            content_version=1,
+            status="uncertain",
+            attempt_count=1,
+            last_error="timeout",
+        )
+        session.add(part)
+        await session.commit()
+        delivery_id, part_id = delivery.id, part.id
+
+    scenario = await get_scenario_summary(db_session_maker, scenario.id)
+    assert scenario is not None
+    steps = await list_steps(db_session_maker, scenario.id, include_archived=False)
+    media = await list_scenario_media(db_session_maker, scenario.id)
+    delivery_item = DeliveryItem(
+        id=delivery_id,
+        event_id=scenario.id,
+        user_id=40,
+        user_display="Problem user",
+        message_kind="immediate_confirmation",
+        step_id=None,
+        status="uncertain",
+        due_at_msk="01.01.2030 11:00",
+        attempt_count=1,
+        last_error="timeout",
+        sent_or_finished_msk=None,
+        platform="max",
+        retry_index=0,
+        parent_delivery_id=None,
+    )
+    part_item = DeliveryPartItem(
+        id=part_id,
+        part_index=0,
+        part_kind="media",
+        status="uncertain",
+        attempt_count=1,
+        last_error="timeout",
+        external_message_id=None,
+    )
+    render_client = AsyncMock(spec=MaxApiClient)
+    render_states = MemoryStateStore()
+    await max_admin_events.show_scenarios(render_client, chat_id=123, page=0, include_archived=True)
+    await max_admin_events.show_scenario(render_client, chat_id=123, event_id=scenario.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_edit_menu(render_client, chat_id=123, event_id=scenario.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_media_editor(render_client, render_states, 123, 456, scenario.id)
+    await max_admin_events.show_steps(render_client, chat_id=123, event_id=scenario.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_step(render_client, chat_id=123, step_id=first_step.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_test_send_menu(render_client, chat_id=123, event_id=scenario.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_stats(render_client, chat_id=123, event_id=scenario.id)
+    await max_admin_events.show_problems(render_client, chat_id=123, event_id=scenario.id)
+    await max_admin_events.show_problem_detail(render_client, chat_id=123, delivery_id=delivery_id)
+    payloads = list(dict.fromkeys(_max_event_payloads(render_client)))
+    assert payloads
+    contracts = {payload: _max_event_callback_contract(payload) for payload in payloads}
+
+    from max_messenger_bot import app as max_app_module
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+    app = MaxBotApplication(client)
+    app.states = states
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    routed: list[str] = []
+    service_names = {
+        "show_scenarios", "show_scenario", "toggle_scenario", "toggle_media_order",
+        "archive_scenario_ask", "archive_scenario_confirm", "start_scenario_create",
+        "skip_meeting_link", "show_edit_menu", "start_edit_description", "save_description",
+        "delete_description", "show_media_editor", "start_add_media", "mutate_media_draft",
+        "save_media", "start_edit_title", "start_edit_duration", "start_edit_link",
+        "start_edit_place", "start_reschedule", "start_copy", "show_steps", "start_step_add",
+        "select_step_offset_preset", "start_step_offset_custom", "start_edit_step_text",
+        "toggle_step_event_details", "start_edit_step_offset", "select_edit_step_offset_preset",
+        "start_edit_step_offset_custom", "step_move_up", "step_move_down", "ask_delete_step",
+        "confirm_delete_step", "show_step", "show_stats", "show_problems", "show_problem_detail",
+        "start_resolve", "show_test_send_menu", "do_test_send",
+    }
+
+    def wrap_service(name: str, original):
+        @wraps(original)
+        async def wrapped(*args, **kwargs):
+            routed.append(name)
+            return await original(*args, **kwargs)
+
+        return wrapped
+
+    for name in service_names:
+        monkeypatch.setattr(max_admin_events, name, wrap_service(name, getattr(max_admin_events, name)))
+    monkeypatch.setattr(
+        max_app_module.admin_service,
+        "show_admin_panel",
+        wrap_service("show_admin_panel", max_app_module.admin_service.show_admin_panel),
+    )
+
+    async def prepare_state(payload: str) -> None:
+        await states.clear(456)
+        event_id = scenario.id
+        if payload == "admin_ev_skip_meeting_link":
+            await states.set(
+                456,
+                123,
+                "max_event_create_meeting_link",
+                {
+                    "create_event_type": "meeting",
+                    "create_code": "max_real_created",
+                    "create_title": "Created from route",
+                    "create_starts_at": (datetime.utcnow() + timedelta(days=3)).isoformat(),
+                    "create_duration": 120,
+                    "create_place": "Room 1",
+                },
+            )
+        elif payload.startswith("admin_ev_description_save_"):
+            await states.set(456, 123, "max_event_edit_description", {
+                "event_id": event_id,
+                "description_draft": "Updated description",
+                "event_list_back": "admin_ev_page_1_1",
+            })
+        elif payload.startswith("admin_ev_media_"):
+            await states.set(456, 123, "max_event_edit_media", {
+                "event_id": event_id,
+                "media_draft": [
+                    {"file_type": "photo", "file_id": "max-photo", "max_token": "max-photo", "source_platform": "max"},
+                    {"file_type": "video", "file_id": "max-video", "max_token": "max-video", "source_platform": "max"},
+                ],
+                "media_draft_dirty": True,
+                "event_list_back": "admin_ev_page_1_1",
+            })
+        elif payload.startswith("admin_ev_offset_"):
+            await states.set(456, 123, "max_event_step_offset", {"event_id": event_id, "event_list_back": "admin_ev_page_1_1"})
+        elif payload.startswith("admin_ev_step_edit_preset_") or payload.startswith("admin_ev_step_edit_custom_"):
+            await states.set(456, 123, "max_event_step_edit_offset", {"step_id": first_step.id, "event_list_back": "admin_ev_page_1_1"})
+
+    try:
+        for payload in payloads:
+            await prepare_state(payload)
+            routed.clear()
+            client.reset_mock()
+            result = await app._handle_callback_impl(
+                IncomingCallback(
+                    raw={},
+                    callback_id=f"real-{payload}",
+                    payload=payload,
+                    chat_id=123,
+                    message_id=None,
+                    sender=sender,
+                )
+            )
+            assert result is None
+            assert routed and routed[0] == contracts[payload]["route"], f"Unexpected real service for {payload}: {routed}"
+            assert client.send_message.called, payload
+            expected_state = contracts[payload]["expected_state"]
+            if expected_state is not None:
+                snapshot = await states.get(456)
+                assert snapshot is not None and snapshot.state == expected_state, payload
+    finally:
+        await states.clear(456)
 
 
 @pytest.mark.asyncio
