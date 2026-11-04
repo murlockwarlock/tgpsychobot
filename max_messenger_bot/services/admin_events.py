@@ -1564,6 +1564,7 @@ async def show_problems(
     event_id: int,
     page: int = 0,
 ) -> None:
+    page = max(0, page)
     items, total = await list_problem_deliveries(
         async_session_maker,
         event_id,
@@ -1571,7 +1572,15 @@ async def show_problems(
         offset=page * PROBLEMS_PAGE_SIZE,
     )
     total_pages = max(1, (total + PROBLEMS_PAGE_SIZE - 1) // PROBLEMS_PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
+    safe_page = min(page, total_pages - 1)
+    if safe_page != page:
+        page = safe_page
+        items, total = await list_problem_deliveries(
+            async_session_maker,
+            event_id,
+            limit=PROBLEMS_PAGE_SIZE,
+            offset=page * PROBLEMS_PAGE_SIZE,
+        )
 
     rows = []
     for it in items:
@@ -1729,6 +1738,7 @@ async def receive_resolve_reason(
     res_type = state_obj.data["res_type"]
     part_id = state_obj.data.get("part_id")
     problem_page = int(state_obj.data.get("problem_page", 0))
+    list_back = state_obj.data.get("event_list_back", "admin_events")
 
     try:
         deliv, ok = await resolve_uncertain_delivery(
@@ -1740,6 +1750,13 @@ async def receive_resolve_reason(
             part_id=part_id,
         )
         await states.clear(user_id)
+        if list_back != "admin_events":
+            await states.set(
+                user_id,
+                chat_id,
+                "max_event_card",
+                {"event_list_back": list_back, "problem_page": problem_page},
+            )
         await client.send_message(chat_id=chat_id, text=f"✅ Доставка ID {delivery_id} успешно разрешена ({deliv.status})!")
         await show_problem_detail(client, chat_id, delivery_id, problem_page=problem_page)
     except Exception as exc:

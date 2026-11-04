@@ -866,6 +866,109 @@ async def test_max_problem_delivery_page_roundtrip_uses_current_page(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_max_successful_resolution_reopens_clamped_page_and_event_context(db_session_maker, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+    from max_messenger_bot import app as max_app_module
+
+    scenarios = []
+    for index in range(max_admin_events.PAGE_SIZE + 1):
+        scenarios.append(
+            await create_scenario(
+                db_session_maker,
+                code=f"max_resolution_context_{index}",
+                event_type="meeting",
+                title=f"MAX resolution context {index}",
+                starts_at_utc=datetime.utcnow() + timedelta(days=2, minutes=index),
+                place="Room 1",
+            )
+        )
+    target = scenarios[0]
+    delivery_ids = []
+    async with db_session_maker() as session:
+        for index in range(max_admin_events.PROBLEMS_PAGE_SIZE + 1):
+            user = User(id=1200 + index, first_name=f"Problem {index}")
+            session.add(user)
+            await session.flush()
+            registration = EventRegistration(event_id=target.id, user_id=user.id, status="started")
+            session.add(registration)
+            await session.flush()
+            delivery = EventDelivery(
+                event_id=target.id,
+                user_id=user.id,
+                registration_id=registration.id,
+                message_kind="immediate_confirmation",
+                delivery_key=f"max_resolution_delivery_{index}",
+                due_at=datetime.utcnow(),
+                next_attempt_at=datetime.utcnow(),
+                platform="max",
+                status="uncertain",
+                attempt_count=1,
+                last_error="timeout",
+                content_version_snapshot=1,
+            )
+            session.add(delivery)
+            await session.flush()
+            delivery_ids.append(delivery.id)
+        await session.commit()
+
+    client = AsyncMock(spec=MaxApiClient)
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    async def feed(payload: str):
+        client.reset_mock()
+        await app._handle_callback_impl(
+            IncomingCallback(
+                raw={},
+                callback_id=f"resolution-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+
+    try:
+        await feed(f"admin_ev_open_{target.id}_1_1")
+        await feed(f"admin_ev_stats_{target.id}")
+        await feed(f"admin_ev_problems_{target.id}_1")
+        item_callback = next(payload for payload in _max_event_payloads(client) if payload.startswith("admin_ev_problem_item_"))
+        assert item_callback.endswith("_1")
+
+        await feed(item_callback)
+        resolve_callback = next(payload for payload in _max_event_payloads(client) if payload == f"admin_ev_resolve_sent_{delivery_ids[0]}")
+        await feed(resolve_callback)
+        client.reset_mock()
+        await app._handle_message_impl(
+            IncomingMessage(
+                raw={},
+                message_id="resolution-reason",
+                chat_id=123,
+                sender=sender,
+                text="Confirmed delivery",
+            )
+        )
+        assert f"admin_ev_problems_{target.id}_1" in _max_event_payloads(client)
+
+        await feed(f"admin_ev_problems_{target.id}_1")
+        assert "Проблемные доставки (5)" in client.send_message.call_args.kwargs["text"]
+        assert "Страница 1 из 1" in client.send_message.call_args.kwargs["text"]
+        assert "Проблемных доставок нет" not in client.send_message.call_args.kwargs["text"]
+
+        await feed(f"admin_ev_stats_{target.id}")
+        assert f"admin_ev_open_{target.id}_1_1" in _max_event_payloads(client)
+        await feed(f"admin_ev_open_{target.id}_1_1")
+        await feed("admin_ev_page_1_1")
+        assert "Страница 2 из 2" in client.send_message.call_args.kwargs["text"]
+        assert "admin_ev_toggle_archive_view_0" in _max_event_payloads(client)
+    finally:
+        await app.states.clear(456)
+
+
+@pytest.mark.asyncio
 async def test_max_pagination_boundaries_for_scenarios_and_problems(mock_client, monkeypatch):
     def scenario_rows(count: int) -> list[SimpleNamespace]:
         return [

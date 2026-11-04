@@ -1892,7 +1892,7 @@ async def show_delivery_stats(callback: CallbackQuery, state: FSMContext | None 
 async def show_problem_deliveries(callback: CallbackQuery) -> None:
     parts = callback.data.split("_")
     event_id = int(parts[3])
-    page = int(parts[4])
+    page = max(0, int(parts[4]))
 
     items, total = await list_problem_deliveries(
         async_session_maker,
@@ -1901,7 +1901,15 @@ async def show_problem_deliveries(callback: CallbackQuery) -> None:
         offset=page * PROBLEMS_PAGE_SIZE,
     )
     total_pages = max(1, (total + PROBLEMS_PAGE_SIZE - 1) // PROBLEMS_PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
+    safe_page = min(page, total_pages - 1)
+    if safe_page != page:
+        page = safe_page
+        items, total = await list_problem_deliveries(
+            async_session_maker,
+            event_id,
+            limit=PROBLEMS_PAGE_SIZE,
+            offset=page * PROBLEMS_PAGE_SIZE,
+        )
 
     text_lines = [
         f"⚠️ <b>Проблемные доставки ({total})</b>\n",
@@ -2031,6 +2039,8 @@ async def process_resolution_reason(message: Message, state: FSMContext) -> None
     delivery_id = data["res_delivery_id"]
     res_type = data["res_type"]
     part_id = data.get("res_part_id")
+    problem_page = int(data.get("res_problem_page", 0))
+    list_back = data.get("res_event_list_back", "admin_events")
     admin_id = message.from_user.id if message.from_user else 0
 
     try:
@@ -2043,6 +2053,7 @@ async def process_resolution_reason(message: Message, state: FSMContext) -> None
             part_id=part_id,
         )
         await state.clear()
+        await state.update_data(event_list_back=list_back, problem_page=problem_page)
         updated_item = await get_delivery_item(async_session_maker, delivery_id)
         assert updated_item is not None
 
@@ -2054,7 +2065,7 @@ async def process_resolution_reason(message: Message, state: FSMContext) -> None
             reply_markup=_delivery_resolution_keyboard(
                 updated_item,
                 updated_parts,
-                int(data.get("res_problem_page", 0)),
+                problem_page,
             ),
         )
     except Exception as exc:

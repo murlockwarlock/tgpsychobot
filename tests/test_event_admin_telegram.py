@@ -895,6 +895,106 @@ async def test_telegram_problem_delivery_page_roundtrip_uses_current_page(monkey
 
 
 @pytest.mark.asyncio
+async def test_telegram_successful_resolution_reopens_clamped_page_and_event_context(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    scenarios = []
+    for index in range(event_admin_telegram.SCENARIOS_PAGE_SIZE + 1):
+        scenarios.append(
+            await create_scenario(
+                db_session_maker,
+                code=f"telegram_resolution_context_{index}",
+                event_type="meeting",
+                title=f"Telegram resolution context {index}",
+                starts_at_utc=datetime.utcnow() + timedelta(days=2, minutes=index),
+                place="Room 1",
+            )
+        )
+    target = scenarios[0]
+    delivery_ids = []
+    async with db_session_maker() as session:
+        for index in range(event_admin_telegram.PROBLEMS_PAGE_SIZE + 1):
+            user = User(id=1100 + index, first_name=f"Problem {index}")
+            session.add(user)
+            await session.flush()
+            registration = EventRegistration(event_id=target.id, user_id=user.id, status="started")
+            session.add(registration)
+            await session.flush()
+            delivery = EventDelivery(
+                event_id=target.id,
+                user_id=user.id,
+                registration_id=registration.id,
+                message_kind="immediate_confirmation",
+                delivery_key=f"telegram_resolution_delivery_{index}",
+                due_at=utc_now(),
+                next_attempt_at=utc_now(),
+                platform="telegram",
+                status="uncertain",
+                attempt_count=1,
+                last_error="timeout",
+                content_version_snapshot=1,
+            )
+            session.add(delivery)
+            await session.flush()
+            delivery_ids.append(delivery.id)
+        await session.commit()
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {router: router._parent_router for router in routers}
+    for router in routers:
+        router._parent_router = None
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        dp.include_router(router)
+
+    def markup_callbacks(methods):
+        method = next(
+            method for method in methods
+            if isinstance(method, (EditMessageText, SendMessage)) and method.reply_markup is not None
+        )
+        return _telegram_event_callbacks(method.reply_markup)
+
+    try:
+        await _feed_callback(dp, bot, f"admin_ev_open_{target.id}_1_1")
+        methods = await _feed_callback(dp, bot, f"admin_ev_stats_{target.id}")
+        problem_root = next(callback for callback in markup_callbacks(methods) if callback.startswith(f"admin_ev_problems_{target.id}_"))
+
+        methods = await _feed_callback(dp, bot, f"admin_ev_problems_{target.id}_1")
+        item_callback = next(callback for callback in markup_callbacks(methods) if callback.startswith("admin_ev_problem_item_"))
+        assert item_callback.endswith("_1")
+
+        methods = await _feed_callback(dp, bot, item_callback)
+        resolve_callback = next(callback for callback in markup_callbacks(methods) if callback == f"admin_ev_resolve_sent_{delivery_ids[0]}")
+        await _feed_callback(dp, bot, resolve_callback)
+        methods = await _feed_message(dp, bot, "Confirmed delivery")
+        assert f"admin_ev_problems_{target.id}_1" in markup_callbacks(methods)
+
+        methods = await _feed_callback(dp, bot, f"admin_ev_problems_{target.id}_1")
+        list_edit = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "Проблемные доставки (5)" in list_edit.text
+        assert "Страница 1 из 1" in list_edit.text
+        assert "Проблемных доставок нет" not in list_edit.text
+
+        methods = await _feed_callback(dp, bot, f"admin_ev_stats_{target.id}")
+        assert f"admin_ev_open_{target.id}_1_1" in markup_callbacks(methods)
+        await _feed_callback(dp, bot, f"admin_ev_open_{target.id}_1_1")
+        methods = await _feed_callback(dp, bot, f"admin_ev_page_1_1")
+        list_edit = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 2 из 2" in list_edit.text
+        assert "admin_ev_toggle_archive_view_0" in markup_callbacks(methods)
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
 async def test_telegram_pagination_boundaries_for_scenarios_and_problems(monkeypatch):
     def scenario_rows(count: int) -> list[SimpleNamespace]:
         return [
