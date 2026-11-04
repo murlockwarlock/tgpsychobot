@@ -267,6 +267,33 @@ async def build_test_delivery_plan(
     return plan or [{"kind": "text", "text": text}]
 
 
+async def ensure_max_test_media_materialized(
+    session_maker: async_sessionmaker[AsyncSession],
+    event_id: int,
+    step_id: int | None,
+    max_client: MaxApiClient,
+) -> None:
+    """Prepare Telegram-origin event media before an admin MAX preview."""
+    async with session_maker() as session:
+        scenario = await session.scalar(
+            select(EventScenario)
+            .options(selectinload(EventScenario.media))
+            .where(EventScenario.id == event_id)
+        )
+        step = await session.get(EventStep, step_id) if step_id is not None else None
+    if scenario is None:
+        raise ValueError(f"Сценарий {event_id} не найден.")
+    if step_id is not None and not (step and step.include_event_details):
+        return
+    if not any(not media.max_token for media in (scenario.media or ())):
+        return
+    await materialize_event_scenario_media_from_telegram(
+        event_id,
+        max_client,
+        session_factory=session_maker,
+    )
+
+
 async def send_test_delivery_plan(
     plan: list[dict[str, Any]],
     *,

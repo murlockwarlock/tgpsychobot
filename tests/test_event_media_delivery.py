@@ -24,6 +24,8 @@ from event_delivery_worker import (
     set_runtime_max_client,
 )
 from event_service import (
+    DEFAULT_ADAPTIVE_CONFIRMATION_TEMPLATE,
+    DEFAULT_LIVE_TEMPLATE,
     handle_event_callback_max,
     handle_event_callback_telegram,
     handle_event_start_max,
@@ -31,6 +33,7 @@ from event_service import (
     cancel_event_registration,
     register_user_for_event,
     render_event_message,
+    render_event_template,
 )
 
 
@@ -95,6 +98,143 @@ async def _create_unregistered_media_event(session_factory, *, user_id: int, cod
         ])
         await session.commit()
     return now, scenario.id
+
+
+async def _create_meeting_event(session_factory, *, user_id: int, code: str, starts_in_minutes: int = 10):
+    now = datetime.utcnow()
+    async with session_factory() as session:
+        session.add(User(id=user_id, first_name="Участник встречи"))
+        scenario = EventScenario(
+            code=code,
+            event_type="meeting",
+            title="Очная встреча",
+            starts_at=now + timedelta(minutes=starts_in_minutes),
+            duration_minutes=120,
+            place="Москва, ул. Тверская, 7, зал 3",
+            link=None,
+            is_active=True,
+            is_archived=False,
+        )
+        session.add(scenario)
+        await session.commit()
+    return now, scenario.id
+
+
+@pytest.mark.asyncio
+async def test_meeting_default_templates_render_place_instead_of_empty_link(session_factory):
+    now, event_id = await _create_meeting_event(session_factory, user_id=9210, code="meeting_template_place")
+    async with session_factory() as session:
+        scenario = await session.get(EventScenario, event_id)
+
+    for template in (DEFAULT_ADAPTIVE_CONFIRMATION_TEMPLATE, DEFAULT_LIVE_TEMPLATE):
+        rendered = render_event_template(template, scenario, now=now)
+        assert "Москва, ул. Тверская, 7, зал 3" in rendered
+        assert "Ссылка для входа:" not in rendered
+        assert "Ссылка для подключения:" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_telegram_late_meeting_registration_sends_place(session_factory):
+    now, event_id = await _create_meeting_event(session_factory, user_id=9211, code="meeting_late_telegram")
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=81))
+
+    assert await handle_event_start_telegram(
+        bot,
+        chat_id=9211,
+        user_id=9211,
+        start_arg="meeting_late_telegram",
+        session_maker=session_factory,
+        now=now,
+    ) is True
+
+    texts = [call.kwargs["text"] for call in bot.send_message.call_args_list]
+    assert any("Москва, ул. Тверская, 7, зал 3" in text for text in texts)
+    assert all("Ссылка для входа:" not in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_max_late_meeting_registration_sends_place(session_factory):
+    user_id = 1000000009212
+    now, event_id = await _create_meeting_event(session_factory, user_id=user_id, code="meeting_late_max")
+    client = MagicMock()
+    client.send_message = AsyncMock(return_value={"message_id": "max-meeting-place"})
+
+    assert await handle_event_start_max(
+        client,
+        chat_id=user_id,
+        user_id=user_id,
+        start_payload="meeting_late_max",
+        session_maker=session_factory,
+        now=now,
+    ) is True
+
+    text = client.send_message.call_args.kwargs["text"]
+    assert "Москва, ул. Тверская, 7, зал 3" in text
+    assert "Ссылка для входа:" not in text
+
+
+@pytest.mark.asyncio
+async def test_telegram_adaptive_meeting_confirmation_sends_place(session_factory):
+    now, event_id = await _create_meeting_event(
+        session_factory,
+        user_id=9213,
+        code="meeting_adaptive_telegram",
+        starts_in_minutes=20,
+    )
+    result = await register_user_for_event(
+        session_factory,
+        9213,
+        "meeting_adaptive_telegram",
+        platform="telegram",
+        now=now,
+    )
+    adaptive_now = now + timedelta(minutes=6)
+    claimed = await claim_pending_deliveries(session_factory, now=adaptive_now)
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=82))
+
+    assert await process_single_delivery(
+        session_factory,
+        result.immediate_delivery.id,
+        claimed[0][1],
+        bot=bot,
+        now=adaptive_now,
+    ) == "sent"
+    assert "Москва, ул. Тверская, 7, зал 3" in bot.send_message.call_args.kwargs["text"]
+    assert "Ссылка для входа:" not in bot.send_message.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_max_adaptive_meeting_confirmation_sends_place(session_factory):
+    user_id = 1000000009214
+    now, event_id = await _create_meeting_event(
+        session_factory,
+        user_id=user_id,
+        code="meeting_adaptive_max",
+        starts_in_minutes=20,
+    )
+    result = await register_user_for_event(
+        session_factory,
+        user_id,
+        "meeting_adaptive_max",
+        platform="max",
+        now=now,
+    )
+    adaptive_now = now + timedelta(minutes=6)
+    claimed = await claim_pending_deliveries(session_factory, now=adaptive_now)
+    client = MagicMock()
+    client.send_message = AsyncMock(return_value={"message_id": "max-adaptive-place"})
+
+    assert await process_single_delivery(
+        session_factory,
+        result.immediate_delivery.id,
+        claimed[0][1],
+        max_client=client,
+        now=adaptive_now,
+    ) == "sent"
+    assert "Москва, ул. Тверская, 7, зал 3" in client.send_message.call_args.kwargs["text"]
+    assert "Ссылка для входа:" not in client.send_message.call_args.kwargs["text"]
 
 
 @pytest.mark.asyncio

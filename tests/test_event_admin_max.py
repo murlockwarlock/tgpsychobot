@@ -1,3 +1,4 @@
+import io
 import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
 from max_messenger_bot.services import admin_events as max_admin_events
 from max_messenger_bot.storage import StateStore
 from time_helpers import utc_now
+from event_admin_service import DeliveryItem, DeliveryStats
 
 
 @pytest_asyncio.fixture
@@ -138,6 +140,182 @@ async def test_max_pagination_callback_preserves_archive_filter(mock_client, mon
     buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
     callbacks = [button["payload"] for row in buttons for button in row if "payload" in button]
     assert "admin_ev_page_1_1" in callbacks
+
+
+def _max_event_payloads(mock_client) -> list[str]:
+    payloads = []
+    for call in mock_client.send_message.call_args_list:
+        for attachment in call.kwargs.get("attachments") or []:
+            if attachment.get("type") != "inline_keyboard":
+                continue
+            for row in attachment["payload"]["buttons"]:
+                payloads.extend(button["payload"] for button in row if "payload" in button)
+    return payloads
+
+
+def _assert_max_event_callback_contract(payloads: list[str]) -> None:
+    exact = {
+        "admin_events",
+        "admin_panel",
+        "admin_ev_create_webinar",
+        "admin_ev_create_meeting",
+    }
+    prefixes = (
+        "admin_ev_page_",
+        "admin_ev_toggle_archive_view_",
+        "admin_ev_open_",
+        "admin_ev_toggle_",
+        "admin_ev_steps_",
+        "admin_ev_stats_",
+        "admin_ev_reschedule_",
+        "admin_ev_edit_menu_",
+        "admin_ev_copy_",
+        "admin_ev_test_send_menu_",
+        "admin_ev_archive_",
+        "admin_ev_edit_",
+        "admin_ev_media_",
+        "admin_ev_description_",
+        "admin_ev_toggle_media_order_",
+        "admin_ev_step_",
+        "admin_ev_offset_",
+        "admin_ev_problems_",
+        "admin_ev_problem_item_",
+        "admin_ev_resolve_",
+        "admin_ev_test_step_",
+        "admin_ev_do_test_send_",
+    )
+    for payload in payloads:
+        assert payload in exact or payload.startswith(prefixes), f"Unclassified event payload: {payload}"
+
+
+@pytest.mark.asyncio
+async def test_max_event_visible_button_contract_covers_changed_screens(
+    db_session_maker, mock_client, states, monkeypatch
+):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import add_step, create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_visible_button_contract",
+        event_type="meeting",
+        title="MAX visible buttons",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        place="Room 1",
+    )
+    step = await add_step(db_session_maker, scen.id, -60, "Reminder", include_event_details=True)
+    mock_client.send_message.reset_mock()
+    await max_admin_events.show_scenarios(mock_client, chat_id=123, page=0, include_archived=True)
+    await max_admin_events.show_scenario(mock_client, chat_id=123, event_id=scen.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_edit_menu(mock_client, chat_id=123, event_id=scen.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_media_editor(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.start_edit_description(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.show_steps(mock_client, chat_id=123, event_id=scen.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_step(mock_client, chat_id=123, step_id=step.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_test_send_menu(mock_client, chat_id=123, event_id=scen.id, back="admin_ev_page_1_1")
+    monkeypatch.setattr(
+        max_admin_events,
+        "get_scenario_delivery_stats",
+        AsyncMock(return_value=DeliveryStats(uncertain=1)),
+    )
+    await max_admin_events.show_stats(mock_client, chat_id=123, event_id=scen.id)
+    problem = DeliveryItem(
+        id=900,
+        event_id=scen.id,
+        user_id=901,
+        user_display="Problem user",
+        message_kind="immediate_confirmation",
+        step_id=None,
+        status="uncertain",
+        due_at_msk="01.01.2030 12:00",
+        attempt_count=1,
+        last_error="timeout",
+        sent_or_finished_msk=None,
+        platform="max",
+        retry_index=0,
+        parent_delivery_id=None,
+    )
+    monkeypatch.setattr(max_admin_events, "list_problem_deliveries", AsyncMock(return_value=([problem], 1)))
+    await max_admin_events.show_problems(mock_client, chat_id=123, event_id=scen.id)
+
+    payloads = _max_event_payloads(mock_client)
+    _assert_max_event_callback_contract(payloads)
+    assert f"admin_ev_edit_description_{scen.id}" in payloads
+    assert f"admin_ev_media_save_{scen.id}" in payloads
+    assert f"admin_ev_step_edit_text_{step.id}_1_1" in payloads
+    assert f"admin_ev_test_send_menu_{scen.id}" in payloads
+    assert f"admin_ev_problems_{scen.id}_0" in payloads
+
+
+@pytest.mark.asyncio
+async def test_max_pagination_boundaries_for_scenarios_and_problems(mock_client, monkeypatch):
+    def scenario_rows(count: int) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                id=index + 1,
+                title=f"Event {index + 1}",
+                starts_at_msk="01.01.2030 12:00",
+                code=f"event_{index + 1}",
+                event_type="webinar",
+                is_archived=False,
+                is_active=True,
+                registrations_count=0,
+            )
+            for index in range(count)
+        ]
+
+    for count in (0, 1, max_admin_events.PAGE_SIZE, max_admin_events.PAGE_SIZE + 1):
+        monkeypatch.setattr(max_admin_events, "list_scenarios", AsyncMock(return_value=scenario_rows(count)))
+        mock_client.send_message.reset_mock()
+        await max_admin_events.show_scenarios(mock_client, chat_id=123, page=0, include_archived=True)
+        payloads = _max_event_payloads(mock_client)
+        assert ("admin_ev_page_1_1" in payloads) is (count > max_admin_events.PAGE_SIZE)
+        assert "admin_ev_page_0_1" not in payloads
+        if count > max_admin_events.PAGE_SIZE:
+            mock_client.send_message.reset_mock()
+            await max_admin_events.show_scenarios(mock_client, chat_id=123, page=1, include_archived=True)
+            payloads = _max_event_payloads(mock_client)
+            assert "admin_ev_page_0_1" in payloads
+            assert "admin_ev_page_2_1" not in payloads
+
+    def problem_rows(count: int) -> list[DeliveryItem]:
+        return [
+            DeliveryItem(
+                id=index + 1,
+                event_id=10,
+                user_id=100 + index,
+                user_display=f"User {index + 1}",
+                message_kind="immediate_confirmation",
+                step_id=None,
+                status="failed",
+                due_at_msk="01.01.2030 12:00",
+                attempt_count=1,
+                last_error="failure",
+                sent_or_finished_msk=None,
+                platform="max",
+                retry_index=0,
+                parent_delivery_id=None,
+            )
+            for index in range(count)
+        ]
+
+    for count in (0, 1, max_admin_events.PROBLEMS_PAGE_SIZE, max_admin_events.PROBLEMS_PAGE_SIZE + 1):
+        async def fake_list_problem_deliveries(session_maker, event_id, *, limit, offset, _count=count):
+            rows = problem_rows(_count)
+            return rows[offset : offset + limit], _count
+
+        monkeypatch.setattr(max_admin_events, "list_problem_deliveries", fake_list_problem_deliveries)
+        mock_client.send_message.reset_mock()
+        await max_admin_events.show_problems(mock_client, chat_id=123, event_id=10, page=0)
+        payloads = _max_event_payloads(mock_client)
+        assert ("admin_ev_problems_10_1" in payloads) is (count > max_admin_events.PROBLEMS_PAGE_SIZE)
+        assert "admin_ev_problems_10_0" not in payloads
+        if count > max_admin_events.PROBLEMS_PAGE_SIZE:
+            mock_client.send_message.reset_mock()
+            await max_admin_events.show_problems(mock_client, chat_id=123, event_id=10, page=1)
+            payloads = _max_event_payloads(mock_client)
+            assert "admin_ev_problems_10_0" in payloads
+            assert "admin_ev_problems_10_2" not in payloads
 
 
 @pytest.mark.asyncio
@@ -797,6 +975,122 @@ async def test_max_test_send_uses_runtime_media_plan_without_delivery_rows(db_se
     text_call = mock_client.send_message.call_args_list[1].kwargs
     assert any(item.get("type") == "image" for item in media_call["attachments"])
     assert "Напоминание MAX Test Media" in text_call["text"]
+    async with db_session_maker() as session:
+        assert (await session.execute(select(EventDelivery))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_max_test_send_materializes_telegram_media_without_delivery_rows(
+    db_session_maker, mock_client, monkeypatch
+):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+
+    from event_admin_service import add_step, create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_test_send_telegram_media",
+        event_type="webinar",
+        title="MAX Telegram Media",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://max.example/telegram-media",
+        description="Описание после Telegram-загрузки",
+    )
+    async with db_session_maker() as session:
+        session.add_all(
+            [
+                EventScenarioMedia(
+                    event_id=scen.id,
+                    file_type="photo",
+                    file_id="telegram-photo",
+                    source_platform="telegram",
+                    sort_order=0,
+                ),
+                EventScenarioMedia(
+                    event_id=scen.id,
+                    file_type="video",
+                    file_id="telegram-video",
+                    source_platform="telegram",
+                    sort_order=1,
+                ),
+            ]
+        )
+        await session.commit()
+    step = await add_step(
+        db_session_maker,
+        scen.id,
+        -120,
+        "Напоминание {event_title}",
+        include_event_details=True,
+    )
+
+    class FakeTelegramBot:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get_file(self, file_id):
+            return SimpleNamespace(file_path=f"{file_id}.bin")
+
+        async def download_file(self, file_path):
+            return io.BytesIO(file_path.encode())
+
+    monkeypatch.setattr("telegram_client.create_telegram_bot", lambda token: FakeTelegramBot())
+    mock_client.upload_file = AsyncMock(side_effect=[{"token": "max-photo-token"}, {"token": "max-video-token"}])
+    mock_client.send_message.reset_mock()
+
+    await max_admin_events.do_test_send(
+        mock_client,
+        chat_id=123,
+        user_id=456,
+        event_id=scen.id,
+        step_id=step.id,
+    )
+
+    assert mock_client.upload_file.await_count == 2
+    assert mock_client.send_message.await_count == 2
+    media_payload = mock_client.send_message.call_args_list[0].kwargs
+    assert {item["type"] for item in media_payload["attachments"]} >= {"image", "video"}
+    assert {item["payload"]["token"] for item in media_payload["attachments"] if item["type"] in {"image", "video"}} == {
+        "max-photo-token",
+        "max-video-token",
+    }
+    async with db_session_maker() as session:
+        assert (await session.execute(select(EventDelivery))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_max_test_send_reports_media_materialization_error(db_session_maker, mock_client, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+    from event_media import EventMediaMaterializationError
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_test_send_materialization_error",
+        event_type="webinar",
+        title="MAX materialization error",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://max.example/materialization-error",
+    )
+    monkeypatch.setattr(
+        "event_delivery_worker.ensure_max_test_media_materialized",
+        AsyncMock(side_effect=EventMediaMaterializationError("Telegram media unavailable")),
+    )
+    mock_client.send_message.reset_mock()
+
+    await max_admin_events.do_test_send(
+        mock_client,
+        chat_id=123,
+        user_id=456,
+        event_id=scen.id,
+        step_id=None,
+    )
+
+    assert mock_client.send_message.await_count == 1
+    assert "Не удалось подготовить медиа" in mock_client.send_message.call_args.kwargs["text"]
     async with db_session_maker() as session:
         assert (await session.execute(select(EventDelivery))).scalars().all() == []
 

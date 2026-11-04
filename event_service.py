@@ -503,12 +503,12 @@ DEFAULT_CONFIRMATION_TEMPLATE = (
 DEFAULT_ADAPTIVE_CONFIRMATION_TEMPLATE = (
     "Вы успешно зарегистрированы на мероприятие «{event_title}»!\n\n"
     "Мероприятие скоро начнётся или уже в эфире!\n"
-    "🔗 Ссылка для подключения: {link}"
+    "{link_or_place_icon} {link_or_place_label}: {link_or_place}"
 )
 
 DEFAULT_LIVE_TEMPLATE = (
     "Мероприятие «{event_title}» скоро начнётся / уже в эфире!\n\n"
-    "🔗 Ваша ссылка для входа: {link}"
+    "{link_or_place_icon} {link_or_place_label}: {link_or_place}"
 )
 
 DEFAULT_RESCHEDULE_TEMPLATE = (
@@ -551,7 +551,9 @@ def render_event_template(
         link_val = ""
 
     place_val = (scenario.place or "").strip()
-    link_or_place_val = (scenario.link or scenario.place or "").strip()
+    link_or_place_val = link_val or place_val
+    link_or_place_icon = "🔗" if link_val else "📍"
+    link_or_place_label = "Ссылка для подключения" if link_val else "Место встречи"
     date_val = format_msk(scenario.starts_at, "%d.%m.%Y")
     time_val = format_msk(scenario.starts_at, "%H:%M")
 
@@ -573,6 +575,8 @@ def render_event_template(
         "description": description_val,
         "link": html.escape(link_val, quote=True),
         "link_or_place": html.escape(link_or_place_val, quote=True),
+        "link_or_place_icon": link_or_place_icon,
+        "link_or_place_label": link_or_place_label,
         "place": html.escape(place_val, quote=False),
     }
 

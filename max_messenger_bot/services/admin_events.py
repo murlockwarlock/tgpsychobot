@@ -1735,7 +1735,27 @@ async def do_test_send(
     async with async_session_maker() as session:
         admin_user = await session.get(User, user_id)
 
-    from event_delivery_worker import build_test_delivery_plan, send_test_delivery_plan
+    from event_delivery_worker import (
+        build_test_delivery_plan,
+        ensure_max_test_media_materialized,
+        send_test_delivery_plan,
+    )
+    from event_media import EventMediaMaterializationError
+
+    try:
+        await ensure_max_test_media_materialized(
+            async_session_maker,
+            event_id,
+            step_id,
+            client,
+        )
+    except EventMediaMaterializationError as exc:
+        log.exception("MAX test-send media materialization failed for event=%s", event_id)
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"❌ Не удалось подготовить медиа для тестовой отправки в MAX: {exc}",
+        )
+        return
 
     plan = await build_test_delivery_plan(
         async_session_maker,
