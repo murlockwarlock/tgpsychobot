@@ -20,7 +20,7 @@ import logging
 import re
 import secrets
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -76,6 +76,16 @@ log = logging.getLogger(__name__)
 # Global platform cooldown trackers (MSK / UTC naive)
 _telegram_rate_limited_until: datetime | None = None
 _max_rate_limited_until: datetime | None = None
+_runtime_max_client: MaxApiClient | None = None
+
+
+def set_runtime_max_client(client: MaxApiClient | None) -> None:
+    global _runtime_max_client
+    _runtime_max_client = client
+
+
+def get_runtime_max_client() -> MaxApiClient | None:
+    return _runtime_max_client
 
 
 def get_telegram_cooldown() -> datetime | None:
@@ -218,6 +228,72 @@ def _build_delivery_plan(
     if media and (not text_chunks or scenario.media_order == "text_top"):
         plan.append({"kind": "control", "text": ""})
     return plan
+
+
+async def build_test_delivery_plan(
+    session_maker: async_sessionmaker[AsyncSession],
+    event_id: int,
+    step_id: int | None,
+    admin_user: Any,
+    *,
+    header: str = "",
+) -> list[dict[str, Any]]:
+    """Build the same text/media sequence as runtime delivery without creating a delivery row."""
+    from event_admin_service import render_test_step
+
+    rendered = await render_test_step(
+        session_maker,
+        event_id=event_id,
+        step_id=step_id,
+        admin_user=admin_user,
+    )
+    async with session_maker() as session:
+        scenario = await session.scalar(
+            select(EventScenario)
+            .options(selectinload(EventScenario.media))
+            .where(EventScenario.id == event_id)
+        )
+        step = await session.get(EventStep, step_id) if step_id is not None else None
+    if scenario is None:
+        raise ValueError(f"Сценарий {event_id} не найден.")
+    include_media = step_id is None or bool(step and step.include_event_details)
+    text = f"{header}\n\n{rendered}" if header else rendered
+    plan = _build_delivery_plan(
+        scenario,
+        event_id,
+        text,
+        include_media=include_media,
+    )
+    return plan or [{"kind": "text", "text": text}]
+
+
+async def send_test_delivery_plan(
+    plan: list[dict[str, Any]],
+    *,
+    platform: str,
+    user_id: int,
+    event_id: int,
+    bot: Bot | None = None,
+    max_client: MaxApiClient | None = None,
+) -> list[str | None]:
+    """Send an admin-only preview using runtime render/segmentation/media ordering."""
+    max_client = max_client or get_runtime_max_client()
+    sent_ids: list[str | None] = []
+    preview_parts = [payload for payload in plan if payload.get("kind") != "control"]
+    for index, payload in enumerate(preview_parts):
+        sent_ids.append(
+            await _send_delivery_part(
+                payload,
+                platform=platform,
+                user_id=user_id,
+                event_id=event_id,
+                is_last=index == len(plan) - 1,
+                bot=bot,
+                max_client=max_client,
+                include_controls=False,
+            )
+        )
+    return sent_ids
 
 
 async def _ensure_delivery_parts(
@@ -464,6 +540,7 @@ async def _send_delivery_part(
     is_last: bool,
     bot: Bot | None,
     max_client: MaxApiClient | None,
+    include_controls: bool = True,
 ) -> str | None:
     if platform == "telegram":
         if bot is None:
@@ -492,7 +569,7 @@ async def _send_delivery_part(
 
         markup = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Не смогу прийти", callback_data=f"ev_cancel:{event_id}")]]
-        ) if is_last else None
+        ) if is_last and include_controls else None
         kind = payload.get("kind")
         if kind == "text" or kind == "control":
             message = await bot.send_message(
@@ -533,7 +610,7 @@ async def _send_delivery_part(
     if platform == "max":
         if max_client is None:
             raise PreTransmissionError("MAX client transport is not configured")
-        markup = inline_keyboard([[callback_button("❌ Не смогу прийти", f"ev_cancel:{event_id}")]]) if is_last else []
+        markup = inline_keyboard([[callback_button("❌ Не смогу прийти", f"ev_cancel:{event_id}")]]) if is_last and include_controls else []
         kind = payload.get("kind")
         if kind in {"media", "media_caption"}:
             attachments = []
@@ -547,13 +624,13 @@ async def _send_delivery_part(
                 })
             text = payload.get("caption") or " "
             response = await max_client.send_message(
-                user_id=raw_max_user_id(user_id),
+                user_id=raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id,
                 text=text,
                 attachments=attachments + markup,
             )
         else:
             response = await max_client.send_message(
-                user_id=raw_max_user_id(user_id),
+                user_id=raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id,
                 text=payload.get("text") or "Управление мероприятием:",
                 attachments=markup,
             )
@@ -873,13 +950,18 @@ async def process_single_delivery(
     bot: Bot | None = None,
     max_client: MaxApiClient | None = None,
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> str:
     """
     Executes the pre-send protocol and dispatches network send for a single claimed delivery.
 
     Returns the resulting status string.
     """
-    effective_now = now or datetime.utcnow()
+    def current_time() -> datetime:
+        return clock() if clock is not None else (now or datetime.utcnow())
+
+    max_client = max_client or get_runtime_max_client()
+    effective_now = current_time()
 
     # Step 1: Read delivery and relation context without locks
     async with session_maker() as session:
@@ -933,15 +1015,15 @@ async def process_single_delivery(
         content_version = scenario.content_version
 
     # Step 1.5: Platform cooldown check before Point of No Return
-    current_time = now or datetime.utcnow()
+    current_time_value = current_time()
     cooldown_until: datetime | None = None
     if platform == "telegram":
         tg_cd = get_telegram_cooldown()
-        if tg_cd and tg_cd > current_time:
+        if tg_cd and tg_cd > current_time_value:
             cooldown_until = tg_cd
     elif platform == "max":
         max_cd = get_max_cooldown()
-        if max_cd and max_cd > current_time:
+        if max_cd and max_cd > current_time_value:
             cooldown_until = max_cd
 
     if cooldown_until is not None:
@@ -960,7 +1042,7 @@ async def process_single_delivery(
                     lease_until=None,
                     send_started_at=None,
                     next_attempt_at=cooldown_until,
-                    updated_at=current_time,
+                    updated_at=current_time_value,
                 )
             )
             await session.execute(revert_stmt)
@@ -972,6 +1054,7 @@ async def process_single_delivery(
         return f"cooldown_reverted:{platform}"
 
     # Step 2: Pre-send lock and CAS validation (Point of No Return inside)
+    prepare_now = current_time() if (clock is not None or now is not None) else None
     ok, locked_delivery, skip_reason = await prepare_and_lock_delivery_for_sending(
         session_maker,
         delivery_id=delivery_id,
@@ -980,7 +1063,7 @@ async def process_single_delivery(
         expected_step_version=expected_step_version,
         rendered_text=rendered_text,
         template_text=template,
-        now=now,
+        now=prepare_now,
     )
     if not ok:
         log.info("Pre-send rejected delivery %s: reason=%s", delivery_id, skip_reason)
@@ -1033,7 +1116,7 @@ async def process_single_delivery(
         expected_step_version = step.step_version if step else None
         content_version = scenario.content_version
 
-    send_started = now or datetime.utcnow()
+    send_started = current_time()
     if platform == "max" and any(not media.max_token for media in getattr(scenario, "media", ()) or ()):
         try:
             if max_client is None:
@@ -1147,13 +1230,14 @@ async def process_single_delivery(
                     now=now,
                 )
                 return "uncertain"
+            part_now = current_time()
             part_token, claim_rejection = await _claim_delivery_part(
                 session_maker,
                 delivery_id,
                 part.id,
                 claim_token,
                 content_version,
-                send_started,
+                part_now,
             )
             if not part_token:
                 if claim_rejection:
@@ -1176,7 +1260,7 @@ async def process_single_delivery(
                     part.id,
                     part_token,
                     "sent",
-                    now=send_started,
+                    now=current_time(),
                     external_message_id=external_id,
                 )
                 if not part_finished:
@@ -1563,12 +1647,14 @@ async def dispatch_immediate_delivery(
     bot: Bot | None = None,
     max_client: MaxApiClient | None = None,
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> str | None:
     """
     Attempts to atomically claim and dispatch a specific pending delivery immediately
     using the durable delivery worker protocol.
     """
-    effective_now = now or datetime.utcnow()
+    max_client = max_client or get_runtime_max_client()
+    effective_now = clock() if clock is not None else (now or datetime.utcnow())
     token = secrets.token_hex(16)
     lease_until = effective_now + timedelta(seconds=60)
 
@@ -1625,5 +1711,6 @@ async def dispatch_immediate_delivery(
         bot=bot,
         max_client=max_client,
         now=now,
+        clock=clock,
     )
 

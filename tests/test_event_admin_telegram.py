@@ -161,6 +161,114 @@ async def test_telegram_pagination_preserves_archive_filter(db_session_maker, mo
 
 
 @pytest.mark.asyncio
+async def test_telegram_steps_roundtrip_preserves_paginated_back_callbacks(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    from event_admin_service import add_step, create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_steps_back",
+        event_type="webinar",
+        title="Telegram steps back",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/steps-back",
+    )
+    step = await add_step(db_session_maker, scen.id, -60, "Шаг")
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
+
+    await event_admin_telegram.open_scenario_card(_make_callback(f"admin_ev_open_{scen.id}_2_1"), state)
+    callback = _make_callback(f"admin_ev_steps_{scen.id}_2_1")
+    await event_admin_telegram.show_steps_list(callback, state)
+    markup = callback.message.edit_text.call_args.kwargs["reply_markup"]
+    back_button = markup.inline_keyboard[-1][0]
+    assert back_button.callback_data == f"admin_ev_open_{scen.id}_2_1"
+
+    card = _make_callback(f"admin_ev_step_{step.id}")
+    await event_admin_telegram.open_step_card(card, state)
+    card_markup = card.message.edit_text.call_args.kwargs["reply_markup"]
+    assert card_markup.inline_keyboard[-1][0].callback_data == f"admin_ev_steps_{scen.id}_2_1"
+
+
+@pytest.mark.asyncio
+async def test_telegram_dispatcher_steps_buttons_roundtrip_page_context(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import add_step, create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_dispatcher_steps_back",
+        event_type="webinar",
+        title="Telegram dispatcher steps",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/dispatcher-steps",
+    )
+    step = await add_step(db_session_maker, scen.id, -60, "Шаг {event_title}")
+    event_admin_router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(event_admin_router)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+
+    methods = await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}_2_1")
+    card = next(method for method in methods if isinstance(method, EditMessageText))
+    steps_callback = next(
+        button.callback_data
+        for row in card.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("admin_ev_steps_")
+    )
+
+    methods = await _feed_callback(dp, bot, steps_callback)
+    steps_screen = next(method for method in methods if isinstance(method, EditMessageText))
+    steps_back = steps_screen.reply_markup.inline_keyboard[-1][0].callback_data
+    assert steps_back == f"admin_ev_open_{scen.id}_2_1"
+    step_callback = next(
+        button.callback_data
+        for row in steps_screen.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("admin_ev_step_")
+        and not button.callback_data.startswith("admin_ev_step_add_")
+    )
+
+    methods = await _feed_callback(dp, bot, step_callback)
+    step_screen = next(method for method in methods if isinstance(method, EditMessageText))
+    assert step_screen.reply_markup.inline_keyboard[-1][0].callback_data == f"admin_ev_steps_{scen.id}_2_1"
+    edit_callback = next(
+        button.callback_data
+        for row in step_screen.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("admin_ev_step_edit_text_")
+    )
+
+    await _feed_callback(dp, bot, edit_callback)
+    methods = await _feed_message(dp, bot, "Обновлённый {event_title}")
+    saved = next(method for method in methods if isinstance(method, SendMessage) and "Текст шага обновлен" in method.text)
+    assert saved.reply_markup.inline_keyboard[-1][0].callback_data == f"admin_ev_steps_{scen.id}_2_1"
+
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_{step.id}")
+    step_screen = next(method for method in methods if isinstance(method, EditMessageText))
+    edit_callback = next(
+        button.callback_data
+        for row in step_screen.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("admin_ev_step_edit_text_")
+    )
+    methods = await _feed_callback(dp, bot, edit_callback)
+    edit_screen = next(method for method in methods if isinstance(method, EditMessageText))
+    cancel_callback = next(
+        button.callback_data
+        for row in edit_screen.reply_markup.inline_keyboard
+        for button in row
+        if button.text == "⬅️ Отмена"
+    )
+    methods = await _feed_callback(dp, bot, cancel_callback)
+    cancelled = next(method for method in methods if isinstance(method, EditMessageText))
+    assert cancelled.reply_markup.inline_keyboard[-1][0].callback_data == f"admin_ev_steps_{scen.id}_2_1"
+
+
+@pytest.mark.asyncio
 async def test_telegram_description_and_media_edit_routes(db_session_maker, monkeypatch):
     monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
     monkeypatch.setattr("event_admin_telegram.get_all_admin_ids", AsyncMock(return_value={12345}))
@@ -351,6 +459,40 @@ async def test_telegram_long_description_preview_is_bounded(db_session_maker, mo
     await event_admin_telegram.start_edit_description(callback, state)
     rendered = callback.message.edit_text.call_args.args[0]
     assert len(rendered) < 4096
+
+
+@pytest.mark.asyncio
+async def test_telegram_description_chunks_append_and_runtime_split_after_save(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+    from event_delivery_worker import build_test_delivery_plan
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_chunked_description",
+        event_type="webinar",
+        title="Chunked Telegram description",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/chunks",
+    )
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
+    await event_admin_telegram.start_edit_description(_make_callback(f"admin_ev_edit_description_{scen.id}"), state)
+    first = _make_message("A" * 3000)
+    first.html_text = "A" * 3000
+    second = _make_message("B" * 3000)
+    second.html_text = "B" * 3000
+    await event_admin_telegram.process_edit_description(first, state)
+    await event_admin_telegram.process_edit_description(second, state)
+    await event_admin_telegram.save_description(_make_callback(f"admin_ev_description_save_{scen.id}"), state)
+
+    async with db_session_maker() as session:
+        saved = await session.get(EventScenario, scen.id)
+        assert saved.description == ("A" * 3000) + "\n" + ("B" * 3000)
+    plan = await build_test_delivery_plan(db_session_maker, scen.id, None, None)
+    text_parts = [part for part in plan if part["kind"] == "text"]
+    assert len(text_parts) >= 2
+    assert all(len(part["text"]) <= 4000 for part in text_parts)
 
 
 def test_telegram_uncertain_resolution_buttons_target_specific_part():
@@ -638,6 +780,50 @@ async def test_telegram_test_send_to_self(db_session_maker, monkeypatch, mock_bo
     assert "ТЕСТОВОЕ НАПОМИНАНИЕ" in sent_text
     assert "https://webinar.com/live" in sent_text
     assert "Привет, Admin!" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_telegram_test_send_uses_runtime_media_plan_without_delivery_rows(db_session_maker, monkeypatch, mock_bot):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    from event_admin_service import add_step, create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="test_send_tg_media",
+        event_type="webinar",
+        title="Test Send TG Media",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://webinar.com/media",
+        description="Описание для тестовой галереи",
+    )
+    async with db_session_maker() as session:
+        session.add(EventScenarioMedia(event_id=scen.id, file_type="photo", file_id="tg-preview-photo", sort_order=0))
+        session.add(EventScenarioMedia(event_id=scen.id, file_type="video", file_id="tg-preview-video", sort_order=1))
+        await session.commit()
+    step = await add_step(
+        db_session_maker,
+        scen.id,
+        -120,
+        "Напоминание {event_title}",
+        include_event_details=True,
+    )
+    mock_bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=201)])
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=202))
+
+    await event_admin_telegram.test_send_single_step(_make_callback(f"admin_ev_test_step_{step.id}"), mock_bot)
+
+    assert mock_bot.send_media_group.await_count == 1
+    assert mock_bot.send_message.await_count == 1
+    from aiogram.methods import SendMediaGroup, SendMessage
+    SendMediaGroup(chat_id=12345, media=mock_bot.send_media_group.call_args.kwargs["media"])
+    SendMessage(
+        chat_id=12345,
+        text=mock_bot.send_message.call_args.kwargs["text"],
+        parse_mode=mock_bot.send_message.call_args.kwargs["parse_mode"],
+        reply_markup=mock_bot.send_message.call_args.kwargs.get("reply_markup"),
+    )
+    async with db_session_maker() as session:
+        assert (await session.execute(select(EventDelivery))).scalars().all() == []
 
 
 async def _feed_callback(dp: Dispatcher, bot: Bot, data: str, user_id: int = 12345, message_id: int = 100):

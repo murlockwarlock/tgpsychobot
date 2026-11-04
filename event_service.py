@@ -1729,11 +1729,12 @@ async def handle_event_start_telegram(
 
     if reg_res.status in ("registered", "rejoined"):
         if reg_res.immediate_delivery:
-            from event_delivery_worker import dispatch_immediate_delivery
+            from event_delivery_worker import dispatch_immediate_delivery, get_runtime_max_client
             outcome = await dispatch_immediate_delivery(
                 sm,
                 reg_res.immediate_delivery.id,
                 bot=bot,
+                max_client=get_runtime_max_client(),
                 now=now,
             )
             if outcome == "pre_transmission_retry":

@@ -82,6 +82,16 @@ def _parse_numeric_callback_payload(data: str, prefix: str, count: int) -> tuple
     return tuple(int(part) for part in parts)
 
 
+def _event_page_back_from_parts(parts: list[str], *, page_index: int | None = None) -> str:
+    if page_index is not None:
+        if len(parts) > page_index + 1 and parts[page_index].isdigit() and parts[page_index + 1] in {"0", "1"}:
+            return f"admin_ev_page_{parts[page_index]}_{parts[page_index + 1]}"
+        return "admin_events"
+    if len(parts) >= 2 and parts[-2].isdigit() and parts[-1] in {"0", "1"}:
+        return f"admin_ev_page_{parts[-2]}_{parts[-1]}"
+    return "admin_events"
+
+
 def _log_background_task_result(task: asyncio.Task[None]) -> None:
     try:
         task.result()
@@ -1963,10 +1973,16 @@ class MaxBotApplication:
                 await admin_events_service.show_scenarios(self.client, chat_id, page=0, include_archived=inc_arch)
                 return
             if data.startswith("admin_ev_open_"):
-                await self.states.clear(user_id)
                 parts = data.split("_")
                 event_id = int(parts[3])
                 back = f"admin_ev_page_{parts[4]}_{parts[5]}" if len(parts) >= 6 else "admin_events"
+                await self.states.clear(user_id)
+                await self.states.set(
+                    user_id,
+                    chat_id,
+                    "max_event_card",
+                    {"event_id": event_id, "event_list_back": back},
+                )
                 await admin_events_service.show_scenario(self.client, chat_id, event_id, back=back)
                 return
             if data.startswith("admin_ev_toggle_"):
@@ -2073,13 +2089,35 @@ class MaxBotApplication:
                 await admin_events_service.start_copy(self.client, self.states, chat_id, user_id, event_id)
                 return
             if data.startswith("admin_ev_steps_"):
+                snapshot = await self.states.get(user_id)
+                parts = data.split("_")
+                event_id = int(parts[3])
+                back = (
+                    f"admin_ev_page_{parts[4]}_{parts[5]}"
+                    if len(parts) >= 6
+                    else (snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events")
+                )
                 await self.states.clear(user_id)
-                event_id = int(data.split("_")[-1])
-                await admin_events_service.show_steps(self.client, chat_id, event_id)
+                await self.states.set(
+                    user_id,
+                    chat_id,
+                    "max_event_steps_menu",
+                    {"event_id": event_id, "event_list_back": back},
+                )
+                await admin_events_service.show_steps(self.client, chat_id, event_id, back=back)
                 return
             if data.startswith("admin_ev_step_add_"):
-                event_id = int(data.split("_")[-1])
-                await admin_events_service.start_step_add(self.client, self.states, chat_id, user_id, event_id)
+                parts = data.split("_")
+                event_id = int(parts[4])
+                back = _event_page_back_from_parts(parts, page_index=5)
+                await admin_events_service.start_step_add(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    event_id,
+                    back=back if back != "admin_events" else None,
+                )
                 return
             if data.startswith("admin_ev_offset_preset_"):
                 parts = data.split("_")
@@ -2090,44 +2128,113 @@ class MaxBotApplication:
                 await admin_events_service.start_step_offset_custom(self.client, self.states, chat_id, user_id, event_id)
                 return
             if data.startswith("admin_ev_step_edit_text_"):
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.start_edit_step_text(self.client, self.states, chat_id, user_id, step_id)
+                parts = data.split("_")
+                step_id = int(parts[5])
+                back = _event_page_back_from_parts(parts, page_index=6)
+                await admin_events_service.start_edit_step_text(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    step_id,
+                    back=back if back != "admin_events" else None,
+                )
                 return
             if data.startswith("admin_ev_step_toggle_details_"):
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.toggle_step_event_details(self.client, chat_id, step_id)
+                parts = data.split("_")
+                step_id = int(parts[5])
+                back = _event_page_back_from_parts(parts, page_index=6)
+                if back == "admin_events":
+                    snapshot = await self.states.get(user_id)
+                    back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.toggle_step_event_details(self.client, chat_id, step_id, back=back)
                 return
             if data.startswith("admin_ev_step_edit_offset_"):
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.start_edit_step_offset(self.client, self.states, chat_id, user_id, step_id)
+                parts = data.split("_")
+                step_id = int(parts[5])
+                back = _event_page_back_from_parts(parts, page_index=6)
+                await admin_events_service.start_edit_step_offset(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    step_id,
+                    back=back if back != "admin_events" else None,
+                )
                 return
             if data.startswith("admin_ev_step_edit_preset_"):
                 parts = data.split("_")
-                await admin_events_service.select_edit_step_offset_preset(self.client, self.states, chat_id, user_id, int(parts[5]), int(parts[6]))
+                back = _event_page_back_from_parts(parts, page_index=7)
+                if back != "admin_events":
+                    await self.states.update(user_id, event_list_back=back)
+                await admin_events_service.select_edit_step_offset_preset(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    int(parts[5]),
+                    int(parts[6]),
+                )
                 return
             if data.startswith("admin_ev_step_edit_custom_"):
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.start_edit_step_offset_custom(self.client, self.states, chat_id, user_id, step_id)
+                parts = data.split("_")
+                step_id = int(parts[5])
+                back = _event_page_back_from_parts(parts, page_index=6)
+                await admin_events_service.start_edit_step_offset_custom(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    step_id,
+                    back=back if back != "admin_events" else None,
+                )
                 return
             if data.startswith("admin_ev_step_up_"):
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.step_move_up(self.client, chat_id, step_id)
+                parts = data.split("_")
+                step_id = int(parts[4])
+                back = _event_page_back_from_parts(parts, page_index=5)
+                if back == "admin_events":
+                    snapshot = await self.states.get(user_id)
+                    back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.step_move_up(self.client, chat_id, step_id, back=back)
                 return
             if data.startswith("admin_ev_step_down_"):
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.step_move_down(self.client, chat_id, step_id)
+                parts = data.split("_")
+                step_id = int(parts[4])
+                back = _event_page_back_from_parts(parts, page_index=5)
+                if back == "admin_events":
+                    snapshot = await self.states.get(user_id)
+                    back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.step_move_down(self.client, chat_id, step_id, back=back)
                 return
             if data.startswith("admin_ev_step_del_ask_"):
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.ask_delete_step(self.client, chat_id, step_id)
+                parts = data.split("_")
+                step_id = int(parts[5])
+                back = _event_page_back_from_parts(parts, page_index=6)
+                if back == "admin_events":
+                    snapshot = await self.states.get(user_id)
+                    back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.ask_delete_step(self.client, chat_id, step_id, back=back)
                 return
             if data.startswith("admin_ev_step_del_yes_"):
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.confirm_delete_step(self.client, chat_id, step_id)
+                parts = data.split("_")
+                step_id = int(parts[5])
+                back = _event_page_back_from_parts(parts, page_index=6)
+                if back == "admin_events":
+                    snapshot = await self.states.get(user_id)
+                    back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.confirm_delete_step(self.client, chat_id, step_id, back=back)
                 return
-            if data.startswith("admin_ev_step_") and data[len("admin_ev_step_"):].isdigit():
-                step_id = int(data.split("_")[-1])
-                await admin_events_service.show_step(self.client, chat_id, step_id)
+            if data.startswith("admin_ev_step_"):
+                parts = data.split("_")
+                if len(parts) < 4 or not parts[3].isdigit():
+                    return
+                step_id = int(parts[3])
+                back = _event_page_back_from_parts(parts, page_index=4)
+                if back == "admin_events":
+                    snapshot = await self.states.get(user_id)
+                    back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.show_step(self.client, chat_id, step_id, back=back)
                 return
             if data.startswith("admin_ev_stats_"):
                 event_id = int(data.split("_")[-1])
@@ -2148,10 +2255,12 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ev_test_send_menu_"):
                 event_id = int(data.split("_")[-1])
-                await admin_events_service.show_test_send_menu(self.client, chat_id, event_id)
+                snapshot = await self.states.get(user_id)
+                back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.show_test_send_menu(self.client, chat_id, event_id, back=back)
                 return
             if data.startswith("admin_ev_test_step_"):
-                step_id = int(data.split("_")[-1])
+                step_id = int(data.split("_")[4])
                 from event_admin_service import get_step_item as _get_step_item
                 st = await _get_step_item(async_session_maker, step_id)
                 if st:

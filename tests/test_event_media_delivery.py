@@ -16,7 +16,13 @@ from sqlalchemy.pool import StaticPool
 
 from database import Base, EventDelivery, EventDeliveryPart, EventRegistration, EventScenario, EventScenarioMedia, User
 from event_admin_service import add_step, resolve_uncertain_delivery, update_scenario_fields
-from event_delivery_worker import _build_delivery_plan, claim_pending_deliveries, process_single_delivery, PreTransmissionError
+from event_delivery_worker import (
+    _build_delivery_plan,
+    claim_pending_deliveries,
+    process_single_delivery,
+    PreTransmissionError,
+    set_runtime_max_client,
+)
 from event_service import (
     handle_event_callback_max,
     handle_event_callback_telegram,
@@ -456,6 +462,91 @@ async def test_telegram_route_warns_when_max_origin_media_cannot_materialize(ses
         )
         assert delivery.status == "pending"
         assert "MAX-origin" in (delivery.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_telegram_user_route_uses_runtime_max_transport_for_max_origin_media(session_factory):
+    now, event_id = await _create_unregistered_media_event(
+        session_factory,
+        user_id=9204,
+        code="max_origin_runtime_client",
+    )
+    async with session_factory() as session:
+        media = (
+            await session.execute(select(EventScenarioMedia).where(EventScenarioMedia.event_id == event_id))
+        ).scalars().all()
+        for index, row in enumerate(media):
+            row.source_platform = "max"
+            row.file_id = f"runtime-max-file-{index}"
+            row.max_token = f"runtime-max-token-{index}"
+        await session.commit()
+
+    bot = MagicMock()
+    bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=51), MagicMock(message_id=52)])
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=53))
+    max_client = MagicMock()
+    max_client.download_attachment = AsyncMock(side_effect=[b"runtime-photo", b"runtime-video"])
+    set_runtime_max_client(max_client)
+    try:
+        assert await handle_event_start_telegram(
+            bot,
+            chat_id=9204,
+            user_id=9204,
+            start_arg="max_origin_runtime_client",
+            session_maker=session_factory,
+            now=now,
+        ) is True
+    finally:
+        set_runtime_max_client(None)
+
+    assert max_client.download_attachment.await_count == 2
+    assert bot.send_media_group.await_count == 1
+    assert bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_delivery_part_claim_uses_fresh_clock_between_parts(session_factory):
+    now, delivery_id = await _setup_media_event(session_factory, description="Короткое описание")
+    expires_at = now + timedelta(seconds=1)
+    async with session_factory() as session:
+        delivery = await session.get(EventDelivery, delivery_id)
+        delivery.expires_at = expires_at
+        await session.commit()
+
+    claimed = await claim_pending_deliveries(session_factory, now=now)
+    bot = MagicMock()
+    bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=61), MagicMock(message_id=62)])
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=63))
+    clock_calls = 0
+
+    def advancing_clock():
+        nonlocal clock_calls
+        clock_calls += 1
+        return now if clock_calls < 6 else now + timedelta(seconds=2)
+
+    outcome = await process_single_delivery(
+        session_factory,
+        delivery_id,
+        claimed[0][1],
+        bot=bot,
+        now=now,
+        clock=advancing_clock,
+    )
+    assert outcome == "pre_send_rejected:expired"
+    assert bot.send_media_group.await_count == 1
+    assert bot.send_message.await_count == 0
+    async with session_factory() as session:
+        delivery = await session.get(EventDelivery, delivery_id)
+        parts = (
+            await session.execute(
+                select(EventDeliveryPart)
+                .where(EventDeliveryPart.delivery_id == delivery_id)
+                .order_by(EventDeliveryPart.part_index)
+            )
+        ).scalars().all()
+        assert delivery.status == "skipped"
+        assert delivery.skip_reason == "expired"
+        assert [part.status for part in parts] == ["sent", "skipped"]
 
 
 @pytest.mark.asyncio

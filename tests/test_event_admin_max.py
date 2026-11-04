@@ -22,7 +22,7 @@ from database import (
 )
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.app import MaxBotApplication
-from max_messenger_bot.models import IncomingCallback, Sender
+from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
 from max_messenger_bot.services import admin_events as max_admin_events
 from max_messenger_bot.storage import StateStore
 from time_helpers import utc_now
@@ -175,6 +175,34 @@ async def test_max_description_and_media_edit_routes(db_session_maker, mock_clie
         media = (await session.execute(select(EventScenarioMedia).where(EventScenarioMedia.event_id == scen.id))).scalars().all()
         assert saved.description == "<b>MAX формат</b>"
         assert [(item.file_type, item.file_id, item.max_token) for item in media] == [("photo", "max-photo", "max-photo")]
+
+
+@pytest.mark.asyncio
+async def test_max_description_chunks_append_and_runtime_split_after_save(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+    from event_delivery_worker import build_test_delivery_plan
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_chunked_description",
+        event_type="webinar",
+        title="Chunked MAX description",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-chunks",
+    )
+    await max_admin_events.start_edit_description(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.receive_edit_description(mock_client, states, 123, 456, "A" * 3000)
+    await max_admin_events.receive_edit_description(mock_client, states, 123, 456, "B" * 3000)
+    await max_admin_events.save_description(mock_client, states, 123, 456)
+
+    async with db_session_maker() as session:
+        saved = await session.get(EventScenario, scen.id)
+        assert saved.description == ("A" * 3000) + "\n" + ("B" * 3000)
+    plan = await build_test_delivery_plan(db_session_maker, scen.id, None, None)
+    text_parts = [part for part in plan if part["kind"] == "text"]
+    assert len(text_parts) >= 2
+    assert all(len(part["text"]) <= 4000 for part in text_parts)
 
 
 @pytest.mark.asyncio
@@ -362,6 +390,103 @@ async def test_max_callback_open_and_edit_preserve_page_context(mock_client, sta
     callback.payload = "admin_ev_edit_menu_77"
     await app._handle_callback_impl(callback)
     show_edit_menu.assert_awaited_once_with(mock_client, 123, 77, back="admin_ev_page_2_1")
+
+
+@pytest.mark.asyncio
+async def test_max_steps_roundtrip_preserves_paginated_back_callbacks(mock_client, states, monkeypatch):
+    app = MaxBotApplication(mock_client)
+    app.states = states
+    monkeypatch.setattr("max_messenger_bot.app.common.is_admin", AsyncMock(return_value=True))
+    show_steps = AsyncMock()
+    show_step = AsyncMock()
+    monkeypatch.setattr("max_messenger_bot.app.admin_events_service.show_steps", show_steps)
+    monkeypatch.setattr("max_messenger_bot.app.admin_events_service.show_step", show_step)
+
+    callback = IncomingCallback(
+        raw={},
+        callback_id="steps-page",
+        payload="admin_ev_steps_77_2_1",
+        chat_id=123,
+        message_id=None,
+        sender=Sender(user_id=456, username="admin", first_name="Admin", last_name=None),
+    )
+    await app._handle_callback_impl(callback)
+    show_steps.assert_awaited_once_with(mock_client, 123, 77, back="admin_ev_page_2_1")
+    snapshot = await states.get(456)
+    assert snapshot.data["event_list_back"] == "admin_ev_page_2_1"
+
+    callback.payload = "admin_ev_step_19"
+    await app._handle_callback_impl(callback)
+    show_step.assert_awaited_once_with(mock_client, 123, 19, back="admin_ev_page_2_1")
+
+
+@pytest.mark.asyncio
+async def test_max_dispatcher_steps_buttons_roundtrip_page_context(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr("max_messenger_bot.app.common.is_admin", AsyncMock(return_value=True))
+    from event_admin_service import add_step, create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_dispatcher_steps",
+        event_type="webinar",
+        title="MAX dispatcher steps",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-dispatcher-steps",
+    )
+    step = await add_step(db_session_maker, scen.id, -1440, "Initial reminder")
+    app = MaxBotApplication(mock_client)
+    app.states = states
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload: str) -> None:
+        await app._handle_callback_impl(
+            IncomingCallback(
+                raw={},
+                callback_id=payload,
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+
+    def visible_payloads() -> list[str]:
+        rows = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+        return [button["payload"] for row in rows for button in row if "payload" in button]
+
+    await press(f"admin_ev_open_{scen.id}_2_1")
+    steps_payload = next(payload for payload in visible_payloads() if payload.startswith(f"admin_ev_steps_{scen.id}"))
+    assert steps_payload == f"admin_ev_steps_{scen.id}_2_1"
+
+    await press(steps_payload)
+    step_payload = next(payload for payload in visible_payloads() if payload.startswith(f"admin_ev_step_{step.id}"))
+    assert step_payload == f"admin_ev_step_{step.id}_2_1"
+    assert f"admin_ev_open_{scen.id}_2_1" in visible_payloads()
+
+    await press(step_payload)
+    edit_payload = next(payload for payload in visible_payloads() if payload.startswith(f"admin_ev_step_edit_text_{step.id}"))
+    assert edit_payload == f"admin_ev_step_edit_text_{step.id}_2_1"
+
+    await press(edit_payload)
+    await app._handle_message_impl(
+        IncomingMessage(
+            raw={},
+            message_id="max-msg-1",
+            chat_id=123,
+            sender=sender,
+            text="Updated reminder",
+        )
+    )
+    assert f"admin_ev_steps_{scen.id}_2_1" in visible_payloads()
+
+    await press(edit_payload)
+    cancel_payload = next(payload for payload in visible_payloads() if payload.startswith(f"admin_ev_step_{step.id}"))
+    assert cancel_payload == f"admin_ev_step_{step.id}_2_1"
+    await press(cancel_payload)
+    assert f"admin_ev_steps_{scen.id}_2_1" in visible_payloads()
+    await press(f"admin_ev_steps_{scen.id}_2_1")
+    assert f"admin_ev_open_{scen.id}_2_1" in visible_payloads()
 
 
 @pytest.mark.asyncio
@@ -567,6 +692,51 @@ async def test_max_test_send_to_self(db_session_maker, mock_client, states, monk
     assert "ТЕСТОВОЕ СООБЩЕНИЕ MAX" in text
     assert "MAX Test Send Meet" in text
     assert "Conference Room B" in text
+
+
+@pytest.mark.asyncio
+async def test_max_test_send_uses_runtime_media_plan_without_delivery_rows(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+
+    from event_admin_service import add_step, create_scenario
+    max_user_id = 100000000456
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_test_send_media",
+        event_type="webinar",
+        title="MAX Test Media",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://max.example/media",
+        description="MAX gallery description",
+    )
+    async with db_session_maker() as session:
+        session.add(EventScenarioMedia(event_id=scen.id, file_type="photo", file_id="max-preview-photo", max_token="max-preview-token", sort_order=0))
+        session.add(EventScenarioMedia(event_id=scen.id, file_type="video", file_id="max-preview-video", max_token="max-preview-video-token", sort_order=1))
+        await session.commit()
+    step = await add_step(
+        db_session_maker,
+        scen.id,
+        -120,
+        "Напоминание {event_title}",
+        include_event_details=True,
+    )
+    mock_client.send_message.reset_mock()
+
+    await max_admin_events.do_test_send(
+        mock_client,
+        chat_id=123,
+        user_id=max_user_id,
+        event_id=scen.id,
+        step_id=step.id,
+    )
+
+    assert mock_client.send_message.await_count == 2
+    media_call = mock_client.send_message.call_args_list[0].kwargs
+    text_call = mock_client.send_message.call_args_list[1].kwargs
+    assert any(item.get("type") == "image" for item in media_call["attachments"])
+    assert "Напоминание MAX Test Media" in text_call["text"]
+    async with db_session_maker() as session:
+        assert (await session.execute(select(EventDelivery))).scalars().all() == []
 
 
 @pytest.mark.asyncio

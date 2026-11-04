@@ -44,7 +44,6 @@ from event_admin_service import (
     list_steps,
     parse_msk_datetime,
     parse_offset_minutes,
-    render_test_step,
     reorder_steps,
     reschedule_scenario,
     resolve_uncertain_delivery,
@@ -101,6 +100,40 @@ def _event_open_callback(event_id: int, back: str) -> str:
     return f"admin_ev_open_{event_id}"
 
 
+def _event_steps_callback(event_id: int, back: str) -> str:
+    if back.startswith("admin_ev_page_"):
+        parts = back.split("_")
+        if len(parts) == 5:
+            return f"admin_ev_steps_{event_id}_{parts[3]}_{parts[4]}"
+    return f"admin_ev_steps_{event_id}"
+
+
+def _event_step_callback(step_id: int, back: str) -> str:
+    if back.startswith("admin_ev_page_"):
+        parts = back.split("_")
+        if len(parts) == 5:
+            return f"admin_ev_step_{step_id}_{parts[3]}_{parts[4]}"
+    return f"admin_ev_step_{step_id}"
+
+
+def _event_step_action_callback(action: str, step_id: int, back: str) -> str:
+    prefix = "admin_ev_test_step" if action == "test" else f"admin_ev_step_{action}"
+    if back.startswith("admin_ev_page_"):
+        parts = back.split("_")
+        if len(parts) == 5:
+            return f"{prefix}_{step_id}_{parts[3]}_{parts[4]}"
+    return f"{prefix}_{step_id}"
+
+
+def _event_step_value_callback(action: str, step_id: int, value: int, back: str) -> str:
+    prefix = f"admin_ev_step_{action}"
+    if back.startswith("admin_ev_page_"):
+        parts = back.split("_")
+        if len(parts) == 5:
+            return f"{prefix}_{step_id}_{value}_{parts[3]}_{parts[4]}"
+    return f"{prefix}_{step_id}_{value}"
+
+
 PROBLEMS_PAGE_SIZE = 5
 
 
@@ -144,9 +177,9 @@ async def show_scenarios(
     nav_row = []
     archive_flag = 1 if include_archived else 0
     if page > 0:
-        nav_row.append(callback_button("◀️ Назад", f"admin_ev_page_{page - 1}_{archive_flag}"))
+        nav_row.append(callback_button("⬅️ Назад", f"admin_ev_page_{page - 1}_{archive_flag}"))
     if page < total_pages - 1:
-        nav_row.append(callback_button("Вперёд ▶️", f"admin_ev_page_{page + 1}_{archive_flag}"))
+        nav_row.append(callback_button("Далее ➡️", f"admin_ev_page_{page + 1}_{archive_flag}"))
     if nav_row:
         rows.append(nav_row)
 
@@ -239,7 +272,7 @@ async def show_scenario(
         toggle_label = "⚪️ Выключить запись" if s.is_active else "🟢 Включить запись"
         rows.append([callback_button(toggle_label, f"admin_ev_toggle_{s.id}")])
 
-    rows.append([callback_button("📝 Цепочка сообщений (шаги)", f"admin_ev_steps_{s.id}")])
+    rows.append([callback_button("📝 Цепочка сообщений (шаги)", _event_steps_callback(s.id, back))])
     rows.append([callback_button("📊 Статус отправок", f"admin_ev_stats_{s.id}")])
 
     if not s.is_archived:
@@ -607,12 +640,22 @@ async def start_edit_description(client: MaxApiClient, states: StateStore, chat_
         return
     snapshot = await states.get(user_id)
     list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
-    await states.set(user_id, chat_id, "max_event_edit_description", {"event_id": event_id, "description_draft": s.description or "", "event_list_back": list_back})
+    await states.set(
+        user_id,
+        chat_id,
+        "max_event_edit_description",
+        {
+            "event_id": event_id,
+            "description_draft": s.description or "",
+            "description_input_started": False,
+            "event_list_back": list_back,
+        },
+    )
     await client.send_message(
         chat_id=chat_id,
         text=(
             "📝 <b>Описание мероприятия</b>\n\n"
-            "Отправьте новый текст. Описание не ограничивается лимитом caption; при доставке длинный текст будет разделён безопасно.\n\n"
+            "Отправьте новый текст. Следующие сообщения добавляются к черновику, чтобы сохранить описание длиннее 4096 символов. При доставке длинный текст будет разделён безопасно.\n\n"
             f"Текущий черновик:\n<blockquote>{truncate_html_preview(s.description, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>"
         ),
         attachments=inline_keyboard(_description_editor_keyboard(event_id)),
@@ -623,10 +666,12 @@ async def receive_edit_description(client: MaxApiClient, states: StateStore, cha
     snapshot = await states.get(user_id)
     if not snapshot:
         return
-    await states.update(user_id, description_draft=raw_text)
+    previous = snapshot.data.get("description_draft", "") if snapshot.data.get("description_input_started") else ""
+    combined = f"{previous}\n{raw_text}" if previous and raw_text else (previous or raw_text)
+    await states.update(user_id, description_draft=combined, description_input_started=True)
     await client.send_message(
         chat_id=chat_id,
-        text=f"📝 Черновик обновлён ({len(raw_text)} символов).\n\n<blockquote>{truncate_html_preview(raw_text, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
+        text=f"📝 Черновик обновлён ({len(combined)} символов).\n\n<blockquote>{truncate_html_preview(combined, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
         attachments=inline_keyboard(_description_editor_keyboard(snapshot.data["event_id"])),
     )
 
@@ -648,7 +693,17 @@ async def save_description(client: MaxApiClient, states: StateStore, chat_id: in
 async def delete_description(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
     snapshot = await states.get(user_id)
     list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
-    await states.set(user_id, chat_id, "max_event_edit_description", {"event_id": event_id, "description_draft": "", "event_list_back": list_back})
+    await states.set(
+        user_id,
+        chat_id,
+        "max_event_edit_description",
+        {
+            "event_id": event_id,
+            "description_draft": "",
+            "description_input_started": True,
+            "event_list_back": list_back,
+        },
+    )
     await client.send_message(
         chat_id=chat_id,
         text="🗑 Описание будет удалено после нажатия «Сохранить и выйти».",
@@ -972,7 +1027,13 @@ async def receive_copy_starts_at(client: MaxApiClient, states: StateStore, chat_
 # REMINDER STEPS CRUD
 # ==============================================================================
 
-async def show_steps(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+async def show_steps(
+    client: MaxApiClient,
+    chat_id: int,
+    event_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     s = await get_scenario_summary(async_session_maker, event_id)
     if not s:
         return
@@ -982,12 +1043,12 @@ async def show_steps(client: MaxApiClient, chat_id: int, event_id: int) -> None:
     for idx, st in enumerate(steps):
         short = (st.message_text[:25] + "...") if len(st.message_text) > 25 else st.message_text
         label = f"{idx + 1}. {st.offset_display} — {short.replace('\n', ' ')}"
-        rows.append([callback_button(label, f"admin_ev_step_{st.id}")])
+        rows.append([callback_button(label, _event_step_callback(st.id, back))])
 
     if not s.is_archived:
-        rows.append([callback_button("➕ Добавить шаг", f"admin_ev_step_add_{event_id}")])
+        rows.append([callback_button("➕ Добавить шаг", _event_step_action_callback("add", event_id, back))])
 
-    rows.append(_back(f"admin_ev_open_{event_id}"))
+    rows.append(_back(_event_open_callback(event_id, back)))
 
     text_lines = [
         f"📝 <b>Цепочка напоминаний: {html.escape(s.title)}</b>\n\n",
@@ -1009,7 +1070,13 @@ async def show_steps(client: MaxApiClient, chat_id: int, event_id: int) -> None:
     )
 
 
-async def show_step(client: MaxApiClient, chat_id: int, step_id: int) -> None:
+async def show_step(
+    client: MaxApiClient,
+    chat_id: int,
+    step_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     st = await get_step_item(async_session_maker, step_id)
     if not st:
         await client.send_message(chat_id=chat_id, text="Шаг не найден.")
@@ -1025,25 +1092,25 @@ async def show_step(client: MaxApiClient, chat_id: int, step_id: int) -> None:
 
     rows = []
     if not s.is_archived:
-        rows.append([callback_button("✏️ Изменить текст", f"admin_ev_step_edit_text_{st.id}")])
-        rows.append([callback_button("⏱ Изменить время отправки", f"admin_ev_step_edit_offset_{st.id}")])
+        rows.append([callback_button("✏️ Изменить текст", _event_step_action_callback("edit_text", st.id, back))])
+        rows.append([callback_button("⏱ Изменить время отправки", _event_step_action_callback("edit_offset", st.id, back))])
         rows.append([callback_button(
             f"📎 Детали события: {'вкл.' if st.include_event_details else 'выкл.'}",
-            f"admin_ev_step_toggle_details_{st.id}",
+            _event_step_action_callback("toggle_details", st.id, back),
         )])
 
         order_row = []
         if not is_first:
-            order_row.append(callback_button("⬆️ Выше", f"admin_ev_step_up_{st.id}"))
+            order_row.append(callback_button("⬆️ Выше", _event_step_action_callback("up", st.id, back)))
         if not is_last:
-            order_row.append(callback_button("⬇️ Ниже", f"admin_ev_step_down_{st.id}"))
+            order_row.append(callback_button("⬇️ Ниже", _event_step_action_callback("down", st.id, back)))
         if order_row:
             rows.append(order_row)
 
-        rows.append([callback_button("🗑 Удалить шаг", f"admin_ev_step_del_ask_{st.id}")])
+        rows.append([callback_button("🗑 Удалить шаг", _event_step_action_callback("del_ask", st.id, back))])
 
-    rows.append([callback_button("🚀 Тестовая отправка шага", f"admin_ev_test_step_{st.id}")])
-    rows.append(_back(f"admin_ev_steps_{st.event_id}"))
+    rows.append([callback_button("🚀 Тестовая отправка шага", _event_step_action_callback("test", st.id, back))])
+    rows.append(_back(_event_steps_callback(st.event_id, back)))
 
     text = (
         f"📝 <b>Шаг напоминания {idx + 1} из {len(all_steps)}</b>\n\n"
@@ -1062,24 +1129,45 @@ async def show_step(client: MaxApiClient, chat_id: int, step_id: int) -> None:
     )
 
 
-async def toggle_step_event_details(client: MaxApiClient, chat_id: int, step_id: int) -> None:
+async def toggle_step_event_details(
+    client: MaxApiClient,
+    chat_id: int,
+    step_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     step = await get_step_item(async_session_maker, step_id)
     if not step:
         return
     try:
         await set_step_event_details(async_session_maker, step_id, not step.include_event_details)
-        await show_step(client, chat_id, step_id)
+        await show_step(client, chat_id, step_id, back=back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
-async def start_step_add(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
-    await states.set(user_id, chat_id, "max_event_step_offset", {"event_id": event_id})
+async def start_step_add(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    event_id: int,
+    *,
+    back: str | None = None,
+) -> None:
+    snapshot = await states.get(user_id)
+    list_back = back or (snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events")
+    await states.set(
+        user_id,
+        chat_id,
+        "max_event_step_offset",
+        {"event_id": event_id, "event_list_back": list_back},
+    )
     rows = []
     for offset_val, label in PRESET_OFFSETS:
         rows.append([callback_button(label, f"admin_ev_offset_preset_{event_id}_{offset_val}")])
     rows.append([callback_button("✏️ Ввести другое смещение", f"admin_ev_offset_custom_{event_id}")])
-    rows.append(_back(f"admin_ev_steps_{event_id}"))
+    rows.append(_back(_event_steps_callback(event_id, list_back)))
 
     await client.send_message(
         chat_id=chat_id,
@@ -1096,11 +1184,13 @@ async def select_step_offset_preset(
     event_id: int,
     offset_val: int,
 ) -> None:
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
     await states.set(
         user_id,
         chat_id,
         "max_event_step_text",
-        {"event_id": event_id, "offset_minutes": offset_val},
+        {"event_id": event_id, "offset_minutes": offset_val, "event_list_back": list_back},
     )
     disp = format_offset_minutes(offset_val)
     await client.send_message(
@@ -1115,7 +1205,7 @@ async def select_step_offset_preset(
             f"• <code>{{event_time}}</code> — время МСК\n"
             f"• <code>{{link}}</code> — ссылка"
         ),
-        attachments=inline_keyboard([_back(f"admin_ev_steps_{event_id}")]),
+        attachments=inline_keyboard([_back(_event_steps_callback(event_id, list_back))]),
     )
 
 
@@ -1126,11 +1216,18 @@ async def start_step_offset_custom(
     user_id: int,
     event_id: int,
 ) -> None:
-    await states.set(user_id, chat_id, "max_event_step_offset_custom", {"event_id": event_id})
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(
+        user_id,
+        chat_id,
+        "max_event_step_offset_custom",
+        {"event_id": event_id, "event_list_back": list_back},
+    )
     await client.send_message(
         chat_id=chat_id,
         text="⏱ Введите смещение (например: <code>-24h</code>, <code>-2h</code>, <code>0</code>, <code>+2h</code>, <code>-30m</code>):",
-        attachments=inline_keyboard([_back(f"admin_ev_steps_{event_id}")]),
+        attachments=inline_keyboard([_back(_event_steps_callback(event_id, list_back))]),
     )
 
 
@@ -1163,13 +1260,14 @@ async def receive_step_text(
     data = state_obj.data if state_obj else {}
     event_id = data["event_id"]
     offset = data["offset_minutes"]
+    list_back = data.get("event_list_back", "admin_events")
 
     try:
         validate_step_input(offset, raw_text)
         st = await add_step(async_session_maker, event_id, offset, raw_text)
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text="🎉 <b>Шаг успешно добавлен!</b>")
-        await show_steps(client, chat_id, event_id)
+        await show_steps(client, chat_id, event_id, back=list_back)
     except Exception as exc:
         log.exception("MAX add step error: %s", exc)
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
@@ -1181,15 +1279,24 @@ async def start_edit_step_text(
     chat_id: int,
     user_id: int,
     step_id: int,
+    *,
+    back: str | None = None,
 ) -> None:
     st = await get_step_item(async_session_maker, step_id)
     if not st:
         return
-    await states.set(user_id, chat_id, "max_event_step_edit_text", {"step_id": step_id})
+    snapshot = await states.get(user_id)
+    list_back = back or (snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events")
+    await states.set(
+        user_id,
+        chat_id,
+        "max_event_step_edit_text",
+        {"step_id": step_id, "event_list_back": list_back},
+    )
     await client.send_message(
         chat_id=chat_id,
         text=f"✏️ <b>Редактирование текста</b>\n\nТекущий:\n<blockquote>{html.escape(st.message_text)}</blockquote>\n\nВведите новый текст:",
-        attachments=inline_keyboard([_back(f"admin_ev_step_{step_id}")]),
+        attachments=inline_keyboard([_back(_event_step_callback(step_id, list_back))]),
     )
 
 
@@ -1201,12 +1308,14 @@ async def receive_edit_step_text(
     raw_text: str,
 ) -> None:
     state_obj = await states.get(user_id)
-    step_id = state_obj.data["step_id"]
+    data = state_obj.data
+    step_id = data["step_id"]
+    list_back = data.get("event_list_back", "admin_events")
     try:
         updated = await update_step(async_session_maker, step_id, message_text=raw_text)
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text=f"✅ Текст обновлен (v{updated.step_version}).")
-        await show_step(client, chat_id, step_id)
+        await show_step(client, chat_id, step_id, back=list_back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
@@ -1217,15 +1326,26 @@ async def start_edit_step_offset(
     chat_id: int,
     user_id: int,
     step_id: int,
+    *,
+    back: str | None = None,
 ) -> None:
     st = await get_step_item(async_session_maker, step_id)
     if not st:
         return
+    snapshot = await states.get(user_id)
+    list_back = back or (snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events")
+    await states.set(
+        user_id,
+        chat_id,
+        "max_event_step_edit_offset",
+        {"step_id": step_id, "event_list_back": list_back},
+    )
     rows = []
     for offset_val, label in PRESET_OFFSETS:
-        rows.append([callback_button(label, f"admin_ev_step_edit_preset_{step_id}_{offset_val}")])
-    rows.append([callback_button("✏️ Ввести другое смещение", f"admin_ev_step_edit_custom_{step_id}")])
-    rows.append(_back(f"admin_ev_step_{step_id}"))
+        callback = _event_step_value_callback("edit_preset", step_id, offset_val, list_back)
+        rows.append([callback_button(label, callback)])
+    rows.append([callback_button("✏️ Ввести другое смещение", _event_step_action_callback("edit_custom", step_id, list_back))])
+    rows.append(_back(_event_step_callback(step_id, list_back)))
 
     await client.send_message(
         chat_id=chat_id,
@@ -1242,11 +1362,13 @@ async def select_edit_step_offset_preset(
     step_id: int,
     offset_val: int,
 ) -> None:
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
     try:
         updated = await update_step(async_session_maker, step_id, offset_minutes=offset_val)
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text=f"✅ Время отправки обновлено: <b>{updated.offset_display}</b>")
-        await show_step(client, chat_id, step_id)
+        await show_step(client, chat_id, step_id, back=list_back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
@@ -1257,12 +1379,21 @@ async def start_edit_step_offset_custom(
     chat_id: int,
     user_id: int,
     step_id: int,
+    *,
+    back: str | None = None,
 ) -> None:
-    await states.set(user_id, chat_id, "max_event_step_edit_offset_custom", {"step_id": step_id})
+    snapshot = await states.get(user_id)
+    list_back = back or (snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events")
+    await states.set(
+        user_id,
+        chat_id,
+        "max_event_step_edit_offset_custom",
+        {"step_id": step_id, "event_list_back": list_back},
+    )
     await client.send_message(
         chat_id=chat_id,
         text="⏱ Введите произвольное смещение (например: <code>-24h</code>, <code>-2h</code>, <code>0</code>, <code>+2h</code>):",
-        attachments=inline_keyboard([_back(f"admin_ev_step_{step_id}")]),
+        attachments=inline_keyboard([_back(_event_step_callback(step_id, list_back))]),
     )
 
 
@@ -1274,18 +1405,26 @@ async def receive_edit_step_offset_custom(
     raw_offset: str,
 ) -> None:
     state_obj = await states.get(user_id)
-    step_id = state_obj.data["step_id"]
+    data = state_obj.data
+    step_id = data["step_id"]
+    list_back = data.get("event_list_back", "admin_events")
     try:
         offset = parse_offset_minutes(raw_offset)
         updated = await update_step(async_session_maker, step_id, offset_minutes=offset)
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text=f"✅ Время отправки обновлено: <b>{updated.offset_display}</b>")
-        await show_step(client, chat_id, step_id)
+        await show_step(client, chat_id, step_id, back=list_back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ {exc}\nПопробуйте ещё раз:")
 
 
-async def step_move_up(client: MaxApiClient, chat_id: int, step_id: int) -> None:
+async def step_move_up(
+    client: MaxApiClient,
+    chat_id: int,
+    step_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     st = await get_step_item(async_session_maker, step_id)
     if not st:
         return
@@ -1295,10 +1434,16 @@ async def step_move_up(client: MaxApiClient, chat_id: int, step_id: int) -> None
     if idx > 0:
         ids[idx - 1], ids[idx] = ids[idx], ids[idx - 1]
         await reorder_steps(async_session_maker, st.event_id, ids)
-    await show_step(client, chat_id, step_id)
+    await show_step(client, chat_id, step_id, back=back)
 
 
-async def step_move_down(client: MaxApiClient, chat_id: int, step_id: int) -> None:
+async def step_move_down(
+    client: MaxApiClient,
+    chat_id: int,
+    step_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     st = await get_step_item(async_session_maker, step_id)
     if not st:
         return
@@ -1308,16 +1453,22 @@ async def step_move_down(client: MaxApiClient, chat_id: int, step_id: int) -> No
     if idx < len(ids) - 1:
         ids[idx + 1], ids[idx] = ids[idx], ids[idx + 1]
         await reorder_steps(async_session_maker, st.event_id, ids)
-    await show_step(client, chat_id, step_id)
+    await show_step(client, chat_id, step_id, back=back)
 
 
-async def ask_delete_step(client: MaxApiClient, chat_id: int, step_id: int) -> None:
+async def ask_delete_step(
+    client: MaxApiClient,
+    chat_id: int,
+    step_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     st = await get_step_item(async_session_maker, step_id)
     if not st:
         return
     rows = [
-        [callback_button("✅ Да, архивировать", f"admin_ev_step_del_yes_{step_id}")],
-        _back(f"admin_ev_step_{step_id}"),
+        [callback_button("✅ Да, архивировать", _event_step_action_callback("del_yes", step_id, back))],
+        _back(_event_step_callback(step_id, back)),
     ]
     await client.send_message(
         chat_id=chat_id,
@@ -1326,13 +1477,19 @@ async def ask_delete_step(client: MaxApiClient, chat_id: int, step_id: int) -> N
     )
 
 
-async def confirm_delete_step(client: MaxApiClient, chat_id: int, step_id: int) -> None:
+async def confirm_delete_step(
+    client: MaxApiClient,
+    chat_id: int,
+    step_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     st = await get_step_item(async_session_maker, step_id)
     if not st:
         return
     await archive_step(async_session_maker, step_id)
     await client.send_message(chat_id=chat_id, text="✅ Шаг архивирован.")
-    await show_steps(client, chat_id, st.event_id)
+    await show_steps(client, chat_id, st.event_id, back=back)
 
 
 # ==============================================================================
@@ -1394,9 +1551,9 @@ async def show_problems(client: MaxApiClient, chat_id: int, event_id: int, page:
 
     nav_row = []
     if page > 0:
-        nav_row.append(callback_button("◀️ Назад", f"admin_ev_problems_{event_id}_{page - 1}"))
+        nav_row.append(callback_button("⬅️ Назад", f"admin_ev_problems_{event_id}_{page - 1}"))
     if page < total_pages - 1:
-        nav_row.append(callback_button("Вперёд ▶️", f"admin_ev_problems_{event_id}_{page + 1}"))
+        nav_row.append(callback_button("Далее ➡️", f"admin_ev_problems_{event_id}_{page + 1}"))
     if nav_row:
         rows.append(nav_row)
 
@@ -1542,7 +1699,13 @@ async def receive_resolve_reason(
 # TEST SEND TO SELF
 # ==============================================================================
 
-async def show_test_send_menu(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+async def show_test_send_menu(
+    client: MaxApiClient,
+    chat_id: int,
+    event_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     steps = await list_steps(async_session_maker, event_id, include_archived=False)
     rows = [
         [callback_button("✉️ Подтверждение регистрации", f"admin_ev_do_test_send_{event_id}_0")],
@@ -1551,7 +1714,7 @@ async def show_test_send_menu(client: MaxApiClient, chat_id: int, event_id: int)
         short = (s.message_text[:20] + "...") if len(s.message_text) > 20 else s.message_text
         rows.append([callback_button(f"✉️ Шаг {idx + 1} ({s.offset_display}): {short}", f"admin_ev_do_test_send_{event_id}_{s.id}")])
 
-    rows.append(_back(f"admin_ev_open_{event_id}"))
+    rows.append(_back(_event_open_callback(event_id, back)))
 
     await client.send_message(
         chat_id=chat_id,
@@ -1572,14 +1735,19 @@ async def do_test_send(
     async with async_session_maker() as session:
         admin_user = await session.get(User, user_id)
 
-    rendered = await render_test_step(
-        async_session_maker,
-        event_id=event_id,
-        step_id=step_id,
-        admin_user=admin_user,
-    )
+    from event_delivery_worker import build_test_delivery_plan, send_test_delivery_plan
 
-    await client.send_message(
-        chat_id=chat_id,
-        text=f"🧪 <b>[ТЕСТОВОЕ СООБЩЕНИЕ MAX]</b>\n\n{rendered}",
+    plan = await build_test_delivery_plan(
+        async_session_maker,
+        event_id,
+        step_id,
+        admin_user,
+        header="🧪 <b>[ТЕСТОВОЕ СООБЩЕНИЕ MAX]</b>",
+    )
+    await send_test_delivery_plan(
+        plan,
+        platform="max",
+        user_id=user_id,
+        event_id=event_id,
+        max_client=client,
     )

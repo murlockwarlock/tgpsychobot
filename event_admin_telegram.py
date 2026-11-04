@@ -53,7 +53,6 @@ from event_admin_service import (
     list_steps,
     parse_msk_datetime,
     parse_offset_minutes,
-    render_test_step,
     reorder_steps,
     reschedule_scenario,
     resolve_uncertain_delivery,
@@ -66,6 +65,7 @@ from event_admin_service import (
     validate_scenario_input,
     validate_step_input,
 )
+from event_delivery_worker import build_test_delivery_plan, send_test_delivery_plan
 
 log = logging.getLogger(__name__)
 
@@ -166,10 +166,10 @@ def _scenarios_list_keyboard(
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
         archive_flag = 1 if include_archived else 0
-        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_ev_page_{page - 1}_{archive_flag}"))
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_ev_page_{page - 1}_{archive_flag}"))
     if page < total_pages - 1:
         archive_flag = 1 if include_archived else 0
-        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_ev_page_{page + 1}_{archive_flag}"))
+        nav_row.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"admin_ev_page_{page + 1}_{archive_flag}"))
     if nav_row:
         builder.row(*nav_row)
 
@@ -195,6 +195,22 @@ def _event_open_callback(event_id: int, back: str) -> str:
     return f"admin_ev_open_{event_id}"
 
 
+def _event_steps_callback(event_id: int, back: str) -> str:
+    if back.startswith("admin_ev_page_"):
+        parts = back.split("_")
+        if len(parts) == 5:
+            return f"admin_ev_steps_{event_id}_{parts[3]}_{parts[4]}"
+    return f"admin_ev_steps_{event_id}"
+
+
+def _event_edit_menu_callback(event_id: int, back: str) -> str:
+    if back.startswith("admin_ev_page_"):
+        parts = back.split("_")
+        if len(parts) == 5:
+            return f"admin_ev_edit_menu_{event_id}_{parts[3]}_{parts[4]}"
+    return f"admin_ev_edit_menu_{event_id}"
+
+
 def _scenario_card_keyboard(s: ScenarioSummary, back: str = "admin_events") -> Any:
     builder = InlineKeyboardBuilder()
 
@@ -203,12 +219,12 @@ def _scenario_card_keyboard(s: ScenarioSummary, back: str = "admin_events") -> A
         toggle_label = "⚪️ Выключить запись" if s.is_active else "🟢 Включить запись"
         builder.button(text=toggle_label, callback_data=f"admin_ev_toggle_{s.id}")
 
-    builder.button(text="📝 Цепочка сообщений (шаги)", callback_data=f"admin_ev_steps_{s.id}")
+    builder.button(text="📝 Цепочка сообщений (шаги)", callback_data=_event_steps_callback(s.id, back))
     builder.button(text="📊 Статус отправок", callback_data=f"admin_ev_stats_{s.id}")
 
     if not s.is_archived:
         builder.button(text="⏰ Перенести время", callback_data=f"admin_ev_reschedule_{s.id}")
-        builder.button(text="✏️ Редактировать", callback_data=f"admin_ev_edit_menu_{s.id}")
+        builder.button(text="✏️ Редактировать", callback_data=_event_edit_menu_callback(s.id, back))
         builder.button(text="📋 Скопировать", callback_data=f"admin_ev_copy_{s.id}")
         builder.button(text="🚀 Тестовая отправка себе", callback_data=f"admin_ev_test_send_menu_{s.id}")
         builder.button(text="📦 В архив", callback_data=f"admin_ev_archive_ask_{s.id}")
@@ -244,7 +260,13 @@ def _scenario_edit_keyboard(s: ScenarioSummary, *, list_back: str = "admin_event
     return builder.as_markup()
 
 
-def _steps_list_keyboard(event_id: int, steps: list[StepItem], is_archived: bool) -> Any:
+def _steps_list_keyboard(
+    event_id: int,
+    steps: list[StepItem],
+    is_archived: bool,
+    *,
+    back: str = "admin_events",
+) -> Any:
     builder = InlineKeyboardBuilder()
 
     for idx, st in enumerate(steps):
@@ -258,12 +280,20 @@ def _steps_list_keyboard(event_id: int, steps: list[StepItem], is_archived: bool
     if not is_archived:
         builder.button(text="➕ Добавить шаг", callback_data=f"admin_ev_step_add_{event_id}")
 
-    builder.button(text="⬅️ Назад в мероприятие", callback_data=f"admin_ev_open_{event_id}")
+    builder.button(text="⬅️ Назад в мероприятие", callback_data=_event_open_callback(event_id, back))
     builder.adjust(1)
     return builder.as_markup()
 
 
-def _step_card_keyboard(event_id: int, step: StepItem, is_first: bool, is_last: bool, is_archived: bool) -> Any:
+def _step_card_keyboard(
+    event_id: int,
+    step: StepItem,
+    is_first: bool,
+    is_last: bool,
+    is_archived: bool,
+    *,
+    back: str = "admin_events",
+) -> Any:
     builder = InlineKeyboardBuilder()
 
     if not is_archived:
@@ -286,7 +316,7 @@ def _step_card_keyboard(event_id: int, step: StepItem, is_first: bool, is_last: 
         builder.button(text="🗑 Удалить/Архивировать шаг", callback_data=f"admin_ev_step_del_ask_{step.id}")
 
     builder.button(text="🚀 Тестовая отправка шага", callback_data=f"admin_ev_test_step_{step.id}")
-    builder.button(text="⬅️ К списку шагов", callback_data=f"admin_ev_steps_{event_id}")
+    builder.button(text="⬅️ К списку шагов", callback_data=_event_steps_callback(event_id, back))
     builder.adjust(1)
     return builder.as_markup()
 
@@ -342,9 +372,9 @@ def _problem_deliveries_keyboard(
 
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_ev_problems_{event_id}_{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_ev_problems_{event_id}_{page - 1}"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_ev_problems_{event_id}_{page + 1}"))
+        nav_row.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"admin_ev_problems_{event_id}_{page + 1}"))
     if nav_row:
         builder.row(*nav_row)
 
@@ -373,7 +403,12 @@ def _delivery_resolution_keyboard(item: DeliveryItem, parts: list[DeliveryPartIt
     return builder.as_markup()
 
 
-def _test_send_picker_keyboard(event_id: int, steps: list[StepItem]) -> Any:
+def _test_send_picker_keyboard(
+    event_id: int,
+    steps: list[StepItem],
+    *,
+    back: str = "admin_events",
+) -> Any:
     builder = InlineKeyboardBuilder()
     builder.button(text="✉️ Подтверждение регистрации", callback_data=f"admin_ev_do_test_send_{event_id}_0")
     for idx, s in enumerate(steps):
@@ -383,7 +418,7 @@ def _test_send_picker_keyboard(event_id: int, steps: list[StepItem]) -> Any:
             text=f"✉️ Шаг {idx + 1} ({s.offset_display}): {clean}",
             callback_data=f"admin_ev_do_test_send_{event_id}_{s.id}",
         )
-    builder.button(text="⬅️ Отмена", callback_data=f"admin_ev_open_{event_id}")
+    builder.button(text="⬅️ Отмена", callback_data=_event_open_callback(event_id, back))
     builder.adjust(1)
     return builder.as_markup()
 
@@ -803,10 +838,15 @@ async def _finalize_scenario_creation(
 @router.callback_query(F.data.startswith("admin_ev_edit_menu_"))
 async def show_edit_menu(callback: CallbackQuery, state: FSMContext) -> None:
     state_data = await state.get_data()
-    list_back = state_data.get("event_list_back", "admin_events")
+    parts = callback.data.split("_")
+    list_back = (
+        f"admin_ev_page_{parts[4]}_{parts[5]}"
+        if len(parts) >= 7
+        else state_data.get("event_list_back", "admin_events")
+    )
     await state.clear()
     await state.update_data(event_list_back=list_back)
-    event_id = int(callback.data.split("_")[-1])
+    event_id = int(parts[4])
     scen = await get_scenario_summary(async_session_maker, event_id)
     if not scen:
         await callback.answer("Мероприятие не найдено.", show_alert=True)
@@ -967,11 +1007,16 @@ async def start_edit_description(callback: CallbackQuery, state: FSMContext) -> 
     state_data = await state.get_data()
     list_back = state_data.get("event_list_back", "admin_events")
     await state.clear()
-    await state.update_data(edit_event_id=event_id, description_draft=scen.description or "", event_list_back=list_back)
+    await state.update_data(
+        edit_event_id=event_id,
+        description_draft=scen.description or "",
+        description_input_started=False,
+        event_list_back=list_back,
+    )
     await state.set_state(EventAdminStates.edit_description)
     await callback.message.edit_text(
         "📝 <b>Описание мероприятия</b>\n\n"
-        "Отправьте новый текст. Поддерживается длинное описание без лимита caption; текст больше 4096 символов будет разделён при доставке.\n\n"
+        "Отправьте новый текст. Следующие сообщения добавляются к черновику, чтобы сохранить описание длиннее 4096 символов. Поддерживается длинное описание без лимита caption; при доставке оно будет разделено безопасно.\n\n"
         f"Текущий черновик:\n<blockquote>{truncate_html_preview(scen.description, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
         parse_mode="HTML",
         reply_markup=_description_editor_keyboard(event_id),
@@ -983,9 +1028,11 @@ async def process_edit_description(message: Message, state: FSMContext) -> None:
     text = message.html_text or message.text or message.caption or ""
     data = await state.get_data()
     event_id = data["edit_event_id"]
-    await state.update_data(description_draft=text)
+    previous = data.get("description_draft", "") if data.get("description_input_started") else ""
+    combined = f"{previous}\n{text}" if previous and text else (previous or text)
+    await state.update_data(description_draft=combined, description_input_started=True)
     await message.answer(
-        f"📝 Черновик обновлён ({len(text)} символов).\n\n<blockquote>{truncate_html_preview(text, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
+        f"📝 Черновик обновлён ({len(combined)} символов).\n\n<blockquote>{truncate_html_preview(combined, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
         parse_mode="HTML",
         reply_markup=_description_editor_keyboard(event_id),
     )
@@ -1014,7 +1061,7 @@ async def save_description(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("admin_ev_description_delete_"))
 async def delete_description(callback: CallbackQuery, state: FSMContext) -> None:
     event_id = int(callback.data.split("_")[-1])
-    await state.update_data(edit_event_id=event_id, description_draft="")
+    await state.update_data(edit_event_id=event_id, description_draft="", description_input_started=True)
     await state.set_state(EventAdminStates.edit_description)
     await callback.message.edit_text(
         "🗑 Описание будет удалено после нажатия «Сохранить и выйти».",
@@ -1304,8 +1351,16 @@ async def process_copy_starts_at(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("admin_ev_steps_"))
 async def show_steps_list(callback: CallbackQuery, state: FSMContext) -> None:
+    state_data = await state.get_data()
+    parts = callback.data.split("_")
+    event_id = int(parts[3])
+    list_back = (
+        f"admin_ev_page_{parts[4]}_{parts[5]}"
+        if len(parts) >= 6
+        else state_data.get("event_list_back", "admin_events")
+    )
     await state.clear()
-    event_id = int(callback.data.split("_")[-1])
+    await state.update_data(event_list_back=list_back)
     scen = await get_scenario_summary(async_session_maker, event_id)
     if not scen:
         await callback.answer("Мероприятие не найдено.", show_alert=True)
@@ -1334,22 +1389,24 @@ async def show_steps_list(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         "".join(text_lines),
         parse_mode="HTML",
-        reply_markup=_steps_list_keyboard(event_id, steps, scen.is_archived),
+        reply_markup=_steps_list_keyboard(event_id, steps, scen.is_archived, back=list_back),
     )
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_add_"))
 async def start_add_step(callback: CallbackQuery, state: FSMContext) -> None:
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
     event_id = int(callback.data.split("_")[-1])
     await state.clear()
-    await state.update_data(step_event_id=event_id)
+    await state.update_data(step_event_id=event_id, event_list_back=list_back)
 
     await callback.message.edit_text(
         "➕ <b>Добавление шага напоминания</b>\n\n"
         "<b>Шаг 1 из 2:</b> Выберите время отправки относительно начала мероприятия "
         "или выберите ручной ввод смещения:",
         parse_mode="HTML",
-        reply_markup=_step_offset_picker_keyboard(event_id, back_cb=f"admin_ev_steps_{event_id}"),
+        reply_markup=_step_offset_picker_keyboard(event_id, back_cb=_event_steps_callback(event_id, list_back)),
     )
 
 
@@ -1358,6 +1415,8 @@ async def process_offset_preset(callback: CallbackQuery, state: FSMContext) -> N
     parts = callback.data.split("_")
     event_id = int(parts[4])
     offset_val = int(parts[5])
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
 
     await state.update_data(step_event_id=event_id, step_offset=offset_val)
     await state.set_state(EventAdminStates.step_text)
@@ -1374,14 +1433,20 @@ async def process_offset_preset(callback: CallbackQuery, state: FSMContext) -> N
         f"• <code>{{link}}</code> — ссылка на мероприятие\n"
         f"• <code>{{place}}</code> — место встречи\n",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_steps_{event_id}").as_markup(),
+        reply_markup=InlineKeyboardBuilder().button(
+            text="⬅️ Отмена", callback_data=_event_steps_callback(event_id, list_back)
+        ).as_markup(),
     )
 
 
 @router.callback_query(F.data.startswith("admin_ev_offset_custom_"))
 async def start_offset_custom(callback: CallbackQuery, state: FSMContext) -> None:
     event_id = int(callback.data.split("_")[-1])
-    await state.update_data(step_event_id=event_id)
+    state_data = await state.get_data()
+    await state.update_data(
+        step_event_id=event_id,
+        event_list_back=state_data.get("event_list_back", "admin_events"),
+    )
     await state.set_state(EventAdminStates.step_offset_custom)
 
     await callback.message.edit_text(
@@ -1393,7 +1458,10 @@ async def start_offset_custom(callback: CallbackQuery, state: FSMContext) -> Non
         "• <code>+2h</code> или <code>120</code> — через 2 ч. после начала\n"
         "• <code>-30m</code> — за 30 мин. до начала",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_steps_{event_id}").as_markup(),
+        reply_markup=InlineKeyboardBuilder().button(
+            text="⬅️ Отмена",
+            callback_data=_event_steps_callback(event_id, state_data.get("event_list_back", "admin_events")),
+        ).as_markup(),
     )
 
 
@@ -1425,11 +1493,13 @@ async def process_step_text(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     event_id = data["step_event_id"]
     offset = data["step_offset"]
+    list_back = data.get("event_list_back", "admin_events")
 
     try:
         validate_step_input(offset, text)
         st = await add_step(async_session_maker, event_id, offset, text)
         await state.clear()
+        await state.update_data(event_list_back=list_back)
         scen = await get_scenario_summary(async_session_maker, event_id)
         assert scen is not None
         steps = await list_steps(async_session_maker, event_id, include_archived=False)
@@ -1439,14 +1509,19 @@ async def process_step_text(message: Message, state: FSMContext) -> None:
             f"• Версия: v{st.step_version}\n"
             f"• Текст:\n<blockquote>{html.escape(st.message_text)}</blockquote>",
             parse_mode="HTML",
-            reply_markup=_steps_list_keyboard(event_id, steps, scen.is_archived),
+            reply_markup=_steps_list_keyboard(event_id, steps, scen.is_archived, back=list_back),
         )
     except Exception as exc:
         log.exception("Add step failed: %s", exc)
         await message.answer(f"❌ Ошибка: {exc}")
 
 
-async def _render_step_card_view(callback: CallbackQuery, step_id: int) -> None:
+async def _render_step_card_view(
+    callback: CallbackQuery,
+    step_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     step = await get_step_item(async_session_maker, step_id)
     if not step:
         await callback.answer("Шаг не найден.", show_alert=True)
@@ -1476,19 +1551,26 @@ async def _render_step_card_view(callback: CallbackQuery, step_id: int) -> None:
         await callback.message.edit_text(
             text,
             parse_mode="HTML",
-            reply_markup=_step_card_keyboard(step.event_id, step, is_first, is_last, scen.is_archived),
+            reply_markup=_step_card_keyboard(
+                step.event_id, step, is_first, is_last, scen.is_archived, back=back
+            ),
         )
 
 
 @router.callback_query(F.data.regexp(r"^admin_ev_step_(\d+)$"))
 async def open_step_card(callback: CallbackQuery, state: FSMContext) -> None:
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
     await state.clear()
+    await state.update_data(event_list_back=list_back)
     step_id = int(callback.data.split("_")[-1])
-    await _render_step_card_view(callback, step_id)
+    await _render_step_card_view(callback, step_id, back=list_back)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_toggle_details_"))
-async def toggle_step_event_details(callback: CallbackQuery) -> None:
+async def toggle_step_event_details(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     step_id = int(callback.data.split("_")[-1])
     step = await get_step_item(async_session_maker, step_id)
     if not step:
@@ -1496,7 +1578,7 @@ async def toggle_step_event_details(callback: CallbackQuery) -> None:
         return
     try:
         await set_step_event_details(async_session_maker, step_id, not step.include_event_details)
-        await _render_step_card_view(callback, step_id)
+        await _render_step_card_view(callback, step_id, back=list_back)
     except Exception as exc:
         await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
 
@@ -1509,8 +1591,14 @@ async def start_edit_step_text(callback: CallbackQuery, state: FSMContext) -> No
         await callback.answer("Шаг не найден.", show_alert=True)
         return
 
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
     await state.clear()
-    await state.update_data(edit_step_id=step_id, edit_step_event_id=step.event_id)
+    await state.update_data(
+        edit_step_id=step_id,
+        edit_step_event_id=step.event_id,
+        event_list_back=list_back,
+    )
     await state.set_state(EventAdminStates.step_edit_text)
 
     await callback.message.edit_text(
@@ -1527,10 +1615,12 @@ async def process_edit_step_text(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     data = await state.get_data()
     step_id = data["edit_step_id"]
+    list_back = data.get("event_list_back", "admin_events")
 
     try:
         updated = await update_step(async_session_maker, step_id, message_text=text)
         await state.clear()
+        await state.update_data(event_list_back=list_back)
         scen = await get_scenario_summary(async_session_maker, updated.event_id)
         assert scen is not None
         all_steps = await list_steps(async_session_maker, updated.event_id, include_archived=False)
@@ -1540,7 +1630,14 @@ async def process_edit_step_text(message: Message, state: FSMContext) -> None:
             f"✅ Текст шага обновлен (новая версия: v{updated.step_version})!\n\n"
             f"<blockquote>{html.escape(updated.message_text)}</blockquote>",
             parse_mode="HTML",
-            reply_markup=_step_card_keyboard(updated.event_id, updated, idx == 0, idx == len(all_steps) - 1, scen.is_archived),
+            reply_markup=_step_card_keyboard(
+                updated.event_id,
+                updated,
+                idx == 0,
+                idx == len(all_steps) - 1,
+                scen.is_archived,
+                back=list_back,
+            ),
         )
     except Exception as exc:
         await message.answer(f"❌ Ошибка: {exc}")
@@ -1554,8 +1651,14 @@ async def start_edit_step_offset(callback: CallbackQuery, state: FSMContext) -> 
         await callback.answer("Шаг не найден.", show_alert=True)
         return
 
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
     await state.clear()
-    await state.update_data(edit_step_id=step_id, edit_step_event_id=step.event_id)
+    await state.update_data(
+        edit_step_id=step_id,
+        edit_step_event_id=step.event_id,
+        event_list_back=list_back,
+    )
 
     await callback.message.edit_text(
         f"⏱ <b>Изменение времени отправки шага</b>\n\n"
@@ -1571,10 +1674,13 @@ async def process_edit_offset_preset(callback: CallbackQuery, state: FSMContext)
     parts = callback.data.split("_")
     step_id = int(parts[5])
     offset_val = int(parts[6])
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
 
     try:
         updated = await update_step(async_session_maker, step_id, offset_minutes=offset_val)
         await state.clear()
+        await state.update_data(event_list_back=list_back)
         scen = await get_scenario_summary(async_session_maker, updated.event_id)
         assert scen is not None
         all_steps = await list_steps(async_session_maker, updated.event_id, include_archived=False)
@@ -1583,7 +1689,14 @@ async def process_edit_offset_preset(callback: CallbackQuery, state: FSMContext)
         await callback.message.edit_text(
             f"✅ Время отправки обновлено: <b>{updated.offset_display}</b> (v{updated.step_version})",
             parse_mode="HTML",
-            reply_markup=_step_card_keyboard(updated.event_id, updated, idx == 0, idx == len(all_steps) - 1, scen.is_archived),
+            reply_markup=_step_card_keyboard(
+                updated.event_id,
+                updated,
+                idx == 0,
+                idx == len(all_steps) - 1,
+                scen.is_archived,
+                back=list_back,
+            ),
         )
     except Exception as exc:
         await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
@@ -1592,13 +1705,19 @@ async def process_edit_offset_preset(callback: CallbackQuery, state: FSMContext)
 @router.callback_query(F.data.startswith("admin_ev_step_edit_custom_"))
 async def start_edit_offset_custom(callback: CallbackQuery, state: FSMContext) -> None:
     step_id = int(callback.data.split("_")[-1])
-    await state.update_data(edit_step_id=step_id)
+    state_data = await state.get_data()
+    await state.update_data(
+        edit_step_id=step_id,
+        event_list_back=state_data.get("event_list_back", "admin_events"),
+    )
     await state.set_state(EventAdminStates.step_edit_offset_custom)
 
     await callback.message.edit_text(
         "⏱ Введите произвольное смещение (например: <code>-24h</code>, <code>-2h</code>, <code>0</code>, <code>+2h</code>, <code>-30m</code>):",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_step_{step_id}").as_markup(),
+        reply_markup=InlineKeyboardBuilder().button(
+            text="⬅️ Отмена", callback_data=f"admin_ev_step_{step_id}"
+        ).as_markup(),
     )
 
 
@@ -1607,11 +1726,13 @@ async def process_edit_offset_custom(message: Message, state: FSMContext) -> Non
     raw = (message.text or "").strip()
     data = await state.get_data()
     step_id = data["edit_step_id"]
+    list_back = data.get("event_list_back", "admin_events")
 
     try:
         offset = parse_offset_minutes(raw)
         updated = await update_step(async_session_maker, step_id, offset_minutes=offset)
         await state.clear()
+        await state.update_data(event_list_back=list_back)
         scen = await get_scenario_summary(async_session_maker, updated.event_id)
         assert scen is not None
         all_steps = await list_steps(async_session_maker, updated.event_id, include_archived=False)
@@ -1620,14 +1741,23 @@ async def process_edit_offset_custom(message: Message, state: FSMContext) -> Non
         await message.answer(
             f"✅ Время отправки обновлено: <b>{updated.offset_display}</b> (v{updated.step_version})",
             parse_mode="HTML",
-            reply_markup=_step_card_keyboard(updated.event_id, updated, idx == 0, idx == len(all_steps) - 1, scen.is_archived),
+            reply_markup=_step_card_keyboard(
+                updated.event_id,
+                updated,
+                idx == 0,
+                idx == len(all_steps) - 1,
+                scen.is_archived,
+                back=list_back,
+            ),
         )
     except Exception as exc:
         await message.answer(f"❌ Ошибка: {exc}")
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_up_"))
-async def step_move_up(callback: CallbackQuery) -> None:
+async def step_move_up(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     step_id = int(callback.data.split("_")[-1])
     step = await get_step_item(async_session_maker, step_id)
     if not step:
@@ -1641,11 +1771,13 @@ async def step_move_up(callback: CallbackQuery) -> None:
             ids[idx - 1], ids[idx] = ids[idx], ids[idx - 1]
             await reorder_steps(async_session_maker, step.event_id, ids)
             await callback.answer("Перемещено выше")
-    await _render_step_card_view(callback, step_id)
+    await _render_step_card_view(callback, step_id, back=list_back)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_down_"))
-async def step_move_down(callback: CallbackQuery) -> None:
+async def step_move_down(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     step_id = int(callback.data.split("_")[-1])
     step = await get_step_item(async_session_maker, step_id)
     if not step:
@@ -1659,11 +1791,11 @@ async def step_move_down(callback: CallbackQuery) -> None:
             ids[idx + 1], ids[idx] = ids[idx], ids[idx + 1]
             await reorder_steps(async_session_maker, step.event_id, ids)
             await callback.answer("Перемещено ниже")
-    await _render_step_card_view(callback, step_id)
+    await _render_step_card_view(callback, step_id, back=list_back)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_del_ask_"))
-async def ask_delete_step(callback: CallbackQuery) -> None:
+async def ask_delete_step(callback: CallbackQuery, state: FSMContext | None = None) -> None:
     step_id = int(callback.data.split("_")[-1])
     step = await get_step_item(async_session_maker, step_id)
     if not step:
@@ -1680,7 +1812,9 @@ async def ask_delete_step(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_del_yes_"))
-async def delete_step_yes(callback: CallbackQuery) -> None:
+async def delete_step_yes(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     step_id = int(callback.data.split("_")[-1])
     step = await get_step_item(async_session_maker, step_id)
     if not step:
@@ -1693,7 +1827,7 @@ async def delete_step_yes(callback: CallbackQuery) -> None:
     steps = await list_steps(async_session_maker, step.event_id, include_archived=False)
     await callback.message.edit_text(
         f"Шаг успешно удалён.\n\nВсего активных шагов: {len(steps)}",
-        reply_markup=_steps_list_keyboard(step.event_id, steps, scen.is_archived),
+        reply_markup=_steps_list_keyboard(step.event_id, steps, scen.is_archived, back=list_back),
     )
 
 
@@ -1893,15 +2027,17 @@ async def process_resolution_reason(message: Message, state: FSMContext) -> None
 # ==============================================================================
 
 @router.callback_query(F.data.startswith("admin_ev_test_send_menu_"))
-async def show_test_send_picker(callback: CallbackQuery) -> None:
+async def show_test_send_picker(callback: CallbackQuery, state: FSMContext | None = None) -> None:
     event_id = int(callback.data.split("_")[-1])
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     steps = await list_steps(async_session_maker, event_id, include_archived=False)
     await callback.message.edit_text(
         "🚀 <b>Тестовая отправка сообщения себе</b>\n\n"
         "Выберите сообщение для отправки. Бот отрендерит его с вашим именем "
         "и отправит в этот чат Telegram. Реальные пользователи и статус доставок не затрагиваются:",
         parse_mode="HTML",
-        reply_markup=_test_send_picker_keyboard(event_id, steps),
+        reply_markup=_test_send_picker_keyboard(event_id, steps, back=list_back),
     )
 
 
@@ -1914,17 +2050,19 @@ async def test_send_single_step(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     admin_user = callback.from_user
-    rendered = await render_test_step(
+    plan = await build_test_delivery_plan(
         async_session_maker,
-        event_id=step.event_id,
-        step_id=step.id,
-        admin_user=admin_user,  # type: ignore[arg-type]
+        step.event_id,
+        step.id,
+        admin_user,
+        header=f"🧪 <b>[ТЕСТОВОЕ НАПОМИНАНИЕ — {step.offset_display}]</b>",
     )
-
-    await bot.send_message(
-        chat_id=callback.message.chat.id,
-        text=f"🧪 <b>[ТЕСТОВОЕ НАПОМИНАНИЕ — {step.offset_display}]</b>\n\n{rendered}",
-        parse_mode="HTML",
+    await send_test_delivery_plan(
+        plan,
+        platform="telegram",
+        user_id=callback.message.chat.id,
+        event_id=step.event_id,
+        bot=bot,
     )
     await callback.answer("Тестовое сообщение отправлено в чат!")
 
@@ -1937,17 +2075,19 @@ async def do_test_send(callback: CallbackQuery, bot: Bot) -> None:
     target_step_id = None if step_id == 0 else step_id
 
     admin_user = callback.from_user
-    rendered = await render_test_step(
-        async_session_maker,
-        event_id=event_id,
-        step_id=target_step_id,
-        admin_user=admin_user,  # type: ignore[arg-type]
-    )
-
     header = "🧪 <b>[ТЕСТОВОЕ СООБЩЕНИЕ]</b>"
-    await bot.send_message(
-        chat_id=callback.message.chat.id,
-        text=f"{header}\n\n{rendered}",
-        parse_mode="HTML",
+    plan = await build_test_delivery_plan(
+        async_session_maker,
+        event_id,
+        target_step_id,
+        admin_user,
+        header=header,
+    )
+    await send_test_delivery_plan(
+        plan,
+        platform="telegram",
+        user_id=callback.message.chat.id,
+        event_id=event_id,
+        bot=bot,
     )
     await callback.answer("Тестовое сообщение отправлено в чат!")
