@@ -22,6 +22,7 @@ from event_service import (
     handle_event_callback_telegram,
     handle_event_start_max,
     handle_event_start_telegram,
+    cancel_event_registration,
     register_user_for_event,
     render_event_message,
 )
@@ -164,6 +165,107 @@ async def test_admin_force_retry_resumes_only_uncertain_part(session_factory):
     bot.send_message = AsyncMock(return_value=MagicMock(message_id=3))
     assert await process_single_delivery(session_factory, child.id, retry_claim[0][1], bot=bot, now=now + timedelta(seconds=1)) == "sent"
     assert bot.send_media_group.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_album_success_then_control_timeout_retries_only_control(session_factory):
+    now, delivery_id = await _setup_media_event(session_factory, description="Короткое описание")
+    async with session_factory() as session:
+        scenario = await session.get(EventScenario, 1)
+        scenario.media_order = "text_top"
+        await session.commit()
+
+    claimed = await claim_pending_deliveries(session_factory, batch_size=10, now=now)
+    bot = MagicMock()
+    bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=10), MagicMock(message_id=11)])
+    bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=12), PreTransmissionError("control timeout")])
+    assert await process_single_delivery(session_factory, delivery_id, claimed[0][1], bot=bot, now=now) == "pre_transmission_retry"
+    assert bot.send_media_group.await_count == 1
+    assert bot.send_message.await_count == 2
+
+    retry_now = now + timedelta(seconds=61)
+    retry_claim = await claim_pending_deliveries(session_factory, batch_size=10, now=retry_now)
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=13))
+    assert await process_single_delivery(session_factory, delivery_id, retry_claim[0][1], bot=bot, now=retry_now) == "sent"
+    assert bot.send_media_group.await_count == 1
+    assert bot.send_message.await_count == 1
+
+    async with session_factory() as session:
+        parts = (await session.execute(select(EventDeliveryPart).where(EventDeliveryPart.delivery_id == delivery_id).order_by(EventDeliveryPart.part_index))).scalars().all()
+        assert [part.status for part in parts] == ["sent", "sent", "sent"]
+
+
+@pytest.mark.asyncio
+async def test_registration_cancelled_between_parts_stops_remaining_delivery(session_factory):
+    now, delivery_id = await _setup_media_event(session_factory, description="Короткое описание")
+    claimed = await claim_pending_deliveries(session_factory, batch_size=10, now=now)
+    bot = MagicMock()
+
+    async def send_gallery(**kwargs):
+        await cancel_event_registration(session_factory, 9101, 1, now=now)
+        return [MagicMock(message_id=20), MagicMock(message_id=21)]
+
+    bot.send_media_group = AsyncMock(side_effect=send_gallery)
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=22))
+    outcome = await process_single_delivery(session_factory, delivery_id, claimed[0][1], bot=bot, now=now)
+    assert outcome == "pre_send_rejected:cancelled"
+    bot.send_message.assert_not_awaited()
+
+    async with session_factory() as session:
+        delivery = await session.get(EventDelivery, delivery_id)
+        parts = (await session.execute(select(EventDeliveryPart).where(EventDeliveryPart.delivery_id == delivery_id).order_by(EventDeliveryPart.part_index))).scalars().all()
+        registration = await session.get(EventRegistration, delivery.registration_id)
+        assert delivery.status == "skipped"
+        assert delivery.skip_reason == "cancelled"
+        assert [part.status for part in parts] == ["sent", "skipped"]
+        assert registration.status == "cancelled"
+
+
+@pytest.mark.parametrize(
+    ("resolution_type", "expected_part_status"),
+    [("mark_sent", "resolved_sent"), ("mark_skipped", "resolved_skipped")],
+)
+@pytest.mark.asyncio
+async def test_manual_resolution_targets_uncertain_part_and_resumes_remainder(
+    session_factory,
+    resolution_type,
+    expected_part_status,
+):
+    now, delivery_id = await _setup_media_event(session_factory, description="Короткое описание")
+    async with session_factory() as session:
+        scenario = await session.get(EventScenario, 1)
+        scenario.media_order = "text_top"
+        await session.commit()
+    claimed = await claim_pending_deliveries(session_factory, batch_size=10, now=now)
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=30))
+    bot.send_media_group = AsyncMock(side_effect=TimeoutError("gallery result unknown"))
+    assert await process_single_delivery(session_factory, delivery_id, claimed[0][1], bot=bot, now=now) == "uncertain"
+
+    async with session_factory() as session:
+        parts = (await session.execute(select(EventDeliveryPart).where(EventDeliveryPart.delivery_id == delivery_id).order_by(EventDeliveryPart.part_index))).scalars().all()
+        uncertain_part_id = parts[1].id
+
+    resolved, created = await resolve_uncertain_delivery(
+        session_factory,
+        delivery_id=delivery_id,
+        admin_id=999,
+        resolution_type=resolution_type,
+        resolution_reason="Проверка ручного разрешения части",
+        part_id=uncertain_part_id,
+    )
+    assert created is True
+    assert resolved.status == "pending"
+
+    async with session_factory() as session:
+        parts = (await session.execute(select(EventDeliveryPart).where(EventDeliveryPart.delivery_id == delivery_id).order_by(EventDeliveryPart.part_index))).scalars().all()
+        assert [part.status for part in parts] == ["sent", expected_part_status, "pending"]
+
+    retry_claim = await claim_pending_deliveries(session_factory, batch_size=10, now=now + timedelta(seconds=1))
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=31))
+    assert await process_single_delivery(session_factory, delivery_id, retry_claim[0][1], bot=bot, now=now + timedelta(seconds=1)) == "sent"
+    bot.send_media_group.assert_awaited_once()
+    assert bot.send_message.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -344,7 +446,7 @@ async def test_telegram_route_warns_when_max_origin_media_cannot_materialize(ses
         now=now,
     ) is True
     assert bot.send_media_group.await_count == 0
-    assert any("не удалось подготовить" in call.kwargs["text"] for call in bot.send_message.call_args_list)
+    assert any("Вложения из MAX" in call.kwargs["text"] for call in bot.send_message.call_args_list)
     async with session_factory() as session:
         delivery = await session.scalar(
             select(EventDelivery).where(

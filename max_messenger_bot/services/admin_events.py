@@ -38,6 +38,7 @@ from event_admin_service import (
     get_scenario_summary,
     get_step_item,
     list_problem_deliveries,
+    list_delivery_parts,
     list_scenario_media,
     list_scenarios,
     list_steps,
@@ -652,9 +653,14 @@ def _media_editor_keyboard(event_id: int, draft: list[dict[str, Any]]) -> list[l
 
 
 async def show_media_editor(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
-    media = await list_scenario_media(async_session_maker, event_id)
-    draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
-    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": event_id, "media_draft": draft})
+    snapshot = await states.get(user_id)
+    preserve_draft = snapshot and snapshot.state in {"max_event_edit_media", "max_event_edit_media_add"} and snapshot.data.get("event_id") == event_id and snapshot.data.get("media_draft_dirty") and isinstance(snapshot.data.get("media_draft"), list)
+    if preserve_draft:
+        draft = list(snapshot.data["media_draft"])
+    else:
+        media = await list_scenario_media(async_session_maker, event_id)
+        draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
+    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": event_id, "media_draft": draft, "media_draft_dirty": bool(preserve_draft)})
     await client.send_message(
         chat_id=chat_id,
         text=f"🖼 <b>Медиа мероприятия</b>\n\nВ черновике: <b>{len(draft)}</b>. Отправьте медиа после кнопки добавления и сохраните изменения.",
@@ -665,7 +671,7 @@ async def show_media_editor(client: MaxApiClient, states: StateStore, chat_id: i
 async def start_add_media(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
     snapshot = await states.get(user_id)
     draft = snapshot.data.get("media_draft", []) if snapshot else []
-    await states.set(user_id, chat_id, "max_event_edit_media_add", {"event_id": event_id, "media_draft": draft})
+    await states.set(user_id, chat_id, "max_event_edit_media_add", {"event_id": event_id, "media_draft": draft, "media_draft_dirty": snapshot.data.get("media_draft_dirty", False) if snapshot else False})
     await client.send_message(chat_id=chat_id, text="🖼 Отправьте фото или видео одним сообщением.", attachments=inline_keyboard([_back(f"admin_ev_edit_media_{event_id}")]))
 
 
@@ -676,7 +682,7 @@ async def receive_media(client: MaxApiClient, states: StateStore, chat_id: int, 
         return
     draft = list(snapshot.data.get("media_draft", []))
     draft.append({"file_type": "photo" if media_type == "image" else media_type, "file_id": media_token, "max_token": media_token, "source_platform": "max"})
-    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": snapshot.data["event_id"], "media_draft": draft})
+    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": snapshot.data["event_id"], "media_draft": draft, "media_draft_dirty": True})
     await client.send_message(chat_id=chat_id, text=f"✅ Медиа добавлено. В черновике: {len(draft)}.", attachments=inline_keyboard(_media_editor_keyboard(snapshot.data["event_id"], draft)))
 
 
@@ -700,7 +706,7 @@ async def mutate_media_draft(
             target = index + direction
             if 0 <= target < len(draft):
                 draft[index], draft[target] = draft[target], draft[index]
-    await states.update(user_id, media_draft=draft)
+    await states.update(user_id, media_draft=draft, media_draft_dirty=True)
     await client.send_message(chat_id=chat_id, text=f"🖼 В черновике: {len(draft)}.", attachments=inline_keyboard(_media_editor_keyboard(event_id, draft)))
 
 
@@ -1380,11 +1386,27 @@ async def show_problem_detail(client: MaxApiClient, chat_id: int, delivery_id: i
         await client.send_message(chat_id=chat_id, text="Доставка не найдена.")
         return
 
+    parts = await list_delivery_parts(async_session_maker, delivery_id)
     rows = []
     if it.status == "uncertain":
-        rows.append([callback_button("🔄 Повторить отправку (Force Retry)", f"admin_ev_resolve_force_{it.id}")])
-        rows.append([callback_button("✅ Отметить отправленным (Mark Sent)", f"admin_ev_resolve_sent_{it.id}")])
-        rows.append([callback_button("⏭ Отметить пропущенным (Mark Skipped)", f"admin_ev_resolve_skipped_{it.id}")])
+        uncertain_parts = [part for part in parts if part.status == "uncertain"]
+        if uncertain_parts:
+            for part in uncertain_parts:
+                suffix = f"_{part.id}"
+                rows.append([callback_button(f"🔄 Часть {part.part_index + 1}: повторить", f"admin_ev_resolve_force_{it.id}{suffix}")])
+                rows.append([callback_button(f"✅ Часть {part.part_index + 1}: доставлено", f"admin_ev_resolve_sent_{it.id}{suffix}")])
+                rows.append([callback_button(f"⏭ Часть {part.part_index + 1}: пропустить", f"admin_ev_resolve_skipped_{it.id}{suffix}")])
+        else:
+            rows.append([callback_button("🔄 Повторить отправку (Force Retry)", f"admin_ev_resolve_force_{it.id}")])
+            rows.append([callback_button("✅ Отметить отправленным (Mark Sent)", f"admin_ev_resolve_sent_{it.id}")])
+            rows.append([callback_button("⏭ Отметить пропущенным (Mark Skipped)", f"admin_ev_resolve_skipped_{it.id}")])
+
+    part_lines = ""
+    if parts:
+        part_lines = "\n" + "".join(
+            f"• Часть {part.part_index + 1}: <b>{part.part_kind}</b> — <b>{part.status}</b>\n"
+            for part in parts
+        )
 
     rows.append(_back(f"admin_ev_problems_{it.event_id}_0"))
 
@@ -1398,6 +1420,7 @@ async def show_problem_detail(client: MaxApiClient, chat_id: int, delivery_id: i
         f"• Попыток: {it.attempt_count}\n"
         f"• Индекс retry: {it.retry_index}\n"
         f"• Ошибка:\n<code>{html.escape(it.last_error or '—')}</code>"
+        f"{part_lines}"
     )
 
     await client.send_message(
@@ -1414,6 +1437,7 @@ async def start_resolve(
     user_id: int,
     delivery_id: int,
     action: str,
+    part_id: int | None = None,
 ) -> None:
     type_map = {
         "force": ("force_retry", "Повторная отправка"),
@@ -1425,7 +1449,7 @@ async def start_resolve(
         user_id,
         chat_id,
         "max_event_resolve_reason",
-        {"delivery_id": delivery_id, "res_type": res_type},
+        {"delivery_id": delivery_id, "res_type": res_type, "part_id": part_id},
     )
 
     await client.send_message(
@@ -1454,6 +1478,7 @@ async def receive_resolve_reason(
     state_obj = await states.get(user_id)
     delivery_id = state_obj.data["delivery_id"]
     res_type = state_obj.data["res_type"]
+    part_id = state_obj.data.get("part_id")
 
     try:
         deliv, ok = await resolve_uncertain_delivery(
@@ -1462,6 +1487,7 @@ async def receive_resolve_reason(
             admin_id=user_id,
             resolution_type=res_type,
             resolution_reason=reason,
+            part_id=part_id,
         )
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text=f"✅ Доставка ID {delivery_id} успешно разрешена ({deliv.status})!")

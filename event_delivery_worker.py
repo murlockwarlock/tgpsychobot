@@ -215,7 +215,7 @@ def _build_delivery_plan(
     else:
         text_parts = [{"kind": "text", "text": chunk} for chunk in text_chunks]
         plan = media_parts + text_parts if scenario.media_order == "media_top" else text_parts + media_parts
-    if not text_chunks:
+    if media and (not text_chunks or scenario.media_order == "text_top"):
         plan.append({"kind": "control", "text": ""})
     return plan
 
@@ -292,7 +292,7 @@ async def _claim_delivery_part(
     parent_claim_token: str,
     content_version: int,
     now: datetime,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     token = secrets.token_hex(24)
     async with session_maker() as session:
         bind = session.get_bind()
@@ -301,6 +301,29 @@ async def _claim_delivery_part(
             await session.execute(text("BEGIN IMMEDIATE"))
         else:
             await session.begin()
+
+        parent_probe = await session.scalar(select(EventDelivery).where(EventDelivery.id == delivery_id))
+        if not parent_probe:
+            await session.rollback()
+            return None, None
+
+        scenario_stmt = select(EventScenario).where(EventScenario.id == parent_probe.event_id)
+        if is_postgres:
+            scenario_stmt = scenario_stmt.with_for_update(read=True)
+        scenario = await session.scalar(scenario_stmt)
+
+        registration_stmt = select(EventRegistration).where(EventRegistration.id == parent_probe.registration_id)
+        if is_postgres:
+            registration_stmt = registration_stmt.with_for_update()
+        registration = await session.scalar(registration_stmt)
+
+        step = None
+        if parent_probe.step_id is not None:
+            step_stmt = select(EventStep).where(EventStep.id == parent_probe.step_id)
+            if is_postgres:
+                step_stmt = step_stmt.with_for_update(read=True)
+            step = await session.scalar(step_stmt)
+
         parent_stmt = select(EventDelivery).where(EventDelivery.id == delivery_id)
         if is_postgres:
             parent_stmt = parent_stmt.with_for_update()
@@ -312,7 +335,64 @@ async def _claim_delivery_part(
             or parent.content_version_snapshot != content_version
         ):
             await session.rollback()
-            return None
+            return None, None
+
+        rejection_reason: str | None = None
+        if not scenario or scenario.is_archived:
+            rejection_reason = "scenario_archived"
+        elif not registration or registration.status != "started" or registration.generation != parent.registration_generation:
+            rejection_reason = "cancelled"
+        elif not scenario.is_active:
+            rejection_reason = "disabled_past"
+        elif scenario.schedule_revision != parent.schedule_revision:
+            rejection_reason = "schedule_rescheduled"
+        elif parent.content_version_snapshot != scenario.content_version:
+            rejection_reason = "content_changed"
+        elif parent.step_id is not None and (not step or step.is_archived):
+            rejection_reason = "step_archived"
+        elif parent.expires_at and parent.expires_at <= now:
+            rejection_reason = "expired"
+        elif not parent.lease_until or parent.lease_until <= now:
+            rejection_reason = "lease_expired"
+        elif parent.due_at > now or parent.next_attempt_at > now:
+            await session.rollback()
+            return None, None
+
+        if rejection_reason is not None:
+            sending_part = await session.scalar(
+                select(EventDeliveryPart.id).where(
+                    EventDeliveryPart.delivery_id == delivery_id,
+                    EventDeliveryPart.status == "sending",
+                ).limit(1)
+            )
+            parent_status = "uncertain" if rejection_reason == "lease_expired" or sending_part else "skipped"
+            await session.execute(
+                update(EventDeliveryPart)
+                .where(
+                    EventDeliveryPart.delivery_id == delivery_id,
+                    EventDeliveryPart.status == "pending",
+                )
+                .values(
+                    status="skipped",
+                    finished_at=now,
+                    claim_token=None,
+                    lease_until=None,
+                    send_started_at=None,
+                    last_error=f"Delivery stopped before next part: {rejection_reason}.",
+                    updated_at=now,
+                )
+            )
+            parent.status = parent_status
+            parent.skip_reason = rejection_reason if parent_status == "skipped" else None
+            parent.finished_at = now
+            parent.last_error = f"Delivery stopped before next part: {rejection_reason}."
+            parent.claim_token = None
+            parent.lease_until = None
+            parent.send_started_at = None
+            parent.claimed_at = None
+            parent.updated_at = now
+            await session.commit()
+            return None, rejection_reason
         stmt = (
             update(EventDeliveryPart)
             .where(
@@ -333,7 +413,7 @@ async def _claim_delivery_part(
         )
         result = await session.execute(stmt)
         await session.commit()
-        return token if result.rowcount == 1 else None
+        return (token, None) if result.rowcount == 1 else (None, None)
 
 
 async def _finish_delivery_part(
@@ -448,13 +528,6 @@ async def _send_delivery_part(
             else:
                 media.append(InputMediaVideo(media=media_reference))
         messages = await bot.send_media_group(chat_id=user_id, media=media)
-        if is_last:
-            control = await bot.send_message(
-                chat_id=user_id,
-                text="Управление мероприятием:",
-                reply_markup=markup,
-            )
-            return str(getattr(control, "message_id", ""))
         return ",".join(str(getattr(message, "message_id", "")) for message in messages)
 
     if platform == "max":
@@ -1074,7 +1147,7 @@ async def process_single_delivery(
                     now=now,
                 )
                 return "uncertain"
-            part_token = await _claim_delivery_part(
+            part_token, claim_rejection = await _claim_delivery_part(
                 session_maker,
                 delivery_id,
                 part.id,
@@ -1083,6 +1156,8 @@ async def process_single_delivery(
                 send_started,
             )
             if not part_token:
+                if claim_rejection:
+                    return f"pre_send_rejected:{claim_rejection}"
                 part_claim_lost = True
                 continue
             try:

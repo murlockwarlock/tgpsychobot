@@ -1737,12 +1737,17 @@ async def handle_event_start_telegram(
                 now=now,
             )
             if outcome == "pre_transmission_retry":
+                async with sm() as status_session:
+                    failed_delivery = await status_session.get(EventDelivery, reg_res.immediate_delivery.id)
+                warning_text = (
+                    "Регистрация сохранена. Вложения из MAX пока не удалось подготовить для Telegram; "
+                    "мы повторим отправку автоматически."
+                    if failed_delivery and "MAX-origin" in (failed_delivery.last_error or "")
+                    else "Регистрация сохранена. Вложения пока не удалось подготовить; мы повторим отправку автоматически."
+                )
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=(
-                        "Регистрация сохранена. Вложения пока не удалось подготовить; "
-                        "мы повторим отправку автоматически."
-                    ),
+                    text=warning_text,
                     parse_mode="HTML",
                     reply_markup=markup,
                 )

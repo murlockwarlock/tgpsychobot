@@ -21,6 +21,8 @@ from database import (
     User,
 )
 from max_messenger_bot.api import MaxApiClient
+from max_messenger_bot.app import MaxBotApplication
+from max_messenger_bot.models import IncomingCallback, Sender
 from max_messenger_bot.services import admin_events as max_admin_events
 from max_messenger_bot.storage import StateStore
 from time_helpers import utc_now
@@ -214,6 +216,77 @@ async def test_max_description_and_media_buttons_are_displayed(db_session_maker,
     assert (await states.get(456)).state == "max_event_edit_media_add"
     add_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
     assert add_buttons[0][0]["payload"] == f"admin_ev_edit_media_{scen.id}"
+
+
+@pytest.mark.asyncio
+async def test_max_media_back_preserves_draft_and_cancel_state_is_clear(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_media_back",
+        event_type="webinar",
+        title="MAX media back",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-media-back",
+    )
+
+    await max_admin_events.show_media_editor(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.start_add_media(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.receive_media(
+        mock_client,
+        states,
+        123,
+        456,
+        media_type="image",
+        media_token="draft-max-photo",
+    )
+    await max_admin_events.start_add_media(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.receive_media(
+        mock_client,
+        states,
+        123,
+        456,
+        media_type="image",
+        media_token="draft-max-photo-2",
+    )
+    snapshot = await states.get(456)
+    assert snapshot.state == "max_event_edit_media"
+    assert len(snapshot.data["media_draft"]) == 2
+
+    await max_admin_events.start_add_media(mock_client, states, 123, 456, scen.id)
+    await max_admin_events.show_media_editor(mock_client, states, 123, 456, scen.id)
+    media_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+    media_payloads = [button["payload"] for row in media_buttons for button in row]
+    assert f"admin_ev_media_remove_{scen.id}_0" in media_payloads
+    assert f"admin_ev_media_remove_{scen.id}_1" in media_payloads
+
+    await states.clear(456)
+    await max_admin_events.show_media_editor(mock_client, states, 123, 456, scen.id)
+    snapshot = await states.get(456)
+    assert snapshot.state == "max_event_edit_media"
+    assert snapshot.data["media_draft"] == []
+
+
+@pytest.mark.asyncio
+async def test_max_media_cancel_route_clears_unsaved_draft(states, mock_client, monkeypatch):
+    app = MaxBotApplication(mock_client)
+    app.states = states
+    monkeypatch.setattr("max_messenger_bot.app.common.is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr("max_messenger_bot.app.admin_events_service.show_edit_menu", AsyncMock())
+    await states.set(456, 123, "max_event_edit_media", {"event_id": 77, "media_draft": [{"file_type": "photo"}], "media_draft_dirty": True})
+
+    callback = IncomingCallback(
+        raw={},
+        callback_id="cancel-media",
+        payload="admin_ev_edit_menu_77",
+        chat_id=123,
+        message_id=None,
+        sender=Sender(user_id=456, username="admin", first_name="Admin", last_name=None),
+    )
+    await app._handle_callback_impl(callback)
+    assert await states.get(456) is None
 
 
 @pytest.mark.asyncio

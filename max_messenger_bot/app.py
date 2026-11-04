@@ -1992,6 +1992,7 @@ class MaxBotApplication:
                 await admin_events_service.skip_meeting_link(self.client, self.states, chat_id, user_id)
                 return
             if data.startswith("admin_ev_edit_menu_"):
+                await self.states.clear(user_id)
                 event_id = int(data.split("_")[-1])
                 await admin_events_service.show_edit_menu(self.client, chat_id, event_id)
                 return
@@ -2125,7 +2126,8 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ev_resolve_"):
                 parts = data.split("_")
-                await admin_events_service.start_resolve(self.client, self.states, chat_id, user_id, int(parts[4]), parts[3])
+                part_id = int(parts[5]) if len(parts) > 5 else None
+                await admin_events_service.start_resolve(self.client, self.states, chat_id, user_id, int(parts[4]), parts[3], part_id)
                 return
             if data.startswith("admin_ev_test_send_menu_"):
                 event_id = int(data.split("_")[-1])

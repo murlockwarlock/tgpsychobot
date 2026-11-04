@@ -224,6 +224,17 @@ class DeliveryItem:
     parent_delivery_id: int | None
 
 
+@dataclass(frozen=True)
+class DeliveryPartItem:
+    id: int
+    part_index: int
+    part_kind: str
+    status: str
+    attempt_count: int
+    last_error: str | None
+    external_message_id: str | None
+
+
 # ==============================================================================
 # DATETIME & OFFSET HELPERS
 # ==============================================================================
@@ -1726,6 +1737,32 @@ async def get_delivery_item(
         )
 
 
+async def list_delivery_parts(
+    session_maker: async_sessionmaker[AsyncSession],
+    delivery_id: int,
+) -> list[DeliveryPartItem]:
+    async with session_maker() as session:
+        parts = (
+            await session.execute(
+                select(EventDeliveryPart)
+                .where(EventDeliveryPart.delivery_id == delivery_id)
+                .order_by(EventDeliveryPart.part_index.asc())
+            )
+        ).scalars().all()
+        return [
+            DeliveryPartItem(
+                id=part.id,
+                part_index=part.part_index,
+                part_kind=part.part_kind,
+                status=part.status,
+                attempt_count=part.attempt_count,
+                last_error=part.last_error,
+                external_message_id=part.external_message_id,
+            )
+            for part in parts
+        ]
+
+
 # ==============================================================================
 # MANUAL RESOLUTION
 # ==============================================================================
@@ -1736,6 +1773,7 @@ async def resolve_uncertain_delivery(
     admin_id: int,
     resolution_type: str,
     resolution_reason: str,
+    part_id: int | None = None,
 ) -> tuple[EventDelivery, bool]:
     """
     Manually resolves an uncertain event delivery.
@@ -1804,23 +1842,59 @@ async def resolve_uncertain_delivery(
 
         now = utc_now()
         target_status = "resolved_sent" if resolution_type == "mark_sent" else "resolved_skipped"
-        delivery.status = target_status
-        if resolution_type == "mark_skipped":
-            delivery.skip_reason = "manual_resolution"
-        delivery.finished_at = now
-        delivery.updated_at = now
-        part_status = "resolved_sent" if resolution_type == "mark_sent" else "resolved_skipped"
-        part_stmt = select(EventDeliveryPart).where(
-            EventDeliveryPart.delivery_id == delivery.id,
-            EventDeliveryPart.status.in_(("pending", "sending", "uncertain")),
+        part_status = target_status
+        part_stmt = (
+            select(EventDeliveryPart)
+            .where(EventDeliveryPart.delivery_id == delivery.id)
+            .order_by(EventDeliveryPart.part_index.asc())
         )
+        if is_postgres:
+            part_stmt = part_stmt.with_for_update()
         parts = (await session.execute(part_stmt)).scalars().all()
-        for part in parts:
-            part.status = part_status
-            part.finished_at = now
-            part.claim_token = None
-            part.lease_until = None
-            part.updated_at = now
+        uncertain_parts = [part for part in parts if part.status == "uncertain"]
+        if uncertain_parts:
+            target_part = next((part for part in uncertain_parts if part.id == part_id), None) if part_id else uncertain_parts[0]
+            if target_part is None:
+                raise ValueError(f"Часть доставки {part_id} не находится в статусе uncertain.")
+            target_part.status = part_status
+            target_part.finished_at = now
+            target_part.sent_at = now if resolution_type == "mark_sent" else target_part.sent_at
+            target_part.claim_token = None
+            target_part.lease_until = None
+            target_part.send_started_at = None
+            target_part.updated_at = now
+
+            remaining_uncertain = any(part.status == "uncertain" for part in parts)
+            remaining_sending = any(part.status == "sending" for part in parts)
+            remaining_active = any(part.status in {"pending", "sending", "uncertain"} for part in parts)
+            delivery.claim_token = None
+            delivery.lease_until = None
+            delivery.claimed_at = None
+            delivery.send_started_at = None
+            delivery.updated_at = now
+            if remaining_uncertain or remaining_sending:
+                delivery.status = "uncertain"
+                delivery.finished_at = None
+                delivery.skip_reason = None
+                delivery.last_error = "Часть доставки разрешена вручную; ожидаются остальные uncertain-части."
+            elif remaining_active:
+                delivery.status = "pending"
+                delivery.finished_at = None
+                delivery.skip_reason = None
+                delivery.next_attempt_at = now
+                delivery.last_error = "Часть доставки разрешена вручную; оставшиеся части возобновлены."
+            else:
+                delivery.status = target_status
+                delivery.finished_at = now
+                delivery.skip_reason = "manual_resolution" if resolution_type == "mark_skipped" else None
+        else:
+            if parts or part_id is not None:
+                raise ValueError("У uncertain-доставки нет разрешаемой uncertain-части.")
+            delivery.status = target_status
+            if resolution_type == "mark_skipped":
+                delivery.skip_reason = "manual_resolution"
+            delivery.finished_at = now
+            delivery.updated_at = now
 
         resolution = EventDeliveryResolution(
             delivery_id=delivery.id,

@@ -28,6 +28,7 @@ import event_admin_telegram
 from event_admin_telegram import router as event_admin_router
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from time_helpers import utc_now
+from event_admin_service import DeliveryItem, DeliveryPartItem
 
 
 @pytest_asyncio.fixture
@@ -242,6 +243,82 @@ async def test_telegram_description_and_media_buttons_are_displayed(db_session_m
     assert await state.get_state() == event_admin_telegram.EventAdminStates.edit_media_add.state
     add_markup = add_callback.message.edit_text.call_args.kwargs["reply_markup"]
     assert add_markup.inline_keyboard[0][0].callback_data == f"admin_ev_edit_media_{scen.id}"
+
+
+@pytest.mark.asyncio
+async def test_telegram_media_back_preserves_draft_and_cancel_discards_it(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_media_back",
+        event_type="webinar",
+        title="Media back",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/media-back",
+    )
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
+
+    await event_admin_telegram.start_edit_media(_make_callback(f"admin_ev_edit_media_{scen.id}"), state)
+    await event_admin_telegram.start_add_media(_make_callback(f"admin_ev_media_add_{scen.id}"), state)
+    media_message = _make_message("")
+    media_message.text = None
+    media_message.caption = None
+    media_message.photo = [SimpleNamespace(file_id="draft-photo")]
+    media_message.video = None
+    await event_admin_telegram.receive_media(media_message, state)
+
+    back_callback = _make_callback(f"admin_ev_edit_media_{scen.id}")
+    await event_admin_telegram.start_edit_media(back_callback, state)
+    back_markup = back_callback.message.edit_text.call_args.kwargs["reply_markup"]
+    back_payloads = [button.callback_data for row in back_markup.inline_keyboard for button in row]
+    assert f"admin_ev_media_remove_{scen.id}_0" in back_payloads
+    assert await state.get_state() == event_admin_telegram.EventAdminStates.edit_media.state
+
+    await event_admin_telegram.show_edit_menu(_make_callback(f"admin_ev_edit_menu_{scen.id}"), state)
+    assert await state.get_state() is None
+    reopen_callback = _make_callback(f"admin_ev_edit_media_{scen.id}")
+    await event_admin_telegram.start_edit_media(reopen_callback, state)
+    reopened_markup = reopen_callback.message.edit_text.call_args.kwargs["reply_markup"]
+    reopened_payloads = [button.callback_data for row in reopened_markup.inline_keyboard for button in row]
+    assert f"admin_ev_media_remove_{scen.id}_0" not in reopened_payloads
+
+
+def test_telegram_uncertain_resolution_buttons_target_specific_part():
+    item = DeliveryItem(
+        id=41,
+        event_id=7,
+        user_id=9,
+        user_display="User",
+        message_kind="immediate_confirmation",
+        step_id=None,
+        status="uncertain",
+        due_at_msk="04.11.2026 12:00",
+        attempt_count=1,
+        last_error="timeout",
+        sent_or_finished_msk=None,
+        platform="telegram",
+        retry_index=0,
+        parent_delivery_id=None,
+    )
+    part = DeliveryPartItem(
+        id=99,
+        part_index=1,
+        part_kind="media",
+        status="uncertain",
+        attempt_count=1,
+        last_error="timeout",
+        external_message_id=None,
+    )
+    markup = event_admin_telegram._delivery_resolution_keyboard(item, [part])
+    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert callbacks[:3] == [
+        "admin_ev_resolve_force_41_99",
+        "admin_ev_resolve_sent_41_99",
+        "admin_ev_resolve_skipped_41_99",
+    ]
 
 
 @pytest.mark.asyncio

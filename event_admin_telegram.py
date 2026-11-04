@@ -30,6 +30,7 @@ from event_admin_service import (
     PRESET_OFFSETS,
     PROBLEM_DELIVERY_STATUSES,
     DeliveryItem,
+    DeliveryPartItem,
     DeliveryStats,
     ScenarioSummary,
     StepItem,
@@ -45,6 +46,7 @@ from event_admin_service import (
     get_scenario_summary,
     get_step_item,
     list_problem_deliveries,
+    list_delivery_parts,
     list_scenario_media,
     list_scenarios,
     list_steps,
@@ -341,13 +343,21 @@ def _problem_deliveries_keyboard(
     return builder.as_markup()
 
 
-def _delivery_resolution_keyboard(item: DeliveryItem) -> Any:
+def _delivery_resolution_keyboard(item: DeliveryItem, parts: list[DeliveryPartItem] | None = None) -> Any:
     builder = InlineKeyboardBuilder()
 
     if item.status == "uncertain":
-        builder.button(text="🔄 Повторить отправку (Force Retry)", callback_data=f"admin_ev_resolve_force_{item.id}")
-        builder.button(text="✅ Отметить отправленным (Mark Sent)", callback_data=f"admin_ev_resolve_sent_{item.id}")
-        builder.button(text="⏭ Отметить пропущенным (Mark Skipped)", callback_data=f"admin_ev_resolve_skipped_{item.id}")
+        uncertain_parts = [part for part in (parts or []) if part.status == "uncertain"]
+        if uncertain_parts:
+            for part in uncertain_parts:
+                suffix = f"_{part.id}"
+                builder.button(text=f"🔄 Часть {part.part_index + 1}: повторить", callback_data=f"admin_ev_resolve_force_{item.id}{suffix}")
+                builder.button(text=f"✅ Часть {part.part_index + 1}: доставлено", callback_data=f"admin_ev_resolve_sent_{item.id}{suffix}")
+                builder.button(text=f"⏭ Часть {part.part_index + 1}: пропустить", callback_data=f"admin_ev_resolve_skipped_{item.id}{suffix}")
+        else:
+            builder.button(text="🔄 Повторить отправку (Force Retry)", callback_data=f"admin_ev_resolve_force_{item.id}")
+            builder.button(text="✅ Отметить отправленным (Mark Sent)", callback_data=f"admin_ev_resolve_sent_{item.id}")
+            builder.button(text="⏭ Отметить пропущенным (Mark Skipped)", callback_data=f"admin_ev_resolve_skipped_{item.id}")
 
     builder.button(text="⬅️ К списку проблемных", callback_data=f"admin_ev_problems_{item.event_id}_0")
     builder.adjust(1)
@@ -1013,10 +1023,16 @@ async def _render_media_editor(message: Message, event_id: int, state: FSMContex
 @router.callback_query(F.data.startswith("admin_ev_edit_media_"))
 async def start_edit_media(callback: CallbackQuery, state: FSMContext) -> None:
     event_id = int(callback.data.split("_")[-1])
-    media = await list_scenario_media(async_session_maker, event_id)
-    draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
+    current_state = await state.get_state()
+    state_data = await state.get_data()
+    preserve_draft = current_state in {EventAdminStates.edit_media.state, EventAdminStates.edit_media_add.state} and state_data.get("edit_event_id") == event_id and state_data.get("media_draft_dirty") and isinstance(state_data.get("media_draft"), list)
+    if preserve_draft:
+        draft = list(state_data["media_draft"])
+    else:
+        media = await list_scenario_media(async_session_maker, event_id)
+        draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
     await state.clear()
-    await state.update_data(edit_event_id=event_id, media_draft=draft)
+    await state.update_data(edit_event_id=event_id, media_draft=draft, media_draft_dirty=preserve_draft)
     await state.set_state(EventAdminStates.edit_media)
     await _render_media_editor(callback.message, event_id, state)
 
@@ -1048,7 +1064,7 @@ async def receive_media(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     draft = list(data.get("media_draft", []))
     draft.append({"file_type": file_type, "file_id": file_id, "max_token": None, "source_platform": "telegram"})
-    await state.update_data(media_draft=draft)
+    await state.update_data(media_draft=draft, media_draft_dirty=True)
     await state.set_state(EventAdminStates.edit_media)
     await _render_media_editor(message, data["edit_event_id"], state, edit=False)
 
@@ -1066,7 +1082,7 @@ async def _mutate_media_draft(callback: CallbackQuery, state: FSMContext, direct
             target = index + direction
             if 0 <= target < len(draft):
                 draft[index], draft[target] = draft[target], draft[index]
-    await state.update_data(media_draft=draft)
+    await state.update_data(media_draft=draft, media_draft_dirty=True)
     await _render_media_editor(callback.message, event_id, state)
 
 
@@ -1735,6 +1751,13 @@ async def open_problem_delivery(callback: CallbackQuery) -> None:
     if not item:
         await callback.answer("Доставка не найдена.", show_alert=True)
         return
+    parts = await list_delivery_parts(async_session_maker, delivery_id)
+    part_lines = ""
+    if parts:
+        part_lines = "• <b>Части:</b>\n" + "".join(
+            f"  {part.part_index + 1}. {part.part_kind} — <b>{part.status}</b>" + (f" — {html.escape(part.last_error[:80])}" if part.last_error else "") + "\n"
+            for part in parts
+        )
 
     text = (
         f"🔍 <b>Детали доставки ID {item.id}</b>\n\n"
@@ -1749,12 +1772,13 @@ async def open_problem_delivery(callback: CallbackQuery) -> None:
         f"• <b>Родительская доставка:</b> {item.parent_delivery_id or '—'}\n"
         f"• <b>Последняя ошибка:</b>\n"
         f"<code>{html.escape(item.last_error or '—')}</code>\n"
+        f"{part_lines}"
     )
 
     await callback.message.edit_text(
         text,
         parse_mode="HTML",
-        reply_markup=_delivery_resolution_keyboard(item),
+        reply_markup=_delivery_resolution_keyboard(item, parts),
     )
 
 
@@ -1764,6 +1788,7 @@ async def prompt_resolution_reason(callback: CallbackQuery, state: FSMContext) -
     parts = callback.data.split("_")
     action_type = parts[3]  # 'force', 'sent', 'skipped'
     delivery_id = int(parts[4])
+    part_id = int(parts[5]) if len(parts) > 5 else None
 
     type_map = {
         "force": ("force_retry", "Повторная отправка (Force Retry)"),
@@ -1773,7 +1798,7 @@ async def prompt_resolution_reason(callback: CallbackQuery, state: FSMContext) -
     res_type, title = type_map[action_type]
 
     await state.clear()
-    await state.update_data(res_delivery_id=delivery_id, res_type=res_type)
+    await state.update_data(res_delivery_id=delivery_id, res_type=res_type, res_part_id=part_id)
     await state.set_state(EventAdminStates.resolve_reason)
 
     warning = "⚠️ Повторная отправка может привести к дублю части медиа, если провайдер уже принял запрос.\n\n" if res_type == "force_retry" else ""
@@ -1797,6 +1822,7 @@ async def process_resolution_reason(message: Message, state: FSMContext) -> None
     data = await state.get_data()
     delivery_id = data["res_delivery_id"]
     res_type = data["res_type"]
+    part_id = data.get("res_part_id")
     admin_id = message.from_user.id if message.from_user else 0
 
     try:
@@ -1806,16 +1832,18 @@ async def process_resolution_reason(message: Message, state: FSMContext) -> None
             admin_id=admin_id,
             resolution_type=res_type,
             resolution_reason=reason,
+            part_id=part_id,
         )
         await state.clear()
         updated_item = await get_delivery_item(async_session_maker, delivery_id)
         assert updated_item is not None
 
+        updated_parts = await list_delivery_parts(async_session_maker, delivery_id)
         await message.answer(
             f"✅ Доставка ID {delivery_id} успешно разрешена ({res_type})!\n"
             f"Текущий статус: <b>{updated_item.status}</b>",
             parse_mode="HTML",
-            reply_markup=_delivery_resolution_keyboard(updated_item),
+            reply_markup=_delivery_resolution_keyboard(updated_item, updated_parts),
         )
     except Exception as exc:
         log.exception("Resolution failed: %s", exc)
