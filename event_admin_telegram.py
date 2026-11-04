@@ -341,7 +341,7 @@ def _step_edit_offset_picker_keyboard(step_id: int) -> Any:
     return builder.as_markup()
 
 
-def _delivery_stats_keyboard(event_id: int, stats: DeliveryStats) -> Any:
+def _delivery_stats_keyboard(event_id: int, stats: DeliveryStats, back: str = "admin_events") -> Any:
     builder = InlineKeyboardBuilder()
     if stats.problematic_total > 0:
         builder.button(
@@ -349,7 +349,7 @@ def _delivery_stats_keyboard(event_id: int, stats: DeliveryStats) -> Any:
             callback_data=f"admin_ev_problems_{event_id}_0",
         )
     builder.button(text="🔄 Обновить", callback_data=f"admin_ev_stats_{event_id}")
-    builder.button(text="⬅️ Назад в мероприятие", callback_data=f"admin_ev_open_{event_id}")
+    builder.button(text="⬅️ Назад в мероприятие", callback_data=_event_open_callback(event_id, back))
     builder.adjust(1)
     return builder.as_markup()
 
@@ -366,7 +366,10 @@ def _problem_deliveries_keyboard(
     for item in items:
         status_icon = "❓" if item.status == "uncertain" else ("🛑" if item.status == "blocked" else "❌")
         btn_text = f"{status_icon} ID {item.id}: {item.user_display[:20]} ({item.status})"
-        builder.button(text=btn_text, callback_data=f"admin_ev_problem_item_{item.id}")
+        item_callback = f"admin_ev_problem_item_{item.id}"
+        if page > 0:
+            item_callback += f"_{page}"
+        builder.button(text=btn_text, callback_data=item_callback)
 
     builder.adjust(1)
 
@@ -382,7 +385,11 @@ def _problem_deliveries_keyboard(
     return builder.as_markup()
 
 
-def _delivery_resolution_keyboard(item: DeliveryItem, parts: list[DeliveryPartItem] | None = None) -> Any:
+def _delivery_resolution_keyboard(
+    item: DeliveryItem,
+    parts: list[DeliveryPartItem] | None = None,
+    problem_page: int = 0,
+) -> Any:
     builder = InlineKeyboardBuilder()
 
     if item.status == "uncertain":
@@ -398,7 +405,7 @@ def _delivery_resolution_keyboard(item: DeliveryItem, parts: list[DeliveryPartIt
             builder.button(text="✅ Отметить отправленным (Mark Sent)", callback_data=f"admin_ev_resolve_sent_{item.id}")
             builder.button(text="⏭ Отметить пропущенным (Mark Skipped)", callback_data=f"admin_ev_resolve_skipped_{item.id}")
 
-    builder.button(text="⬅️ К списку проблемных", callback_data=f"admin_ev_problems_{item.event_id}_0")
+    builder.button(text="⬅️ К списку проблемных", callback_data=f"admin_ev_problems_{item.event_id}_{problem_page}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -600,8 +607,10 @@ async def toggle_active_handler(callback: CallbackQuery, state: FSMContext | Non
 
 
 @router.callback_query(F.data.startswith("admin_ev_archive_ask_"))
-async def ask_archive_handler(callback: CallbackQuery) -> None:
+async def ask_archive_handler(callback: CallbackQuery, state: FSMContext | None = None) -> None:
     event_id = int(callback.data.split("_")[-1])
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     scen = await get_scenario_summary(async_session_maker, event_id)
     if not scen:
         await callback.answer("Мероприятие не найдено.", show_alert=True)
@@ -614,14 +623,16 @@ async def ask_archive_handler(callback: CallbackQuery) -> None:
         parse_mode="HTML",
         reply_markup=_confirm_keyboard(
             yes_cb=f"admin_ev_archive_yes_{event_id}",
-            no_cb=f"admin_ev_open_{event_id}",
+            no_cb=_event_open_callback(event_id, list_back),
         ),
     )
 
 
 @router.callback_query(F.data.startswith("admin_ev_archive_yes_"))
-async def archive_yes_handler(callback: CallbackQuery) -> None:
+async def archive_yes_handler(callback: CallbackQuery, state: FSMContext | None = None) -> None:
     event_id = int(callback.data.split("_")[-1])
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     try:
         await archive_scenario(async_session_maker, event_id)
         await callback.answer("Мероприятие архивировано.")
@@ -635,7 +646,7 @@ async def archive_yes_handler(callback: CallbackQuery) -> None:
         await callback.message.edit_text(
             _format_scenario_card_text(scen, bot_username=bot_username),
             parse_mode="HTML",
-            reply_markup=_scenario_card_keyboard(scen),
+            reply_markup=_scenario_card_keyboard(scen, list_back),
         )
 
 
@@ -1836,8 +1847,10 @@ async def delete_step_yes(callback: CallbackQuery, state: FSMContext | None = No
 # ==============================================================================
 
 @router.callback_query(F.data.startswith("admin_ev_stats_"))
-async def show_delivery_stats(callback: CallbackQuery) -> None:
+async def show_delivery_stats(callback: CallbackQuery, state: FSMContext | None = None) -> None:
     event_id = int(callback.data.split("_")[-1])
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     scen = await get_scenario_summary(async_session_maker, event_id)
     if not scen:
         await callback.answer("Мероприятие не найдено.", show_alert=True)
@@ -1871,7 +1884,7 @@ async def show_delivery_stats(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         "".join(status_lines),
         parse_mode="HTML",
-        reply_markup=_delivery_stats_keyboard(event_id, stats),
+        reply_markup=_delivery_stats_keyboard(event_id, stats, list_back),
     )
 
 
@@ -1914,8 +1927,18 @@ async def show_problem_deliveries(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("admin_ev_problem_item_"))
-async def open_problem_delivery(callback: CallbackQuery) -> None:
-    delivery_id = int(callback.data.split("_")[-1])
+async def open_problem_delivery(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    callback_parts = callback.data.split("_")
+    delivery_id = int(callback_parts[4])
+    problem_page = int(callback_parts[5]) if len(callback_parts) > 5 else 0
+    if state is not None:
+        state_data = await state.get_data()
+        if await state.get_state() == EventAdminStates.resolve_reason.state:
+            await state.clear()
+            restore_back = state_data.get("event_list_back") or state_data.get("res_event_list_back")
+            if restore_back:
+                await state.update_data(event_list_back=restore_back)
+        await state.update_data(problem_page=problem_page)
     item = await get_delivery_item(async_session_maker, delivery_id)
     if not item:
         await callback.answer("Доставка не найдена.", show_alert=True)
@@ -1947,7 +1970,7 @@ async def open_problem_delivery(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         text,
         parse_mode="HTML",
-        reply_markup=_delivery_resolution_keyboard(item, parts),
+        reply_markup=_delivery_resolution_keyboard(item, parts, problem_page),
     )
 
 
@@ -1958,6 +1981,9 @@ async def prompt_resolution_reason(callback: CallbackQuery, state: FSMContext) -
     action_type = parts[3]  # 'force', 'sent', 'skipped'
     delivery_id = int(parts[4])
     part_id = int(parts[5]) if len(parts) > 5 else None
+    state_data = await state.get_data()
+    problem_page = int(state_data.get("problem_page", 0))
+    list_back = state_data.get("event_list_back", "admin_events")
 
     type_map = {
         "force": ("force_retry", "Повторная отправка (Force Retry)"),
@@ -1967,7 +1993,13 @@ async def prompt_resolution_reason(callback: CallbackQuery, state: FSMContext) -
     res_type, title = type_map[action_type]
 
     await state.clear()
-    await state.update_data(res_delivery_id=delivery_id, res_type=res_type, res_part_id=part_id)
+    await state.update_data(
+        res_delivery_id=delivery_id,
+        res_type=res_type,
+        res_part_id=part_id,
+        res_problem_page=problem_page,
+        res_event_list_back=list_back,
+    )
     await state.set_state(EventAdminStates.resolve_reason)
 
     warning = "⚠️ Повторная отправка может привести к дублю части медиа, если провайдер уже принял запрос.\n\n" if res_type == "force_retry" else ""
@@ -1977,7 +2009,14 @@ async def prompt_resolution_reason(callback: CallbackQuery, state: FSMContext) -
         f"{warning}"
         "Введите причину разрешения (обязательно для аудита):",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_problem_item_{delivery_id}").as_markup(),
+        reply_markup=InlineKeyboardBuilder().button(
+            text="⬅️ Отмена",
+            callback_data=(
+                f"admin_ev_problem_item_{delivery_id}_{problem_page}"
+                if problem_page > 0
+                else f"admin_ev_problem_item_{delivery_id}"
+            ),
+        ).as_markup(),
     )
 
 
@@ -2012,13 +2051,24 @@ async def process_resolution_reason(message: Message, state: FSMContext) -> None
             f"✅ Доставка ID {delivery_id} успешно разрешена ({res_type})!\n"
             f"Текущий статус: <b>{updated_item.status}</b>",
             parse_mode="HTML",
-            reply_markup=_delivery_resolution_keyboard(updated_item, updated_parts),
+            reply_markup=_delivery_resolution_keyboard(
+                updated_item,
+                updated_parts,
+                int(data.get("res_problem_page", 0)),
+            ),
         )
     except Exception as exc:
         log.exception("Resolution failed: %s", exc)
         await message.answer(
             f"❌ Ошибка разрешения: {exc}",
-            reply_markup=InlineKeyboardBuilder().button(text="⬅️ Назад", callback_data=f"admin_ev_problem_item_{delivery_id}").as_markup(),
+            reply_markup=InlineKeyboardBuilder().button(
+                text="⬅️ Назад",
+                callback_data=(
+                    f"admin_ev_problem_item_{delivery_id}_{int(data.get('res_problem_page', 0))}"
+                    if int(data.get("res_problem_page", 0)) > 0
+                    else f"admin_ev_problem_item_{delivery_id}"
+                ),
+            ).as_markup(),
         )
 
 

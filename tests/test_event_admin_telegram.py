@@ -220,7 +220,7 @@ _TELEGRAM_EVENT_BUTTON_CONTRACTS = (
     (re.compile(r"admin_ev_step_edit_preset_\d+_-?\d+$"), "mutation", "events/step", "telegram.steps.dispatcher", "process_edit_offset_preset", None),
     (re.compile(r"admin_ev_step_edit_custom_\d+$"), "navigation", "events/step", "telegram.steps.dispatcher", "start_edit_offset_custom", "EventAdminStates.step_edit_offset_custom"),
     (re.compile(r"admin_ev_problems_\d+_\d+$"), "navigation", "events/problems", "telegram.delivery.lifecycle", "show_problem_deliveries", None),
-    (re.compile(r"admin_ev_problem_item_\d+$"), "navigation", "events/problem", "telegram.delivery.lifecycle", "open_problem_delivery", None),
+    (re.compile(r"admin_ev_problem_item_\d+(?:_\d+)?$"), "navigation", "events/problem", "telegram.delivery.lifecycle", "open_problem_delivery", None),
     (re.compile(r"admin_ev_resolve_(?:force|sent|skipped)_\d+(?:_\d+)?$"), "mutation", "events/problem", "telegram.delivery.resolution", "prompt_resolution_reason", "EventAdminStates.resolve_reason"),
     (re.compile(r"admin_ev_test_step_\d+$"), "external", "telegram/test-send", "telegram.delivery.test-send", "test_send_single_step", None),
     (re.compile(r"admin_ev_do_test_send_\d+_\d+$"), "external", "telegram/test-send", "telegram.delivery.test-send", "do_test_send", None),
@@ -741,6 +741,156 @@ async def test_telegram_visible_event_buttons_execute_real_dispatcher_journeys(d
         for router in routers:
             for handler, original in zip(router.callback_query.handlers, original_callbacks[router]):
                 handler.callback = original
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_paginated_card_mutations_and_stats_return_to_original_list(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    scenarios = []
+    for index in range(event_admin_telegram.SCENARIOS_PAGE_SIZE + 1):
+        scenarios.append(
+            await create_scenario(
+                db_session_maker,
+                code=f"telegram_page_context_{index}",
+                event_type="meeting",
+                title=f"Telegram page context {index}",
+                starts_at_utc=datetime.utcnow() + timedelta(days=2, minutes=index),
+                place="Room 1",
+            )
+        )
+    target = scenarios[0]
+    page_back = f"admin_ev_page_1_1"
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {router: router._parent_router for router in routers}
+    for router in routers:
+        router._parent_router = None
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        dp.include_router(router)
+
+    def callbacks(methods):
+        markup = next(method for method in methods if isinstance(method, EditMessageText)).reply_markup
+        return _telegram_event_callbacks(markup)
+
+    try:
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{target.id}_1_1")
+        card_callbacks = callbacks(methods)
+        assert page_back in card_callbacks
+
+        methods = await _feed_callback(dp, bot, f"admin_ev_toggle_{target.id}")
+        assert page_back in callbacks(methods)
+
+        methods = await _feed_callback(dp, bot, f"admin_ev_archive_ask_{target.id}")
+        confirm_callbacks = callbacks(methods)
+        assert f"admin_ev_open_{target.id}_1_1" in confirm_callbacks
+        assert f"admin_ev_archive_yes_{target.id}" in confirm_callbacks
+
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{target.id}_1_1")
+        assert page_back in callbacks(methods)
+
+        await _feed_callback(dp, bot, f"admin_ev_archive_ask_{target.id}")
+        methods = await _feed_callback(dp, bot, f"admin_ev_archive_yes_{target.id}")
+        assert page_back in callbacks(methods)
+
+        methods = await _feed_callback(dp, bot, f"admin_ev_page_1_1")
+        list_edit = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 2 из 2" in list_edit.text
+        assert "Скрыть архив" in list_edit.text or "admin_ev_toggle_archive_view_0" in callbacks(methods)
+
+        await _feed_callback(dp, bot, f"admin_ev_open_{target.id}_1_1")
+        methods = await _feed_callback(dp, bot, f"admin_ev_stats_{target.id}")
+        assert f"admin_ev_open_{target.id}_1_1" in callbacks(methods)
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{target.id}_1_1")
+        assert page_back in callbacks(methods)
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_problem_delivery_page_roundtrip_uses_current_page(monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    selected = DeliveryItem(
+        id=605,
+        event_id=77,
+        user_id=700,
+        user_display="Problem page user",
+        message_kind="immediate_confirmation",
+        step_id=None,
+        status="uncertain",
+        due_at_msk="01.01.2030 11:00",
+        attempt_count=1,
+        last_error="timeout",
+        sent_or_finished_msk=None,
+        platform="telegram",
+        retry_index=0,
+        parent_delivery_id=None,
+    )
+    page_items = [selected]
+
+    async def fake_list_problem_deliveries(session_maker, event_id, *, limit, offset):
+        assert event_id == 77
+        assert limit == event_admin_telegram.PROBLEMS_PAGE_SIZE
+        assert offset == event_admin_telegram.PROBLEMS_PAGE_SIZE
+        return page_items, 6
+
+    monkeypatch.setattr(event_admin_telegram, "list_problem_deliveries", fake_list_problem_deliveries)
+    monkeypatch.setattr(event_admin_telegram, "get_delivery_item", AsyncMock(return_value=selected))
+    monkeypatch.setattr(event_admin_telegram, "list_delivery_parts", AsyncMock(return_value=[]))
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {router: router._parent_router for router in routers}
+    for router in routers:
+        router._parent_router = None
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        dp.include_router(router)
+
+    def callbacks(methods):
+        markup = next(method for method in methods if isinstance(method, EditMessageText)).reply_markup
+        return _telegram_event_callbacks(markup)
+
+    try:
+        methods = await _feed_callback(dp, bot, "admin_ev_problems_77_1")
+        item_callback = next(callback for callback in callbacks(methods) if callback.startswith("admin_ev_problem_item_"))
+        assert item_callback == "admin_ev_problem_item_605_1"
+
+        methods = await _feed_callback(dp, bot, item_callback)
+        assert "admin_ev_problems_77_1" in callbacks(methods)
+
+        resolve_callback = next(
+            callback for callback in callbacks(methods)
+            if callback.startswith("admin_ev_resolve_force_605")
+        )
+        methods = await _feed_callback(dp, bot, resolve_callback)
+        assert "admin_ev_problem_item_605_1" in callbacks(methods)
+        state = FSMContext(storage=storage, key=StorageKey(bot_id=bot.id, chat_id=12345, user_id=12345))
+        assert await state.get_state() == event_admin_telegram.EventAdminStates.resolve_reason.state
+
+        methods = await _feed_callback(dp, bot, "admin_ev_problem_item_605_1")
+        assert "admin_ev_problems_77_1" in callbacks(methods)
+        assert await state.get_state() is None
+
+        methods = await _feed_callback(dp, bot, "admin_ev_problems_77_1")
+        detail_list = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "Страница 2 из 2" in detail_list.text
+    finally:
+        for router in routers:
             router._parent_router = original_parents[router]
 
 

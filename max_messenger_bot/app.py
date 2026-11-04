@@ -1986,9 +1986,9 @@ class MaxBotApplication:
                 await admin_events_service.show_scenario(self.client, chat_id, event_id, back=back)
                 return
             if data.startswith("admin_ev_toggle_"):
+                snapshot = await self.states.get(user_id)
+                list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
                 if data.startswith("admin_ev_toggle_media_order_"):
-                    snapshot = await self.states.get(user_id)
-                    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
                     await admin_events_service.toggle_media_order(
                         self.client,
                         chat_id,
@@ -1997,15 +1997,34 @@ class MaxBotApplication:
                     )
                     return
                 event_id = int(data.split("_")[-1])
-                await admin_events_service.toggle_scenario(self.client, chat_id, event_id)
+                await admin_events_service.toggle_scenario(
+                    self.client,
+                    chat_id,
+                    event_id,
+                    back=list_back,
+                )
                 return
             if data.startswith("admin_ev_archive_ask_"):
                 event_id = int(data.split("_")[-1])
-                await admin_events_service.archive_scenario_ask(self.client, chat_id, event_id)
+                snapshot = await self.states.get(user_id)
+                list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.archive_scenario_ask(
+                    self.client,
+                    chat_id,
+                    event_id,
+                    back=list_back,
+                )
                 return
             if data.startswith("admin_ev_archive_yes_"):
                 event_id = int(data.split("_")[-1])
-                await admin_events_service.archive_scenario_confirm(self.client, chat_id, event_id)
+                snapshot = await self.states.get(user_id)
+                list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.archive_scenario_confirm(
+                    self.client,
+                    chat_id,
+                    event_id,
+                    back=list_back,
+                )
                 return
             if data == "admin_ev_create_webinar":
                 await admin_events_service.start_scenario_create(self.client, self.states, chat_id, user_id, "webinar")
@@ -2238,20 +2257,65 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ev_stats_"):
                 event_id = int(data.split("_")[-1])
-                await admin_events_service.show_stats(self.client, chat_id, event_id)
+                snapshot = await self.states.get(user_id)
+                list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.show_stats(
+                    self.client,
+                    chat_id,
+                    event_id,
+                    back=list_back,
+                )
                 return
             if data.startswith("admin_ev_problems_"):
                 parts = data.split("_")
                 await admin_events_service.show_problems(self.client, chat_id, int(parts[3]), int(parts[4]))
                 return
             if data.startswith("admin_ev_problem_item_"):
-                delivery_id = int(data.split("_")[-1])
-                await admin_events_service.show_problem_detail(self.client, chat_id, delivery_id)
+                parts = data.split("_")
+                delivery_id = int(parts[4])
+                problem_page = int(parts[5]) if len(parts) > 5 else 0
+                snapshot = await self.states.get(user_id)
+                if snapshot is not None:
+                    if snapshot.state == "max_event_resolve_reason":
+                        list_back = snapshot.data.get("event_list_back", "admin_events")
+                        await self.states.clear(user_id)
+                        await self.states.set(
+                            user_id,
+                            chat_id,
+                            "max_event_card",
+                            {"event_list_back": list_back, "problem_page": problem_page},
+                        )
+                    else:
+                        await self.states.set(
+                            user_id,
+                            chat_id,
+                            snapshot.state,
+                            {**snapshot.data, "problem_page": problem_page},
+                        )
+                await admin_events_service.show_problem_detail(
+                    self.client,
+                    chat_id,
+                    delivery_id,
+                    problem_page=problem_page,
+                )
                 return
             if data.startswith("admin_ev_resolve_"):
                 parts = data.split("_")
                 part_id = int(parts[5]) if len(parts) > 5 else None
-                await admin_events_service.start_resolve(self.client, self.states, chat_id, user_id, int(parts[4]), parts[3], part_id)
+                snapshot = await self.states.get(user_id)
+                problem_page = int(snapshot.data.get("problem_page", 0)) if snapshot else 0
+                list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.start_resolve(
+                    self.client,
+                    self.states,
+                    chat_id,
+                    user_id,
+                    int(parts[4]),
+                    parts[3],
+                    part_id,
+                    problem_page=problem_page,
+                    list_back=list_back,
+                )
                 return
             if data.startswith("admin_ev_test_send_menu_"):
                 event_id = int(data.split("_")[-1])

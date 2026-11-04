@@ -299,7 +299,13 @@ async def show_scenario(
     )
 
 
-async def toggle_scenario(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+async def toggle_scenario(
+    client: MaxApiClient,
+    chat_id: int,
+    event_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     try:
         new_active = await toggle_scenario_active(async_session_maker, event_id)
         msg_text = "🟢 Регистрация включена!" if new_active else "⚪️ Регистрация приостановлена."
@@ -308,16 +314,22 @@ async def toggle_scenario(client: MaxApiClient, chat_id: int, event_id: int) -> 
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
         return
 
-    await show_scenario(client, chat_id, event_id)
+    await show_scenario(client, chat_id, event_id, back=back)
 
 
-async def archive_scenario_ask(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+async def archive_scenario_ask(
+    client: MaxApiClient,
+    chat_id: int,
+    event_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     s = await get_scenario_summary(async_session_maker, event_id)
     if not s:
         return
     rows = [
         [callback_button("✅ Да, архивировать", f"admin_ev_archive_yes_{event_id}")],
-        _back(f"admin_ev_open_{event_id}"),
+        _back(_event_open_callback(event_id, back)),
     ]
     await client.send_message(
         chat_id=chat_id,
@@ -326,7 +338,13 @@ async def archive_scenario_ask(client: MaxApiClient, chat_id: int, event_id: int
     )
 
 
-async def archive_scenario_confirm(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+async def archive_scenario_confirm(
+    client: MaxApiClient,
+    chat_id: int,
+    event_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     try:
         await archive_scenario(async_session_maker, event_id)
         await client.send_message(chat_id=chat_id, text="✅ Мероприятие архивировано.")
@@ -334,7 +352,7 @@ async def archive_scenario_confirm(client: MaxApiClient, chat_id: int, event_id:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
         return
 
-    await show_scenario(client, chat_id, event_id)
+    await show_scenario(client, chat_id, event_id, back=back)
 
 
 # ==============================================================================
@@ -1496,7 +1514,13 @@ async def confirm_delete_step(
 # MONITORING & MANUAL RESOLUTION
 # ==============================================================================
 
-async def show_stats(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+async def show_stats(
+    client: MaxApiClient,
+    chat_id: int,
+    event_id: int,
+    *,
+    back: str = "admin_events",
+) -> None:
     s = await get_scenario_summary(async_session_maker, event_id)
     if not s:
         return
@@ -1506,7 +1530,7 @@ async def show_stats(client: MaxApiClient, chat_id: int, event_id: int) -> None:
     if stats.problematic_total > 0:
         rows.append([callback_button(f"⚠️ Проблемные доставки ({stats.problematic_total})", f"admin_ev_problems_{event_id}_0")])
     rows.append([callback_button("🔄 Обновить", f"admin_ev_stats_{event_id}")])
-    rows.append(_back(f"admin_ev_open_{event_id}"))
+    rows.append(_back(_event_open_callback(event_id, back)))
 
     lines = [
         f"📊 <b>Мониторинг доставок: {html.escape(s.title)}</b>\n\n",
@@ -1534,7 +1558,12 @@ async def show_stats(client: MaxApiClient, chat_id: int, event_id: int) -> None:
     )
 
 
-async def show_problems(client: MaxApiClient, chat_id: int, event_id: int, page: int = 0) -> None:
+async def show_problems(
+    client: MaxApiClient,
+    chat_id: int,
+    event_id: int,
+    page: int = 0,
+) -> None:
     items, total = await list_problem_deliveries(
         async_session_maker,
         event_id,
@@ -1547,7 +1576,10 @@ async def show_problems(client: MaxApiClient, chat_id: int, event_id: int, page:
     rows = []
     for it in items:
         status_icon = "❓" if it.status == "uncertain" else ("🛑" if it.status == "blocked" else "❌")
-        rows.append([callback_button(f"{status_icon} ID {it.id}: {it.user_display[:20]} ({it.status})", f"admin_ev_problem_item_{it.id}")])
+        item_callback = f"admin_ev_problem_item_{it.id}"
+        if page > 0:
+            item_callback += f"_{page}"
+        rows.append([callback_button(f"{status_icon} ID {it.id}: {it.user_display[:20]} ({it.status})", item_callback)])
 
     nav_row = []
     if page > 0:
@@ -1578,7 +1610,12 @@ async def show_problems(client: MaxApiClient, chat_id: int, event_id: int, page:
     )
 
 
-async def show_problem_detail(client: MaxApiClient, chat_id: int, delivery_id: int) -> None:
+async def show_problem_detail(
+    client: MaxApiClient,
+    chat_id: int,
+    delivery_id: int,
+    problem_page: int = 0,
+) -> None:
     it = await get_delivery_item(async_session_maker, delivery_id)
     if not it:
         await client.send_message(chat_id=chat_id, text="Доставка не найдена.")
@@ -1606,7 +1643,7 @@ async def show_problem_detail(client: MaxApiClient, chat_id: int, delivery_id: i
             for part in parts
         )
 
-    rows.append(_back(f"admin_ev_problems_{it.event_id}_0"))
+    rows.append(_back(f"admin_ev_problems_{it.event_id}_{problem_page}"))
 
     text = (
         f"🔍 <b>Детали доставки ID {it.id}</b>\n\n"
@@ -1636,6 +1673,8 @@ async def start_resolve(
     delivery_id: int,
     action: str,
     part_id: int | None = None,
+    problem_page: int = 0,
+    list_back: str = "admin_events",
 ) -> None:
     type_map = {
         "force": ("force_retry", "Повторная отправка"),
@@ -1647,7 +1686,13 @@ async def start_resolve(
         user_id,
         chat_id,
         "max_event_resolve_reason",
-        {"delivery_id": delivery_id, "res_type": res_type, "part_id": part_id},
+        {
+            "delivery_id": delivery_id,
+            "res_type": res_type,
+            "part_id": part_id,
+            "problem_page": problem_page,
+            "event_list_back": list_back,
+        },
     )
 
     await client.send_message(
@@ -1657,7 +1702,13 @@ async def start_resolve(
             + ("⚠️ Повторная отправка может привести к дублю части медиа, если провайдер уже принял запрос.\n\n" if res_type == "force_retry" else "")
             + "Введите причину разрешения (для аудита):"
         ),
-        attachments=inline_keyboard([_back(f"admin_ev_problem_item_{delivery_id}")]),
+        attachments=inline_keyboard([
+            _back(
+                f"admin_ev_problem_item_{delivery_id}_{problem_page}"
+                if problem_page > 0
+                else f"admin_ev_problem_item_{delivery_id}"
+            )
+        ]),
     )
 
 
@@ -1677,6 +1728,7 @@ async def receive_resolve_reason(
     delivery_id = state_obj.data["delivery_id"]
     res_type = state_obj.data["res_type"]
     part_id = state_obj.data.get("part_id")
+    problem_page = int(state_obj.data.get("problem_page", 0))
 
     try:
         deliv, ok = await resolve_uncertain_delivery(
@@ -1689,7 +1741,7 @@ async def receive_resolve_reason(
         )
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text=f"✅ Доставка ID {delivery_id} успешно разрешена ({deliv.status})!")
-        await show_problem_detail(client, chat_id, delivery_id)
+        await show_problem_detail(client, chat_id, delivery_id, problem_page=problem_page)
     except Exception as exc:
         log.exception("MAX resolution error: %s", exc)
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
