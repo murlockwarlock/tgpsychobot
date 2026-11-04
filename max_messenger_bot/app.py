@@ -1964,12 +1964,21 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ev_open_"):
                 await self.states.clear(user_id)
-                event_id = int(data.split("_")[-1])
-                await admin_events_service.show_scenario(self.client, chat_id, event_id)
+                parts = data.split("_")
+                event_id = int(parts[3])
+                back = f"admin_ev_page_{parts[4]}_{parts[5]}" if len(parts) >= 6 else "admin_events"
+                await admin_events_service.show_scenario(self.client, chat_id, event_id, back=back)
                 return
             if data.startswith("admin_ev_toggle_"):
                 if data.startswith("admin_ev_toggle_media_order_"):
-                    await admin_events_service.toggle_media_order(self.client, chat_id, int(data.split("_")[-1]))
+                    snapshot = await self.states.get(user_id)
+                    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                    await admin_events_service.toggle_media_order(
+                        self.client,
+                        chat_id,
+                        int(data.split("_")[-1]),
+                        back=list_back,
+                    )
                     return
                 event_id = int(data.split("_")[-1])
                 await admin_events_service.toggle_scenario(self.client, chat_id, event_id)
@@ -1992,9 +2001,17 @@ class MaxBotApplication:
                 await admin_events_service.skip_meeting_link(self.client, self.states, chat_id, user_id)
                 return
             if data.startswith("admin_ev_edit_menu_"):
+                snapshot = await self.states.get(user_id)
+                list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
                 await self.states.clear(user_id)
-                event_id = int(data.split("_")[-1])
-                await admin_events_service.show_edit_menu(self.client, chat_id, event_id)
+                parts = data.split("_")
+                event_id = int(parts[4])
+                if len(parts) >= 7:
+                    list_back = f"admin_ev_page_{parts[5]}_{parts[6]}"
+                has_list_context = list_back != "admin_events"
+                if has_list_context:
+                    await self.states.set(user_id, chat_id, "max_event_edit_menu", {"event_id": event_id, "event_list_back": list_back})
+                await admin_events_service.show_edit_menu(self.client, chat_id, event_id, back=list_back)
                 return
             if data.startswith("admin_ev_edit_description_"):
                 event_id = int(data.split("_")[-1])

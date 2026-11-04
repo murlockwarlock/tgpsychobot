@@ -57,6 +57,7 @@ from event_admin_service import (
     validate_scenario_input,
     validate_step_input,
 )
+from html_utils import truncate_html_preview
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard
 from ..legacy import User, async_session_maker
@@ -90,6 +91,16 @@ MAX_EVENT_INPUT_STATES = frozenset({
 })
 
 PAGE_SIZE = 6
+
+
+def _event_open_callback(event_id: int, back: str) -> str:
+    if back.startswith("admin_ev_page_"):
+        parts = back.split("_")
+        if len(parts) == 5:
+            return f"admin_ev_open_{event_id}_{parts[3]}_{parts[4]}"
+    return f"admin_ev_open_{event_id}"
+
+
 PROBLEMS_PAGE_SIZE = 5
 
 
@@ -127,7 +138,7 @@ async def show_scenarios(
         status_icon = "📦" if s.is_archived else ("🟢" if s.is_active else "⚪️")
         type_icon = "💻" if s.event_type == "webinar" else "📍"
         label = f"{status_icon} {type_icon} {s.title} ({s.starts_at_msk[:10]})"
-        rows.append([callback_button(label, f"admin_ev_open_{s.id}")])
+        rows.append([callback_button(label, f"admin_ev_open_{s.id}_{page}_{1 if include_archived else 0}")])
 
     # Pagination
     nav_row = []
@@ -233,7 +244,12 @@ async def show_scenario(
 
     if not s.is_archived:
         rows.append([callback_button("⏰ Перенести время", f"admin_ev_reschedule_{s.id}")])
-        rows.append([callback_button("✏️ Редактировать", f"admin_ev_edit_menu_{s.id}")])
+        if back.startswith("admin_ev_page_"):
+            back_parts = back.split("_")
+            edit_callback = f"admin_ev_edit_menu_{s.id}_{back_parts[3]}_{back_parts[4]}" if len(back_parts) == 5 else f"admin_ev_edit_menu_{s.id}"
+        else:
+            edit_callback = f"admin_ev_edit_menu_{s.id}"
+        rows.append([callback_button("✏️ Редактировать", edit_callback)])
         rows.append([callback_button("📋 Скопировать", f"admin_ev_copy_{s.id}")])
         rows.append([callback_button("🚀 Тестовая отправка себе", f"admin_ev_test_send_menu_{s.id}")])
         rows.append([callback_button("📦 В архив", f"admin_ev_archive_ask_{s.id}")])
@@ -548,7 +564,7 @@ async def _finish_scenario_create(
 # EDIT SCENARIO FIELDS
 # ==============================================================================
 
-async def show_edit_menu(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+async def show_edit_menu(client: MaxApiClient, chat_id: int, event_id: int, *, back: str = "admin_events") -> None:
     s = await get_scenario_summary(async_session_maker, event_id)
     if not s:
         return
@@ -569,7 +585,7 @@ async def show_edit_menu(client: MaxApiClient, chat_id: int, event_id: int) -> N
         link_label = "🔗 Изменить ссылку" if s.link else "🔗 Добавить ссылку"
         rows.append([callback_button(link_label, f"admin_ev_edit_link_{s.id}")])
 
-    rows.append(_back(f"admin_ev_open_{s.id}"))
+    rows.append(_back(_event_open_callback(s.id, back)))
     await client.send_message(
         chat_id=chat_id,
         text=f"✏️ <b>Редактирование мероприятия: {html.escape(s.title)}</b>\n\nВыберите поле для изменения:",
@@ -589,13 +605,15 @@ async def start_edit_description(client: MaxApiClient, states: StateStore, chat_
     s = await get_scenario_summary(async_session_maker, event_id)
     if not s:
         return
-    await states.set(user_id, chat_id, "max_event_edit_description", {"event_id": event_id, "description_draft": s.description or ""})
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(user_id, chat_id, "max_event_edit_description", {"event_id": event_id, "description_draft": s.description or "", "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
         text=(
             "📝 <b>Описание мероприятия</b>\n\n"
             "Отправьте новый текст. Описание не ограничивается лимитом caption; при доставке длинный текст будет разделён безопасно.\n\n"
-            f"Текущий черновик:\n<blockquote>{html.escape(s.description or '—')}</blockquote>"
+            f"Текущий черновик:\n<blockquote>{truncate_html_preview(s.description, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>"
         ),
         attachments=inline_keyboard(_description_editor_keyboard(event_id)),
     )
@@ -608,7 +626,7 @@ async def receive_edit_description(client: MaxApiClient, states: StateStore, cha
     await states.update(user_id, description_draft=raw_text)
     await client.send_message(
         chat_id=chat_id,
-        text=f"📝 Черновик обновлён ({len(raw_text)} символов).\n\n<blockquote>{html.escape(raw_text[:3000])}</blockquote>",
+        text=f"📝 Черновик обновлён ({len(raw_text)} символов).\n\n<blockquote>{truncate_html_preview(raw_text, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
         attachments=inline_keyboard(_description_editor_keyboard(snapshot.data["event_id"])),
     )
 
@@ -618,21 +636,24 @@ async def save_description(client: MaxApiClient, states: StateStore, chat_id: in
     if not snapshot:
         return
     event_id = snapshot.data["event_id"]
+    list_back = snapshot.data.get("event_list_back", "admin_events")
     try:
         s = await update_scenario_fields(async_session_maker, event_id, description=snapshot.data.get("description_draft", ""))
         await states.clear(user_id)
-        await client.send_message(chat_id=chat_id, text="✅ Описание сохранено.", attachments=inline_keyboard([_back(f"admin_ev_open_{s.id}")]))
+        await client.send_message(chat_id=chat_id, text="✅ Описание сохранено.", attachments=inline_keyboard([_back(_event_open_callback(s.id, list_back))]))
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
 async def delete_description(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
-    try:
-        s = await update_scenario_fields(async_session_maker, event_id, description=None)
-        await states.clear(user_id)
-        await client.send_message(chat_id=chat_id, text="✅ Описание удалено.", attachments=inline_keyboard([_back(f"admin_ev_open_{s.id}")]))
-    except Exception as exc:
-        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(user_id, chat_id, "max_event_edit_description", {"event_id": event_id, "description_draft": "", "event_list_back": list_back})
+    await client.send_message(
+        chat_id=chat_id,
+        text="🗑 Описание будет удалено после нажатия «Сохранить и выйти».",
+        attachments=inline_keyboard(_description_editor_keyboard(event_id)),
+    )
 
 
 def _media_editor_keyboard(event_id: int, draft: list[dict[str, Any]]) -> list[list[dict]]:
@@ -654,13 +675,14 @@ def _media_editor_keyboard(event_id: int, draft: list[dict[str, Any]]) -> list[l
 
 async def show_media_editor(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
     snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
     preserve_draft = snapshot and snapshot.state in {"max_event_edit_media", "max_event_edit_media_add"} and snapshot.data.get("event_id") == event_id and snapshot.data.get("media_draft_dirty") and isinstance(snapshot.data.get("media_draft"), list)
     if preserve_draft:
         draft = list(snapshot.data["media_draft"])
     else:
         media = await list_scenario_media(async_session_maker, event_id)
         draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
-    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": event_id, "media_draft": draft, "media_draft_dirty": bool(preserve_draft)})
+    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": event_id, "media_draft": draft, "media_draft_dirty": bool(preserve_draft), "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
         text=f"🖼 <b>Медиа мероприятия</b>\n\nВ черновике: <b>{len(draft)}</b>. Отправьте медиа после кнопки добавления и сохраните изменения.",
@@ -671,7 +693,7 @@ async def show_media_editor(client: MaxApiClient, states: StateStore, chat_id: i
 async def start_add_media(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
     snapshot = await states.get(user_id)
     draft = snapshot.data.get("media_draft", []) if snapshot else []
-    await states.set(user_id, chat_id, "max_event_edit_media_add", {"event_id": event_id, "media_draft": draft, "media_draft_dirty": snapshot.data.get("media_draft_dirty", False) if snapshot else False})
+    await states.set(user_id, chat_id, "max_event_edit_media_add", {"event_id": event_id, "media_draft": draft, "media_draft_dirty": snapshot.data.get("media_draft_dirty", False) if snapshot else False, "event_list_back": snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"})
     await client.send_message(chat_id=chat_id, text="🖼 Отправьте фото или видео одним сообщением.", attachments=inline_keyboard([_back(f"admin_ev_edit_media_{event_id}")]))
 
 
@@ -682,7 +704,7 @@ async def receive_media(client: MaxApiClient, states: StateStore, chat_id: int, 
         return
     draft = list(snapshot.data.get("media_draft", []))
     draft.append({"file_type": "photo" if media_type == "image" else media_type, "file_id": media_token, "max_token": media_token, "source_platform": "max"})
-    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": snapshot.data["event_id"], "media_draft": draft, "media_draft_dirty": True})
+    await states.set(user_id, chat_id, "max_event_edit_media", {"event_id": snapshot.data["event_id"], "media_draft": draft, "media_draft_dirty": True, "event_list_back": snapshot.data.get("event_list_back", "admin_events")})
     await client.send_message(chat_id=chat_id, text=f"✅ Медиа добавлено. В черновике: {len(draft)}.", attachments=inline_keyboard(_media_editor_keyboard(snapshot.data["event_id"], draft)))
 
 
@@ -713,106 +735,119 @@ async def mutate_media_draft(
 async def save_media(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
     snapshot = await states.get(user_id)
     draft = snapshot.data.get("media_draft", []) if snapshot else []
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
     try:
         await replace_scenario_media(async_session_maker, event_id, draft)
         await states.clear(user_id)
-        await client.send_message(chat_id=chat_id, text="✅ Медиа сохранены.", attachments=inline_keyboard([_back(f"admin_ev_open_{event_id}")]))
+        await client.send_message(chat_id=chat_id, text="✅ Медиа сохранены.", attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]))
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
-async def toggle_media_order(client: MaxApiClient, chat_id: int, event_id: int) -> None:
+async def toggle_media_order(client: MaxApiClient, chat_id: int, event_id: int, *, back: str = "admin_events") -> None:
     s = await get_scenario_summary(async_session_maker, event_id)
     if not s:
         return
     try:
         updated = await update_scenario_fields(async_session_maker, event_id, media_order="text_top" if s.media_order == "media_top" else "media_top")
-        await show_edit_menu(client, chat_id, updated.id)
+        await show_edit_menu(client, chat_id, updated.id, back=back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
 async def start_edit_title(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
-    await states.set(user_id, chat_id, "max_event_edit_title", {"event_id": event_id})
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(user_id, chat_id, "max_event_edit_title", {"event_id": event_id, "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
         text="✏️ Введите новое название мероприятия (до 255 символов):",
-        attachments=inline_keyboard([_back(f"admin_ev_open_{event_id}")]),
+        attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]),
     )
 
 
 async def receive_edit_title(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, raw_title: str) -> None:
     state_obj = await states.get(user_id)
     event_id = state_obj.data["event_id"]
+    list_back = state_obj.data.get("event_list_back", "admin_events")
     try:
         scen = await update_scenario_fields(async_session_maker, event_id, title=raw_title)
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text=f"✅ Название обновлено: <b>{html.escape(scen.title)}</b>")
-        await show_scenario(client, chat_id, event_id)
+        await show_scenario(client, chat_id, event_id, back=list_back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
 async def start_edit_duration(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
-    await states.set(user_id, chat_id, "max_event_edit_duration", {"event_id": event_id})
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(user_id, chat_id, "max_event_edit_duration", {"event_id": event_id, "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
         text="⏱ Введите новую длительность в минутах (от 15 до 1440):",
-        attachments=inline_keyboard([_back(f"admin_ev_open_{event_id}")]),
+        attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]),
     )
 
 
 async def receive_edit_duration(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, raw_dur: str) -> None:
     state_obj = await states.get(user_id)
     event_id = state_obj.data["event_id"]
+    list_back = state_obj.data.get("event_list_back", "admin_events")
     try:
         dur = int(raw_dur.strip())
         scen = await update_scenario_fields(async_session_maker, event_id, duration_minutes=dur)
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text=f"✅ Длительность обновлена: {scen.duration_minutes} мин.")
-        await show_scenario(client, chat_id, event_id)
+        await show_scenario(client, chat_id, event_id, back=list_back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
 async def start_edit_link(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
-    await states.set(user_id, chat_id, "max_event_edit_link", {"event_id": event_id})
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(user_id, chat_id, "max_event_edit_link", {"event_id": event_id, "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
         text="🔗 Введите новую ссылку:",
-        attachments=inline_keyboard([_back(f"admin_ev_open_{event_id}")]),
+        attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]),
     )
 
 
 async def receive_edit_link(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, raw_link: str) -> None:
     state_obj = await states.get(user_id)
     event_id = state_obj.data["event_id"]
+    list_back = state_obj.data.get("event_list_back", "admin_events")
     try:
         scen = await update_scenario_fields(async_session_maker, event_id, link=raw_link)
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text="✅ Ссылка обновлена.")
-        await show_scenario(client, chat_id, event_id)
+        await show_scenario(client, chat_id, event_id, back=list_back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
 
 async def start_edit_place(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, event_id: int) -> None:
-    await states.set(user_id, chat_id, "max_event_edit_place", {"event_id": event_id})
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(user_id, chat_id, "max_event_edit_place", {"event_id": event_id, "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
         text="📍 Введите новое место проведения встречи:",
-        attachments=inline_keyboard([_back(f"admin_ev_open_{event_id}")]),
+        attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]),
     )
 
 
 async def receive_edit_place(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, raw_place: str) -> None:
     state_obj = await states.get(user_id)
     event_id = state_obj.data["event_id"]
+    list_back = state_obj.data.get("event_list_back", "admin_events")
     try:
         scen = await update_scenario_fields(async_session_maker, event_id, place=raw_place)
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text="✅ Место проведения обновлено.")
-        await show_scenario(client, chat_id, event_id)
+        await show_scenario(client, chat_id, event_id, back=list_back)
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
@@ -825,7 +860,9 @@ async def start_reschedule(client: MaxApiClient, states: StateStore, chat_id: in
     s = await get_scenario_summary(async_session_maker, event_id)
     if not s:
         return
-    await states.set(user_id, chat_id, "max_event_reschedule_starts_at", {"event_id": event_id})
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(user_id, chat_id, "max_event_reschedule_starts_at", {"event_id": event_id, "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
         text=(
@@ -836,13 +873,14 @@ async def start_reschedule(client: MaxApiClient, states: StateStore, chat_id: in
             f"Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
             f"Пример: <code>28.10.2026 20:00</code>"
         ),
-        attachments=inline_keyboard([_back(f"admin_ev_open_{event_id}")]),
+        attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]),
     )
 
 
 async def receive_reschedule(client: MaxApiClient, states: StateStore, chat_id: int, user_id: int, raw_dt: str) -> None:
     state_obj = await states.get(user_id)
     event_id = state_obj.data["event_id"]
+    list_back = state_obj.data.get("event_list_back", "admin_events")
     try:
         utc_dt = parse_msk_datetime(raw_dt)
         res = await reschedule_scenario(async_session_maker, event_id, utc_dt)
@@ -856,7 +894,7 @@ async def receive_reschedule(client: MaxApiClient, states: StateStore, chat_id: 
                 f"• Затронуто регистраций: <b>{res.registrations_count}</b>"
             ),
         )
-        await show_scenario(client, chat_id, event_id)
+        await show_scenario(client, chat_id, event_id, back=list_back)
     except Exception as exc:
         log.exception("MAX reschedule error: %s", exc)
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка переноса: {exc}\nПопробуйте ещё раз:")
@@ -870,7 +908,9 @@ async def start_copy(client: MaxApiClient, states: StateStore, chat_id: int, use
     s = await get_scenario_summary(async_session_maker, source_id)
     if not s:
         return
-    await states.set(user_id, chat_id, "max_event_copy_code", {"source_id": source_id})
+    snapshot = await states.get(user_id)
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    await states.set(user_id, chat_id, "max_event_copy_code", {"source_id": source_id, "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
         text=(
@@ -878,7 +918,7 @@ async def start_copy(client: MaxApiClient, states: StateStore, chat_id: int, use
             f"Все параметры и шаги скопируются. Регистрации и отправки НЕ копируются.\n\n"
             f"<b>Шаг 1 из 2:</b> Введите уникальный код нового сценария (например: <code>{s.code}_next</code>):"
         ),
-        attachments=inline_keyboard([_back(f"admin_ev_open_{source_id}")]),
+        attachments=inline_keyboard([_back(_event_open_callback(source_id, list_back))]),
     )
 
 
@@ -919,9 +959,10 @@ async def receive_copy_starts_at(client: MaxApiClient, states: StateStore, chat_
             new_code=new_code,
             new_starts_at_utc=utc_dt,
         )
+        list_back = data.get("event_list_back", "admin_events")
         await states.clear(user_id)
         await client.send_message(chat_id=chat_id, text="🎉 <b>Сценарий успешно скопирован!</b>")
-        await show_scenario(client, chat_id, new_scen.id)
+        await show_scenario(client, chat_id, new_scen.id, back=list_back)
     except Exception as exc:
         log.exception("MAX copy error: %s", exc)
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка копирования: {exc}\nПопробуйте снова:")

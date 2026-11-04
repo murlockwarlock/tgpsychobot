@@ -290,6 +290,81 @@ async def test_max_media_cancel_route_clears_unsaved_draft(states, mock_client, 
 
 
 @pytest.mark.asyncio
+async def test_max_paginated_edit_roundtrip_and_delete_stays_draft(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_paginated_edit",
+        event_type="webinar",
+        title="MAX paginated edit",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-paginated-edit",
+        description="x" * 5000,
+    )
+
+    await max_admin_events.show_scenario(mock_client, 123, scen.id, back="admin_ev_page_2_1")
+    card_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+    assert any(
+        button[0]["payload"] == f"admin_ev_edit_menu_{scen.id}_2_1"
+        for button in card_buttons
+        if button
+    )
+
+    await max_admin_events.show_edit_menu(mock_client, 123, scen.id, back="admin_ev_page_2_1")
+    menu_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+    assert menu_buttons[-1][0]["payload"] == f"admin_ev_open_{scen.id}_2_1"
+    await states.set(456, 123, "max_event_edit_menu", {"event_id": scen.id, "event_list_back": "admin_ev_page_2_1"})
+
+    await max_admin_events.start_edit_description(mock_client, states, 123, 456, scen.id)
+    long_preview = mock_client.send_message.call_args.kwargs["text"]
+    assert len(long_preview) < 4096
+    await max_admin_events.delete_description(mock_client, states, 123, 456, scen.id)
+    async with db_session_maker() as session:
+        unchanged = await session.get(EventScenario, scen.id)
+        assert unchanged.description == "x" * 5000
+
+    await max_admin_events.save_description(mock_client, states, 123, 456)
+    async with db_session_maker() as session:
+        saved = await session.get(EventScenario, scen.id)
+        assert saved.description is None
+    saved_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+    assert saved_buttons[0][0]["payload"] == f"admin_ev_open_{scen.id}_2_1"
+
+
+@pytest.mark.asyncio
+async def test_max_callback_open_and_edit_preserve_page_context(mock_client, states, monkeypatch):
+    app = MaxBotApplication(mock_client)
+    app.states = states
+    monkeypatch.setattr("max_messenger_bot.app.common.is_admin", AsyncMock(return_value=True))
+    show_scenario = AsyncMock()
+    show_edit_menu = AsyncMock()
+    monkeypatch.setattr("max_messenger_bot.app.admin_events_service.show_scenario", show_scenario)
+    monkeypatch.setattr("max_messenger_bot.app.admin_events_service.show_edit_menu", show_edit_menu)
+
+    callback = IncomingCallback(
+        raw={}, callback_id="open-page", payload="admin_ev_open_77_2_1", chat_id=123, message_id=None,
+        sender=Sender(user_id=456, username="admin", first_name="Admin", last_name=None),
+    )
+    await app._handle_callback_impl(callback)
+    show_scenario.assert_awaited_once_with(mock_client, 123, 77, back="admin_ev_page_2_1")
+
+    callback.payload = "admin_ev_edit_menu_77_2_1"
+    await app._handle_callback_impl(callback)
+    show_edit_menu.assert_awaited_once_with(mock_client, 123, 77, back="admin_ev_page_2_1")
+    snapshot = await states.get(456)
+    assert snapshot.state == "max_event_edit_menu"
+    assert snapshot.data["event_list_back"] == "admin_ev_page_2_1"
+
+    show_edit_menu.reset_mock()
+    await states.set(456, 123, "max_event_edit_media", {"event_id": 77, "event_list_back": "admin_ev_page_2_1"})
+    callback.payload = "admin_ev_edit_menu_77"
+    await app._handle_callback_impl(callback)
+    show_edit_menu.assert_awaited_once_with(mock_client, 123, 77, back="admin_ev_page_2_1")
+
+
+@pytest.mark.asyncio
 async def test_max_webinar_creation_flow(db_session_maker, mock_client, states, monkeypatch):
     monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
 

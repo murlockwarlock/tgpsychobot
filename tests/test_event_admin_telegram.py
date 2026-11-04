@@ -286,6 +286,73 @@ async def test_telegram_media_back_preserves_draft_and_cancel_discards_it(db_ses
     assert f"admin_ev_media_remove_{scen.id}_0" not in reopened_payloads
 
 
+@pytest.mark.asyncio
+async def test_telegram_paginated_edit_roundtrip_and_delete_stays_draft(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_paginated_edit",
+        event_type="webinar",
+        title="Paginated edit",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/paginated-edit",
+        description="Stored description",
+    )
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
+
+    await event_admin_telegram.open_scenario_card(_make_callback(f"admin_ev_open_{scen.id}_2_1"), state)
+    edit_callback = _make_callback(f"admin_ev_edit_menu_{scen.id}")
+    await event_admin_telegram.show_edit_menu(edit_callback, state)
+    edit_markup = edit_callback.message.edit_text.call_args.kwargs["reply_markup"]
+    edit_callbacks = [button.callback_data for row in edit_markup.inline_keyboard for button in row]
+    assert f"admin_ev_open_{scen.id}_2_1" in edit_callbacks
+    rendered = _make_callback(f"admin_ev_edit_description_{scen.id}")
+    await event_admin_telegram.start_edit_description(rendered, state)
+    description_markup = rendered.message.edit_text.call_args.kwargs["reply_markup"]
+    description_callbacks = [button.callback_data for row in description_markup.inline_keyboard for button in row]
+    assert description_callbacks[-1] == f"admin_ev_edit_menu_{scen.id}"
+
+    delete_callback = _make_callback(f"admin_ev_description_delete_{scen.id}")
+    await event_admin_telegram.delete_description(delete_callback, state)
+    async with db_session_maker() as session:
+        unchanged = await session.get(EventScenario, scen.id)
+        assert unchanged.description == "Stored description"
+
+    save_callback = _make_callback(f"admin_ev_description_save_{scen.id}")
+    await event_admin_telegram.save_description(save_callback, state)
+    async with db_session_maker() as session:
+        saved = await session.get(EventScenario, scen.id)
+        assert saved.description is None
+    saved_markup = save_callback.message.edit_text.call_args.kwargs["reply_markup"]
+    saved_callbacks = [button.callback_data for row in saved_markup.inline_keyboard for button in row]
+    assert "admin_ev_page_2_1" in saved_callbacks
+
+
+@pytest.mark.asyncio
+async def test_telegram_long_description_preview_is_bounded(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_long_preview",
+        event_type="webinar",
+        title="Long preview",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/long-preview",
+        description="x" * 5000,
+    )
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
+    callback = _make_callback(f"admin_ev_edit_description_{scen.id}")
+    await event_admin_telegram.start_edit_description(callback, state)
+    rendered = callback.message.edit_text.call_args.args[0]
+    assert len(rendered) < 4096
+
+
 def test_telegram_uncertain_resolution_buttons_target_specific_part():
     item = DeliveryItem(
         id=41,
