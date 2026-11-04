@@ -26,7 +26,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database import async_session_maker, get_all_admin_ids
-from html_utils import truncate_html_preview
+from admin_html_preview import truncate_html_preview
 from event_admin_service import (
     PRESET_OFFSETS,
     PROBLEM_DELIVERY_STATUSES,

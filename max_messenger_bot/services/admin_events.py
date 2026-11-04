@@ -56,7 +56,7 @@ from event_admin_service import (
     validate_scenario_input,
     validate_step_input,
 )
-from html_utils import truncate_html_preview
+from admin_html_preview import truncate_html_preview
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard
 from ..legacy import User, async_session_maker

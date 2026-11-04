@@ -36,7 +36,7 @@ from database import (
     User,
 )
 from max_messenger_bot.identity import is_max_user_id
-from html_utils import truncate_html_preview
+from admin_html_preview import truncate_html_preview
 from time_helpers import MSK, format_msk, to_msk, utc_now
 from user_metadata import load_metadata_records
 
