@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -9,6 +10,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import pytest
 import pytest_asyncio
 from aiogram import Bot, Dispatcher
+from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
@@ -169,37 +171,68 @@ def _telegram_event_callbacks(markup) -> list[str]:
     ]
 
 
+_TELEGRAM_EVENT_BUTTON_CONTRACTS = (
+    (re.compile(r"(?:admin_events|admin_panel|admin_ev_create_(?:webinar|meeting))"), "navigation", "events/list", "telegram.events.root"),
+    (re.compile(r"admin_ev_skip_meeting_link$"), "fsm", "events/create", "telegram.events.root"),
+    (re.compile(r"admin_ev_page_\d+_[01]$"), "navigation", "events/list", "telegram.events.pagination"),
+    (re.compile(r"admin_ev_toggle_archive_view_[01]$"), "navigation", "events/list", "telegram.events.pagination"),
+    (re.compile(r"admin_ev_open_\d+(?:_\d+_[01])?$"), "navigation", "events/card", "telegram.events.card"),
+    (re.compile(r"admin_ev_toggle_media_order_\d+$"), "mutation", "events/edit", "telegram.description-media"),
+    (re.compile(r"admin_ev_toggle_\d+$"), "mutation", "events/card", "telegram.events.card"),
+    (re.compile(r"admin_ev_stats_\d+$"), "navigation", "events/stats", "telegram.delivery.lifecycle"),
+    (re.compile(r"admin_ev_reschedule_\d+$"), "fsm", "events/reschedule", "telegram.events.card"),
+    (re.compile(r"admin_ev_edit_menu_\d+(?:_\d+_[01])?$"), "navigation", "events/edit", "telegram.events.edit"),
+    (re.compile(r"admin_ev_copy_\d+$"), "mutation", "events/copy", "telegram.events.card"),
+    (re.compile(r"admin_ev_test_send_menu_\d+$"), "navigation", "events/test-send", "telegram.delivery.test-send"),
+    (re.compile(r"admin_ev_archive_(?:ask|yes)_\d+$"), "destructive", "events/archive", "telegram.delivery.lifecycle"),
+    (re.compile(r"admin_ev_edit_(?:title|duration|link|place|description|media)_\d+$"), "fsm", "events/edit", "telegram.events.edit"),
+    (re.compile(r"admin_ev_description_(?:save|delete)_\d+$"), "mutation", "events/edit", "telegram.description-media"),
+    (re.compile(r"admin_ev_media_(?:add|save)_\d+$"), "mutation", "events/edit-media", "telegram.description-media"),
+    (re.compile(r"admin_ev_media_(?:remove|up|down)_\d+_\d+$"), "mutation", "events/edit-media", "telegram.description-media"),
+    (re.compile(r"admin_ev_steps_\d+(?:_\d+_[01])?$"), "navigation", "events/steps", "telegram.steps.roundtrip"),
+    (re.compile(r"admin_ev_step_add_\d+$"), "fsm", "events/steps", "telegram.steps.roundtrip"),
+    (re.compile(r"admin_ev_offset_preset_\d+_-?\d+$"), "fsm", "events/steps", "telegram.steps.roundtrip"),
+    (re.compile(r"admin_ev_offset_custom_\d+$"), "fsm", "events/steps", "telegram.steps.roundtrip"),
+    (re.compile(r"admin_ev_step_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "telegram.steps.roundtrip"),
+    (re.compile(r"admin_ev_step_(?:toggle_details|edit_text|edit_offset|up|down|del_ask|del_yes)_\d+$"), "mutation", "events/step", "telegram.steps.dispatcher"),
+    (re.compile(r"admin_ev_step_edit_preset_\d+_-?\d+$"), "fsm", "events/step", "telegram.steps.dispatcher"),
+    (re.compile(r"admin_ev_step_edit_custom_\d+$"), "fsm", "events/step", "telegram.steps.dispatcher"),
+    (re.compile(r"admin_ev_problems_\d+_\d+$"), "navigation", "events/problems", "telegram.delivery.lifecycle"),
+    (re.compile(r"admin_ev_problem_item_\d+$"), "navigation", "events/problem", "telegram.delivery.lifecycle"),
+    (re.compile(r"admin_ev_resolve_(?:force|sent|skipped)_\d+(?:_\d+)?$"), "fsm", "events/problem", "telegram.delivery.resolution"),
+    (re.compile(r"admin_ev_test_step_\d+$"), "external", "telegram/test-send", "telegram.delivery.test-send"),
+    (re.compile(r"admin_ev_do_test_send_\d+_\d+$"), "external", "telegram/test-send", "telegram.delivery.test-send"),
+)
+
+_TELEGRAM_EVENT_JOURNEY_COVERAGE = {
+    "telegram.events.root",
+    "telegram.events.pagination",
+    "telegram.events.card",
+    "telegram.events.edit",
+    "telegram.description-media",
+    "telegram.steps.roundtrip",
+    "telegram.steps.dispatcher",
+    "telegram.delivery.lifecycle",
+    "telegram.delivery.resolution",
+    "telegram.delivery.test-send",
+}
+
+
+def _event_callback_contract(callback: str) -> dict[str, str]:
+    for pattern, classification, target, journey_id in _TELEGRAM_EVENT_BUTTON_CONTRACTS:
+        if pattern.fullmatch(callback):
+            assert journey_id in _TELEGRAM_EVENT_JOURNEY_COVERAGE
+            return {
+                "classification": classification,
+                "target": target,
+                "journey_id": journey_id,
+            }
+    raise AssertionError(f"Uncontracted event callback: {callback}")
+
+
 def _assert_event_callback_contract(callbacks: list[str]) -> None:
-    exact = {
-        "admin_events",
-        "admin_panel",
-        "admin_ev_create_webinar",
-        "admin_ev_create_meeting",
-    }
-    prefixes = (
-        "admin_ev_page_",
-        "admin_ev_toggle_archive_view_",
-        "admin_ev_open_",
-        "admin_ev_toggle_",
-        "admin_ev_steps_",
-        "admin_ev_stats_",
-        "admin_ev_reschedule_",
-        "admin_ev_edit_menu_",
-        "admin_ev_copy_",
-        "admin_ev_test_send_menu_",
-        "admin_ev_archive_",
-        "admin_ev_edit_",
-        "admin_ev_toggle_media_order_",
-        "admin_ev_step_",
-        "admin_ev_offset_",
-        "admin_ev_problems_",
-        "admin_ev_problem_item_",
-        "admin_ev_resolve_",
-        "admin_ev_test_step_",
-        "admin_ev_do_test_send_",
-    )
     for callback in callbacks:
-        assert callback in exact or callback.startswith(prefixes), f"Unclassified event callback: {callback}"
+        _event_callback_contract(callback)
 
 
 def test_telegram_event_visible_button_contract_covers_changed_screens():
@@ -264,16 +297,165 @@ def test_telegram_event_visible_button_contract_covers_changed_screens():
         event_admin_telegram._scenario_edit_keyboard(scenario, list_back="admin_ev_page_1_1"),
         event_admin_telegram._steps_list_keyboard(10, [step], False, back="admin_ev_page_1_1"),
         event_admin_telegram._step_card_keyboard(10, step, False, False, False, back="admin_ev_page_1_1"),
-        event_admin_telegram._step_offset_picker_keyboard(10, "admin_ev_step_20_1_1"),
+        event_admin_telegram._step_offset_picker_keyboard(10, "admin_ev_steps_10_1_1"),
         event_admin_telegram._step_edit_offset_picker_keyboard(20),
+        event_admin_telegram._media_editor_keyboard(
+            10,
+            [
+                {"file_type": "photo", "file_id": "photo-1", "max_token": None, "source_platform": "telegram"},
+                {"file_type": "video", "file_id": "video-1", "max_token": None, "source_platform": "telegram"},
+            ],
+        ),
         event_admin_telegram._delivery_stats_keyboard(10, DeliveryStats(uncertain=1)),
         event_admin_telegram._problem_deliveries_keyboard(10, [delivery], 0, 2),
         event_admin_telegram._delivery_resolution_keyboard(delivery, [part]),
         event_admin_telegram._test_send_picker_keyboard(10, [step], back="admin_ev_page_1_1"),
+        event_admin_telegram.InlineKeyboardBuilder().button(
+            text="Пропустить ссылку", callback_data="admin_ev_skip_meeting_link"
+        ).as_markup(),
     ]
     _assert_event_callback_contract(
         [callback for keyboard in keyboards for callback in _telegram_event_callbacks(keyboard)]
     )
+
+
+@pytest.mark.asyncio
+async def test_telegram_visible_event_buttons_dispatch_through_router_contract(monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    scenario = ScenarioSummary(
+        id=10,
+        code="event_dispatch_contract",
+        event_type="meeting",
+        title="Contract meeting",
+        starts_at=datetime.utcnow(),
+        starts_at_msk="01.01.2030 12:00",
+        duration_minutes=90,
+        place="Room 1",
+        link=None,
+        is_active=True,
+        is_archived=False,
+        schedule_revision=1,
+        content_version=1,
+        registrations_count=2,
+        description="Description",
+        media_order="media_top",
+        media_count=2,
+    )
+    step = StepItem(
+        id=20,
+        event_id=10,
+        offset_minutes=-60,
+        offset_display="1 ч. до начала",
+        message_text="Reminder",
+        step_version=1,
+        sort_order=0,
+        is_archived=False,
+        include_event_details=True,
+    )
+    delivery = DeliveryItem(
+        id=30,
+        event_id=10,
+        user_id=40,
+        user_display="User",
+        message_kind="immediate_confirmation",
+        step_id=None,
+        status="uncertain",
+        due_at_msk="01.01.2030 11:00",
+        attempt_count=1,
+        last_error="timeout",
+        sent_or_finished_msk=None,
+        platform="telegram",
+        retry_index=0,
+        parent_delivery_id=None,
+    )
+    part = DeliveryPartItem(
+        id=31,
+        part_index=0,
+        part_kind="media",
+        status="uncertain",
+        attempt_count=1,
+        last_error="timeout",
+        external_message_id=None,
+    )
+    keyboards = [
+        event_admin_telegram._scenarios_list_keyboard([scenario], 0, 2, True),
+        event_admin_telegram._scenario_card_keyboard(scenario, "admin_ev_page_1_1"),
+        event_admin_telegram._scenario_edit_keyboard(scenario, list_back="admin_ev_page_1_1"),
+        event_admin_telegram._steps_list_keyboard(10, [step], False, back="admin_ev_page_1_1"),
+        event_admin_telegram._step_card_keyboard(10, step, False, False, False, back="admin_ev_page_1_1"),
+        event_admin_telegram._step_offset_picker_keyboard(10, "admin_ev_steps_10_1_1"),
+        event_admin_telegram._step_edit_offset_picker_keyboard(20),
+        event_admin_telegram._media_editor_keyboard(
+            10,
+            [
+                {"file_type": "photo", "file_id": "photo-1", "max_token": None, "source_platform": "telegram"},
+                {"file_type": "video", "file_id": "video-1", "max_token": None, "source_platform": "telegram"},
+            ],
+        ),
+        event_admin_telegram._delivery_stats_keyboard(10, DeliveryStats(uncertain=1)),
+        event_admin_telegram._problem_deliveries_keyboard(10, [delivery], 0, 2),
+        event_admin_telegram._delivery_resolution_keyboard(delivery, [part]),
+        event_admin_telegram._test_send_picker_keyboard(10, [step], back="admin_ev_page_1_1"),
+        event_admin_telegram.InlineKeyboardBuilder().button(
+            text="Пропустить ссылку", callback_data="admin_ev_skip_meeting_link"
+        ).as_markup(),
+    ]
+    callbacks = [callback for keyboard in keyboards for callback in _telegram_event_callbacks(keyboard)]
+    assert callbacks
+    for callback in callbacks:
+        _event_callback_contract(callback)
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_callbacks = {
+        router: [handler.callback for handler in router.callback_query.handlers]
+        for router in routers
+    }
+    routed: list[str] = []
+
+    def make_probe(handler_name: str):
+        async def probe(*args, **kwargs):
+            callback = kwargs.get("callback") or (args[0] if args else None)
+            assert callback is not None
+            routed.append(handler_name)
+            await callback.message.edit_text(f"route:{handler_name}")
+
+        return probe
+
+    try:
+        for router in routers:
+            for handler in router.callback_query.handlers:
+                handler.callback = make_probe(handler.callback.__name__)
+            router._parent_router = None
+        dp = Dispatcher(storage=MemoryStorage())
+        for router in routers:
+            dp.include_router(router)
+        bot = AsyncMock(spec=Bot)
+        bot.id = 123456789
+        for callback in callbacks:
+            routed.clear()
+            bot.reset_mock()
+            user = TgUser(id=12345, is_bot=False, first_name="Admin", username="admin_user")
+            chat = Chat(id=12345, type="private")
+            message = Message(message_id=100, date=datetime.now(), chat=chat, text="Original text")
+            query = CallbackQuery(
+                id=f"contract-{callback}",
+                from_user=user,
+                chat_instance="contract",
+                data=callback,
+                message=message,
+            )
+            result = await dp.feed_update(bot, Update(update_id=100, callback_query=query))
+            assert result is not UNHANDLED, f"Visible callback was not routed: {callback}"
+            assert len(routed) == 1, f"Visible callback selected {routed}: {callback}"
+            methods = [call.args[0] for call in bot.call_args_list if call.args]
+            assert any(isinstance(method, EditMessageText) for method in methods), callback
+    finally:
+        for router in routers:
+            for handler, original in zip(router.callback_query.handlers, original_callbacks[router]):
+                handler.callback = original
+            router._parent_router = None
 
 
 @pytest.mark.asyncio
@@ -293,7 +475,13 @@ async def test_telegram_pagination_boundaries_for_scenarios_and_problems(monkeyp
             for index in range(count)
         ]
 
-    for count in (0, 1, event_admin_telegram.SCENARIOS_PAGE_SIZE, event_admin_telegram.SCENARIOS_PAGE_SIZE + 1):
+    for count in (
+        0,
+        1,
+        event_admin_telegram.SCENARIOS_PAGE_SIZE,
+        event_admin_telegram.SCENARIOS_PAGE_SIZE + 1,
+        event_admin_telegram.SCENARIOS_PAGE_SIZE * 2 + 1,
+    ):
         monkeypatch.setattr(event_admin_telegram, "list_scenarios", AsyncMock(return_value=scenario_rows(count)))
         callback = _make_callback("admin_events")
         await event_admin_telegram._show_scenarios_page(callback, page=0, include_archived=True)
@@ -305,7 +493,13 @@ async def test_telegram_pagination_boundaries_for_scenarios_and_problems(monkeyp
             await event_admin_telegram._show_scenarios_page(callback, page=1, include_archived=True)
             callbacks = _telegram_event_callbacks(callback.message.edit_text.call_args.kwargs["reply_markup"])
             assert "admin_ev_page_0_1" in callbacks
-            assert "admin_ev_page_2_1" not in callbacks
+            assert ("admin_ev_page_2_1" in callbacks) is (count > event_admin_telegram.SCENARIOS_PAGE_SIZE * 2)
+            if count > event_admin_telegram.SCENARIOS_PAGE_SIZE * 2:
+                callback = _make_callback("admin_ev_events_page_2")
+                await event_admin_telegram._show_scenarios_page(callback, page=2, include_archived=True)
+                callbacks = _telegram_event_callbacks(callback.message.edit_text.call_args.kwargs["reply_markup"])
+                assert "admin_ev_page_1_1" in callbacks
+                assert "admin_ev_page_3_1" not in callbacks
 
     def problem_rows(count: int) -> list[DeliveryItem]:
         return [
@@ -328,7 +522,13 @@ async def test_telegram_pagination_boundaries_for_scenarios_and_problems(monkeyp
             for index in range(count)
         ]
 
-    for count in (0, 1, event_admin_telegram.PROBLEMS_PAGE_SIZE, event_admin_telegram.PROBLEMS_PAGE_SIZE + 1):
+    for count in (
+        0,
+        1,
+        event_admin_telegram.PROBLEMS_PAGE_SIZE,
+        event_admin_telegram.PROBLEMS_PAGE_SIZE + 1,
+        event_admin_telegram.PROBLEMS_PAGE_SIZE * 2 + 1,
+    ):
         async def fake_list_problem_deliveries(session_maker, event_id, *, limit, offset, _count=count):
             rows = problem_rows(_count)
             return rows[offset : offset + limit], _count
@@ -344,7 +544,13 @@ async def test_telegram_pagination_boundaries_for_scenarios_and_problems(monkeyp
             await event_admin_telegram.show_problem_deliveries(callback)
             callbacks = _telegram_event_callbacks(callback.message.edit_text.call_args.kwargs["reply_markup"])
             assert "admin_ev_problems_10_0" in callbacks
-            assert "admin_ev_problems_10_2" not in callbacks
+            assert ("admin_ev_problems_10_2" in callbacks) is (count > event_admin_telegram.PROBLEMS_PAGE_SIZE * 2)
+            if count > event_admin_telegram.PROBLEMS_PAGE_SIZE * 2:
+                callback = _make_callback("admin_ev_problems_10_2")
+                await event_admin_telegram.show_problem_deliveries(callback)
+                callbacks = _telegram_event_callbacks(callback.message.edit_text.call_args.kwargs["reply_markup"])
+                assert "admin_ev_problems_10_1" in callbacks
+                assert "admin_ev_problems_10_3" not in callbacks
 
 
 @pytest.mark.asyncio
@@ -453,6 +659,51 @@ async def test_telegram_dispatcher_steps_buttons_roundtrip_page_context(db_sessi
     methods = await _feed_callback(dp, bot, cancel_callback)
     cancelled = next(method for method in methods if isinstance(method, EditMessageText))
     assert cancelled.reply_markup.inline_keyboard[-1][0].callback_data == f"admin_ev_steps_{scen.id}_2_1"
+
+
+@pytest.mark.asyncio
+async def test_telegram_dispatcher_delete_last_step_returns_empty_page(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import add_step, create_scenario, list_steps
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_delete_last_step",
+        event_type="webinar",
+        title="Delete last step",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/delete-last",
+    )
+    step = await add_step(db_session_maker, scen.id, -60, "Last reminder")
+    event_admin_router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(event_admin_router)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+
+    methods = await _feed_callback(dp, bot, f"admin_ev_steps_{scen.id}_2_1")
+    steps_screen = next(method for method in methods if isinstance(method, EditMessageText))
+    await _feed_callback(dp, bot, f"admin_ev_step_{step.id}")
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_del_ask_{step.id}")
+    confirmation = next(method for method in methods if isinstance(method, EditMessageText))
+    assert f"admin_ev_step_del_yes_{step.id}" in _telegram_event_callbacks(confirmation.reply_markup)
+
+    methods = await _feed_callback(dp, bot, f"admin_ev_step_del_yes_{step.id}")
+    empty_page = next(method for method in methods if isinstance(method, EditMessageText))
+    assert "Всего активных шагов: 0" in empty_page.text
+    assert not any(
+        button.callback_data and button.callback_data.startswith("admin_ev_step_")
+        and not button.callback_data.startswith("admin_ev_step_add_")
+        for row in empty_page.reply_markup.inline_keyboard
+        for button in row
+    )
+    assert any(
+        button.callback_data == f"admin_ev_open_{scen.id}_2_1"
+        for row in empty_page.reply_markup.inline_keyboard
+        for button in row
+    )
+    assert await list_steps(db_session_maker, scen.id, include_archived=False) == []
 
 
 @pytest.mark.asyncio

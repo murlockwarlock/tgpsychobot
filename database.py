@@ -2125,7 +2125,30 @@ async def init_db():
                     "ALTER TABLE event_deliveries ADD COLUMN content_version_snapshot INTEGER DEFAULT 1 NOT NULL "
                     "CONSTRAINT ck_event_deliveries_content_version CHECK (content_version_snapshot >= 1)"
                 ))
-            sync_conn.execute(text("UPDATE event_deliveries SET content_version_snapshot = 1 WHERE content_version_snapshot IS NULL OR content_version_snapshot < 1"))
+                sync_conn.execute(text(
+                    "UPDATE event_deliveries "
+                    "SET content_version_snapshot = ("
+                    "SELECT content_version FROM event_scenarios "
+                    "WHERE event_scenarios.id = event_deliveries.event_id"
+                    ") "
+                    "WHERE EXISTS ("
+                    "SELECT 1 FROM event_scenarios "
+                    "WHERE event_scenarios.id = event_deliveries.event_id"
+                    ")"
+                ))
+            else:
+                sync_conn.execute(text(
+                    "UPDATE event_deliveries "
+                    "SET content_version_snapshot = ("
+                    "SELECT content_version FROM event_scenarios "
+                    "WHERE event_scenarios.id = event_deliveries.event_id"
+                    ") "
+                    "WHERE (content_version_snapshot IS NULL OR content_version_snapshot < 1) "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM event_scenarios "
+                    "WHERE event_scenarios.id = event_deliveries.event_id"
+                    ")"
+                ))
             EventDeliveryResolution.__table__.create(sync_conn, checkfirst=True)
             EventScenarioMedia.__table__.create(sync_conn, checkfirst=True)
             EventDeliveryPart.__table__.create(sync_conn, checkfirst=True)

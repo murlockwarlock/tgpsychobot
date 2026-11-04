@@ -1,5 +1,6 @@
 import io
 import os
+import re
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -27,7 +28,7 @@ from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
 from max_messenger_bot.services import admin_events as max_admin_events
 from max_messenger_bot.storage import StateStore
 from time_helpers import utc_now
-from event_admin_service import DeliveryItem, DeliveryStats
+from event_admin_service import DeliveryItem, DeliveryPartItem, DeliveryStats
 
 
 @pytest_asyncio.fixture
@@ -153,39 +154,68 @@ def _max_event_payloads(mock_client) -> list[str]:
     return payloads
 
 
+_MAX_EVENT_BUTTON_CONTRACTS = (
+    (re.compile(r"(?:admin_events|admin_panel|admin_ev_create_(?:webinar|meeting))"), "navigation", "events/list", "max.events.root"),
+    (re.compile(r"admin_ev_skip_meeting_link$"), "fsm", "events/create", "max.events.root"),
+    (re.compile(r"admin_ev_page_\d+_[01]$"), "navigation", "events/list", "max.events.pagination"),
+    (re.compile(r"admin_ev_toggle_archive_view_[01]$"), "navigation", "events/list", "max.events.pagination"),
+    (re.compile(r"admin_ev_open_\d+(?:_\d+_[01])?$"), "navigation", "events/card", "max.events.card"),
+    (re.compile(r"admin_ev_toggle_media_order_\d+$"), "mutation", "events/edit", "max.description-media"),
+    (re.compile(r"admin_ev_toggle_\d+$"), "mutation", "events/card", "max.events.card"),
+    (re.compile(r"admin_ev_stats_\d+$"), "navigation", "events/stats", "max.delivery.lifecycle"),
+    (re.compile(r"admin_ev_reschedule_\d+$"), "fsm", "events/reschedule", "max.events.card"),
+    (re.compile(r"admin_ev_edit_menu_\d+(?:_\d+_[01])?$"), "navigation", "events/edit", "max.events.edit"),
+    (re.compile(r"admin_ev_copy_\d+$"), "mutation", "events/copy", "max.events.card"),
+    (re.compile(r"admin_ev_test_send_menu_\d+$"), "navigation", "events/test-send", "max.delivery.test-send"),
+    (re.compile(r"admin_ev_archive_(?:ask|yes)_\d+$"), "destructive", "events/archive", "max.delivery.lifecycle"),
+    (re.compile(r"admin_ev_edit_(?:title|duration|link|place|description|media)_\d+$"), "fsm", "events/edit", "max.events.edit"),
+    (re.compile(r"admin_ev_description_(?:save|delete)_\d+$"), "mutation", "events/edit", "max.description-media"),
+    (re.compile(r"admin_ev_media_(?:add|save)_\d+$"), "mutation", "events/edit-media", "max.description-media"),
+    (re.compile(r"admin_ev_media_(?:remove|up|down)_\d+_\d+$"), "mutation", "events/edit-media", "max.description-media"),
+    (re.compile(r"admin_ev_steps_\d+(?:_\d+_[01])?$"), "navigation", "events/steps", "max.steps.roundtrip"),
+    (re.compile(r"admin_ev_step_add_\d+(?:_\d+_[01])?$"), "fsm", "events/steps", "max.steps.roundtrip"),
+    (re.compile(r"admin_ev_offset_preset_\d+_-?\d+$"), "fsm", "events/steps", "max.steps.roundtrip"),
+    (re.compile(r"admin_ev_offset_custom_\d+$"), "fsm", "events/steps", "max.steps.roundtrip"),
+    (re.compile(r"admin_ev_step_\d+(?:_\d+_[01])?$"), "navigation", "events/step", "max.steps.roundtrip"),
+    (re.compile(r"admin_ev_step_(?:toggle_details|edit_text|edit_offset|up|down|del_ask|del_yes)_\d+(?:_\d+_[01])?$"), "mutation", "events/step", "max.steps.dispatcher"),
+    (re.compile(r"admin_ev_step_edit_preset_\d+_-?\d+(?:_\d+_[01])?$"), "fsm", "events/step", "max.steps.dispatcher"),
+    (re.compile(r"admin_ev_step_edit_custom_\d+(?:_\d+_[01])?$"), "fsm", "events/step", "max.steps.dispatcher"),
+    (re.compile(r"admin_ev_problems_\d+_\d+$"), "navigation", "events/problems", "max.delivery.lifecycle"),
+    (re.compile(r"admin_ev_problem_item_\d+$"), "navigation", "events/problem", "max.delivery.lifecycle"),
+    (re.compile(r"admin_ev_resolve_(?:force|sent|skipped)_\d+(?:_\d+)?$"), "fsm", "events/problem", "max.delivery.resolution"),
+    (re.compile(r"admin_ev_test_step_\d+(?:_\d+_[01])?$"), "external", "max/test-send", "max.delivery.test-send"),
+    (re.compile(r"admin_ev_do_test_send_\d+_\d+$"), "external", "max/test-send", "max.delivery.test-send"),
+)
+
+_MAX_EVENT_JOURNEY_COVERAGE = {
+    "max.events.root",
+    "max.events.pagination",
+    "max.events.card",
+    "max.events.edit",
+    "max.description-media",
+    "max.steps.roundtrip",
+    "max.steps.dispatcher",
+    "max.delivery.lifecycle",
+    "max.delivery.resolution",
+    "max.delivery.test-send",
+}
+
+
+def _max_event_callback_contract(payload: str) -> dict[str, str]:
+    for pattern, classification, target, journey_id in _MAX_EVENT_BUTTON_CONTRACTS:
+        if pattern.fullmatch(payload):
+            assert journey_id in _MAX_EVENT_JOURNEY_COVERAGE
+            return {
+                "classification": classification,
+                "target": target,
+                "journey_id": journey_id,
+            }
+    raise AssertionError(f"Uncontracted event payload: {payload}")
+
+
 def _assert_max_event_callback_contract(payloads: list[str]) -> None:
-    exact = {
-        "admin_events",
-        "admin_panel",
-        "admin_ev_create_webinar",
-        "admin_ev_create_meeting",
-    }
-    prefixes = (
-        "admin_ev_page_",
-        "admin_ev_toggle_archive_view_",
-        "admin_ev_open_",
-        "admin_ev_toggle_",
-        "admin_ev_steps_",
-        "admin_ev_stats_",
-        "admin_ev_reschedule_",
-        "admin_ev_edit_menu_",
-        "admin_ev_copy_",
-        "admin_ev_test_send_menu_",
-        "admin_ev_archive_",
-        "admin_ev_edit_",
-        "admin_ev_media_",
-        "admin_ev_description_",
-        "admin_ev_toggle_media_order_",
-        "admin_ev_step_",
-        "admin_ev_offset_",
-        "admin_ev_problems_",
-        "admin_ev_problem_item_",
-        "admin_ev_resolve_",
-        "admin_ev_test_step_",
-        "admin_ev_do_test_send_",
-    )
     for payload in payloads:
-        assert payload in exact or payload.startswith(prefixes), f"Unclassified event payload: {payload}"
+        _max_event_callback_contract(payload)
 
 
 @pytest.mark.asyncio
@@ -248,6 +278,145 @@ async def test_max_event_visible_button_contract_covers_changed_screens(
 
 
 @pytest.mark.asyncio
+async def test_max_visible_event_buttons_dispatch_through_application_contract(db_session_maker, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import add_step, create_scenario
+
+    scenario = await create_scenario(
+        db_session_maker,
+        code="max_dispatch_contract",
+        event_type="meeting",
+        title="MAX contract meeting",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        place="Room 1",
+    )
+    step = await add_step(db_session_maker, scenario.id, -60, "Reminder", include_event_details=True)
+    delivery = DeliveryItem(
+        id=30,
+        event_id=scenario.id,
+        user_id=40,
+        user_display="User",
+        message_kind="immediate_confirmation",
+        step_id=None,
+        status="uncertain",
+        due_at_msk="01.01.2030 11:00",
+        attempt_count=1,
+        last_error="timeout",
+        sent_or_finished_msk=None,
+        platform="max",
+        retry_index=0,
+        parent_delivery_id=None,
+    )
+    part = DeliveryPartItem(
+        id=31,
+        part_index=0,
+        part_kind="media",
+        status="uncertain",
+        attempt_count=1,
+        last_error="timeout",
+        external_message_id=None,
+    )
+    render_client = AsyncMock(spec=MaxApiClient)
+    render_states = MemoryStateStore()
+    await max_admin_events.show_scenarios(render_client, chat_id=123, page=0, include_archived=True)
+    await max_admin_events.show_scenario(render_client, chat_id=123, event_id=scenario.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_edit_menu(render_client, chat_id=123, event_id=scenario.id, back="admin_ev_page_1_1")
+    await max_admin_events.start_edit_description(render_client, render_states, 123, 456, scenario.id)
+    await max_admin_events.receive_create_place(render_client, render_states, 123, 456, "Room 1")
+    await render_states.set(
+        456,
+        123,
+        "max_event_edit_media",
+        {
+            "event_id": scenario.id,
+            "media_draft": [
+                {"file_type": "photo", "file_id": "photo-1", "max_token": "photo-1", "source_platform": "max"},
+                {"file_type": "video", "file_id": "video-1", "max_token": "video-1", "source_platform": "max"},
+            ],
+            "media_draft_dirty": True,
+            "event_list_back": "admin_ev_page_1_1",
+        },
+    )
+    await max_admin_events.show_media_editor(render_client, render_states, 123, 456, scenario.id)
+    await max_admin_events.show_steps(render_client, chat_id=123, event_id=scenario.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_step(render_client, chat_id=123, step_id=step.id, back="admin_ev_page_1_1")
+    await max_admin_events.start_step_add(render_client, render_states, 123, 456, scenario.id, back="admin_ev_page_1_1")
+    await max_admin_events.start_edit_step_offset(render_client, render_states, 123, 456, step.id, back="admin_ev_page_1_1")
+    await max_admin_events.show_test_send_menu(render_client, chat_id=123, event_id=scenario.id, back="admin_ev_page_1_1")
+    monkeypatch.setattr(max_admin_events, "get_scenario_delivery_stats", AsyncMock(return_value=DeliveryStats(uncertain=1)))
+    await max_admin_events.show_stats(render_client, chat_id=123, event_id=scenario.id)
+    monkeypatch.setattr(max_admin_events, "list_problem_deliveries", AsyncMock(return_value=([delivery], 1)))
+    await max_admin_events.show_problems(render_client, chat_id=123, event_id=scenario.id)
+    monkeypatch.setattr(max_admin_events, "get_delivery_item", AsyncMock(return_value=delivery))
+    monkeypatch.setattr(max_admin_events, "list_delivery_parts", AsyncMock(return_value=[part]))
+    await max_admin_events.show_problem_detail(render_client, chat_id=123, delivery_id=delivery.id)
+    payloads = _max_event_payloads(render_client)
+    assert payloads
+    for payload in payloads:
+        _max_event_callback_contract(payload)
+
+    import event_admin_service
+    from max_messenger_bot import app as max_app_module
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+    app = MaxBotApplication(client)
+    app.states = states
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        event_admin_service,
+        "get_step_item",
+        AsyncMock(return_value=step),
+    )
+
+    service_names = {
+        "show_scenarios", "show_scenario", "toggle_scenario", "toggle_media_order",
+        "archive_scenario_ask", "archive_scenario_confirm", "start_scenario_create",
+        "skip_meeting_link", "show_edit_menu", "start_edit_description", "save_description",
+        "delete_description", "show_media_editor", "start_add_media", "mutate_media_draft",
+        "save_media", "start_edit_title", "start_edit_duration", "start_edit_link",
+        "start_edit_place", "start_reschedule", "start_copy", "show_steps", "start_step_add",
+        "select_step_offset_preset", "start_step_offset_custom", "start_edit_step_text",
+        "toggle_step_event_details", "start_edit_step_offset", "select_edit_step_offset_preset",
+        "start_edit_step_offset_custom", "step_move_up", "step_move_down", "ask_delete_step",
+        "confirm_delete_step", "show_step", "show_stats", "show_problems", "show_problem_detail",
+        "start_resolve", "show_test_send_menu", "do_test_send",
+    }
+    routed: list[str] = []
+
+    def make_probe(name: str):
+        async def probe(client_arg, *args, **kwargs):
+            routed.append(name)
+            await client_arg.send_message(chat_id=kwargs.get("chat_id", 123), text=f"route:{name}")
+
+        return probe
+
+    for name in service_names:
+        mock = AsyncMock(side_effect=make_probe(name))
+        monkeypatch.setattr(max_admin_events, name, mock)
+    admin_panel_mock = AsyncMock(side_effect=make_probe("admin_panel"))
+    monkeypatch.setattr(max_app_module.admin_service, "show_admin_panel", admin_panel_mock)
+
+    for payload in payloads:
+        routed.clear()
+        client.reset_mock()
+        result = await app._handle_callback_impl(
+            IncomingCallback(
+                raw={},
+                callback_id=f"contract-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+        assert result is None
+        assert len(routed) == 1, f"Visible payload selected {routed}: {payload}"
+        assert client.send_message.called, payload
+
+
+@pytest.mark.asyncio
 async def test_max_pagination_boundaries_for_scenarios_and_problems(mock_client, monkeypatch):
     def scenario_rows(count: int) -> list[SimpleNamespace]:
         return [
@@ -264,7 +433,13 @@ async def test_max_pagination_boundaries_for_scenarios_and_problems(mock_client,
             for index in range(count)
         ]
 
-    for count in (0, 1, max_admin_events.PAGE_SIZE, max_admin_events.PAGE_SIZE + 1):
+    for count in (
+        0,
+        1,
+        max_admin_events.PAGE_SIZE,
+        max_admin_events.PAGE_SIZE + 1,
+        max_admin_events.PAGE_SIZE * 2 + 1,
+    ):
         monkeypatch.setattr(max_admin_events, "list_scenarios", AsyncMock(return_value=scenario_rows(count)))
         mock_client.send_message.reset_mock()
         await max_admin_events.show_scenarios(mock_client, chat_id=123, page=0, include_archived=True)
@@ -276,7 +451,13 @@ async def test_max_pagination_boundaries_for_scenarios_and_problems(mock_client,
             await max_admin_events.show_scenarios(mock_client, chat_id=123, page=1, include_archived=True)
             payloads = _max_event_payloads(mock_client)
             assert "admin_ev_page_0_1" in payloads
-            assert "admin_ev_page_2_1" not in payloads
+            assert ("admin_ev_page_2_1" in payloads) is (count > max_admin_events.PAGE_SIZE * 2)
+            if count > max_admin_events.PAGE_SIZE * 2:
+                mock_client.send_message.reset_mock()
+                await max_admin_events.show_scenarios(mock_client, chat_id=123, page=2, include_archived=True)
+                payloads = _max_event_payloads(mock_client)
+                assert "admin_ev_page_1_1" in payloads
+                assert "admin_ev_page_3_1" not in payloads
 
     def problem_rows(count: int) -> list[DeliveryItem]:
         return [
@@ -299,7 +480,13 @@ async def test_max_pagination_boundaries_for_scenarios_and_problems(mock_client,
             for index in range(count)
         ]
 
-    for count in (0, 1, max_admin_events.PROBLEMS_PAGE_SIZE, max_admin_events.PROBLEMS_PAGE_SIZE + 1):
+    for count in (
+        0,
+        1,
+        max_admin_events.PROBLEMS_PAGE_SIZE,
+        max_admin_events.PROBLEMS_PAGE_SIZE + 1,
+        max_admin_events.PROBLEMS_PAGE_SIZE * 2 + 1,
+    ):
         async def fake_list_problem_deliveries(session_maker, event_id, *, limit, offset, _count=count):
             rows = problem_rows(_count)
             return rows[offset : offset + limit], _count
@@ -315,7 +502,13 @@ async def test_max_pagination_boundaries_for_scenarios_and_problems(mock_client,
             await max_admin_events.show_problems(mock_client, chat_id=123, event_id=10, page=1)
             payloads = _max_event_payloads(mock_client)
             assert "admin_ev_problems_10_0" in payloads
-            assert "admin_ev_problems_10_2" not in payloads
+            assert ("admin_ev_problems_10_2" in payloads) is (count > max_admin_events.PROBLEMS_PAGE_SIZE * 2)
+            if count > max_admin_events.PROBLEMS_PAGE_SIZE * 2:
+                mock_client.send_message.reset_mock()
+                await max_admin_events.show_problems(mock_client, chat_id=123, event_id=10, page=2)
+                payloads = _max_event_payloads(mock_client)
+                assert "admin_ev_problems_10_1" in payloads
+                assert "admin_ev_problems_10_3" not in payloads
 
 
 @pytest.mark.asyncio
@@ -665,6 +858,57 @@ async def test_max_dispatcher_steps_buttons_roundtrip_page_context(db_session_ma
     assert f"admin_ev_steps_{scen.id}_2_1" in visible_payloads()
     await press(f"admin_ev_steps_{scen.id}_2_1")
     assert f"admin_ev_open_{scen.id}_2_1" in visible_payloads()
+
+
+@pytest.mark.asyncio
+async def test_max_dispatcher_delete_last_step_returns_empty_page(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr("max_messenger_bot.app.common.is_admin", AsyncMock(return_value=True))
+    from event_admin_service import add_step, create_scenario, list_steps
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_delete_last_step",
+        event_type="webinar",
+        title="MAX delete last step",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-delete-last",
+    )
+    step = await add_step(db_session_maker, scen.id, -60, "Last reminder")
+    app = MaxBotApplication(mock_client)
+    app.states = states
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload: str) -> None:
+        await app._handle_callback_impl(
+            IncomingCallback(
+                raw={},
+                callback_id=payload,
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+
+    def visible_payloads() -> list[str]:
+        return _max_event_payloads(mock_client)
+
+    await press(f"admin_ev_steps_{scen.id}_2_1")
+    await press(f"admin_ev_step_{step.id}_2_1")
+    await press(f"admin_ev_step_del_ask_{step.id}_2_1")
+    assert f"admin_ev_step_del_yes_{step.id}_2_1" in visible_payloads()
+    mock_client.send_message.reset_mock()
+
+    await press(f"admin_ev_step_del_yes_{step.id}_2_1")
+    messages = [call.kwargs["text"] for call in mock_client.send_message.call_args_list if "text" in call.kwargs]
+    assert any("Шагов пока нет" in text for text in messages)
+    assert f"admin_ev_open_{scen.id}_2_1" in visible_payloads()
+    assert not any(
+        payload.startswith("admin_ev_step_") and not payload.startswith("admin_ev_step_add_")
+        for payload in visible_payloads()
+    )
+    assert await list_steps(db_session_maker, scen.id, include_archived=False) == []
 
 
 @pytest.mark.asyncio

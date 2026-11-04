@@ -1,14 +1,14 @@
 import os
 import re
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import inspect, select, text
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("BOT_TOKEN", "test_token")
@@ -1748,6 +1748,132 @@ async def test_real_postgresql_init_and_schema_verification():
 
             async with pg_engine.connect() as conn:
                 await conn.run_sync(verify_event_reminder_chains_schema)
+    finally:
+        await pg_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_real_postgresql_migration_backfills_delivery_content_version_snapshot():
+    """An existing v3 event keeps scheduled deliveries active when the snapshot column is added."""
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
+
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
+            await conn.run_sync(Base.metadata.create_all)
+
+        sessions = async_sessionmaker(pg_engine, expire_on_commit=False, class_=AsyncSession)
+        base_now = datetime.utcnow()
+        async with sessions() as session:
+            user = User(id=9910, first_name="Legacy PG user")
+            scenario = EventScenario(
+                code="pg_legacy_content_v3",
+                event_type="webinar",
+                title="Legacy v3 webinar",
+                starts_at=base_now + timedelta(hours=2),
+                duration_minutes=120,
+                link="https://example.test/legacy-v3",
+                is_active=True,
+                is_archived=False,
+                content_version=3,
+            )
+            session.add_all([user, scenario])
+            await session.flush()
+            steps = [
+                EventStep(
+                    event_id=scenario.id,
+                    offset_minutes=offset,
+                    message_text=f"Напоминание {index} {{event_title}}",
+                    step_version=1,
+                    sort_order=index,
+                    is_archived=False,
+                    include_event_details=False,
+                )
+                for index, offset in enumerate((-60, -120, -180))
+            ]
+            session.add_all(steps)
+            await session.flush()
+            registration = EventRegistration(
+                event_id=scenario.id,
+                user_id=user.id,
+                status="started",
+                generation=1,
+                registration_mode="standard",
+                registered_at=base_now,
+            )
+            session.add(registration)
+            await session.flush()
+            deliveries = [
+                EventDelivery(
+                    event_id=scenario.id,
+                    user_id=user.id,
+                    registration_id=registration.id,
+                    step_id=step.id,
+                    message_kind="scheduled_step",
+                    delivery_key=f"ev:{scenario.id}:reg:{registration.id}:step:{step.id}:r0",
+                    due_at=base_now,
+                    next_attempt_at=base_now,
+                    expires_at=base_now + timedelta(hours=3),
+                    schedule_revision=1,
+                    registration_generation=1,
+                    platform="telegram",
+                    status="pending",
+                )
+                for step in steps
+            ]
+            deliveries[1].status = "sent"
+            deliveries[1].sent_at = base_now
+            deliveries[1].finished_at = base_now
+            deliveries[2].status = "uncertain"
+            deliveries[2].last_error = "legacy timeout"
+            session.add_all(deliveries)
+            await session.commit()
+            delivery_ids = [delivery.id for delivery in deliveries]
+
+        async with pg_engine.begin() as conn:
+            await conn.execute(text(
+                "ALTER TABLE event_deliveries "
+                "DROP CONSTRAINT IF EXISTS ck_event_deliveries_content_version"
+            ))
+            await conn.execute(text("ALTER TABLE event_deliveries DROP COLUMN content_version_snapshot"))
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(database, "engine", pg_engine)
+            mp.setattr(database, "async_session_maker", sessions)
+            await database.init_db()
+            await database.init_db()
+
+        async with sessions() as session:
+            migrated = (await session.execute(
+                select(EventDelivery).where(EventDelivery.id.in_(delivery_ids)).order_by(EventDelivery.id)
+            )).scalars().all()
+            assert [delivery.content_version_snapshot for delivery in migrated] == [3, 3, 3]
+            assert [delivery.status for delivery in migrated] == ["pending", "sent", "uncertain"]
+
+        from event_delivery_worker import claim_pending_deliveries, process_single_delivery
+
+        claimed = await claim_pending_deliveries(sessions, batch_size=10, now=base_now)
+        assert [delivery_id for delivery_id, _ in claimed] == [delivery_ids[0]]
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=MagicMock(message_id=9910))
+        assert await process_single_delivery(
+            sessions,
+            delivery_ids[0],
+            claimed[0][1],
+            bot=bot,
+            now=base_now,
+        ) == "sent"
+        async with sessions() as session:
+            delivered = await session.get(EventDelivery, delivery_ids[0])
+            assert delivered.status == "sent"
+            assert delivered.content_version_snapshot == 3
+            history = (await session.execute(
+                select(EventDelivery.status).where(EventDelivery.id.in_(delivery_ids[1:])).order_by(EventDelivery.id)
+            )).scalars().all()
+            assert history == ["sent", "uncertain"]
     finally:
         await pg_engine.dispose()
 
