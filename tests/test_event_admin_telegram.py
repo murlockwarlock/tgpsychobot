@@ -269,6 +269,65 @@ async def test_telegram_dispatcher_steps_buttons_roundtrip_page_context(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_telegram_dispatcher_description_chunks_save_reopen_and_runtime_split(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    from event_delivery_worker import build_test_delivery_plan
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_dispatcher_description",
+        event_type="webinar",
+        title="Telegram dispatcher description",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/dispatcher-description",
+    )
+    event_admin_router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(event_admin_router)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+
+    methods = await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}_2_1")
+    card = next(method for method in methods if isinstance(method, EditMessageText))
+    edit_callback = next(
+        button.callback_data
+        for row in card.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("admin_ev_edit_menu_")
+    )
+    methods = await _feed_callback(dp, bot, edit_callback)
+    edit_menu = next(method for method in methods if isinstance(method, EditMessageText))
+    description_callback = next(
+        button.callback_data
+        for row in edit_menu.reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("admin_ev_edit_description_")
+    )
+    await _feed_callback(dp, bot, description_callback)
+    await _feed_message(dp, bot, "A" * 3000)
+    await _feed_message(dp, bot, "B" * 3000)
+    await _feed_callback(dp, bot, f"admin_ev_description_save_{scen.id}")
+
+    async with db_session_maker() as session:
+        saved = await session.get(EventScenario, scen.id)
+        assert saved.description == ("A" * 3000) + "\n" + ("B" * 3000)
+    plan = await build_test_delivery_plan(db_session_maker, scen.id, None, None)
+    text_parts = [part for part in plan if part["kind"] == "text"]
+    assert len(text_parts) >= 2
+    assert all(len(part["text"]) <= 4000 for part in text_parts)
+
+    methods = await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}_2_1")
+    card = next(method for method in methods if isinstance(method, EditMessageText))
+    assert any(
+        button.callback_data and button.callback_data.startswith("admin_ev_edit_menu_")
+        for row in card.reply_markup.inline_keyboard
+        for button in row
+    )
+
+
+@pytest.mark.asyncio
 async def test_telegram_description_and_media_edit_routes(db_session_maker, monkeypatch):
     monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
     monkeypatch.setattr("event_admin_telegram.get_all_admin_ids", AsyncMock(return_value={12345}))

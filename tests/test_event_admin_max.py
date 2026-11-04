@@ -490,6 +490,68 @@ async def test_max_dispatcher_steps_buttons_roundtrip_page_context(db_session_ma
 
 
 @pytest.mark.asyncio
+async def test_max_dispatcher_description_chunks_save_reopen_and_runtime_split(db_session_maker, mock_client, states, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr("max_messenger_bot.app.common.is_admin", AsyncMock(return_value=True))
+    from event_admin_service import create_scenario
+    from event_delivery_worker import build_test_delivery_plan
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_dispatcher_description",
+        event_type="webinar",
+        title="MAX dispatcher description",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-dispatcher-description",
+    )
+    app = MaxBotApplication(mock_client)
+    app.states = states
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload: str) -> None:
+        await app._handle_callback_impl(
+            IncomingCallback(
+                raw={},
+                callback_id=payload,
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+
+    def visible_payloads() -> list[str]:
+        rows = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+        return [button["payload"] for row in rows for button in row if "payload" in button]
+
+    await press(f"admin_ev_open_{scen.id}_2_1")
+    edit_callback = next(payload for payload in visible_payloads() if payload.startswith("admin_ev_edit_menu_"))
+    await press(edit_callback)
+    description_callback = next(
+        payload for payload in visible_payloads() if payload.startswith(f"admin_ev_edit_description_{scen.id}")
+    )
+    await press(description_callback)
+    await app._handle_message_impl(
+        IncomingMessage(raw={}, message_id="max-description-1", chat_id=123, sender=sender, text="A" * 3000)
+    )
+    await app._handle_message_impl(
+        IncomingMessage(raw={}, message_id="max-description-2", chat_id=123, sender=sender, text="B" * 3000)
+    )
+    await press(f"admin_ev_description_save_{scen.id}")
+
+    async with db_session_maker() as session:
+        saved = await session.get(EventScenario, scen.id)
+        assert saved.description == ("A" * 3000) + "\n" + ("B" * 3000)
+    plan = await build_test_delivery_plan(db_session_maker, scen.id, None, None)
+    text_parts = [part for part in plan if part["kind"] == "text"]
+    assert len(text_parts) >= 2
+    assert all(len(part["text"]) <= 4000 for part in text_parts)
+
+    await press(f"admin_ev_open_{scen.id}_2_1")
+    assert any(payload.startswith("admin_ev_edit_menu_") for payload in visible_payloads())
+
+
+@pytest.mark.asyncio
 async def test_max_webinar_creation_flow(db_session_maker, mock_client, states, monkeypatch):
     monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
 
