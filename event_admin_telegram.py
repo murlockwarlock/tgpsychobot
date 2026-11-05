@@ -689,7 +689,7 @@ async def process_create_code(message: Message, state: FSMContext) -> None:
     await state.set_state(EventAdminStates.create_title)
     await message.answer(
         f"✅ Код принят: <code>{norm_code}</code>\n\n"
-        f"<b>Шаг 2 из 5:</b> Введите название мероприятия (до 1000 символов):",
+        f"<b>Шаг 2 из 5:</b> Введите название мероприятия (до {EVENT_TITLE_MAX_LENGTH} символов):",
         parse_mode="HTML",
     )
 
@@ -697,8 +697,8 @@ async def process_create_code(message: Message, state: FSMContext) -> None:
 @router.message(EventAdminStates.create_title)
 async def process_create_title(message: Message, state: FSMContext) -> None:
     title = (message.text or "").strip()
-    if not title or len(title) > 255:
-        await message.answer("❌ Название не должно быть пустым и не может превышать 1000 символов. Попробуйте ещё раз:")
+    if not title or len(title) > EVENT_TITLE_MAX_LENGTH:
+        await message.answer(f"❌ Название не должно быть пустым и не может превышать {EVENT_TITLE_MAX_LENGTH} символов. Попробуйте ещё раз:")
         return
 
     await state.update_data(create_title=title)
@@ -883,7 +883,7 @@ async def start_edit_title(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(edit_event_id=event_id, event_list_back=list_back)
     await state.set_state(EventAdminStates.edit_title)
     await callback.message.edit_text(
-        "✏️ Введите новое название мероприятия (до 1000 символов):",
+        f"✏️ Введите новое название мероприятия (до {EVENT_TITLE_MAX_LENGTH} символов):",
         reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=_event_open_callback(event_id, list_back)).as_markup(),
     )
 

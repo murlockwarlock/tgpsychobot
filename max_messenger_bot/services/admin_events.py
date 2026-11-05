@@ -406,7 +406,7 @@ async def receive_create_code(
     await states.set(user_id, chat_id, "max_event_create_title", (await states.get(user_id)).data)
     await client.send_message(
         chat_id=chat_id,
-        text=f"✅ Код принят: <code>{norm_code}</code>\n\n<b>Шаг 2 из 5:</b> Введите название мероприятия (до 1000 символов):",
+        text=f"✅ Код принят: <code>{norm_code}</code>\n\n<b>Шаг 2 из 5:</b> Введите название мероприятия (до {EVENT_TITLE_MAX_LENGTH} символов):",
     )
 
 
@@ -418,8 +418,8 @@ async def receive_create_title(
     raw_title: str,
 ) -> None:
     title = raw_title.strip()
-    if not title or len(title) > 255:
-        await client.send_message(chat_id=chat_id, text="❌ Название не должно быть пустым и не может превышать 1000 символов:")
+    if not title or len(title) > EVENT_TITLE_MAX_LENGTH:
+        await client.send_message(chat_id=chat_id, text=f"❌ Название не должно быть пустым и не может превышать {EVENT_TITLE_MAX_LENGTH} символов:")
         return
 
     state_obj = await states.get(user_id)
@@ -837,7 +837,7 @@ async def start_edit_title(client: MaxApiClient, states: StateStore, chat_id: in
     await states.set(user_id, chat_id, "max_event_edit_title", {"event_id": event_id, "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
-        text="✏️ Введите новое название мероприятия (до 1000 символов):",
+        text=f"✏️ Введите новое название мероприятия (до {EVENT_TITLE_MAX_LENGTH} символов):",
         attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]),
     )
 
